@@ -302,9 +302,9 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
     load's or a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
     `step`), but those whose owner keeps them as long as itself: an objective's (`Objective.program`),
-    and the RL rollouts', each built over its own environment and policy (`dew.objectives.rl.control`'s
-    and `dew.objectives.rl.dreamer`'s rollouts, `dew.rl.flight.GateRace`'s and `dew.rl.hyperlux`'s
-    programs, `dew.rl.simulator`'s policy step)."""
+    and the RL programs built over their own environment or rollout (`dew.objectives.rl.control`'s
+    collection and episode-return summary, `dew.objectives.rl.dreamer`'s replay sampler,
+    `dew.rl.flight.GateRace`'s and `dew.rl.hyperlux`'s programs)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
