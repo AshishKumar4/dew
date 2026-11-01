@@ -123,7 +123,7 @@ def test_a_chain_of_an_importable_iterator_is_recorded():
 
 def test_a_run_recorded_while_its_iterators_identities_were_their_names_reads_its_chains_back(tmp_path):
     """A run recorded while an iterator's content version was its `name` loads its chains with that version
-    its `identity` (`dew.config.earlier_chains`, row 3031), wherever a chain holds the iterator: a mix's
+    its `identity` (`dew.data.records.earlier_chains`, row 3031), wherever a chain holds the iterator: a mix's
     member, a concatenation's part, in its data and its validation."""
     from dew.config import RunConfig
     from dew.data.sources import Concatenate

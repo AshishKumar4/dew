@@ -406,6 +406,9 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
+    # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
+    if saved.get("version") != plan.version:
+        return saved
     manifest = record(saved.get("manifest", {}), "saved data manifest")
     named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
     saved = {**saved, "manifest": {**manifest, "source": named}, **_members_as_today(saved, plan)}

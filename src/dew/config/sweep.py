@@ -21,7 +21,7 @@ from typing import Protocol
 import numpy as np
 
 from dew.files import write_atomically
-from dew.telemetry.records import TrialFinished, json_value
+from dew.telemetry.records import TrialFinished, tracker_json
 
 type Choice = None | bool | int | float | str
 """One candidate value for a swept field, of a type both JSON and Optuna can hold."""
@@ -118,7 +118,7 @@ def write_ledger(path: Path, space: Space, trials: Sequence[TrialFinished]) -> N
     half a ledger behind."""
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomically(path, json.dumps({'space': _recorded(space),
-                                       'trials': [json_value(trial) for trial in trials]}, indent=2))
+                                       'trials': [tracker_json(trial) for trial in trials]}, indent=2))
 
 
 __all__ = ["Choice", "GridSearch", "OptunaSearch", "Point", "RandomSearch", "Search", "Space"]

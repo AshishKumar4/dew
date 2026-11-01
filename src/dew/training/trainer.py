@@ -1509,8 +1509,8 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                interval.count(batch, measured_flops, loss, finite, committed, aux)
-                run.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                interval.count(batch, measured_flops, loss, finite, committed, aux,
+                               run.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1925,8 +1925,8 @@ class Trainer(Generic[Loss, Effects]):
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
                         rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
-                    counted.count(batch, None, loss, finite, committed, aux)
-                    branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
+                    counted.count(batch, None, loss, finite, committed, aux,
+                                  branched.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
                     done, branched.current = done + 1, branched.current + 1
             finally:
                 self._stage_starts = starts

@@ -59,10 +59,12 @@ _log = logging.getLogger("dew.kernels")
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """A template launch as it traced: its identity apart from its config (`_identity`), its op's name and
-    its config, none of its traced values."""
+    its config, none of its traced values; and the share of its tile grid its tails pad
+    (`tuning.KernelOp.padded`), None where its op states none."""
     identity: str
     op: str
     config: Hashable
+    padded: float | None = None
 
 
 @dataclasses.dataclass
@@ -72,6 +74,7 @@ class _Pending:
     identity: Callable[[], str]
     op: str
     config: Hashable
+    padded: Callable[[], float | None]
     digest: str | None = None
 
 
@@ -146,7 +149,8 @@ def _digest(text: str) -> str:
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
-    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
+    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
+                                  lambda: op.padded(arguments, config)))
     try:
         yield
     finally:
@@ -176,7 +180,7 @@ def launch_digest() -> str | None:
         identity = pending.identity()
         digest = _digest(f"{identity}|{pending.config!r}")
         with _GUARD:
-            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config))
+            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded()))
         pending.digest = digest
     return pending.digest
 
