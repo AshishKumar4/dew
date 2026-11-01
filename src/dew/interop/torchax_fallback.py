@@ -113,11 +113,11 @@ class TorchAdmission:
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     """Tier 3's decision on an unregistered model_type no registered convention computes, on the
     probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
-    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward is
-    causal, so changing a row's last token leaves every earlier position's logits bit for bit, the row
-    run alone (a decoder configured bidirectionally, BERT's with is_decoder False, is not); and its
-    inference and training forwards trace as tier 3 traces them (`TorchGraph.traced`), the training one
-    drawing nothing on the host. An operation whose output's shape or value the traced values decide (a
+    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its inference and
+    training forwards trace as tier 3 traces them (`TorchGraph.traced`), the training one drawing
+    nothing on the host; and the forward tier 3 runs is causal, so changing a row's last token leaves
+    every earlier position's logits bit for bit (a decoder configured bidirectionally, BERT's with
+    is_decoder False, is not). An operation whose output's shape or value the traced values decide (a
     `nonzero`, an `item()`) fails that trace with JAX's own error, naming it. Each refusal names its
     cause."""
     import torch
@@ -140,17 +140,6 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     probe = _Probe()
     with torch.no_grad(), probe.recording():
         model(input_ids=ids, use_cache=False)
-    changed = ids.clone()
-    changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
-    # Each row alone: a forward whose experts run over the batch's tokens together (Longcat Flash's
-    # loop) rounds one row's products by what the other rows route, which is no attention to later
-    # tokens (ledger 3125).
-    with torch.no_grad():
-        rows = [(model(input_ids=ids[row:row + 1], use_cache=False).logits,
-                 model(input_ids=changed[row:row + 1], use_cache=False).logits) for row in range(len(ids))]
-    if not all(torch.equal(logits[:, :-1], moved[:, :-1]) for logits, moved in rows):
-        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
-                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
     # Its inference and training forwards traced as tier 3 traces them; the training one's dropout and
     # any layer drop run only there, and a draw on the host would be fixed for every step.
     from torchax.interop import JittableModule, extract_all_buffers
@@ -160,7 +149,17 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     graph = TorchGraph(jittable, ())
-    graph.traced(params, buffers, ids.numpy().astype(np.int32), None, train=False)
+    # Causal as tier 3 runs it, its experts at static shapes (`functional_parts`): transformers' own
+    # forward runs Longcat Flash's experts over the tokens each routes, so one token's route rounds
+    # another's products, which is no attention to later tokens (ledger 3125).
+    placed = {name: jnp.asarray(leaf) for name, leaf in params.items()}
+    held = {name: jnp.asarray(leaf) for name, leaf in buffers.items()}
+    tokens = jnp.asarray(ids.numpy(), jnp.int32)
+    changed = tokens.at[:, -1].set((tokens[:, -1] + 1) % int(config.vocab_size))
+    logits, moved = (np.asarray(graph(placed, held, row, train=False)[0]) for row in (tokens, changed))
+    if not np.array_equal(logits[:, :-1], moved[:, :-1]):
+        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
+                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
     _, _, draws = graph.traced(params, buffers, ids.numpy().astype(np.int32), jax.random.key(0), train=True)
     if draws.host:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
