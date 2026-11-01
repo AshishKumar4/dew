@@ -23,7 +23,7 @@ NEEDS = Needs(communicators={0: {2: GIB}, 1: {2: 2 * GIB}}, runtime={0: GIB // 2
 """Two GPUs' measurement: a collective's communicator over both takes 1 GiB on each, a permute's 2, the
 runtime half."""
 
-BOTH = frozenset({(0, "all", 2), (1, "all", 2)})
+BOTH = frozenset({(0, ((0, 1),)), (1, ((0, 1),))})
 """A collective's and a permute's communicator over both GPUs, which Dew leaves room for before a step
 compiles."""
 
@@ -41,7 +41,7 @@ def test_the_pool_takes_at_most_the_users_share_and_leaves_the_communicators_roo
         share = communicators.pool_share(NEEDS, MEMORY, requested=requested, cliques=BOTH)
         assert share * 80 * GIB <= tightest < (share + 0.001) * 80 * GIB
     roomy = {0: (79 * GIB, 80 * GIB)}
-    assert communicators.pool_share(NEEDS, roomy, requested=None, cliques=frozenset({(0, "all", 2)})) == 0.95
+    assert communicators.pool_share(NEEDS, roomy, requested=None, cliques=frozenset({(0, ((0, 1),))})) == 0.95
     assert communicators.pool_share(NEEDS, MEMORY, requested=0.5, cliques=BOTH) == 0.5
     with pytest.raises(CommunicatorRoom) as refused:
         communicators.pool_share(NEEDS, {0: (3 * GIB, 80 * GIB)}, requested=0.97, cliques=BOTH)
@@ -78,31 +78,45 @@ def test_the_sized_pool_is_recorded_with_what_it_left_room_for(monkeypatch):
     assert sized["needed"] == NEEDS.needed(BOTH, MEMORY, runtime=True)
 
 
-def test_a_compiled_steps_communicators_are_read_by_kind_and_device_grouping():
-    """A compiled step makes a communicator for each kind and device grouping its collectives take (XLA keys a
-    clique by its devices and its kind): two all-gathers over one grouping share one, another grouping of the
-    same size makes another, and a permute makes its own."""
+def test_a_compiled_steps_communicators_are_read_by_kind_and_device_groups():
+    """A compiled step makes a communicator for each kind and set of device groups its collectives take (XLA
+    keys a clique by its devices and its kind), however the program writes the groups: listed and as an iota,
+    transposed or not, the same groups share one; other groups of the same size make another; a permute makes
+    its own over every GPU."""
     program = ("%a = f32[8] all-gather(%x), replica_groups={{0,1},{2,3}}\n"
-               "%b = f32[8] all-reduce(%y), replica_groups={{0,1},{2,3}}\n"
+               "%b = f32[8] all-reduce(%y), replica_groups=[2,2]<=[4]\n"
                "%c = f32[8] all-reduce(%z), replica_groups={{0,2},{1,3}}\n"
-               "%d = f32[8] all-to-all(%w), replica_groups=[1,4]<=[4]\n"
-               "%e = f32[8] collective-permute(%v), source_target_pairs={{0,1},{1,0}}\n"
-               "%f = f32[8] add(%u, %t)\n")
+               "%d = f32[8] reduce-scatter(%z), replica_groups=[2,2]<=[2,2]T(1,0)\n"
+               "%e = f32[8] all-to-all(%w), replica_groups=[1,4]<=[4]\n"
+               "%f = f32[8] all-reduce(%w), replica_groups={}\n"
+               "%g = f32[8] collective-permute(%v), source_target_pairs={{0,1},{1,0}}\n"
+               "%h = f32[8] add(%u, %t)\n")
+    every = ((0, 1, 2, 3),)
     assert communicators.cliques_of(program, 4) == frozenset({
-        (0, "{{0,1},{2,3}}", 2), (0, "{{0,2},{1,3}}", 2), (0, "[1,4]<=[4]", 4), (1, "all", 4)})
-    assert communicators.cliques_of("%f = f32[8] add(%u, %t)", 4) == frozenset()
+        (0, ((0, 1), (2, 3))), (0, ((0, 2), (1, 3))), (0, every), (1, every)})
+    assert communicators.cliques_of("%h = f32[8] add(%u, %t)", 4) == frozenset()
 
 
-def test_a_compiled_steps_communicators_are_held_to_the_room_dew_left_outside_the_pool():
-    """A compiled step whose communicators need more than the room Dew left outside the pool is refused before
-    it runs, naming the bytes, never left to stall in a collective; one within it passes, its communicators
-    already made by earlier steps counted against that room, not against what is free after them. A
-    grouping the host was not measured for is charged as its size's measured communicator."""
-    room = {0: 4 * GIB, 1: 4 * GIB}
-    communicators.checked_room(BOTH, NEEDS, room)
+FOUR = Needs(communicators={0: {2: GIB, 4: 2 * GIB}, 1: {2: GIB, 4: 2 * GIB}},
+             runtime=dict.fromkeys(range(4), GIB // 2), seconds=8.0)
+"""Four GPUs' measurement: a communicator over two of them takes 1 GiB on each, over all four 2 GiB."""
+
+
+def test_a_processs_communicators_are_held_together_to_the_room_dew_left_outside_the_pool():
+    """Every communicator a process has made stays made (XLA caches them), so each compiled step is admitted
+    only if its communicators and those of the steps before it, each counted once, and the runtime fit the
+    room Dew left outside the pool; one beyond it is refused before it runs, naming the bytes, never left to
+    stall in a collective."""
+    room = dict.fromkeys(range(4), 4 * GIB)
+    every, pairs, crossed = ((0, 1, 2, 3),), ((0, 1), (2, 3)), ((0, 2), (1, 3))
+    resident = communicators.Resident()
+    resident.admit(frozenset({(0, every), (0, pairs)}), FOUR, room)
+    resident.admit(frozenset({(0, every)}), FOUR, room)
     with pytest.raises(CommunicatorRoom) as refused:
-        communicators.checked_room(BOTH | {(0, "{{0,1}}", 2)}, NEEDS, room)
-    assert refused.value.needed == {0: 4 * GIB + GIB // 2, 1: 4 * GIB + GIB // 2} and refused.value.room == room
+        resident.admit(frozenset({(0, crossed), (1, every)}), FOUR, room)
+    assert refused.value.needed == dict.fromkeys(range(4), 2 * GIB + GIB + GIB + 2 * GIB + GIB // 2)
+    assert refused.value.room == room
+    assert resident.cliques == frozenset({(0, every), (0, pairs)})
 
 
 def test_a_host_of_one_gpu_or_none_or_a_cpu_process_measures_nothing(monkeypatch):
