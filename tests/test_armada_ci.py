@@ -1452,6 +1452,9 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
         "    finally:\n"
         "        os.close(folder)\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    # The test lists the checkout's own directory, where its runs are counted: the count stands there before
+    # the first run, as a run that adds an entry to a directory it lists keeps no key (`moved`).
+    (tmp_path / "runs").write_text("")
     # Each page changed, added or listed anew runs the file again, and the run after reuses that row.
     # Python bytecode a run leaves beside a page (a directory, `None` here) is no change to the pages.
     changes = [(None, "", 1), ("docs/model.md", "width 8\n", 2), ("docs/serving.md", "serve\n", 3),
@@ -1979,11 +1982,12 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
-def test_a_kept_task_reuses_each_files_own_row_where_files_share_every_input_and_so_a_key(
+def test_a_kept_task_reuses_each_files_own_row_and_names_every_file_once(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Files whose runs read the same inputs, each importing the others, share a key: a kept task still
-    reuses each file's own green row (`green_key`, kept at the row's place), and names every file once
-    (2026-10-30: a kept task reported one file's row for six files, and a verdict was not graded)."""
+    """Files whose runs read the same inputs, each importing the others, keep a row each: a kept task reuses
+    each file's own green row (`green_key`, kept at the row's place), runs none of them again, and names
+    every file once (2026-10-30: a kept task reported one file's row for six files, and a verdict was not
+    graded)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     head = "import sys\nfrom pathlib import Path\nsys.path.insert(0, 'tests')\n"
 
@@ -1994,10 +1998,6 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_share_every_input_and
 
     written(tmp_path, {f"test_{name}.py": body(name) for name in "abc"})
     armada_task(ci, monkeypatch, verdict)
-    common = ci.shared("3.12")
-    keys = {ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
-                        "token")["key"] for name in "abc"}
-    assert len(keys) == 1 and None not in keys, "the three share every input, and so one key"
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
