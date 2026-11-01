@@ -95,15 +95,15 @@ def test_a_decision_corpus_counts_its_source_examples():
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_each_batch_states_the_source_examples_read_by_then_and_a_resumed_read_goes_on_from_them(workers):
-    """Fifteen examples, each made one to three rows of, read eight rows a batch by `workers` loading
-    workers: after each batch the corpus states the source examples whose rows it delivered by then, the
-    sum of what those batches consume; a read resumed from a position saved after the second batch states
-    the same counts after each later batch as the read it was saved from."""
+    """Fifteen examples in shards of three, each made one to three rows of, read eight rows a batch by
+    `workers` loading workers: after each batch the corpus states the source examples whose rows it
+    delivered by then, the sum of what those batches consume; a read resumed from a position saved after
+    the second batch states the same counts after each later batch as the read it was saved from."""
     ids = np.arange(1, 16, dtype=np.int32)
     loading = Loading(workers=workers)
 
     def stream():
-        loader = compile(Pipeline(Memory({"id": ids})).batch(BATCH), read="streamed",
+        loader = compile(Pipeline(Memory({"id": ids}, shard_rows=3)).batch(BATCH), read="streamed",
                          objective=ObjectiveData(train=(Questioned(),)), examples=15, loading=loading)
         return loader, loader.train(DataPartition())
 
