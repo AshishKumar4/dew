@@ -597,8 +597,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); otherwise (the accurate form, a hooked
-        or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds)
-        two launches, the dQ launch then the keys-first dK/dV one, in a fixed order."""
+        or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds,
+        a call over key spans, windows, documents or runs, whose one launch's dK and dV an H100 got wrong,
+        1.27 and 0.79 times their RMS from the two launches' and different on a rerun at a packed windowed
+        call of width 64, interpreted exact, ET-3171-BAND-h100, row 3171) two launches, the dQ launch then
+        the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -611,7 +614,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
-        if not deterministic_ops_requested():
+        if not deterministic_ops_requested() and self.form != "spans":
             # Legal where the form, the hooks, the widths and the registers allow (`legal`): of the one
             # launch keys first and queries first, the larger query tile (`_derived`'s order).
             found = []
