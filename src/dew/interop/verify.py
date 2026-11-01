@@ -51,6 +51,7 @@ from dew import _records
 from dew.cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
+from dew.nn import precision
 from dew.nn.blocks import padded_row
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -718,19 +719,21 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
     Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
     probe's depth and width as the source's does; a computation the candidate does not share puts the
     source as far from the truth as it moves any logit. A non-finite logit on either side is no
-    rounding: infinite."""
+    rounding: infinite. The candidate's float32 runs as a user's process runs it: its products summed in
+    float32 (`precision.FP32_SUMS`), not in TF32 on a GPU, nor in float64 as a test process's wide CPU
+    arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
+    users get and the ratio past what users' rounding reaches."""
 
-    def logits(dtype: str, network: nn.Module) -> np.ndarray:
+    def logits(dtype: str, network: nn.Module, algorithm: str) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
-        # A GPU's default runs fp32 matmuls in TF32, which is not the float32 the source runs.
-        with jax.default_matmul_precision('highest'):
+        with jax.default_matmul_precision(algorithm):
             return np.asarray(network.apply(held, ids), np.float64)
 
-    ours = logits('float32', model)
+    ours = logits('float32', model, precision.FP32_SUMS)
     with jax.enable_x64(new_val=True):
         wide = models.build('causal_transformer',
                             {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
-        truth = logits('float64', wide)
+        truth = logits('float64', wide, 'highest')
     expected = np.asarray(expected, np.float64)
     if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
         return math.inf
