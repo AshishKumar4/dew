@@ -54,7 +54,7 @@ from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.registry import from_record, read_arguments
 
-from ..activations import GatedActivation, Situ, ungated_activation
+from ..activations import HIDDEN_ACT, SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
@@ -89,7 +89,7 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
-from ..norms import RMSNorm
+from ..norms import OffsetLayerNorm, RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -155,6 +155,17 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
+def _norm_gain(norm: nn.Module) -> jax.Array:
+    """The largest gain `norm`'s weight puts on its normalized input, |g| over its features: its scale,
+    from one where it stores its offset from one (`RMSNorm.scale_offset`, `OffsetLayerNorm`), one
+    without a scale."""
+    scale = norm.variables.get("params", {}).get("scale")
+    if scale is None:
+        return jnp.ones((), jnp.float32)
+    offset = isinstance(norm, OffsetLayerNorm) or (isinstance(norm, RMSNorm) and norm.scale_offset)
+    return jnp.max(jnp.abs(jnp.asarray(scale, jnp.float32) + (1 if offset else 0)))
+
+
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -934,8 +945,8 @@ class CausalTransformer(nn.Module):
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
-            self.continuum_level = Continuum(self.continuum, dtype=self.dtype, precision=self.precision,
-                                             name='continuum')
+            self.continuum_level = Continuum(self.continuum, self.emb_features, dtype=self.dtype,
+                                             precision=self.precision, name='continuum')
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -1259,17 +1270,44 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
-    def affine_head(self) -> bool:
-        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
-        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
-        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
-        modules alone leaves it affine, and a tied head reads its table with none."""
+    def head_bounds(self) -> tuple[jax.Array, jax.Array]:
+        """Bounds, over every state, on the curvature and the slope of a slot's cross entropy in the
+        states the head past the continuum level reads (`head_logits`): the norms of its Hessian and its
+        gradient there (`SteppedInContext`), read from the bound model; constants of the step, not
+        differentiated. With A the head's rows (`vocabulary_rows`, an adapter applied) and |A| their
+        Frobenius norm, at least the spectral: the cross entropy's Hessian in the logits is at most 1/2 and
+        its gradient p - y at most sqrt 2, so an affine head's are |A|^2 / 2 and sqrt 2 |A|. A logit
+        softcap c tanh(u / c) has a slope of at most 1 and a second derivative of at most 4 / (3 sqrt 3 c),
+        each logit's gradient at most 1, which adds |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign.
+        A head transform N(phi(D s)) before A, N its norm of gain g and epsilon e, has a Jacobian of at
+        most |g| p1 |D| / sqrt e (a norm's is |g| over its input's root mean square, at least sqrt e) and a
+        second derivative of at most |g| (6 p1^2 / e + p2 / sqrt e) |D|^2 (a norm's is 6 |g| / e at most),
+        p1, p2 its activation's `SLOPES`: a real bound, its epsilon making it a loose one. A quantizer of the
+        head's own input makes the head piecewise constant in its states, whose gradient no Lipschitz bound
+        holds: refused. A checkpoint's quantizer of the trunk's modules alone leaves the head as it is, and
+        a tied head reads its table with none. nGPT's gains never meet a level (`setup`)."""
         # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
         heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
                                                                   else [self.project_out])]
-        quantized = any(self._quantizer(head) is not None for head in heads)
-        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
-                and not quantized)
+        if any(self._quantizer(head) is not None for head in heads):
+            raise ValueError("a damped step bounds the head's curvature in its states, and a quantizer of "
+                             "the head's input makes the head piecewise constant there, its gradient jumping "
+                             "at every rounding boundary, which no curvature bounds: step it undamped")
+        rows = jnp.asarray(self.vocabulary_rows())
+        table = jnp.sum(jnp.square(rows.astype(at_least_fp32(rows.dtype))))
+        curvature, slope = table / 2, jnp.sqrt(2 * table)
+        if self.final_logit_softcap is not None:
+            curvature = table * (0.5 + 4 / (3 * math.sqrt(3) * self.final_logit_softcap))
+        if self.head_transform is not None:
+            p1, p2 = SLOPES[UNGATED[self.head_transform]]
+            dense = self.applied_kernel("head_dense")
+            spread = jnp.sum(jnp.square(dense.astype(at_least_fp32(dense.dtype))))
+            gain = _norm_gain(self.head_norm)
+            epsilon = self.head_norm.epsilon
+            jacobian = jnp.sqrt(gain ** 2 * p1 ** 2 * spread / epsilon)
+            bent = gain * (6 * p1 ** 2 / epsilon + (p2 or 0) / math.sqrt(epsilon)) * spread
+            curvature, slope = jacobian ** 2 * curvature + slope * bent, jacobian * slope
+        return jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope)
 
     @nn.nowrap
     def in_context_level(self, variables):
@@ -1287,6 +1325,20 @@ class CausalTransformer(nn.Module):
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
         return self.continuum_level(hidden)
+
+    def level_terms(self, hidden) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """What bounds a step of the continuum level's kernels at final states `hidden`
+        (`Continuum.step_terms`, `SteppedInContext`)."""
+        if self.continuum is None:
+            raise ValueError("this model has no continuum level")
+        return self.continuum_level.step_terms(hidden)
+
+    @nn.nowrap
+    def level_slopes(self) -> tuple[float, float | None]:
+        """The level's activation's derivative bounds (`Continuum.slopes`, `SteppedInContext`)."""
+        if self.continuum is None:
+            raise ValueError("this model has no continuum level")
+        return SLOPES[HIDDEN_ACT[self.continuum.activation]]
 
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a

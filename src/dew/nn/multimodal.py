@@ -528,9 +528,9 @@ class MultimodalTransformer(DecoderWrapper):
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
 
-    def affine_head(self) -> bool:
-        """Whether the decoder's head past its level is affine in its states (`SteppedInContext`)."""
-        return self.language_model.affine_head()
+    def head_bounds(self) -> tuple[jax.Array, jax.Array]:
+        """The decoder's head's curvature and slope bounds past its level (`SteppedInContext`)."""
+        return self.language_model.head_bounds()
 
     @nn.nowrap
     def in_context_level(self, variables):
@@ -547,6 +547,15 @@ class MultimodalTransformer(DecoderWrapper):
     def continuum_states(self, hidden):
         """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
         return self.language_model.continuum_states(hidden)
+
+    def level_terms(self, hidden):
+        """What bounds a step of the decoder's level at its final states (`SteppedInContext`)."""
+        return self.language_model.level_terms(hidden)
+
+    @nn.nowrap
+    def level_slopes(self) -> tuple[float, float | None]:
+        """The decoder's level's activation's derivative bounds (`SteppedInContext`)."""
+        return self.language_model.level_slopes()
 
     def head_logits(self, states):
         """The decoder's head over states its continuum level already read (`SteppedInContext`)."""

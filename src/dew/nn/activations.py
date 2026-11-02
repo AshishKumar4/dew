@@ -99,6 +99,18 @@ UNGATED: dict[str, Activation] = {
 """The activations an ungated feed-forward takes, by Dew's names."""
 
 
+SLOPES: dict[Activation, tuple[float, float | None]] = {
+    gelu_exact: (1.1289122, 0.7978924), gelu_exact_torch: (1.1289122, 0.7978924),
+    gelu_tanh: (1.1290011, 0.7978924), quick_gelu: (1.0998479, 0.851009), silu: (1.0998444, 0.5000031),
+    jax.nn.relu: (1.0, None)}
+"""Upper bounds on each activation's `sup |phi'|` and `sup |phi''|` over the reals, which a curvature bound
+through it reads (`dew.objectives.lm.adaptation`): the exact GELU's are Phi(sqrt 2) + sqrt 2 phi(sqrt 2) and
+2 phi(0), SiLU's sigma(x)(1 + x(1 - sigma(x))) at its root 2 + x(1 - 2 sigma(x)) = 0 and 1/2, quick GELU's
+SiLU's at 1.702 x, and 1.702 / 2, each rounded up past its float64 maximum on a grid of step 2e-5 by the step
+times the next derivative's maximum (`tests/test_chunk_adaptation.py`). ReLU's `phi''` is a point mass at
+zero, which no number bounds (None)."""
+
+
 def ungated_activation(name: str, x: jax.Array) -> jax.Array:
     """`x` through the `UNGATED` activation `name`, in `x`'s dtype; callers check `name` first."""
     return UNGATED[name](x)

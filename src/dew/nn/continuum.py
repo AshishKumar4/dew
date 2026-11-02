@@ -15,6 +15,7 @@ import dataclasses
 
 import flax.linen as nn
 import jax
+import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import activation
@@ -47,15 +48,30 @@ class Continuum(nn.Module):
     `up` zero at its start."""
 
     level: ContinuumLevel
+    features: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
-    @nn.compact
+    def setup(self):
+        # The ungated feed-forward `down`, `up`, the latter zero at its start; its first projection is
+        # the feed-forward's `up_proj`, named `down` here, and its output `down_proj`, named `up`.
+        self.mlp = GatedMLP(self.level.hidden, self.features, activation(self.level.activation),
+                            output_init_std=0.0, linear=Dense, names=("down", "up"), dtype=self.dtype,
+                            precision=self.precision)
+        nn.share_scope(self, self.mlp)
+
     def __call__(self, x: jax.Array) -> jax.Array:
-        # The ungated feed-forward `down`, `up`, the latter zero at its start.
-        mlp = GatedMLP(self.level.hidden, x.shape[-1], activation(self.level.activation), output_init_std=0.0,
-                       linear=Dense, names=("down", "up"), dtype=self.dtype, precision=self.precision)
-        nn.share_scope(self, mlp)
         # The residual sums in at least fp32 and rounds once to the states' dtype, the head's input.
         wide = at_least_fp32(x.dtype)
-        return (x.astype(wide) + mlp(x).astype(wide)).astype(x.dtype)
+        return (x.astype(wide) + self.mlp(x).astype(wide)).astype(x.dtype)
+
+    def step_terms(self, x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """What bounds a step of the level's kernels at states `x` `[..., features]`
+        (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, f = act(down(x)) the
+        inputs `up` multiplies, and the Frobenius norm of the map `up` applies, an adapter's factors on it
+        included, at least its spectral norm; in at least fp32."""
+        wide = at_least_fp32(x.dtype)
+        hidden = activation(self.level.activation)(self.mlp.up_proj(x)).astype(wide)
+        applied = self.mlp.down_proj(jnp.eye(self.level.hidden, dtype=x.dtype)).astype(wide)
+        return (jnp.sum(jnp.square(x.astype(wide)), axis=-1), jnp.sum(jnp.square(hidden), axis=-1),
+                jnp.sqrt(jnp.sum(jnp.square(applied))))
