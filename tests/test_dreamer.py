@@ -55,15 +55,17 @@ def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
 @pytest.mark.parametrize("unimix", [0.0, 0.01])
 def test_a_categoricals_log_probabilities_stay_finite_where_a_class_is_far_below(unimix):
     """A latent's log-probabilities (`unimix_log_probs`) of logits a thousand below their row's largest,
-    with and without the uniform mixture, are the mixture's written in float64 from the log-softmax: finite
-    wherever float32's log-softmax is, so the world model's KL over them stays finite."""
+    with and without the uniform mixture, are finite in float32, so the world model's KL over them stays
+    finite, and in float64 the mixture's written from the log-softmax, where a probability's log is -inf
+    once its softmax underflows (below about -745 in float64)."""
     logits = np.asarray([[0.0, -1000.0, -3.0, 2.5], [-40.0, 0.0, -1000.0, 1.0]], np.float32)
-    found = np.asarray(unimix_log_probs(jnp.asarray(logits), unimix))
+    assert np.isfinite(np.asarray(unimix_log_probs(jnp.asarray(logits), unimix))).all()
     wide = logits.astype(np.float64)
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(unimix_log_probs(jnp.asarray(wide), unimix))
     log_softmax = wide - wide.max(-1, keepdims=True)
     log_softmax = log_softmax - np.log(np.exp(log_softmax).sum(-1, keepdims=True))
     expected = log_softmax if not unimix else np.log((1 - unimix) * np.exp(log_softmax) + unimix / 4)
-    assert np.isfinite(found).all()
     assert_computes_the_oracle(found, expected, "the latent's log-probabilities", roundings=16)
 
 

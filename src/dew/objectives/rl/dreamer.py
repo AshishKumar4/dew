@@ -850,12 +850,15 @@ class DreamerRollout:
 
     The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
     steps it still owes; its environments begin again and its replay is made again, from `replay` or the
-    prefill. Resumed from a step that holds none of its state (one an earlier Dew saved), it owes the
-    steps of the updates after that step alone. A cooldown branch runs on copies of its environments and
-    replay (`branch`), a `Simulator` keeping its own (`dew.rl.simulator.branched`). With
-    `checkpointed_replay`, its checkpoints also hold its replay, its environments mid episode and their
-    running returns, and a resumed run samples what the uninterrupted run did, at the replay's size a
-    checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live outside JAX)."""
+    prefill. A rollout owes each update from the step it goes on from at its own pace, so a run resumed
+    with another batch, length or train ratio (a later phase's longer windows) takes the steps of its
+    updates from there at that pace alone. Resumed from a step that holds none of its state (one an
+    earlier Dew saved), it owes the steps of the updates after that step alone. A cooldown branch runs on
+    copies of its environments and replay (`branch`), a `Simulator` keeping its own
+    (`dew.rl.simulator.branched`). With `checkpointed_replay`, its checkpoints also hold its replay, its
+    environments mid episode and their running returns, and a resumed run samples what the uninterrupted
+    run did, at the replay's size a checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live
+    outside JAX)."""
 
     objective: DreamerV3Objective
     env: Env | Simulator
@@ -872,6 +875,7 @@ class DreamerRollout:
     _taken: int = field(default=0, init=False, repr=False)
     _prefilled: int = field(default=0, init=False, repr=False)
     _restored: bool = field(default=False, init=False, repr=False)
+    _paced: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
     _driven: DrivenSimulator | None = field(default=None, init=False, repr=False)
 
@@ -942,6 +946,7 @@ class DreamerRollout:
         """The rollout carrying on from a `saved` tree: owing the steps after those it had taken, and with
         `checkpointed_replay` from its replay and its environments as they stood."""
         self._taken, self._prefilled, self._restored = _count(tree["taken"]), _count(tree["prefilled"]), True
+        self._paced = None
         if "replay" in tree and "carry" in tree and "returns" in tree:
             self._live = _Live(tree["carry"], tree["replay"], tree["returns"])
 
@@ -1041,10 +1046,16 @@ class DreamerRollout:
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
-        if self._live is None and not self._restored:
-            # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
-            # steps of the updates after that step alone: those before it were taken by the run it resumes.
-            self._taken = self._owed(int(state.updates))
+        if self._paced is None:
+            updates = int(state.updates)
+            if not self._restored:
+                # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
+                # steps of the updates after that step alone: those before it were taken by the run it
+                # resumes.
+                self._taken = self._paced_steps(updates)
+            # The updates and the steps owed for them where this rollout goes on, from which it owes at its
+            # own pace (`_owed`).
+            self._paced = (updates, self._taken - self._prefilled)
         live = self._started(variables, act_key) if self._live is None else self._live
         owed = self._owed(int(state.updates) + 1)
         envs = live.returns.shape[0]
@@ -1057,7 +1068,16 @@ class DreamerRollout:
         return self._drawn(sample_key)
 
     def _owed(self, updates: int) -> int:
-        """The environment steps `updates` updates train on at the rollout's train ratio, rounded up."""
+        """The environment steps owed for `updates` updates: those owed where the rollout went on from, and
+        the steps of the updates since at its pace (`_paced_steps`), rounded as a run at that pace from
+        the start rounds them, so a resumed run takes the uninterrupted run's steps."""
+        assert self._paced is not None
+        since, owed = self._paced
+        return owed + self._paced_steps(updates) - self._paced_steps(since)
+
+    def _paced_steps(self, updates: int) -> int:
+        """The environment steps `updates` updates train on at the rollout's batch, length and train ratio,
+        rounded up."""
         return math.ceil(updates * self.batch * self.length / self.train_ratio)
 
     @contextlib.contextmanager
@@ -1067,13 +1087,13 @@ class DreamerRollout:
         that advance it, so the run's is copied aside first, at the replay's size again for the branch; a
         begun `Simulator` keeps its own environments (`DrivenSimulator.branch`)."""
         kept = (None if self._live is None else jax.tree.map(jnp.copy, self._live), self._taken,
-                self._prefilled, self._restored, self._ended)
+                self._prefilled, self._restored, self._paced, self._ended)
         driven = self._driven if self._live is not None else None
         try:
             with contextlib.nullcontext() if driven is None else driven.branch():
                 yield
         finally:
-            self._live, self._taken, self._prefilled, self._restored, self._ended = kept
+            self._live, self._taken, self._prefilled, self._restored, self._paced, self._ended = kept
 
     def sample(self, key: jax.Array) -> Batch:
         """`batch` windows of `length` steps drawn from the replay as an update draws them, fetched to the

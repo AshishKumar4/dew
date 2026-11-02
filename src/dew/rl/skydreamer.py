@@ -41,9 +41,11 @@ heading; the camera's extrinsics are fixed and the dynamics' parameters are left
 30 degrees, fixed as a real FPV quadrotor's camera is mounted (`Racing`'s; SkyDreamer's is 45 to 55), its
 horizontal field of view `fov`.
 
-Randomization is `ramp`'s, a race's curriculum from 0 (none) to 1, as `dew.rl.flight`'s: the drone's body
-and its rotors' noise (`dew.rl.quadrotor.drawn_body`, `flown`), its rate limit, the camera's image and the
-scene's looks (`dew.rl.flight.drawn_camera`), and the latency's spread, half its nominal either way at 1.
+Randomization is `ramp`'s, a race's curriculum from 0 (none) to 1, as `dew.rl.flight`'s, one level for
+every track or each track's own, so a curriculum may raise each track's as its own flights allow: the
+drone's body and its rotors' noise (`dew.rl.quadrotor.drawn_body`, `flown`), its rate limit, the camera's
+image and the scene's looks (`dew.rl.flight.drawn_camera`), and the latency's spread, half its nominal
+either way at 1.
 The world frame is x forward, y left, z up (`dew.rl.flight`'s).
 """
 
@@ -250,14 +252,15 @@ def roll_pitch(orientation: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 @struct.dataclass
 class SkyRace:
-    """One drone racing `sky`'s tracks as a `dew.rl.env.Env` at randomization `ramp` (the module docstring):
+    """One drone racing `sky`'s tracks as a `dew.rl.env.Env` at randomization `ramp` (the module docstring),
+    one level for every track or each of `sky.tracks`' own in turn, an episode flown at its track's:
     actions `[4]` in [-1, 1]; observations a dict of the `views` asked for, each but the image (`VIEWS`,
     which `SkyDreamerRace` adds). It cuts its own episodes (`Sky.steps`); a curriculum changes its `ramp`,
     its programs compiled again."""
 
     sky: Sky = struct.field(pytree_node=False, default_factory=Sky)
     views: tuple[str, ...] = struct.field(pytree_node=False, default=VIEWS[1:])
-    ramp: float = struct.field(pytree_node=False, default=0.0)
+    ramp: float | tuple[float, ...] = struct.field(pytree_node=False, default=0.0)
 
     action_size = 4
 
@@ -296,11 +299,17 @@ class SkyRace:
         return Scene(jnp.asarray(center)[lap.track], jnp.asarray(heading)[lap.track], count, jnp.asarray(-1),
                      jnp.zeros((OBSTACLES, 4)), lap.camera.look)
 
+    @property
+    def levels(self) -> np.ndarray:
+        """Each track's randomization, `[len(sky.tracks)]`, in `sky.tracks`' order."""
+        return np.broadcast_to(np.asarray(self.ramp, float), (len(self.sky.tracks),))
+
     def reset(self, key: jax.Array) -> tuple[Lap, TimeStep]:
-        """A start of Table III's (the module docstring) at the race's `ramp`."""
-        sky, racing, ramp = self.sky, self.sky.racing, jnp.asarray(self.ramp)
+        """A start of Table III's (the module docstring) at its track's level of the race's `ramp`."""
+        sky, racing = self.sky, self.sky.racing
         keys = iter(jax.random.split(key, 14))
         track = jax.random.randint(next(keys), (), 0, len(sky.tracks))
+        ramp = jnp.asarray(self.levels)[track]
         anywhere = jax.random.uniform(next(keys)) < sky.anywhere
         gates = jnp.asarray(sky.layout[3])[track]
         index = jnp.where(anywhere, jax.random.randint(next(keys), (), 0, gates), 0)
@@ -320,12 +329,15 @@ class SkyRace:
                                      angular_velocity=rates, measured=rates)
         rate_limit = racing.rate_limit * (1 + ramp * racing.rate_spread
                                           * jax.random.uniform(next(keys), (), minval=-1.0, maxval=1.0))
-        shortest, longest, held = sky.delays(self.ramp)
+        # Each track's latency range at its level, and the longest at any level, which every lap holds.
+        shortest, longest, held = np.asarray([sky.delays(float(level)) for level in self.levels]).T
         # Until its first command arrives, the drone holds its hover.
         hover = jnp.concatenate([(body.mass * GRAVITY)[None], jnp.zeros(3)])
         lap = Lap(body=body, flight=flight, camera=drawn_camera(racing, next(keys), ramp),
-                  rate_limit=rate_limit, delay=jax.random.randint(next(keys), (), shortest, longest + 1),
-                  pending=jnp.tile(hover, (held + 1, 1)), track=track, index=index,
+                  rate_limit=rate_limit,
+                  delay=jax.random.randint(next(keys), (), jnp.asarray(shortest)[track],
+                                           jnp.asarray(longest)[track] + 1),
+                  pending=jnp.tile(hover, (int(held[0]) + 1, 1)), track=track, index=index,
                   stage=jnp.zeros((), jnp.int32),
                   distance=jnp.linalg.norm(position - pre_gate(sky, track, index)),
                   passed=jnp.zeros((), jnp.int32), steps=jnp.zeros((), jnp.int32), key=next(keys))
@@ -340,7 +352,7 @@ class SkyRace:
         lap, collective, rates = commanded(sky.quadrotor, lap, action)
         key, noise = jax.random.split(lap.key)
         flight, _ = flown(sky.quadrotor, lap.body, lap.flight, collective, rates, noise, sky.hz,
-                          jnp.asarray(self.ramp))
+                          jnp.asarray(self.levels)[lap.track])
         after = flight.position
         track, index, stage, approaching = lap.track, lap.index, lap.stage, lap.stage == 0
         crossing, collided = jnp.ones((), bool), jnp.zeros((), bool)
@@ -384,12 +396,13 @@ class SkyRace:
 class SkyDreamerRace(Seen):
     """A batch of `renderer.count` drones racing `sky`'s tracks (`SkyRace`, stepped on device), seen through
     `renderer`'s cameras (`dew.rl.flight.Seen`), as a `dew.rl.simulator.Simulator`: observations a dict of
-    the `views` asked for (`VIEWS`), each `[B, ...]`. An episode starts at the race's `ramp`, which a race
-    starts at and which may change between steps. The renderer's gates must be the race's, and a renderer's
-    fisheye lens (`dew.rl.hyperlux.HyperLuxRenderer`) the cameras' field of view."""
+    the `views` asked for (`VIEWS`), each `[B, ...]`. An episode is flown at its track's level of the race's
+    `ramp` (`SkyRace`), which a race starts at and which may change between steps. The renderer's gates
+    must be the race's, and a renderer's fisheye lens (`dew.rl.hyperlux.HyperLuxRenderer`) the cameras'
+    field of view."""
 
     def __init__(self, renderer: Renderer | None, sky: Sky | None = None, views: tuple[str, ...] = VIEWS,
-                 count: int | None = None, ramp: float = 0.0):
+                 count: int | None = None, ramp: float | tuple[float, ...] = 0.0):
         from dew.rl.hyperlux import HyperLuxRenderer
 
         self.sky, self.ramp = (Sky() if sky is None else sky), ramp
@@ -404,7 +417,8 @@ class SkyDreamerRace(Seen):
         super().__init__(renderer, race, views, VIEWS, "a SkyDreamer race", count)
 
     def _env_now(self) -> SkyRace:
-        return dataclasses.replace(self._env, ramp=float(self.ramp))
+        # Held as plain floats: the race's programs are keyed on it.
+        return dataclasses.replace(self._env, ramp=tuple(float(level) for level in np.ravel(self.ramp)))
 
 
 __all__ = ["CIRCLE", "INVERTED_LOOP", "LADDER", "PLANES", "QUADCOPTER", "TRACKS", "VIEWS", "Gate", "Lap",
