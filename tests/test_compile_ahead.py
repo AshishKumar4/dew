@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import without_flag
 from model_support import TINY_DECODER
 from token_support import token_rows
 
@@ -106,8 +107,7 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     from dew.training.ahead import compile_only_gpus
     from dew.training.memory import deviceless_options
 
-    monkeypatch.setenv("XLA_FLAGS", " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                                             if not flag.startswith("--xla_gpu_autotune_level")))
+    monkeypatch.setenv("XLA_FLAGS", without_flag(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level"))
     deviceless = MeshSpec().build(compile_only_gpus("sm90", 1))
     assert deviceless_options(deviceless, None) == {"xla_gpu_autotune_level": 0}
     assert deviceless_options(deviceless, {"xla_gpu_enable_triton_gemm": False}) == {

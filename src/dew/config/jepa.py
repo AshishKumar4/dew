@@ -87,7 +87,9 @@ class JepaRunConfig(RunConfig):
         ramp = {}
         if "momentum_steps" not in self.objective.fields:
             updates = self.trainer.total_updates(dataset)
-            if updates is None and self.trainer.examples is None:
+            # Its data compiled bounded in examples, by `examples` or by epochs of a read that counts no
+            # records ahead (`Loader.examples`), the run reads its progress.
+            if updates is None and dataset.examples is None:
                 raise ValueError("a run bounded by tokens alone counts no updates ahead for the target "
                                  "encoder's momentum to ramp over; set --objective.momentum_steps")
             # A run bounded in examples that counts no updates ahead ramps it over its progress.
