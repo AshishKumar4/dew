@@ -242,6 +242,10 @@ class MixerBase:
     """Whether the module this kind builds takes a prediction depth's phase (`prediction_phase`, 'extend'
     or 'draft', `DecoderBlock._mix`): a k-pool's index shared across a depth's iterations
     (`CausalTransformer.index_share_for_mtp_iteration`) or a latent attention's."""
+    shares_prediction_index = False
+    """Whether the kind shares its sparse selection across a prediction depth's iterations under that
+    phase (`CausalTransformer.index_share_for_mtp_iteration`): the k-pool's, or a composed kind's through
+    one of its own."""
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's

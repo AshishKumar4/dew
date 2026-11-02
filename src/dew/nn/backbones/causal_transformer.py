@@ -61,7 +61,6 @@ from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
-from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
@@ -87,7 +86,6 @@ from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
-from ..mixers.parallel import ParallelMixer
 from ..mla import MLAMixer
 from ..ngpt import NGPT, gain
 from ..norms import RMSNorm
@@ -1066,13 +1064,9 @@ class CausalTransformer(nn.Module):
         # experts) and is dense otherwise.
         mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        # A parallel prediction mixer shares the index through its k-pool branch, which reads the phase.
-        held = (tuple(branch.mixer for branch in prediction_mixer.branches)
-                if isinstance(prediction_mixer, ParallelMixer) else (prediction_mixer,))
-        if (self.index_share_for_mtp_iteration
-                and not any(isinstance(mixer, KPoolSparseAttentionMixer) for mixer in held)):
-            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer, or a "
-                             "parallel one with a k-pool branch")
+        if self.index_share_for_mtp_iteration and not prediction_mixer.shares_prediction_index:
+            raise ValueError("index_share_for_mtp_iteration requires a prediction mixer that shares its "
+                             "index (`MixerBase.shares_prediction_index`): a k-pool, or a kind composing one")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths

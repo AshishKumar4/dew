@@ -8,6 +8,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping
 
+import jax
 from flax import linen as nn
 
 from dew.nn.backbones.decoder_block import ReadsMixing
@@ -15,7 +16,7 @@ from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import scaled
-from dew.nn.protocols import ProjectionGroup, ReadsTrain, Routes, RoutesExperts, declared_groups
+from dew.nn.protocols import ProjectionGroup, ReadsTrain, Routes, RoutesBySite, RoutesExperts, declared_groups
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,8 +39,8 @@ class ParallelMixers(nn.Module):
     in the branches' order (`ParallelMixer`). Every branch holds its own parameters, its own decode cache
     and its own routers under its name. A prediction depth's phase reaches the branches that read it
     (`MixerBase.reads_phase`), the rest running their ordinary call; a routing replay reaches the branches
-    that route (`RoutesExperts`), each its own record by its name, or the one routed branch a layer's
-    single record."""
+    that route (`RoutesExperts`), each its own sites' records by their paths below it (`routed_sites`,
+    `dew.nn.protocols.RoutesBySite`), or the one routed site a layer's single record."""
 
     branches: tuple[tuple[str, Callable[..., nn.Module], float, float, bool], ...]
     """Each branch's name, its mixer's factory, its input and output multipliers, and whether it reads a
@@ -62,11 +63,22 @@ class ParallelMixers(nn.Module):
         replay reaches it."""
         return bool(self._routed())
 
+    @property
+    def routed_sites(self) -> frozenset[str]:
+        """Its routed sites' paths below it: a routed branch's name, or a composed branch's sites below
+        its name (`dew.nn.protocols.RoutesBySite`)."""
+        return frozenset(site for name, sites in self._routed().items() for site in sites)
+
     @nn.nowrap
-    def _routed(self) -> frozenset[str]:
-        """The branches that route over experts, by name."""
-        return frozenset(name for name, factory, *_ in self.branches
-                         if isinstance(built := factory(parent=None), RoutesExperts) and built.routes_experts)
+    def _routed(self) -> dict[str, tuple[str, ...]]:
+        """The branches that route over experts, by name, each with its sites' paths below this mixer."""
+        routed = {}
+        for name, factory, *_ in self.branches:
+            built = factory(parent=None)
+            if isinstance(built, RoutesExperts) and built.routes_experts:
+                routed[name] = (tuple(f'{name}/{site}' for site in sorted(built.routed_sites))
+                                if isinstance(built, RoutesBySite) else (name,))
+        return routed
 
     @property
     def reads_train(self) -> bool:
@@ -89,22 +101,27 @@ class ParallelMixers(nn.Module):
 
     def __call__(self, x, call: MixerCall = PLAIN_CALL, *, train: bool = False,
                  prediction_phase: PredictionPhase = 'ordinary',
-                 routes: Routes | Mapping[str, Routes] | None = None):
+                 routes: Routes | tuple[Mapping[str, jax.Array], jax.Array | None] | None = None):
         routed = self._routed()
-        if routes is not None and not isinstance(routes, Mapping):
-            if len(routed) != 1:
-                raise ValueError(f"a layer's one routing record replays one routed site, and branches "
-                                 f"{sorted(routed)} route; key the record by branch name")
-            routes = {next(iter(routed)): routes}
-        if routes is not None and (missing := sorted(routed - set(routes))):
-            raise ValueError(f"the routing record names {sorted(routes)}, not the routed branches {missing}")
+        records, covered = (None, None) if routes is None else routes
+        if records is not None and not isinstance(records, Mapping):
+            # A layer's one record, for its one routed site.
+            sites = self.routed_sites
+            if len(sites) != 1:
+                raise ValueError(f"a layer's one routing record replays one routed site, and sites "
+                                 f"{sorted(sites)} route; key the record by site path")
+            records = {next(iter(sites)): records}
+        if records is not None and (missing := sorted(self.routed_sites - set(records))):
+            raise ValueError(f"the routing record names {sorted(records)}, not the routed sites {missing}")
         total = None
         for mixer, (name, _, into, out, phased) in zip(self.mixers, self.branches, strict=True):
             options = {
                 **({'train': train} if isinstance(mixer, ReadsTrain) and mixer.reads_train else {}),
                 **({'prediction_phase': prediction_phase} if phased and prediction_phase != 'ordinary'
                    else {}),
-                **({'routes': routes.get(name)} if routes is not None and name in routed else {})}
+                **({} if records is None or name not in routed else {'routes': (
+                    records[name] if routed[name] == (name,)
+                    else {site[len(name) + 1:]: records[site] for site in routed[name]}, covered)})}
             output = scaled(mixer(scaled(x, into), call, **options), out)
             total = output if total is None else total + output
         return total
@@ -129,6 +146,10 @@ class ParallelMixer(MixerBase):
     @property
     def reads_phase(self) -> bool:
         return any(branch.mixer.reads_phase for branch in self.branches)
+
+    @property
+    def shares_prediction_index(self) -> bool:
+        return any(branch.mixer.shares_prediction_index for branch in self.branches)
 
     @property
     def reads_depth(self) -> bool:

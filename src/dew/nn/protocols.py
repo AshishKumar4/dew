@@ -819,6 +819,16 @@ class RoutesExperts(Protocol):
 
 
 @runtime_checkable
+class RoutesBySite(Protocol):
+    """A token mixer composed of routed sites (a parallel layer's branches, `dew.nn.mixers.parallel`):
+    `routed_sites` are their paths below it, `/`-joined branch names, and its call takes `routes` as each
+    site's own record by its path (`dew.nn.inputs.LayerInputs.experts`) beside the coverage."""
+
+    @property
+    def routed_sites(self) -> frozenset[str]: ...
+
+
+@runtime_checkable
 class ProjectionSites(Protocol):
     """A bound module's packed groups, its own and its children's."""
 

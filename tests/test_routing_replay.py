@@ -22,7 +22,7 @@ from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.inputs import FEEDFORWARD_ROUTES
+from dew.nn.inputs import FEEDFORWARD_ROUTES, MIXER_ROUTES
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
@@ -133,33 +133,42 @@ def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
     np.testing.assert_array_equal(replayed, recorded)
 
 
-def parallel_routed(dtype=None) -> LMObjective:
-    """Every layer a parallel mixer (`dew.nn.mixers.parallel`) of attention beside a routed MLP (`experts`),
-    its feed-forward routed too: two routed sites a layer."""
+def parallel_routed(mixed: bool) -> LMObjective:
+    """Two layers routing at several sites: a parallel mixer (`dew.nn.mixers.parallel`) of attention beside
+    a routed MLP (`experts`) and a routed feed-forward on each, or, `mixed`, the first layer's mixer a
+    routed MLP of its own (Nemotron-H's slot) and the second the parallel one."""
     from dew.nn.mixers import AttentionMixer
     from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 
-    experts = MLPMixer(intermediate_size=32, mixture=Mixture(experts=EXPERTS, top_k=TOP_K))
+    def routed_mlp():
+        return MLPMixer(intermediate_size=32, mixture=Mixture(experts=EXPERTS, top_k=TOP_K))
+
+    parallel = ParallelMixer(branches=(ParallelBranch("attention", AttentionMixer(), 0.8, 0.6),
+                                       ParallelBranch("experts", routed_mlp(), 1.3, 0.7)))
+    layout = ({"layer_types": ("moe", "parallel"),
+               "kinds": {"moe": LayerKind(mixer=routed_mlp()), "parallel": LayerKind(mixer=parallel)}}
+              if mixed else {"mixer": parallel})
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1, mlp_features=64,
-        max_seq_len=SEQ_LEN, dtype=dtype, mixture=Mixture(experts=EXPERTS, top_k=TOP_K),
-        mixer=ParallelMixer(branches=(ParallelBranch("attention", AttentionMixer(), 0.8, 0.6),
-                                      ParallelBranch("experts", experts, 1.3, 0.7))))
+        max_seq_len=SEQ_LEN, mixture=Mixture(experts=EXPERTS, top_k=TOP_K), **layout)
     return LMObjective(model, SEQ_LEN)
 
 
 def site_choices(obj, params, tokens, routes=None) -> dict[str, np.ndarray]:
-    """Each routed site's sown choice, `[B, S, layers, top_k]`, keyed as a record keys it: the feed-forward
-    (`FEEDFORWARD_ROUTES`) and the parallel mixer's routed branch by its name."""
+    """Each routed site's sown choice, `[B, S, layers, top_k]`, keyed by its path as a record keys it
+    (`LayerInputs.experts`): the feed-forward, a mixer of one routed site, and a parallel mixer's routed
+    branch below the mixer; a layer without the site holds zeros there, as an engine's dense layers do."""
     sown = obj.token_scores(params, tokens, routing=True, routes=routes).routing
-    chosen = {FEEDFORWARD_ROUTES: {}, "experts": {}}
+    chosen: dict[str, dict[int, np.ndarray]] = {}
     for path, leaf in jax.tree_util.tree_leaves_with_path(sown):
         # A sown leaf sits in a tuple under its name; its dict keys name the site.
         keys = [entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)]
         if keys[-1] == "indices":
-            site = "experts" if "self_attn" in keys else FEEDFORWARD_ROUTES
-            chosen[site][int(keys[0].split("_")[1])] = np.asarray(leaf)
-    return {site: np.stack([layers[index] for index in sorted(layers)], axis=2)
+            site = (FEEDFORWARD_ROUTES if "self_attn" not in keys
+                    else f"{MIXER_ROUTES}/experts" if "experts" in keys else MIXER_ROUTES)
+            chosen.setdefault(site, {})[int(keys[0].split("_")[1])] = np.asarray(leaf)
+    shape = next(iter(next(iter(chosen.values())).values())).shape
+    return {site: np.stack([layers.get(index, np.zeros(shape, np.int32)) for index in range(2)], axis=2)
             for site, layers in chosen.items()}
 
 
@@ -169,20 +178,26 @@ def keyed_record(chosen: dict[str, np.ndarray], shift: int = 0) -> dict[str, np.
             for site, record in chosen.items()}
 
 
-def test_a_record_keyed_by_site_replays_each_routed_site_its_own():
-    """A layer that routes in a parallel mixer's branch and in its feed-forward replays a record keyed by
-    site: each router chooses its own entry's experts, one off its own choice on every token, and a
-    record of each site's own choice changes nothing, bit for bit. A single record, which names no site,
-    is refused there (ledger 3574)."""
-    obj = parallel_routed()
+@pytest.mark.parametrize("mixed", [False, True], ids=["parallel", "mixed-stack"])
+def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
+    """Layers that route in a parallel mixer's branch, in a mixer of their own and in their feed-forward
+    replay a record keyed by site path (`LayerInputs.experts`): each router chooses its own entry's
+    experts, one off its own choice on every token, and a record of each site's own choice changes
+    nothing, bit for bit. A single record, which names no site, is refused there (ledger 3574)."""
+    obj = parallel_routed(mixed)
     params = obj.init(jax.random.key(0))
     tokens = tokens_of(2)
     native = site_choices(obj, params, tokens)
+    assert sorted(native) == sorted([FEEDFORWARD_ROUTES, f"{MIXER_ROUTES}/experts",
+                                     *([MIXER_ROUTES] if mixed else [])])
     shifted = keyed_record(native, shift=1)
     replayed = site_choices(obj, params, tokens, routes=(shifted, None))
     for site, chosen in replayed.items():
-        assert np.all(chosen != native[site]), site
-        np.testing.assert_array_equal(chosen, shifted[site][:, :-1], err_msg=site)
+        # The layers holding the site: the first's mixer, the second's branch, both feed-forwards.
+        held = [index for index in range(2) if (site != MIXER_ROUTES or index == 0)
+                and (site != f"{MIXER_ROUTES}/experts" or not mixed or index == 1)]
+        assert np.all(chosen[:, :, held] != native[site][:, :, held]), site
+        np.testing.assert_array_equal(chosen[:, :, held], shifted[site][:, :-1, held], err_msg=site)
     np.testing.assert_array_equal(replayed_log_probs(obj, params, tokens, (keyed_record(native), None)),
                                   obj.per_token_log_probs(params, tokens))
     with pytest.raises(ValueError):

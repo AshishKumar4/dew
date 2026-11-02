@@ -332,6 +332,7 @@ class KPoolSparseAttentionMixer(MixerBase):
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
     reads_phase = True
+    shares_prediction_index = True
 
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512
