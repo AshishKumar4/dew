@@ -371,6 +371,22 @@ def test_the_smoothness_term_is_the_squared_change_of_the_imagined_means():
                                roundings=16)
 
 
+def test_a_recipes_run_trains_nothing_past_its_steps_and_scores_a_chunk_left_unscored_first():
+    """The recipe's run (`tools/skydreamer_race.py`) run again once it has taken its steps, or asked for fewer
+    than it took, trains no update; a chunk checkpointed before its score is restored and scored where it
+    stands; otherwise its next chunk ends at the update reaching the next judgement 100k steps on, at 8
+    environment steps an update with windows of 64 and 32 with the later phases' 256."""
+    from tool_support import load
+
+    tool = load("skydreamer_race")
+    warmup, longer = tool.PHASES[0], tool.PHASES[1]
+    for steps in (4_000_000, 1_000_000):
+        assert tool.chunk_end(300_000, 4_000_000, steps, 100_000, longer, pending=False) is None
+    assert tool.chunk_end(300_000, 4_000_000, 4_000_000, 100_000, longer, pending=True) == 300_000
+    assert tool.chunk_end(200_000, 1_602_048, 4_000_000, 100_000, warmup, pending=False) == 200_000 + 12_244
+    assert tool.chunk_end(200_000, 1_602_048, 4_000_000, 100_000, longer, pending=False) == 200_000 + 3_061
+
+
 @pytest.mark.parametrize("setting", ["BASE", "REALISM"])
 def test_a_recipes_run_reads_back_as_itself(setting):
     """The recipe's run in each setting (`tools/skydreamer_race.py`: the base check and the realism run)
