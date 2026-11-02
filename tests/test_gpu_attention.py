@@ -96,6 +96,9 @@ def test_the_attention_kernels_run_on_this_gpu():
     run_cells([
         sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
         sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
+        # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
+        # race, attention_triton_stages).
+        *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
         *(Cell(f"the Pallas-Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
@@ -203,8 +206,6 @@ def test_the_mosaic_template_holds_on_an_h100():
         *cells_of(inplace.a_routes_hooked_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
-        *cells_of(inplace.a_routes_hooked_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
-        *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
     ])
 
