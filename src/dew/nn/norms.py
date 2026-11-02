@@ -16,6 +16,7 @@ from flax.typing import Dtype
 
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, rms_statistics, rms_weighted, rounded_to
+from .sharding import LogicalAxes, declared
 
 
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
@@ -235,6 +236,8 @@ class RMSNorm(nn.Module):
     implementation: str = 'auto'
     activation: Callable[[jax.Array], jax.Array] | None = None
     groups: int = 1
+    scale_axes: LogicalAxes | None = None
+    """The scale's logical axes, as its owner declares them where it makes it; None declares none."""
 
     def __call__(self, x, *, axes=None):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
@@ -248,7 +251,7 @@ class RMSNorm(nn.Module):
         dtype = self.dtype if self.dtype is not None else x.dtype
         scale = self.param(
             'scale',
-            nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
+            declared(nn.initializers.zeros if self.scale_offset else nn.initializers.ones, self.scale_axes),
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         if self.groups == 1:
             return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
