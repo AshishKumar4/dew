@@ -10,6 +10,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - `ChunkAdaptation(carry="run")` keeps a continuum level's in-context steps across documents and updates: a
   row's documents step one level in turn, and each update carries its rows' mean step into the `carried`
   collection, which the run saves and resumes bit for bit. The per-document reset stays the default.
+- A chain of continuum levels (`CausalTransformer(continuum=(ContinuumLevel(...), ...))`), Nested Learning's
+  multi-frequency memory, steps each level in context at its own window and rate
+  (`ChunkAdaptation(window=(16, 64), rate=(1e-2, 2e-3))`), damped or not. A chain's levels live in
+  `continuum_0`, `continuum_1`, ...; a single level keeps `continuum`.
+- `ChunkAdaptation(layers=...)` steps a pretrained decoder's own feed-forward blocks in context, chunk by chunk
+  through its decode cache (`dew.objectives.lm.stacking`, section 7.3's ad-hoc level stacking), so continued
+  pre-training trains the blocks' starts through their steps.
+- `dew.eval.continual`: a continual run's accuracy matrix, forgetting and backward transfer, and a language
+  model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
+- An evaluation batch's device outputs come home through pinned host memory, in one transfer.
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
   curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and
