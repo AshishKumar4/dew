@@ -110,9 +110,9 @@ from dew.objectives.base import (
 from dew.objectives.lm.adaptation import (
     CARRIED,
     ChunkAdaptation,
-    adapted_scores,
     _carried_start,
     _carried_update,
+    adapted_scores,
 )
 from dew.objectives.lm.chunked import (
     final_read,

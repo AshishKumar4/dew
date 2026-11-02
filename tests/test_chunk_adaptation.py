@@ -19,7 +19,7 @@ from affine_run import Replaying, dataset
 from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
-from dew.nn.activations import HIDDEN_ACT, _SLOPES
+from dew.nn.activations import _SLOPES, HIDDEN_ACT
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
