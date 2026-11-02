@@ -1043,7 +1043,10 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     padded_q, padded_k = whole(max(queries, 1), query_block or block), whole(max(keys, 1), block)
     padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
     if table is not None and keys % block:
-        raise ValueError(f"a paged call's {keys} slots are no whole number of {block}-key blocks")
+        # A row's pages padded to whole blocks with page 0, whose slots no span of the call reaches.
+        if block % key.shape[2]:
+            raise ValueError(f"a paged call's pages of {key.shape[2]} keys pad to no whole {block}-key block")
+        table = jnp.pad(table, ((0, 0), (0, whole(keys, block) // key.shape[2] - table.shape[1])))
 
     def pad(array, rows, columns):
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))

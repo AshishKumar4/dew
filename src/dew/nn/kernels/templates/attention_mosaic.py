@@ -283,16 +283,16 @@ class MosaicForward(_Mainloop[Tiles]):
         (`guarded_tiles`), which the launch walks where the plain one overflowed."""
         if not super().legal(ba, config, target):
             return False
-        # A paged call's page whole key tiles of the launch's (and of its natural rewalk's), so no tile
-        # spans two pages (`_paged_views`), its table's slots whole blocks (`attention.padded_call`).
+        # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
+        # in them (`_pages_hold`).
+        query, value = ba.arguments["query"], ba.arguments["value"]
         tiles = (config.block_k, config.relaunch_k or config.block_k)
         page = _page(ba)
-        if page is not None and (any(page % tile for tile in tiles) or self.keys % _block(config)):
+        family = bundle_of(config, query.dtype)
+        if page is not None and not all(_pages_hold(page, tile, family) for tile in tiles):
             return False
-        query, value = ba.arguments["query"], ba.arguments["value"]
         if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(value.dtype):
             return True
-        family = bundle_of(config, query.dtype)
         columns = guarded_columns(family, value.shape[3], value.dtype)
         width = _width(query.shape[3], family, query.dtype)
         return guarded_tiles(family, config, columns, value.dtype, width) is not None
@@ -489,6 +489,16 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
     return max(resources.live_registers(family, carried, *phases, *products), scored) + rows
+
+
+def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
+    """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
+    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, each its own copy
+    into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where `family` streams
+    through rings."""
+    if page % tile == 0:
+        return True
+    return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
 
 
 def _page(ba: tokamax.BoundArguments) -> int | None:

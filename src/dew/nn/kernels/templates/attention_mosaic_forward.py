@@ -97,15 +97,15 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
 
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
-                         residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None
-                         ) -> tuple[list, dict]:
+                         residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
+                         pieces: int = 1) -> tuple[list, dict]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
     query stages and their rows' status; each one's output stage where the value is not as wide as the query
     and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
     is), a training forward's its split sums' fp32 (`_Residuals`); a training forward's or a peak walk's
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
-    peak walk's keys alone."""
+    peak walk's keys alone, each slot loaded in `pieces` copies (a paged call's tile of several pages)."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [plgpu.SMEM((consumers, block_q, width), dtype), plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
@@ -119,7 +119,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if not peaks:
         blocks["values"] = ((block_k, value_width), dtype)
     # The logits' product reads the keys transposed.
-    return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"))
+    return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"),
+                                  copies=dict.fromkeys(blocks, pieces))
 
 
 def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
@@ -190,8 +191,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
         table=table, inference=True)
-    # A paged call's table and its pools' page (`_launch`'s `table`).
-    paged = None if table is None else (table, key.shape[2])
+    # A paged call's table, its rows' pages whole blocks of the call's, and its pools' page (`_launch`'s
+    # `table`).
+    paged = None if call.table is None or call.page is None else (call.table, call.page)
 
     def whole_rows(live: jax.Array) -> jax.Array:
         # A split launch's row live in every slice where it is in any (`[B, H, S·Qp]`): the guarded launch's
@@ -753,12 +755,17 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
 
 
-def _paged_views(refs: dict, table, row, head, per_page: int) -> dict:
-    """A paged call's streams' views (`_views_of`): each pool `[KV, P·size, D]`'s `[P·size, D]` at key head
-    `head`, step `j` its key tile `j` where row `row`'s table maps it: `per_page` tiles a page, the tile's
-    page `table[row, j // per_page]` and its place in it `j % per_page`."""
+def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
+    """A paged call's streams' views (`_views_of`): each pool `[KV, P·page, D]`'s `[P·page, D]` at key head
+    `head`, step `j` its key tile `j` where row `row`'s table maps it: of a page of several tiles, the
+    tile's page `table[row, j // per]` and its place in it `j % per` (`per` tiles a page); of a tile of
+    several pages (`count` a tile), each page's rows from its own (`mosaic.Pieces`)."""
+    per, count = max(1, page // block_k), max(1, block_k // page)
+
     def tile(j):
-        return (table[row, lax.div(j, per_page)] * per_page + lax.rem(j, per_page), 0)
+        if count == 1:
+            return (table[row, lax.div(j, per)] * per + lax.rem(j, per), 0)
+        return mosaic.Pieces((table[row, j * count + piece], 0) for piece in range(count))
 
     return {name: (ref.at[head], tile) for name, ref in refs.items()}
 
@@ -843,8 +850,10 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
     reuse = value_width == width and out_dtype == query.dtype
+    # A paged call's key tile of several pages loaded a page at a time (`_paged_views`).
+    pieces = block_k // page if page is not None and page < block_k else 1
     scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
-                                         program.stages, peaks=peaks, out_dtype=out_dtype)
+                                         program.stages, peaks=peaks, out_dtype=out_dtype, pieces=pieces)
     arrays = len(scoped) - 2
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
@@ -856,7 +865,7 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         named = {"keys": k_ref} if peaks else {"keys": k_ref, "values": v_ref}
         views = (_views_of(named, row, lax.div(head, group)) if page is None
-                 else _paged_views(named, table_of, row, lax.div(head, group), page // block_k))
+                 else _paged_views(named, table_of, row, lax.div(head, group), page, block_k))
         if column_block is not None and "values" in views:
             # The values' tile at its block of the columns: a step's block index the column block's.
             ref, tile = views["values"]

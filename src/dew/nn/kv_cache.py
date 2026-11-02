@@ -659,18 +659,20 @@ are the gathered attention's, through the attention dispatch (`gpu_paged`), so n
 kernel nor forward mode limits it."""
 
 def _template_tiles(case: PagedCase) -> bool:
-    """Whether the attention template's decode holds whole key tiles in a page of `case`'s pool: its
-    Mosaic mainloop qualified on the GPU's family for the query's dtype (`attention_mosaic_program.bundle`)
-    and a page a whole number of that family's least key tile (`attention_mosaic_program.extents`)."""
-    from dew.nn.kernels.templates import attention_mosaic_program
+    """Whether the attention template's decode reads `case`'s pages: its Mosaic mainloop qualified on the
+    GPU's family for the query's dtype (`attention_mosaic_program.bundle`), and its key tiles whole in a
+    page or a page's keys whole in its tiles, one copy a page (`attention_mosaic._pages_hold` over the
+    family's key extents, `attention_mosaic_program.extents`)."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program
 
-    if backend() != "gpu":
+    if backend() != "gpu" or case.page_size is None:
         return False
     family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype)
-    if family is None or case.page_size is None:
+    if family is None:
         return False
-    least = attention_mosaic_program.extents(family, case.dtype, case.page_size)
-    return bool(least) and case.page_size % least[-1] == 0
+    # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
+    tiles = attention_mosaic_program.extents(family, case.dtype, family.copy_extent or case.page_size)
+    return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
 
 
 TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
@@ -685,7 +687,7 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
                 lambda case: f"the template's decode reads a 16-bit query over pages of its dtype, not "
                              f"{case.dtype} over {case.pool}", row='ledger 3624'),
     Requirement('tiles', _template_tiles,
-                lambda case: f"the attention template's decode holds no whole key tile in a page of "
+                lambda case: f"the attention template's decode reads no key tile of pages of "
                              f"{case.page_size} keys on this GPU", row='ledger 3648'),
     Requirement('head_shards', lambda case: case.kv_heads % case.head_shards == 0,
                 "a mesh splits the query heads past the pool's key heads, whose pages the kernel reads "

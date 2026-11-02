@@ -139,15 +139,18 @@ PAGE = 128
 
 
 @INTERPRETS
+@pytest.mark.parametrize("page", [PAGE, 16])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call):
+def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
-    tile, on par with the reference path over the cache gathered dense (check 1)."""
+    tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
+    and pages of 16 keys, the docs' (docs/concepts/inference.md), several to a key tile, each loaded on its
+    own (`mosaic.Pieces`, row 3648)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
-    per_row = KEYS // PAGE
-    table = jnp.asarray([[3, 0], [1, 2]], jnp.int32)[:, :per_row]
+    per_row = KEYS // page
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
 
     def gathered(pool):
         # [KV, P, page, D] at each row's pages: [B, K, KV, D].
@@ -164,10 +167,12 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call):
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 3)
         query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), jnp.bfloat16)
-        pools = (jax.random.normal(stream, (kv_heads, 4, PAGE, 64), jnp.bfloat16) for stream in streams[1:])
+        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 64), jnp.bfloat16)
+                 for stream in streams[1:])
         return query, *pools
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call}", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page}",
+                    seeds=SEEDS)
 
 
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
