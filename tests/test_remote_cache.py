@@ -72,8 +72,8 @@ def test_a_collection_that_runs_no_test_fetches_no_bundle(cache_worker, tmp_path
 
     def fetched(*options: str) -> list[str]:
         seen.clear()
-        done = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider",
-                               *options, str(site)], cwd=tmp_path, env=env, capture_output=True, text=True,
+        command = [sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider", *options]
+        done = subprocess.run([*command, str(site)], cwd=tmp_path, env=env, capture_output=True, text=True,
                               timeout=300)
         assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
         return [path for path in seen if "/bundles/" in path]
