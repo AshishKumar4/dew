@@ -294,6 +294,21 @@ def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(gen
 
 
 @pytest.mark.mesh(devices=8)
+def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_again(tmp_path):
+    """A file of programs compiled ahead whose programs are not executables of this Dew's (an `AheadPrograms`
+    saved before row 3670 made `Executable` its programs' one form) is refused as it loads, asking for them
+    compiled again (row 3671), never an AttributeError as it runs."""
+    import pickle
+
+    from dew.training.ahead import AheadPrograms, BuildTarget
+
+    target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
+    path = tmp_path / "old.dew-aot"
+    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())})))
+    with pytest.raises(ValueError, match="compile"):
+        AheadPrograms.load(path)
+
+
 def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
     """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
     refused, as XLA's CPU executable, loaded again, finds none of its fused functions."""
@@ -352,6 +367,47 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
     assert saved.capacity == 2**30 and saved.plan is not None
     assert not runs.exists()
+
+
+def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there(
+        tmp_path, monkeypatch):
+    """`--trainer.compile-ahead.multiprocessors` states the GPU a step is compiled ahead for within its
+    generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): the saved step's
+    build target and the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the
+    canonical one is refused; and the rung its plan recorded is that GPU's, apart from the canonical build's
+    beside it in one record directory."""
+    import dataclasses
+
+    from run_kinds import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.nn.kernels.generation import gpu_target
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    records = tmp_path / "rungs"
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
+
+    def compiled(*stated: str) -> AheadOfTime:
+        path = tmp_path / f"step{len(stated)}.dew-aot"
+        run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                               "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
+                               "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                               "--trainer.compile-ahead.capacity-gib", "0.0007",
+                               "--trainer.compile-ahead.frontier", *stated],
+                              default=lm(tmp_path, drawn=False))
+        with pytest.raises(CompiledAhead):
+            run.run()
+        return AheadOfTime.load(path)
+
+    pcie = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    canonical = compiled()
+    assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
+    assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
+    held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
+    assert pcie.derived_for(held) == pcie.target
+    with pytest.raises(ValueError):
+        pcie.derived_for(gpu_target("sm90"))
+    assert len(list(records.rglob("*.json"))) == 2
 
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
