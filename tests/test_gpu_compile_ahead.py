@@ -51,6 +51,18 @@ with executable_only():
 with open(sys.argv[3], "wb") as file:
     pickle.dump(results, file)
 """
+REFUSED = """
+import sys
+
+from dew.training.ahead import AheadPrograms
+
+try:
+    AheadPrograms.load(sys.argv[1]).loaded()
+except ValueError:
+    sys.exit(0)
+sys.exit("its programs loaded in a process whose XLA computes otherwise")
+"""
+"""A fresh process loading the programs at argv[1], which its loader must refuse."""
 TRAIN = """
 import sys
 
@@ -61,9 +73,18 @@ from token_support import token_rows
 from dew.training import MeshSpec
 from dew.training.ahead import AheadOfTime
 
-run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True)
-assert int(run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1).step) == 1
+refused = sys.argv[2] == "refused"
+try:
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True)
+    assert int(run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1).step) == 1
+except ValueError:
+    if not refused:
+        raise
+    sys.exit(0)
+if refused:
+    sys.exit("the step loaded in a process whose XLA computes otherwise")
 """
+"""A fresh process training from the step at argv[1], or, argv[2] "refused", one its loader must refuse."""
 COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 """An XLA flag that changes what a program computes, which a process loading programs compiled without it is
 refused for (`BuildTarget.held`)."""
@@ -89,7 +110,7 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     # A target is the device's own, whatever generation this process assumes.
     with assumed("sm80" if generation != "sm80" else "sm90"):
         assert BuildTarget.of(jax.devices()[:1]) == own
-    for name, text in (("build.py", BUILD), ("run.py", RUN)):
+    for name, text in (("build.py", BUILD), ("run.py", RUN), ("refused.py", REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
     # Built where no GPU is visible, as a CPU host builds them.
@@ -103,8 +124,8 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
            str(tmp_path / "arguments.pkl"), str(tmp_path / "outputs.pkl")]
     subprocess.run(run, env=dumps(tmp_path / "dumps", environment), check=True)
     assert compiled_in(tmp_path / "dumps") == []
-    refused = subprocess.run(run, env=computing_otherwise(environment), capture_output=True, text=True)
-    assert refused.returncode != 0 and COMPUTING in refused.stderr, refused.stderr[-2000:]
+    subprocess.run([sys.executable, str(tmp_path / "refused.py"), str(tmp_path / "programs.dew-aot")],
+                   env=computing_otherwise(environment), check=True)
     ahead = pickle.loads((tmp_path / "outputs.pkl").read_bytes())
     for name, (function, _) in programs(generation).items():
         with assumed(generation):
@@ -124,6 +145,5 @@ def test_a_step_compiled_ahead_for_this_gpu_trains_here_and_is_refused_where_xla
     (tmp_path / "train.py").write_text(TRAIN)
     environment = environment_of(tmp_path)
     train = [sys.executable, str(tmp_path / "train.py"), str(tmp_path / "step.dew-aot")]
-    subprocess.run(train, env=environment, check=True)
-    refused = subprocess.run(train, env=computing_otherwise(environment), capture_output=True, text=True)
-    assert refused.returncode != 0 and COMPUTING in refused.stderr, refused.stderr[-2000:]
+    subprocess.run([*train, "trained"], env=environment, check=True)
+    subprocess.run([*train, "refused"], env=computing_otherwise(environment), check=True)

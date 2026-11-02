@@ -233,8 +233,10 @@ def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_o
     spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     canonical = generation.gpu_target("sm90").multiprocessors
     if generation.device_target(jax.devices()[0]).multiprocessors != canonical:
-        with pytest.raises(AssertionError, match="does not run"):
-            spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
+        from dew.training.ahead import AheadOfTime, handed
+
+        with pytest.raises(ValueError), handed(AheadOfTime.load(step)):
+            pass
         return
     handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
     assert handed["step"] == 1 and handed["ahead"] is True
