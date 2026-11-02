@@ -2,13 +2,15 @@
 declarations), so no rule escapes and none drifts from its proof (docs/design/algebra.md §6.3):
 
 - a rewrite (`rewrite`, `birewrite`, a rule's `union`) is an identity over the reals: its two sides, each
-  term an array of SymPy symbols, equal exactly (SymPy's `simplify` of their difference zero), at every
+  term an array of SymPy symbols, equal exactly (SymPy's `simplify` of their difference zero, at each order
+  of the symbols a maximum or a minimum compares, `_ordered`), at every
   instantiation the rule's conditions admit over a universe of shapes (scalars, vectors, matrices, a batch
   of matrices) and parameters (plain, transposed and batched products, every broadcast of a lower rank),
   each side of one shape. Its conditions on dtypes (`plain`), on a scale's being a power of two
   (`exact_scale`) and on magnitudes (`log2_bound`, `reach`: bible §6's dominance rule) are rounding's,
-  which a real identity reads nothing of; a logarithm's operand is positive, its domain. A rule no
-  instantiation admits is vacuous, and fails;
+  which a real identity reads nothing of; a logarithm's operand is positive, its domain, as is a term a
+  condition asks be a positive scale (`positive_scale`). A rule no instantiation admits is vacuous, and
+  fails;
 - a magnitude a rule states for its new intermediate (`set log2_bound`) is at least the bound the magnitude
   table proves for it (`terms._bounded`, itself proven by tests/test_algebra_bounds.py) from its operands'
   stated powers;
@@ -213,6 +215,8 @@ class Evaluated:
                 raise Inadmissible("a reduction past its operand's rank")
             if monoid == "sum":
                 return np.sum(x, axis=tuple(axes))
+            if monoid in ("max", "min"):
+                return _extreme(x, axes, monoid, symbolic=self.symbolic)
             raise TypeError(monoid)
         if name == "select":
             predicate, false, true = values
@@ -256,6 +260,9 @@ class Evaluated:
             return values[0]
         if name == "unit":
             return np.shape(values[0]) == () and bool(np.asarray(values[0]) == 1)
+        if name == "positive_scale":
+            # Its witness is positive (`_instantiations`): a scalar of it the fact's own.
+            return np.shape(values[0]) == ()
         if name == "reads":
             return 1
         if name in ROUNDING_FACTS:
@@ -388,7 +395,7 @@ def _names(expr, found: list) -> None:
 CANDIDATES = {"dot": DOTS, "broadcast": BROADCASTS, "transpose": ({"permutation": (1, 0)},),
               "elementwise": ELEMENTWISE, "axes": ((0,), (1,), (2,)), "axis": (0, 1, 2),
               "binary name": ("add", "sub", "mul", "max", "min"), "compare name": ("lt", "eq"),
-              "unary name": ("exp", "neg", "tanh"), "reduce name": ("sum",),
+              "unary name": ("exp", "neg", "tanh"), "reduce name": ("sum", "max", "min"),
               "shaped name": ("broadcast_in_dim", "transpose"),
               "layout": (*BROADCASTS, {"permutation": (1, 0)})}
 
@@ -399,12 +406,14 @@ def _instantiations(matched, conditions, symbolic: bool):
     name, pattern = matched
     roles = _variables(pattern, {})
     roles.update(dict.fromkeys(_free(conditions, roles, name), "axis"))
-    units = _units(conditions)
+    units = _named(conditions, "unit")
+    positive = _named(conditions, "positive_scale") | POSITIVE
     term_names = sorted(n for n, role in roles.items() if role == "term" and n not in units)
     param_names = sorted(n for n, role in roles.items() if role != "term")
     for shapes in itertools.product(SHAPES, repeat=len(term_names)):
         for chosen in itertools.product(*(CANDIDATES[roles[n]] for n in param_names)):
-            arrays = {n: _operand(n, shape, symbolic) for n, shape in zip(term_names, shapes, strict=True)}
+            arrays = {n: _operand(n, shape, symbolic, positive=n in positive)
+                      for n, shape in zip(term_names, shapes, strict=True)}
             arrays.update({n: np.asarray(1 if symbolic else 1.0, dtype=object if symbolic else float)
                            for n in units})
             evaluated = Evaluated(arrays, dict(zip(param_names, chosen, strict=True)), symbolic)
@@ -417,25 +426,24 @@ def _instantiations(matched, conditions, symbolic: bool):
                 continue
 
 
-def _units(conditions) -> set[str]:
-    """The terms `conditions` ask be the literal 1 (`unit`)."""
+def _named(conditions, fact: str) -> set[str]:
+    """The terms `conditions` ask `fact` of (`unit`: be the literal 1; `positive_scale`: be past zero)."""
     found = set()
-    for fact in conditions:
-        inner = _inner(fact.typed_expr) if isinstance(fact, decl.ExprFactDecl) else None
+    for condition in conditions:
+        inner = _inner(condition.typed_expr) if isinstance(condition, decl.ExprFactDecl) else None
         named = getattr(inner.callable, "ident", None) if isinstance(inner, decl.CallDecl) else None
-        if named is not None and named.name == "unit":
+        if named is not None and named.name == fact:
             found.add(_inner(inner.args[0]).name)
     return found
 
 
-def _operand(name: str, shape: tuple, symbolic: bool):
-    """A term's value: an array of fresh real symbols, or of distinct floats (a fresh shape's check)."""
+def _operand(name: str, shape: tuple, symbolic: bool, *, positive: bool = False):
+    """A term's value: an array of fresh real symbols (positive ones where `positive`), or of distinct floats
+    (a fresh shape's check)."""
     count = math.prod(shape)
     if not symbolic:
         return np.arange(1.0, count + 1.0).reshape(shape) + 0.5
-    symbols = sympy.symbols(f"{name}_0:{count}", real=True) if count else ()
-    if name in POSITIVE:
-        symbols = sympy.symbols(f"{name}_0:{count}", positive=True) if count else ()
+    symbols = sympy.symbols(f"{name}_0:{count}", real=True, positive=positive or None) if count else ()
     return np.asarray(symbols, dtype=object).reshape(shape)
 
 
@@ -463,10 +471,40 @@ def test_every_rewrite_is_an_identity_over_the_reals(name, index, rule):
             other = evaluated.value(rhs)
             assert np.shape(other) == np.shape(value), f"{name}[{index}] changes {np.shape(value)}"
             difference = np.asarray(value - other, dtype=object).ravel()
-            assert all(sympy.simplify(sympy.expand(entry)) == 0 for entry in difference), (
+            assert all(sympy.simplify(sympy.expand(ordered)) == 0 for entry in difference
+                       for ordered in _ordered(sympy.sympify(entry))), (
                 f"{name}[{index}] differs: {difference[:2]}")
         proven += 1
     assert proven, f"{name}[{index}]: no instantiation over the universe admits it"
+
+
+def _extreme(x: np.ndarray, axes, monoid: str, *, symbolic: bool) -> np.ndarray:
+    """The maximum or minimum of `x` over `axes`, each axis folded in turn (SymPy's `Max`/`Min` over
+    symbols)."""
+    pick = {"max": (sympy.Max, np.maximum), "min": (sympy.Min, np.minimum)}[monoid][0 if symbolic else 1]
+    for axis in sorted(axes, reverse=True):
+        parts = np.moveaxis(x, axis, 0)
+        x = parts[0]
+        for part in parts[1:]:
+            x = np.vectorize(pick, otypes=[object])(x, part) if symbolic else pick(x, part)
+    return np.asarray(x, dtype=object if symbolic else float)
+
+
+def _ordered(expression):
+    """`expression` at each order of the symbols its maxima and minima compare: each a base and nonnegative
+    gaps above it, so SymPy decides every comparison of them (and of their positive multiples), ties among
+    them; `expression` alone where it holds none."""
+    compared = sorted({symbol for found in expression.atoms(sympy.Max, sympy.Min)
+                       for symbol in found.free_symbols if not symbol.is_positive}, key=str)
+    if not compared:
+        yield expression
+        return
+    base = sympy.Symbol("base", real=True)
+    gaps = sympy.symbols(f"gap_0:{len(compared)}", nonnegative=True)
+    for order in itertools.permutations(compared):
+        decided = expression.subs({symbol: base + sum(gaps[:place]) for place, symbol in enumerate(order)})
+        assert not decided.atoms(sympy.Max, sympy.Min), f"undecided by an order: {decided}"
+        yield decided
 
 
 def _set_name(action) -> str:
@@ -505,7 +543,8 @@ def _jax_value(expr, arrays: dict, params: dict, bound: dict, matched: tuple):
     if method == "dot":
         return lax.dot_general(value(args[0]), value(args[1]), param(args[2])["dimension_numbers"])
     if method == "reduce":
-        return jnp.sum(value(args[0]), axis=tuple(_axes(args[2], params, bound)))
+        reduced = {"sum": jnp.sum, "max": jnp.max, "min": jnp.min}[args[1].expr.value]
+        return reduced(value(args[0]), axis=tuple(_axes(args[2], params, bound)))
     if method == "shaped":
         kind, laid = args[1].expr.value, param(args[2])
         if kind == "transpose":
