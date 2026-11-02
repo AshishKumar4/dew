@@ -134,6 +134,34 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
                     draw, f"template decode of one slice a row {hook}", seeds=SEEDS)
 
 
+@INTERPRETS
+def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
+    """A serving step's work list over a cache of two rows: three batch rows, a decode row's one query and
+    two pieces of four prompt queries each, reading cache rows 1, 0 and 1 where they lie (`attend`'s
+    `sources`), each query over its own span (a piece's causal over its row's earlier keys, past its prefix):
+    on par with the reference path over the rows gathered (check 1)."""
+    sources = jnp.asarray([1, 0, 1], jnp.int32)
+    starts = jnp.zeros((3, 4), jnp.int32)
+    ends = jnp.asarray([[200, 0, 0, 0], [97, 98, 99, 100], [181, 182, 183, 184]], jnp.int32)
+    spans = template.KeySpans(starts, ends, None, None, keys=KEYS)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True, sources=sources)
+
+    def reference(query, key, value):
+        return template.reference(query, key[sources], value[sources], spans)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (3, 4, 8, 64), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (2, KEYS, 2, 64), jnp.bfloat16) for stream in streams[1:])
+        return query, key, value
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode over a work list's rows",
+                    seeds=SEEDS)
+
+
 PAGE = 128
 """A paged cache's keys a page: whole key tiles of the derived decode launch's."""
 

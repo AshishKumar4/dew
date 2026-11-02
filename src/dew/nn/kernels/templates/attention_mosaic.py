@@ -236,7 +236,7 @@ class MosaicForward(_Mainloop[Tiles]):
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, table=None, *, residuals: Kept, interpret: bool, config: Tiles,
+             drop=None, table=None, sources=None, *, residuals: Kept, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
                       self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
@@ -252,7 +252,7 @@ class MosaicForward(_Mainloop[Tiles]):
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                      table=table, **form), None
+                                      table=table, sources=sources, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -510,7 +510,8 @@ def _page(ba: tokamax.BoundArguments) -> int | None:
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
-            masked: bool = False, splits: int = 1, table: jax.Array | None = None) -> jax.Array:
+            masked: bool = False, splits: int = 1, table: jax.Array | None = None,
+            sources: jax.Array | None = None) -> jax.Array:
     ...
 
 
@@ -518,15 +519,15 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
-            out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
+            sources: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
-            table: jax.Array | None = None):
+            table: jax.Array | None = None, sources: jax.Array | None = None):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -538,10 +539,12 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
     family `generation.assumed` names; `out_dtype` the inference walk's output's (`MosaicForward.out_dtype`).
     A paged call's `key` and `value` are its pools `[Hk, P, page, D]` and `table` its page table `[B, pages
-    a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`.
+    a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`. With `sources`
+    `[B]` int32 (a call of rows of keys, inference), batch row `b` reads key row `sources[b]` of `key` and
+    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied.
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             out_dtype=out_dtype, masked=masked, splits=splits, table=table)
+                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -556,7 +559,8 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
-                  splits: int = 1, table: jax.Array | None = None) -> tuple[MosaicForward, tuple]:
+                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None
+                  ) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -572,7 +576,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
-                table)
+                table, sources)
 
 
 def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) -> resources.Scope:

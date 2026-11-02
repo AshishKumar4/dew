@@ -97,7 +97,8 @@ class Plan:
 
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
-         scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None) -> Plan:
+         scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
+         sources: jax.Array | None = None) -> Plan:
     """The work list of a packed call (`packed`) on `target`: the forward's derived config and its slices.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
     nothing). Else as many as its programs' residency fills (`resources.resident_programs`, its registers;
@@ -106,7 +107,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
     whole step took 13)."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
-                                              out_dtype=jnp.float32, masked=True, table=table)
+                                              out_dtype=jnp.float32, masked=True, table=table,
+                                              sources=sources)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
     if config is None:
@@ -163,9 +165,11 @@ def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | Non
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
-           scale: float | None = None, interpret: bool = False, table: jax.Array | None = None) -> jax.Array:
+           scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
+           sources: jax.Array | None = None) -> jax.Array:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
-    `value` `[B, K, KV, Dv]` (or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
+    `value` `[B, K, KV, Dv]` (`[R, K, KV, D]` with `sources`, batch row `b` reading key row `sources[b]`;
+    or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward in fp32 with its rows
@@ -182,20 +186,23 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
     walked = dataclasses.replace(hooks, initial=None)
     target = generation.gpu_target()
-    work = plan(rows, key, value, row_spans, walked, scale=scale, target=target, table=table)
+    work = plan(rows, key, value, row_spans, walked, scale=scale, target=target, table=table, sources=sources)
     if work.slices == 1:
         # One slice a row: its walk merges the initial state itself (`algebra.merge`) and finishes its rows in
         # the query's dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at
         # 4096 keys, ET-DECODE6-h100).
         whole = dataclasses.replace(hooks, initial=initial)
-        work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table)
+        work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table,
+                    sources=sources)
         with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
             out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
-                                           residuals=Kept.NONE, interpret=interpret, masked=True, table=table)
+                                           residuals=Kept.NONE, interpret=interpret, masked=True, table=table,
+                                           sources=sources)
         return unpacked(out, heads)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
-            interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table)[:3]
+            interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, table=table,
+            sources=sources)[:3]
     merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
     return unpacked(merged_rows, heads).astype(query.dtype)
