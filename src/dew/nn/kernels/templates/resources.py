@@ -184,29 +184,33 @@ def entry_registers(warpgroups: int, programs: int = 1) -> int:
     return min(255, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
+RAISE_CEILING = cost.THREAD_REGISTERS // cost.REGISTER_STEP * cost.REGISTER_STEP
+"""The most a consumer's registers are raised to: the largest of setmaxnreg's steps of 8 within the 255 a
+thread addresses (248), not the instruction's 256, which ptxas plans past those it can use: the 27B gated
+delta net's packed output launch, one consumer at one program, spilled a 64-bit address at a raise of 256 and
+none at any of 192 to 248 (FS-LT-OUTPUT-CAPS1, its PTX otherwise the same)."""
+
+
 def raised_registers(consumers: int, programs: int = 1) -> int:
     """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg),
     `programs` programs held by a multiprocessor at once: the program's launch pool at that residency less
-    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (one consumer's 256 at
-    one program and 232 at two; two consumers' 240 at one). The pool is what the program launches with
+    the producer's, shared among them in setmaxnreg's steps of 8 and at most `RAISE_CEILING` (one consumer's
+    248 at one program and 232 at two; two consumers' 240 at one). The pool is what the program launches with
     (`entry_registers`), which setmaxnreg moves between a program's warps and never past ("The total number
     of registers allocated to all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums
     302068): four consumers' 640 threads launch at 96 a thread, so they hold 104, where the multiprocessor's
     share would ask 112 and wait for registers no warp gives back."""
     pool = entry_registers(consumers + 1, programs) * (consumers + 1) * THREADS
     share = (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS)
-    return min(256, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
+    return min(RAISE_CEILING, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def consumer_registers(consumers: int, programs: int = 1) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
     multiprocessor: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
-    program's entry's otherwise; at most the 255 a thread addresses (`cost.THREAD_REGISTERS`), which a raise
-    to setmaxnreg's 256 does not pass: the 27B gated delta net's packed output launch, one consumer at one
-    program, kept a swizzle its model held at 256 registers and spilled 16 bytes."""
-    if RAISES_HONORED:
-        return min(raised_registers(consumers, programs), cost.THREAD_REGISTERS)
-    return min(entry_registers(consumers + 1, programs), cost.THREAD_REGISTERS)
+    program's entry's otherwise."""
+    return (raised_registers(consumers, programs) if RAISES_HONORED
+            else entry_registers(consumers + 1, programs))
 
 
 def producer_registers(consumers: int, programs: int = 1) -> int:
