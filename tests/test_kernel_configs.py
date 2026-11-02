@@ -665,7 +665,17 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+@pytest.fixture
+def libtpu_shared(monkeypatch):
+    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
+    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
+    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
+    lock file."""
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
+
+
 @COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
@@ -828,6 +838,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
 
 
 @COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
