@@ -410,7 +410,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
-    assert pcie.sampled is not None and again.plan == pcie.plan
+    assert pcie.sampled is not None and again.built == pcie.built
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
     assert pcie.derived_for(held) == pcie.target

@@ -5,6 +5,7 @@ import threading
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.telemetry.compiles import Compiles, ExecutableOnly, executable_only

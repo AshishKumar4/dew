@@ -132,13 +132,15 @@ def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = No
     `multiprocessors` a build states where it states them (`built_target`). `capacity` states bytes per device
     to XLA's scheduler and rematerialization pass, not only Dew's admission check; absent it, XLA's target
     states zero rather than a hardware capacity."""
-    return _compile_only_gpus(generation, count, capacity, multiprocessors)
+    stated = built_target(generation, multiprocessors).multiprocessors
+    return _compile_only_gpus(generation, count, capacity, stated)
 
 
 @functools.cache
 def _compile_only_gpus(generation: str, count: int, capacity: int | None,
                        multiprocessors: int | None) -> tuple:
-    """`compile_only_gpus`, one topology for each set of its arguments however a caller spells them."""
+    """`compile_only_gpus`, one topology for each GPU however a caller states it (the generation's own
+    multiprocessors as None or as their count)."""
     config = target_config(built_target(generation, multiprocessors), capacity)
     topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
                                             topology=f"1x1x{count}")
