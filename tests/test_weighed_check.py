@@ -58,6 +58,12 @@ def reference(a, b, big):
     return jnp.concatenate([amplified(a, big), a[:, 1:] * b[:, 1:]], axis=-1)
 
 
+def reformulated(a, b, big):
+    """The reference's own math reformulated: its amplified element cancelled the other way, its products'
+    operands swapped."""
+    return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
+
+
 def failed(dew, label: str, against=reference) -> GateFailure:
     """The failure check 1 decides `dew` against `against` with conditioning, never an Inconclusive."""
     with pytest.raises(GateFailure) as raised:
@@ -88,10 +94,7 @@ def test_a_fault_on_the_elements_a_program_computes_well_is_decided_weighed():
 def test_an_arm_as_exact_as_the_reference_passes_conditioned():
     """The reference's own math, the amplified element cancelled the other way and the products' operands
     swapped, passes as a weighed site is judged."""
-    def swapped(a, b, big):
-        return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
-
-    assert_as_exact(jax.jit(swapped), jax.jit(reference), draw,
+    assert_as_exact(jax.jit(reformulated), jax.jit(reference), draw,
                     "the products swapped, cancelled the other way", seeds=WEIGHED_SEEDS,
                     conditioning=CONDITIONED_SEEDS)
 
@@ -131,9 +134,6 @@ def test_the_weighed_check_passes_the_reference_against_its_reformulation():
     and it decides at least `WEIGHED_DECIDED` of them, so the control is never vacuous. The unweighted
     check's own verdicts are not asserted here: its worst-row rule decides some of these heavy-tailed runs
     falsely, the central gate's row 3684, whose own null judges it."""
-    def reformulated(a, b, big):
-        return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
-
     verdicts = null_runs(jax.jit(reference), draw, "the reference against its reformulation, weighed",
                          seeds=WEIGHED_SEEDS, runs=NULL_RUNS, dew_fn=jax.jit(reformulated), paired=True,
                          conditioning=CONDITIONED_SEEDS)
@@ -177,12 +177,13 @@ def test_a_programs_integer_output_has_no_scale_and_its_float_one_does():
 
 
 def test_a_bfloat16_program_is_weighed_at_its_own_rounding():
-    """A bfloat16 product's scale is bfloat16's rounding, 2^16 times float32's for the same values."""
+    """A bfloat16 product's scale is bfloat16's rounding: of the same values, bfloat16's own, each element's
+    exactly 2^16 times float32's (their unit roundoffs' ratio), the taps drawn alike."""
     a, b, _ = draw(0)
-    _, narrow = rounding_scale(lambda a, b: a * b, a.astype(jnp.bfloat16), b.astype(jnp.bfloat16))
-    _, wide = rounding_scale(lambda a, b: a * b, a, b)
-    ratio = np.median(np.asarray(narrow, np.float64) / np.asarray(wide, np.float64))
-    assert 2.0 ** 15 < ratio < 2.0 ** 17
+    narrow_a, narrow_b = a.astype(jnp.bfloat16), b.astype(jnp.bfloat16)
+    _, narrow = rounding_scale(lambda a, b: a * b, narrow_a, narrow_b)
+    _, wide = rounding_scale(lambda a, b: a * b, narrow_a.astype(jnp.float32), narrow_b.astype(jnp.float32))
+    np.testing.assert_array_equal(np.asarray(narrow, np.float64), np.asarray(wide, np.float64) * 2.0 ** 16)
 
 
 @pytest.mark.mesh(devices=2)
