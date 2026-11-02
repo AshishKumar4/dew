@@ -71,7 +71,10 @@ def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int) -> str
     held[tokens] = Reads(1, np.array([1 << position for position in range(length)], np.int64))
     walk = _Walk(length)
     consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
-    outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+    # The values it evaluates (indices, their tests) computed now, also where a trace encloses the walk
+    # (a program at a new length proven as it is traced, `torchax_fallback.TorchGraph.certify`).
+    with jax.ensure_compile_time_eval():
+        outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
     for output in outputs:
         if output is not None and _later(output, length):
             where = f"; first at {walk.first}" if walk.first else ""
