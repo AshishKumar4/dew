@@ -197,17 +197,14 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     else:
         dv, dbeta, dskip = _gate_back(run, call, dv2, gated, laid_do, skip)
         dk_w, after_w, decay_w = None, 0.0, 0.0
-    # Each token's decay's gradient, the launches' (`algebra.summed_ranges` is linear in its terms) and the
-    # memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from the
-    # chunk's start, every token's.
+    # Each token's decay's gradient from the launches' terms (`algebra.decay_gradient`, linear in them): the
+    # query/key launch's ranges, `after` from each token to the chunk's end and `leaving` from its start to
+    # before it, the keys launch's beside them, and the memory's decay across each chunk.
     memory = memory.reshape(-1, heads, chunks, call.block).sum((0, 3))
     ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
-    # The query/key launch's range terms each token's through them (`algebra.summed_ranges`):
-    # `after` from each token to the chunk's end, `leaving` from its start to before it.
     after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
-    ranges = algebra.summed_ranges(after + after_w, leaving)
-    dg = ((decay_pairs + decay_w).reshape(heads, chunks, CHUNK) + ranges
-          + (memory * jnp.exp2(ending))[..., None])
+    dg = algebra.decay_gradient((decay_pairs + decay_w).reshape(heads, chunks, CHUNK), after + after_w,
+                                leaving, memory, ending)
     dg, dbeta = dg.reshape(heads, rows).T, dbeta.T if delta else dbeta
 
     def headed(x, size):
