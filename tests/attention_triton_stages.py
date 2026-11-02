@@ -31,7 +31,10 @@ CALLS: dict[str, tuple] = {
 """Causal calls that reach the Pallas-Triton backward on an H100, by width, query and key heads, dtype,
 softcap, implementation and the mainloop named (`generation.chosen`): Gemma 2 9B's heads under its softcap at
 its default route (the Mosaic backward takes no hooked call 256 wide), Qwen3-8B's heads on the Triton mainloop
-named (FS-TRITON-RACE1-h100's call), and in fp32, which the Mosaic mainloop takes none of."""
+named (FS-TRITON-RACE1-h100's call), and in fp32, which the Mosaic mainloop takes none of. At main 6bb411dcbd
+the Triton mainloop's bf16 call failed (its dK 1.79 times the reference's error, a row 0.56 off,
+ET-P0RACE2-h100), and Gemma's and the fp32 call passed: they reach the launch, but their draws showed no
+race there."""
 
 
 def _step(name: str, implementation: AttentionImpl):
