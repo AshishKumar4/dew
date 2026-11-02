@@ -874,8 +874,10 @@ def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name)
 
     def dew(x, w, b):
         def loss(b):
-            out = template.gemm(x, w, sizes, epilogue=biased, epilogue_operands=((b, ("groups", "columns")),),
-                                out_dtype=jnp.float32, interpret_on_cpu=True)
+            # The groups axis reaches the hook as rows: each row's tile of its group's bias.
+            out = template.gemm(x, w, sizes, epilogue=biased_row,
+                                epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.float32,
+                                interpret_on_cpu=True)
             return jnp.sum(out[:ROUTED] ** 2), out
         (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
         return out[:ROUTED], grad
