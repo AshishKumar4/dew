@@ -42,7 +42,7 @@ from .scan_orders import (
     unscanned,
     zigzag_indices,
 )
-from .sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes
+from .sharding import RESIDUAL, LogicalAxes, constrain, declared
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
 
 # The rotary base every model here rotates with, RoFormer's.
@@ -176,7 +176,6 @@ class PatchEmbedding(nn.Module):
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
 
 
-@logical_axes({("ada_proj",): ("embed", "modulation")})
 class AdaLNParams(nn.Module):
     """The six adaLN-Zero modulation vectors of one block, `[B, 1, 6 * features]`,
     from the conditioning vector.
@@ -200,7 +199,6 @@ class AdaLNParams(nn.Module):
                           dtype=self.dtype, precision=self.precision, kernel_axes=("embed", "modulation"))
 
 
-@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
     """Patchify through `PatchEmbedding`, gather the tokens into
     raster/hilbert/zigzag order (`scan_ordered`) and add the 2D sincos signal.
@@ -240,7 +238,6 @@ class PatchSequenceEmbed(nn.Module):
         return tokens, inv_idx
 
 
-@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")})
 class ConditioningEmbed(nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
@@ -304,8 +301,6 @@ class ConditioningEmbed(nn.Module):
         return cond_emb
 
 
-@logical_axes({("final_ada_proj",): ("embed", "modulation"),
-               ("final_proj",): ("embed", "output")})
 class PatchSequenceOutput(nn.Module):
     """Final norm + zero-init fp32 head + unpatchify for any scan order and
     any (non-square included) patch grid."""

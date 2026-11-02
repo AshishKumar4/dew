@@ -52,7 +52,7 @@ from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .linear import DepthwiseConv1d, held_conv1d
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
-from .sharding import declared, logical_axes
+from .sharding import declared
 
 __all__ = ["Engram", "PLELayer", "compressed_token_map"]
 
@@ -319,13 +319,6 @@ class EngramHashes(nn.Module):
         return spec.hash_ids(ids, blocked, table[spec.pad_token_id])
 
 
-@logical_axes({
-    # The table's rows, 384M a layer at release size, shard as a
-    # vocabulary's do; the key weights are model-width rows per stream.
-    ("engram", "embed"): ("vocab", None),
-    ("engram",): (None, "embed"),
-    ("wkv",): (None, "embed"),
-})
 class EngramLayer(nn.Module):
     """One layer's lookup gated into the residual streams (model.py:328-365).
 

@@ -64,7 +64,7 @@ from dew.nn.rope import (
     rotate,
     yarn_query_scale,
 )
-from dew.nn.sharding import RESIDUAL, constrain, declared, down_projection, logical_axes
+from dew.nn.sharding import RESIDUAL, constrain, declared, down_projection
 from dew.nn.sparse_selection import (
     index_agreements,
     index_scores,
@@ -207,14 +207,6 @@ class IndexerFront:
         return self.weighed(index_agreements(query, keys, self.precision), hidden)
 
 
-@logical_axes({
-    ("wq_b",): ("qlora", "index"),
-    ("wk",): ("embed", "index"),
-    # The key norm is a LayerNorm, so scale and bias share the indexer width.
-    ("k_norm",): ("index",),
-    # Maps the hidden states onto one weight per indexer head.
-    ("weights_proj",): ("embed", "index"),
-})
 class SparseIndexer(IndexerFront, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
@@ -292,17 +284,6 @@ class SparseIndexer(IndexerFront, nn.Module):
         return top_k_selection(scores, keep, self.top_k)
 
 
-@logical_axes({
-    ("q_a_proj",): ("embed", "qlora"),
-    ("q_b_proj",): ("qlora", "attention"),
-    # The output concatenates the latent and the decoupled rope head, which
-    # ride into the cache together; the name picks the sharded side.
-    ("kv_a_proj_with_mqa",): ("embed", "kvlora"),
-    ("kv_b_proj",): ("kvlora", "attention"),
-    ("o_proj",): ("attention", "embed"),
-    ("q_a_layernorm",): ("qlora",),
-    ("kv_a_layernorm",): ("kvlora",),
-})
 class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 

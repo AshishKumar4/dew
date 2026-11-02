@@ -31,7 +31,7 @@ from .joined import joined_dense, joins
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
 from .protocols import ProjectionGroup
-from .sharding import MLP_HIDDEN, LogicalAxes, constrain, logical_axes
+from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
@@ -89,7 +89,6 @@ MLP_AXES: dict[str, LogicalAxes] = {
 them; a projection of another name (an ungated MLP's own `names`) declares none."""
 
 
-@logical_axes({(name,): axes for name, axes in MLP_AXES.items()})
 class GatedMLP(nn.Module):
     """Computes the gated feed-forward down_proj(act(gate_proj(x)) * up_proj(x)).
 

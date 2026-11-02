@@ -26,7 +26,7 @@ from dew.nn.moe import (
     renormalized_softmax,
 )
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import declared, logical_axes
+from dew.nn.sharding import declared
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -104,10 +104,6 @@ class GptOssExperts(nn.Module):
         return checkpoint_name(output + gather_expert_bias(down_bias, expert_ids, dtype), 'down_proj')
 
 
-@logical_axes({
-    ("router",): ("embed", "exp"),
-    **{("experts", name): axes for name, axes in FUSED_EXPERT_AXES.items()},
-})
 class GptOssMLP(nn.Module):
     """Softmax over the selected biased logits, then the selected expert sum.
 

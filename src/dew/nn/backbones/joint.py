@@ -27,7 +27,6 @@ from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, p
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.rope import rotate
-from dew.nn.sharding import logical_axes
 
 TIME_FEATURES = 256
 
@@ -127,12 +126,6 @@ def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *,
 # kernels keep that shape and shard their embedding side. The suffixes carry
 # the attention's own name: the scratch MM-DiT declares three-axis `to_q`
 # kernels of its own, and one path suffix holds one set of axes.
-@logical_axes({(module, name): axes for module in ("attn", "attn2")
-               for name, axes in (
-                   *(((name), ("embed", None)) for name in
-                     ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")),
-                   ("to_out_0", (None, "embed")),
-                   ("to_add_out", (None, "embed")))})
 class JointAttention(nn.Module):
     """Runs the source's `Attention` over an image stream and an optional context.
 

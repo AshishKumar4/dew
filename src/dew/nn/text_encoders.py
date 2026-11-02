@@ -54,7 +54,7 @@ from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import declared, logical_axes
+from dew.nn.sharding import declared
 from dew.nn.text_checkpoints import DEFAULT_MODEL
 from dew.registry import resolve_dtype
 
@@ -129,7 +129,6 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                         norm_bias=norm_bias, dtype=dtype, precision=precision, name=name)
 
 
-@logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
 class CLIPTextTransformer(nn.Module):
     """The text tower of CLIP, param layout and defaults of `CLIPTextConfig`.
 
@@ -274,7 +273,6 @@ class CLIPVisionTransformer(nn.Module):
         return CLIPTowerOutput(sequence, pooled)
 
 
-@logical_axes({("text_projection",): ("embed", "output"), ("visual_projection",): ("embed", "output")})
 class CLIP(nn.Module):
     """Both towers and their projection heads, `CLIPModel` in the reference.
 
@@ -591,7 +589,6 @@ whose tanh GELU (transformers' `NewGELUActivation`) gates wi_1 by wi_0, the
 feed-forward SD3.5 and Flux run."""
 
 
-@logical_axes({("embed_tokens",): ("vocab", "embed")})
 class T5EncoderTransformer(nn.Module):
     """The T5 encoder stack: token embedding, pre-norm blocks of
     bidirectional relative-bias attention and feed-forward, a final RMS norm,

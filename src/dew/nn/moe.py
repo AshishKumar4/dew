@@ -42,7 +42,7 @@ from .kernels import generation
 from .kernels.templates.gemm import template
 from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import declared, logical_axes
+from .sharding import declared
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -977,23 +977,6 @@ class ExpertMLP(nn.Module):
         return self._combine(slots, weights)
 
 
-@logical_axes({
-    ("gate",): ("embed", "exp"),
-    # A sparse layer's experts are stacked on one leaf, so the expert
-    # dimension is named here and the longer path wins over the dense
-    # projection of the same name.
-    **{("experts", name): axes for name, axes in EXPERT_AXES.items()},
-    # The shared branch is one dense gated MLP beside the experts, sharded
-    # like the dense layers' own.
-    ("shared_experts", "gate_proj"): ("embed", "mlp"),
-    ("shared_experts", "up_proj"): ("embed", "mlp"),
-    ("shared_experts", "down_proj"): ("mlp", "embed"),
-    ("shared_expert_gate",): ("embed", None),
-    # Kimi K3's latent projections around the routed experts: the experts
-    # themselves run at the latent width under the expert names above.
-    ("routed_expert_down_proj",): ("embed", None),
-    ("routed_expert_up_proj",): (None, "embed"),
-})
 class SparseMLP(nn.Module):
     """A router over `num_experts` MLPs, `top_k` of them per token.
 

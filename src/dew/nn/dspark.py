@@ -39,7 +39,6 @@ from .inputs import MixerCall
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .protocols import ProjectionGroup
-from .sharding import logical_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,10 +76,6 @@ class DSpark:
                              f"got {self.reads!r}")
 
 
-@logical_axes({
-    ("main_proj",): (None, "embed"),
-    ("confidence",): (None, None),
-})
 class DSparkStage(nn.Module):
     """One drafter stage: its decoder block, the context projection on the
     first, and the norm, Markov head and confidence head on the last.

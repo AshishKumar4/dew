@@ -13,7 +13,7 @@ from dew.nn.activations import gated_product
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP, geglu_feed_forward
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import declarations, declared_axes, parameter_path
+from dew.nn.sharding import boxed, boxed_axes, declared_axes, parameter_path, unboxed
 
 GEGLU_SEEDS = {"tanh float32": 128, "tanh bfloat16": 128, "erf float32": 128, "erf bfloat16": 128}
 """Check 1's declared seeds for each form, sized by `seeds_for` on armada."""
@@ -93,13 +93,14 @@ def test_a_unets_feed_forward_declares_its_kernels_axes():
     params = jax.eval_shape(lambda: model.init(
         jax.random.key(0), jnp.zeros((1, 8, 8, 4)), jnp.ones((1,)),
         conditioning=DenoisingCondition(jnp.zeros((1, 3, 768)))))["params"]
-    declared = declarations(params)
-    leaves = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(params)
+    leaves = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(params))
               if "ff" in parameter_path(path)]
     assert {parameter_path(path)[-2] for path, _ in leaves} == {"gate_up_proj", "down_proj"}
     expected = {"kernel": ("embed", "mlp"), "bias": ("mlp",)}
-    for path, leaf in leaves:
-        axes = declared_axes(path, len(leaf.shape), declared)
+    with boxed(boxed_axes(params)):
+        found = {path: declared_axes(path, len(leaf.shape)) for path, leaf in leaves}
+    for path, _ in leaves:
+        axes = found[path]
         names = parameter_path(path)
         assert axes is not None, names
         if names[-2] == "gate_up_proj":

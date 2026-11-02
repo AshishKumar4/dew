@@ -5,8 +5,8 @@ layers/attention2d.py (Apache 2.0): convolutional residual blocks, spatial
 multi-query attention through Dew's kernel seam, and a multiscale adapter.
 Inputs are processor-ready NCHW pixels, outputs row-major spatial tokens
 [batch, resolution**2, 2048]. A convolution kernel `[kh, kw, in, out]` names
-only its output side in `@logical_axes`, as `PatchSequenceEmbed` does, which
-the layout and Muon both read; its norm and bias take that width for free.
+only its output side where it is drawn (`_conv`), as `PatchSequenceEmbed`'s
+does, which the layout and Muon both read; its norm and bias name that width.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from .attention import scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .conv import Conv
 from .norms import RMSNorm
-from .sharding import declared, logical_axes
+from .sharding import declared
 
 
 def _divisible(channels: float) -> int:
@@ -150,21 +150,6 @@ _ARCHITECTURE = (
 # own channels are the model width, which is what the two names say. A
 # depthwise kernel holds one input channel per group, so its input side is
 # unnamed for the same reason the spatial dimensions are.
-@logical_axes({
-    ("conv_exp",): (None, None, None, "mlp"),
-    ("bn1",): ("mlp",),
-    ("conv_pwl",): (None, None, None, "embed"),
-    ("bn2",): ("embed",),
-    ("dw_start", "conv"): (None, None, None, "embed"),
-    ("dw_start", "bn"): ("embed",),
-    ("pw_exp", "conv"): (None, None, None, "mlp"),
-    ("pw_exp", "bn"): ("mlp",),
-    ("dw_mid", "conv"): (None, None, None, "mlp"),
-    ("dw_mid", "bn"): ("mlp",),
-    ("pw_proj", "conv"): (None, None, None, "embed"),
-    ("pw_proj", "bn"): ("embed",),
-    ("layer_scale",): ("embed",),
-})
 class MobileResidual(nn.Module):
     spec: _Block
     features: int
@@ -250,16 +235,6 @@ class MobileKVProjection(nn.Module):
 # declares elsewhere, so the projections are declared here under the role the
 # attention gives each one: the query holds every head, a multi-query key and
 # value hold one, and the output maps the head space back to the block width.
-@logical_axes({
-    ("query", "proj"): (None, None, None, "heads"),
-    ("key", "down_conv"): (None, None, None, "embed"),
-    ("key", "norm"): ("embed",),
-    ("key", "proj"): (None, None, None, "kv"),
-    ("value", "down_conv"): (None, None, None, "embed"),
-    ("value", "norm"): ("embed",),
-    ("value", "proj"): (None, None, None, "kv"),
-    ("output", "proj"): (None, None, None, "embed"),
-})
 class MobileMultiQueryAttention(nn.Module):
     spec: _Block
     features: int
@@ -397,11 +372,6 @@ class MobileNetV5:
 # The stem reads three image channels, which is no width worth naming, and the
 # adapter's own norm sits under the name this encoder gives it; its inverted
 # bottleneck is a `MobileResidual` and carries that class's declarations.
-@logical_axes({
-    ("conv_stem", "conv"): (None, None, None, "embed"),
-    ("conv_stem", "bn"): ("embed",),
-    ("msfa", "norm"): ("embed",),
-})
 class MobileNetV5Encoder(nn.Module):
     """The mobilenetv5_300m_enc graph, built as its `construction` says.
 

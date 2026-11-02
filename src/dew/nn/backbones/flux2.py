@@ -37,13 +37,11 @@ from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
-from dew.nn.sharding import logical_axes
 
 from .joint import (
     DoubleStreamBlock,
     TextStream,
     embedding,
-    embedding_axes,
     embedding_flops,
     guided_time,
     layer_norm,
@@ -67,7 +65,6 @@ def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:
     return positions
 
 
-@logical_axes({("to_qkv_mlp_proj",): ("embed", None), ("proj_fused",): (None, "embed")})
 class Flux2SingleBlock(nn.Module):
     """Runs one `Flux2SingleTransformerBlock` over the joined sequence.
 
@@ -125,8 +122,6 @@ class Flux2SingleBlock(nn.Module):
                                          kernel_axes=(None, "embed"), dot_general=float32_dot_general)(joined)
 
 
-@logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
-               ("proj_out",): ("embed", None), **embedding_axes("timestep_embedder", "guidance_embedder")})
 class Flux2Transformer(TextStream, nn.Module):
     """Runs Diffusers 0.40.0's `Flux2Transformer2DModel` behind Dew's model interface.
 

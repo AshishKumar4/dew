@@ -46,7 +46,7 @@ from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel
 from .linear import DepthwiseConv1d, RMSNormGated, held_scan, over_sequence, split_delta_rule
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
-from .sharding import LogicalAxes, logical_axes, sequence_shards
+from .sharding import LogicalAxes, sequence_shards
 
 KDA_AXES: dict[str, LogicalAxes] = {
     # The attention mixer's projections under its names (`ATTENTION_AXES`).
@@ -65,8 +65,6 @@ KDA_AXES: dict[str, LogicalAxes] = {
 """The logical axes of KDA's projections, by name, as it declares them where it makes them."""
 
 
-@logical_axes({(name,): axes for name, axes in KDA_AXES.items() if name not in ("q_proj", "k_proj", "v_proj",
-                                                                                  "o_proj")})
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
 

@@ -33,7 +33,7 @@ from dew.registry import from_record
 from .activations import activation
 from .conv import Conv
 from .norms import LayerNorm, RMSNorm
-from .sharding import logical_axes, unboxed
+from .sharding import unboxed
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
 
@@ -142,7 +142,6 @@ def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: P
                              dot_general=float32_dot_general)
 
 
-@logical_axes({("linear",): ("embed", "mlp")})
 class AudioLinear(nn.Module):
     """Gemma 4's clippable linear in the audio tower's layout: the `dense` map
     under `linear` and its bounds beside it, as the reference nests them

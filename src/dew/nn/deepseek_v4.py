@@ -66,7 +66,7 @@ from dew.nn.norms import RMSNorm, unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
 from dew.nn.scatter import gather_positions
-from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
+from dew.nn.sharding import RESIDUAL, constrain, down_projection
 from dew.nn.sparse_selection import (
     candidate_pool,
     index_agreements,
@@ -591,25 +591,6 @@ def _published(kv_store, name: str, layer: str):
     return kv_store[name]
 
 
-@logical_axes({
-    ("q_a_proj",): ("embed", "qlora"),
-    ("q_b_proj",): ("qlora", "attention"),
-    ("q_a_norm",): ("qlora",),
-    # One shared key/value head: nothing to shard on the output side.
-    ("kv_proj",): ("embed", None),
-    ("o_a_proj",): (None, "attention", None),
-    ("o_b_proj",): (None, "embed"),
-    # The compressors' projections are the entry width or twice it; the
-    # longer suffixes keep them off the dense feed-forward's rule.
-    ("compressor", "kv_proj"): ("embed", None),
-    ("compressor", "gate_proj"): ("embed", None),
-    ("indexer", "kv_proj"): ("embed", None),
-    ("indexer", "gate_proj"): ("embed", None),
-    ("indexer", "q_b_proj"): ("qlora", "index"),
-    ("indexer", "wq_b"): ("qlora", "index"),
-    ("indexer", "weights_proj"): ("embed", "index"),
-    ("scorer", "weights_proj"): ("embed", "index"),
-})
 class DeepseekV4Attention(FakeQuantizing):
     """One V4 attention layer, sliding or compressed (see the module doc).
 

@@ -41,7 +41,7 @@ from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.sharding import logical_axes, sequence_shards
+from dew.nn.sharding import sequence_shards
 
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
 """The recurrence's form: one log decay a head, no delta rule, no write gate, no scale."""
@@ -68,11 +68,6 @@ def lightning_slopes(heads: int) -> tuple[float, ...]:
     return tuple(slopes(heads))
 
 
-@logical_axes({
-    ("qkv_proj",): ("embed", "linear"),
-    ("output_gate",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class LightningAttention(nn.Module):
     """The token mixer of a MiniMax `linear_attention` layer. Parameter names are the release's:
     `qkv_proj` (each head's query, key and value side by side), `output_gate`, `norm/scale` over

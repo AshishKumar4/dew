@@ -72,7 +72,7 @@ from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.norms import unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, sequence_shards
+from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -159,10 +159,6 @@ class MambaRMSNormGated(nn.Module):
         return (scale.astype(dtype) * y.astype(dtype)).astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 

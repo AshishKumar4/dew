@@ -105,7 +105,7 @@ from ..precision import (
 from ..progress import Progress
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages
+from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
@@ -156,18 +156,6 @@ DECODER_AXES: dict[str, LogicalAxes] = {
 it makes them."""
 
 
-@logical_axes({
-    ("embed_tokens",): ("vocab", "embed"),
-    ("embed_positions",): (None, "embed"),
-    ("lm_head",): ("embed", "vocab"),
-    ("head_bias",): ("vocab",),
-    ("embed_tokens_per_layer",): ("vocab", None),
-    ("per_layer_model_projection",): ("embed", "mlp"),
-    # AltUp's copies enter and leave through embed-by-embed projections, one
-    # per copy past the first, named by their index like the layers; a
-    # square kernel takes the shape heuristic the way the other indexed
-    # projections do.
-})
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 

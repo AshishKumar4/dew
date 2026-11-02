@@ -44,10 +44,10 @@ from dew.nn.flops import (
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
-from dew.nn.sharding import LogicalAxes, logical_axes
+from dew.nn.sharding import LogicalAxes
 
 from ..mlp import GatedMLP
-from .joint import TIME_FEATURES, JointAttention, embedding, embedding_axes, embedding_flops, layer_norm
+from .joint import TIME_FEATURES, JointAttention, embedding, embedding_flops, layer_norm
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -173,10 +173,6 @@ class _Block(nn.Module):
         return x
 
 
-@logical_axes({("img_in",): (None, "embed"), ("proj_out",): ("embed", None),
-               ("modulation",): (None, "embed"), ("norm_out_linear",): (None, "embed"),
-               ("txt_in", "in_layer"): (None, "embed"), ("txt_in", "out_layer"): (None, "embed"),
-               **embedding_axes("timestep_embedder")})
 class QwenImageTransformer(nn.Module):
     """Runs `QwenImage21Transformer2DModel` behind Dew's model interface.
 

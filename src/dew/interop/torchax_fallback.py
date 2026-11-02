@@ -62,7 +62,7 @@ from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.protocols import Lacks, OutputTable
-from dew.nn.sharding import Suffix, parameter_path
+from dew.nn.sharding import parameter_path
 from dew.registry import resolve_dtype
 
 if TYPE_CHECKING:
@@ -760,11 +760,11 @@ class TorchLayout(Layout):
         """The logical axes `names` gives `name` at rank `ndim`, or None."""
         return next((axes for held, axes in self.names if held == name and len(axes) == ndim), None)
 
-    def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+    def _axes(self, path, ndim: int) -> LogicalAxes | None:
         """The axes the name table gives the leaf's torch name, else `Layout`'s."""
         names = parameter_path(path)
         axes = self.axes(names[-1], ndim) if names else None
-        return super()._axes(path, ndim, declared) if axes is None else axes
+        return super()._axes(path, ndim) if axes is None else axes
 
 
 @dataclass(frozen=True, eq=False)

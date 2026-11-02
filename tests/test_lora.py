@@ -45,7 +45,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
-from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path, unboxed
+from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, parameter_path, unboxed
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -474,22 +474,26 @@ def test_an_adapters_factors_take_their_kernels_axes_on_each_side_of_the_rank(lo
     factors took the module's two kernel axes as they stood, so `lora_B`'s rank was named the
     kernel's input and split over fsdp."""
     variables = loaded.variables
-    declared = declarations(variables)
+    # The adapted model draws each factor in the box its kernel's axes give it: the run's table.
+    table = boxed_axes(jax.eval_shape(loaded.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     factors = {"/".join(parameter_path(path)[-2:]): (path, leaf)
                for path, leaf in jax.tree_util.tree_leaves_with_path(variables)
                if parameter_path(path)[-1] in lora.FACTORS and "layers_0" in parameter_path(path)}
-    assert {name: declared_axes(path, leaf.ndim, declared) for name, (path, leaf) in factors.items()} == {
+    with boxed(table):
+        declared = {name: declared_axes(path, leaf.ndim) for name, (path, leaf) in factors.items()}
+    assert declared == {
         "q_proj/lora_A": ("embed", ADAPTER_RANK), "q_proj/lora_B": (ADAPTER_RANK, "heads"),
         "v_proj/lora_A": ("embed", ADAPTER_RANK), "v_proj/lora_B": (ADAPTER_RANK, "kv"),
         "down_proj/lora_A": ("mlp", ADAPTER_RANK), "down_proj/lora_B": (ADAPTER_RANK, "embed")}
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    placed = Layout(min_shard=1).shardings(mesh, variables)
+    with boxed(table):
+        placed = Layout(min_shard=1).shardings(mesh, variables)
+        muon = muon_weight_dimension_numbers(variables["params"])
     specs = {"/".join(parameter_path(path)[-2:]): sharding.spec
              for path, sharding in jax.tree_util.tree_leaves_with_path(placed)
              if "/".join(parameter_path(path)[-2:]) in factors and "layers_0" in parameter_path(path)}
     assert specs["q_proj/lora_A"][0] == specs["v_proj/lora_A"][0] == "fsdp", specs
     assert all(not spec or spec[0] is None for name, spec in specs.items() if name.endswith("lora_B")), specs
-    muon = muon_weight_dimension_numbers(variables["params"])
     for name, (path, _) in factors.items():
         numbers = muon
         for key in path[1:]:

@@ -23,7 +23,7 @@ from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .norms import LayerNorm, RMSNorm
 from .precision import float32_dot_general
 from .rope import rotate
-from .sharding import HEADS, KV_HEADS, constrain, logical_axes, split_positions
+from .sharding import HEADS, KV_HEADS, constrain, split_positions
 
 
 def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias: bool = True,
@@ -119,12 +119,6 @@ def kept_context(module: nn.Module, rows: int, length: int, shapes: tuple[tuple[
     return key, value
 
 
-@logical_axes({
-    ("to_q",): ("embed", "heads", "head_dim"),
-    ("to_k",): ("embed", "heads", "head_dim"),
-    ("to_v",): ("embed", "heads", "head_dim"),
-    ("to_out_0",): ("heads", "head_dim", "embed"),
-})
 class NormalAttention(nn.Module):
     """Attend over a `[B, S, C]` or `[B, H, W, C]` input with multiple heads.
 

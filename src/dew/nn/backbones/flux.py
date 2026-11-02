@@ -32,7 +32,6 @@ from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, pro
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
-from dew.nn.sharding import logical_axes
 
 from .joint import (
     TIME_FEATURES,
@@ -40,7 +39,6 @@ from .joint import (
     JointAttention,
     TextStream,
     embedding,
-    embedding_axes,
     embedding_flops,
     guided_time,
     layer_norm,
@@ -63,7 +61,6 @@ def flux_positions(rows: int, columns: int, text: int) -> np.ndarray:
     return positions
 
 
-@logical_axes({("proj_mlp",): ("embed", "mlp"), ("proj_fused",): (None, "embed")})
 class FluxSingleBlock(nn.Module):
     """Runs one single-stream block: attention and a feed-forward over the joined sequence.
 
@@ -116,9 +113,6 @@ class FluxSingleBlock(nn.Module):
                                          kernel_axes=(None, "embed"), dot_general=float32_dot_general)(joined)
 
 
-@logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
-               ("proj_out",): ("embed", None),
-               **embedding_axes("timestep_embedder", "guidance_embedder", "text_embedder")})
 class FluxTransformer(TextStream, nn.Module):
     """Runs Diffusers 0.34.0's `FluxTransformer2DModel` behind Dew's model interface.
 

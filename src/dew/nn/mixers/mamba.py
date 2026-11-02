@@ -48,7 +48,7 @@ from dew.nn.kernels import recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, rows_like, sequence_shards
+from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
@@ -96,10 +96,6 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     return out.astype(dtype), final.astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba(nn.Module):
     """The token mixer of a Mamba layer, `MambaMixer` (modeling_mamba.py:285-482).
 

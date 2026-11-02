@@ -65,7 +65,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
-from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared, logical_axes
+from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
@@ -269,21 +269,6 @@ ATTENTION_AXES: dict[str, LogicalAxes] = {
 where it makes them; a packed projection (`qkv_proj`) declares none."""
 
 
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    # The output gate's own projection (`gate_projection='own'`) is per head
-    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
-    ("self_attn", "gate_proj"): ("embed", "heads"),
-    ("o_proj",): ("attention", "embed"),
-    # DEX's projections of a chosen subset of heads, which no head split divides, its lambda, and the
-    # heads and lambda_init it holds: whole on every device (`dew.nn.dex`).
-    ("dex_projection",): (None, None, None),
-    ("dex_lambda",): (),
-    ("dex_heads",): (None,),
-    ("dex_lambda_init",): (),
-})
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.

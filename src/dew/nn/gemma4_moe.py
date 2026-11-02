@@ -24,10 +24,9 @@ from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.protocols import Routes
-from dew.nn.sharding import declared, logical_axes
+from dew.nn.sharding import declared
 
 
-@logical_axes({("proj",): ("embed", "exp")})
 class Gemma4TextRouter(nn.Module):
     """Which experts a token takes and with what weight, `[..., k]` of each."""
 

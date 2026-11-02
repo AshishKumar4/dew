@@ -40,7 +40,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.scatter import gather_positions
-from dew.nn.sharding import declared, logical_axes
+from dew.nn.sharding import declared
 from dew.nn.text_encoders import clip_layer
 
 if TYPE_CHECKING:
@@ -233,8 +233,6 @@ def _gather(x, index):
     return gather_positions(x, index)
 
 
-@logical_axes({("patch_embed",): (None, None, None, "embed"),
-               ("position_table",): (None, None, "embed")})
 class VisionTransformer(nn.Module):
     """A family's trunk (`ViTLayout`): patches mapped and placed, the blocks, and the trunk sequence
     in merge-block order.

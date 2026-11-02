@@ -70,7 +70,6 @@ from .sharding import (
     automatic_axes,
     constrain,
     grouped_heads,
-    logical_axes,
     manual_map,
     rows_like,
     seen_whole,
@@ -642,7 +641,6 @@ GATED_DELTA_AXES: dict[str, LogicalAxes] = {
 """The logical axes of Gated DeltaNet's projections, by name, as it declares them where it makes them."""
 
 
-@logical_axes({(name,): axes for name, axes in GATED_DELTA_AXES.items()})
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
 

@@ -34,7 +34,6 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
-from dew.nn.sharding import logical_axes
 
 from ..mlp import GatedMLP
 from .joint import JointAttention, layer_norm
@@ -133,9 +132,6 @@ class ZImageBlock(nn.Module):
         )
 
 
-@logical_axes({("x_embedder",): (None, "embed"), ("cap_embedder",): (None, "embed"),
-               ("final_linear",): ("embed", None), ("final_modulation",): (None, "embed"),
-               ("t_embedder_1",): (None, "mlp"), ("t_embedder_2",): ("mlp", None)})
 class ZImageTransformer(nn.Module):
     """Runs Diffusers 0.40.0's `ZImageTransformer2DModel` behind Dew's model interface.
 

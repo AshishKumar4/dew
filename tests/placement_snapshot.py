@@ -22,7 +22,7 @@ from tiny_models import DECODERS, build_model, tiny_inputs
 from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes, ruled_boxes
+from dew.nn.sharding import boxed, boxed_axes, declared_axes, ruled_boxes, unboxed
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers, models
 from dew.training import Trainer
@@ -148,10 +148,9 @@ def _axes(variables, table=None) -> dict[str, tuple]:
     """Each leaf's declared logical axes, as the layout reads them, by its key path: those `variables`
     box, or the run's `table` (`Objective.parameter_axes`) for a state that mirrors them."""
     rules = Layout().axis_rules
-    declared = declarations(variables)
     with boxed(ruled_boxes(boxed_axes(variables) if table is None else table, rules)):
-        return {jax.tree_util.keystr(path): declared_axes(path, leaf.ndim, declared)
-                for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(variables))}
+        return {jax.tree_util.keystr(path): declared_axes(path, leaf.ndim)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(variables))}
 
 
 def _lines(name: str, tree, placement, table=None) -> list[str]:

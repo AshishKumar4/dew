@@ -46,7 +46,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
-from ..sharding import RESIDUAL, constrain, logical_axes
+from ..sharding import RESIDUAL, constrain
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
@@ -529,13 +529,6 @@ def remat_record(remat: RematPolicy | None) -> JSON:
             else {'save': list(remat.save), 'offload': list(remat.offload)})
 
 
-@logical_axes({
-    ("per_layer_input_gate",): ("embed", "mlp"),
-    ("per_layer_projection",): ("mlp", "embed"),
-    # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
-    ("attn_alpha",): ("embed",),
-    ("mlp_alpha",): ("embed",),
-})
 class _Plain(NamedTuple):
     """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
     predictions of every copy when the block runs AltUp."""
@@ -1231,13 +1224,6 @@ class DecoderBlock(nn.Module):
         return self.post_per_layer_input_norm(projected)
 
 
-@logical_axes({
-    # The input is two embed-width vectors concatenated, which no single name
-    # describes and the rules must not split twice; the output side shards.
-    ("eh_proj",): (None, "embed"),
-    ("e_proj",): (None, "embed"),
-    ("h_proj",): (None, "embed"),
-})
 class MTPBlock(nn.Module):
     """Computes one multi-token-prediction depth: the hidden states of the next depth.
 

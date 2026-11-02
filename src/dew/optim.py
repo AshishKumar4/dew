@@ -52,7 +52,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import boxed, declarations, declared_axes, parameter_path
+from dew.nn.sharding import boxed, declared_axes, parameter_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -181,20 +181,19 @@ def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonD
     path. A matrix's declared sides are read first, so a projection of one head, `[embed, 1, head_dim]`,
     is the matrix its declaration names; only a parameter no declaration makes a matrix is read as a
     per-channel filter by its shape."""
-    declared = declarations(params)
     leaves = jax.tree_util.tree_leaves_with_path(params)
     decaying = jax.tree_util.tree_leaves(weight_decay_mask(params))
     placed = {}
     for (path, param), decays in zip(leaves, decaying, strict=True):
-        placed[path] = _placement(path, param, decays, declared)
+        placed[path] = _placement(path, param, decays)
     return placed
 
 
-def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
-               declared) -> tuple[optax.contrib.MuonDimensionNumbers | None, str]:
+def _placement(path: jax.tree_util.KeyPath, param,
+               decays: bool) -> tuple[optax.contrib.MuonDimensionNumbers | None, str]:
     if not decays:
         return None, "adamw: a bias or of rank below two"
-    axes = declared_axes(path, param.ndim, declared)
+    axes = declared_axes(path, param.ndim)
     # A declaration that names no axis says how the parameter shards (whole, on every device),
     # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
     named = None if axes is None or all(axis is None for axis in axes) else axes
@@ -214,7 +213,8 @@ def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
     if param.ndim > 2:
         raise ValueError(
             f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no declared logical axes, so Muon "
-            "cannot tell which of its axes form the matrix. Declare it with @logical_axes on its module.")
+            "cannot tell which of its axes form the matrix. Declare its axes where its module draws it "
+            "(nn.with_logical_partitioning, dew.nn.sharding.declared).")
     return optax.contrib.MuonDimensionNumbers(), "muon"
 
 

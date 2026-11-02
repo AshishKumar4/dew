@@ -21,7 +21,6 @@ from dew.nn.activations import activation
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import logical_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,10 +37,6 @@ class ContinuumLevel:
         activation(self.activation)
 
 
-@logical_axes({
-    ("continuum", "down"): ("embed", "mlp"),
-    ("continuum", "up"): ("mlp", "embed"),
-})
 class Continuum(nn.Module):
     """The level `ContinuumLevel` describes over `[..., features]` states: `x + up(act(down(x)))`,
     `up` zero at its start."""

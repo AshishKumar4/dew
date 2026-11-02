@@ -38,16 +38,7 @@ from dew.mesh import (
     logical_spec,
     mesh_axes,
 )
-from dew.nn.sharding import (
-    Suffix,
-    boxed,
-    boxed_axes,
-    current_boxes,
-    declarations,
-    declared_axes,
-    ruled_boxes,
-    unboxed,
-)
+from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, ruled_boxes, unboxed
 from dew.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: diloco holds DiLoCo's replica
@@ -529,10 +520,9 @@ class Layout:
         self._refuse_unknown(mesh)
         sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
         explicit = set(explicit_axes(mesh))
-        declared = declarations(tree)
 
         def leaf_sharding(path, value):
-            axes = self._axes(path, value.ndim, declared)
+            axes = self._axes(path, value.ndim)
             size = int(np.prod(value.shape, dtype=np.int64))
             if axes is None:
                 spec = state_spec(lambda placed: parameter_spec(
@@ -563,17 +553,17 @@ class Layout:
         modules declared, as the rules place them."""
         return boxed(ruled_boxes({**current_boxes(), **boxed_axes(tree)}, self.axis_rules))
 
-    def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
+    def _axes(self, path, ndim: int) -> LogicalAxes | None:
         """The logical axes of the leaf at `path`: those its module declared, or None for the shape
         heuristic. Placement, its minimum size, `frozen_whole` and its checks follow from them. A layout
         that names axes otherwise overrides it (torchax's `TorchLayout`, by a module's torch names)."""
-        return declared_axes(path, ndim, declared)
+        return declared_axes(path, ndim)
 
-    def _splitting(self, path, value, declared: Mapping[Suffix, LogicalAxes]) -> set[str]:
+    def _splitting(self, path, value) -> set[str]:
         """The parameter axes the rules could split the leaf at `path` over:
         those its declared names' rules name, or fsdp, which the shape
         heuristic splits an undeclared leaf over."""
-        axes = self._axes(path, value.ndim, declared)
+        axes = self._axes(path, value.ndim)
         if axes is None:
             return {FSDP_AXIS}
         return set(parameter_axes(axis for name, assignment in self.axis_rules if name in axes
@@ -659,9 +649,8 @@ class Layout:
 
         path_leaves, _ = jax.tree_util.tree_flatten_with_path(unboxed(params))
         splits = {axis for axis in parameter_axes(mesh.axis_names) if mesh.shape[axis] > 1}
-        declared = declarations(params)
         with self._declared(params):
-            splittable = [bool(self._splitting(path, param, declared) & splits)
+            splittable = [bool(self._splitting(path, param) & splits)
                           for path, param in path_leaves]
         shardable_elements = 0
         replicated = []
@@ -768,12 +757,11 @@ class Layout:
         a rule places too, which `shardings` leaves to the shape heuristic (`ruled_boxes`)."""
         named = {name for name, _ in self.axis_rules}
         found: dict[str, list[str]] = collections.defaultdict(list)
-        declared = declarations(state)
         with boxed({**current_boxes(), **boxed_axes(state)}):
             for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
                 if _within_variables(path) is None:
                     continue
-                for name in self._axes(path, leaf.ndim, declared) or ():
+                for name in self._axes(path, leaf.ndim) or ():
                     if name is not None and name not in named:
                         found[name].append(_variable_path(path))
         return {name: tuple(paths) for name, paths in found.items()}

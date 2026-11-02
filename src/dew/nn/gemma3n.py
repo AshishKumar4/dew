@@ -28,7 +28,7 @@ from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, sqrt_or_zero
-from dew.nn.sharding import declared, logical_axes
+from dew.nn.sharding import declared
 
 # The reference floors the magnitude a projected copy is rescaled by
 # (modeling_gemma3n.py, Gemma3nTextModel.forward, `epsilon_tensor`).
@@ -75,10 +75,6 @@ def rescale_to(x, target):
     return x * target_magnitude / magnitude
 
 
-@logical_axes({
-    ("linear_left",): ("embed", "mlp"),
-    ("linear_right",): ("mlp", "embed"),
-})
 class LaurelBlock(nn.Module):
     """Computes Gemma 3n's learned augmented residual (LAuReL).
 
@@ -159,13 +155,6 @@ def clamped_predictions(params, clip: float):
     return clamped(params, None)
 
 
-@logical_axes({
-    ("modality_router",): ("embed", None),
-    # A handful of coefficients per token: num_inputs squared at most, which
-    # no mesh axis should split.
-    ("correction_coefs",): (None, None),
-    ("prediction_coefs",): (None, None),
-})
 class AltUpLayer(nn.Module):
     """Runs one layer's AltUp: `predict` before the block and `correct` after it.
 
