@@ -58,6 +58,12 @@ SUMMED = frozenset({"dot_general", "ragged_dot_general", "conv_general_dilated",
                     "scatter-add"})
 """Sums of terms, bounded by their terms' magnitudes (`_weight`)."""
 
+SCATTERS = {"scatter": jax.lax.scatter, "scatter-add": jax.lax.scatter_add,
+            "scatter-mul": jax.lax.scatter_mul, "scatter-min": jax.lax.scatter_min,
+            "scatter-max": jax.lax.scatter_max}
+"""The scatters by primitive, each of whose equations holds its combining computation in its operands' dtype,
+which a float64 evaluation of a float32 program builds again (`TapRule.primitive`)."""
+
 DRAWS = 8
 """The tap draws a rounding scale averages (`rounding_scale`): over 8 draws its root mean square is at least
 0.41 of its expectation in 995 of 1000 elements (a chi-square of 8 degrees of freedom's 0.005 quantile is
@@ -90,6 +96,12 @@ class TapRule:
         if name == "reduce_precision":
             # The float64 evaluation keeps its value, the rounding it is weighed.
             outputs = list(operands)
+        elif name in SCATTERS:
+            # A scatter's combining computation is traced for its dtype: built again for the widened one.
+            operand, indices, updates = operands
+            outputs = [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
+                                      indices_are_sorted=params["indices_are_sorted"],
+                                      unique_indices=params["unique_indices"], mode=params["mode"])]
         else:
             outputs = equation.primitive.bind(*operands, **equation.primitive.get_bind_params(params))
             outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
