@@ -68,7 +68,7 @@ class ChunkAdaptation:
     of a half (ledger 1714).
     An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused,
     as are a step of a kernel its product rounds and a step of `down` through an `up` that rounds its
-    input or kernel (`Continuum._step_terms`), the loss piecewise constant in what steps.
+    input or kernel (`Continuum.step_terms`), the loss piecewise constant in what steps.
     """
 
     window: int = 16

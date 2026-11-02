@@ -1284,7 +1284,7 @@ class CausalTransformer(nn.Module):
                              f"it undamped")
         transform = None if self.head_transform is None else (
             _SLOPES[UNGATED[self.head_transform]], _squared_norm(self.applied_kernel("head_dense")),
-            self.head_norm._largest_gain(), self.head_norm.epsilon)
+            self.head_norm.largest_gain(), self.head_norm.epsilon)
         return _head_loss_bounds(_squared_norm(jnp.asarray(self.vocabulary_rows())), self.final_logit_softcap,
                                 transform)
 
@@ -1307,10 +1307,10 @@ class CausalTransformer(nn.Module):
 
     def level_terms(self, hidden, parts: tuple[str, ...]):
         """What bounds a damped step of the continuum level's `parts` at final states `hidden`, its maps'
-        inputs as a checkpoint's quantizers round them (`Continuum._step_terms`, `SteppedInContext`)."""
+        inputs as a checkpoint's quantizers round them (`Continuum.step_terms`, `SteppedInContext`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level._step_terms(hidden, parts, self._quantizer)
+        return self.continuum_level.step_terms(hidden, parts, self._quantizer)
 
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a

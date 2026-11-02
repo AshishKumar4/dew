@@ -95,7 +95,7 @@ class Continuum(nn.Module):
         forward)."""
         return quantized_products(self, name).inputs
 
-    def _step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
+    def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
         (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
