@@ -34,6 +34,7 @@ import pytest
 import test_attention_accurate_form as accurate_form
 import test_attention_dropout as dropout
 import test_attention_inplace_operands as inplace
+import test_attention_matrix as matrix
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
 import test_attention_route as route
@@ -179,6 +180,12 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_matrix_holds_on_this_gpu():
+    """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
+    reference path at every pair of axis values the route serves, each cell on its own GPU."""
+    run_cells(cells_of(matrix.a_routes_training_step_is_on_par))
+
+
 def test_the_mosaic_template_holds_on_an_h100():
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
     long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
