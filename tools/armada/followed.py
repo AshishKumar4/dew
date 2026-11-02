@@ -75,6 +75,14 @@ use of another library in tools/armada; the pool is then read through `jax.devic
 FRACTION = "XLA_PYTHON_CLIENT_MEM_FRACTION"
 SHARED = ""
 """The owner of what runs for every file: before the first test, around them, and after the last."""
+EXEC = "exec"
+"""A followed child's restart of this Python (`restarts`), logged before the exec: the new image's `began`
+after it is the recorder's word that it took the log over (`logged`). No list of how an exec can drop the
+recorder (an argv[0], a prefix, an environment without the recorder's names) stands in for that word
+(review)."""
+COUNTED = {"followed": "start\tfollowed", "unfollowed": "unfollowed\t1", "restarted": EXEC}
+"""The line a child's log takes for each kind of start (`start`): a followed child's start a line each, so
+they are counted; an unfollowed one's; a restart of this Python's."""
 CLOSED = "closed"
 """The last line of a log the process wrote to its end: its atexit, registered before any other."""
 READ = "read:"
@@ -497,10 +505,9 @@ def start(event: str, args: tuple, directory: str, child: bool = False) -> str |
     """How a process start the audit names counts for its test file: None for none of its own (a
     native tool, `subprocess`'s own start beneath the Popen its audit already named, multiprocessing's
     exec of a spawned child, which `spawned` counts, a fork, whose child runs this process's own code
-    under its hooks, and, in a followed `child`, its exec of this Python again with the recorder's
-    environment and its site (`sited`), which records into its log, the pid's), "followed" for a child that
-    records itself into
-    `directory`, else "unfollowed"."""
+    under its hooks); "restarted" for a followed `child`'s exec of this Python again (`restarts`), which
+    records into its log, the pid's, once its new image answers (`EXEC`); "followed" for a child that
+    records itself into `directory`; else "unfollowed"."""
     if event not in SPAWNS:
         return None
     if event in ("os.fork", "os.forkpty"):
@@ -511,7 +518,7 @@ def start(event: str, args: tuple, directory: str, child: bool = False) -> str |
         return None
     environment = os.environ if event != "os.exec" or args[2] is None else args[2]
     if child and event == "os.exec" and restarts(args[0], args[1], environment, directory):
-        return None
+        return "restarted"
     if native(programs(event, args)):
         return None
     if event == "subprocess.Popen":
@@ -727,11 +734,9 @@ def follow() -> None:
         counted(start(event, args, str(directory), child=True))
 
     def counted(kind: str | None) -> None:
-        # A start's count (`start`, `spawned`): a followed child's start a line each, any unfollowed once.
-        if kind == "followed":
-            log.write("start\tfollowed\n")
-        elif kind == "unfollowed":
-            write("unfollowed", 1)
+        # A start's line (`start`, `spawned`, `COUNTED`): a followed child's, an unfollowed one's, a restart.
+        if kind in COUNTED:
+            log.write(f"{COUNTED[kind]}\n")
 
     def closing() -> None:
         write("ended", time.time())
@@ -769,11 +774,15 @@ def gpu_memory() -> tuple[int, int] | str:
 def logged(path: Path) -> dict:
     """A child's log read back: whose it is, the files it executed and read and the modules it imported, its
     reads of the backend, how many children it followed in turn, whether it started one no event sees or
-    was not followed itself, its life, its GPU pool, and whether it closed."""
+    was not followed itself (a restart its new image never answered among them), its life, its GPU pool,
+    and whether it closed."""
     record = {"file": "", "files": set(), "reads": set(), "expected": 0, "unfollowed": False, "began": 0.0,
               "ended": None, "pool": None, "peak": None, "inherited": False, "closed": False}
+    restarting = False
     for line in path.read_text().splitlines():
         kind, _, value = line.partition("\t")
+        # A restart (`EXEC`) the new image never answered with its `began` ran unrecorded.
+        restarting = kind == EXEC or (restarting and kind != "began")
         if kind == "owner":
             record["file"] = value
         elif kind == "file":
@@ -792,6 +801,7 @@ def logged(path: Path) -> dict:
             record["inherited"] = value == "1"
         elif kind == "closed":
             record["closed"] = True
+    record["unfollowed"] = record["unfollowed"] or restarting
     return record
 
 
