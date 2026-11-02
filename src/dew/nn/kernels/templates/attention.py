@@ -447,18 +447,26 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     start, end = (spans.start, spans.end) if runs else (spans.start[..., None], spans.end[..., None])
     start, end = _blocked(start, block_q, 0), _blocked(end, block_q, 0)
     nonempty = end > start
-    held = jnp.any(nonempty, axis=2)
+    # Every bound the map reads of a block's queries in one reduction, their maxima (a minimum the maximum
+    # of its negation): each its own, XLA ran six kernels of a decode step's map (ET-DECODE5-h100). Each
+    # run's first start and last end of the queries reading it, whether any reads it and whether all do,
+    # and the block's latest start and earliest end.
+    read = nonempty.astype(jnp.int32)
+    bounds = jnp.stack([jnp.where(nonempty, -start, -big), jnp.where(nonempty, end, 0), read, 1 - read,
+                        start, -end], axis=-1)
+    first, last, some, missed, latest, earliest = jnp.moveaxis(jnp.max(bounds, axis=2), -1, 0)
+    held = some > 0
     # Each run's envelope over the block's queries, `(0, 0)` where none of them reads it.
-    lo_r = jnp.where(held, jnp.min(jnp.where(nonempty, start, big), axis=2) // block_k, 0)
-    hi_r = jnp.where(held, -(-jnp.max(jnp.where(nonempty, end, 0), axis=2) // block_k), 0)
+    lo_r = jnp.where(held, -first // block_k, 0)
+    hi_r = jnp.where(held, -(-last // block_k), 0)
     ranges = _merged(lo_r, hi_r, held, key_blocks) if runs else jnp.stack([lo_r, hi_r], axis=-1)
     lo = jnp.where(jnp.any(ranges[..., 1] > ranges[..., 0], axis=-1), ranges[..., 0, 0], 0)
     hi = jnp.max(ranges[..., 1], axis=-1)
     # A run's tile is whole where every query of the block sees all its keys through it: the block's latest
     # start and earliest end bound them, and a query that misses the run leaves none whole.
-    whole_lo = -(-jnp.max(start, axis=2) // block_k)
-    whole_hi = jnp.minimum(jnp.min(end, axis=2), keys) // block_k
-    whole = jnp.all(nonempty, axis=2) & (whole_hi > whole_lo)
+    whole_lo = -(-latest // block_k)
+    whole_hi = jnp.minimum(-earliest, keys) // block_k
+    whole = (missed == 0) & (whole_hi > whole_lo)
     widest = jnp.argmax(jnp.where(whole, whole_hi - whole_lo, -1), axis=-1)[..., None]
     some = jnp.any(whole, axis=-1)
     full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
@@ -467,9 +475,11 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     j = jnp.arange(key_blocks)[None, None, :, None]
     reads = jnp.any((ranges[:, :, None, :, 0] <= j) & (j < ranges[:, :, None, :, 1]), axis=-1)
     i = jnp.arange(lo.shape[1])[None, :, None]
-    q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
-    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
-    q_lo = jnp.where(q_hi > 0, q_lo, 0)
+    # The first and last query block reading each key block, one reduction as the bounds above.
+    first_q, q_hi = jnp.moveaxis(jnp.max(jnp.stack([jnp.where(reads, -i, -big), jnp.where(reads, i + 1, 0)],
+                                                   axis=-1), axis=1, initial=-big), -1, 0)
+    q_hi = jnp.maximum(q_hi, 0)
+    q_lo = jnp.where(q_hi > 0, -first_q, 0)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
 
