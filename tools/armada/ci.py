@@ -186,7 +186,9 @@ threads ended at interpreter exit), which no record sees; and the plan runs wher
 token is not. Across 34 suite runs no file was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
-COLLECT_TASKS = 4
+COLLECT_SECONDS = 6.0
+"""A file's collection where armada recorded none: past the slowest rate it has run at (train 459: 5.1 s a
+file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
@@ -1220,16 +1222,28 @@ def plan(target: float, timings: dict) -> list[dict]:
                      "cache": cache, "whole": cells}
                     for entry in site_entries(python, marked, found, timings, target)]
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
-    # As many collect tasks as there are files to collect, up to COLLECT_TASKS: one that holds none reports no
-    # row its entry names, which armada cannot grade.
-    collecting = min(COLLECT_TASKS, len(rest))
-    for index in range(collecting):
-        names = rest[index::collecting]
-        entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
-                        "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
-                        "cache": cache, "whole": cells})
-    return entries
+    collecting = collect_entries(rest, timings, target)
+    return entries + [{**entry, "cache": cache, "whole": cells} for entry in collecting]
+
+
+def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
+    """The newest Python's tasks that import `names` without running them (`collect`): each at most
+    `target` seconds of files at the slowest per-file rate armada recorded for a collection (else
+    `COLLECT_SECONDS`), and weighed at that. A collect task's rows split its seconds evenly, and the same
+    files collect five times as long on one host class as on another, so the slowest rate keeps every task
+    within the target on any host; weighed at the target, train 459's four tasks of 140 files started last
+    and ran 485-910 s on Genoa hosts, and the run ended with them."""
+    rates = [seconds for name, seconds in timings.get("rows", {}).items()
+             if ":" in name and parsed_row(name)[0] == PYTHONS[-1] and parsed_row(name)[2] == COLLECT]
+    rate = max(rates, default=COLLECT_SECONDS)
+    # The files a task holds within the target, one where a file alone takes longer; and no task holds none:
+    # armada cannot grade a row its entry names that its task never reports.
+    each = max(math.floor(target / rate), 1)
+    count = math.ceil(len(names) / each)
+    return [{"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1], "tests": " ".join(held),
+             "split": COLLECT, "rows": [row(PYTHONS[-1], name, COLLECT) for name in held],
+             "weight": len(held) * rate}
+            for index, held in enumerate(names[at::count] for at in range(count))]
 
 
 MARKED = ("whole_suite", "release_env")

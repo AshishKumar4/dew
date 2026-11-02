@@ -3,6 +3,7 @@
 import functools
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -93,6 +94,26 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
             "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
             "tests/test_new.py"}
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
+
+
+def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
+        ci, tmp_path, monkeypatch):
+    """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
+    recorded for a collection, and weighs that, so armada's heaviest-first order starts it beside the run's
+    other full tasks. Train 459's four collect tasks of 140 files, each weighed at the target, started last
+    and ran 485-910 s on Genoa hosts against 145 s on Turin ones; the run ended with the last of them."""
+    names = [f"tests/test_f{index:03}.py" for index in range(200)]
+    for name in names:
+        (tmp_path / name).write_text("")
+    monkeypatch.setattr(ci, "NEWEST_FILES", ())
+    # A collect task's rows split its seconds evenly: these files last ran on a fast host and a slow one.
+    rates = {ci.row("3.14", name, ci.COLLECT): 5.3 if index % 2 else 1.0 for index, name in enumerate(names)}
+    collecting = [entry for entry in ci.plan(120.0, {"rows": rates}) if entry["split"] == ci.COLLECT]
+    assert sorted(name for entry in collecting for name in entry["tests"].split()) == names
+    # 22 files fit the target at 5.3 s each.
+    assert len(collecting) == math.ceil(len(names) / 22), [entry["weight"] for entry in collecting]
+    assert all(entry["weight"] == len(entry["tests"].split()) * 5.3 <= 120.0 for entry in collecting), [
+        (len(entry["tests"].split()), entry["weight"]) for entry in collecting]
 
 
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):

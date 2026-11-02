@@ -52,6 +52,37 @@ for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
         assert zen4.endswith("/AuthenticAMD-25-17") and zen3.endswith("/AuthenticAMD-25-1"), (platforms, zen4)
 
 
+def test_a_collection_that_runs_no_test_fetches_no_bundle(cache_worker, tmp_path):
+    """A `pytest --collect-only` (ci.py's `collect`) runs no test, so it fetches no file's bundle. Train
+    459's 3.14 collect tasks restored the bundle of every file they imported, 602,483 programs and 6 GB
+    for 140 files on a Genoa host: 735 s of a collection that took 54 s without them, and the suite ended
+    with them. A run of the same file fetches its bundle."""
+    import os
+    import subprocess
+    import sys
+
+    url, _, seen = cache_worker
+    site = tmp_path / "test_site.py"
+    site.write_text("def test_one():\n    pass\n")
+    tests = Path(__file__).resolve().parent
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")]),
+           "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token", "JAX_PLATFORMS": "cpu",
+           "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache"), "JAX_ENABLE_COMPILATION_CACHE": "true"}
+    # The cache on, whether this suite runs cold or not (DEW_TEST_NO_CACHE turns JAX's off for its children).
+    env.pop("DEW_TEST_NO_CACHE", None)
+
+    def fetched(*options: str) -> list[str]:
+        seen.clear()
+        command = [sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider", *options]
+        done = subprocess.run([*command, str(site)], cwd=tmp_path, env=env, capture_output=True, text=True,
+                              timeout=300)
+        assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+        return [path for path in seen if "/bundles/" in path]
+
+    assert fetched("--collect-only") == []
+    assert fetched() != []
+
+
 def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch, tmp_path):
     """No Worker at the URL: each file's bundle fails to arrive or leave until
     `FAILURES` requests have, the remote is then left alone, every program stays

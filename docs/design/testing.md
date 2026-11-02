@@ -119,6 +119,14 @@ The committed generator uses the reference's public interface. Kernel qualificat
 
 **Layout invariance.** Raw random bits, and what exact operations alone derive from them (uniforms, bit-compare masks such as dropout's), are bit-identical on every layout. Floats derived through rounding chains (normals, Gumbel noise, initial weights) are held equal across layouts by check 1 of `tests/reference_error.py`. A discrete result taken from them, such as a categorical sample by the argmax of Gumbel noise plus logits, can flip near a tie, and its check says so. Every other exact contract stays exact: checkpoint and resume, caches, serialization, and the same program run twice in deterministic mode. A bitwise claim across programs moves to check 1 only where it is shown invalid.
 
+## Property tests
+
+Hypothesis is for property, metamorphic and fuzz tests: an invariant held over drawn inputs (an operation's algebraic law, an equivalence between two forms of one computation, a parser or planner's behavior on generated input). It is not an accuracy gate. A property test that judges numerics draws its shapes or configuration from Hypothesis and holds each with `assert_as_exact`, whose seeds draw the values; it carries no tolerance of its own.
+
+The suite's profile, `dew` (tests/conftest.py), draws the same examples on every run, so a red reproduces anywhere; keeps no example database, and stores nothing in the checkout (its storage goes under the system temp directory unless `HYPOTHESIS_STORAGE_DIRECTORY` is set); and runs 50 generated examples, each under a soft 2 s deadline. Those are workload targets, not a wall-time bound: explicit examples, discarded draws and shrinking run beyond them, and the deadline is checked after an example runs. A test whose examples compile (a new shape each draw) sizes its own `settings` deadline and count from its measured runtime, within a test's 120 s with room for generation and shrinking.
+
+A failure shrinks to a minimal example. That example joins the test as a regular case (`@example`, or a test of its own), so the defect stays covered whatever later strategies draw.
+
 ## Tests must catch a defect
 
 A fix includes the behavioral case that fails before it and passes after it. The failure is observed through the public interface, including at error boundaries; error wording is not the contract.
