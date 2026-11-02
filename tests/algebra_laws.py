@@ -445,11 +445,32 @@ def _cases(mine, theirs):
         yield decided, mine_case, theirs_case
 
 
+def _scaled_out(expression):
+    """`expression` with each maximum and minimum whose arguments share a positive rational factor (their
+    contents' greatest common one, a float's least, `LEAST`, apart) taken as that factor times the extremum of
+    the arguments over it: a positive scale keeps every order, so a scaled logit's maxima are ordered as its
+    raw products' are, not as twice as many values (a positive factor's forward proved in minutes, not
+    seconds, every order of both counted)."""
+    def factored(atom):
+        scaled = [argument for argument in atom.args if argument != LEAST]
+        if not scaled:
+            return atom
+        factor = functools.reduce(sympy.gcd, [argument.primitive()[0] for argument in scaled])
+        if not (factor.is_Rational and factor > 0 and factor != 1):
+            return atom
+        return factor * type(atom)(*(argument if argument == LEAST else sympy.expand(argument / factor)
+                                     for argument in atom.args))
+
+    return expression.replace(lambda term: isinstance(term, (sympy.Max, sympy.Min)), factored)
+
+
 def _orderings(expression):
-    """`expression` with each maximum and minimum it holds decided by each order of the values they compare:
-    every maximum its greatest argument by that order, every minimum its least, a float's least (`LEAST`)
-    below all, so an identity of every order is one of every value of them (two equal values decide
-    alike). An argument that holds a maximum of its own is decided again once it is taken."""
+    """`expression` with each maximum and minimum it holds decided by each order of the values they compare
+    (each over its arguments' positive factor, `_scaled_out`): every maximum its greatest argument by that
+    order, every minimum its least, a float's least (`LEAST`) below all, so an identity of every order is
+    one of every value of them (two equal values decide alike). An argument that holds a maximum of its own
+    is decided again once it is taken."""
+    expression = _scaled_out(expression)
     atoms = expression.atoms(sympy.Max, sympy.Min)
     if not atoms:
         yield expression
