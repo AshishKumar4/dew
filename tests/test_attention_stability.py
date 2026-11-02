@@ -702,11 +702,14 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
     the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
     family; the written-out one where a family has sinks or a resumed state, which it has no input for,
     or a query of no keys, to which it gives the values' mean where Dew and the truth give zeros (every
-    such family fp32, whose probabilities round to nothing). A family whose products pass fp32's largest
-    before the scale (`Family.query_first`) gives jax's attention the query scaled first and a scale of 1:
-    the scale, 1/4 at its width of 16, a power of two, scales it exactly, so the logits are the scaled
-    products', rounded alike, but finite."""
-    jax_holds = not anchored and np.asarray(family.keep).any(-1).all()
+    such family fp32, whose probabilities round to nothing), or a float16 call on a CPU, whose dot into
+    float32 (F16_F16_F32, the algorithm jax's attention names for it) XLA's CPU compiler has none of, as
+    Dew's xla attention hands it to its reference path (`attention_kernels`' `cpu_float16`). A family whose
+    products pass fp32's largest before the scale (`Family.query_first`) gives jax's attention the query
+    scaled first and a scale of 1: the scale, 1/4 at its width of 16, a power of two, scales it exactly, so
+    the logits are the scaled products', rounded alike, but finite."""
+    cpu_float16 = jnp.dtype(family.dtype) == jnp.float16 and jax.default_backend() == "cpu"
+    jax_holds = not anchored and np.asarray(family.keep).any(-1).all() and not cpu_float16
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
