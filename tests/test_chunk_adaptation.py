@@ -608,9 +608,9 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half, the half over
-    weights where its step is stable (the divergent corner's gradient awaits the gate, `CORNER_WINDOWS`),
-    and at the corner itself through damped steps of `up`, their rates constants of the step, one draw
-    a seed: the contract the undamped corner leaves open (ledger 1714)."""
+    weights where its step is stable (the divergent corner's gradient is held within its rounding bound,
+    `test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding`), and at the corner
+    itself through damped steps of `up`, their rates constants of the step, one draw a seed."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = (ChunkAdaptation(window=3, rate=rate, select=("up",), damped=True) if damped
                   else ChunkAdaptation(window=3, rate=rate))
