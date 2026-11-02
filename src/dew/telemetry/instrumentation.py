@@ -11,6 +11,7 @@ the compiler picked a visible Triton dot or an opaque cuBLAS call for the same
 matmul (docs/research/benchmark-parity.md:5-9,93-102).
 """
 
+import contextlib
 import functools
 import json
 import math
@@ -50,22 +51,79 @@ class Program:
     where: str
 
 
+EVENTS: Mapping[str, str] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
+                              "/jax/core/compile/jaxpr_to_mlir_module_duration": "lowered",
+                              "/jax/core/compile/backend_compile_duration": "compiled"}
+"""JAX's events of a trace, a lowering and a backend compile (`jax.monitoring`'s durations), by what each is.
+This module's one listener (`_heard`) hears them for every open `Compiles` and `executable_only` block."""
+
+_open: list["Compiles"] = []
+"""The `Compiles` blocks open in this process, which `_heard` tells each event."""
+_open_lock = threading.Lock()
+
+
+class ExecutableOnly(RuntimeError):
+    """A trace, lowering or compile in a process held to running loaded programs alone (`executable_only`)."""
+
+
+class _Held(threading.local):
+    """How many `executable_only` blocks this thread is within."""
+
+    depth = 0
+
+
+_held = _Held()
+
+
+def _heard(event: str, duration_secs: float, **metadata: str | int) -> None:
+    """`EVENTS`' one listener: an event raises `ExecutableOnly` on a thread within `executable_only`, and is
+    told to every open `Compiles` otherwise."""
+    kind = EVENTS.get(event)
+    if kind is None:
+        return
+    if _held.depth:
+        raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
+                             "program compiled ahead was missing, or code traced around it")
+    with _open_lock:
+        listening = list(_open)
+    for compiles in listening:
+        compiles.heard(kind, duration_secs, metadata)
+
+
+@functools.cache
+def _listening() -> None:
+    jax.monitoring.register_event_duration_secs_listener(_heard)
+
+
+@contextlib.contextmanager
+def executable_only() -> Iterator[None]:
+    """Within the block, on this thread, a trace, a lowering or a backend compile raises `ExecutableOnly` as
+    JAX records it (`EVENTS`), and a loaded program (`dew.training.ahead.AheadPrograms.loaded`) runs: a GPU
+    node measuring programs compiled ahead stops where one is missing (ledger 2716). JAX records an event as
+    its step ends, so this stops a run, not the step itself; that no compile ran anywhere in a run, children
+    included, is its compilers' own dumps left empty (`dew.training.ahead.dumps`, `compiled_in`)."""
+    _listening()
+    _held.depth += 1
+    try:
+        yield
+    finally:
+        _held.depth -= 1
+
+
 class Compiles:
     """Counts the programs jitted functions named `name` need while it is open (every function's with
     None), each compiled or fetched from the persistent compilation cache, as JAX reports them
-    (`jax.monitoring`'s backend compile event, which names a function `jit(<name>)`): what a warm-up
-    costs, or a compile a measured run should not have paid. `programs` holds every program it
-    heard, the ones traced beside the ones compiled. JAX's events have one listener owner, this
-    module.
+    (`EVENTS`' backend compile, which names a function `jit(<name>)`): what a warm-up costs, or a compile
+    a measured run should not have paid. `programs` holds every program it heard, the ones traced beside
+    the ones compiled.
 
         with Compiles("_stepped") as compiles:
             server.run()
         assert compiles.count == 0
     """
 
-    EVENTS: ClassVar[Mapping[str, str]] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
-                                           "/jax/core/compile/backend_compile_duration": "compiled"}
-    """The compile events `jax.monitoring` records a duration for, by what each counts."""
+    COUNTED: ClassVar[frozenset[str]] = frozenset({"traced", "compiled"})
+    """The kinds of `EVENTS` it holds a program for."""
 
     def __init__(self, name: str | None) -> None:
         self.name = name
@@ -82,17 +140,20 @@ class Compiles:
         return len(self.seconds)
 
     def __enter__(self) -> "Compiles":
-        jax.monitoring.register_event_duration_secs_listener(self._heard)
+        _listening()
+        with _open_lock:
+            _open.append(self)
         return self
 
     def __exit__(self, *_) -> None:
-        jax.monitoring.unregister_event_duration_listener(self._heard)
+        with _open_lock:
+            _open.remove(self)
 
-    def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        kind = self.EVENTS.get(event)
+    def heard(self, kind: str, duration_secs: float, metadata: Mapping[str, str | int]) -> None:
+        """An event of kind `kind` (`EVENTS`') that took `duration_secs`, as JAX's metadata names it."""
         # A trace names its function bare, a backend compile `jit(<name>)`.
         named = self.name is None or metadata.get("fun_name") in (self.name, f"jit({self.name})")
-        if kind is not None and named:
+        if kind in self.COUNTED and named:
             frame = next((frame for frame in reversed(traceback.extract_stack()[:-1])
                           if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
                           and frame.filename != __file__ and "contextlib" not in frame.filename), None)
