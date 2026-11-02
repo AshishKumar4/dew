@@ -15,11 +15,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 from test_algebra_derive import shaped, walked
 
 from dew.algebra import SATURATION, derive, forms as algebra_forms
-from dew.nn.kernels import generation
+from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
 from dew.nn.precision import float32_einsum
 
@@ -118,6 +118,23 @@ def test_the_derived_forward_is_on_par_with_the_templates(base2, mask, split):
     assert_as_exact(jax.jit(derived_walk(base2, mask, split)), jax.jit(oracle_walk(base2, mask, split)), draw,
                     f"derived attention {mask} {'merged' if split else 'walked'}", seeds=16,
                     truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
+
+
+@pytest.mark.parametrize("derived", [False, True], ids=["template", "derived"])
+def test_a_split_decodes_combine_of_many_slices_traces_about_one_merge(derived):
+    """A split decode's combine of 32 slices (`decode_attention._combined`) traces at most three times a
+    combine of 4's equations, either forms: a fold traced a merge a slice, which at Dory 4B's depth compiled
+    its decode step for minutes."""
+    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5, natural=False)
+
+    def size(slices: int) -> int:
+        parts = (jax.ShapeDtypeStruct((slices, ROWS, WIDTH), jnp.float32),
+                 *[jax.ShapeDtypeStruct((slices, ROWS), jnp.float32)] * 2)
+        combined = jax.make_jaxpr(lambda *parts: decode_attention._combined(spec, *parts, axis=0))(*parts)
+        return sum(1 for _ in equations(combined.jaxpr))
+
+    with algebra_forms.derived(derived):
+        assert size(32) <= 3 * size(4)
 
 
 LENGTH, DEPTH, BLOCK = 64, 32, 16
@@ -442,7 +459,7 @@ FRESH = """
 import dataclasses
 import jax, jax.numpy as jnp
 from dew.algebra import forms
-from dew.nn.kernels import generation
+from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.templates import attention as template, attention_portable
 
 operands = [jnp.full((1, 16, 1, 8), 0.1 * (index + 1), jnp.float16) for index in range(3)]
