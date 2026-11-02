@@ -248,7 +248,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
               dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
-        db_ref, dc_ref = mosaic.stacked_views([dbc_ref], ((0, 1),))
         row, channel = lax.axis_index("rows"), lax.axis_index("channels")
 
         def load(ref):
@@ -290,8 +289,9 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 so_far = carried[1, n]
                 carried[1, n] = so_far + block_scan.summed(through * dts, exchanged, interpret=interpret)
                 partial = channel % PARTIALS
-                added(db_ref.at[partial, row, n, span], cotangent * dts * xs)
-                added(dc_ref.at[partial, row, n, span], dys * (a * before + written))
+                # B's and C's gradients one ref, each its place along its leading axis, indexed once.
+                added(dbc_ref.at[0, partial, row, n, span], cotangent * dts * xs)
+                added(dbc_ref.at[1, partial, row, n, span], dys * (a * before + written))
                 # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
                 return (dx + cotangent * bs * dts,
                         ddt + cotangent * bs * xs + through * (rate * math.log(2.0)))
@@ -323,8 +323,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                                       plgpu.SMEM((2, states), jnp.float32)))
     def accumulated(refs):
         """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero, one ref
-        of both (a leading axis of them, `mosaic.stacked_views`: two refs of equal zeros are one value to
-        XLA, which a fusion wrapping the launch may pass once for both, row 3180): state the run discharges
+        of both (a leading axis of them: two refs of equal zeros are one value to XLA, which a fusion
+        wrapping the launch may pass once for both, row 3180, `mosaic.checked`): state the run discharges
         (`pl.run_state`), as a kernel's derivative inside a custom JVP (`generation.linear_tangent`) can
         create no Ref of its own. A whole-array write of a launch's output XLA folds to the output itself."""
         dbc_ref, *outputs = refs
@@ -332,7 +332,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
         for ref, value in zip(outputs, found, strict=True):
             ref[...] = value
 
-    zeros = (jnp.zeros((2, PARTIALS, *b.shape), jnp.float32), *(jnp.zeros(t.shape, t.dtype) for t in out_type))
+    zeros = (jnp.zeros((2, PARTIALS, *b.shape), jnp.float32),
+             *(jnp.zeros(t.shape, t.dtype) for t in out_type))
     dbc, dx, ddt, da, dd, dstate = pl.run_state(accumulated)(zeros)
     return dx, ddt, dbc[0].sum(0), dbc[1].sum(0), da, dd, dstate
 
