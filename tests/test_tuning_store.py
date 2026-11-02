@@ -14,9 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tokamax
+from reference_error import assert_computes_the_oracle
 
-from dew.nn.kernels import norm_swiglu, tuning
-from dew.nn.kernels.templates import report
+from dew.nn.kernels import generation, norm_swiglu, tuning
+from dew.nn.kernels.templates import attention, report
+from dew.nn.precision import Numerics
 
 
 def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
@@ -240,12 +242,13 @@ def test_two_hooks_share_an_identity_only_where_they_lower_to_one_program():
     keys = [op.identified("prologue", hook) for hook in hooks]
 
     def lowered(hook):
-        closed = jax.make_jaxpr(hook)(tile)
+        closed = jax.make_jaxpr(lambda value: hook(value))(tile)
         return str(closed.jaxpr), [np.asarray(constant).tobytes() for constant in closed.consts]
 
     for (first, one), (second, other) in itertools.combinations(zip(keys, hooks, strict=True), 2):
         if first == second:
             assert lowered(one) == lowered(other), f"{one} and {other} share {first}"
+            assert_computes_the_oracle(one(tile), other(tile), f"{one} and {other}", roundings=0)
 
 
 TRACES: list[str] = []
@@ -265,9 +268,8 @@ class _CountingKernel(_HookedKernel):
 def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
     """A launch's identity traces a hook once for its object while it lives (a model's layers share it), at
     the op's layouts and the trace's configuration: twice asked, traced once; another object of one code,
-    apart; a bundle rebuilt around the same callable (a bind's), traced once for it; a frozen dataclass
-    hook rebuilt each call (a softcap's), traced once for its class and fields, and one whose state is no
-    field, once an object; under another random bits' construction, apart where its program differs. The
+    apart; a bundle rebuilt around the same callable (a bind's), traced once for it; arbitrary callable
+    dataclasses, once an object; under another random bits' construction, apart where its program differs. The
     whole identity, its kernels' names (`report.launching`), reads it alike."""
     def scaling(scale):
         def hook(tile):
@@ -286,7 +288,7 @@ def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
     assert op.identified("prologue", _Times(2.0)) == op.identified("prologue", _Times(2.0))
     assert op.identified("prologue", _Times(2.0, added=True)) != op.identified("prologue", _Times(2.0))
     assert op.identified("prologue", _Initialized(2.0)) == op.identified("prologue", _Initialized(2.0))
-    assert TRACES == ["prologue"] * 4
+    assert TRACES == ["prologue"] * 6
     hooked = _HookedKernel(prologue=shared)
     whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
     assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
@@ -299,6 +301,65 @@ def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
         partitionable = op.identified("prologue", drawing)
     with jax.threefry_partitionable(new_val=False):
         assert op.identified("prologue", drawing) != partitionable
+
+
+@pytest.mark.parametrize("biased", (False, True))
+def test_rebuilt_softcap_and_bias_hooks_share_their_analysis(biased):
+    from dew.nn.kernels.templates.attention_mosaic import MosaicForward
+
+    calls = []
+
+    def cap():
+        hook = attention.Capped(2.0)
+        return attention.Biased(hook) if biased else hook
+
+    @dataclasses.dataclass(frozen=True)
+    class Counted(MosaicForward):
+        score_kinds: tuple[attention.Kind, ...] = (attention.Kind.KEY,) if biased else ()
+        score_dtypes: tuple[str, ...] = ("float32",) if biased else ()
+
+        def traced(self, name, value):
+            calls.append(name)
+            return super().traced(name, value)
+
+    op = Counted()
+    keys = [op.identified("score_mod", cap()) for _ in range(3)]
+    assert keys[0] == keys[1] == keys[2]
+    assert calls == ["score_mod"]
+    changed = attention.Capped(3.0)
+    changed = attention.Biased(changed) if biased else changed
+    assert op.identified("score_mod", changed) != keys[0]
+
+
+@pytest.mark.parametrize("forms", (("fast", "accurate"), ("accurate", "fast")))
+def test_a_retained_score_hook_keys_each_run_precisions_program(forms):
+    from dew.nn.kernels.templates.attention_mosaic import MosaicForward, Tiles
+
+    def contextual(scores, queries, keys):
+        del queries, keys
+        return scores * (2.0 if generation.numerics().forms == "accurate" else 3.0)
+
+    op = MosaicForward(score_mod=contextual)
+    q = jax.ShapeDtypeStruct((1, 16, 1, 16), jnp.bfloat16)
+    starts = jax.ShapeDtypeStruct((1, 16), jnp.int32)
+    bound = op.bind(q, q, q, starts, starts, None, None, (), (), None,
+                    residuals=attention.Kept.NONE, interpret=True)
+    identities, programs, names = [], [], []
+    for form in forms:
+        with generation.run_precision(Numerics(forms=form)):
+            direct = op.traced("score_mod", contextual)
+            held = op.identified("score_mod", contextual)
+            assert held == direct
+            programs.append(held)
+            identities.append(report._identity(op, bound))
+            with report.launching(op, bound, Tiles(16, 16, 2, 1)):
+                names.append(report.named("attention"))
+            value = contextual(jnp.ones((1, 1)), None, None)
+            expected = np.full((1, 1), 2.0 if form == "accurate" else 3.0)
+            assert_computes_the_oracle(value, expected, form, roundings=0)
+    assert programs[0] != programs[1]
+    assert identities[0] != identities[1]
+    assert names[0] != names[1]
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -329,6 +390,75 @@ class _Equal:
 
     def __call__(self, tile):
         return tile * self.scale
+
+
+class _ScaleSlot:
+    __slots__ = ("scale",)
+
+
+@dataclasses.dataclass(frozen=True, slots=True, init=False, eq=False)
+class _SlottedScale(_ScaleSlot):
+    def __init__(self, scale):
+        object.__setattr__(self, "scale", scale)
+
+    def __call__(self, tile):
+        return tile * self.scale
+
+
+@pytest.mark.parametrize("factory", (_Equal, _SlottedScale, _Initialized))
+def test_hooks_with_distinct_outputs_have_distinct_program_and_launch_keys(factory):
+    hooks = [factory(scale) for scale in (2.0, 3.0)]
+    tile = jnp.ones(TILE.shape, TILE.dtype)
+    for scale, hook in zip((2.0, 3.0), hooks, strict=True):
+        assert_computes_the_oracle(hook(tile), np.full(TILE.shape, scale), "scaled tile", roundings=0)
+
+    op = _HookedKernel()
+    direct = [tuning.program(hook, TILE) for hook in hooks]
+    held = [op.identified("prologue", hook) for hook in hooks]
+    identities, names = [], []
+    for hook in hooks:
+        launch = _HookedKernel(prologue=hook)
+        bound = launch.bind(TILE, _Hooks(None, ()))
+        identities.append(report._identity(launch, bound))
+        with report.launching(launch, bound, 1):
+            names.append(report.named("hooked"))
+    assert direct[0] != direct[1]
+    assert held == direct
+    assert identities[0] != identities[1]
+    assert names[0] != names[1]
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _CyclicScale:
+    scale: float
+    context: list
+
+    def __call__(self, tile):
+        return tile * self.scale
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _CyclicBundle:
+    epilogue: object
+    context: list
+
+
+@pytest.mark.parametrize("bundled", (False, True))
+def test_a_cyclic_hook_graph_names_its_finite_program(bundled):
+    context = []
+    hook = _CyclicScale(2.0, context)
+    graph = _CyclicBundle(hook, context) if bundled else hook
+    context.append(graph)
+    op = _HookedKernel()
+    direct = tuning.program(lambda tile: hook(tile), TILE)
+    held = op.identified("hooks" if bundled else "prologue", graph)
+    assert (held.epilogue if bundled else held) == direct
+    assert_computes_the_oracle(hook(jnp.ones(TILE.shape, TILE.dtype)),
+                              np.full(TILE.shape, 2.0), "cyclic hook", roundings=0)
+    launch = _HookedKernel(prologue=None if bundled else hook)
+    bound = launch.bind(TILE, graph if bundled else _Hooks(None, ()))
+    with report.launching(launch, bound, 1):
+        assert report.named("hooked") is not None
 
 
 def _scaled_hook(tile):

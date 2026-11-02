@@ -12,7 +12,9 @@ import functools
 import itertools
 
 import algebra_laws as laws
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.algebra import SATURATION, derive
@@ -50,14 +52,21 @@ def test_every_mainloop_s_tiles_lie_in_the_kernel_extents():
     assert {template.power_of_two(width) for width in range(1, 257)} <= set(WIDTHS)
 
 
-def _forward(base2: bool, keys_first: bool, dtype):
-    declared = attention_algebra.declaration(base2=base2, keys_first=keys_first)
+def _forward(base2: bool, keys_first: bool, dtype, factor: float | None = None):
+    declared = attention_algebra.declaration(base2=base2, keys_first=keys_first, factor=factor)
 
     def shapes(rows, keys, width):
         tile = (keys, rows) if keys_first else (rows, keys)
         return {"logits": (tile, jnp.float32), "values": ((keys, width), dtype)}
 
     return declared, shapes
+
+
+FACTORS = (None, 1.0, 0.125, float(np.float32(128 ** -0.5 * np.log2(np.e))), -0.125)
+"""The forward's logits as the mainloop gives them (`Keys.products`, `logits_of`): its formed logits (None,
+under a hook), or its raw products and their factor (`Forward.factor`): one where the accurate form keeps them
+raw, a power of two's scale, a scale times log2(e) folded (an fp32's), and a negative scale, whose order no
+maximum keeps."""
 
 
 def _backward(walked: str, hooked: bool, dropped: bool, dtype, width: int):
@@ -137,12 +146,14 @@ def _certify_every_structure(declaration, shapes, tiles) -> None:
 KERNEL_TILES = tuple(itertools.product(ROWS, KEYS, WIDTHS))
 
 
+@pytest.mark.parametrize("factor", FACTORS, ids=str)
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize(("base2", "keys_first"), list(itertools.product((False, True), repeat=2)),
                          ids=lambda value: str(value))
-def test_every_structure_of_the_forward_is_certified(base2, keys_first, dtype):
-    """The forward's softmax walk (`attention_algebra.declaration`), in either base, queries or keys first."""
-    _certify_every_structure(*_forward(base2, keys_first, dtype), KERNEL_TILES)
+def test_every_structure_of_the_forward_is_certified(base2, keys_first, dtype, factor):
+    """The forward's softmax walk (`attention_algebra.declaration`), in either base, queries or keys first,
+    over its formed logits or its raw products and each regime of their factor."""
+    _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES)
 
 
 @pytest.mark.parametrize("width", WIDTHS)
@@ -244,3 +255,33 @@ def test_forms_whose_output_is_laid_out_otherwise_are_refused():
                      mapped=forms.mapped)
 
     assert raised.value.law == "declared"
+
+
+@jax.custom_jvp
+def _scaled(bias, scale):
+    return bias * scale
+
+
+@_scaled.defjvp
+def _scaled_jvp(primals, tangents):
+    (bias, scale), (dbias, dscale) = primals, tangents
+    return _scaled(bias, scale), dbias * scale + bias * dscale
+
+
+def test_forms_whose_opaque_literal_differs_share_no_structure():
+    """A declaration adding a bias through an equation outside the language (a custom JVP's) whose literal
+    scale changes with the tile's width (1 at a small one, 2 at a kernel's) has two structures: an opaque
+    equation's literal is its own slot's, so the small tile's certificate is not the kernel tile's."""
+    def function(logits, values, bias):
+        p = jnp.exp(logits - jnp.max(logits, axis=-1)[:, None])
+        scale = jnp.float32(2 if values.shape[-1] >= 8 else 1)
+        return (p @ values) / jnp.sum(p, axis=-1)[:, None] + _scaled(bias, scale)
+
+    declaration = derive.Reduction(function, {"logits": ("rows", "keys"), "values": ("keys", "width"),
+                                              "bias": ()}, walked="keys", exponent="e")
+
+    def shapes(rows, keys, width):
+        return {"logits": ((rows, keys), jnp.float32), "values": ((keys, width), jnp.float32),
+                "bias": ((), jnp.float32)}
+
+    assert laws.skeletons(declaration, shapes(3, 2, 4)) != laws.skeletons(declaration, shapes(64, 32, 128))

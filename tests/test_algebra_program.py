@@ -20,6 +20,7 @@ from dew import algebra
 from dew.algebra import cost, program, terms
 from dew.nn.kernels import generation, options
 from dew.nn.kernels.templates import report
+from dew.nn.precision import FP32_SUMS
 
 
 def reductions(closed) -> int:
@@ -146,6 +147,29 @@ def test_products_with_a_shared_operand_join_into_one():
                     seeds=16)
 
 
+@pytest.mark.parametrize("shared", ["left", "right"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+@pytest.mark.parametrize("overflow", ["product", "sum"])
+def test_factoring_products_keeps_finite_cancellation(shared, compiled, overflow):
+    """Two contractions cancel exactly; factoring their bounded operands overflows a term product or a
+    partial sum, although the new operand itself stays finite."""
+    def contracted(a, z, w):
+        z, w = jnp.tanh(z), jnp.tanh(w)
+        return a @ z + a @ w if shared == "left" else z.T @ a.T + w.T @ a.T
+
+    length = 2 if overflow == "product" else 4
+    a = jnp.full((1, length), 2.0 ** (127 if overflow == "product" else 126), jnp.float32)
+    z = jnp.repeat(jnp.array([20.0, -20.0], jnp.float32), length // 2)
+    z = jnp.broadcast_to(z[:, None], (length, 64))
+    original, rewritten = contracted, algebra.rewritten(contracted)
+    if compiled:
+        original, rewritten = jax.jit(original), jax.jit(rewritten)
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected = original(a, z, z)
+        np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
+        np.testing.assert_array_equal(rewritten(a, z, z), expected)
+
+
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
     """An outer program (`options.program`) traces its function rewritten, so its lowering, its trace and its
     executable read one program; under `algebra.passes(on=False)`, which the gate opens for a reference arm,
@@ -269,6 +293,31 @@ def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
 
     assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
                     "a scale through a contraction", seeds=16)
+
+
+@pytest.mark.parametrize("scaled", ["left", "right"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+@pytest.mark.parametrize("overflow", ["product", "sum"])
+def test_moving_a_scale_keeps_finite_contraction_products(scaled, compiled, overflow):
+    """Scaling the small operand stays finite, but its replacement contraction overflows a term product or
+    a partial sum where the original grouping cancels exactly."""
+    length = 2 if overflow == "product" else 4
+
+    def contracted(y):
+        x = jnp.full((1, length), 2.0 ** (120 if overflow == "product" else 125), jnp.float32)
+        product = x @ y if scaled == "left" else y.T @ x.T
+        return product * jnp.float32(2)
+
+    magnitude = 128.0 if overflow == "product" else 2.0
+    y = jnp.repeat(jnp.array([magnitude, -magnitude], jnp.float32), length // 2)
+    y = jnp.broadcast_to(y[:, None], (length, 4 if overflow == "product" else 64))
+    original, rewritten = contracted, algebra.rewritten(contracted)
+    if compiled:
+        original, rewritten = jax.jit(original), jax.jit(rewritten)
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected = original(y)
+        np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
+        np.testing.assert_array_equal(rewritten(y), expected)
 
 
 

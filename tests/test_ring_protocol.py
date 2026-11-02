@@ -28,6 +28,13 @@ and a rotation unrolled or a step a trip."""
 CASES = [case for case in ring_protocol.configurations(**BOUNDS) if case["in_flight"] < case["stages"]]
 """Every configuration of `BOUNDS` a walk takes: fewer steps in flight than its ring's slots."""
 
+SEGMENT_CASES = [
+    case for case in ring_protocol.configurations(
+        stages=(2, 3), consumers=BOUNDS["consumers"], segments=((6,), (3, 3), (0, 1, 0, 2, 3, 0)),
+        in_flight=(0, 1, 2), unrolled=BOUNDS["unrolled"])
+    if case["in_flight"] < case["stages"]]
+"""One walk's six steps in one segment or adjacent segments, including empty and short segments."""
+
 
 @functools.cache
 def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool):
@@ -75,6 +82,53 @@ def test_the_ring_familys_walk_holds_every_property_in_every_interleaving(case):
     loads' landings explored, each property held (`ring_protocol.explore`)."""
     threads, arrivals = walked(**case)
     assert any(event.kind == "load" for event in threads[-1]), "the producer loads nothing"
+    assert explore(threads, arrivals) > 0
+
+
+@functools.cache
+def segmented(stages: int, consumers: int, segments: tuple, in_flight: int, unrolled: bool):
+    """One ring walk's adjacent segments with traced bounds and a nonzero origin."""
+    family = mosaic_sm90.WGMMA
+    starts = [sum(segments[:index]) for index in range(len(segments))]
+    total = sum(segments)
+
+    def body(x_gmem, out_gmem):
+        first = jax.lax.axis_index("programs") + 3
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {"a": (x_gmem, lambda step: (step - first, 0))}
+
+            def step(index, slots, carry, accumulators):
+                slots["a"][0, 0]
+                return carry, accumulators
+
+            def consumer(wg):
+                family.walk(rings, tuple((step, first + lo, first + lo + count)
+                                         for lo, count in zip(starts, segments, strict=True)),
+                            None, (), interpret=False, first=first, in_flight=in_flight, unrolled=unrolled)
+
+            family.roles(consumers, consumer, lambda: family.stream(rings, views, first, first + total))
+
+        family.scoped(scope, streams=family.streams({"a": (BLOCK, jnp.bfloat16)}, stages, consumers))
+
+    kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
+                           grid_names=("programs",), consumers=consumers, interpret=False,
+                           name="segmented_ring_model")
+    return programs(kernel, jnp.zeros((total * BLOCK[0], BLOCK[1]), jnp.bfloat16), threads=consumers + 1)
+
+
+@pytest.mark.parametrize("case", SEGMENT_CASES, ids=[
+    f"stages{c['stages']}-consumers{c['consumers']}-segments{c['segments']}-inflight{c['in_flight']}"
+    f"-{'unrolled' if c['unrolled'] else 'stepped'}" for c in SEGMENT_CASES])
+def test_segments_of_one_walk_release_their_slots_before_the_producer_reuses_them(case):
+    """Adjacent segments release every step exactly once without deadlock, including their pending tails."""
+    threads, arrivals = segmented(**case)
+    total = sum(case["segments"])
+    assert sum(event.kind == "load" for event in threads[-1]) == total
+    for consumer in threads[:-1]:
+        assert sum(event.kind == "read" for event in consumer) == total
+        assert sum(event.kind == "arrive" for event in consumer) == total
     assert explore(threads, arrivals) > 0
 
 

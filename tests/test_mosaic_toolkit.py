@@ -393,3 +393,20 @@ def test_products_issue_in_place_into_a_carried_accumulator():
     a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
     np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
+
+
+def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
+    """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
+    registers would hold sixteen programs: on an A10 and an RTX PRO 6000, twelve, their 1536 resident
+    threads' worth of its one warpgroup; on an A100 with its 2048, sixteen."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    def scope(stages: int) -> resources.Scope:
+        return resources.Scope(program=(plgpu.SMEM((stages * 1024,), jnp.uint8),))
+
+    launch = resources.Launch(scope, consumers=1, registers=32, floor=1)
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+    for name, most in (("sm86", 12), ("sm120", 12), ("sm80", 16)):
+        with generation.assumed(name):
+            found = resources.plan([launch], family, generation.gpu_target())
+        assert found is not None and found[0].programs == most, name

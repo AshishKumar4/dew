@@ -15,7 +15,8 @@ import pytest
 from jax.extend import core as jcore
 from reference_error import assert_as_exact
 
-from dew.algebra import SATURATION, scan
+from dew.algebra import SATURATION, cost, linear_scan, scan
+from dew.nn.kernels import generation
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
 
@@ -271,6 +272,39 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
                     seeds=16)
 
 
+@pytest.mark.parametrize("target", ["sm86", "sm90"])
+def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
+    """The gated delta rule's chunks derived under an A10 (its step's latency unstated, so the token loop is
+    priced at its work alone and extracted) and an H100 (WY's): on par with the token scan, outputs and
+    final state, against the float64 truth (check 1)."""
+    with generation.assumed(target):
+        forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                           state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+
+        def derived(q, k, v, g, beta):
+            values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+            state, outputs = forms.init({}), []
+            for index in range(TOKENS // CHUNK):
+                chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
+                prepared = forms.prepare(chunk)
+                outputs.append(forms.mapped(prepared, state))
+                state = forms.step(state, prepared)
+            return jnp.concatenate(outputs), forms.finish(state, values)
+
+        assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
+                        f"gated delta on {target}", seeds=8)
+
+
+def test_a_chunks_form_is_the_one_its_target_derives():
+    """A chunk's form asked for under one target and then another is each target's own derivation: an
+    H100's (WY with its inverse by doubling) and an A10's (by substitution, its span unpriced)."""
+    extents = linear_scan.Extents(64, 128, 128, 1)
+    for target in ("sm90", "sm86", "sm90"):
+        with generation.assumed(target):
+            assert scan._form(extents, corrected=True) == linear_scan.derive(
+                extents, corrects=True, schedule=cost.fused(cost.target()))
+
+
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])
@@ -460,16 +494,20 @@ def test_a_walk_through_a_vanished_decay_differentiates_and_merges_finite(decays
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in (value, gradient, tangent, *merged))
 
 
-def test_a_float64_walk_carries_its_decay_in_its_own_dtype():
-    """A float64 scalar SSD walked over two chunks by `lax.scan`: the walk's decay stays float64 through its
-    steps (its carry's type unchanged), and its final state is finite."""
+@pytest.mark.parametrize("dtype", [jnp.float64, jnp.float16, jnp.bfloat16], ids=lambda d: jnp.dtype(d).name)
+def test_a_walk_carries_its_state_in_one_dtype(dtype):
+    """A scalar SSD of a float64, float16 or bfloat16 state walked over two chunks by `lax.scan`: its carry
+    keeps its type through the steps (the walk's decay and state at their accumulation's, a float64 state's
+    float64), its final state finite and of the declared dtype."""
     with jax.enable_x64(new_val=True):
-        forms = scalar_ssd(jnp.float64)
+        forms = scalar_ssd(dtype)
         prepared = jax.vmap(forms.prepare)(jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]),
-                                                       ones_chunk(jnp.zeros((4,), jnp.float64), jnp.float64)))
+                                                       ones_chunk(jnp.zeros((4,), dtype), dtype)))
         state, _ = jax.lax.scan(lambda carried, chunk: (forms.step(carried, chunk), None), forms.init({}),
                                 prepared)
-        assert state[0].dtype == jnp.float64 and np.isfinite(np.asarray(state[1])).all()
+        final = forms.finish(state, {})
+        assert final.dtype == dtype and np.isfinite(np.asarray(final, np.float64)).all()
+        assert state[0].dtype == jnp.dtype(jnp.float64 if dtype == jnp.float64 else jnp.float32)
 
 
 def _primitives(jaxpr):
@@ -726,3 +764,40 @@ def test_no_gradient_crosses_a_reset(rule):
         assert not np.any(np.asarray(grads[name][:reset])), f"{rule}: {name}'s gradient crosses the reset"
     if "g" in grads:
         assert not np.any(np.asarray(grads["g"][reset])), f"{rule}: the reset token's decay has a gradient"
+
+
+def _cast(h, g, b, v, q):
+    return jnp.exp(g) * h + b.astype(jnp.int32).astype(h.dtype)[:, None] * v[None, :]
+
+
+def _huge(h, g, b, v, q):
+    return jnp.exp(g) * h + b[:, None] * (v * jnp.float64(1e100))[None, :]
+
+
+@pytest.mark.parametrize(("update", "dtype"), [(_cast, jnp.float32), (_huge, jnp.float64)],
+                         ids=["integer_conversion", "float64_literal"])
+def test_a_derived_chunk_computes_what_its_token_update_states(update, dtype):
+    """A chunk's derived form computes its declared token scan exactly where the update's terms hold more
+    than their algebra's: a key truncated to an integer and back (1.9 counts 1), a float64 literal past
+    float32's range (1e100): the conversion and the literal's dtype kept, not the identity and a float32's
+    infinity."""
+    def readout(h, g, b, v, q):
+        return q @ h
+
+    with jax.enable_x64(new_val=True):
+        operands = {"g": ("time",), "b": ("time", "keys"), "v": ("time", "values"), "q": ("time", "keys")}
+        made = scan.derive_scan(scan.Scan(update, readout, operands, walked="time", state=((2, 3), dtype)),
+                                saturation=SATURATION)
+        chunk = {"g": jnp.zeros((2,), dtype), "b": jnp.full((2, 2), 1.9, dtype), "v": jnp.ones((2, 3), dtype),
+                 "q": jnp.ones((2, 2), dtype)}
+        prepared = made.prepare(chunk)
+        outputs, final = made.mapped(prepared, made.init({})), made.step(made.init({}), prepared)[1]
+
+        def token(h, values):
+            h = update(h, **values)
+            return h, readout(h, **values)
+
+        declared_final, declared_outputs = jax.lax.scan(token, jnp.zeros((2, 3), dtype), chunk)
+        # Every value here is exact (counts, doublings of one rounded 1.9e100), so the two agree exactly.
+        np.testing.assert_array_equal(np.asarray(final), np.asarray(declared_final))
+        np.testing.assert_array_equal(np.asarray(outputs), np.asarray(declared_outputs))

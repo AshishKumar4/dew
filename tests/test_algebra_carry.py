@@ -5,9 +5,11 @@ prepared values, its carry and its emitted outputs together compute the function
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, carry
+from dew.nn.precision import FP32_SUMS
 
 
 def split_run(function, carried):
@@ -80,3 +82,28 @@ def test_products_of_one_contraction_over_operands_of_other_ranks_compute_throug
 
     assert_as_exact(jax.jit(split_run(ranked, (0, 1))), jax.jit(ranked), draw, "ranked products",
                     seeds=8)
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+@pytest.mark.parametrize("overflow", ["product", "sum"])
+def test_association_keeps_finite_carried_contraction_products(compiled, overflow):
+    """The prepared product x@y is finite, but its contraction with the state overflows a term product or
+    a partial sum where the declared grouping cancels exactly before reading x."""
+    length = 2 if overflow == "product" else 4
+
+    def associated(h):
+        x = jnp.ones((1, 2), jnp.float32)
+        y = jnp.ones((2, length), jnp.float32)
+        return (x @ (y @ h),)
+
+    magnitude = 2.0 ** (127 if overflow == "product" else 126)
+    h = jnp.repeat(jnp.array([magnitude, -magnitude], jnp.float32), length // 2)
+    h = jnp.broadcast_to(h[:, None], (length, 128))
+    original, rewritten = associated, split_run(associated, (0,))
+    if compiled:
+        original, rewritten = jax.jit(original), jax.jit(rewritten)
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected, = original(h)
+        np.testing.assert_array_equal(expected, jnp.zeros_like(expected))
+        actual, = rewritten(h)
+        np.testing.assert_array_equal(actual, expected)
