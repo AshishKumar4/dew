@@ -666,7 +666,8 @@ def test_a_dreamer_rollout_restored_in_a_later_phase_owes_each_update_at_its_own
         rollout = DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
                                  prefill=64, checkpointed_replay=True)
         if restored is not None:
-            rollout.restored(restored.saved())
+            # A copy, as a checkpoint holds it: the restored rollout's calls donate what it carries.
+            rollout.restored(jax.tree.map(jnp.copy, restored.saved()))
         return rollout
 
     def called(rollout, updates):

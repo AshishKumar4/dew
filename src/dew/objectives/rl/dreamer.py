@@ -28,7 +28,6 @@ import functools
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from fractions import Fraction
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import jax
@@ -1179,8 +1178,8 @@ def _ratio(bits: int) -> float:
 
 def _whole(updates: int, windows: int, ratio: float, envs: int) -> int:
     """The environment steps `updates` updates of `windows` replayed steps each train on at the train
-    `ratio`, exactly, rounded up to whole steps of every one of `envs` environments stepped together."""
-    return envs * math.ceil(Fraction(updates * windows) / (Fraction(ratio) * envs))
+    `ratio`, rounded up, then to whole steps of every one of `envs` environments stepped together."""
+    return envs * -(-math.ceil(updates * windows / ratio) // envs)
 
 
 @struct.dataclass
