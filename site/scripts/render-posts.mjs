@@ -3,7 +3,7 @@
 // twice. The posts overview lists them newest first, and src/generated/posts.json holds the listing the sidebar
 // and the landing page read.
 
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { newest, shown } from '../src/latest.mjs';
 import { escapeHtml } from './notebook-outputs.mjs';
@@ -12,6 +12,7 @@ import {
 	describe,
 	editUrl,
 	lastUpdated,
+	listed,
 	pageFile,
 	postFiles,
 	published,
@@ -35,20 +36,16 @@ for (const file of postFiles()) {
 }
 const posts = newest(listing);
 
-// The posts overview: sync-docs wrote its prose from docs/posts.md; the list comes from the posts.
-const overview = pageFile('posts');
-const list = '<ol class="post-list not-content">';
-if (!checkOnly) {
-	const prose = (await readFile(overview, 'utf8')).split(`\n\n${list}`)[0].trimEnd();
-	const items = posts.map((post) => [
-		`<li><a class="post-link" href="/${post.slug}/">`,
-		post.published ? `<time datetime="${post.published}">${shown(post.published)}</time>` : '',
-		`<span class="post-title">${escapeHtml(post.title)}</span>`,
-		`<span class="post-text">${escapeHtml(post.description ?? '')}</span>`,
-		'</a></li>',
-	].join(''));
-	await writeFile(overview, items.length ? `${prose}\n\n${list}${items.join('')}</ol>\n` : `${prose}\n`);
-}
+// The posts overview: sync-docs wrote its prose from docs/posts.md; the list comes from the posts, each the
+// landing's card (`latest-link`, landing.css).
+const items = posts.map((post) => [
+	`<li><a class="latest-link" href="/${post.slug}/">`,
+	`<span class="latest-meta"><span>Post</span>${post.published ? `<time datetime="${post.published}">${shown(post.published)}</time>` : ''}</span>`,
+	`<span class="latest-title">${escapeHtml(post.title)}</span>`,
+	`<span class="latest-text">${escapeHtml(post.description ?? '')}</span>`,
+	'</a></li>',
+].join(''));
+if (!checkOnly) await listed('posts', '<ol class="latest-list not-content">', items);
 
 await writeGenerated('posts', posts);
 console.log(`render-posts: ${posts.length} posts`);

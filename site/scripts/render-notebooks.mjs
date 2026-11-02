@@ -3,7 +3,7 @@
 // files served from /tutorials/. The build fails on a notebook that is not
 // executed top to bottom, or that recorded an error it did not declare.
 
-import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { readdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { repository } from '../src/manifest.mjs';
 import { runsLive } from '../src/data/live-notebooks.mjs';
@@ -14,6 +14,7 @@ import {
 	describe,
 	generatedRoot,
 	lastUpdated,
+	listed,
 	pageFile,
 	published,
 	repoRoot,
@@ -177,13 +178,8 @@ const cards = tutorials.listing.map((entry) => {
 		'</span></a>',
 	].join('');
 });
-const overview = pageFile('tutorials');
-const grid = '<div class="tutorial-grid not-content">';
-if (!checkOnly) {
-	// A render after another, with no sync-docs between, replaces the grid the last one appended.
-	const prose = (await readFile(overview, 'utf8')).split(`\n\n${grid}`)[0].trimEnd();
-	await writeFile(overview, `${prose}\n\n${grid}${cards.join('')}</div>\n`);
-}
+// A render after another, with no sync-docs between, replaces the grid the last one appended.
+if (!checkOnly) await listed('tutorials', '<div class="tutorial-grid not-content">', cards);
 
 await writeGenerated('tutorials', tutorials.listing.map(({ slug, label }) => ({ slug, label })));
 await writeGenerated('tutorial-cards', tutorials.listing);
