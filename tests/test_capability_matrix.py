@@ -837,7 +837,8 @@ def refuse_shortcut(family: Family) -> None:
 def teacher_of(family: Family, model, inputs: InputSpec):
     """A teacher of the family's own kind, its variables drawn apart from the student's."""
     objective = denoising(model, process=presets.Flow(), inputs=inputs)
-    return objective.model_variables(jax.device_get(objective.initializer(jax.random.key(11))))
+    # Drawn by one compiled program, as a run's initial state is, not op by op.
+    return objective.model_variables(jax.device_get(jax.jit(objective.initializer)(jax.random.key(11))))
 
 
 def rcm(family: Family, directory: Path) -> None:

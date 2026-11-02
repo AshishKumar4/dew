@@ -37,7 +37,7 @@ for (const file of postFiles()) {
 const posts = newest(listing);
 
 // The posts overview: sync-docs wrote its prose from docs/posts.md; the list comes from the posts, each the
-// landing's card (`latest-link`, landing.css).
+// landing's card (`latest-link`, theme.css).
 const items = posts.map((post) => [
 	`<li><a class="latest-link" href="/${post.slug}/">`,
 	`<span class="latest-meta"><span>Post</span>${post.published ? `<time datetime="${post.published}">${shown(post.published)}</time>` : ''}</span>`,

@@ -7,6 +7,7 @@ import itertools
 
 import numpy as np
 import pytest
+from data_support import Keeps, Twice, jittered
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
@@ -355,20 +356,9 @@ def _kept(row):
     return int(row["id"]) % 4 != 0
 
 
-class _FourthRefused:
-    """A step that refuses every fourth record."""
-
-    identity = "fourth-refused@1"
-    rejects = True
-
-    def __call__(self, row):
-        from dew.data.pipeline import Rejected
-
-        return Rejected("fourth") if int(row["id"]) % 4 == 0 else row
-
-
 def _fourth_refused(metadata):
-    return _FourthRefused()
+    """A step configured for the source that refuses every fourth record."""
+    return Keeps(4)
 
 
 @pytest.mark.parametrize("prefix", ["configured filter", "take"])
@@ -450,28 +440,12 @@ def test_epochs_of_a_memory_read_that_packs_its_examples_as_it_holds_them_are_pa
     from dew.data.pipeline import ObjectiveData
     from dew.training import Trainer
 
-    class Twice:
-        identity = "twice@1"
-
-        def flat_map(self, element):
-            return (element, element)
-
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(8)
     loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
     assert (loader.records, loader.epochs, loader.pass_examples, loader.examples) == (None, 2, 10, 20)
     state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
     assert int(state.consumed) == 20
-
-
-def _jittered(metadata):
-    import grain.python as grain
-
-    class Jittered(grain.RandomMapTransform):
-        def random_map(self, element, rng):
-            return element
-
-    return Jittered()
 
 
 @pytest.mark.parametrize("layout", ["pack", "windows"])
@@ -487,12 +461,6 @@ def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
     from dew.training import Trainer
-
-    class Twice:
-        identity = "twice@1"
-
-        def flat_map(self, element):
-            return (element, element)
 
     documents = [{"id": np.full(index % 5 + 3, index + 1, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents, shard_rows=5))
@@ -538,16 +506,10 @@ def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_o
     from dew.data.pipeline import Configured, ObjectiveData
     from dew.training import Trainer
 
-    class Twice:
-        identity = "twice@1"
-
-        def flat_map(self, element):
-            return (element, element)
-
     documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
     chain = Pipeline(Memory(documents))
     if before == "configured draw":
-        chain = chain.map(Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True))
+        chain = chain.map(Configured(jittered, needs=(), scope="run", random=True, one_to_one=True))
     else:
         if before != "cache":
             scope = "run" if before.startswith("run") else "source"

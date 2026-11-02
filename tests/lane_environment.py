@@ -35,10 +35,14 @@ configuration, which cuDNN refuses on an H100, so that test compiles in its
 own process without it (tests/test_quantization.py)."""
 
 
+def without_flag(flags: str, name: str) -> str:
+    """XLA `flags` without the flag `name` (`--xla_...`), whatever value it carries."""
+    return " ".join(flag for flag in flags.split() if flag.split("=")[0] != name)
+
+
 def without_deterministic_ops(flags: str) -> str:
     """XLA `flags` without `DETERMINISTIC_OPS`."""
-    name = DETERMINISTIC_OPS.split("=")[0]
-    return " ".join(flag for flag in flags.split() if not flag.startswith(name))
+    return without_flag(flags, DETERMINISTIC_OPS.split("=")[0])
 
 
 def configure_lane(environ: MutableMapping[str, str]) -> None:
