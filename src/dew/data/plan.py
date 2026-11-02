@@ -462,12 +462,12 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
     its members' counts (none: the members of a mixture's counter past its mix count afresh) and the
     examples it owes by member (none), as does each carrier (`owed_members`) and each held count of a
     completion (`dew.data.completion`); a mixture a run bounds in examples counts its members where its
-    rows are delivered, a counter of its own above the rows, which takes each member's counts as the mix
-    left them (as it read them). What a position held in flight by member, it held as no member's: a run
-    saved before counts the examples in flight in its total and on its clock, and of no member; tokens a
-    causal window or a pack held start no member's count (a member that joined since holds none of them,
-    `dew.data.steps.windows`)."""
-    from dew.data.mixing import COUNTER, CorpusCounts, state_counts
+    rows are delivered, a counter of its own above the rows, which counts each member afresh from the
+    resume (its draws counted each example as the mix drew it, a refused one too). What a position held
+    in flight by member, it held as no member's: a run saved before counts the examples in flight in its
+    total and on its clock, and of no member; tokens a causal window or a pack held start no member's
+    count (a member that joined since holds none of them, `dew.data.steps.windows`)."""
+    from dew.data.mixing import COUNTER, CorpusCounts
 
     def filled(branch: JSON) -> JSON:
         match branch:
@@ -505,42 +505,18 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
             "run (`--pretrained <run directory>`)")
 
     def counter(rows: JSON) -> JSON:
-        """`rows`, the mixture's rows as format 1 saved them, beneath its members' counter."""
-        mixed = _mix_node(rows)
-        held = {} if mixed is None else record(mixed.get("parents", {}), "mixture members")
-        members: dict[str, JSON] = {}
-        for key, state in held.items():
-            counted = list(state_counts(record(state, "member position")).values())
-            if len(counted) == 1:
-                counts = counted[0]
-                members[key] = {"corpus": counts.name, "label": counts.label,
-                                "counts": json_value(counts.state(), "member counts")}
+        """`rows`, the mixture's rows as format 1 saved them, beneath its members' counter, which counts
+        each member afresh: its draws counted each example as the mix drew it, a refused one too."""
         own = json_value(CorpusCounts("mixture", "mixture", rows=False).state(), "mixture counts")
         node: dict[str, JSON] = {"corpus": "mixture", "label": "mixture", "counts": own, "rows": False,
                                  "consecutive": 0, "warned": False, "consumed": 0, "consumed_members": {},
-                                 "members": members}
+                                 "members": {}}
         return {"parent": rows, COUNTER: node}
 
     match iterator:
         case {"workers_state": {**workers}} as pooled:
             return {**pooled, "workers_state": {name: counter(state) for name, state in workers.items()}}
     return counter(iterator)
-
-
-def _mix_node(branch: JSON) -> Mapping[str, JSON] | None:
-    """The node of a mixture's draw in a position: its members' positions under their keys (`parents`)."""
-    match branch:
-        case {"parents": dict(), "index": _}:
-            return branch
-        case dict():
-            for child in branch.values():
-                if (found := _mix_node(child)) is not None:
-                    return found
-        case list():
-            for child in branch:
-                if (found := _mix_node(child)) is not None:
-                    return found
-    return None
 
 
 def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:

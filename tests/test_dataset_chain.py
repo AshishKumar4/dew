@@ -863,8 +863,8 @@ def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_
     """The streamed read of the resume test above, its position saved after three batches by main
     87e6e0965, before a mixture's members were counted where their rows are delivered
     (tests/fixtures/bounded_mixture_position.json): restored, it delivers the batches that read did after
-    them, the read's 18 source examples consumed in all, and counts each member on from what its draws
-    counted, the examples it read since counted where they are delivered (row 3312)."""
+    them, each consuming the source examples it did there, and counts each member afresh from the resume,
+    its examples counted where they are delivered (row 3312)."""
     fixture = Path(__file__).with_name("fixtures") / "bounded_mixture_position.json"
     recorded = json.loads(fixture.read_text())
     objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
@@ -875,12 +875,15 @@ def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_
     after = list(stream)
     stream.close()
     assert [np.asarray(batch["id"]).tolist() for batch in after] == recorded["after_ids"]
-    consumed = sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in after)
-    before = sum(sum(held) for _, held in recorded["before"])
-    assert before + consumed == 18
+    assert [np.asarray(batch[EXAMPLES_CONSUMED]).tolist() for batch in after] == recorded["after_consumed"]
+    # Each member counted afresh from the resume: its records whose last row it delivered since, not
+    # refused at the third question.
     statistics = data.statistics()
-    assert {f"data/rows/{name}" for name in ("left", "right")} <= set(statistics)
-    assert sum(statistics[f"data/rows/{name}"] for name in ("left", "right")) >= consumed
+    since = {int(identity) for ids in recorded["after_ids"] for identity in ids}
+    for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
+        assert statistics[f"data/rows/{name}"] == sum(identity in since and identity % 3 != 2
+                                                      for identity in members), name
+    assert not [name for name in statistics if name.startswith("data/rejected/mixture")]
 
 
 def _asked(read: str, *, shuffled: bool = True) -> Dataset:
