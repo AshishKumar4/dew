@@ -75,9 +75,10 @@ def restarted(fn, case: str):
 
 
 PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
-                               'one sequence-bf16-kept': 122}}
+                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-recomputed': 402}}
 """The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
-ledger 2127), which the whole suite runs (`timed`)."""
+ledger 2127; the recomputed decay a key dimension's at a42fefc6b, kda-recompute), which the whole suite runs
+(`timed`)."""
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
