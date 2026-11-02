@@ -29,7 +29,7 @@ its own vocabulary and any field its claim turns on."""
 def model_draw(model, shape: tuple[int, ...], vocab: int):
     """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
     `vocab`, the variables initialized compiled."""
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         ids = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)

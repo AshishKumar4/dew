@@ -89,8 +89,8 @@ def source_final(schedule, process, times, rescale, label, scale):
 
     def final(value):
         rows = value.shape[0]
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *value.shape[1:])), jnp.ones((1,)),
-                            jnp.ones((1,)))
+        params = nn.unbox(model.init(jax.random.PRNGKey(1), jnp.ones((1, *value.shape[1:])), jnp.ones((1,)),
+                            jnp.ones((1,))))
         denoise = process.denoiser(model, params, {"label": jnp.full((rows,), label)},
                                    {"label": jnp.zeros((rows,))})
         return sample(denoise, value, solver=schedule.solver, guidance=CFG(scale, rescale=rescale),
@@ -102,7 +102,7 @@ def source_final(schedule, process, times, rescale, label, scale):
 def walk(solver, process, model, x_T, times, key=0):
     """Each solver interval's new state, without the closing denoise, through `sample`'s own walk with
     its folded per-step keys (`sample(record=...)`)."""
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
+    params = nn.unbox(model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,))))
     denoise = process.denoiser(model, params, {})
     with jax.ensure_compile_time_eval():
         times = jnp.asarray(times, jnp.float32)
@@ -307,7 +307,7 @@ class DeterministicObjective(Objective):
         self.ema = EMASpec(decay=optax.constant_schedule(0.999) if decay is None else decay)
 
     def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.ones((1, 8, 8, 3)), jnp.zeros((1,)))
+        return nn.unbox(self.model.init(key, jnp.ones((1, 8, 8, 3)), jnp.zeros((1,))))
 
     def loss(self, variables, batch, step):
         data = unit_range(batch["image"])

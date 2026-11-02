@@ -199,7 +199,7 @@ def unit(view):
 def drawn(module: InContextMemory):
     """A seed's stream and its own weights for `module`: each draw a fresh model, so no one draw of
     the weights is shared by every seed's error."""
-    init = jax.jit(lambda key: module.init(key, jnp.zeros((1, LENGTH, WIDTH))))
+    init = jax.jit(lambda key: nn.unbox(module.init(key, jnp.zeros((1, LENGTH, WIDTH)))))
 
     def draw(seed: int) -> tuple[np.ndarray, dict]:
         x = np.random.default_rng([1645, seed]).standard_normal((ROWS, LENGTH, WIDTH)).astype(np.float32)

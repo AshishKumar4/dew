@@ -42,6 +42,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import ACCURATE, Numerics
+from dew.nn.sharding import boxed
 from dew.optim import (
     OPTIMIZER_MAP,
     Cosine,
@@ -630,7 +631,9 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
             return {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
                 'kernel': jax.device_put(value, placement)}}}}}}
 
-        with jax.set_mesh(mesh):
+        # The axes the stack is drawn in, as a run's table holds them.
+        table = {('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel'): ('exp', 'embed', 'mlp')}
+        with jax.set_mesh(mesh), boxed(table):
             updates, _ = jax.jit(solver.update)(stacked(grads), solver.init(stacked(params)), stacked(params))
         return np.asarray(updates['params']['layers_0']['mlp']['experts']['gate_proj']['kernel'])
 

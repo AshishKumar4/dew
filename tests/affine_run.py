@@ -33,7 +33,7 @@ class Regression(Objective):
         self.probe = probe
 
     def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
+        return nn.unbox(self.model.init(key, jnp.zeros((1, FEATURES))))
 
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
