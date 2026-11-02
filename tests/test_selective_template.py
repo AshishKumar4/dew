@@ -13,6 +13,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+from generation_support import lowers
 from reference_error import (
     FEWEST_SEEDS,
     as_given,
@@ -250,3 +251,44 @@ def test_the_selector_refuses_a_state_row_of_either_stream_no_bulk_copy_takes(st
         routed("sm90", states, jnp.bfloat16, named=True)
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
     assert routed("sm90", states, named=True) == {("mosaic_gpu", None)}
+
+
+@lowers('sm90')
+@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
+    """The selective scan's backward over Mamba's 16 states compiled for an H100 (`kernel_compile`), its
+    documents packed or not: its launch spills nothing at the registers its residency leaves a thread
+    (`selective.RESIDENT` programs a multiprocessor, `mosaic.compiler_params`' `resident`), and the most
+    programs the least spill-free cap ptxas finds (`register_need`) leaves room for is the residency it
+    launches at, so a backward whose need grows past its share, or falls below the next residency's, fails
+    here rather than spilling or leaving a program out on the GPU (row 3589)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import resources
+
+    rows, length, channels, states = 1, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    starts = jax.ShapeDtypeStruct((rows, length), bool) if packed else None
+
+    def call():
+        def trained(x, dt, A, B, C, D, starts=None):
+            def scanned(*given):
+                return selective.selective_scan(*given, starts=starts, family=mosaic_sm90.WGMMA)[0]
+
+            out, pull = jax.vjp(scanned, x, dt, A, B, C, D)
+            return pull(out)
+
+        return (trained, (*operands, starts)) if packed else (trained, operands)
+
+    (record,) = compile_mosaic_kernels([KernelCase('selective backward', call)], 'sm90', least=True)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+    (kernel,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
+    need = kernel['least']
+    assert need is not None, kernel
+    held = max(programs for programs in range(1, resources.RESIDENT_PROGRAMS + 1)
+               if resources.entry_registers(1, programs) >= need)
+    assert held == selective.RESIDENT, (need, held, selective.RESIDENT)
