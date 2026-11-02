@@ -102,8 +102,11 @@ def rounding_bound(fn, *args, batch: int = 64):
 CHEAP_COMPILE = {"xla_backend_optimization_level": 0, "xla_llvm_disable_expensive_passes": True}
 """The compile options of a rounding scale's program (`rounding_scale`)."""
 
-DRAWS = 16
-"""The Gaussian tap draws that estimate a program's rounding scale (`rounding_scale`)."""
+DRAWS = 8
+"""The Gaussian tap draws that estimate a program's rounding scale (`rounding_scale`): over 8 draws its
+root mean square is at least 0.41 of the exact one in 995 of 1000 elements (a chi-square of 8 degrees of
+freedom's 0.005 quantile is 1.344, and sqrt(1.344 / 8) = 0.41), the element's own last rounding flooring
+it."""
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each program's compiled rounding scale (`rounding_scale`), by its function and its arguments' structure,
@@ -244,7 +247,8 @@ def _owned(equation, inputs, outputs, made: list, owns: dict) -> None:
         rounded = [var for var, is_float in zip(equation.outvars, floats, strict=True) if is_float]
         if len(made) != len(rounded):
             made = made[-1:] if len(rounded) == 1 else []
-        owns.update((var, bound) for var, bound in zip(rounded, made)
+        # `made` holds one bound an output here, or none.
+        owns.update((var, bound) for var, bound in zip(rounded[:len(made)], made, strict=True)
                     if jnp.shape(bound) == tuple(var.aval.shape))
         return
     known = [not isinstance(var, Literal) and var in owns for var in equation.invars]
