@@ -1484,8 +1484,10 @@ def a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_determinis
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
     took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
-    on an RTX 4080). The prefill scores on par with the full pass, both from
-    the model in float64 (check 1)."""
+    on an RTX 4080): its compiled program runs cuDNN's fused attention (a
+    selector that refused the mask sent it to xla's dots, b00926a6db, row
+    3676). The prefill scores on par with the full pass, both from the model
+    in float64 (check 1)."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
     made, _ = decode_steps(model)
@@ -1502,6 +1504,9 @@ def a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_determinis
     def prefilled(params, ids):
         return held(prefill(params, made(params, ids.shape[0]), ids))
 
+    params, ids = drawn(model)(0)
+    program = prefill.lower(params, made(params, ids.shape[0]), ids).compile().as_text()
+    assert "__cudnn$fmha" in program, "the masked prefill runs no cuDNN fused attention"
     assert_as_exact(prefilled, full(model), drawn(model), "padded prefill", seeds=SEEDS['padded prefill'],
                     truth_fn=full(float64(model)))
 
