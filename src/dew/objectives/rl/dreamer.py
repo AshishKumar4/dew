@@ -702,7 +702,7 @@ class DreamerV3Objective(Objective[Ratio]):
         }
         alive = (1 - terminal) * (1 - 1 / self.horizon)
         logit = model.continue_(feature)
-        losses["continue"] = -(alive * jax.nn.log_sigmoid(logit) + (1 - alive) * jax.nn.log_sigmoid(-logit))
+        losses["continue"] = optax.losses.sigmoid_binary_cross_entropy(logit, alive)
         for name, _, _ in self.model.auxiliary:
             target = jnp.asarray(batch["observation"][name], jnp.float32)
             losses[name] = jnp.sum(jnp.square(model.predicted(name, feature) - target), -1)
