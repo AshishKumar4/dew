@@ -67,6 +67,7 @@ import jax.core
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
@@ -404,51 +405,43 @@ first of them collected, and a lookup whose references no longer reach its calla
 object took) is none."""
 
 
-def _held_key(value, leaves: list) -> Hashable:
-    """`value` as `_TRACED` keys it: a frozen dataclass that holds its fields alone (`_by_fields`: a hook
-    rebuilt each call, a softcap's `Capped`) by its class's identity (appended to `leaves`) and its fields'
-    keys; any other callable by its identity (appended to `leaves`: what a closure or a callable object
-    reads need not be in its parts); a tuple's, a list's and a dataclass's parts in turn (a launch's hooks
-    bundle, rebuilt each bind around one retained callable); any other value as it hashes (a static's own
-    contract, as `jax.jit` reads it). `TypeError` for a value no hash holds."""
-    if _by_fields(value):
-        leaves.append(type(value))
-        return "fields", id(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves))
-                                                for field in dataclasses.fields(value))
+class FieldHook:
+    """A hook whose call reads its class's code and its frozen dataclass fields alone, which its type
+    promises by subclassing this: one rebuilt each call with equal fields (a softcap's `Capped`) shares its
+    analysis by its class and fields (`_held_key`). Any other callable keys by its identity, whatever its
+    layout: a class's slots, constructor or init-only values may hold state its fields do not."""
+
+
+def _held_key(value, leaves: list, path: frozenset = frozenset()) -> Hashable:
+    """`value` as `_TRACED` keys it: a field hook (`FieldHook`) by its class's identity (appended to
+    `leaves`) and its fields' keys, or by its own identity where they hold no key (a cycle back to it, an
+    array); any other callable by its identity (appended to `leaves`); a tuple's, a list's and a dataclass's
+    parts in turn (a launch's hooks bundle, rebuilt each bind around one retained callable); any other
+    value as it hashes (a static's own contract, as `jax.jit` reads it). `TypeError` for a value no hash
+    holds, a graph that reaches a part of itself (`path`) among them."""
+    if id(value) in path:
+        raise TypeError("a hook's parts reach the hook again")
+    inner = path | {id(value)}
+    if isinstance(value, FieldHook):
+        held: list = []
+        try:
+            fields = tuple((field.name, _held_key(getattr(value, field.name), held, inner))
+                           for field in dataclasses.fields(value))
+        except TypeError:
+            leaves.append(value)
+            return "callable", id(value)
+        leaves.extend((type(value), *held))
+        return "fields", id(type(value)), fields
     if callable(value):
         leaves.append(value)
         return "callable", id(value)
     if isinstance(value, (tuple, list)):
-        return type(value).__name__, tuple(_held_key(part, leaves) for part in value)
+        return type(value).__name__, tuple(_held_key(part, leaves, inner) for part in value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _named(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves))
+        return _named(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves, inner))
                                           for field in dataclasses.fields(value))
     hash(value)
     return type(value).__qualname__, value
-
-
-def _by_fields(value) -> bool:
-    """Whether `value` is a frozen dataclass whose call reads its class's code and its fields alone: no
-    `__post_init__` (which may set an attribute from an init-only value) and no attribute but its fields."""
-    kind = type(value)
-    if not dataclasses.is_dataclass(value) or isinstance(value, type) or not kind.__dataclass_params__.frozen:
-        return False
-    if any("__post_init__" in vars(base) for base in kind.__mro__):
-        return False
-    try:
-        held = set(vars(value))
-    except TypeError:
-        # A slotted dataclass holds its fields alone.
-        return True
-    return held <= {field.name for field in dataclasses.fields(value)}
-
-
-def _context() -> Hashable:
-    """The trace's configuration a hook's program reads beside its code: its random bits' construction, its
-    products' default precision, its arrays' width and promotion."""
-    config = jax.config
-    return (config.jax_threefry_partitionable, str(config.jax_default_matmul_precision),
-            config.jax_enable_x64, config.jax_numpy_dtype_promotion, config.jax_numpy_rank_promotion)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -615,7 +608,7 @@ class KernelOp(tokamax.Op):
             return self.traced(name, value)
         try:
             leaves: list = []
-            place = (type(self), name, _context(), _held_key(value, leaves),
+            place = (type(self), name, jax_config.trace_context(), _held_key(value, leaves),
                      tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
                            if field.name not in (*self.HOOKS, "config", "vjp")))
             hash(place)
@@ -723,7 +716,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     hooks seconds a step (the class of the algebra pass's printed terms). A captured array that is itself
     traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
     and dtype alone."""
-    closed = jax.make_jaxpr(function)(*arguments)
+    # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
+    # equal hook of another call would take this one's program.
+    closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
     digest = hashlib.sha256()
 
     def update(*parts) -> None:

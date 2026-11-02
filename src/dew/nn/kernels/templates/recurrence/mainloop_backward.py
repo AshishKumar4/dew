@@ -517,11 +517,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
             grad, dv = _reverse_carried(call, slots, grad, out, columns, issue, (hi_ref, lo_ref), h, n,
                                         scale=scale)
             if gates:
-                skip = None if skip_ref is None else skip_ref[h]
-                dv, *terms = _values_gated_back(call, slots, columns, out, dv,
-                                                family.rows_of(beta_ref.at[h, span]), skip)
-                for ref, term in zip(gated_ref, terms, strict=False):
-                    ref.at[column // bv, h, span][...] = term
+                dv = _gated_values_stored(call, slots, columns, out, dv, (beta_ref, skip_ref, gated_ref), h,
+                                          span, column // bv)
             before_store()
             grads.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
                         smem=lands["corrected"], wait=False)
@@ -855,6 +852,19 @@ def _value_grads(call: _Call) -> _Operand:
     `sum(v du)` took the rounding of every `du` it sums."""
     return dataclasses.replace(call.held, rows=call.rows) if call.delta else _Operand(call.rows, 1,
                                                                                        jnp.dtype(jnp.float32))
+
+
+def _gated_values_stored(call: _Call, slots, columns, out, dv, refs, h, span, slice_index):
+    """A chunk's values' gradient through the walk's gate (`_values_gated_back`, at the head's write gate
+    and skip), its gate's and skip's terms stored at the chunk's span of their outputs: the gated
+    gradient."""
+    beta_ref, skip_ref, gated_ref = refs
+    skip = None if skip_ref is None else skip_ref[h]
+    dv, *terms = _values_gated_back(call, slots, columns, out, dv, call.family.rows_of(beta_ref.at[h, span]),
+                                    skip)
+    for ref, term in zip(gated_ref, terms, strict=False):
+        ref.at[slice_index, h, span][...] = term
+    return dv
 
 
 def _reverse_values(call: _Call, *, gates: bool) -> _Operand:

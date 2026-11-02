@@ -329,6 +329,14 @@ def register_programs(family: "Family", consumers: int, registers: int | None = 
     return 0
 
 
+def resident_programs(family: "Family", consumers: int, registers: int | None, target) -> int:
+    """The most programs of a launch of `consumers` consumer roles a multiprocessor of `target` holds at
+    once, each consumer thread holding `registers`: its registers' (`Family.programs`) within its resident
+    threads (an sm86's or sm120's 1536, twelve warpgroups)."""
+    threads = target.architecture.resident_threads // (family.warpgroups(consumers) * THREADS)
+    return min(family.programs(consumers, registers), threads)
+
+
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
     """A launch's register decision as its template's model states it, which the compile gate holds the
@@ -372,11 +380,12 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), and the most
     programs a multiprocessor holds of it at those registers (`register_programs`), as its plan's."""
     warpgroups = family.warpgroups(consumers)
-    most = register_programs(family, consumers, registers)
-    if target is not None:
+    if target is None:
+        most = register_programs(family, consumers, registers)
+    else:
         from dew.nn.kernels import generation
 
-        most = min(most, target.architecture.resident_threads // (warpgroups * THREADS))
+        most = resident_programs(family, consumers, registers, target)
         if shared is not None:
             block = generation.shared_budget(target)
             most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
@@ -454,7 +463,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     for launch in launches:
         if launch.registers > family.registers(launch.consumers):
             return None
-        most = family.programs(launch.consumers, launch.registers)
+        most = resident_programs(family, launch.consumers, launch.registers, target)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         found = None
         for held in residencies:

@@ -40,6 +40,9 @@ from dew.training.ahead import compile_only_gpus
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
 
+MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
+"""Mosaic GPU's refusal, as it lowers, of a kernel whose shared memory a block of the GPU does not hold."""
+
 SHARED = re.compile(r"smem_scratch_bytes=(\d+)")
 TENSOR_MEMORY = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
 """A Mosaic GPU kernel's resource estimate as Pallas prints it while it lowers the kernel (its `Resources`,
@@ -229,7 +232,12 @@ def _compiled(case, generation: str, record: dict,
               estimating as estimated):
             lowered = jax.jit(fn).trace(*placed).lower()
     except Exception as error:  # A case that does not lower is its own failure.
-        record["error"] = f"it does not lower: {str(error)[-800:]}"
+        # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
+        refused = MOSAIC_REFUSED.search(str(error))
+        if refused is None:
+            record["error"] = f"it does not lower: {str(error)[-800:]}"
+        else:
+            record["shared"] = int(refused.group(1))
         return None
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]

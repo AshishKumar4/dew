@@ -69,8 +69,10 @@ def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
 
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
-    which their legality matched (`MosaicForward.legal`)."""
-    found = {family.name: family for family in layouts(generation.gpu_target().generation, dtype)}
+    which their legality matched (`MosaicForward.legal`). A config names its physical layout; which configs
+    a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
+    A100's mma.sync, its resource witness) resolves too."""
+    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")

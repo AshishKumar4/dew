@@ -82,6 +82,25 @@ class Scan:
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
 
 
+def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk: Mapping):
+    """`function` (the declaration's update or readout) traced at one token of `chunk`: the state's type and
+    each operand's without its walked axis, jit disabled so a jitted library function's equations are the
+    declaration's own."""
+    shape, dtype = declaration.state
+
+    def named(h, *xs):
+        return function(h, **dict(zip(names, xs, strict=True)))
+
+    def token(name: str) -> jax.ShapeDtypeStruct:
+        axes = zip(chunk[name].shape, declaration.operands[name], strict=True)
+        return jax.ShapeDtypeStruct(tuple(extent for extent, axis in axes if axis != declaration.walked),
+                                    chunk[name].dtype)
+
+    tokens = [token(name) for name in names]
+    with jax.disable_jit():
+        return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
+
+
 def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived:
     """`declaration`'s chunk forms (the module's account), split into what every chunk computes at once and
     what its carry computes in sequence (`carry.split`, under `saturation`'s limits): `init(shapes)` a zero
@@ -95,27 +114,14 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
 
-    def traced(function: Callable, chunk: Mapping):
-        def named(h, *xs):
-            return function(h, **dict(zip(names, xs, strict=True)))
-
-        tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
-                                                                              declaration.operands[name],
-                                                                              strict=True)
-                                             if axis != declaration.walked), chunk[name].dtype)
-                  for name in names]
-        # Jit disabled, so a jitted library function's equations are the declaration's own.
-        with jax.disable_jit():
-            return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
-
     corrects: list = []  # whether a token corrects the state, once a chunk was read
     decomposed: dict = {}  # the token's affine map by its operands' types, its e-graph saturated once
 
     def parts(chunk: Mapping):
         types = tuple((chunk[name].shape, str(chunk[name].dtype)) for name in names)
         if types not in decomposed:
-            decomposed[types] = linear_scan.parts(traced(declaration.update, chunk),
-                                                   traced(declaration.readout, chunk))
+            decomposed[types] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
+                                                   _traced(declaration, declaration.readout, names, chunk))
         affine = decomposed[types]
         corrects[:] = [affine.correction is not None]
         # An operand with no walked axis (a rate, a skip) is every token's.
@@ -130,13 +136,14 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
         return affine, (exponent, *values)
 
-    # A walk's decay carried in its exponents' accumulation (`parts`' float32 at least; a float64 state's,
-    # float64).
+    # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
+    # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
+    # as declared left each chunk wider than it entered.
     carried = at_least_fp32(jnp.dtype(dtype))
 
     def init(shapes):
         del shapes
-        return jnp.zeros((shape[0],), carried), jnp.zeros(shape, dtype)
+        return jnp.zeros((shape[0],), carried), jnp.zeros(shape, carried)
 
     splits: dict = {}
 
@@ -154,7 +161,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
         key = (affine.base2, corrected, *((value.shape, str(value.dtype)) for value in given))
         if key not in splits:
-            h = jax.ShapeDtypeStruct(shape, dtype)
+            h = jax.ShapeDtypeStruct(shape, carried)
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
             ranges = _ranges(declaration, names, chunk, affine, extents.tokens)
             bound = ranges.pop("inverse", None)
@@ -186,7 +193,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     def finish(state, operands):
         del operands
-        return state[1]
+        return state[1].astype(dtype)
 
     def backward(chunk, state, d_state, d_outputs):
         # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
@@ -221,11 +228,19 @@ TOKENS = ("B", "U", "s", "C", "Q", "R")
 """A token's values (`_token`'s), as the chunk's form names them (`linear_scan.Chunk.token`)."""
 
 
-@functools.cache
 def _form(extents: linear_scan.Extents, corrected: bool) -> linear_scan.Form:
     """The chunk's form at its extents, derived by the identities of affine scans and extracted by the
-    work-span model under XLA's schedule (`linear_scan.derive`)."""
-    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(cost.target()))
+    work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for and at
+    the products' configured precision, each of which prices the forms (`cost.target`, `cost.product_work`):
+    a derivation under one target is no other's."""
+    return _derived_form(extents, corrected, cost.target(), jax.config.jax_default_matmul_precision)
+
+
+@functools.cache
+def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precision) -> linear_scan.Form:
+    """`_form`'s, once for each of its facts, `precision` the configured one its products read."""
+    del precision
+    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target))
 
 
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
@@ -355,17 +370,20 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool):
     """The token loop over the chunk, each token's step in turn (its decay `exp(z_t)` the pair of it and the
-    token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs and the state it leaves."""
+    token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs and the state it leaves. Each
+    token's output is placed at its row by a constant one-hot column and the rows summed, the carry's own
+    language (`carry.split` reads products and sums, not a concatenation)."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
-    outputs = []
+    placed = jnp.eye(B.shape[0], dtype=jnp.float32)
+    outputs = 0.0
     for t in range(B.shape[0]):
         decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
         h = decay[:, None] * h
         if corrected:
             h = h - s[t] * B[t][:, None] * float32_matmul(C[t][None, :], h)
         h = h + B[t][:, None] * values[t][None, :]
-        outputs.append(float32_matmul(Q[t][None, :], h)[0] + R[t])
-    return jnp.stack(outputs), h
+        outputs = outputs + placed[:, t][:, None] * (float32_matmul(Q[t][None, :], h)[0] + R[t])[None, :]
+    return outputs, h
 
 
 def _substituted(lower, given):

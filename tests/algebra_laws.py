@@ -192,9 +192,9 @@ def skeleton(term, region) -> str:
         # does not read), as that equation and its inputs: a leaf's index names no computation.
         opaque, place = made[leaf]
         kept = {name: value for name, value in sorted(opaque.equation.params.items()) if name not in SHAPES}
-        literals = iter(opaque.literals)
-        inputs = [walk(term.__egg_typed_expr__, None, 0) if term is not None else repr(next(literals))
-                  for term in opaque.inputs]
+        # Each input its term or, at its own slot, its literal (`terms.Opaque`).
+        inputs = [walk(term.__egg_typed_expr__, None, 0) if term is not None else repr(literal)
+                  for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
         return f"{opaque.equation.primitive.name}{kept}({','.join(inputs)})[{place}]"
 
     def walk(expr, method: str | None, place: int) -> str:
@@ -292,7 +292,9 @@ LEAST = -sympy.Symbol("largest", positive=True)
 
 
 def _constant(value) -> np.ndarray:
-    """A program's constant over the reals: a float's largest magnitude infinite (`LARGEST`)."""
+    """A program's constant over the reals, exactly: a float's value its dyadic rational, so the laws'
+    arithmetic stays exact (a 30-digit float's left a scaled exponent's zero test undecided); a float's
+    largest magnitude below every other (`LARGEST`)."""
     array = np.asarray(value)
 
     def real(element):
@@ -303,7 +305,7 @@ def _constant(value) -> np.ndarray:
             return -LEAST if number > 0 else LEAST
         if np.issubdtype(array.dtype, np.integer) or array.dtype == bool:
             return sympy.Integer(int(element))
-        return sympy.Rational(number) if number == int(number) else sympy.Float(number, 30)
+        return sympy.Rational(number)
 
     return np.vectorize(real, otypes=[object])(array) if array.shape else np.asarray(real(array), object)
 

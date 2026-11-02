@@ -555,10 +555,11 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
 
 
 @dataclasses.dataclass(frozen=True)
-class Capped:
+class Capped(tuning.FieldHook):
     """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
     `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
-    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+    its static facts serves every layer of one cap (`tuning.lowered_once`), and its call reads its cap
+    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`)."""
 
     softcap: float
 
@@ -568,11 +569,11 @@ class Capped:
 
 
 @dataclasses.dataclass(frozen=True)
-class Biased:
+class Biased(tuning.FieldHook):
     """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
     tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
     `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
-    equal inner hooks (`Capped`)."""
+    equal inner hooks (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
 
     score_mod: Callable | None = None
 

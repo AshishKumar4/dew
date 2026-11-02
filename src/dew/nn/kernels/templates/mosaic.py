@@ -1754,17 +1754,25 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 pl.when(index >= lo + in_flight)(lambda: given(turn.back(in_flight, stages), release=True))
             return carry, accumulators
 
-        walked = self.accumulated(
-            tuple(loop for step, lo, hi in segments
-                  for loop in stepping(functools.partial(turned, step, lo), lo, hi, first, stages,
-                                       unrolled=unrolled)),
-            start, shapes, interpret, initial)
-        # Each segment's last `in_flight` steps, their products done by the walk's end, oldest first.
-        for _, lo, hi in segments:
-            for back in reversed(range(in_flight)):
-                pl.when(hi - back > lo)(lambda hi=hi, back=back: given(Turn.of(hi - 1 - back - first, stages),
-                                                                       release=True))
-        return walked
+        def drained(lo, hi) -> tuple:
+            # A segment's last `in_flight` steps' products done and their slots given back, oldest first,
+            # before the next segment's steps wait for those slots: its own releases start at its own `lo`.
+            def drain(index, carry, accumulators):
+                del index
+                self.settled()
+                for back in reversed(range(in_flight)):
+                    pl.when(hi - back > lo)(lambda back=back: given(Turn.of(hi - 1 - back - first, stages),
+                                                                    release=True))
+                return carry, accumulators
+
+            return drain, 0, 1
+
+        loops = []
+        for step, lo, hi in segments:
+            loops += stepping(functools.partial(turned, step, lo), lo, hi, first, stages, unrolled=unrolled)
+            if in_flight:
+                loops.append(drained(lo, hi))
+        return self.accumulated(tuple(loops), start, shapes, interpret, initial)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)

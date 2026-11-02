@@ -253,8 +253,8 @@ def parts(update: Program, readout: Program) -> Parts:
                  correction[0] if correction else None, *readout_args)
 
 
-_KEEPING = frozenset({"convert_element_type", "copy", "copy_p"})
-"""Equations that keep a value's elements and shape (its precision aside)."""
+_KEEPING = frozenset({"copy", "copy_p"})
+"""Equations that keep a value's elements, dtype and shape."""
 
 
 def _translated(traced: Program, atoms: list) -> Token:
@@ -265,14 +265,18 @@ def _translated(traced: Program, atoms: list) -> Token:
     held: dict = {jaxpr.invars[0]: Token.state()}
     reads = {jaxpr.invars[0]}
 
+    def leaf(atom, shape: tuple) -> Token:
+        atoms.append((traced, atom))
+        value = Token.value(len(atoms) - 1)
+        return Token.scalar(value) if shape == () else value
+
     def term(atom) -> Token:
-        if isinstance(atom, jcore.Literal) and np.ndim(atom.val) == 0:
-            return Token.scalar(Token.literal(float(atom.val)))
+        # A literal is a leaf of its own at each use, read at its dtype (`Parts.atoms`): a float64 1e100 is no
+        # float32's.
+        if isinstance(atom, jcore.Literal):
+            return leaf(atom, np.shape(atom.val))
         if atom not in held:
-            atoms.append((traced, atom))
-            leaf = Token.value(len(atoms) - 1)
-            shape = np.shape(atom.val) if isinstance(atom, jcore.Literal) else aval(atom).shape
-            held[atom] = Token.scalar(leaf) if shape == () else leaf
+            held[atom] = leaf(atom, aval(atom).shape)
         return held[atom]
 
     for equation in jaxpr.eqns:
@@ -296,6 +300,14 @@ def _algebra(equation: jcore.JaxprEqn, operands: list[Token]) -> Token | None:
     after = aval(equation.outvars[0]).shape
     if name in _KEEPING:
         return operands[0]
+    if name == "convert_element_type":
+        # A float widened keeps every value, so its term is its operand's; any other conversion rounds (an
+        # integer's truncation), so its output is no term here: a leaf where it reads no state, refused where
+        # it does.
+        before, after = aval(equation.invars[0]).dtype, jnp.dtype(equation.params["new_dtype"])
+        widened = (jnp.issubdtype(before, jnp.floating) and jnp.issubdtype(after, jnp.floating)
+                   and jnp.promote_types(before, after) == after)
+        return operands[0] if widened else None
     if name in ("mul", "add"):
         return operands[0].times(operands[1]) if name == "mul" else operands[0].plus(operands[1])
     if name == "sub":
@@ -559,7 +571,10 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule) -> Form
 
     model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
     extracted = graph.extract(root, cost_model=model, extractor="greedy-dag")
-    outputs, state = get_callable_args(extracted, Chunk.pair)
+    # The pair of its two parts, or one algorithm that gives both (the token loop, where the target prices
+    # its steps past every other form's work), read by its projections.
+    parts = get_callable_args(extracted, Chunk.pair)
+    outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
     shape_of = functools.partial(_shape_of, graph)
     return Form(outputs, state, cost.Seconds(_priced((outputs, state), extents, shape_of), schedule))
 

@@ -115,6 +115,14 @@ def log2_of(size: i64Like) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
+def contracted_length(params: i64Like) -> i64: ...
+"""A contraction's (`Term.dot`'s, by its parameters' index) length's power of two, `ceil(log2(...))` of the
+elements each of its outputs sums: a rule that makes a contraction bounds its products' and its sum's
+magnitude by its operands' and this (`product_magnitude`). A contraction of no stated length (an operand of
+no known shape) has none, so a rule that asks it does not fire."""
+
+
+@function(merge=lambda old, new: old)
 def sum_length(term: Term) -> i64: ...
 """A reduction's length's power of two, `ceil(log2(...))` of the elements it sums into each of its own
 (`program.stated`): a reordering that sums anew over the same axes of a value of the same shape bounds its
@@ -246,16 +254,27 @@ def _linear() -> Ruleset:
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
     scalar = Vec[i64].empty()
     sets = []
-    # A contraction scaled by a power of two: the scale on either operand, the product linear in each.
-    for scaled, made_of in ((x, lambda s: s.dot(y, params)), (y, lambda s: x.dot(s, params))):
+    # A contraction scaled by a power of two: the scale on either operand, the product linear in each. The
+    # new operand and the new contraction over it each under the program's reach: a scale moved into a
+    # contraction's operand scales each of its products before its sum (2**120 x times 2 summed past 2**128).
+    for scaled, other, made_of in ((x, y, lambda s: s.dot(y, params)), (y, x, lambda s: x.dot(s, params))):
         facts, power = product_magnitude(magnitude(scaled, "s"), magnitude(a, "a"), 0)
         new = scaled.binary("mul", a, multiplied)
+        bounds, contracted = product_magnitude(([], power), magnitude(other, "other"),
+                                               var("replaced_length", i64))
         sets.append(rule(eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar),
-                         exact_scale(a), plain(params), plain(multiplied), *facts,
-                         *dominated(power, "new")).then(
+                         exact_scale(a), plain(params), plain(multiplied), *facts, *dominated(power, "new"),
+                         eq(var("replaced_length", i64)).to(contracted_length(params)), *bounds,
+                         *dominated(contracted, "replaced")).then(
             union(t).with_(made_of(new)), *made(new, power)))
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
+    # A shared operand factored out of two contractions: the summed operand and its contraction with the
+    # shared one each under the program's reach.
+    shared_bound = var("shared_bound", i64)
+    shared_length = var("shared_length", i64)
+    factored = (eq(shared_bound).to(log2_bound(a)), eq(shared_length).to(contracted_length(multiplied)),
+                *dominated(power + shared_bound + shared_length, "factored"))
     sets += [
         rule(eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
@@ -263,11 +282,11 @@ def _linear() -> Ruleset:
             union(t).with_(a.binary("mul", new, multiplied)), *made(new, power)),
         rule(eq(t).to(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-             *dominated(power, "new")).then(
+             *dominated(power, "new"), *factored).then(
             union(t).with_(a.dot(new, multiplied)), *made(new, power)),
         rule(eq(t).to(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-             *dominated(power, "new")).then(
+             *dominated(power, "new"), *factored).then(
             union(t).with_(new.dot(a, multiplied)), *made(new, power)),
     ]
     # A positive scale out of a maximum or a minimum: the scaled elements' order is the elements', so the

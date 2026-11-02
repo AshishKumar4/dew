@@ -379,6 +379,10 @@ def _products(region: terms.Region) -> list:
             continue
         index = int(get_literal_value(args[2]))
         _, params = region.params[index]
+        # Its contracted length's power, the elements each output sums (`rules.contracted_length`).
+        (contracting, _), _ = params["dimension_numbers"]
+        length = math.prod(region.shape(args[0])[axis] for axis in contracting)
+        facts.append(set_(rules.contracted_length(i64(index))).to(i64(max(length - 1, 0).bit_length())))
         wanted = params.get("preferred_element_type")
         operands = {region.dtypes.get(terms.key(args[0])), region.dtypes.get(terms.key(args[1]))}
         if wanted is None or operands == {jnp.dtype(wanted)}:
