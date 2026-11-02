@@ -45,7 +45,14 @@ from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
-from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul, two_product
+from dew.nn.precision import (
+    compensated_add,
+    exact_float32,
+    float32_einsum,
+    float32_matmul,
+    two_product,
+    vanishing,
+)
 
 from . import recurrence
 
@@ -101,12 +108,13 @@ def portable(name: str, left, right):
 
 
 @program
-def _cumulated(g, documents=None):
+def _cumulated(g, documents=None, restarts=None):
     """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
-    restarting at each of packed `documents`' first positions: one program JAX traces once for their types,
-    whose exact sums the portable math's forward and gradient each traced afresh (row 3142)."""
+    restarting at each of packed `documents`' first positions and at each of `restarts` (`[..., C, F]`): one
+    program JAX traces once for their types, whose exact sums the portable math's forward and gradient each
+    traced afresh (row 3142)."""
     zeros = jnp.zeros_like(g)
-    if documents is None:
+    if documents is None and restarts is None:
         return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
 
     def segmented(left, right):
@@ -116,10 +124,13 @@ def _cumulated(g, documents=None):
                      for kept, summed in zip(right_sum, total, strict=True))
         return left_start | right_start, *restarted
 
-    changed = jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
-                               documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
-    _, hi, lo = jax.lax.associative_scan(segmented, (jnp.broadcast_to(changed, g.shape), g, zeros),
-                                         axis=g.ndim - 2)
+    changed = jnp.zeros(g.shape, bool)
+    if documents is not None:
+        changed = changed | jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
+                                             documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
+    if restarts is not None:
+        changed = changed | restarts
+    _, hi, lo = jax.lax.associative_scan(segmented, (changed, g, zeros), axis=g.ndim - 2)
     return hi, lo
 
 
@@ -152,19 +163,31 @@ def decays(g, documents=None):
 
     With packed `documents` `[..., C, 1]` (each position's document within its chunk), the sum restarts at
     each document's first position and pairs of positions in different documents weigh zero, masked before
-    exp: a document's decays are its own tokens' alone, the ones it computes run by itself."""
-    hi, lo = _cumulated(g, documents)
+    exp: a document's decays are its own tokens' alone, the ones it computes run by itself.
+
+    A token whose log decay vanishes (`precision.vanishing`: its decay, and every decay through it, zero)
+    restarts the sum too, taken as 0 within it, and every decay through it is zero, as the derived chunk's
+    (`dew.algebra.scan`): summed with the rest, a prefix holding -2**127 twice was -inf (its decays NaN) and
+    one holding -2**70 lost a later -1 to its rounding (a decay of 1 in place of `exp(-1)`)."""
+    vanished = g <= vanishing(g.dtype)
+    hi, lo = _cumulated(jnp.where(vanished, 0.0, g), documents, vanished)
     chunk_size = hi.shape[-2]
-    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
+    # Each position's segment: the vanished tokens at or before it.
+    segments = jnp.cumsum(vanished.astype(jnp.int32), axis=-2)
+    inclusive = (jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
+                 & (segments[..., :, None, :] == segments[..., None, :, :]))
     if documents is not None:
         inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
+    # The decay from a document's start: zero past a vanished token since it.
+    entered = _cumulated(vanished.astype(g.dtype), documents)[0] == 0
     whole, part = compensated_add((hi[..., :, None, :], lo[..., :, None, :]),
                                   (-hi[..., None, :, :], -lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     whole, part = (jnp.where(inclusive, x, 0.0) for x in (whole, part))
-    return grown_from(hi, lo), jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
+    grown = jnp.where(entered, grown_from(jnp.where(entered, hi, 0.0), jnp.where(entered, lo, 0.0)), 0.0)
+    return grown, jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
 
 
 LOG2_E = math.log2(math.e)

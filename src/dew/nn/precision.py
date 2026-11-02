@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import math
 import os
 from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
@@ -994,6 +995,16 @@ def divided(numerator, rate):
     if dtype == jnp.float64:
         return numerator / rate
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
+
+
+def vanishing(dtype, base2: bool = False) -> float:
+    """The exponent at and below which a decay (`exp`, or `exp2` with `base2`) is zero in `dtype`, whatever
+    exponents join it (each at most zero): below the base's logarithm of its least subnormal (`exp(-105)` and
+    `exp2(-151)` are zero in fp32). A prefix summing one with the others loses them (two of -2**127 are
+    -inf; one of -2**70 loses a later -1 to its rounding), so a chunk's decays restart past it
+    (`recurrence_algebra.decays`, `dew.algebra.scan`)."""
+    least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
+    return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
 @_protected
