@@ -6,6 +6,7 @@ and tools/joint_checkpoint_reference.py wrote the fixtures from its code."""
 import base64
 import io
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -449,14 +450,18 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
                                   layout=JointLayout(max_len=768))
     data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
-    runs, states = [], []
-    for index, steps in enumerate((2, 1)):
-        run = tmp_path / f"run{index}"
-        checkpoints = Checkpoints(str(run), keep=1)
-        states.append(Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
-            data, steps=steps, log_every=100, checkpoint_every=steps))
-        checkpoints.wait()
-        runs.append(str(run))
+    # Two runs, of two steps and of one: the one-step run is the two-step run's directory as it stood
+    # after its first step, which the run then resumes from, its step compiled once for both.
+    runs = [tmp_path / "run0", tmp_path / "run1"]
+    checkpoints = Checkpoints(str(runs[0]), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
+    first = trainer.fit(data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    shutil.copytree(runs[0], runs[1])
+    states = [trainer.fit(data, steps=2, log_every=100, checkpoint_every=1), first]
+    checkpoints.wait()
+    runs = [str(run) for run in runs]
+    assert int(states[0].step) == 2 and int(states[1].step) == 1
     stated = data.statistics()
     assert not [name for name in stated if name.startswith(("data/rejected/", "data/cut"))]
     assert all(value == 0 for name, value in stated.items() if name.startswith("data/truncated/"))

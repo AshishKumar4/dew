@@ -579,7 +579,7 @@ def window_segments(kind: str, seed: int, window: int = 3):
 
 
 @pytest.mark.parametrize("kind", ["documents", "packed"])
-@pytest.mark.check1_shards(seeds=512, per_task=35)
+@pytest.mark.check1_shards(seeds=512, per_task=28)
 def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
     """At the corner, each window's gradient alone, by the variables and the states, started from the
     level the literal loop in float64 stands at there rounded to float32 (`window_segments`), on par
