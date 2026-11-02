@@ -725,3 +725,37 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     first, *_ = listed(plan["probes"], "probes", read=record, what="probes")
     assert int(state.step) == 1 and int(state.updates) == 1
     assert plan["split"] == 2 and first["ahead"] is True
+
+
+def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
+    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`) are the programs loaded
+    after saving, each an executable this host's CPU is no target of: loading them here is refused, naming the GPU
+    kind it is not (ledger 2716: an H100 node loads what a CPU host built, and runs it alone)."""
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
+
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    built = compile_programs({"dot": (lambda x, y: x @ y, [square, square]),
+                              "scaled": (lambda x: 2 * x, [square])}, "sm90")
+    assert set(built.programs) == {"dot", "scaled"}
+    assert (built.target.generation, built.target.devices) == ("sm90", 1)
+    built.save(tmp_path / "programs.dew-aot")
+    loaded = AheadPrograms.load(tmp_path / "programs.dew-aot")
+    assert loaded == built
+    with pytest.raises(ValueError, match="device_kind"):
+        loaded.loaded()
+    assert built.target.differences(BuildTarget.of(jax.devices()))
+
+
+def test_a_process_held_to_loaded_programs_refuses_a_compile_and_runs_what_was_compiled():
+    """Within `executable_only`, a function jitted anew fails rather than compiles, and an executable compiled
+    before runs; past it, jitting compiles again (ledger 2716: a node measuring programs compiled ahead fails
+    where one is missing)."""
+    from dew.training.ahead import ExecutableOnly, executable_only
+
+    x = jnp.arange(8.0)
+    compiled = jax.jit(lambda value: value * 3).lower(x).compile()
+    with executable_only():
+        assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
+        with pytest.raises(ExecutableOnly):
+            jax.jit(lambda value: value + 1)(x)
+    assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
