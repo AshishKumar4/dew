@@ -1603,13 +1603,19 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
 
 def _output_swizzle(call: _Call, bv: int, staging: tuple, landing: dict) -> int:
     """The swizzle `_output` stages its keys at under a decay a head (`Kᵀ` read transposed, each load a
-    whole swizzle of its depth, `Family.rhs_fragment_depth`): the widest its key rows fill whose consumer
-    thread's registers fit (`_output_held`, beside its addresses into its `staging` and `landing` tiles),
-    halved down to the narrowest Mosaic stages; the narrowest where none fits, which the launch then refuses.
+    whole swizzle of its depth, `Family.rhs_fragment_depth`): the widest its key rows fill, and where products
+    read their operands from shared memory the memory's value-block rows too, whose consumer thread's
+    registers fit (`_output_held`, beside its addresses into its `staging` and `landing` tiles), halved down
+    to the narrowest Mosaic stages; the narrowest where none fits, which the launch then refuses.
     Nemotron-H 4B's SSD output held a bf16 key block's whole 64-column depth at 128 bytes, 255 registers
-    and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (row 2943)."""
+    and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (row 2943). Warpgroup MMA reads
+    a product's two operands at one transform, and the queries are the left operand of the scores' product
+    and the memory's (`Q Kᵀ`, `Q H`): the keys' swizzle is the memory's, which a 32-wide bf16 block's rows
+    fill at 64 bytes, and at the keys' 128 Mosaic GPU found no layout for the launch."""
     family = call.family
     swizzle = mosaic.widest_swizzle(call.given.stored, call.width)
+    if not family.operands_in_registers:
+        swizzle = min(swizzle, mosaic.widest_swizzle(call.memories.stored, bv))
     while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
             > family.registers(1)):
