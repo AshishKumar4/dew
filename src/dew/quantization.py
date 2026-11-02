@@ -306,10 +306,12 @@ class QuantizedProducts:
     stochastic: bool = False
 
 
-def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
+def quantized_products(module: nn.Module, name: str | None = None) -> QuantizedProducts:
     """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
     bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
-    rules select their paths: the submodule's own, and the scope of each parameter it holds."""
+    rules select their paths: the submodule's own, and the scope of each parameter it holds. Without a
+    `name`, the products `module` forms in its own scope, which Qwix selects by that scope alone (a
+    decoder's tied head, its table multiplied where the decoder runs)."""
     trace: QuantizedTrace | None = QUANTIZED_TRACE.value
     if trace is None:
         return QuantizedProducts(inputs=False, weights=False)
@@ -317,9 +319,12 @@ def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
     if policy is None:
         # A trace that names no policy (a provider of the caller's own) may quantize anything.
         return QuantizedProducts(inputs=True, weights=True, stochastic=True)
-    scope = (*module.path, name)
-    params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
-    scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
+    if name is None:
+        scopes = {tuple(module.path)}
+    else:
+        scope = (*module.path, name)
+        params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
+        scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
     if all(policy.rule_for(path) is None for path in scopes):
         return QuantizedProducts(inputs=False, weights=False)
     # Whether a product the rule selects rounds stochastically, a weight-only rule's matmuls among them,

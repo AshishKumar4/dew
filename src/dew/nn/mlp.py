@@ -18,9 +18,11 @@ from dew.nn.dropout import Dropout
 
 from .activations import (
     UNGATED,
+    XIELU,
     Activation,
     GatedActivation,
     Situ,
+    Xielu,
     gated_product,
     packed_gated_product,
     swiglu_clamped,
@@ -181,6 +183,9 @@ class GatedMLP(nn.Module):
             self.up_proj = dense(projections[up][1], name=up)
         self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
+        if self.activation == XIELU:
+            # A learned activation, its parameters under the reference's own name (`act_fn`).
+            self.act_fn = Xielu(name='act_fn')
         if self.dropout_rate:
             # Only where it drops: two MLPs sharing one owner's scope (`joint.embedding`) hold one name.
             self.dropout = Dropout(rate=self.dropout_rate)
@@ -273,9 +278,15 @@ class GatedMLP(nn.Module):
     def _activation(self) -> GatedActivation | Activation:
         """The gated product's activation (a name `gated_product` reads, or Situ), else the
         ungated MLP's function."""
+        if self.activation == XIELU:
+            return self._learned
         if isinstance(self.activation, str):
             return UNGATED.get(self.activation, self.activation)
         return self.activation
+
+    def _learned(self, hidden):
+        """The ungated MLP's learned activation (`Xielu`)."""
+        return self.act_fn(hidden)
 
     def _gated(self) -> bool:
         return isinstance(self._activation(), (str, Situ))

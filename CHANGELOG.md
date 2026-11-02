@@ -36,6 +36,35 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   state moves) run the executable they fetched once (`dew.nn.kernels.options.Fetched`), building no dispatch
   key a step; a race keeps its programs for the curriculum it is at and makes them again where it changes.
   Source that builds an `OuterProgram` outside `dew.nn.kernels.options` is reported (SLOP025).
+- A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
+  a logit softcap or a head transform: its rate bounds the window's curvature along the step from the
+  head's bounds (`head_bounds`) and the activation's derivatives, so it never overshoots, and stays
+  non-expansive where the loss is convex (an affine head, `up` alone). Its terms read the level's inputs as
+  its maps multiply them, a checkpoint's quantizer applied, and its rate is a constant of the step. A step
+  of `down` under ReLU, a head map that rounds its input or whose kernel Qwix rounds, a step of a level
+  kernel Qwix rounds, and a step of `down` through an `up` that rounds stay refused, as no curvature
+  bounds them (ReLU's and a quantized head were refused before, with every head but an affine one).
+- API changes for a model that holds a continuum level: `dew.nn.continuum.Continuum` takes the residual
+  stream's width as a required `features` field, as its maps are built in `setup`; the `SteppedInContext`
+  hook `affine_head` is gone, replaced by `head_bounds` (bounds on a slot loss's curvature and slope in the
+  states the head reads) and `level_terms` (what bounds a damped step of the level), which
+  `CausalTransformer` and `MultimodalTransformer` implement.
+- A pipelined run's state is stage-local: over a stage axis of S, each device holds its own stage's layers
+  of each run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run, and every rule
+  of Dew's optimizers reads a stacked leaf as its stored layers. An LM's decoder, a decision's backbone,
+  PPO's policy and critic, a DiT's, a JEPA's and a UNet level's stacks are stage-local; an objective that
+  declares no stack logs that its run keeps every layer whole. `fit` returns and an `Observe` reads the
+  state as the run holds it, which the model reads off the mesh as its stored layers; `Trainer.stored`
+  and `Trainer.staged` convert between that state and every layer whole. A checkpoint holds every layer
+  as one device's would and resumes onto any stage count.
+  `Layout(stage_local=False)` keeps every layer whole on every stage, as does a run whose optax
+  transformation may read a parameter whole, a Gauss-Newton run and a DiLoCo run.
+- A mixture a run bounds in examples counts each member's source examples where their rows are delivered,
+  and what a step after the mix refuses of a member's rows under that member, through objective steps,
+  batched steps, packs, windows and the shuffles after them (they were counted as the mix drew them, and
+  refused under the mixture). A data position now records its counters' format. A position saved before
+  counts its mixture's members afresh from the resume. The examples a counter, a causal window or a
+  completion held in flight count in its total and on its clock as before, and complete no member's.
 - A step compiled ahead for GPUs with none attached compiles with XLA's autotuning off, unless `XLA_FLAGS` sets it: its programs
   and their memory are the same, and its fit search compiles each rung about a third faster.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
@@ -73,11 +102,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
-- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
-  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
-  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
-  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
-  (docs/installation.md lists each fix).
+- Dew requires its JAX build 0.12.0.1.post45, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins and their PJRT plugins, which Dew's package index serves: Mosaic GPU honours a kernel's
+  register raises (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC
+  blocks by their strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and
+  `griddepcontrol`, and Triton's pipeliner gives a tile a wgmma reads from shared memory, and another use
+  reads in registers, a buffer of its own a stage, so Pallas Triton attention's dK on an H100 is right and the
+  same every run (docs/installation.md lists each fix). The register raises hold from post43, whose PJRT
+  plugin, where Mosaic GPU compiles a kernel, is Dew's build too.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.

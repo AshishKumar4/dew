@@ -478,23 +478,28 @@ class LoadName:
     pattern: str | None
 
 
-def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
+def load_names(model: PreTrainedModel, inventory: Collection[str] | None = None
+               ) -> Callable[[str], LoadName] | None:
     """The name `model`'s transformers load gives each stored key (`convert_and_load_state_dict_in_model`,
     by the conversion mapping it keeps for the model, `get_model_conversion_mapping`): every renaming,
     then at most one converter, the base model's prefix added or dropped as the model holds the name,
-    and the stored name itself where only it is held. None where a renaming renames a key by whether
-    another is stored (`GroupWeightRename`), which no read of one name tells: the caller leaves such a
-    checkpoint to transformers' own load."""
+    and the stored name itself where only it is held. Where a renaming renames a key by whether another
+    is stored (`GroupWeightRename`), the whole pipeline runs once over the checkpoint's `inventory` in
+    the order transformers' load iterates it (`dot_natural_key`), each key's name the one that pass
+    gives it, as that load names it; None where it holds one and no inventory is given, which no read
+    of one name tells."""
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
         GroupWeightRename,
         WeightConverter,
         WeightRenaming,
+        dot_natural_key,
         rename_source_key,
     )
 
     transforms = get_model_conversion_mapping(model)
-    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+    grouped = any(isinstance(transform, GroupWeightRename) for transform in transforms)
+    if grouped and inventory is None:
         return None
     renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
@@ -508,4 +513,9 @@ def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
             converter for converter in converters if pattern in converter.source_patterns)
         return LoadName(name, rename_source_key(stored, renamings, [])[0], converter, pattern)
 
-    return loaded
+    if not grouped:
+        return loaded
+    # One pass in the load's own order: a group renames its later keys once it has seen its first
+    # pattern's (`GroupWeightRename.rename_source_key`), each key as renamed by the renamings before it.
+    named = {stored: loaded(stored) for stored in sorted(inventory or (), key=dot_natural_key)}
+    return lambda stored: named[stored] if stored in named else loaded(stored)

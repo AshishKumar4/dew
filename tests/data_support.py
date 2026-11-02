@@ -1,6 +1,7 @@
 """What the data suites share: Grain's flags parsed for its worker processes, a caption reader that
 hands the words back, the caption templates and host augmentation the image suites draw from, a
-random step that draws a wide integer, and objectives' expansions of a record into rows of it."""
+random step that draws a wide integer, objectives' expansions of a record into rows of it, a step that
+refuses every n-th record and a draw configured for the run."""
 
 import dataclasses
 import itertools
@@ -53,6 +54,42 @@ class Fanned:
     def flat_map(self, element):
         record = int(element["id"])
         return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
+
+
+class Twice:
+    """An objective's expansion of each record, or packed window, into two rows of it (`FlatMap.examples`)."""
+
+    identity = "twice@1"
+
+    def flat_map(self, element):
+        return (element, element)
+
+
+@dataclasses.dataclass(frozen=True)
+class Keeps:
+    """Rejects a record whose id is a multiple of `every`, permanently: a record steps cannot make."""
+
+    every: int
+    identity = "keeps@1"
+    rejects = True
+
+    def __call__(self, row):
+        from dew.data.pipeline import Rejected
+
+        return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
+
+
+class _Passing(grain.RandomMapTransform):
+    """A random step that keeps each record as it is."""
+
+    def random_map(self, element, rng):
+        return element
+
+
+def jittered(metadata):
+    """A random step configured for the run (`Configured(jittered, ..., random=True)`), which binds to a
+    random map (`RandomMap`) that keeps each record."""
+    return _Passing()
 
 
 @dataclasses.dataclass(frozen=True)

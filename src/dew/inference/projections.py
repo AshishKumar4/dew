@@ -65,7 +65,8 @@ def _placed_alike(leaves: Sequence[object]) -> bool:
     heads, an FSDP layout's widest axis) would leave its packed columns on another member's
     devices, and members in different memory spaces (one offloaded to pinned host memory, which the
     layer stages on its own) do not concatenate where they are, so either keeps its group apart."""
-    if all(isinstance(leaf, np.ndarray) for leaf in leaves):
+    if all(isinstance(leaf, np.ndarray) for leaf in leaves) or all(
+            isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves):
         return True
     arrays = [leaf for leaf in leaves if isinstance(leaf, jax.Array)]
     if len(arrays) != len(leaves):
@@ -85,7 +86,7 @@ def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
     return group.packed in node or (_same_quantization(variables, group) and "kernel" in fields
                                     and fields <= {"kernel", "bias"} and all(
         set(projection) == fields for projection in held) and all(
-        isinstance(projection[field], (jax.Array, np.ndarray))
+        isinstance(projection[field], (jax.Array, np.ndarray, jax.ShapeDtypeStruct))
         and projection[field].dtype == held[0][field].dtype
         and projection[field].shape[:-1] == held[0][field].shape[:-1]
         for projection in held for field in fields) and all(
@@ -253,8 +254,14 @@ def _joined(variables: Variables, groups: Sequence[ProjectionGroup],
 def pending(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
     """The groups `model` reads packed that `variables` hold unpacked and can pack
     (`projection_groups`), compared on these concrete values: what a generation over a borrowed
-    tree, a live objective's, packs inside its compiled call (`packed_in_call`)."""
+    tree, a live objective's, packs inside its compiled call (`packed_in_call`). A stage-local run's
+    store, which the call cuts onto its layers first (`stored_layers`), is compared as that cut, by
+    its shapes alone: the call lays the packed leaves out."""
+    from dew.nn.backbones.layer_names import stage_count, stored_layers
+
     variables = unfreeze(dict(variables))
+    if stage_count(variables) > 1:
+        variables = unfreeze(dict(jax.eval_shape(lambda tree: stored_layers(model, tree), variables)))
     return tuple(group for group in _projection_groups(model, variables)
                  if group.packed not in _node(variables, "params", group.path))
 

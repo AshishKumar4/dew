@@ -76,7 +76,7 @@ The same objective trains a low-rank adapter without any change. Given `adapter.
 
 `variables=None` means the objective's own configured input, which is what a plain `init(key)` uses. The trainer always passes the tree through the initializer, so nothing is read off the objective inside the trace. Because the tree is an argument, it stays an argument however deeply `init` nests its own `jax.jit`. An objective that wraps another passes the held tree on to that objective's `init`. A subclass of an objective that holds weights must accept the `variables` parameter; if it does not, the call raises.
 
-The state is built in one place, `Trainer.initial_state(initializer=None, key=None)`, and each argument left as `None` is taken from the run. `Trainer.place` calls it once for the shapes and once for the values, so `trainer.initial_state()` returns the state a run starts from.
+The state is built in one place, `Trainer.initial_state(initializer=None, key=None)`, and each argument left as `None` is taken from the run. `Trainer.place` calls it once for the shapes and once for the values, so `trainer.initial_state()` returns the state a run starts from, every layer whole; a run over a stage axis starts from it stacked by stage, as `Trainer.staged` gives it.
 
 ## Several networks, several optimizers
 

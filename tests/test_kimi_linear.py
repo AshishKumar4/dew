@@ -17,7 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
+from kimi_support import RECORDING, assert_greedy_as_exact, drawn_batch, exported, kimi_source, recorded_dew
+from reference_runs import assert_as_exact_as_recorded
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "kimi-linear-tiny"
@@ -28,15 +29,20 @@ def source():
     return kimi_source(TINY)
 
 
-def test_forward_matches_the_reference_over_left_padding(source):
-    """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
-    by 9, against fla 0.4.0 on CUDA in IEEE fp32
-    (tools/kimi_linear_reference.py): Dew's RMS distance from the float64
-    logits at most twice the reference's, and argmax exact. The reference
-    sits 1.04e-6 from float64 (RMS); Dew at 0.88 of that on CPU, 0.79 on an
-    AVX-512 CPU (Intel SDE's Ice Lake server, the CI runners' ISA) and 0.68
-    on an RTX 4080."""
-    assert_forward_as_exact(source)
+FIXTURE = TINY / RECORDING
+OUTPUTS = ("logits",)
+"""The leaves `dew` gives, the site's recorded leaves (tools/venv_reference.py's `kimi-linear`)."""
+SEEDS = 8
+"""The declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
+draw = drawn_batch
+dew = recorded_dew(TINY, OUTPUTS)
+
+
+def test_forward_matches_the_reference_over_left_padding():
+    """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, on par
+    with fla 0.4.0's on CUDA in IEEE fp32 over the recorded seeds (check 1, tools/venv_reference.py
+    kimi-linear), Dew's float64 forward the truth."""
+    assert_as_exact_as_recorded(FIXTURE, "kimi-linear", SEEDS, draw, dew, "Kimi Linear's logits")
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):

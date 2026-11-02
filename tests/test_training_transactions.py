@@ -278,15 +278,17 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     def trained(threshold, first, second):
         train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
         initial = train.initial_state()
-        # The step consumes the state: what the expectation reads of it is taken first.
+        # The step consumes the state: what the expectation reads of it is taken first, each layer on its
+        # stored layers as `stored` gives a stage-local state's.
         start = jax.tree.map(np.asarray, initial.variables["params"])
         opt_state = jax.tree.map(np.asarray, initial.opt_state)
-        run = train.compile(initial, first)
-        partial, *_ = run(initial, first)
-        pooled = jax.tree.map(np.asarray, partial.accumulation.qk_stats)
+        held = train.staged(initial)
+        run = train.compile(held, first)
+        partial, *_ = run(held, first)
+        pooled = jax.tree.map(np.asarray, train.stored(partial).accumulation.qk_stats)
         final, *_ = run(partial, second)
         assert int(final.updates) == 1
-        return start, opt_state, pooled, jax.tree.map(np.asarray, final.variables["params"])
+        return start, opt_state, pooled, jax.tree.map(np.asarray, train.stored(final).variables["params"])
 
     _, _, heard, _ = trained(.05, quiet, spoken)
     assert all(np.all(peak == 0) for peak in _maxima(heard))

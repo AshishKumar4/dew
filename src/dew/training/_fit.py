@@ -54,7 +54,7 @@ from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episo
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
-from dew.training.profiling import ProfileWindow, start_capture
+from dew.training.profiling import ProfileWindow, start_capture, stop_capture
 from dew.training.rollout import Rollout
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
@@ -388,6 +388,13 @@ class FitRun:
                 and seen >= profile.warmup and compiled):
             start_capture(profiler)
             self.tracing = True
+
+    def close_window(self, profiler: Profiler) -> None:
+        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
+        it until the run's cleanup waits for them and its outcome reports the window
+        (`Trainer._reported_outcome`)."""
+        stop_capture(profiler, self.loss)
+        self.profiled = (self.traced, self.current)
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
