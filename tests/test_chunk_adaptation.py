@@ -467,7 +467,7 @@ def chain_loop(model, variables, hidden, targets, weights, fields, adaptation: C
                                   for at in range(len(names))])
         return (levels, summed, energies, count + here_real, opened, document, begun), loss
 
-    empty = jnp.stack([_gathered(jnp.zeros((1, 1), bool), jnp.zeros((1, 1, _WIDTH), jnp.float32))[0]]
+    empty = jnp.stack([_gathered(jnp.zeros((1, 1), bool), jnp.zeros((1, 1, _WIDTH), hidden.dtype))[0]]
                       * len(names))
 
     def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
@@ -1393,7 +1393,7 @@ def test_qwixs_unit_scale_bounds_an_operands_growth_by_two(dtype, calibration, g
     model = _qwix("continuum/up", calibration, dtype=jnp.dtype(dtype))
     variables = drawn_variables(0, model)
     terms = model.apply(variables, hidden.astype(dtype), ("up",), method="level_terms")
-    assert terms[3] == grown
+    assert terms.up_growth == grown
     # Qwix's own rounding of the kernel `up` multiplies by, each output column its channel.
     kernel = jnp.asarray(variables["params"]["continuum"]["up"]["kernel"], dtype)
     rounded = qwix.dequantize(qwix.quantize(kernel, jnp.int8, channelwise_axes=(1,),
@@ -1412,8 +1412,8 @@ def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
     for calibration, clip in (("absmax", 1.0), ("absmax,0.8", 0.8)):
         model = _qwix("continuum/up", calibration)
         rounded = model.apply(drawn_variables(0, model), hidden, ("up",), method="level_terms")
-        assert rounded[3] == 1 + math.sqrt(4) * clip / 255 and plain[3] == 1.0
-        assert np.all(np.asarray(rounded[1]) > np.asarray(plain[1]))
+        assert rounded.up_growth == 1 + math.sqrt(4) * clip / 255 and plain.up_growth == 1.0
+        assert np.all(np.asarray(rounded.inputs) > np.asarray(plain.inputs))
 
 
 def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
@@ -1421,11 +1421,11 @@ def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
     checkpoint's quantizer of `down`'s input at a scale that rounds every state to zero zeroes each
     state's |x|^2, and one of `up`'s each slot's |f|^2, where the unquantized level's are positive."""
     _, hidden, _, _ = draw(0, scale=0.5)
-    for site, term in (("continuum/down", 0), ("continuum/up", 1)):
+    for site, term in (("continuum/down", "squares"), ("continuum/up", "inputs")):
         model = _checkpoint(site)
-        plain = MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms")[term]
-        rounded = model.apply(_scaled(drawn_variables(0, model), 1e30), hidden, ("up",),
-                              method="level_terms")[term]
+        plain = getattr(MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms"), term)
+        rounded = getattr(model.apply(_scaled(drawn_variables(0, model), 1e30), hidden, ("up",),
+                                      method="level_terms"), term)
         assert np.all(np.asarray(plain) > 0), site
         assert not np.any(np.asarray(rounded)), site
 
