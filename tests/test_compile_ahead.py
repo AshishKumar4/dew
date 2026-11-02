@@ -817,16 +817,20 @@ def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
     told, release = threading.Event(), threading.Event()
 
     class Slow(Compiles):
-        """An open block that takes its time over each event it is told."""
+        """An open block that takes its time over each event of its function it is told."""
 
         def heard(self, kind, duration_secs, metadata):
-            told.set()
-            release.wait(60)
+            if metadata.get("fun_name") == self.name:
+                told.set()
+                release.wait(60)
             super().heard(kind, duration_secs, metadata)
 
-    compiles = Slow(None).__enter__()
+    def elevenfold(value):
+        return value * 11
+
     x = jnp.arange(8.0)
-    compiler = threading.Thread(target=lambda: jax.jit(lambda value: value * 11).trace(x))
+    compiles = Slow("elevenfold").__enter__()
+    compiler = threading.Thread(target=lambda: jax.jit(elevenfold).trace(x))
     compiler.start()
     assert told.wait(60)
     closed = []
