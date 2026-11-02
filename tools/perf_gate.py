@@ -21,8 +21,7 @@ regression.
 The battery is the training step (a dense and an MoE decoder, a DiT, an
 MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
 VAE's decoder, LM serving at 32 and 128 slots, a full-depth Dory server's warm compile,
-attention forward and backward, a serving admission's left-padded cache prefill, the image input
-pipeline and a checkpoint's save and restore.
+attention forward and backward, the image input pipeline and a checkpoint's save and restore.
 docs/performance.md, "The performance gate", says how it runs before main
 takes a commit.
 """
@@ -124,32 +123,6 @@ for _ in range(3):
 if sys.argv[2:] != ["--peak-run"]:
     print(json.dumps({"save_ms": 1e3 * sorted(saves)[1], "restore_ms": 1e3 * sorted(restores)[1],
                       "peak_device_bytes": None if None in peaks else max(peaks)}))
-"""
-
-
-# A serving admission's cache prefill: 8 prompts of 256, every other left-padded by 37, through Qwen3-0.6B's
-# widths at full depth (random weights) into a cache of 1024 slots a row, its attention the selector's own:
-# the padded cursor mask's route, which docs/performance.md measured cuDNN's bias at 4.0 against xla's
-# 6.2 ms over 28 layers and a selector change sent back to xla unmeasured (ledger 3676).
-PREFILL = """
-import json, statistics, sys
-import jax, jax.numpy as jnp
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.telemetry.benchmark import samples
-rows, length = 8, 256
-model = CausalTransformer(vocab_size=151936, emb_features=1024, num_layers=28, num_heads=16, num_kv_heads=8,
-                          head_dim=128, mlp_features=3072, max_seq_len=1024, dtype=jnp.bfloat16)
-ids = jax.random.randint(jax.random.key(0), (rows, length), 0, 151936)
-valid = jnp.ones((rows, length), bool).at[::2, :37].set(False)
-params = model.init(jax.random.key(1), ids[:, :8])
-cache = jax.jit(lambda params: model.apply(params, rows, method=CausalTransformer.init_cache,
-                                           mutable=['cache'])[1]['cache'])(params)
-def prefilled(params, cache, ids):
-    variables = {**params, 'cache': cache}
-    return model.apply(variables, ids, attention_mask=valid, decode=True, mutable=['cache'])[0]
-prefill = jax.jit(prefilled)
-print(json.dumps({"prefill_ms": 1e3 * statistics.median(samples(prefill, params, cache, ids, warmup=5,
-                                                                repeats=30))}))
 """
 
 
@@ -308,9 +281,6 @@ PROBES = [
                              "--out", str(out)],
           lambda _, out: (lambda pipeline: (pipeline["images_per_second"], peak(pipeline)))(
               json.loads(out.read_text())["pipeline"]["device_crop_flip_jitter"])),
-    Probe((Row("prefill qwen3-0.6b 8x256 left-padded", "ms", ""),),
-          lambda _, out: [str(_script(out, PREFILL))],
-          lambda printed, _: (json.loads(printed.strip().splitlines()[-1])["prefill_ms"],)),
     Probe((Row("checkpoint lm-dense save", "ms", ""), Row("checkpoint lm-dense restore", "ms", ""),
            Row("peak checkpoint lm-dense save and restore", "GiB", "")),
           lambda _, out: [str(_script(out, CHECKPOINT)),

@@ -114,12 +114,10 @@ def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
         commands.append(command)
         if command[1] == "-c":
             return subprocess.CompletedProcess(command, 0, f"{STANDING_IN}\n", "")
-        # The checkpoint's and the prefill's scripts, written beside their probes' outputs.
+        # The checkpoint's script, written beside its probe's output.
         if Path(command[1]).is_file() and Path(command[1]).read_text() == gate.CHECKPOINT:
             printed = json.dumps({"save_ms": 5.0, "restore_ms": 6.0, "peak_device_bytes": peak})
             return subprocess.CompletedProcess(command, 0, printed + "\n", "")
-        if Path(command[1]).is_file() and Path(command[1]).read_text() == gate.PREFILL:
-            return subprocess.CompletedProcess(command, 0, json.dumps({"prefill_ms": 5.0}) + "\n", "")
         tool = Path(command[1]).name
         flag = "--json-out" if "--json-out" in command else "--out"
         Path(after(command, flag)).write_text(json.dumps(outputs[tool](command)))
