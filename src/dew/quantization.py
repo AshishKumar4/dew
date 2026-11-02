@@ -517,7 +517,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
-        product = product + module.get_variable("params", "bias").astype(jnp.float32)
+        product = product + unboxed(module.get_variable("params", "bias")).astype(jnp.float32)
     dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
     return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
 

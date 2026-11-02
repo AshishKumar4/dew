@@ -104,7 +104,7 @@ from ..precision import (
 from ..progress import Progress
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages
+from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages, unboxed
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
@@ -2111,7 +2111,8 @@ class CausalTransformer(nn.Module):
     def applied_kernel(self, name: str) -> jax.Array:
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
-        return getattr(self, name).get_variable("params", "kernel")
+        # `get_variable` hands back the box the kernel was drawn in (`nn.with_logical_partitioning`).
+        return unboxed(getattr(self, name).get_variable("params", "kernel"))
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

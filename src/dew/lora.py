@@ -1070,8 +1070,9 @@ def bound_layouts(model: nn.Module, variables: Variables,
     """
     if layouts:
         return layouts
+    # A draw boxes the kernels its modules declare the axes of; their shapes are their values'.
     derived = {".".join(module): _kernel_layout(module, kernel)
-               for module, kernel in _kernels(variables.get("params", {}), ())
+               for module, kernel in _kernels(unboxed(variables).get("params", {}), ())
                if kernel.ndim == 2}
     if not derived:
         raise ValueError(

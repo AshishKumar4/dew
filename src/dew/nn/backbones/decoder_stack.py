@@ -1010,8 +1010,10 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
             lambda index, stage: jax.tree.map(lambda value: jax.lax.dynamic_slice_in_dim(
                 jax.lax.dynamic_index_in_dim(value, index, 0, keepdims=False),
                 view.offset + stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
+        # A box its module drew a parameter in carries the stage axis unnamed (`stack_layers`).
         run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
-                      in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
+                      in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS,
+                      metadata_params={nn.PARTITION_NAME: None})
         live = (step - stage_ids >= 0) & (step - stage_ids < count)
         out = _on_stage_axis(run(stage(module), stages_in, stage_inputs,
                                  jax.tree.map(lambda value: gather(value, ids), held), live))
@@ -1020,7 +1022,8 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
         return (state_io, shift_down(out)), None
 
     loop = nn.scan(iteration, variable_broadcast=view.broadcast,
-                   variable_axes={True: 0}, split_rngs={True: True})
+                   variable_axes={True: 0}, split_rngs={True: True},
+                   metadata_params={nn.PARTITION_NAME: None})
     (state_io, _), _ = loop(model, (state_io, shift), jnp.arange(count + stages - 1))
     # Microbatch 0 finished stages - 1 iterations in, so it sits that
     # many slots along; the rest follow it in order.
