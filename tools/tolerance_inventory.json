@@ -437,10 +437,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_mamba2_interop.py": {
-   "comparisons": 3,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_masked_diffusion.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"

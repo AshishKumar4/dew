@@ -95,22 +95,24 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
                     f"a static count passed {pass_n}", seeds=16)
 
 
+def _shared_products(a, x, y):
+    """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
+    a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
+    return jnp.dot(a, x) + jnp.dot(a, y)
+
+
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     """Under the run's accurate numerics (`precision="accurate"`, `generation.run_precision`) the pass admits
     the `exact` sets alone (docs/design/algebra.md §1.4): two products of a shared operand, summed, which the
     default numerics join into one, stay two (`dot_general` counted) and compute what they compute."""
     from dew.nn.precision import ACCURATE
 
-    def contracted(a, x, y):
-        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
-        return jnp.dot(a, x) + jnp.dot(a, y)
-
     operands_ = rows(1, (256, 64), (64, 64), (64, 64))
     with generation.run_precision(ACCURATE), report.refusals():
-        accurate = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
+        accurate = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
         # Its numerics admit commutativity alone, which XLA's HloCSE takes already: no pass runs.
         assert not report.rewrites()
-    default = jax.make_jaxpr(algebra.rewritten(contracted))(*operands_)
+    default = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
     assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
 
@@ -132,19 +134,15 @@ def test_products_with_a_shared_operand_join_into_one():
     """Two matrix products with one shared operand (`dot_general`), summed, become one product of the shared
     operand with the summed other, their operands bounded (tanh's) so the range facts bound the new sum
     (§6.3): a contraction is bilinear, and the product's FLOPs halved outweigh the sum's operations."""
-    def contracted(a, x, y):
-        a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
-        return jnp.dot(a, x) + jnp.dot(a, y)
-
     shapes = ((256, 64), (64, 64), (64, 64))
-    after = jax.make_jaxpr(algebra.rewritten(contracted))(*rows(1, *shapes))
+    after = jax.make_jaxpr(algebra.rewritten(_shared_products))(*rows(1, *shapes))
     assert sum(equation.primitive.name == "dot_general" for equation in equations(after)) == 1
 
     def draw(seed):
         return rows(seed, *shapes)
 
-    assert_as_exact(jax.jit(algebra.rewritten(contracted)), jax.jit(contracted), draw, "two products",
-                    seeds=16)
+    assert_as_exact(jax.jit(algebra.rewritten(_shared_products)), jax.jit(_shared_products), draw,
+                    "two products", seeds=16)
 
 
 @pytest.mark.parametrize("shared", ["left", "right"])

@@ -815,6 +815,21 @@ variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."
 
 
 
+def _form(name: str, dtype) -> dict:
+    """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
+    an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
+    wide for its skip."""
+    return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
+
+
+def _skipped(name: str, dtype) -> dict:
+    """The skip a rated scan's 16-bit call fuses into the template's output and reverse walk under the run's
+    fast forms (`recurrence_chunk._rated_scan`), its value heads' `[HV]`, as its route hands it."""
+    if name not in RATED or jnp.dtype(dtype).itemsize != 2:
+        return {}
+    return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
+
+
 def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
@@ -838,7 +853,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
                                      floor=resource_floor(name), bound=None if name in RATED else 1.0,
-                                     **form(name, dtype), **skipped(name, dtype))
+                                     **_form(name, dtype), **_skipped(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             held = Unbudgeted().derived(bound, facts)
@@ -857,11 +872,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
-            unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
+            unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
                     max_segments=8 if packed else None, floor=resource_floor(name), **unwide,
-                    **skipped(name, dtype)):
+                    **_skipped(name, dtype)):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -886,19 +901,6 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                 for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
-    def form(name: str, dtype) -> dict:
-        """The call's form beside its operands under the run's fast forms (`rounded`, `fast_rounding`, an fp32
-        call's operands in two parts), as its route gives it: a rated scan's without the delta rule and wide
-        for its skip."""
-        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
-
-    def skipped(name: str, dtype) -> dict:
-        """The skip a rated scan's 16-bit call fuses into the template's output and reverse walk under the
-        run's fast forms (`recurrence_chunk._rated_scan`), its value heads' `[HV]`, as its route hands it."""
-        if name not in RATED or jnp.dtype(dtype).itemsize != 2:
-            return {}
-        return {'skip': jax.ShapeDtypeStruct((RESOURCE_SHAPES[name][1],), jnp.float32)}
-
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, _ = RESOURCE_SHAPES[name]
 
@@ -908,11 +910,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
                  f"{' packed' if packed else ''} {kind}{tiles}")
         plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
-        unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
+        unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or mainloop_backward.backward_holds(
                 *args, tiles=tiles, family=family, target=facts, starts=starts,
-                floor=resource_floor(name), **unwide, **skipped(name, dtype))
+                floor=resource_floor(name), **unwide, **_skipped(name, dtype))
         if not held:
             # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`,
             # as at the derived tiles): the launches its model refuses held apart (`apart_failures`).
@@ -924,10 +926,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             if training:
                 given += [array(rows, length, value_heads, value_width),
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
-            formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
+            formed = {key: value for key, value in _form(name, dtype).items()
+                      if key != 'wide' or not training}
             run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
                                     floor=resource_floor(name))
-            skip = list(skipped(name, dtype).values())
+            skip = list(_skipped(name, dtype).values())
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)

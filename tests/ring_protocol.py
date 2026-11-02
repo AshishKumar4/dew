@@ -217,18 +217,16 @@ def _commit(self: _Interpreter, equation, values) -> list:
     return self.emit("commit")
 
 
-def _get(self: _Interpreter, equation, values) -> list:
-    ref = values[0]
-    if isinstance(ref, Ref):
-        self.emit("read", _slot(ref, equation.params["tree"], values[1:]))
-    return [None] * len(equation.outvars)
+def _access(kind: str, indexed: int) -> Callable:
+    """A ref's access, an event of `kind` at the slot its indexers name, the equation's values from `indexed`
+    on: a get's after its ref, a swap's after its ref and the value it writes."""
+    def access(self: _Interpreter, equation, values) -> list:
+        ref = values[0]
+        if isinstance(ref, Ref):
+            self.emit(kind, _slot(ref, equation.params["tree"], values[indexed:]))
+        return [None] * len(equation.outvars)
 
-
-def _swap(self: _Interpreter, equation, values) -> list:
-    ref = values[0]
-    if isinstance(ref, Ref):
-        self.emit("write", _slot(ref, equation.params["tree"], values[2:]))
-    return [None] * len(equation.outvars)
+    return access
 
 
 def _product(self: _Interpreter, equation, values) -> list:
@@ -243,8 +241,8 @@ def _product_wait(self: _Interpreter, equation, values) -> list:
 
 SYNC: dict[str, Callable] = {
     "barrier_wait": _wait, "barrier_arrive": _arrive, "copy_gmem_to_smem": _load,
-    "copy_smem_to_gmem": _store, "wait_smem_to_gmem": _store_wait, "commit_smem": _commit, "get": _get,
-    "swap": _swap, "wgmma": _product, "wgmma_wait": _product_wait,
+    "copy_smem_to_gmem": _store, "wait_smem_to_gmem": _store_wait, "commit_smem": _commit,
+    "get": _access("read", 1), "swap": _access("write", 2), "wgmma": _product, "wgmma_wait": _product_wait,
 }
 """Each primitive of the toolkit's synchronization and shared memory, as an `Event`."""
 

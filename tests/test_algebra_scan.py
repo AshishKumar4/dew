@@ -65,16 +65,16 @@ def operands(x, dt, B, C) -> dict:
     return {"x": x, "dt": dt, "B": B, "C": C, "rate": jnp.float32(RATE), "skip": jnp.float32(SKIP)}
 
 
-def chunk_of(values: dict, index: int) -> dict:
+def chunk_of(values: dict, index: int, axes: dict = OPERANDS) -> dict:
     tokens = slice(index * CHUNK, (index + 1) * CHUNK)
-    return {name: value[tokens] if OPERANDS[name][:1] == ("time",) else value
+    return {name: value[tokens] if axes[name][:1] == ("time",) else value
             for name, value in values.items()}
 
 
-def walk(forms, values, chunks: range, state):
+def walk(forms, values, chunks: range, state, axes: dict = OPERANDS):
     outputs = []
     for index in chunks:
-        chunk = chunk_of(values, index)
+        chunk = chunk_of(values, index, axes)
         prepared = forms.prepare(chunk)
         outputs.append(forms.mapped(prepared, state))
         state = forms.step(state, prepared)
@@ -246,6 +246,17 @@ def kimi_draw(seed):
     return q, k, v, jnp.asarray(-(10.0 ** rng.uniform(-3, 0, (TOKENS, KEY))), jnp.float32), beta
 
 
+def gated_walk(forms, axes: dict):
+    """`forms`' chunks walked over a gated rule's operands (`axes`, `GATED`'s or `KIMI`'s) from a zero state:
+    the outputs and the final state, as `gated_tokenwise` gives them."""
+    def walked(q, k, v, g, beta):
+        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        outputs, state = walk(forms, values, range(TOKENS // CHUNK), forms.init({}), axes)
+        return jnp.concatenate(outputs), forms.finish(state, values)
+
+    return walked
+
+
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
     (gated_delta, GATED, gated_draw), (gated_delta_written_as_error, GATED, gated_draw),
     (kimi_delta, KIMI, kimi_draw), (kimi_delta_written_as_error, KIMI, kimi_draw)],
@@ -257,19 +268,8 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
     1), decays down to 1e-3 a token."""
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-
-    def derived(q, k, v, g, beta):
-        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
-        state, outputs = forms.init({}), []
-        for index in range(TOKENS // CHUNK):
-            chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-            prepared = forms.prepare(chunk)
-            outputs.append(forms.mapped(prepared, state))
-            state = forms.step(state, prepared)
-        return jnp.concatenate(outputs), forms.finish(state, values)
-
-    assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(update_fn)), draw_fn, update_fn.__name__,
-                    seeds=16)
+    assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn)), draw_fn,
+                    update_fn.__name__, seeds=16)
 
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
@@ -280,18 +280,7 @@ def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
     with generation.assumed(target):
         forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-
-        def derived(q, k, v, g, beta):
-            values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
-            state, outputs = forms.init({}), []
-            for index in range(TOKENS // CHUNK):
-                chunk = {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
-                prepared = forms.prepare(chunk)
-                outputs.append(forms.mapped(prepared, state))
-                state = forms.step(state, prepared)
-            return jnp.concatenate(outputs), forms.finish(state, values)
-
-        assert_as_exact(jax.jit(derived), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
+        assert_as_exact(jax.jit(gated_walk(forms, GATED)), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
                         f"gated delta on {target}", seeds=8)
 
 
@@ -417,22 +406,14 @@ def test_a_chunks_later_decays_keep_their_digits_after_a_vanished_one():
     `2^127` from the second token on: the token scan's output is `(1 + e^-1) 2^127`, finite; the derived
     chunk's is too, its last decay e^-1, not the 1 a prefix holding -2^70 rounds its -1 into, whose two
     writes sum past float32's largest."""
-    def ssd(h, q, b, v, g):
-        return jnp.exp(g) * h + b[:, None] * v[None, :]
-
-    def read(h, q, b, v, g):
-        return q @ h
-
-    operands = {"q": ("time", "key"), "b": ("time", "key"), "v": ("time", "value"), "g": ("time",)}
-    forms = scan.derive_scan(scan.Scan(ssd, read, operands, walked="time", state=((1, 1), jnp.float32),
-                                       ranges={"g": (-np.inf, 0.0)}), saturation=SATURATION)
+    forms = scalar_ssd()
     writes = jnp.asarray([[0.0], [2.0 ** 127], [2.0 ** 127]])
     chunk = {"q": jnp.ones((3, 1)), "b": jnp.ones((3, 1)), "v": writes,
              "g": jnp.asarray([-(2.0 ** 127), -(2.0 ** 70), -1.0])}
     h, expected = jnp.zeros((1, 1)), []
     for index in range(3):
-        token = [chunk[name][index] for name in operands]
-        expected.append(read(h := ssd(h, *token), *token))
+        token = [chunk[name][index] for name in SCALAR_SSD]
+        expected.append(scalar_read(h := scalar_step(h, *token), *token))
     outputs = forms.mapped(forms.prepare(chunk), forms.init({}))
     assert np.all(np.isfinite(np.asarray(expected))) and np.all(np.isfinite(np.asarray(outputs)))
 
@@ -456,17 +437,25 @@ def test_a_chunk_of_a_vast_declared_step_derives():
         assert np.all(np.isfinite(np.asarray(forms.mapped(forms.prepare(chunk), forms.init({})))))
 
 
+def scalar_step(h, q, b, v, g):
+    """A scalar SSD's token update, `h = exp(g) h + b v`."""
+    return jnp.exp(g) * h + b[:, None] * v[None, :]
+
+
+def scalar_read(h, q, b, v, g):
+    """A scalar SSD's readout, `q h`."""
+    return q @ h
+
+
+SCALAR_SSD = {"q": ("time", "key"), "b": ("time", "key"), "v": ("time", "value"), "g": ("time",)}
+"""A scalar SSD's operands and their axes."""
+
+
 def scalar_ssd(dtype=jnp.float32):
-    """A scalar SSD's derived forms (`h = exp(g) h + b v`, read `q h`) of a `dtype` state."""
-    def ssd(h, q, b, v, g):
-        return jnp.exp(g) * h + b[:, None] * v[None, :]
-
-    def read(h, q, b, v, g):
-        return q @ h
-
-    operands = {"q": ("time", "key"), "b": ("time", "key"), "v": ("time", "value"), "g": ("time",)}
-    return scan.derive_scan(scan.Scan(ssd, read, operands, walked="time", state=((1, 1), dtype),
-                                      ranges={"g": (-np.inf, 0.0)}), saturation=SATURATION)
+    """A scalar SSD's derived forms (`scalar_step`, `scalar_read`) of a `dtype` state."""
+    return scan.derive_scan(scan.Scan(scalar_step, scalar_read, SCALAR_SSD, walked="time",
+                                      state=((1, 1), dtype), ranges={"g": (-np.inf, 0.0)}),
+                            saturation=SATURATION)
 
 
 def ones_chunk(g, dtype=jnp.float32):
