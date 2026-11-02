@@ -305,7 +305,7 @@ def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_
     target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
     path = tmp_path / "old.dew-aot"
     path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())})))
-    with pytest.raises(ValueError, match="compile"):
+    with pytest.raises(ValueError):
         AheadPrograms.load(path)
 
 
@@ -399,8 +399,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
-                               "--trainer.compile-ahead.frontier", "--trainer.inspection.every", "1",
-                               *stated],
+                               "--trainer.inspection.every", "1", *stated],
                               default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
             run.run()

@@ -59,8 +59,16 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
-from dew.nn.kernels.generation import (GpuTarget, assumed, built_target, capability, device_target, gpu_mesh,
-                                       gpu_target, tpu)
+from dew.nn.kernels.generation import (
+    GpuTarget,
+    assumed,
+    built_target,
+    capability,
+    device_target,
+    gpu_mesh,
+    gpu_target,
+    tpu,
+)
 from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
@@ -276,7 +284,10 @@ class AheadOfTime:
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
-        return _saved(path, AheadOfTime, "step")
+        step = _saved(path, AheadOfTime, "step")
+        sampled = [] if step.sampled is None else [step.sampled.executable]
+        _current(path, "step", [step.executable, *sampled])
+        return step
 
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
@@ -417,7 +428,9 @@ class AheadPrograms:
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:
         """The programs `save` wrote to `path`."""
-        return _saved(path, AheadPrograms, "programs")
+        programs = _saved(path, AheadPrograms, "programs")
+        _current(path, "programs", list(programs.programs.values()))
+        return programs
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
@@ -430,17 +443,19 @@ class AheadPrograms:
 
 
 def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
-    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds), or where its
-    executables are not this Dew's one form (`Executable`): one saved before it, compiled again."""
+    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds)."""
     loaded = pickle.loads(Path(path).read_bytes())
     if not isinstance(loaded, kind):
         raise ValueError(f"{path} holds no {what} compiled ahead of time")
-    held = (list(loaded.programs.values()) if isinstance(loaded, AheadPrograms)
-            else [loaded.executable, *([] if loaded.sampled is None else [loaded.sampled.executable])])
+    return loaded
+
+
+def _current(path: str | Path, what: str, held: Sequence[object]) -> None:
+    """Refuse the `what` saved at `path` where its executables `held` are not this Dew's one form
+    (`Executable`): saved by an earlier Dew, they are compiled again."""
     if not all(isinstance(executable, Executable) for executable in held):
         raise ValueError(f"{path} holds {what} saved by an earlier Dew, whose executables this one does not "
                          "load: compile them ahead again")
-    return loaded
 
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
@@ -688,7 +703,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
-        devices = compile_only_gpus(generation, len(devices), capacity, stated.multiprocessors)
+        devices = compile_only_gpus(generation, len(devices), capacity,
+                                    None if stated is None else stated.multiprocessors)
         trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
             np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()
