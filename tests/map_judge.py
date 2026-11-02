@@ -69,16 +69,21 @@ def _file(site: str) -> str:
     return hashlib.sha256(site.encode()).hexdigest()[:16]
 
 
-def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
-    """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's
-    record of those units (pickled whole, then moved into place), and True; else False. Beside it, the
-    seconds from the task's process's start to its units (`before`: its imports, collection, the site's
-    setup and compiles) and those its units took (`draws`), so a run's map tasks say what each paid before
-    any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut)."""
+def record_units(label: str, payload: Callable[[int, int], object], upto: int | None = None) -> bool:
+    """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's record
+    of those units (pickled whole, then moved into place), and True; else False. With `upto`, the units
+    the site takes at most (a weighed check's beside its unweighted one's, reference_error's
+    `conditioning`): the range is cut there, and a task whose range starts past it records nothing. Beside
+    it, the seconds from the task's process's start to its units (`before`: its imports, collection, the
+    site's setup and compiles) and those its units took (`draws`), so a run's map tasks say what each paid
+    before any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut)."""
     span = os.environ.get(DRAWS)
     if not span:
         return False
     start, stop = (int(part) for part in span.split(":"))
+    stop = stop if upto is None else min(stop, upto)
+    if start >= stop:
+        return True
     records = os.environ.get(RECORDS)
     if not records:
         raise ValueError(f"{label}: a map task ({DRAWS}={span}) writes its records to {RECORDS}, which is "

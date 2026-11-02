@@ -1,0 +1,177 @@
+"""Check 1's conditioning (tests/reference_error.py's `assert_as_exact(..., conditioning=)`, ledger 1714):
+where the unweighted check stays undecided with its budget spent, each arm's error weighed by the reference
+program's own rounding there (tests/rounding_bound.py's `rounding_scale`), so a fault on the elements a
+program computes well shows beside the one it amplifies.
+
+The operation holds both in one row: `amplified`, a value pushed through 2^k and back, k drawn per seed from
+0 to 24, whose rounding is up to 2^24 times its own size's and differs by orders from draw to draw, and the
+products of the rest, each rounded once. Unweighed, a row's error is its amplified element's, heavy-tailed
+across draws, and the check stays undecided over its seeds; weighed, every element's error is in units of
+its own rounding."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import GateFailure, Inconclusive, assert_as_exact, null_rate_bound, null_runs
+from rounding_bound import rounding_scale
+
+ROWS, HALF = 1, 16
+
+WEIGHED_SEEDS = 8
+"""Check 1's declared seeds here, the unweighted check's and the weighed one's alike: over them and their
+REDRAW stage the unweighted check stays undecided on every arm below that its rows do not decide."""
+
+NULL_RUNS = 32
+"""The null control's runs: the reference against itself on disjoint draws, judged as a weighed site is."""
+
+
+def draw(seed: int):
+    """A seed's two `[ROWS, HALF]` standard normal operands, float32, and its amplification 2^k."""
+    rng = np.random.default_rng([0x1714, 2, seed])
+    a, b = (rng.standard_normal((ROWS, HALF)).astype(np.float32) for _ in range(2))
+    return a, b, np.float32(2.0 ** int(rng.integers(0, 25)))
+
+
+def amplified(a, big):
+    """`a`'s first element through `big` and back: exact in float64, its float32 rounding big's."""
+    return jax.lax.optimization_barrier(a[:, :1] + big) - big
+
+
+def cancelled(a, big):
+    """`amplified` the other way, `big` less `a` taken from `big`: exact in float64, rounded alike."""
+    return -(jax.lax.optimization_barrier(big - a[:, :1]) - big)
+
+
+def reference(a, b, big):
+    """Each row's amplified element beside the products of the rest."""
+    return jnp.concatenate([amplified(a, big), a[:, 1:] * b[:, 1:]], axis=-1)
+
+
+def failed(dew, label: str, against=reference) -> GateFailure:
+    """The failure check 1 decides `dew` against `against` with conditioning, never an Inconclusive."""
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact(jax.jit(dew), jax.jit(against), draw, label, seeds=WEIGHED_SEEDS,
+                        conditioning=WEIGHED_SEEDS)
+    assert not isinstance(raised.value, Inconclusive) and raised.value.findings
+    return raised.value
+
+
+def test_a_fault_on_the_elements_a_program_computes_well_is_decided_weighed():
+    """A product eight units of its rounding off beside the amplified element, cancelled the other way,
+    leaves the unweighted check undecided over its seeds, and the weighed check decides it a failure of its
+    ratio and rows, under the weighed check's own label."""
+    def biased(a, b, big):
+        return jnp.concatenate([cancelled(a, big), (a[:, 1:] * b[:, 1:]) * jnp.float32(1 + 2.0 ** -21)],
+                               axis=-1)
+
+    with pytest.raises(Inconclusive):
+        assert_as_exact(jax.jit(biased), jax.jit(reference), draw, "a biased product, unweighted",
+                        seeds=WEIGHED_SEEDS)
+    failure = failed(biased, "a biased product beside an amplified value")
+    assert {finding.rule for finding in failure.findings} <= {"pooled", "row"}
+    assert all(finding.leaf.startswith("a biased product beside an amplified value, conditioned")
+               for finding in failure.findings)
+
+
+def test_an_arm_as_exact_as_the_reference_passes_conditioned():
+    """The reference's own math, the amplified element cancelled the other way and the products' operands
+    swapped, passes as a weighed site is judged."""
+    def swapped(a, b, big):
+        return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
+
+    assert_as_exact(jax.jit(swapped), jax.jit(reference), draw,
+                    "the products swapped, cancelled the other way", seeds=WEIGHED_SEEDS,
+                    conditioning=WEIGHED_SEEDS)
+
+
+def test_an_error_moved_onto_the_amplified_element_fails_decided():
+    """An arm that doubles the amplified element's rounding (through 2^(k+1)), its products the reference's,
+    the reference's errors (M, 1) against its (2M, 1), fails decided: an error on the amplified element never
+    hides behind the rest's."""
+    def moved(a, b, big):
+        return jnp.concatenate([amplified(a, 2 * big), a[:, 1:] * b[:, 1:]], axis=-1)
+
+    failed(moved, "an error moved onto the amplified element")
+
+
+def test_an_element_no_rounding_reaches_must_be_exact_in_every_arm():
+    """An element no rounding of the reference's program reaches (`a` copied) must be exact in every arm: an
+    arm one unit of its rounding off there fails decided."""
+    def copied(a, b, big):
+        return jnp.concatenate([a[:, :1], a[:, 1:] * b[:, 1:]], axis=-1)
+
+    def nudged(a, b, big):
+        return jnp.concatenate([a[:, :1] * jnp.float32(1 + 2.0 ** -23), a[:, 1:] * b[:, 1:]], axis=-1)
+
+    assert_as_exact(jax.jit(copied), jax.jit(copied), draw, "a copy", seeds=WEIGHED_SEEDS,
+                    conditioning=WEIGHED_SEEDS)
+    failed(nudged, "a copy nudged", against=copied)
+
+
+def test_the_weighed_check_passes_the_reference_against_itself():
+    """The null control: the reference against itself on disjoint draws, judged as a weighed site is,
+    passes every one of `NULL_RUNS` runs, each verdict naming the check that decided it, its false-failure
+    rate bounded by `null_rate_bound`."""
+    verdicts = null_runs(jax.jit(reference), draw, "the reference against itself, weighed",
+                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=WEIGHED_SEEDS)
+    reds = sum(not verdict.startswith("pass") for verdict, _, _ in verdicts)
+    assert reds == 0, (reds, null_rate_bound(reds, NULL_RUNS), verdicts)
+
+
+def test_a_rounding_reaches_an_element_its_first_derivative_does_not():
+    """((a + 2^20) - 2^20 - a)^2 is zero in float64 and 2^-20 or so in float32: its rounding's first
+    derivative is zero there, and the scale, read by moving each rounding a rounding's size, is not."""
+    def cancelled(a):
+        big = jnp.asarray(2.0 ** 20, a.dtype)
+        return jnp.square(jax.lax.optimization_barrier(a + big) - big - a)
+
+    value, scale = rounding_scale(cancelled, np.full((4,), 1 + 2.0 ** -10, np.float32))
+    assert np.all(value == 0) and np.all(scale > 0)
+
+
+def test_a_rounding_behind_a_stop_gradient_reaches_its_output():
+    """stop_gradient(a * b) holds its product's rounding, which the scale reads, a stop gradient moving
+    nothing of a value's own."""
+    a, b, _ = draw(0)
+    _, scale = rounding_scale(lambda a, b: jax.lax.stop_gradient(a * b), a, b)
+    assert np.all(scale > 0)
+
+
+def test_an_integer_rounds_where_its_float_is_too_narrow_to_hold_it():
+    """An int32 past 2^24 converts to float32 with rounding the scale reads; one below converts exactly,
+    at no scale."""
+    _, scale = rounding_scale(lambda n: n.astype(jnp.float32), np.asarray([2 ** 24 + 1, 3], np.int32))
+    assert scale[0] > 0 and scale[1] == 0
+
+
+def test_a_programs_integer_output_has_no_scale_and_its_float_one_does():
+    """A program of a float and an integer output (a product and an argmax) scales its float alone."""
+    a, b, _ = draw(0)
+    _, (product, chosen) = rounding_scale(lambda a, b: (a * b, jnp.argmax(a, axis=-1)), a, b)
+    assert chosen is None and np.all(product > 0)
+
+
+def test_a_bfloat16_program_is_weighed_at_its_own_rounding():
+    """A bfloat16 product's scale is bfloat16's rounding, 2^16 times float32's for the same values."""
+    a, b, _ = draw(0)
+    _, narrow = rounding_scale(lambda a, b: a * b, a.astype(jnp.bfloat16), b.astype(jnp.bfloat16))
+    _, wide = rounding_scale(lambda a, b: a * b, a, b)
+    ratio = np.median(np.asarray(narrow, np.float64) / np.asarray(wide, np.float64))
+    assert 2.0 ** 15 < ratio < 2.0 ** 17
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_sum_across_devices_is_weighed_as_a_sum_and_a_gather_as_a_move():
+    """A program sharded over two devices sums each device's partial product across them (`psum`) and
+    gathers an operand (`all_gather`): the device sum's scale is a sum's, over its partial sums' rounding
+    and its own, and the gathered operand, a move of an input, rounds nothing."""
+    from jax.sharding import PartitionSpec as P
+
+    mesh = jax.make_mesh((2,), ("x",), devices=jax.devices()[:2])
+    sharded = jax.shard_map(lambda a, b: (jax.lax.psum(a @ b, "x"), jax.lax.all_gather(a, "x", tiled=True,
+                                                                                         axis=1)),
+                            mesh=mesh, in_specs=(P(None, "x"), P("x", None)), out_specs=(P(), P()))
+    a, b, _ = draw(0)
+    _, (summed, gathered) = rounding_scale(sharded, a, b.T)
+    assert np.all(summed > 0) and np.all(gathered == 0)
