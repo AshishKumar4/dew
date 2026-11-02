@@ -66,9 +66,10 @@ RED_SITE = """
 
 @pytest.mark.check1_shards(seeds=2, per_task=5)
 def test_red_site():
-    assert os.environ.get("DEW_CHECK1_DRAWS") != "5:10", "this map task's draws failed"
+    assert os.environ.get("DEW_CHECK1_DRAWS") != "2:7", "this map task's draws failed"
 """
-"""A second site of the file, of 10 draws, 5 a map task, whose second map task fails."""
+"""A second site of the file, of 10 draws, its first stage's 2 a map task and its second's 5, whose first
+later map task fails."""
 
 DRAWS = "def drawn(start, stop):\n    return ' '.join(str(seed) for seed in range(start, stop))\n"
 
@@ -231,14 +232,14 @@ def test_a_map_task_draws_into_the_artifacts_armada_names_it_and_exits_1_where_i
     draws fail writes its red row and exits 1, which armada reads as a map task that did not pass."""
     out = site_checkout(tmp_path, SITE + RED_SITE)
     entries = planned(ci)
-    first = entries[ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 8))]
+    first = entries[ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))]
     assert entry_task(ci, monkeypatch, first, out, artifacts=tmp_path / ".verdict/first") == 0
-    assert sorted(path.name for path in (tmp_path / ".verdict/first").iterdir()) == ["site.0-8.pkl"]
-    red = entries[ci.site_task("3.12", "tests/test_site.py", "test_red_site", (5, 10))]
+    assert sorted(path.name for path in (tmp_path / ".verdict/first").iterdir()) == ["site.0-4.pkl"]
+    red = entries[ci.site_task("3.12", "tests/test_site.py", "test_red_site", (2, 7))]
     assert entry_task(ci, monkeypatch, red, out, artifacts=tmp_path / ".verdict/red") == 1
     [row] = json.loads(out.read_text())["rows"]
     assert (row["name"], row["exitCode"], row["kind"]) == (
-        "3.12:tests/test_site.py#test_red_site.draws-5-10", 1, "nodes")
+        "3.12:tests/test_site.py#test_red_site.draws-2-7", 1, "nodes")
 
 
 def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a_pool_short_of_them(
