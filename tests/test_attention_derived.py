@@ -120,6 +120,52 @@ def test_the_derived_forward_is_on_par_with_the_templates(base2, mask, split):
                     truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
 
 
+def sliced_walk(mask: str, merged: bool):
+    """The template's forms (a folding call's, `oracle_walk`'s) over each key tile as a slice of its own, the
+    slices' states stacked and merged at once (`algebra.merged`, a split decode's combine) or folded a merge
+    at a time (`algebra.merge`), finished."""
+    spec = algebra.Forward(form="spans", keys=KEYS, ids=False, scale=0.5, natural=False)
+
+    def run(logits, value):
+        seen = MASKS[mask]()
+
+        def keys_at(tile):
+            keys = jax.lax.dynamic_slice_in_dim(KEY_PLACES, tile * TILE, TILE)
+            masked = jnp.where(jax.lax.dynamic_slice_in_dim(seen, tile * TILE, TILE, axis=1),
+                               jax.lax.dynamic_slice_in_dim(logits, tile * TILE, TILE, axis=1), -jnp.inf)
+            tile_values = jax.lax.dynamic_slice_in_dim(value, tile * TILE, TILE)
+            return algebra.Keys(algebra.Coords(QUERY_PLACES[:, None], keys[None, :]), masked,
+                                algebra.Operand(tile_values.shape, tile_values.dtype, lambda: tile_values),
+                                lambda a, b: jnp.dot(a, b, preferred_element_type=jnp.float32))
+
+        states = [algebra.plain_walk(spec, tile, tile + 1, keys_at,
+                                     algebra.started(spec, None, ROWS, WIDTH, None))
+                  for tile in range(KEYS // TILE)]
+        if merged:
+            state = algebra.merged(spec, jax.tree.map(lambda *parts: jnp.stack(parts), *states), 0)
+        else:
+            state = states[0]
+            for other in states[1:]:
+                state = algebra.merge(spec, state, other)
+        return algebra.finish(spec, state, initial=False)[0]
+
+    return run
+
+
+@pytest.mark.parametrize("derived", [False, True], ids=["template", "derived"])
+@pytest.mark.parametrize("mask", list(MASKS))
+def test_slices_merged_at_once_are_on_par_with_their_fold(mask, derived):
+    """A split call's slices merged at once (`algebra.merged`: the template's one sum over them, or behind the
+    switch the derived forms' merges a level at a time), three of them so a level carries one, a slice of no
+    key among them where the mask leaves one: on par with their fold a merge at a time against the float64
+    truth (check 1)."""
+    natural = np.log(2.0)
+    with algebra_forms.derived(derived):
+        assert_as_exact(jax.jit(sliced_walk(mask, merged=True)), jax.jit(sliced_walk(mask, merged=False)),
+                        draw, f"slices merged at once {mask}", seeds=16,
+                        truth_fn=lambda logits, value: attended(logits * natural, MASKS[mask](), value))
+
+
 @pytest.mark.parametrize("derived", [False, True], ids=["template", "derived"])
 def test_a_split_decodes_combine_of_many_slices_traces_about_one_merge(derived):
     """A split decode's combine of 32 slices (`decode_attention._combined`) traces at most three times a

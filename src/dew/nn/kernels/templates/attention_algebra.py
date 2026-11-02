@@ -1486,7 +1486,9 @@ def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     state takes one factor to the largest maximum where the fold takes one a merge, so the sums round in
     another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
     path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
-    need, as `merge` shifts them."""
+    need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
+    if states_derived(spec, stacked):
+        return _derived_merged(spec, stacked, axis)
     m = jnp.max(stacked.m, axis=axis)
     factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
     if stacked.guard is None:
@@ -2424,6 +2426,24 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
                                        tuple(getattr(other, field) for field in fields), shapes=shapes)
     return Partial(**{field: value.reshape(getattr(first, field).shape)
                       for field, value in zip(fields, merged, strict=True)})
+
+
+def _derived_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
+    """`merged` by the derived forms: the slices merged a pair at a time, a level's pairs at once
+    (`_derived_merge` over their rows whatever their leading axes), so n slices trace about log2(n) merges,
+    not n - 1. The forms' merge is associative (tests/test_algebra_laws.py), so any tree of merges is the
+    fold's. A level of an odd count carries its last slice to the next."""
+    def taken(state: Partial, start: int, stop: int, stride: int = 1) -> Partial:
+        return jax.tree.map(lambda part: jax.lax.slice_in_dim(part, start, stop, stride, axis), state)
+
+    while (count := stacked.m.shape[axis]) > 1:
+        pairs = 2 * (count // 2)
+        level = _derived_merge(spec, taken(stacked, 0, pairs, 2), taken(stacked, 1, pairs, 2))
+        if count % 2:
+            level = jax.tree.map(lambda merged, last: jnp.concatenate([merged, last], axis), level,
+                                 taken(stacked, pairs, count))
+        stacked = level
+    return jax.tree.map(lambda part: jnp.squeeze(part, axis), stacked)
 
 
 def _derived_output(spec: Forward, state: Partial) -> jax.Array:
