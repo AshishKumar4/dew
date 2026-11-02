@@ -1332,7 +1332,7 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
     tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
     site = SITE.fullmatch(split)
-    run = selected(session.pytest_run(python, report), False, site=site is not None)
+    run = selected(session.pytest_run(python, report), network=False, site=site is not None)
     return subprocess.run([*run, *arguments, *selection(list(tests), split)],
                           env=session.pytest_environment(site_environment(site)), check=False).returncode
 
