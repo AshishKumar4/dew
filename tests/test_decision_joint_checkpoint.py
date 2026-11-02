@@ -457,7 +457,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     # to 16384. The runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=768))
-    data = decision_rows(examples, 4, objective=objective.data())
+    data = decision_rows(examples, 8, objective=objective.data())
     # Two runs, of two steps and of one: the one-step run is the two-step run's directory holding its
     # first step alone, as the run left it there, its step compiled once for both.
     runs = [tmp_path / "run0", tmp_path / "run1"]
