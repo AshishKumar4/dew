@@ -1238,6 +1238,9 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
             return rows.get("write"), None if call.per_key else (rows["gate"], rows["low"])
 
         def step(index, slots, carry, accumulators, loaded=None):
+            # Every slot waited for each step, the values' too, which the first step alone reads: a load no
+            # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
+            slots.acquire_all()
             found = read(slots) if streamed else loaded
             assert found is not None, "a family that streams no vectors loads them in the prologue"
             betas, prefix = found
