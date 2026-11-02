@@ -168,7 +168,7 @@ class ModelSource:
         its own load reads them (`_records.decoded_floats`)."""
         from transformers import AutoConfig
 
-        stated = _records.record(_records.decoded_floats(_records.json_value(fields, 'config')), 'config')
+        stated = _records.decoded_floats(fields)
         if 'AutoConfig' not in self.references:
             return AutoConfig.for_model(self.model_type, **stated)
         return self.config_class().from_dict(dict(stated))

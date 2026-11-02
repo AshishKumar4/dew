@@ -687,10 +687,12 @@ def _read_norm_gate(view: PartView) -> Mapping[str, object]:
 def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
     """A.X-K2's router: DeepSeek V3's (`_read_grouped_router`), which chooses within groups only where its
     config states `n_group`."""
-    fields = dict(_records.record(_read_grouped_router(view)[_LAYER], _LAYER))
-    if view.num_group is None:
-        fields.update(groups=1, groups_per_token=1)
-    return {_LAYER: fields}
+    grouped = view.num_group is not None
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
+                     'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
+                     'scaling': float(view.routed_scaling_factor), 'bias': True,
+                     'groups': int(view.num_group) if grouped else 1,
+                     'groups_per_token': int(view.topk_group) if grouped else 1}}
 
 
 def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, object]:
