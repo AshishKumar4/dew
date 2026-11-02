@@ -64,7 +64,7 @@ def geometry(case: dict) -> tuple[int, int]:
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(128, 64, 4, 2))
 """The configs each case runs at on the CPU, where interpreting every tile the derivation steps through
-(`FORWARD_STEPS`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
+(`derived_tiles`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
 tests/test_gpu_attention.py)."""
 
 
@@ -219,8 +219,31 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
     check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
 
 
+def derived_tiles(backward: bool = False) -> tuple:
+    """The tiles the Triton mainloop's forward (or `backward`'s) derivation picks on this GPU
+    (`attention_triton._derived`) over every head width and dtype it takes, its inference and training
+    forwards: every tile a call runs there."""
+    import tokamax
+
+    from dew.nn.kernels import generation
+
+    target, found = generation.gpu_target(), set()
+    for width in (32, 64, 128, 256):
+        for dtype in attention_triton.DTYPES:
+            arrays = {role: jax.ShapeDtypeStruct((ROWS, 512, 2, width), dtype)
+                      for role in ("query", "key", "value")}
+            launches = ([(attention_triton.TritonBackward(), arrays)] if backward else
+                        [(attention_triton.TritonForward(), {**arrays, "residuals": kept})
+                         for kept in (False, True)])
+            for op, bound in launches:
+                tiles = op.derived(tokamax.BoundArguments(op, bound), target)
+                if tiles is not None:
+                    found.add(tiles)
+    return tuple(sorted(found))
+
+
 def every_config_on_a_gpu(config, case):
-    """Every tile the forward's derivation steps through (`FORWARD_STEPS`), bf16, every hook: over causal
+    """Every tile the forward's derivation picks on this GPU (`derived_tiles`), bf16, every hook: over causal
     documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
 
@@ -665,7 +688,7 @@ def test_the_backward_walks_many_key_tiles(case):
 
 
 def every_backward_config_on_a_gpu(config, case):
-    """Every tile the backward's derivation steps through (`BACKWARD_STEPS`), bf16, a softcap, sinks and
+    """Every tile the backward's derivation picks on this GPU (`derived_tiles`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
     each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
     programs within a block's shared memory) on par with the reference, and each other refused where it is
@@ -698,27 +721,29 @@ def every_backward_config_on_a_gpu(config, case):
 
 SHARED_BYTES = (
     # (launch, width, config, the bytes Triton asked for where it refused, or None where it compiled, GPU)
-    ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), None, "sm80"),
     ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), 163840, "sm86"),
     ("forward", 128, attention_triton.Tiles(32, 128, 4, 3), 147456, "sm86"),
     ("forward", 128, attention_triton.Tiles(64, 128, 4, 3), 163840, "sm86"),
-    ("forward", 128, attention_triton.Tiles(128, 64, 4, 3), None, "sm86"),
     ("forward", 256, attention_triton.Tiles(64, 32, 4, 3), 102400, "sm86"),
     ("forward", 256, attention_triton.Tiles(128, 128, 4, 2), 229376, "sm86"),
+    ("forward", 128, attention_triton.Tiles(128, 64, 4, 2), None, "sm86"),
     ("backward", 256, attention_triton.Tiles(32, 32, 4, 2), None, "sm86"),
     ("backward", 128, attention_triton.Tiles(128, 128, 4, 2), 167424, "sm80"),
     ("backward", 64, attention_triton.Tiles(128, 128, 4, 2), 101888, "sm86"),
 )
-"""Configs Triton compiled or refused on an A100 (sm80) and an A10 (sm86), bf16, from
-bench_attention_smem.py's runs SMEM-a100 and SMEM-a10 (2026-10-21)."""
+"""Configs Triton refused on an A100 (sm80) and an A10 (sm86), bf16, from bench_attention_smem.py's runs
+SMEM-a100 and SMEM-a10 (2026-10-21), and launches at the derivation's warps and stages
+(`attention_triton.WARPS`, `STAGES`) it compiled on an A10: the backward's 32 x 32 at width 256 (SMEM-a10)
+and the forward's 128 x 64 at width 128, the plain launch's derived tile
+(`test_the_derived_launches_compile_within_a_99_kb_block`)."""
 
 
 @pytest.mark.parametrize("launch, width, tiles, requested, generation_name", SHARED_BYTES)
 def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses(
         launch, width, tiles, requested, generation_name):
-    """Each launch's shared-memory bound against what Triton did on a GPU: within the block's budget
-    where it compiled (an A100's 128 by 128 forward tile in three stages, jax's mha's fastest there),
-    and at or above the bytes it asked for, past the budget, where it refused."""
+    """Each launch's shared-memory bound against what Triton did on a GPU: at or above the bytes it asked
+    for, past the block's budget, where it refused, so no launch the bound passes is refused; within the
+    budget at the derivation's tiles it compiled."""
     import tokamax
 
     from dew.nn.kernels import generation

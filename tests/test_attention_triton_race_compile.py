@@ -9,7 +9,9 @@ import re
 import jax
 import jax.numpy as jnp
 import kernel_compile
+import tokamax
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_triton
 
 
@@ -46,15 +48,16 @@ def _overwritten_mma_operands(module: str) -> tuple[list[str], int, int]:
 
 
 def test_hopper_attention_backward_preserves_its_multiuse_query_tile(tmp_path):
-    """At the first derived config (two stages) the raw query tile dK's product reads stays its own until
+    """At the config an H100 derives (two stages) the raw query tile dK's product reads stays its own until
     that product completes, after its prescaled copy fed the scores."""
-    config = attention_triton.BACKWARD_STEPS[0]
     power, scale = template.prescale(jnp.bfloat16, 128, None)
     op = attention_triton._backward_op(score_mod=None, score_kinds=(), score_dtypes=(), scale=scale,
                                        prescale=power, split=True, natural=False, accurate=template.ACCURATE,
                                        initial=False)
     query = jax.ShapeDtypeStruct((1, 1024, 32, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 1024, 8, 128), jnp.bfloat16)
+    config = op.derived(tokamax.BoundArguments(op, {"query": query, "key": key, "value": key}),
+                        generation.TARGETS["sm90"])
     row = jax.ShapeDtypeStruct((1, 32, 1024), jnp.float32)
     index = jax.ShapeDtypeStruct((1, 32, 1024), jnp.int32)
     span = jax.ShapeDtypeStruct((1, 1024), jnp.int32)
