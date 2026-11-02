@@ -761,6 +761,41 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+@INTERPRETS
+@pytest.mark.parametrize(("rows", "depth", "width"), [(1408, 128, 128), (200, 256, 640)])
+def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, depth, width):
+    """A dense forward product on a Hopper part of 8 multiprocessors whose 11 or 10 output tiles leave its
+    last wave at most half full (`tail.balanced`, `gmm`'s dense tail): its tail's steps balanced over the
+    programs, each program's partial fixed up across them, through an RMS norm's prologue and a bias's
+    epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a tile does
+    not divide. The template's interpreted route launches one program, so this calls the kernel (row 3587)."""
+    assert tail.balanced(-(-rows // COOPERATIVE.block_m) * (width // COOPERATIVE.block_n),
+                            depth // COOPERATIVE.block_k, 8) is not None
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(depth, width)) / np.sqrt(depth), jnp.bfloat16),
+                jnp.asarray(rng.uniform(0.5, 2.0, size=(rows,)), jnp.float32),
+                jnp.asarray(rng.normal(size=(depth,)), jnp.float32),
+                jnp.asarray(rng.normal(size=(width,)), jnp.float32))
+
+    def dew(x, w, ms, nw, b):
+        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32), tiles=COOPERATIVE,
+                              transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=8,
+                              interpret=grouped_matmul.INTERPRETED, dense=True, prologue=normed,
+                              prologue_operands=(ms, nw), prologue_axes=(("rows",), ("depth",)),
+                              epilogue=biased, epilogue_operands=(b,), epilogue_axes=(("columns",),))
+
+    def plain(x, w, ms, nw, b, wide=jnp.float32, out=jnp.bfloat16):
+        h = normed(x, ms, nw).astype(wide)
+        return biased(jnp.dot(h, w.astype(wide), preferred_element_type=wide), b).astype(out)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(dew, jax.jit(plain), draw, f"balanced dense forward {rows}x{depth}x{width}",
+                        seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 def a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
