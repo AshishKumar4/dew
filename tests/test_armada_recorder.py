@@ -138,7 +138,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
         "test_reexecs_bare_env.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare_env.py'],\n"
                                               "                   check=True)\n",
         "test_reexecs_fork.py": started + "again = [sys.executable, 'tests/reexec_fork.py']\n"
-                                          "subprocess.run(again, check=True)\n",
+                                          "    subprocess.run(again, check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
