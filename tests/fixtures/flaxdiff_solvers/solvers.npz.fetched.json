@@ -1,0 +1,9 @@
+{
+ "bytes": 4682386,
+ "license": "MIT",
+ "path": "recordings/02753c84cb1ef203670b11e15c51f88dbbe03bf9c58a80809dc886973ced10f6.npz",
+ "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f",
+ "repo": "dewml/fixtures",
+ "revision": "3521f8776352d28eb7bafad90c6cfbd2b0c5ffe0",
+ "sha256": "02753c84cb1ef203670b11e15c51f88dbbe03bf9c58a80809dc886973ced10f6"
+}

@@ -54,6 +54,9 @@ FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/fl
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "flaxdiff_solvers" / "solvers.npz"
 STEPS, SIGMA_MAX, RHO, SIGMA_DATA = 12, 80.0, 7.0, 0.5
 SHAPE = (32, 64)
+SEEDS = {"multistep walk": 256}
+"""The largest backend's paired sizing, on held-out draws: H100 256, CPU 8
+(TR-2544dbg-sizing-a, TR-2544dbg-2). More elements on the same grid do not narrow its shared rounding."""
 JITTER = 0.01
 """How far a draw moves each point of the grid, in its spacings. A walk's rounding is dominated by the
 sigmas its grid fixes, which both sides compute by one formula: on one grid each side rounds each of them
@@ -205,6 +208,7 @@ def main() -> None:
     # Set here, not on import: the test loads this file for `draw` alone.
     jax.config.update("jax_enable_x64", val=True)
     from recorded_references import provenance, record_case, save
+    from reference_error import FEWEST_SEEDS
     from test_samplers import flaxdiff_closed, flaxdiff_walked
 
     from dew.sampling import RK4, MultiStepDPM
@@ -217,7 +221,8 @@ def main() -> None:
             # Sized paired, as check 1 judges: a draw's grid moves both sides' roundings alike.
             arrays.update(record_case(f"{name} {part}", draw,
                                       functools.partial(evaluated, compiled=compiled, part=part),
-                                      store_inputs=False, summary=True, dew=float32_arm(dew)))
+                                      store_inputs=False, summary=True, dew=float32_arm(dew),
+                                      start=SEEDS.get(f"{name} {part}", FEWEST_SEEDS)))
     written = save(FIXTURE, {**arrays, "provenance": provenance(
         "AshishKumar4/FlaxDiff", COMMIT, "cpu", "python tools/flaxdiff_solver_reference.py")},
         reference=f"AshishKumar4/FlaxDiff {COMMIT}", license="MIT")
