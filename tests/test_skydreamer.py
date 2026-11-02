@@ -250,6 +250,29 @@ def test_a_curriculum_draws_the_latency_and_randomizes_the_drone_and_camera_only
         assert varies == [ramp > 0] * 4
 
 
+def test_a_race_of_a_level_per_track_flies_each_tracks_episodes_at_its_own():
+    """A race over the circle at no randomization and the inverted loop at full: the circle's episodes wait
+    their nominal four steps and fly the nominal drone with no rotor noise, the loop's span two to six steps
+    and vary; a circle's lap stepped from two keys flies alike at the circle's level of none, and apart
+    once the circle's level is full."""
+    sky = Sky(tracks=("circle", "inverted_loop"), latency=0.044)
+    race = SkyRace(sky, views=("passed",), ramp=(0.0, 1.0))
+    laps = jax.vmap(lambda key: race.reset(key)[0])(jax.random.split(jax.random.key(3), 512))
+    track = np.asarray(laps.track)
+    for index, delays, varies in ((0, {4}, False), (1, {2, 3, 4, 5, 6}, True)):
+        on = track == index
+        assert set(np.unique(np.asarray(laps.delay)[on]).tolist()) == delays
+        spread = [np.ptp(np.asarray(value)[on]) > 0 for value in (laps.rate_limit, laps.body.mass)]
+        assert spread == [varies] * 2
+    circle = jax.tree.map(lambda leaf: leaf[int(np.flatnonzero(track == 0)[0])], laps)
+    action = jnp.asarray([0.3, 0.1, -0.2, 0.05])
+    for ramp, apart in (((0.0, 1.0), False), ((1.0, 0.0), True)):
+        stepped = SkyRace(sky, views=("passed",), ramp=ramp)
+        speeds = [np.asarray(stepped.step(circle.replace(key=jax.random.key(seed)), action)[0].flight.speed)
+                  for seed in (5, 6)]
+        assert (not np.array_equal(*speeds)) == apart
+
+
 def written_fisheye(image: np.ndarray, size: int, fov: float) -> np.ndarray:
     """An equidistant fisheye `size` square of horizontal field of view `fov` sampled a pixel at a time from
     the pinhole `image` `[S, S, 3]` of the same field of view: each pixel's angle from the axis its radius
@@ -351,11 +374,13 @@ def test_the_smoothness_term_is_the_squared_change_of_the_imagined_means():
 @pytest.mark.parametrize("setting", ["BASE", "REALISM"])
 def test_a_recipes_run_reads_back_as_itself(setting):
     """The recipe's run in each setting (`tools/skydreamer_race.py`: the base check and the realism run)
-    reads back from its record as itself."""
+    and each of its phases reads back from its record as itself."""
     from tool_support import load
 
     from dew.objectives.rl.config import EnvRunConfig
 
     tool = load("skydreamer_race")
-    run = tool.run(Path("/runs/base"), Path("/assets"), setting=getattr(tool, setting))
-    assert EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))) == run
+    chosen = getattr(tool, setting)
+    for phase in chosen.phases:
+        run = tool.run(Path("/runs/base"), Path("/assets"), setting=chosen, phase=phase)
+        assert EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))) == run
