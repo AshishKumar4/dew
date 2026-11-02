@@ -1272,7 +1272,7 @@ class CausalTransformer(LinearProducts):
         maps = {None if self.tie_embeddings else "lm_head": jnp.shape(table.rows())[-1],
                 **({} if projection is None else {"project_out": jnp.shape(projection.kernel)[0]}),
                 **({} if self.head_transform is None else {"head_dense": self.emb_features})}
-        growth = _head_growth(self, maps)
+        growth = _head_growth(self, maps, self.dtype or states.dtype)
         logits = growth[None if self.tie_embeddings else "lm_head"]
         squared = jnp.square(logits) * _squared_norm(jnp.asarray(self.vocabulary_rows()))
         if projection is not None and logits * growth["project_out"] > 1:
