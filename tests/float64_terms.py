@@ -3,6 +3,8 @@ in float64 (`float64_forward`), and a program evaluated op by op with each outpu
 (`float64_terms`), the size check 1 sizes a row that cancels by and the one-draw rule sizes a row by. Its
 own module, a seam of the gate's: it reads a program's jaxpr and nothing of a check."""
 
+import weakref
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -80,19 +82,25 @@ def float64_terms(fn, *args):
     steps between its branches and loops is one (`_compiled_run`), the
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
-    closed = jax.make_jaxpr(fn)(*args)
+    closed, tree = _traced(fn, args)
     leaves = jax.tree.leaves(args)
     if _static(closed.jaxpr):
-        values, energies = _compiled(closed)(closed.consts, leaves)
+        values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
     else:
         values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
-    tree = jax.tree.structure(jax.eval_shape(fn, *args))
     return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
                                                    for energy, value in zip(energies, values, strict=True)])
 
 
+TRACES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Each function's traced programs, by its arguments' structure, shapes and dtypes (`_traced`), held
+while the function lives."""
+
+PROGRAMS: dict = {}
+"""Each program's first traced jaxpr, by its text: the one every later trace of it evaluates (`_traced`)."""
+
 COMPILED: dict = {}
-"""Each static program's compiled evaluation (`_compiled`), by its jaxpr's text."""
+"""Each static program's compiled evaluation (`_compiled`), by its jaxpr."""
 
 
 def _static(jaxpr) -> bool:
@@ -110,15 +118,29 @@ def _static(jaxpr) -> bool:
     return True
 
 
-def _compiled(closed):
-    """The compiled evaluation (`_evaluated`) of `closed`, a static jaxpr, taking its constants and its
-    inputs: one a program, by its text, which holds its operations, their parameters and its inputs'
-    shapes and dtypes, so a function traced afresh each call (`float64_forward`'s) compiles once."""
-    key = str(closed.jaxpr)
-    if key not in COMPILED:
-        jaxpr = closed.jaxpr
-        COMPILED[key] = jax.jit(lambda consts, given: _evaluated(jaxpr, consts, given))
-    return COMPILED[key]
+def _traced(fn, args):
+    """`fn`'s program at `args` and its outputs' tree, traced once a function and arguments' structure,
+    shapes and dtypes, as jit traces (its closure's arrays the program's constants); the jaxpr the first
+    trace of the same program text gave, so a function made afresh each call (`float64_forward`'s) reads
+    one program, and its compiled runs (`_compiled`, `_compiled_run`) compile once."""
+    from jax.extend.core import ClosedJaxpr
+
+    leaves, structure = jax.tree.flatten(args)
+    key = (structure, tuple((np.shape(leaf), jnp.result_type(leaf)) for leaf in leaves))
+    traces = TRACES.setdefault(fn, {})
+    if key not in traces:
+        closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
+        jaxpr = PROGRAMS.setdefault(str(closed.jaxpr), closed.jaxpr)
+        traces[key] = (ClosedJaxpr(jaxpr, closed.consts), jax.tree.structure(shapes))
+    return traces[key]
+
+
+def _compiled(jaxpr):
+    """The compiled evaluation (`_evaluated`) of `jaxpr`, a static program, taking its constants and
+    its inputs, compiled once a program (`_traced`)."""
+    if jaxpr not in COMPILED:
+        COMPILED[jaxpr] = jax.jit(lambda consts, given: _evaluated(jaxpr, consts, given))
+    return COMPILED[jaxpr]
 
 
 def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
@@ -155,7 +177,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
             # A static run of the walk's steps, compiled once (`_compiled_run`), the values it reads in.
             reads = _run_reads(run)
             kept = [var for var in _run_writes(run) if last.get(var, len(jaxpr.eqns)) >= stop]
-            outputs, made = _compiled_run(run, reads, kept, wanted)(
+            outputs, made = _compiled_run(jaxpr, start, stop, reads, kept, wanted)(
                 [read(var) for var in reads], [energy(var) for var in reads])
             written = kept
         else:
@@ -220,16 +242,19 @@ def _run_reads(run) -> list:
 
 
 RUNS: dict = {}
-"""Each static run's compiled evaluation (`_compiled_run`), by its steps' text and what it reads and keeps."""
+"""Each static run's compiled evaluation (`_compiled_run`), by its program, its span and the energies it
+reads."""
 
 
-def _compiled_run(run, reads, kept, wanted):
-    """The run of static steps `run` evaluated as the walk evaluates them (`_applied`), compiled once a
-    run's text, reading `reads`' values and energies and returning `kept`'s."""
+def _compiled_run(jaxpr, start: int, stop: int, reads, kept, wanted):
+    """`jaxpr`'s run of static steps `start` to `stop` evaluated as the walk evaluates them (`_applied`),
+    compiled once a program (`_traced`) and span, reading `reads`' values and energies and returning
+    `kept`'s."""
     from jax.extend.core import Literal
 
+    run = jaxpr.eqns[start:stop]
     marks = tuple(any(var in wanted for var in equation.outvars) for equation in run)
-    key = ("\n".join(map(str, run)), tuple(map(str, reads)), tuple(map(str, kept)), marks)
+    key = (jaxpr, start, stop, marks)
     if key not in RUNS:
         def evaluate(read_values, read_energies):
             values, energies = dict(zip(reads, read_values, strict=True)), dict(
