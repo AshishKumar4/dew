@@ -458,6 +458,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=768))
     data = decision_rows(examples, 8, objective=objective.data())
+    start = jax.jit(objective.init)(jax.random.key(0))
     # Two runs, of two steps and of one: the one-step run is the two-step run's directory holding its
     # first step alone, as the run left it there, its step compiled once for both.
     runs = [tmp_path / "run0", tmp_path / "run1"]
@@ -472,8 +473,7 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     stated = data.statistics()
     assert not [name for name in stated if name.startswith(("data/rejected/", "data/cut"))]
     assert all(value == 0 for name, value in stated.items() if name.startswith("data/truncated/"))
-    # The second step moved the head the first left.
-    before = jax.tree.leaves(Checkpoints(runs[0]).variables(step=1)["params"]["head"])
+    before = jax.tree.leaves(start["params"]["head"])
     after = jax.tree.leaves(states[0].variables["params"]["head"])
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
 

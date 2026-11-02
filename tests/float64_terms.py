@@ -103,19 +103,16 @@ COMPILED: dict = {}
 """Each static program's compiled evaluation (`_compiled`), by its jaxpr."""
 
 
+STATIC: dict = {}
+"""Whether each jaxpr is static (`_static`), by the jaxpr."""
+
+
 def _static(jaxpr) -> bool:
     """Whether `jaxpr`, its calls' and scans' bodies included, takes no branch or loop its values pick
-    (`cond`, `while`), which the walk reads concretely (`_applied`)."""
-    for equation in jaxpr.eqns:
-        if equation.primitive.name in ("cond", "while"):
-            return False
-        for value in equation.params.values():
-            bodies = value if isinstance(value, tuple | list) else (value,)
-            for body in bodies:
-                inner = getattr(body, "jaxpr", body)
-                if hasattr(inner, "eqns") and not _static(inner):
-                    return False
-    return True
+    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr."""
+    if jaxpr not in STATIC:
+        STATIC[jaxpr] = all(_static_equation(equation) for equation in jaxpr.eqns)
+    return STATIC[jaxpr]
 
 
 def _traced(fn, args):
@@ -151,7 +148,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
     (`_runs`) as one compiled program (`_compiled_run`)."""
     from jax.extend.core import Literal
 
-    wanted = _carrying(jaxpr)
+    wanted, last, runs = _layout(jaxpr)
     values, energies = {}, {}
     for var, value, energy in zip(jaxpr.constvars + jaxpr.invars, [*consts, *args],
                                   [None] * len(consts) + list(given or [None] * len(args)), strict=True):
@@ -163,14 +160,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
     def energy(var):
         return None if isinstance(var, Literal) else energies.get(var)
 
-    # Each value and energy goes once its last reader has run, as an execution
-    # frees it: a chunked scan's float64 intermediates would otherwise all stay.
-    last = {var: index for index, equation in enumerate(jaxpr.eqns)
-            for var in equation.invars if not isinstance(var, Literal)}
-    for var in jaxpr.outvars:
-        if not isinstance(var, Literal):
-            last.pop(var, None)
-    spans = _runs(jaxpr) if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
+    spans = runs if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
     for start, stop in spans:
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:
@@ -194,6 +184,27 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
         for var, value, made_energy in zip(written, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
     return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
+
+
+LAYOUTS: dict = {}
+"""Each walked jaxpr's layout (`_layout`), by the jaxpr: a traced program's (`_traced`) is the same object
+every draw, its bodies' too."""
+
+
+def _layout(jaxpr):
+    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr: the variables whose terms reach an
+    output (`_carrying`), the step that reads each variable last, after which it goes as an execution
+    frees it (a chunked scan's float64 intermediates would otherwise all stay), and its spans (`_runs`)."""
+    from jax.extend.core import Literal
+
+    if jaxpr not in LAYOUTS:
+        last = {var: index for index, equation in enumerate(jaxpr.eqns)
+                for var in equation.invars if not isinstance(var, Literal)}
+        for var in jaxpr.outvars:
+            if not isinstance(var, Literal):
+                last.pop(var, None)
+        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, _runs(jaxpr))
+    return LAYOUTS[jaxpr]
 
 
 def _static_equation(equation) -> bool:
