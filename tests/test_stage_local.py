@@ -613,7 +613,7 @@ def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
     from dew.nn.backbones.decoder_stack import stored_layers
     from dew.sampling import Sampling
 
-    model = decoder()
+    model = decoder(max_seq_len=64)
     run = trainer(model, optax.adam(1e-2), STAGED, 8)
     trained = run.fit(stream(), steps=1, log_every=1)
     whole = jax.device_get(run.stored(trained).variables)
@@ -622,7 +622,7 @@ def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
     served = []
     for variables in (trained.variables, whole):
         task = TextGeneration(model, whole, None, sampling=Sampling(temperature=0.0))
-        server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=16))
+        server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
         try:
             server.load(variables, 1)
             served.append(server.submit([1, 2, 3], 4, key=5).result().tokens)
