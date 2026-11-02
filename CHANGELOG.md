@@ -7,9 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- Tutorial 13 trains a first-person racing drone from its camera alone with SkyDreamer's recipe (DreamerV3
-  with an informed world model), by collective thrust and body rates, and flies it against the untrained
-  policy from the same starts. A SkyDreamer race takes a level of randomization per track (`SkyRace.ramp`, one
+- Tutorial 13 trains a first-person racing drone with SkyDreamer's recipe (DreamerV3 with an informed world
+  model) from its camera image, the body rates and rotor speeds it senses and the flight plan's next gates,
+  by collective thrust and body rates, and flies it against the untrained policy from the same starts. A SkyDreamer race takes a level of randomization per track (`SkyRace.ramp`, one
   level or a tuple in `Sky.tracks`' order), and a curriculum draws each of the scene's looks for its ramp's
   share of episodes (`dew.rl.flight.drawn_camera`). An environment run resumed under its name may change its
   rollout, and any run the settings its objective declares (`Objective.resumable`; DreamerV3's `entropy`), so
