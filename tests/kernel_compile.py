@@ -153,6 +153,21 @@ def _device(generation: str) -> Mesh:
     return Mesh(np.array(compile_only_gpus(generation)), ("data",))
 
 
+def lowered_for(fn, args, generation: str):
+    """`fn` traced on `args`, its abstract leaves placed on a compile-only device of the CUDA `generation`
+    (`_device`), and lowered as on that GPU (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA
+    compiles for it, never run."""
+    mesh = _device(generation)
+    replicated = NamedSharding(mesh, PartitionSpec())
+    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
+                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+    # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
+    # Its bound checks the total allocation, including barriers outside the scratch estimate.
+    with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+          mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
+        return jax.jit(fn).trace(*placed).lower()
+
+
 def refused(record: dict) -> bool:
     """Whether a compiled record failed as a program: its error, or shared bytes past its block's limit
     (a Triton kernel's, or XLA's refusal of a block, which a Mosaic GPU program states only then)."""
@@ -218,19 +233,11 @@ def _compiled(case, generation: str, record: dict,
     each one's resource estimate Pallas prints as it lowers, `record['binaries']` each one's binary
     (`report.binaries`), `record['modules']` each one's kernel hash, by kernel name, and in `directory` the
     PTX Mosaic prints as it compiles, a `<kernel>.ptx` each."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
-    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
     estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
     try:
-        # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
-        # Its bound checks the total allocation, including barriers outside the scratch estimate.
-        with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
-              mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit),
-              estimating as estimated):
-            lowered = jax.jit(fn).trace(*placed).lower()
+        with estimating as estimated:
+            lowered = lowered_for(fn, args, generation)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
         refused = MOSAIC_REFUSED.search(str(error))
