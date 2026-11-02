@@ -178,12 +178,14 @@ def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
     same fp32 backbone states, over every question of every case."""
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
+    # Dew's head compiled, as a served task's pass runs it.
+    head = jax.jit(loaded.model.apply)
     found, reference, truth, terms = [], [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
         for case, (_, row) in laid_out(tokenizer).items():
             inputs = DecisionInputs.collate([row], 0)
             given = (loaded.variables, states[case][None], inputs, table)
-            scores = loaded.model.apply(*given)
+            scores = head(*given)
             _, summed = float64_forward(loaded.model, *given)
             for slot, laid in enumerate(row.questions):
                 key = f"{case}/{laid.name}"
