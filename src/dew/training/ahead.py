@@ -294,7 +294,7 @@ class AheadOfTime:
         return self.loaded()
 
 
-DUMP_FLAGS = ("--xla_dump", "--xla_enable_dumping", "--xla_gpu_dump")
+DUMP_FLAGS = ("--xla_dump", "--xla_gpu_dump")
 """XLA_FLAGS that decide whether and what XLA dumps, which `dumps` sets for a run alone."""
 PHASE_FLAGS = (*DUMP_FLAGS, "--xla_gpu_load_autotune_results",
                "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
@@ -451,8 +451,8 @@ def executable_only() -> Iterator[None]:
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
     """`environment` for a run whose every compile, in it or any process it starts from any directory, its
-    compilers write under `directory`: XLA's (`--xla_dump_to`, dumping on and unfiltered, whatever the
-    environment said of it) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin compile writes
+    compilers write under `directory`: XLA's (`--xla_dump_to`, unfiltered, whatever the environment said of
+    XLA's dumping) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin compile writes
     nothing of XLA's). A run of programs compiled ahead leaves both empty (`compiled_in`). Refused where
     either cannot be written, as a compiler that cannot write its dump compiles on."""
     root = directory.resolve()
@@ -463,7 +463,7 @@ def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
     given = environment.get("XLA_FLAGS", "").split()
     flags = [flag for flag in given if not flag.startswith(DUMP_FLAGS)]
     kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
-    dumping = [*flags, "--xla_enable_dumping=true", f"--xla_dump_to={root / 'xla'}"]
+    dumping = [*flags, f"--xla_dump_to={root / 'xla'}"]
     return {**kept, "XLA_FLAGS": " ".join(dumping), "MOSAIC_GPU_DUMP_TO": str(root / "mosaic")}
 
 

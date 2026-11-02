@@ -777,9 +777,9 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
                                                                                            monkeypatch):
     """A run given `dumps` writes its compiles under that directory, a child process's too from another
-    working directory, whatever the environment said of XLA's dumping (off, or filtered to no module), and
-    nothing where it compiled nothing (`compiled_in`); a directory dumps did not make is refused, never read
-    as empty: the gate of a run of programs compiled ahead (ledger 2716)."""
+    working directory, whatever the environment said of XLA's dumping (elsewhere, or filtered to no
+    module), and nothing where it compiled nothing (`compiled_in`); a directory dumps did not make is
+    refused, never read as empty: the gate of a run of programs compiled ahead (ledger 2716)."""
     import subprocess
     import sys
     from pathlib import Path
@@ -790,7 +790,8 @@ def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compi
     elsewhere = f"[sys.executable, '-c', {child!r}], cwd='/', check=True"
     compiling = f"import subprocess, sys; subprocess.run({elsewhere})"
     monkeypatch.chdir(tmp_path)
-    given = (("off", "--xla_enable_dumping=false"), ("filtered", "--xla_dump_hlo_module_re=^never$"))
+    given = (("elsewhere", f"--xla_dump_to={tmp_path / 'other'}"),
+             ("filtered", "--xla_dump_hlo_module_re=^never$"))
     for name, flags in given:
         environment = {**os.environ, "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
         subprocess.run([sys.executable, "-c", compiling], env=dumps(Path(name), environment), check=True)
