@@ -131,26 +131,25 @@ def marked_setups(name: str, text: str) -> dict[str, str]:
     return found
 
 
-def units(nodes: list[str]) -> list[list[int]]:
+def units(nodes: list[str], recorded: Container[str] | None = None) -> list[list[int]]:
     """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone, but
-    those of one file marked with one `SHARED_SETUP`, together at the first one's place, whether the
-    durations record names them yet or not. Each file's marks are read once."""
+    those of one file marked with one `SHARED_SETUP`, together, whether the durations record names them yet
+    or not, at the place of the first of them `recorded` names (the nodes the record names, where given),
+    else of the first: the plan, which sees the recorded tests alone, then orders the units as a task does.
+    Each file's marks are read once."""
     marks: dict[str, dict[str, str]] = {}
-    held: list[list[int]] = []
-    at: dict[tuple[str, str], int] = {}
+    held: dict[tuple[str, str] | int, list[int]] = {}
     for index, node in enumerate(nodes):
         name = node.split("::")[0]
         if name not in marks:
             marks[name] = shared_setups(name)
         setup = marks[name].get(test_name(node))
-        if setup is None:
-            held.append([index])
-        elif (name, setup) in at:
-            held[at[name, setup]].append(index)
-        else:
-            at[name, setup] = len(held)
-            held.append([index])
-    return held
+        held.setdefault(index if setup is None else (name, setup), []).append(index)
+
+    def place(unit: list[int]) -> int:
+        return next((index for index in unit if recorded is None or nodes[index] in recorded), unit[0])
+
+    return sorted(held.values(), key=place)
 
 
 def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
@@ -163,12 +162,12 @@ def cut(nodes: list[str], seconds: list[float], count: int,
     """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
     every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
     setup's tests in one group. Where `recorded` is given (the nodes the durations record names), a test it
-    lacks weighs nothing in a unit it names another of: the plan, which reads the record alone, cuts where
-    the task does, and the test rides with its setup's."""
-    held = units(nodes)
-    runs = groups([sum(seconds[index] for index in unit
-                       if recorded is None or nodes[index] in recorded
-                       or not any(nodes[each] in recorded for each in unit)) for unit in held], count)
+    lacks weighs nothing, alone or in a unit, recorded or new: the plan, which reads the record alone, cuts
+    the recorded tests where the task does, and the new ones ride with their neighbours (the slow-test gate
+    answers for their cost)."""
+    held = units(nodes, recorded)
+    runs = groups([sum(seconds[index] for index in unit if recorded is None or nodes[index] in recorded)
+                   for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 
