@@ -60,10 +60,10 @@ def draw(site: str, seed: int, config: dict) -> dict[str, np.ndarray]:
     rng = np.random.default_rng([sum(map(ord, site)), seed])
     if site in ("image", "video"):
         return _media(rng, site, config)
-    rows = 1 if site == "packed" else ROWS
-    inputs = {"ids": rng.integers(0, vocabulary(config), (rows, LENGTH)).astype(np.int32)}
+    rows, tokens = 1 if site == "packed" else ROWS, vocabulary(config)
+    inputs = {"ids": rng.integers(0, tokens, (rows, LENGTH)).astype(np.int32)}
     if site == "gradients":
-        inputs["cotangent"] = rng.normal(size=(rows, LENGTH, vocabulary)).astype(np.float32)
+        inputs["cotangent"] = rng.normal(size=(rows, LENGTH, tokens)).astype(np.float32)
     if site == "biased":
         mask = np.ones((rows, LENGTH), np.int32)
         mask[1, :PADDED] = 0
