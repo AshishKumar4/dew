@@ -744,7 +744,7 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     assert loaded == built
     with pytest.raises(ValueError, match="device_kind"):
         loaded.loaded()
-    here = BuildTarget.of(jax.devices())
+    here = BuildTarget.of(jax.devices()[:1])
     assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "device_kind"]
 
 
