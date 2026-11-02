@@ -841,12 +841,11 @@ def teacher_of(family: Family, model, inputs: InputSpec):
 
 
 def rcm(family: Family, directory: Path) -> None:
-    """rCM's consistency and score distillation from a frozen teacher of the same family, its backward
-    simulation one step (tests/test_rcm.py runs it over two)."""
+    """rCM's consistency and score distillation from a frozen teacher of the same family."""
     student = smooth(loaded(family).model)
     inputs = family.inputs()
     objective = ConsistencyDistillationObjective(
-        student, presets.Flow()(), inputs, student_update_freq=1, max_simulation_steps=1,
+        student, presets.Flow()(), inputs, student_update_freq=1, max_simulation_steps=2,
         variables={TEACHER: teacher_of(family, student, inputs)}, ema_decay=None)
     assert_trains(objective, denoised_batch(inputs), directory)
 

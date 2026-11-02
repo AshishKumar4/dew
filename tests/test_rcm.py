@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import per_test_settings
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -173,7 +174,15 @@ class _Teacher(NamedTuple):
 @pytest.fixture(scope="module")
 def saved_teacher(tmp_path_factory) -> _Teacher:
     """A flow run trained one step and saved as its run saves it, its task's record beside its weights,
-    shared by the module's distillations of it."""
+    shared by the module's distillations of it, made under settings of its own as a test's are
+    (`lane_environment.per_test_settings`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        per_test_settings(patch, tmp_path_factory.mktemp)
+        return _saved_teacher(tmp_path_factory.mktemp("rcm"))
+
+
+def _saved_teacher(root: Path) -> _Teacher:
+    """`saved_teacher`, saved under `root`."""
     from diffusion_stubs import batch_for
     from diffusion_support import images_of
 
@@ -186,7 +195,6 @@ def saved_teacher(tmp_path_factory) -> _Teacher:
     from dew.sampling import Euler
     from dew.training import Trainer
 
-    root = tmp_path_factory.mktemp("rcm")
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),

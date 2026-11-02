@@ -851,8 +851,9 @@ class FitSearch[LossT, EffectsT]:
             self.lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
-        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
-        if not self.xla_defaults and self.chosen != self.required:
+        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89). Both
+        # are compared as the target compiles them (`deviceless_options`).
+        if not self.xla_defaults and self.chosen != deviceless_options(self.mesh, self.required):
             self.xla_defaults = True
             return True
         self.xla_defaults = False
