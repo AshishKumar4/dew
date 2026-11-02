@@ -877,6 +877,37 @@ def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_
     assert abs(float(stepped[0, 0]) - exact) <= np.spacing(np.float32(exact))
 
 
+EULER_SEEDS = 8
+"""The zero-SNR Euler step site's declared draws (check 1)."""
+
+
+def test_a_variance_exploding_euler_step_from_a_zero_snr_sigma_rounds_as_ddim():
+    """An Euler step from a zero-SNR schedule's first sigma, 4096, down to 14.6 is as exact as DDIM's step,
+    x_0 + sigma_s (x - x_0) / sigma_t, against its float64 value (check 1): the source's x + derivative dt
+    cancels two terms of x's size there (x is 4e4) and keeps dt's rounding times the derivative, about 270
+    times farther (ledger 3475). The source's increment is the step between near sigmas alone, where
+    neither cancels (2 sigma_s >= sigma_t, the high-sigma walk of ledger 2541)."""
+    from dew.sampling.solvers.sigma import _euler_step
+
+    sigma_t, sigma_s = 4096.0, 14.6
+
+    def draw(seed):
+        rng = np.random.default_rng([3475, seed])
+        denoised = rng.standard_normal((4096, 1)).astype(np.float32)
+        return (denoised + np.float32(sigma_t) * rng.standard_normal((4096, 1))).astype(np.float32), denoised
+
+    def stepped(x, denoised):
+        one = jnp.ones((), x.dtype)
+        return _euler_step(x, denoised, (one, jnp.asarray(sigma_t, x.dtype)),
+                           (one, jnp.asarray(sigma_s, x.dtype)))[0]
+
+    def ddim(x, denoised):
+        return denoised + jnp.asarray(sigma_s, x.dtype) * (x - denoised) / jnp.asarray(sigma_t, x.dtype)
+
+    assert_as_exact(jax.jit(stepped), jax.jit(ddim), draw, "a variance-exploding Euler step from a zero-SNR "
+                    "sigma", seeds=EULER_SEEDS, truth_fn=ddim)
+
+
 POSTERIOR_SEEDS = 8
 """The DDIM posterior site's declared draws (check 1), sized by `seeds_for` paired with Dew's step on
 armada: the most any process took."""
