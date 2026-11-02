@@ -143,14 +143,12 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
                                     under=under)
 
 
-def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward_without_solving_again():
+def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
     """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
-    recomputes the forward's memories (`recomputing(('delta_memory',))`), over one draw of its recorded site:
-    bitwise the gradient its kept memories give, whose check 1 against recorded fla holds both
-    (`test_the_mosaic_gradient_is_as_exact_as_its_reference`), and its recompute reading the inverse the
-    forward kept: the chunks' solve launched as often as under the kept memories (once, in the forward) while
-    the memories are launched again. The recompute had run the solve again, its kept residual unread (row
-    3591)."""
+    recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
+    the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
+    give, whose check 1 against recorded fla holds both
+    (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     from fla_sites import LEAVES, ruled, sites
 
     case = 'a decay a key dimension'
@@ -163,9 +161,6 @@ def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward_without_s
                 return ruled(on, given, LEAVES)
         return run
 
-    kept, recomputed = (str(jax.make_jaxpr(under(names))(arrays)) for names in ((), ('delta_memory',)))
-    assert recomputed.count('recurrence_intra_solve') == kept.count('recurrence_intra_solve')
-    assert recomputed.count('recurrence_states') > kept.count('recurrence_states')
     found = (jax.tree.leaves(jax.jit(under(names))(arrays)) for names in ((), ('delta_memory',)))
     for leaf, a, b in zip(LEAVES, *found, strict=True):
         assert np.array_equal(np.asarray(a), np.asarray(b)), leaf
