@@ -41,14 +41,15 @@ import dataclasses
 import math
 import types
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import FrozenDict, meta
+from flax.typing import Initializer
 
+from dew.batch import Variables
 from dew.mesh import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -561,7 +562,7 @@ _BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.Conte
 `declared_axes` reads ahead of the suffix table while `boxed` holds them."""
 
 
-def declared(init: Callable[..., Any], axes: LogicalAxes | None) -> Callable[..., Any]:
+def declared(init: Initializer, axes: LogicalAxes | None) -> Initializer:
     """`init` drawing a parameter whose module declares its logical `axes` where it makes it
     (`nn.with_logical_partitioning`: the axes travel with the parameter, as Flax's partitioning reads
     them), or `init` itself for `axes` None, a parameter its module names no axes of. A module's `param`
@@ -585,22 +586,20 @@ def unboxed(tree):
     return jax.tree.map(value, tree, is_leaf=is_boxed)
 
 
-def boxed_like(template: Mapping[str, object], values: Mapping[str, object]) -> Mapping[str, Any]:
+def boxed_like(template: Variables, values: Variables) -> Variables:
     """`values`, a tree of `template`'s structure read from elsewhere (a checkpoint's arrays), each leaf in
     the box `template`'s leaf at its path has (a draw's, `jax.eval_shape(module.init, ...)`), so it carries
     the axes its module declares; a leaf `template` leaves unboxed, or one `values` boxed already, stays as
     it is. The one translation of a tree that never passed through its module's init: a loaded tree. It is
     walked by key, so a tree keeps its own container (a FrozenDict, a dict) whatever the draw's is."""
-    kept = {name: _boxed_node(template.get(name), value) for name, value in values.items()}
+    kept = dict(values)
+    for name, value in values.items():
+        box = template.get(name)
+        if isinstance(box, meta.AxisMetadata) and not isinstance(value, meta.AxisMetadata):
+            kept[name] = box.replace_boxed(value)
+        elif isinstance(box, Mapping) and isinstance(value, Mapping):
+            kept[name] = boxed_like(box, value)
     return FrozenDict(kept) if isinstance(values, FrozenDict) else kept
-
-
-def _boxed_node(template: object, value: object) -> object:
-    if isinstance(template, meta.AxisMetadata):
-        return value if isinstance(value, meta.AxisMetadata) else template.replace_boxed(value)
-    if isinstance(template, Mapping) and isinstance(value, Mapping):
-        return boxed_like(template, value)
-    return value
 
 
 def rows_boxed(boxed, value):
