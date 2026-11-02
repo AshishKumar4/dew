@@ -1136,6 +1136,134 @@ causal_transformer+qwen35	['params']['layers_3']['self_attn']['q_norm']['scale']
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['v_proj']['kernel']	32x8	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['norm']['scale']	32	-	('fsdp',)	device
+decoder+continuum	['params']['continuum']['down']['kernel']	32x4	embed,mlp	('fsdp', 'tensor')	device
+decoder+continuum	['params']['continuum']['up']['kernel']	4x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+continuum	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
+decoder+continuum	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+continuum	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+continuum	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+continuum	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+continuum	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+continuum	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+continuum	['params']['layers_0']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_0']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+continuum	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+continuum	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+continuum	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+continuum	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+continuum	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+continuum	['params']['layers_1']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+continuum	['params']['layers_1']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+continuum	['params']['norm']['scale']	32	-	('fsdp',)	device
+decoder+dex	['constants']['layers_0']['self_attn']['dex_heads']	2	.	()	device
+decoder+dex	['constants']['layers_0']['self_attn']['dex_lambda_init']	-	()	()	device
+decoder+dex	['constants']['layers_1']['self_attn']['dex_heads']	2	.	()	device
+decoder+dex	['constants']['layers_1']['self_attn']['dex_lambda_init']	-	()	()	device
+decoder+dex	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
+decoder+dex	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+dex	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+dex	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+dex	['params']['layers_0']['self_attn']['dex_lambda']	-	()	()	device
+decoder+dex	['params']['layers_0']['self_attn']['dex_projection']	2x8x8	.,.,.	()	device
+decoder+dex	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+dex	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+dex	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+dex	['params']['layers_0']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_0']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+dex	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+dex	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+dex	['params']['layers_1']['self_attn']['dex_lambda']	-	()	()	device
+decoder+dex	['params']['layers_1']['self_attn']['dex_projection']	2x8x8	.,.,.	()	device
+decoder+dex	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+dex	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+dex	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+dex	['params']['layers_1']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+dex	['params']['layers_1']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+dex	['params']['norm']['scale']	32	-	('fsdp',)	device
+decoder+engram	['constants']['engram_hashes']['token_map']	37	-	()	device
+decoder+engram	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
+decoder+engram	['params']['hc_head']['hc_base']	2	-	()	device
+decoder+engram	['params']['hc_head']['hc_fn']	2x64	-	(None, 'fsdp')	device
+decoder+engram	['params']['hc_head']['hc_scale']	1	-	()	device
+decoder+engram	['params']['layers_0']['attn_hc']['base']	8	-	()	device
+decoder+engram	['params']['layers_0']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+decoder+engram	['params']['layers_0']['attn_hc']['scale']	3	-	()	device
+decoder+engram	['params']['layers_0']['engram']['embed']['embedding']	88x4	vocab,.	(('fsdp', 'tensor'),)	device
+decoder+engram	['params']['layers_0']['engram']['k_weight']	2x32	.,embed	(None, 'fsdp')	device
+decoder+engram	['params']['layers_0']['engram']['q_weight']	2x32	.,embed	(None, 'fsdp')	device
+decoder+engram	['params']['layers_0']['engram']['wkv']['kernel']	16x96	.,embed	(None, 'fsdp')	device
+decoder+engram	['params']['layers_0']['ffn_hc']['base']	8	-	()	device
+decoder+engram	['params']['layers_0']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+decoder+engram	['params']['layers_0']['ffn_hc']['scale']	3	-	()	device
+decoder+engram	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+engram	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+engram	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+engram	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+engram	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+engram	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+engram	['params']['layers_0']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_0']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_1']['attn_hc']['base']	8	-	()	device
+decoder+engram	['params']['layers_1']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+decoder+engram	['params']['layers_1']['attn_hc']['scale']	3	-	()	device
+decoder+engram	['params']['layers_1']['ffn_hc']['base']	8	-	()	device
+decoder+engram	['params']['layers_1']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+decoder+engram	['params']['layers_1']['ffn_hc']['scale']	3	-	()	device
+decoder+engram	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+engram	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+engram	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+engram	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+engram	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+engram	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+engram	['params']['layers_1']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+engram	['params']['layers_1']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+engram	['params']['norm']['scale']	32	-	('fsdp',)	device
+decoder+value_experts	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
+decoder+value_experts	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+value_experts	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+decoder+value_experts	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+value_experts	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+value_experts	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+value_experts	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+value_experts	['params']['layers_0']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_0']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+value_experts	['params']['layers_1']['mlp']['experts']['down_proj']['kernel']	4x64x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+decoder+value_experts	['params']['layers_1']['mlp']['experts']['gate_proj']['kernel']	4x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_1']['mlp']['experts']['up_proj']['kernel']	4x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_1']['mlp']['gate']['kernel']	32x4	embed,exp	('fsdp', 'expert')	device
+decoder+value_experts	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+decoder+value_experts	['params']['layers_1']['self_attn']['experts']['v_proj']['kernel']	4x32x32	exp,embed,kv	('expert', 'fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_1']['self_attn']['experts']['v_router']['kernel']	32x4	-	('fsdp',)	device
+decoder+value_experts	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+value_experts	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+decoder+value_experts	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
+decoder+value_experts	['params']['layers_1']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+decoder+value_experts	['params']['norm']['scale']	32	-	('fsdp',)	device
 diffusion_gemma	['params']['self_conditioning']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
 diffusion_gemma	['params']['self_conditioning']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 diffusion_gemma	['params']['self_conditioning']['pre_norm']['scale']	32	-	('fsdp',)	device

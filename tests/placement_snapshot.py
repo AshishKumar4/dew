@@ -55,6 +55,32 @@ def _components() -> dict:
     }
 
 
+def _features() -> dict:
+    """Decoders that turn on a feature whose modules declare axes no catalogued model reaches: continual
+    learning's levels, DEX's chosen heads, routed value experts and Engram's hashed tables."""
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.continuum import ContinuumLevel
+    from dew.nn.dex import DifferentialExtension
+    from dew.nn.engram import Engram
+    from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.value_experts import ValueExperts
+
+    ids = (jnp.zeros((1, 8), jnp.int32),)
+    fields = {
+        "continuum": {"continuum": ContinuumLevel(hidden=4)},
+        "dex": {"dex": DifferentialExtension(((0, (0, 1)), (1, (1, 3))), anneal_steps=10)},
+        # Value experts give the values of the layers a mixture routes.
+        "value_experts": {"value_experts": ValueExperts(experts=4, top_k=2),
+                          "mixture": Mixture(experts=4, top_k=2, layers=(1,))},
+        # Engram gates its lookup into each of mHC's residual streams.
+        "engram": {"engram": Engram(layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=16,
+                                    n_heads=2, head_dim=4, compressed_vocab_size=16),
+                   "hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
+    }
+    return {f"decoder+{name}": lambda extra=extra: (tiny(max_seq_len=128, **extra), ids, {})
+            for name, extra in fields.items()}
+
+
 def cases() -> dict:
     """Each case's name, and how to build its module and the inputs it initializes on."""
     built = {}
@@ -70,7 +96,7 @@ def cases() -> dict:
             return (tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides),
                     (jnp.zeros((1, 8), jnp.int32),), {})
         built[f"mixer:{kind}"] = mixer
-    return {**built, **_components()}
+    return {**built, **_components(), **_features()}
 
 
 TRAINED = ("causal_transformer", "causal_transformer+moe")
