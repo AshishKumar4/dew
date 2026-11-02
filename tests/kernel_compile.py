@@ -27,6 +27,7 @@ import compile_evidence
 import jax
 import jax.experimental.topologies as topologies
 import numpy as np
+from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
@@ -55,7 +56,8 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 @dataclasses.dataclass(frozen=True)
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
-    (Mosaic's resource estimate), its registers a thread and its spilled bytes as the GPU compiles its PTX
+    (its binary's launch and Mosaic's resource estimate, respectively), its registers a thread and its
+    spilled bytes as the GPU compiles its PTX
     (`inherited`, their only source: None until it reads them), what the reports left `unread`: a kernel no
     binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
     `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
@@ -89,12 +91,12 @@ class Report:
 
 def reports(estimates: dict[str, str], binaries: list[report.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
-    """Each kernel's `Report` of its shared memory and tensor memory from its resource estimate (`estimates`,
-    Pallas's printed `Resources`) and its binary (`binaries`, `report.binaries`), paired by the kernel's name
-    and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its registers and spills
-    are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel (`_estimates` pairs them
-    by the program's order): one past the shared memory its binary's launch asks for, or none where it asks
-    for some, is another kernel's, and raises, as two binaries of one launch do."""
+    """Each kernel's `Report` of its total shared memory from its binary (`binaries`, `report.binaries`)
+    and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`), paired by the
+    kernel's name and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its
+    registers and spills are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel
+    (`_estimates` pairs them by the program's order): one past the shared memory its binary's launch asks
+    for, or none where it asks for some, is another kernel's, and raises, as two binaries of one launch do."""
     found: dict[str, report.Binary] = {}
     for binary in binaries:
         if found.setdefault(report.launch_name(binary.kernel, binary.launch), binary) != binary:
@@ -108,11 +110,13 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
                              f"launch asks for {binary.shared}: the estimate is another kernel's")
         # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
-        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                                 ("binary", binary)) if not read)
+        unread = tuple(field for field, read in (
+            ("shared bytes", shared is not None and binary is not None and binary.shared is not None),
+            ("tensor memory columns", tmem), ("binary", binary)) if not read)
         kernel, launch = report.kernel_of(name)
         found_reports.append(Report(
-            kernel, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
+            kernel, binary.shared if binary is not None else None,
+            sum(map(int, tmem.groups())) if tmem else None,
             None, None, unread, (modules or {}).get(name), launch))
     return found_reports
 
@@ -218,7 +222,10 @@ def _compiled(case, generation: str, record: dict,
                           if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
     estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
     try:
+        # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
+        # Its bound checks the total allocation, including barriers outside the scratch estimate.
         with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+              mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit),
               estimating as estimated):
             lowered = jax.jit(fn).trace(*placed).lower()
     except Exception as error:  # A case that does not lower is its own failure.
@@ -700,7 +707,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             stated = record.get("models", {}).get(found_kernel.kernel)
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
-                              f"bytes of scratch, the kernel asks for {found_kernel.shared}")
+                              f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
         record["evidence"] = _register_evidence(record)
     return failed
 

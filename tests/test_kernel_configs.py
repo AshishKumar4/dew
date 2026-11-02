@@ -512,11 +512,11 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel (`resources.register_model`, `kernel_compile.decisions`), and the scratch the planner sized it by
-    (`resources.scratch_bytes` of `launch_of`'s allocations, its barriers apart), against the kernel's
-    own."""
+    kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared memory the planner
+    sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the
+    kernel's own."""
     family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-    shared = resources.scratch_bytes(family, launch.launch_of(ba, config).scope(config.stages))
+    shared = resources.shared_bytes(family, launch.launch_of(ba, config).scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
 
 
@@ -790,10 +790,10 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
+        [report.Binary("a", None, 168, 0, shared=1024), report.Binary("b", None, 255, 40, shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
-    assert set(c["unread"]) == {"tensor memory columns", "binary", "registers", "spills"}
+    assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
     assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):

@@ -1685,15 +1685,49 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
 
 
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
-                for width in (64, 128, 256) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+                for width in (64, 128, 256)
+                for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
 FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
-                 for training in (template.Kept.NONE, template.Kept.SPLIT)
+                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
-head widths, the inference and the training forward, hookless, each score hook at the widths a hooked
-call's derivation takes (row 2281: its live set beside the walk's), and a softcap's inference forward 256
-wide (Gemma's)."""
+head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
+split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
+beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT], ids=["inference", "training"])
+def test_an_a100_forward_counts_its_lowerings_reduction_scratch(dtype, kept, monkeypatch):
+    """The receipt's D256 forward at its pinned tiles: the model includes Mosaic's reduction reservation
+    and both barriers, exactly the 166928 bytes lowering asks for, past the A100's 166912-byte limit.
+    mma.sync is qualified only in this test; the corrected derivation chooses no oversized launch."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    monkeypatch.setattr(attention_mosaic_program, "QUALIFIED",
+                        attention_mosaic_program.QUALIFIED | {"mma.sync"})
+    queries, width = 1024, 256
+    spans = template.spans(queries, queries, 1, causal=True)
+    with generation.assumed("sm80"):
+        query = jnp.zeros((1, queries, 8, width), dtype)
+        key = jnp.zeros((1, queries, 4, width), dtype)
+        op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=kept, interpret=False)
+        config = attention_mosaic.Tiles(64, 64, 2, 1, "mma.sync", narrow=True, relaunch_k=64,
+                                        relaunch_consumers=1, relaunch_columns=128)
+        target = generation.gpu_target()
+        shared = op.staged_bytes(ba, config, target)
+        assert shared == 166928
+        assert shared > target.shared_limit
+        # Lower the fixed config directly: the corrected planner rightly refuses to select it.
+        (found,) = compile_mosaic_kernels([KernelCase("forward", lambda: op.lowering(ba, config))], "sm80")
+        assert "it does not lower:" in found.get("error", ""), found
+        assert f"smem_bytes={shared} > max_smem_bytes={target.shared_limit}" in found["error"], found
+        assert op.derived(ba, target) is None
 
 
 def _forward_kernels(op, ba, config) -> dict:
