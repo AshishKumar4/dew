@@ -728,9 +728,9 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
 
 
 def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
-    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`) are the programs loaded
-    after saving, each an executable this host's CPU is no target of: loading them here is refused, naming the GPU
-    kind it is not (ledger 2716: an H100 node loads what a CPU host built, and runs it alone)."""
+    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`) are the programs
+    loaded after saving, each an executable this host's CPU is no target of: loading them here is refused,
+    naming the GPU kind it is not (ledger 2716: an H100 node loads what a CPU host built, and runs it alone)."""
     from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
 
     square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
