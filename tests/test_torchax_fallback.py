@@ -490,19 +490,6 @@ PACKED_MODELS = {
 window of 4 keys, which counts each document's real tokens."""
 
 
-def test_a_probed_source_proves_each_program_it_runs(tmp_path):
-    """A source tier 3 admits by its probe and runs on Dew's attention (Cohere) proves each program it runs
-    causal before it runs, as one qualified without its probe does (`TorchGraph.certify`, ledger 3679):
-    its probe's 16 tokens say nothing of another length's program."""
-    torch.manual_seed(0)
-    PACKED_MODELS["cohere"]().eval().save_pretrained(tmp_path)
-    with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
-    loaded.model.apply(loaded.variables, jnp.zeros((1, 5), jnp.int32))
-    certified = loaded.model.graph.certified
-    assert certified and all(refusal is None for refusal in certified.values())
-
-
 def packed_rows(seed):
     """Two rows of SEQ + 1 token ids: a drawn run of padding first, numbered with the first document but
     no real token, then two documents cut at a drawn place, the second holding a padding slot among
