@@ -53,6 +53,7 @@ from egglog import (
     vars_,
 )
 from egglog.bindings import EggSmolError
+from jax._src import config as jax_config
 
 from dew.algebra import cost, program, rules, terms
 from dew.algebra.cost import Work
@@ -477,7 +478,12 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     cache: dict = {}
 
     def forms(shapes: Mapping) -> _Forms:
-        key = tuple((name, tuple(shapes[name][0]), str(shapes[name][1])) for name in names)
+        # Each trace context's own (JAX's: its abstract mesh, precision and the user contexts that hold the
+        # pass's target and the run's numerics), as JAX keys its trace caches: forms traced under one hold
+        # its avals in their literals and are priced for its target, so a second context's trace derives
+        # its own (a sharded step's literals bound under a local one's mesh refused to lower).
+        key = (jax_config.trace_context(),
+               *((name, tuple(shapes[name][0]), str(shapes[name][1])) for name in names))
         if key not in cache:
             cache[key] = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
             kernel_report.record_rewrite(cache[key].report)
