@@ -83,11 +83,7 @@ def pytest_configure(config):
 
 
 def pytest_collectstart(collector):
-    """A module's bundle of the shared cache, restored as it is collected, before its tests run; none for a
-    collection that runs no test (`--collect-only`, ci.py's `collect`), which compiles nothing a bundle holds
-    (train 459: 6 GB of programs for 140 files none of whose tests ran, 735 s of a 54 s collection)."""
-    running = not collector.config.option.collectonly
-    if _remote is not None and running and isinstance(collector, pytest.Module):
+    if _remote is not None and isinstance(collector, pytest.Module):
         _remote.opened(bundle(collector))
 
 
