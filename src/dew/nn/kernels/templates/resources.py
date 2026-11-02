@@ -201,9 +201,12 @@ def raised_registers(consumers: int, programs: int = 1) -> int:
 def consumer_registers(consumers: int, programs: int = 1) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
     multiprocessor: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
-    program's entry's otherwise."""
-    return (raised_registers(consumers, programs) if RAISES_HONORED
-            else entry_registers(consumers + 1, programs))
+    program's entry's otherwise; at most the 255 a thread addresses (`cost.THREAD_REGISTERS`), which a raise
+    to setmaxnreg's 256 does not pass: the 27B gated delta net's packed output launch, one consumer at one
+    program, kept a swizzle its model held at 256 registers and spilled 16 bytes."""
+    if RAISES_HONORED:
+        return min(raised_registers(consumers, programs), cost.THREAD_REGISTERS)
+    return min(entry_registers(consumers + 1, programs), cost.THREAD_REGISTERS)
 
 
 def producer_registers(consumers: int, programs: int = 1) -> int:
@@ -270,6 +273,11 @@ def shared_bytes(family: "Family", scope: Scope) -> int:
     return scratch_bytes(family, scope) + BARRIER_BYTES * barriers
 
 
+MOST_STAGES = 8
+"""The deepest ring a launch streams at: deeper rings cover no latency a GPU's loads have (`Launch.most`, the
+recurrence's derived ring)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """One launch a derivation plans (`plan`): its program's allocations at a ring depth (`scope`), its
@@ -280,7 +288,7 @@ class Launch:
     consumers: int
     registers: int
     floor: int = 2
-    most: int = 8
+    most: int = MOST_STAGES
     tile: object = None
     """The template's tile the launch is at, which a plan's evidence names (`recording`)."""
 

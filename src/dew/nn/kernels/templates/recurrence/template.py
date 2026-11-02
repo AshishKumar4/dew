@@ -374,7 +374,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         states = self._states(ba, shallowest, target)
         order = resources.hidden(family, states.consumers)
         deeper = (dataclasses.replace(shallowest, stages=stages)
-                  for stages in range(2, family.most_shared // max(states.step_bytes, 1) + 1))
+                  for stages in range(2, min(resources.MOST_STAGES,
+                                             family.most_shared // max(states.step_bytes, 1)) + 1))
         rings = [shallowest, *(tiles for tiles in deeper if self.legal(ba, tiles, target))]
         return max(rings, key=lambda tiles: order(self.states_held(ba, tiles, target), tiles.stages))
 
