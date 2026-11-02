@@ -330,14 +330,16 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     extracted too, from the graph as it stood (egglog's `push`, `pop`): a region whose forms are its roots'
     (commutativity's alone) takes one extraction."""
     began = time.perf_counter()
-    region = terms.region(closed)
     admitted = rules.admitted(accurate)
-    if not rules.reorderable(region):
+    # A window's structure decides first, its egglog terms built only where a rule may fire.
+    skeleton = terms.region(closed, forms=terms.Skeleton)
+    if not rules.reorderable(skeleton):
         fired = dict.fromkeys((sets.name for sets in admitted), 0)
-        report = AlgebraReport(region.equations, tuple(fired), fired, saturation.limits(region),
+        report = AlgebraReport(skeleton.equations, tuple(fired), fired, saturation.limits(skeleton),
                                iterations=0, nodes=0, limited=False, before=0.0, after=0.0,
                                seconds=time.perf_counter() - began)
-        return Rewrite(region, {}, report)
+        return Rewrite(skeleton, {}, report)
+    region = terms.region(closed)
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()

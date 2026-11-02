@@ -73,7 +73,7 @@ def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[
     return price.value
 
 
-def _valued(region: terms.Region, consts, chosen: dict[Hashable, terms.Term], tree) -> Callable:
+def _valued(region: terms.Region[terms.Term], consts, chosen: dict[Hashable, terms.Term], tree) -> Callable:
     """The function `region`'s program computes with each root in its chosen form (`chosen`, by the root's
     key, `terms.key`), over its operands: each output its root's form, a literal output its literal, in the
     program's output structure `tree`, an equation outside the language evaluated where a form reads its
