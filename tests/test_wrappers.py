@@ -661,3 +661,60 @@ def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():
         stem = weight.removesuffix(".weight")
         for suffix in SIDECARS:
             assert wrapper_route(module + suffix, record) == (component, stem + suffix)
+
+
+VLM_TEXT = {
+    "qwen2_5_vl": {"text_config": {"model_type": "qwen2_5_vl_text", "hidden_size": 64,
+                                   "intermediate_size": 128, "num_hidden_layers": 2, "num_attention_heads": 4,
+                                   "num_key_value_heads": 2,
+                                   "vocab_size": 256, "max_position_embeddings": 64,
+                                   "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3]}},
+                   "vision_config": {"depth": 1, "hidden_size": 32, "out_hidden_size": 64, "num_heads": 2,
+                                     "intermediate_size": 64, "fullatt_block_indexes": [0]}},
+    "qwen3_vl_moe": {"text_config": {"model_type": "qwen3_vl_moe_text", "hidden_size": 64,
+                                     "intermediate_size": 128, "moe_intermediate_size": 32,
+                                     "num_hidden_layers": 2, "num_attention_heads": 4,
+                                     "num_key_value_heads": 2, "head_dim": 16, "num_experts": 4,
+                                     "num_experts_per_tok": 2,
+                                     "vocab_size": 256, "max_position_embeddings": 64,
+                                     "rope_scaling": {"rope_type": "default", "mrope_section": [2, 3, 3],
+                                                      "mrope_interleaved": True}},
+                     "vision_config": {"depth": 1, "hidden_size": 32, "out_hidden_size": 64, "num_heads": 2,
+                                       "intermediate_size": 64, "deepstack_visual_indexes": [0]}},
+}
+"""Two VLMs whose text decoders transformers builds no causal LM for (ledger 3069), each tiny."""
+VLM_TEXT_SEEDS = 8
+"""Their text logits' declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("model_type", sorted(VLM_TEXT))
+def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type):
+    """Qwen2.5-VL's and Qwen3-VL-MoE's text decoders, which transformers builds no causal LM for, load
+    text-only as the Qwen2 and Qwen3-MoE decoders they are, their M-RoPE the plain rotary a text-only row
+    turns (ledger 3069): their logits over drawn text hold check 1 against the VLM's own forward over
+    text alone, from its float64 twin."""
+    import torch
+    from interop_support import token_draw, torch_logits
+    from reference_error import as_given, assert_as_exact
+    from transformers import AutoConfig, AutoModelForImageTextToText
+
+    from dew.interop import Pretrained
+    from dew.interop.verify import scatter_weights
+    from tools.torch_precision import float64, float64_twin
+
+    config = AutoConfig.for_model(model_type, image_token_id=255, video_token_id=254,
+                                  vision_start_token_id=253, vision_end_token_id=252, **VLM_TEXT[model_type])
+
+    def built(dtype):
+        return AutoModelForImageTextToText.from_config(config, dtype=dtype).eval()
+
+    torch.manual_seed(0)
+    model = built(torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", text_only=True)
+    forward = jax.jit(loaded.model.apply)
+    wide = float64_twin(model, lambda: built(torch.float64)).eval()
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_logits(model), token_draw(0x3069, 250, (2, 12)), f"{model_type}'s text logits",
+                    seeds=VLM_TEXT_SEEDS, truth_fn=torch_logits(wide, float64))

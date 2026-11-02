@@ -536,6 +536,38 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], reco
     return sources, tuple(aliases)
 
 
+TEXT_FAMILIES = {"qwen2_vl_text": "qwen2", "qwen2_5_vl_text": "qwen2", "qwen3_vl_text": "qwen3",
+                 "qwen3_vl_moe_text": "qwen3_moe"}
+"""A VLM's text decoder type, which transformers builds no causal LM for, by the family its decoder
+follows: Qwen2-VL's and Qwen2.5-VL's are Qwen2's, Qwen3-VL's Qwen3's and Qwen3-MoE's, each rotating text
+by plain positions (`plain_text_rope`)."""
+
+
+def plain_text_rope(text: Mapping[str, object]) -> dict:
+    """A VLM text decoder's config as its family reads text alone (`TEXT_FAMILIES`): each rope record
+    without its M-RoPE layout, since a text-only row puts every rotary axis at the token's position, so
+    the sections of `mrope_section`, interleaved or not, rotate every channel pair at that one position,
+    the plain table. The sections must cover the rotated pairs."""
+    text = dict(text)
+    head_dim = _records.integer(text.get("head_dim") or _records.integer(text["hidden_size"], "hidden_size")
+                                // _records.integer(text["num_attention_heads"], "num_attention_heads"),
+                                "head_dim")
+    for key in ("rope_parameters", "rope_scaling"):
+        entry = text.get(key)
+        if isinstance(entry, Mapping) and "mrope_section" in entry:
+            entry = dict(entry)
+            section = _records.integers(entry.pop("mrope_section"), "mrope_section")
+            _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
+            if sum(section) != head_dim // 2:
+                raise ValueError(f"mrope_section {section} must cover the {head_dim // 2} channel pairs")
+            if entry.get("type") == "mrope":
+                entry["type"] = "default"
+            if entry.get("rope_type") == "mrope":
+                entry["rope_type"] = "default"
+            text[key] = entry
+    return text
+
+
 def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The config a wrapper's language model states as its text family's own checkpoint: the text_config
     typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
@@ -544,6 +576,8 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
     before the text config's (`generation_config`)."""
     text = dict(_text_config(hf_config))
+    if (family_type := TEXT_FAMILIES.get(str(text.get("model_type")))) is not None:
+        text = {**plain_text_rope(text), "model_type": family_type}
     for field in ("torch_dtype", "dtype"):
         if field in hf_config and field not in text:
             text[field] = hf_config[field]
