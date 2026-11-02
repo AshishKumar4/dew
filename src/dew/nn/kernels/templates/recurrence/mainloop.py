@@ -1981,6 +1981,12 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         (scores,) = _intra(q, k, hi, lo, beta, taken, alone, scale=scale)
         (keys,) = _weighted(k, v, None, hi, lo, beta, taken, alone)
         a = inverse
+    elif per_key and delta and inverse is not None:
+        # The forward's inverse given without its states (a recomputed forward, `delta_memory`): its scores
+        # formed again without the delta rule's system, its weights from the inverse, the solve not repeated.
+        (scores,) = _intra(q, k, hi, lo, beta, taken, dataclasses.replace(call, delta=False), scale=scale)
+        a = inverse
+        w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
     elif per_key and delta:
         system, scores = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
         a = _intra_solve(system, taken, call)
