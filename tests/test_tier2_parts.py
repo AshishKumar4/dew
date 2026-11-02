@@ -446,6 +446,7 @@ BUILT_IN = {
     "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
                  "conv_L_cache": 3, "num_dense_layers": 1, "num_experts": 8, "num_experts_per_tok": 2,
                  "moe_intermediate_size": 32, "routed_scaling_factor": 1.7},
+    "glm4": {"head_dim": None, "num_key_value_heads": 2, "attention_bias": True, "partial_rotary_factor": 0.5},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
@@ -460,11 +461,13 @@ convolutions between its attention layers, its modules under names of their own 
 balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
 first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
 rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
-and keys normed after their rotation, at its dynamic-alpha base."""
+and keys normed after their rotation, at its dynamic-alpha base; and GLM-4's sandwich-normed layers, its
+gate and up projections one fused Linear and its rotary turning adjacent pairs of half of each head
+(ledger 3077)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8}
+                  "hunyuan_v1_moe": 8, "glm4": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
