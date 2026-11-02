@@ -88,18 +88,21 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, Stored]) 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
                      path: tuple[str, ...] = ()) -> np.dtype:
     """Floating payloads use parameter storage, or under `AUTO` keep the dtype
-    each was stored in; integer and boolean state keeps its dtype. Constants, a
-    head's bias and a lightning indexer's head weights (`weights_proj`, which
-    V3.2's, A.X-K2's and V4's references keep in fp32, `_keep_in_fp32_modules`,
-    and which a narrower indexer reads cast down alike) stay fp32."""
-    if path and (path[0] == 'constants' or (path[0] == 'params' and (
-            path[-1] == 'head_bias' or tuple(path[-2:]) == ('weights_proj', 'kernel')))):
+    each was stored in; integer and boolean state keeps its dtype. Constants and
+    a head's bias stay fp32. A lightning indexer's head weights (`weights_proj`)
+    stay fp32 where the storage is fp16, as V3.2's, A.X-K2's and V4's
+    references keep them in a float16 load (`_keep_in_fp32_modules`, which
+    transformers honours at float16 alone, modeling_utils.py:3826-3830)."""
+    if path and (path[0] == 'constants' or (path[0] == 'params' and path[-1] == 'head_bias')):
         param_dtype = 'float32'
     if param_dtype == AUTO:
         return stored
     dtype = resolve_dtype(param_dtype)
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         raise ValueError(f"param_dtype {param_dtype!r} must name floating parameter storage")
+    if np.dtype(dtype) == np.float16 and path and path[0] == 'params' and tuple(path[-2:]) == (
+            'weights_proj', 'kernel'):
+        dtype = jnp.float32
     return np.dtype(dtype) if jnp.issubdtype(stored, jnp.floating) else stored
 
 

@@ -47,15 +47,31 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     if decoder.attention_residuals is not None:
         sources = decoder.attention_residuals.blocks(decoder.num_layers) + 1
         count += depth_counter(DepthAttention(decoder.emb_features, parent=None), lengths, sources)
-    # The gated norms outside the layers (`NormSpec.gate_rank`): the embedding's once, and the final
-    # one's once and between a loop's passes where it steps them.
-    final = decoder.ngpt is None and decoder.final_norm
-    steps = decoder.loop.steps if decoder.loop is not None and decoder.loop.step_norm else 1
+    # The gated norms outside the layers (`NormSpec.gate_rank`): the embedding's once, at the lookup's
+    # width where it norms the lookup, and the final one's each time a call runs it (`final_norm_runs`).
+    lookup = decoder.embedding_features if decoder.embedding_norm_reads == 'lookup' else None
     count += gate_flops(decoder.norms, ('embedding_layernorm',) if decoder.embedding_norm else (),
-                        decoder.emb_features, lengths, routed=None)
-    count += steps * gate_flops(decoder.norms, ('norm',) if final else (), decoder.emb_features, lengths,
-                                routed=None)
+                        lookup or decoder.emb_features, lengths, routed=None)
+    count += final_norm_runs(decoder) * gate_flops(decoder.norms, ('norm',), decoder.emb_features, lengths,
+                                                   routed=None)
     return count
+
+
+def final_norm_runs(decoder: CausalTransformer) -> int:
+    """How many times a call runs the decoder's final norm (`norm`): after its last layer where it ends in
+    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where its exit gate or its step
+    reads the normed state, and, under `reinject`, on each pass's input and after the passes. Under nGPT
+    none, its norm being the unit sphere's, which learns nothing."""
+    if decoder.ngpt is not None:
+        return 0
+    runs = int(decoder.final_norm)
+    loop = decoder.loop
+    if loop is not None:
+        later = loop.steps - 1
+        runs += later * int(loop.step_norm or loop.exit_gate)
+        if loop.reinject:
+            runs += 1 + later + 1
+    return runs
 
 
 def layer_counts(decoder: CausalTransformer, lengths, counter: Counter) -> list[float]:
