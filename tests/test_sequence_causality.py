@@ -86,6 +86,22 @@ REFUSED = {
     "plain attention": lambda tokens: attention(*(embedded(tokens),) * 3, causal=False),
     "masked attention outside Dew's": lambda tokens: attention(*(embedded(tokens),) * 3, causal=True),
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
+    "an operation with no rule": lambda tokens: jax.lax.linalg.tridiagonal_solve(
+        *(jnp.full((tokens.shape[1],), value) for value in (0.5, 2.0, 0.5)),
+        embedded(tokens)[0, :, :1])[None],
+    "positions moved to the features' axis": lambda tokens: jnp.broadcast_to(
+        embedded(tokens)[:, :, :1], (1, tokens.shape[1], tokens.shape[1])).transpose(0, 2, 1),
+    "a reshape that transposes": lambda tokens: jax.lax.reshape(
+        jnp.broadcast_to(embedded(tokens)[:, :, :1], (1, tokens.shape[1], tokens.shape[1])),
+        (1, tokens.shape[1], tokens.shape[1]), dimensions=(0, 2, 1)),
+    "a partial update over a left shift": lambda tokens: jax.lax.dynamic_update_slice(
+        shifted_left(embedded(tokens))[:, :, :2], jnp.zeros((1, tokens.shape[1], 1)), (0, 0, 0)),
+    "a loop of no passes from a left shift": lambda tokens: jax.lax.while_loop(
+        lambda carry: carry[1] < 0, lambda carry: (jnp.zeros_like(carry[0]), carry[1] + 1),
+        (shifted_left(embedded(tokens)), 0))[0],
+    "a convolution grouping the positions by batch": lambda tokens: jax.lax.conv_general_dilated(
+        embedded(tokens)[0, :, :1][:, :, None], jnp.ones((1, 1, 2)), (1,), ((0, 0),),
+        dimension_numbers=("NWC", "WIO", "NWC"), batch_group_count=2).reshape(1, -1, 1),
     "layers scanned with a mean": lambda tokens: jax.lax.scan(
         lambda h, w: (h @ w - (h @ w).mean(axis=1, keepdims=True), None), embedded(tokens),
         jnp.ones((3, D, D)))[0],
@@ -95,7 +111,8 @@ REFUSED = {
 def refusal(function, lengths=LENGTHS):
     """The walk's refusal of `function` at the first of `lengths` it refuses, None where it proves each."""
     for length in lengths:
-        found = causality_refusal(jax.make_jaxpr(function)(jnp.zeros((1, length), jnp.int32)), 0, length)
+        program = jax.make_jaxpr(function)(jnp.zeros((1, length), jnp.int32))
+        found = causality_refusal(program, 0, length, (0,))
         if found is not None:
             return found
     return None
@@ -121,3 +138,10 @@ def test_a_program_that_reads_later_positions_past_a_length_is_proven_below_it_a
 
     assert refusal(thresholded, (13,)) is None
     assert refusal(thresholded, (17,)) is not None
+
+
+def test_a_length_past_a_machine_word_is_walked_whole():
+    """Positions past 64 are walked as at any length (each position's set an integer of any width): a
+    projection of 70 tokens is causal, and its left shift reads a later one."""
+    assert refusal(ADMITTED["projection"], (70,)) is None
+    assert refusal(REFUSED["a left shift by slice and concatenate"], (70,)) is not None

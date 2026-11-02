@@ -1,21 +1,23 @@
 """Whether a traced forward is causal over its tokens, decided from its program alone, with no weights
-(ledger 1595, the 1493 design's H7): tier 3 admits a source whose shrunken probe cannot run by traces of
-its full config over abstract weights, and reads their causality here instead of from the probe's
-logits.
+(ledger 1595, the 1493 design's H7): tier 3 admits a source whose shrunken probe cannot run by a trace of
+its full config over abstract weights, and proves each program it then runs here instead of reading its
+causality from the probe's logits.
 
 The walk composes, through every operation of the program (`jax.make_jaxpr`'s), which input positions
 each entry of each value may read: a value the tokens reach holds an axis along which its entries read
-their own sets of positions (`Reads`), or reads one set everywhere. Slices, concatenations, pads,
-reversals, gathers by indices the program computes without the tokens, reshapes, broadcasts,
-cumulative operations, convolutions and scans (step by step, their carries and initial state included)
-each move those sets as they move the entries; a contraction, reduction, sort or selection across the
-positions' axis gives every entry the union, as any operation the walk holds no rule for does where it
-changes its operands' shape. Dew's causal attention (`CAUSAL_ATTENTION`) gives each query its own
-position's set and its keys' up to its own; a computation Dew states is token by token (`TOKENWISE`)
-gives each token its own. Every set is an over-approximation: the walk may refuse a causal program, never
-admit a later read. A program is causal at the length it is traced at where every output's entry at a
-position reads no later one; another length's program may differ (a branch taken on the sequence's
-length), so each length a model runs is proven on its own program."""
+their own sets of positions (`Reads`, Python integers as bit sets, any length), or reads one set
+everywhere. Slices, concatenations, pads, reversals, gathers by indices the program computes without the
+tokens, reshapes, broadcasts, cumulative operations, convolutions and scans (step by step, their carries
+and initial state included) each move those sets as they move the entries; a contraction, reduction,
+sort or selection across the positions' axis gives every entry the union, as does any operation the
+walk holds no rule for (`_RULES`, `_ENTRYWISE`). Dew's causal attention (`CAUSAL_ATTENTION`) gives each
+query its own position's set and its keys' up to its own; attention under a visibility its caller
+states (`STATED_ATTENTION`) gives each position its own query's, key's and value's, the caller's
+visibility being the call's and not the source's; a computation Dew states is token by token
+(`TOKENWISE`) gives each token its own. Every set is an over-approximation: the walk may refuse a causal
+program, never admit a later read. A program is causal where every positional output's entry at a
+position reads no later one; another length's or another call's program may differ (a branch taken on
+the sequence's length), so each program a model runs is proven on its own."""
 
 from __future__ import annotations
 
@@ -31,6 +33,11 @@ from jax.extend import core
 CAUSAL_ATTENTION = "dew_causal_attention"
 """The name of the jitted call tier 3's attention runs in (`torchax_fallback._dew_attention`), causal over
 its keys by construction, its queries, keys and values `[B, S, H, D]`."""
+
+STATED_ATTENTION = "dew_stated_attention"
+"""The name of the jitted call tier 3's attention runs in under a visibility its caller states (a decision
+row's options, `torchax_fallback._Attending.visible`), its queries, keys and values `[B, S, H, D]`: which
+keys a query reads is the caller's, so the walk holds each position to its own."""
 
 TOKENWISE = "dew_tokenwise"
 """The name of a jitted call Dew computes token by token (tier 3's experts' dispatch,
@@ -55,40 +62,43 @@ class Reads:
         return int(np.bitwise_or.reduce(self.masks))
 
     def flat(self) -> Reads:
-        return Reads(None, np.array([self.union], np.int64))
+        return Reads(None, np.array([self.union], object))
 
 
 type Held = Reads | None
 """What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
 
-def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int) -> str | None:
-    """Why the forward `closed` traces is not provably causal at `length` tokens (its input `tokens`,
-    `[B, S]`, the sequence on axis 1), or None where each output's entry at a position reads that
-    position and earlier ones alone. It holds for this length alone: a program may compute otherwise at
-    another, so a caller proves each length it runs (`torchax_fallback.TorchGraph.certify`)."""
+def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int,
+                      positional: Sequence[int]) -> str | None:
+    """Why the program `closed` is not provably causal at `length` tokens (its input `tokens`, `[B, S]`,
+    the sequence on axis 1), or None where each of its `positional` outputs (by index, each holding its
+    positions on axis 1: a forward's logits and states) reads at a position that position and earlier
+    ones alone. It holds for this program alone: another length's, or another call's, may compute
+    otherwise, so a caller proves each program it runs (`torchax_fallback.TorchGraph`)."""
     held: list[Held] = [None] * len(closed.jaxpr.invars)
-    held[tokens] = Reads(1, np.array([1 << position for position in range(length)], np.int64))
+    held[tokens] = Reads(1, np.array([1 << position for position in range(length)], object))
     walk = _Walk(length)
     consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
     # The values it evaluates (indices, their tests) computed now, also where a trace encloses the walk
-    # (a program at a new length proven as it is traced, `torchax_fallback.TorchGraph.certify`).
+    # (a program proven as it is traced, `torchax_fallback.TorchGraph`).
     with jax.ensure_compile_time_eval():
         outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
-    for output in outputs:
+    for index in positional:
+        output = outputs[index]
         if output is not None and _later(output, length):
             where = f"; first at {walk.first}" if walk.first else ""
-            return f"an output's entry reads a later position at {length} tokens{where}"
+            return f"its output {index}'s entry reads a later position at {length} tokens{where}"
     return None
 
 
 def _later(value: Reads, length: int) -> bool:
-    """Whether an entry of `value`, an output, reads a position later than its own: along a positions'
-    axis of `length`, entry i reads one past i; anywhere else, any read but none is later than some
-    entry's own."""
-    if value.axis is None or len(value.masks) != length:
-        return value.union != 0
-    allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], np.int64)
+    """Whether an entry of `value`, an output holding its positions on axis 1, reads a position later than
+    its own: along that axis, entry i reads one past i; read along any other axis, or along none, every
+    entry reads the union, which reads past position 0 where it holds any later one."""
+    if value.axis != 1 or len(value.masks) != length:
+        return bool(value.union & ~1)
+    allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], object)
     return bool(np.any(value.masks & ~allowed))
 
 
@@ -151,7 +161,7 @@ class _Walk:
         if rule is not None:
             return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
-        if name not in _MIXING and all(_shape(var) == shape for var in eqn.outvars) and all(
+        if name in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
                 _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
                 if isinstance(value, Reads)):
             return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)
@@ -194,7 +204,7 @@ def _flat(given: Sequence[Held]) -> Reads:
     for value in given:
         if isinstance(value, Reads):
             mask |= value.union
-    return Reads(None, np.array([mask], np.int64))
+    return Reads(None, np.array([mask], object))
 
 
 def _combined(given: Sequence[Held], shape: tuple[int, ...]) -> Reads:
@@ -211,7 +221,7 @@ def _combined(given: Sequence[Held], shape: tuple[int, ...]) -> Reads:
             else:
                 extra |= value.union
     if base is None:
-        return Reads(None, np.array([extra], np.int64))
+        return Reads(None, np.array([extra], object))
     return Reads(base.axis, base.masks | extra)
 
 
@@ -220,8 +230,8 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     """A call of a program of its own: Dew's causal attention and its token-by-token computations by
     their own rules, any other walked inside."""
     name = eqn.params.get("name")
-    if name == CAUSAL_ATTENTION and any(isinstance(value, Reads) for value in given):
-        return [_attended(eqn, given)] * len(eqn.outvars), [None] * len(eqn.outvars)
+    if name in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
+        return _attended(eqn, given, causal=name == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
     if name == TOKENWISE and any(isinstance(value, Reads) for value in given):
         out = _shape(eqn.outvars[0])
         aligned = [value for value in given if isinstance(value, Reads)]
@@ -238,22 +248,27 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     return walk.run(inner, given, operands, consts)
 
 
-def _attended(eqn: core.JaxprEqn, given: list[Held]) -> Reads:
-    """Dew's causal attention's output `[B, S, H, D]`: each query position reads its own query's and its
-    documents' positions, and the keys' and values' positions up to its own."""
-    length = _shape(eqn.outvars[0])[1]
-    own, keyed, extra = np.zeros(length, np.int64), np.zeros(length, np.int64), 0
+def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[Held]:
+    """Dew's attention's outputs, its queries `[B, S, H, D]` its first operand: an output of the
+    queries' positions (`[B, S, ...]`) reads at each position its own query's positions and its keys'
+    and values' up to its own (`causal`), or its own (a visibility its caller states); any other output
+    (a cache it writes) every position any operand reads."""
+    length = _shape(eqn.invars[0])[1]
+    own, keyed, extra = (np.zeros(length, object), np.zeros(length, object), 0)
     for index, value in enumerate(given):
         if not isinstance(value, Reads):
             continue
         if value.axis == 1 and len(value.masks) == length:
-            if index == 0:
-                own |= value.masks
+            if index == 0 or not causal:
+                own = own | value.masks
             else:
-                keyed |= value.masks
+                keyed = keyed | value.masks
         else:
             extra |= value.union
-    return Reads(1, own | np.bitwise_or.accumulate(keyed) | extra)
+    rows = own | np.bitwise_or.accumulate(keyed) | extra
+    flat = _flat(given)
+    return [Reads(1, rows) if len(_shape(var)) > 1 and _shape(var)[1] == length else flat
+            for var in eqn.outvars]
 
 
 def _rows(value: Reads) -> np.ndarray:
@@ -266,7 +281,7 @@ def _broadcast_in_dim(walk: _Walk, eqn, given, operands) -> list[Held]:
     if value.axis is None:
         return [value]
     axis = dims[value.axis]
-    masks = value.masks if len(value.masks) == out[axis] else np.full(out[axis], value.union, np.int64)
+    masks = value.masks if len(value.masks) == out[axis] else np.full(out[axis], value.union, object)
     return [Reads(axis, masks)]
 
 
@@ -276,6 +291,11 @@ def _reshape(walk: _Walk, eqn, given, operands) -> list[Held]:
     if value.axis is None:
         return [value]
     before, after = _shape(eqn.invars[0]), tuple(eqn.params["new_sizes"])
+    order = eqn.params.get("dimensions")
+    if order is not None:
+        # Its operand transposed by `dimensions` first, then laid out row-major.
+        before = tuple(before[dim] for dim in order)
+        value = Reads(tuple(order).index(value.axis), value.masks)
     return [_moved(value, before, after)]
 
 
@@ -296,7 +316,7 @@ def _moved(value: Reads, before: tuple[int, ...], after: tuple[int, ...]) -> Rea
         starts = (np.arange(lead)[:, None] * width + np.arange(width)[None, :]) * tail
         rows = np.bitwise_or.reduce(span(starts // inner, (starts + tail - 1) // inner), axis=0)
         if best is None or _tighter(rows, best[1].masks):
-            best = (index, Reads(index, rows.astype(np.int64)))
+            best = (index, Reads(index, rows.astype(object)))
     return value.flat() if best is None or count == 0 else best[1]
 
 
@@ -315,7 +335,7 @@ class _RangeOr:
     def __init__(self, masks: np.ndarray):
         self.count = len(masks)
         self.union = int(np.bitwise_or.reduce(masks)) if self.count else 0
-        table = [np.concatenate([masks, masks]).astype(np.int64)]
+        table = [np.concatenate([masks, masks]).astype(object)]
         while (1 << len(table)) <= 2 * self.count:
             last, step = table[-1], 1 << (len(table) - 1)
             table.append(last[:-step] | last[step:])
@@ -327,7 +347,7 @@ class _RangeOr:
         start = first % self.count
         clipped = np.where(whole, 1, size)
         level = np.floor(np.log2(clipped)).astype(int)
-        out = np.zeros(first.shape, np.int64)
+        out = np.zeros(first.shape, object)
         for height in np.unique(level):
             at = level == height
             row = self.table[height]
@@ -388,7 +408,7 @@ def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
             start = len(lhs_batch) + (0 if side == 0 else len(free[0]))
             placed.append(Reads(start + free[side].index(value.axis), value.masks))
     if not placed:
-        return [Reads(None, np.array([extra], np.int64))]
+        return [Reads(None, np.array([extra], object))]
     base = placed[0]
     for other in placed[1:]:
         if other.axis == base.axis:
@@ -405,6 +425,9 @@ def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
     numbers = eqn.params["dimension_numbers"]
     lhs_spec, rhs_spec, out_spec = numbers.lhs_spec, numbers.rhs_spec, numbers.out_spec
     if lhs.axis == lhs_spec[0]:
+        if eqn.params.get("batch_group_count", 1) != 1:
+            # Grouping the batch moves its entries into the output's features.
+            return [lhs.flat()]
         return [Reads(out_spec[0], lhs.masks)]
     if lhs.axis == lhs_spec[1]:
         return [lhs.flat()]
@@ -423,7 +446,7 @@ def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
             if 0 <= read < len(lhs.masks):
                 mask |= int(lhs.masks[read])
         rows.append(mask)
-    return [Reads(out_spec[2 + spatial], np.array(rows, np.int64))]
+    return [Reads(out_spec[2 + spatial], np.array(rows, object))]
 
 
 def _slice(walk: _Walk, eqn, given, operands) -> list[Held]:
@@ -457,7 +480,7 @@ def _pad(walk: _Walk, eqn, given, operands) -> list[Held]:
             rows.extend([0] * interior)
     rows = [0] * max(low, 0) + rows[max(-low, 0):]
     rows = rows[:len(rows) + high] if high < 0 else rows + [0] * high
-    return [Reads(value.axis, np.array(rows, np.int64))]
+    return [Reads(value.axis, np.array(rows, object))]
 
 
 def _concatenate(walk: _Walk, eqn, given, operands) -> list[Held]:
@@ -469,7 +492,7 @@ def _concatenate(walk: _Walk, eqn, given, operands) -> list[Held]:
         if along and all(value.axis == along[0].axis for value in along) and dimension != along[0].axis:
             return [_combined(given, _shape(eqn.outvars[0]))]
         return [flat]
-    rows = [value.masks if isinstance(value, Reads) else np.zeros(_shape(var)[dimension], np.int64)
+    rows = [value.masks if isinstance(value, Reads) else np.zeros(_shape(var)[dimension], object)
             for var, value in zip(eqn.invars, given, strict=True)]
     return [Reads(dimension, np.concatenate(rows))]
 
@@ -483,7 +506,7 @@ def _dynamic_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     start = operands[1 + value.axis]
     size = eqn.params["slice_sizes"][value.axis]
     if start is None:
-        return [Reads(value.axis, np.full(size, value.union, np.int64))]
+        return [Reads(value.axis, np.full(size, value.union, object))]
     first = int(np.clip(int(start), 0, len(value.masks) - size))
     return [Reads(value.axis, value.masks[first:first + size])]
 
@@ -496,14 +519,21 @@ def _dynamic_update_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     if axis is None or any(isinstance(value, Reads) and value.axis != axis for value in (base, update)):
         return [_flat(given)]
     length = _shape(eqn.outvars[0])[axis]
-    rows = base.masks.copy() if isinstance(base, Reads) else np.zeros(length, np.int64)
+    rows = base.masks.copy() if isinstance(base, Reads) else np.zeros(length, object)
     width = _shape(eqn.invars[1])[axis]
     start = operands[2 + axis]
     if start is None:
         rows |= _flat([update]).masks[0] if isinstance(update, Reads) else 0
         return [Reads(axis, rows)]
     first = int(np.clip(int(start), 0, length - width))
-    rows[first:first + width] = update.masks if isinstance(update, Reads) else 0
+    updated = update.masks if isinstance(update, Reads) else np.zeros(width, object)
+    others = [size for dim, size in enumerate(_shape(eqn.outvars[0])) if dim != axis]
+    covered = [size for dim, size in enumerate(_shape(eqn.invars[1])) if dim != axis]
+    if covered == others:
+        # The update overwrites each of its rows whole: they read what it reads alone.
+        rows[first:first + width] = updated
+    else:
+        rows[first:first + width] = rows[first:first + width] | updated
     return [Reads(axis, rows)]
 
 
@@ -544,12 +574,12 @@ def _decided(ids: np.ndarray, masks: np.ndarray) -> Reads:
     for axis in range(ids.ndim):
         moved = np.moveaxis(ids, axis, 0).reshape(ids.shape[axis], -1)
         rows = np.array([int(np.bitwise_or.reduce(np.append(masks[row[row >= 0]], 0))) for row in moved],
-                        np.int64)
+                        object)
         if best is None or _tighter(rows, best.masks):
             best = Reads(axis, rows)
     if best is None:
         return Reads(None, np.array([int(np.bitwise_or.reduce(np.append(masks[ids[ids >= 0]], 0)))],
-                                    np.int64))
+                                    object))
     return best
 
 
@@ -604,14 +634,15 @@ def _joined(held: Held, found: Held) -> Held:
 
 
 def _settled(walk: _Walk, body: core.Jaxpr, consts: list[Held], carried: list[Held], rest: list[Held],
-             values: Sequence[np.ndarray | None]) -> list[Held]:
-    """`body`'s outputs once its carried values' reads stop growing from pass to pass (they only grow,
-    over finitely many positions)."""
+             values: Sequence[np.ndarray | None]) -> tuple[list[Held], list[Held]]:
+    """A loop's carried values over every number of passes, none included (each the union of its initial
+    reads and every pass's, which only grow over finitely many positions), and `body`'s outputs past its
+    carries over those values."""
     while True:
         out, _ = walk.run(body, [*consts, *carried, *rest], values)
         grown = [_joined(held, found) for held, found in zip(carried, out[:len(carried)], strict=True)]
         if all(_same(held, found) for held, found in zip(grown, carried, strict=True)):
-            return out
+            return grown, out[len(carried):]
         carried = grown
 
 
@@ -651,16 +682,16 @@ def _scan(walk: _Walk, eqn, given, operands) -> list[Held]:
                 ys.append(None)
             elif all(value is None or value.axis is None for value in per_step):
                 ys.append(Reads(0, np.array([0 if value is None else value.union for value in per_step],
-                                            np.int64)))
+                                            object)))
             else:
                 ys.append(_flat(per_step))
         return [*carried, *ys]
     sliced = [value if not isinstance(value, Reads) or value.axis is None
               else Reads(value.axis - 1, value.masks) for value in xs]
-    out = _settled(walk, body, fixed, carried, sliced, values)
+    final, out = _settled(walk, body, fixed, carried, sliced, values)
     ys = [value if not isinstance(value, Reads) or value.axis is None
-          else Reads(value.axis + 1, value.masks) for value in out[carries:]]
-    return [*out[:carries], *ys]
+          else Reads(value.axis + 1, value.masks) for value in out]
+    return [*final, *ys]
 
 
 def _while(walk: _Walk, eqn, given, operands) -> list[Held]:
@@ -668,12 +699,13 @@ def _while(walk: _Walk, eqn, given, operands) -> list[Held]:
     cond_consts, body_consts = params["cond_nconsts"], params["body_nconsts"]
     carried = list(given[cond_consts + body_consts:])
     body = params["body_jaxpr"].jaxpr
-    out = _settled(walk, body, list(given[cond_consts:cond_consts + body_consts]), carried, [],
-                   [None] * len(body.invars))
+    # Its state on exit, after any number of passes, none included.
+    out, _ = _settled(walk, body, list(given[cond_consts:cond_consts + body_consts]), carried, [],
+                      [None] * len(body.invars))
     cond, _ = walk.run(params["cond_jaxpr"].jaxpr, [*given[:cond_consts], *out],
                        [None] * len(params["cond_jaxpr"].jaxpr.invars))
-    if any(isinstance(value, Reads) for value in cond):
-        # How many steps run is the tokens' to decide: every carried entry may read every one.
+    if any(isinstance(value, Reads) for value in [*cond, *given[:cond_consts]]):
+        # How many passes run is the tokens' to decide: every carried entry may read every one.
         return [_flat([*given, *out])] * len(out)
     return out
 
@@ -696,12 +728,19 @@ def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
 _CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "custom_jvp_call", "custom_vjp_call",
                     "custom_vjp_call_jaxpr", "remat", "checkpoint", "custom_lin"})
 
-_MIXING = frozenset({
-    "reduce_window", "reduce_window_sum", "reduce_window_max", "reduce_window_min", "select_and_scatter_add",
-    "select_and_gather_add", "fft", "triangular_solve", "cholesky", "lu", "qr", "eigh", "svd",
-    "all_gather", "all_to_all", "ppermute", "psum", "pmax", "pmin", "custom_linear_solve"})
-"""Operations that read their operands across an axis without changing their shape: their outputs take
-the union where the tokens reach them."""
+_ENTRYWISE = frozenset({
+    "add", "sub", "mul", "div", "rem", "pow", "max", "min", "neg", "abs", "sign", "floor", "ceil", "round",
+    "exp", "exp2", "log", "log1p", "expm1", "tanh", "logistic", "sin", "cos", "tan", "asin", "acos", "atan",
+    "atan2", "sinh", "cosh", "asinh", "acosh", "atanh", "sqrt", "rsqrt", "cbrt", "square", "integer_pow",
+    "erf", "erfc", "erf_inv", "lgamma", "digamma", "is_finite", "not", "and", "or", "xor", "eq", "ne", "lt",
+    "le", "gt", "ge", "select_n", "convert_element_type", "copy", "copy_p", "reduce_precision", "clamp",
+    "nextafter", "shift_left", "shift_right_logical", "shift_right_arithmetic", "population_count", "clz",
+    "real", "imag", "conj", "complex", "stop_gradient", "random_wrap", "random_unwrap", "random_bits",
+    "random_fold_in", "random_split", "threefry2x32", "polygamma", "igamma", "igammac",
+    "bessel_i0e", "bessel_i1e", "zeta"})
+"""The operations whose every output entry reads its operands' entries at its own index (over operands
+broadcast to its shape) and nothing else: the walk keeps their positions' axis. Any operation it holds
+no rule for gives every entry the union of what its operands read."""
 
 type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held], list[np.ndarray | None]], list[Held]]
 

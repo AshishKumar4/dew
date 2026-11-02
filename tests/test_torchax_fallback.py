@@ -454,8 +454,8 @@ def test_a_source_whose_probe_cannot_run_qualifies_on_its_full_config_and_runs_a
     qualifies for tier 3 on its full config with no weights read (`torchax_fallback.qualified`, ledger
     1595): its forward, traced over abstract weights, runs Dew's attention in each layer with a mask
     Dew's causal visibility reproduces and is causal by its program (`sequence_causality`). It loads,
-    warning so, each length it runs proven causal on its own program first (`TorchGraph.certify`), and
-    its logits over rows of its 8 positions are transformers' own (check 1, float64)."""
+    warning so, each program it runs proven causal before it runs (`TorchGraph.certify`), and its logits
+    over rows of its 8 positions are transformers' own (check 1, float64)."""
     torch.manual_seed(0)
     config = transformers.BertConfig(**{**TINY, "max_position_embeddings": 8}, is_decoder=True)
     model = transformers.BertLMHeadModel(config).eval()
@@ -474,7 +474,8 @@ def test_a_source_whose_probe_cannot_run_qualifies_on_its_full_config_and_runs_a
                     as_given(lambda ids: torch_logits(model, ids)), draw, "qualified bert logits",
                     seeds=QUALIFIED_SEEDS, truth_fn=as_given(lambda ids: torch_logits(wide, ids)))
     forward(jnp.zeros((1, 5), jnp.int32))
-    assert loaded.model.graph.certified == {8: None, 5: None}
+    certified = loaded.model.graph.certified
+    assert len(certified) == 2 and all(refusal is None for refusal in certified.values())
 
 
 PACKED_SEEDS = {"cohere": 256, "cohere2": 256}

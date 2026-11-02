@@ -55,7 +55,7 @@ from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
-from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, causality_refusal
+from dew.interop.sequence_causality import CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE, causality_refusal
 from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
@@ -112,9 +112,9 @@ class TorchAdmission:
     attends: bool = False
     why: str = ""
     per_geometry: bool = False
-    """Whether its causality is proven per sequence length its forward runs at (`TorchGraph.certify`):
-    a source qualified on its full config without its probe (`qualified`), whose program at one length
-    says nothing of another's."""
+    """Whether its causality is proven per program it runs (`TorchGraph.certify`): a source qualified on
+    its full config without its probe (`qualified`), whose program at one length or in one call says
+    nothing of another's."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -183,8 +183,8 @@ initialization and an unprobed source's qualification (`qualified`) hold them.""
 
 QUALIFYING = 13
 """The most tokens a row `qualified` traces an unprobed source's forward over at its load, the largest
-prime up to it its context holds: no other size of its program is taken for the sequence's. Each
-length it then runs is proven on its own (`TorchGraph.certify`)."""
+prime up to it its context holds (one token for a context of one): no other size of its program is
+taken for the sequence's. Each program it then runs is proven on its own (`TorchGraph.certify`)."""
 
 
 def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable) -> TorchAdmission:
@@ -199,7 +199,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     position reading no later input through every operation); and its training forward draws nothing on
     the host. Each refusal names its cause. torchax holds no symbolic length (its tensors' torch sizes
     are integers), so no one trace proves every length: the admission is per geometry (`per_geometry`),
-    each length the model runs proven before its first program there runs (`TorchGraph.certify`)."""
+    each program the model then runs proven before it runs (`TorchGraph.certify`)."""
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -212,7 +212,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     _registered()
     context = fields.get("max_position_embeddings")
     stated = None if context is None else _records.integer(context, "max_position_embeddings")
-    length = max(prime for prime in (2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated)
+    length = max(prime for prime in (1, 2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated)
     probe = _Probe(abstract=True)
     try:
         # Its masks evaluated as the trace runs, so the probe reads their values (`_masked`).
@@ -229,7 +229,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
             jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError) as error:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"does not trace at its full config: {type(error).__name__}: {error}") from error
-    refusal = causality_refusal(closed, tokens, length)
+    refusal = causality_refusal(closed, tokens, length, (0, 1))
     if refusal is not None:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"is not causal by its program: {refusal}")
@@ -506,46 +506,59 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     dropping = {"dropout_rate": float(dropout) if drawn else 0.0, "deterministic": not drawn,
                 "dropout_rng": rng}
 
-    def causal(q, k, v, segment_ids, sinks, rng):
+    # Each path runs in a call of its own name, which a walk of the program's causality reads by its own
+    # rule (`sequence_causality`): the cached and the plain or packed paths causal over their keys by
+    # construction (`CAUSAL_ATTENTION`), a stated visibility the caller's (`STATED_ATTENTION`).
+    # Every array each reads is its argument, none a value of the enclosing trace.
+    def attend(q, k, v, *, places, segment_ids, valid, sinks, rng):
+        del places, valid  # the documents hold the padding apart, as 0
         return scaled_dot_product_attention(
             q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
             softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments,
             **{**dropping, "dropout_rng": rng})
 
-    # A call of its own name, which a walk of the program's causality admits whole
-    # (`sequence_causality.CAUSAL_ATTENTION`): causal over its keys by construction.
-    causal.__name__ = CAUSAL_ATTENTION
-    named = nested(causal)
+    def causal(q, k, v, segment_ids, valid, sinks, rng):
+        if valid is None:
+            return attend(q, k, v, places=None, segment_ids=segment_ids, valid=None, sinks=sinks, rng=rng)
+        return compacted(functools.partial(attend, sinks=sinks, rng=rng), q, k, v, None, segment_ids, valid)
 
-    def attend(q, k, v, *, places, segment_ids, valid):
-        del places, valid  # the documents hold the padding apart, as 0
-        return named(q, k, v, segment_ids, sinks, dropping["dropout_rng"])
-
-    if call.cache is not None:
+    def cached(q, k, v, held_key, held_value, slots, filled, sinks, rng):
         # The call's tokens join the row's cache at their slots, and each attends over the whole row:
         # what it has filled, causal by slot and within the window, as Dew's decoders attend a cache.
-        held = call.cache.held.get(module.layer_idx)
-        if held is None:
-            # A cache being opened: its layer's keys and values give its shape, and nothing is held.
-            held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
-        keys, values = (write_cache(held[name], incoming, call.cache.slots)
-                        for name, incoming in (("cached_key", k), ("cached_value", v)))
-        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
-        keys, values = keys.astype(q.dtype), values.astype(q.dtype)
+        keys, values = write_cache(held_key, k, slots), write_cache(held_value, v, slots)
+        read_keys, read_values = keys.astype(q.dtype), values.astype(q.dtype)
         if q.shape[1] == 1 and not drawn:
             # One token a row reads its row's filled slots before its own, from its window's first: a
             # key count and start a row, which the decode kernels take as Dew's decoders give them
             # (`CausalSelfAttention._decode_attention`); a padding token reads one key, its output unused.
-            slot = call.cache.slots[:, 0]
+            slot = slots[:, 0]
             reads = jnp.maximum(slot + 1, 1).astype(jnp.int32)
             starts = None if window is None else jnp.maximum(slot + 1 - window, 0).astype(jnp.int32)
-            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation,
+            out = scaled_dot_product_attention(q, read_keys, read_values, implementation=call.implementation,
                                                causal=False, softcap=softcap, sinks=sinks,
                                                key_value_seq_lengths=reads, key_value_seq_starts=starts)
         else:
-            mask = causal_attention_mask(call.cache.slots, keys.shape[1], window, key_valid=call.cache.filled)
-            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation, mask=mask,
-                                               softcap=softcap, sinks=sinks, **dropping)
+            mask = causal_attention_mask(slots, keys.shape[1], window, key_valid=filled)
+            out = scaled_dot_product_attention(q, read_keys, read_values, implementation=call.implementation,
+                                               mask=mask, softcap=softcap, sinks=sinks,
+                                               **{**dropping, "dropout_rng": rng})
+        return out, keys, values
+
+    def stated(q, k, v, visible, sinks, rng):
+        return scaled_dot_product_attention(q, k, v, implementation=call.implementation,
+                                            mask=visible[:, None], softcap=softcap, sinks=sinks,
+                                            **{**dropping, "dropout_rng": rng})
+
+    causal.__name__ = cached.__name__ = CAUSAL_ATTENTION
+    stated.__name__ = STATED_ATTENTION
+    if call.cache is not None:
+        held = call.cache.held.get(module.layer_idx)
+        if held is None:
+            # A cache being opened: its layer's keys and values give its shape, and nothing is held.
+            held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
+        out, keys, values = nested(cached)(q, k, v, held["cached_key"], held["cached_value"],
+                                           call.cache.slots, call.cache.filled, sinks, rng)
+        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
         visible = jnp.asarray(call.visible, bool)
@@ -555,12 +568,9 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                       else call.places)
             reach = windowed(places[:, :, None], call.key_places[:, None, :], window, causal=False)
             visible = visible & reach
-        out = scaled_dot_product_attention(q, k, v, implementation=call.implementation,
-                                           mask=visible[:, None], softcap=softcap, sinks=sinks, **dropping)
-    elif call.valid is None:
-        out = attend(q, k, v, places=None, segment_ids=call.documents, valid=None)
+        out = nested(stated)(q, k, v, visible, sinks, rng)
     else:
-        out = compacted(attend, q, k, v, None, call.documents, call.valid)
+        out = nested(causal)(q, k, v, call.documents, call.valid, sinks, rng)
     return torch_view(out.astype(q.dtype)), None
 
 
@@ -939,10 +949,10 @@ class TorchGraph:
     axes: tuple[tuple[str, LogicalAxes], ...] = ()
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
-    certified: dict[int, str | None] | None = None
-    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each sequence length its
-    forward has been proven at, by the refusal its walk gave there (None where causal); None for a
-    probed source, whose causality its probe decided (`certify`)."""
+    certified: dict[tuple, str | None] | None = None
+    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each program specialization it
+    has run, by the refusal its walk gave (None where causal); None for a probed source, whose causality
+    its probe decided (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -981,29 +991,10 @@ class TorchGraph:
              (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1)
         return logits, written
 
-    def certify(self, length: int) -> None:
-        """For a source admitted per geometry (`certified`), prove its forward causal at `length` tokens
-        before a program at that length runs: its program over its variables' shapes and a row of
-        `length` tokens, walked by `sequence_causality.causality_refusal`, once a length. Refused where
-        an output position reads a later one."""
-        if self.certified is None:
-            return
-        if length not in self.certified:
-            closed, _, _ = self.traced(self.shapes["params"], self.shapes["buffers"],
-                                       jax.ShapeDtypeStruct((1, length), jnp.int32), None, train=False)
-            tokens = len(self.shapes["params"]) + len(self.shapes["buffers"])
-            self.certified[length] = causality_refusal(closed, tokens, length)
-        refusal = self.certified[length]
-        if refusal is not None:
-            raise ValueError(f"tier 3 qualified this source without its probe, causal at each length its own "
-                             f"program proves, and at {length} tokens it does not: {refusal}")
-
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
-        # A decoding call runs at its cache's capacity, which its prefill filled; any other at its row's.
-        cache = arguments[10]
-        self.certify(int(cache[2].shape[1]) if cache is not None else int(arguments[2].shape[1]))
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
+        self.certify(traced, arguments, train=train, max_segments=max_segments)
         outputs = jax.tree.unflatten(jax.tree.structure(shapes),
                                      _accumulating(traced, *jax.tree.leaves(arguments)))
         key = arguments[3]
@@ -1015,6 +1006,25 @@ class TorchGraph:
         if draws.device and key is None:
             raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
         return outputs
+
+    def certify(self, traced, arguments: tuple, *, train: bool, max_segments: int) -> None:
+        """For a source admitted per geometry (`certified`), prove the program about to run, `traced`
+        over `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
+        position no later token (`sequence_causality.causality_refusal`), once a specialization (its
+        arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
+        output position reads a later one."""
+        if self.certified is None:
+            return
+        leaves, structure = jax.tree.flatten(arguments)
+        signature = (structure, tuple((tuple(leaf.shape), str(leaf.dtype)) for leaf in leaves), train,
+                     max_segments)
+        if signature not in self.certified:
+            tokens = len(jax.tree.leaves(arguments[0])) + len(jax.tree.leaves(arguments[1]))
+            self.certified[signature] = causality_refusal(traced, tokens, int(arguments[2].shape[1]), (0, 1))
+        refusal = self.certified[signature]
+        if refusal is not None:
+            raise ValueError(f"tier 3 qualified this source without its probe, causal in each program its "
+                             f"own walk proves, and this one is not: {refusal}")
 
     def traced(self, params: Mapping[str, Traceable], buffers: Mapping[str, Traceable], tokens: Traceable,
                key: jax.Array | None,
