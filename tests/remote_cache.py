@@ -413,9 +413,16 @@ def install(url: str, token: str) -> RemoteCache | None:
     return RemoteCache(Path(directory), url, token, prefix())
 
 
+def requested() -> bool:
+    """Whether this process's environment asks for the shared cache: DEW_XLA_CACHE_URL and
+    DEW_XLA_CACHE_TOKEN both set (`install_from_environment`)."""
+    return bool(os.environ.get("DEW_XLA_CACHE_URL") and os.environ.get("DEW_XLA_CACHE_TOKEN"))
+
+
 def install_from_environment() -> RemoteCache | None:
-    """`install` where DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN are set. The local cache keeps no
-    LRU bound: a task's container is short-lived, and the bound makes JAX lock and stamp its index on
-    every compilation. The remote's bound is the bucket's 14-day expiry."""
-    url, token = os.environ.get("DEW_XLA_CACHE_URL"), os.environ.get("DEW_XLA_CACHE_TOKEN")
-    return install(url, token) if url and token else None
+    """`install` where the environment asks for the shared cache (`requested`). The local cache keeps
+    no LRU bound: a task's container is short-lived, and the bound makes JAX lock and stamp its index
+    on every compilation. The remote's bound is the bucket's 14-day expiry."""
+    if not requested():
+        return None
+    return install(os.environ["DEW_XLA_CACHE_URL"], os.environ["DEW_XLA_CACHE_TOKEN"])
