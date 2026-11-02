@@ -77,46 +77,55 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
 NEEDING_MICROBATCHES = 700_000
 """Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches."""
 
-ADMITTED = {"split": 4, "head_tile": None, "head_fused": False, "remat": None, "xla_defaults": True,
-            "narrow": True}
-"""The plan `fine_tune`'s step takes on GPUs of `NEEDING_MICROBATCHES`: four microbatches at XLA's default
-options, the narrow copies kept (`test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it`),
-the one its frontier is read above."""
 
-
-def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(tmp_path, monkeypatch):
-    """A step compiled ahead on GPUs whose memory its plan needs several microbatches for takes the first
-    plan that fits, `ADMITTED`, and saves it, the run left at its plan, its rung its last probe's."""
+@pytest.fixture(scope="module")
+def admitted(tmp_path_factory):
+    """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
+    compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
+    trainer and its `AheadOfTime`, admitted once for the module."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
+    records = tmp_path_factory.mktemp("rungs")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("DEW_RUNG_RECORDS", str(records))
+        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
+    return records, trainer, ahead
+
+
+def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
+    """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
+    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
+    _, trainer, ahead = admitted
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
-    assert {name: plan[name] for name in ADMITTED} == ADMITTED and len(probes) > 1
+    assert plan["split"] > 1 and len(probes) > 1 and probes[-1]["fits"] is True
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
 
 
 def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_fewer_microbatches(
-        tmp_path, monkeypatch):
+        admitted, monkeypatch):
     """With its frontier asked, a step compiled ahead on GPUs whose memory its plan needs several
     microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
     takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. Its
-    search starts at the plan the admission finds (`ADMITTED`, `compile_ahead`'s `plan`), which it takes
-    without the compiles that found it, so the frontier is read above it alone."""
+    search starts at the plan admitted before it (`admitted`), kept beside the compilation cache, as a run
+    after another starts at its recorded plan: that plan's compile alone, the frontier read above it."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    records, _, earlier = admitted
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES,
-                          frontier=True, plan=ADMITTED)
+                          frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
-    assert {name: plan[name] for name in ADMITTED} == ADMITTED and len(probes) == 1
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
+    admitted_plan = record(earlier.plan, "admitted plan")
+    assert {name: plan[name] for name in rung} == {name: admitted_plan[name] for name in rung}
+    assert len(probes) == 1
     splits = [plan["split"], *(entry["split"] for entry in frontier)]
     assert len(frontier) >= 2 and all(entry["fits"] is True for entry in frontier)
     assert all(isinstance(more, int) and isinstance(fewer, int) and fewer < more
