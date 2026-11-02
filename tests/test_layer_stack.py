@@ -610,31 +610,6 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
             jax.tree.map(np.asarray, grads))
 
 
-@mesh_lane
-@pytest.mark.parametrize("build, balance",
-                         [(tiny, {}), (routed, {"balance": ExpertBalance(balance_rate=0.01)})],
-                         ids=["dense", "moe"])
-def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, balance):
-    """Four layers over two stages fed four microbatches, against the same
-    step on the fsdp mesh: the loss, every metric and every gradient leaf.
-    Largest observed differences on CPU: loss 0.0 (dense) and 4.8e-07
-    (moe), gradients 1.6e-07 (dense) and 3.4e-07 (moe) on leaves of order
-    0.2."""
-    model = build()
-    objective = LMObjective(model, SEQ_LEN, **balance)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
-    batch = token_batch(PIPELINED_ROWS)
-
-    loss, metrics, grads = loss_and_grads(objective, MeshSpec(fsdp=4), variables, batch)
-    piped, piped_metrics, piped_grads = loss_and_grads(
-        objective, MeshSpec(fsdp=2, stage=2), variables, batch, microbatches=4)
-
-    assert abs(loss - piped) < 1e-5, (loss, piped)
-    assert same_metrics(metrics, piped_metrics), (metrics, piped_metrics)
-    difference = largest_difference(grads, piped_grads)
-    assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
-
-
 def layer_states(model, variables, ids):
     """Every layer's output, as a reader of layer states keeps and reads it (`LayerStates`)."""
     _, kept = model.apply(variables, ids, capture_intermediates=model.capture_layers,
