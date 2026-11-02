@@ -441,6 +441,28 @@ QWEN3_MOE = DecoderFamily(
     padding_idx=True,
 )
 
+def _fused_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    return renamed_path((), name, config, layer_leaves=_QWEN_MOE_LEAVES)
+
+
+QWEN3_VL_MOE_TEXT = DecoderFamily(
+    ('qwen3_vl_moe_text',),
+    _qwen3_moe_config,
+    # A text decoder read from a Qwen3-VL-MoE release (`hf_decoders.TEXT_FAMILIES`), never the family a
+    # model exports as: it exports as Qwen3-MoE.
+    lambda fields: False,
+    'qwen3_moe',
+    'Qwen3MoeForCausalLM',
+    _qwen3_export,
+    weight_path=_fused_moe_path,
+    packed=FUSED_EXPERTS,
+    preserve_source_layout=True,
+    defaults={'max_position_embeddings': 32768},
+    padding_idx=True,
+)
+"""Qwen3-VL-MoE's text decoder: Qwen3-MoE's (`QWEN3_MOE`), its release storing each projection over every
+expert in one fused tensor (`FUSED_EXPERTS`)."""
+
 QWEN3 = DecoderFamily(
     ('qwen3',),
     _qwen3_config,

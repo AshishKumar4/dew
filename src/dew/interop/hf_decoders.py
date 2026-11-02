@@ -563,10 +563,11 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], reco
 
 
 TEXT_FAMILIES = {"qwen2_vl_text": "qwen2", "qwen2_5_vl_text": "qwen2", "qwen3_vl_text": "qwen3",
-                 "qwen3_vl_moe_text": "qwen3_moe"}
+                 "qwen3_vl_moe_text": "qwen3_vl_moe_text"}
 """A VLM's text decoder type, which transformers builds no causal LM for, by the family its decoder
-follows: Qwen2-VL's and Qwen2.5-VL's are Qwen2's, Qwen3-VL's Qwen3's and Qwen3-MoE's, each rotating text
-by plain positions (`plain_text_rope`)."""
+follows: Qwen2-VL's and Qwen2.5-VL's are Qwen2's, Qwen3-VL's Qwen3's, Qwen3-VL-MoE's Qwen3-MoE's as its
+release stores its experts (`families.qwen.QWEN3_VL_MOE_TEXT`), each rotating text by plain positions
+(`plain_text_rope`)."""
 
 
 def plain_text_rope(text: Mapping[str, object]) -> dict:
