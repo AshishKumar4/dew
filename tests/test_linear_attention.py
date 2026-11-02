@@ -42,7 +42,7 @@ from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence as kernel, tuning
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
@@ -848,8 +848,8 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
                           seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
-KEYED, RATED = recurrence.Hooks(decay='vector'), recurrence.Hooks(decay='scalar', rated=True, delta=False,
-                                                                   skip=True)
+KEYED = kernel.Hooks(decay='vector')
+RATED = kernel.Hooks(decay='scalar', rated=True, delta=False, skip=True)
 """The decode step's hooks beside the gated delta net's: Kimi delta attention's decay a key dimension
 (`linear.KEY_STEP`) and Mamba-2's rated scan with its skip (`mamba2.SSD`)."""
 
@@ -898,7 +898,7 @@ def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form
     def exact(query, key, value, decay_or_rate, beta, state, active, skip=None):
         with jax.enable_x64(new_val=True):
             given = {"log_decay": decay_or_rate} if keyed else {"rate": decay_or_rate, "skip": skip}
-            out, _, final = recurrence.step_reference(hooks, recurrence.Step(
+            out, _, final = kernel.step_reference(hooks, kernel.Step(
                 jnp.asarray(state, jnp.float64), query=query, key=key, value=value, beta=beta, active=active,
                 **given), dtype=jnp.float64)
             return np.asarray(out), np.asarray(final)

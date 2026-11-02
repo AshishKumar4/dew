@@ -373,7 +373,7 @@ their check 1's 256 draws run as armada's map tasks and a judge (`check1_shards`
 
 
 @pytest.mark.parametrize('name, regime', [case for case in CASES + TPU_ACCELERATED
-                                          if case not in LONG_GRADIENT])
+                                          if tuple(case.values) not in LONG_GRADIENT])
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
