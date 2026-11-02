@@ -753,6 +753,13 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(held)
         return False
 
+    def compiled_options(self, candidate: Candidate) -> jax.stages.CompilerOptions | None:
+        """The options the search compiles `candidate` under: `required` on the half rung of XLA's defaults,
+        else the step's own (`options`), each under the compile-only policy (`deviceless_options`), which
+        the search alone applies, so a step whose options are its towers' own is that rung's program
+        (`climb`)."""
+        return self.required if self.xla_defaults else deviceless_options(self.mesh, self.options(candidate))
+
     def measured(self, split: int, candidate: Candidate) -> tuple[
             jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
@@ -763,10 +770,7 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
-        # The compile-only policy (`deviceless_options`) is the search's, on the step's options as on
-        # `required`.
-        options = (self.required if self.xla_defaults
-                   else deviceless_options(self.mesh, self.options(candidate)))
+        options = self.compiled_options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
         if ahead is not None:

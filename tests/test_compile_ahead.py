@@ -80,15 +80,10 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
-    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. The
-    run sets Triton's GEMM fusions itself and leaves autotuning to Dew, so its step's options are its towers'
-    own and no probe compiles the half rung under XLA's defaults, which would be the same program: the
-    search applies the compile-only policy (`deviceless_options`) to both alike (row 3506)."""
+    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
-                       + " --xla_gpu_enable_triton_gemm=false")
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=700_000, frontier=True)
     plan = record(ahead.plan, "plan")
@@ -102,7 +97,6 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
              for entry in (plan, *frontier)]
     assert len(set(rungs)) == len(rungs)
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
-    assert not any(probe["xla_defaults"] for probe in probes)
 
 
 def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
@@ -110,8 +104,10 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
     its autotuner would still compile every candidate it cannot time. A run's own XLA_FLAGS setting, and a
     mesh of devices that run, keep the options as given."""
+    from dew.nn.kernels.options import compiler_options
     from dew.training.ahead import compile_only_gpus
     from dew.training.memory import deviceless_options
+    from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
                                                   "--xla_gpu_autotune_level"))
@@ -122,6 +118,15 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     running = MeshSpec().build(jax.devices()[:1])
     assert deviceless_options(running, {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
+    # The fit search alone applies the policy, to the step's options and its towers' alike (row 3506): a
+    # step whose options are its towers' own compiles as the half rung of XLA's defaults does, one program.
+    objective = fine_tune(deviceless, split=None).objective
+    search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
+                       objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
+                       resumed=None, capacity=2**30)
+    assert search.compiled_options(None) == search.required == deviceless_options(
+        deviceless, compiler_options(*objective.towers()) or None)
+    assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
     assert deviceless_options(deviceless, None) is None
 
