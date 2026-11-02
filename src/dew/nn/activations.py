@@ -31,6 +31,7 @@ from collections.abc import Callable
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax.typing import Dtype
 
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, rounded_to
@@ -118,7 +119,7 @@ class Xielu(nn.Module):
     alpha_n_init: float = 0.8
     beta: float = 0.5
     eps: float = -1e-6
-    param_dtype: jnp.dtype = jnp.float32
+    param_dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
