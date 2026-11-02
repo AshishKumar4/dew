@@ -92,14 +92,21 @@ def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int,
     return None
 
 
+def _ahead(value: Reads, length: int) -> bool:
+    """Whether an entry of `value`, along its own axis of `length` entries, reads one past its index:
+    the operation first doing so names a refusal (`_Walk.first`)."""
+    assert value.axis is not None
+    allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], object)
+    return bool(np.any(value.masks & ~allowed))
+
+
 def _later(value: Reads, length: int) -> bool:
     """Whether an entry of `value`, an output holding its positions on axis 1, reads a position later than
     its own: along that axis, entry i reads one past i; read along any other axis, or along none, every
     entry reads the union, which reads past position 0 where it holds any later one."""
     if value.axis != 1 or len(value.masks) != length:
         return bool(value.union & ~1)
-    allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], object)
-    return bool(np.any(value.masks & ~allowed))
+    return _ahead(value, length)
 
 
 def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
@@ -143,7 +150,7 @@ class _Walk:
             held.update(zip(eqn.outvars, outputs, strict=True))
             known.update(zip(eqn.outvars, evaluated, strict=True))
             if not self.first and any(isinstance(value, Reads) and value.axis is not None
-                                      and len(value.masks) == self.length and _later(value, self.length)
+                                      and len(value.masks) == self.length and _ahead(value, self.length)
                                       for value in outputs):
                 self.first = eqn.primitive.name
         return ([None if isinstance(var, core.Literal) else held.get(var) for var in jaxpr.outvars],

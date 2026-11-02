@@ -67,7 +67,8 @@ ADMITTED = {
         0, 2, 1, 3).transpose(0, 2, 1, 3).reshape(1, tokens.shape[1], D),
     "Dew's attention": lambda tokens: named(lambda q, k, v: attention(q, k, v, causal=True),
                                             CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
-    "a token-wise call": lambda tokens: named(lambda x: jnp.sort(x, axis=-1), TOKENWISE)(embedded(tokens)[0]),
+    "a token-wise call": lambda tokens: named(lambda x: jnp.sort(x, axis=-1), TOKENWISE)(
+        embedded(tokens)[0])[None],
     "layers scanned": lambda tokens: jax.lax.scan(lambda h, w: (jnp.cumsum(h @ w, axis=1), None),
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
 }
@@ -99,9 +100,12 @@ REFUSED = {
     "a loop of no passes from a left shift": lambda tokens: jax.lax.while_loop(
         lambda carry: carry[1] < 0, lambda carry: (jnp.zeros_like(carry[0]), carry[1] + 1),
         (shifted_left(embedded(tokens)), 0))[0],
+    # Each position's state beside the next one's as two batch groups, which the convolution moves into
+    # its two features: the second reads a later position.
     "a convolution grouping the positions by batch": lambda tokens: jax.lax.conv_general_dilated(
-        embedded(tokens)[0, :, :1][:, :, None], jnp.ones((1, 1, 2)), (1,), ((0, 0),),
-        dimension_numbers=("NWC", "WIO", "NWC"), batch_group_count=2).reshape(1, -1, 1),
+        jnp.concatenate([embedded(tokens), shifted_left(embedded(tokens))], axis=1)[0, :, :1][:, :, None],
+        jnp.ones((1, 1, 2)), (1,), ((0, 0),), dimension_numbers=("NWC", "WIO", "NWC"),
+        batch_group_count=2).reshape(1, tokens.shape[1], 2),
     "layers scanned with a mean": lambda tokens: jax.lax.scan(
         lambda h, w: (h @ w - (h @ w).mean(axis=1, keepdims=True), None), embedded(tokens),
         jnp.ones((3, D, D)))[0],
