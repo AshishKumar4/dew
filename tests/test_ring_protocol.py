@@ -181,6 +181,19 @@ def test_an_early_release_is_caught():
     assert found.value.kind == "unordered"
 
 
+def test_a_loop_whose_trips_the_checker_cannot_read_is_refused():
+    """A loop whose trip count reads a value the checker does not evaluate (a table's entry in global memory,
+    None to it): the checker refuses it, as it refuses a branch on one, where it ran the loop zero times and
+    explored the kernel with its events missing (row 3588)."""
+    def kernel(table):
+        return jax.lax.while_loop(lambda i: i < table[0], lambda i: i + 1, jnp.int32(0))
+
+    closed = jax.make_jaxpr(kernel)(jnp.zeros((1,), jnp.int32))
+    table = ring_protocol.Ref("gmem0", barrier=False, num_arrivals=0)
+    with pytest.raises(ValueError, match="trips"):
+        ring_protocol._Interpreter(0).run(closed.jaxpr, closed.consts, [table])
+
+
 def test_the_programs_are_the_toolkits_events():
     """The traced programs are the kernel's own synchronization: the producer's loads one a step, each
     with its slot's barrier, every consumer's waits and releases one a step a stream, and a read each."""

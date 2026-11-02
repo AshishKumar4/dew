@@ -153,6 +153,16 @@ class Skeleton:
         return Skeleton(("dot", self.form, other.form, params))
 
 
+def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
+    """A reduction's monoid and its operand's key (`key`), None where `term` is no reduction: an egglog
+    term's or a skeleton's alike."""
+    if isinstance(term, Skeleton):
+        return (term.form[2], term.form[1]) if term.form[0] == "reduce" else None
+    if (args := get_callable_args(term, Term.reduce)) is None:
+        return None
+    return text(args[1]), key(args[0])
+
+
 def binary_of(term: Term | Skeleton) -> tuple[str, Hashable, Hashable] | None:
     """A binary term's operation name and its operands' keys (`key`), None where `term` is no binary: an
     egglog term's or a skeleton's alike."""

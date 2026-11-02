@@ -394,10 +394,12 @@ register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md 
 
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
-         "mul": frozenset({"dot_general"})}
+         "reduce_max": frozenset({"mul"}), "reduce_min": frozenset({"mul"}),
+         "mul": frozenset({"dot_general"}), "dot_general": frozenset({"mul"})}
 """What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
-products or two contractions of one kind (`linear`), a reduction of a product, or a contraction scaled.
-Commutativity alone (`identities`) leaves every price as it was."""
+products or two contractions of one kind (`linear`), a reduction of a product (a sum's, or an extremum's of a
+positive scale), a contraction scaled, or a contraction of a scaled operand (a dequant's matrix scale, its
+broadcast within `program.WINDOW`). Commutativity alone (`identities`) leaves every price as it was."""
 
 
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
@@ -415,7 +417,9 @@ def reorderable(region: terms.Region) -> bool:
     """Whether a reordering rule may fire in `region`: each makes its new intermediate of operands the
     program states a number bound of (`dominated`, `made`: a sum's terms, a product's moved factor), so it
     needs a bounded term other than a literal, or two literals one value is multiplied by, whose sum
-    distributivity takes (`a * 2 + a * 4` as `a * 6`). A program's own math over its unbounded values (most
+    distributivity takes (`a * 2 + a * 4` as `a * 6`). A literal's scale an extremum reduces moves out of it
+    making no new magnitude (`positive_scale`), so a value scaled by a literal under a maximum or a minimum
+    admits it too. A program's own math over its unbounded values (most
     of a training step's: a gemma3n step's 2879 regions each fired commutativity alone) admits none, and is
     left as traced. It reads the region's records alone, so a window's structure (`terms.Skeleton`) decides it
     before its terms are built."""
@@ -423,6 +427,7 @@ def reorderable(region: terms.Region) -> bool:
     if any(bound is not None and named not in literals for named, bound in region.magnitudes.items()):
         return True
     scaled: set = set()
+    by_literal: set = set()
     for term, _ in region.shapes:
         found = terms.binary_of(term)
         if found is None or found[0] != "mul":
@@ -433,7 +438,10 @@ def reorderable(region: terms.Region) -> bool:
                 if operand in scaled:
                     return True
                 scaled.add(operand)
-    return False
+                by_literal.add(terms.key(term))
+    extrema = (terms.reduce_of(term) for term, _ in region.shapes)
+    return any(found is not None and found[0] in ("max", "min") and found[1] in by_literal
+               for found in extrema)
 
 
 def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:

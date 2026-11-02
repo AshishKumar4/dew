@@ -191,6 +191,20 @@ def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
     assert graph.check_bool(eq(algebra.rules.shape(broadcast)).to(Vec[i64](i64(64), i64(16))))
 
 
+@pytest.mark.parametrize("fn", [
+    lambda x, y, s: jnp.max(x * 0.5, axis=1),
+    lambda x, y, s: jnp.min(0.5 * x, axis=1),
+    lambda x, y, s: jnp.dot(x * s[:, None], y),
+], ids=["max of a positive scale", "min of a positive scale", "contraction of a scaled operand"])
+def test_a_rule_whose_left_side_heads_at_a_reduction_or_a_contraction_gets_a_window(fn):
+    """A maximum or minimum of a positively scaled operand (`linear`'s positive scale out of an extremum) and
+    a contraction of a scaled operand (its matrix scale, a dequant's): each opens a window its rule may fire
+    in (`rules.heads`), where no head read a reduction of an extremum over a product or a contraction over
+    one, so neither rule ever ran (row 3580)."""
+    closed = jax.make_jaxpr(fn)(*rows(1, (64, 32), (32, 16), (64,)))
+    assert program._windows(closed.jaxpr)
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
