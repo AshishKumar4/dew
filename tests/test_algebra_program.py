@@ -95,6 +95,34 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
                     f"a static count passed {pass_n}", seeds=16)
 
 
+def test_a_program_no_rule_changes_is_staged_once():
+    """An outer program (`options.program`) whose math no rule changes (an opaque equation beside an unbounded
+    sum), lowered with the pass on: each of its equations staged once, by jit's own trace, which lowers as it
+    is (`program.program_of`), where the pass's replay of its traced program staged each again (a Dory-4B
+    training step's 1.8 seconds of compile, nothing rewritten)."""
+    from jax.extend import core as jex_core
+    from jax.interpreters import mlir
+
+    staged = []
+
+    class Counted(jex_core.Primitive):
+        def bind(self, *args, **params):
+            staged.append(args)
+            return super().bind(*args, **params)
+
+    counted = Counted("counted_staging")
+    counted.def_impl(lambda x: x)
+    counted.def_abstract_eval(lambda x: x)
+    mlir.register_lowering(counted, lambda ctx, x: [x])
+
+    def step(x):
+        return counted.bind(x) + x
+
+    with report.refusals():
+        options.program(step).lower(jnp.ones((4, 8), jnp.float32))
+    assert len(staged) == 1
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
