@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import urllib.parse
 from datetime import timedelta
@@ -23,7 +24,9 @@ from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
 # The suite's Hypothesis profile (docs/design/testing.md): the same examples on every run, so a red
 # reproduces anywhere, no example database, and at most 50 examples of at most 2 s each, within a test's
-# 120 s. A test whose examples compile declares its own deadline and count within that.
+# 120 s. A test whose examples compile declares its own deadline and count within that. What Hypothesis
+# stores besides (its constants and character caches) goes under the run's scratch, not the checkout.
+os.environ.setdefault("HYPOTHESIS_STORAGE_DIRECTORY", os.path.join(tempfile.gettempdir(), "hypothesis"))
 hypothesis.settings.register_profile("dew", derandomize=True, database=None, deadline=timedelta(seconds=2),
                                      max_examples=50, print_blob=True)
 hypothesis.settings.load_profile("dew")

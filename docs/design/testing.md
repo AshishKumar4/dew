@@ -123,7 +123,7 @@ The committed generator uses the reference's public interface. Kernel qualificat
 
 Hypothesis is for property, metamorphic and fuzz tests: an invariant held over drawn inputs (an operation's algebraic law, an equivalence between two forms of one computation, a parser or planner's behavior on generated input). It is not an accuracy gate. A property test that judges numerics calls `assert_as_exact` on its examples, as every other test does, and carries no tolerance of its own.
 
-The suite's profile, `dew` (tests/conftest.py), draws the same examples on every run, so a red reproduces anywhere; keeps no example database; and runs at most 50 examples of at most 2 s each, within a test's 120 s. A test whose examples compile (a new shape each draw) declares its own `settings` deadline and count within that budget.
+The suite's profile, `dew` (tests/conftest.py), draws the same examples on every run, so a red reproduces anywhere; keeps no example database, and stores nothing in the checkout (`HYPOTHESIS_STORAGE_DIRECTORY` under the run's scratch); and runs at most 50 examples of at most 2 s each, within a test's 120 s. A test whose examples compile (a new shape each draw) declares its own `settings` deadline and count within that budget.
 
 A failure shrinks to a minimal example. That example joins the test as a regular case (`@example`, or a test of its own), so the defect stays covered whatever later strategies draw.
 
