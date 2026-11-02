@@ -800,8 +800,9 @@ class Objective(ABC, Generic[Loss, Effects]):
             model = source.model
         else:
             model = source
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
         self.variables = None if variables is OMITTED or variables is None else dicts(
-            unpacked(model, variables))
+            unpacked(model, nn.unbox(variables)))
         self.processor = None if processor is OMITTED else processor
         return model
 
@@ -1702,7 +1703,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
     if signature not in kept:
-        variables = jax.eval_shape(objective.init, jax.random.key(0))
+        variables = nn.unbox(jax.eval_shape(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
         rest = {name: value for name, value in variables.items() if name != "params"}
 

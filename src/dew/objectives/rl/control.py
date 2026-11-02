@@ -121,7 +121,8 @@ class ControlPPOObjective(Objective[Ratio]):
         self.observation_size = observation_size
         self.discount, self.lam, self.clip = discount, lam, clip
         self.reward_scaling, self.value_cost, self.entropy_cost = reward_scaling, value_cost, entropy_cost
-        self.variables = variables
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.variables = nn.unbox(variables)
         self.reads = reads
 
     def seen(self, observation: Observation) -> jax.Array:

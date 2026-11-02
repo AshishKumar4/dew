@@ -1647,7 +1647,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
                 scope.put_variable(collection, name, value)
         return served.clone(parent=scope)(*args, **kwargs)
 
-    _, abstract = jax.eval_shape(core.init(initialized), jax.random.key(0), variables)
+    _, abstract = nn.unbox(jax.eval_shape(core.init(initialized), jax.random.key(0), variables))
     parameters = _serving_parameters(variables["params"], abstract["params"])
     return served, {**variables, "params": parameters}
 

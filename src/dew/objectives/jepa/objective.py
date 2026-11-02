@@ -157,8 +157,9 @@ class JepaObjective(Objective[Ratio]):
         self.mask = mask
         self.sample = sample
         self.label_key = label_key
-        self.encoder_variables = dicts(encoder_variables)
-        self.predictor_variables = dicts(predictor_variables)
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.encoder_variables = dicts(nn.unbox(encoder_variables))
+        self.predictor_variables = dicts(nn.unbox(predictor_variables))
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(

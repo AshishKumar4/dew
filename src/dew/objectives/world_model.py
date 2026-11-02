@@ -278,7 +278,8 @@ class WorldModelObjective(Objective[Ratio]):
     def __init__(self, model: Dynamics, tokenizer: CausalTokenizer, tokenizer_variables: Variables, *,
                  shortcut: bool = True):
         self.model = model
-        self.tokenizer, self.tokenizer_variables = tokenizer, tokenizer_variables
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.tokenizer, self.tokenizer_variables = tokenizer, nn.unbox(tokenizer_variables)
         self.shortcut = shortcut
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:

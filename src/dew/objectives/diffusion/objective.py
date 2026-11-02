@@ -461,7 +461,8 @@ class DiffusionObjective(Objective[Ratio]):
         self.process = build_process(process)
         self.inputs = inputs
         self.autoencoder = autoencoder
-        self.variables = dicts(variables)
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.variables = dicts(nn.unbox(variables))
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         _check_end_to_end(end_to_end, alignment, autoencoder, inputs)
         check_solver(self.process, solver, steps, grid)
