@@ -113,10 +113,26 @@ STATIC: dict = {}
 
 def _static(jaxpr) -> bool:
     """Whether `jaxpr`, its calls' and scans' bodies included, takes no branch or loop its values pick
-    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr."""
+    (`cond`, `while`), which the walk reads concretely (`_applied`), once a jaxpr. A branch its platform
+    picks (`jax.lax.platform_dependent`'s) is static: the walk reads its platform where it runs
+    (`_platform`)."""
     if jaxpr not in STATIC:
-        STATIC[jaxpr] = all(_static_equation(equation) for equation in jaxpr.eqns)
+        picked = _platform_picked(jaxpr)
+        STATIC[jaxpr] = all(_static_equation(equation, picked) for equation in jaxpr.eqns)
     return STATIC[jaxpr]
+
+
+def _platform_picked(jaxpr) -> frozenset:
+    """The variables of `jaxpr` its platform makes (`platform_index`), which a branch they pick reads."""
+    return frozenset(var for equation in jaxpr.eqns if equation.primitive.name == "platform_index"
+                     for var in equation.outvars)
+
+
+def _platform(equation):
+    """A `platform_index` equation's index where this evaluation runs, read concretely, so the branch it
+    picks is one static step even within a compiled run (`_compiled`)."""
+    with jax.ensure_compile_time_eval():
+        return np.asarray(equation.primitive.bind(**equation.params))
 
 
 def _traced(fn, args):
@@ -230,9 +246,11 @@ def _layout(jaxpr):
     return LAYOUTS[jaxpr]
 
 
-def _static_equation(equation) -> bool:
-    """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`)."""
-    if equation.primitive.name in ("cond", "while"):
+def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
+    """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`): a
+    branch whose index is among `picked`, its platform's (`_platform_picked`), is not one."""
+    name = equation.primitive.name
+    if name == "while" or (name == "cond" and equation.invars[0] not in picked):
         return False
     for value in equation.params.values():
         for body in value if isinstance(value, tuple | list) else (value,):
@@ -246,8 +264,9 @@ def _runs(jaxpr) -> list[tuple[int, int]]:
     """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each
     branch or loop a span of its own."""
     spans, start = [], 0
+    picked = _platform_picked(jaxpr)
     for index, equation in enumerate(jaxpr.eqns):
-        if not _static_equation(equation):
+        if not _static_equation(equation, picked):
             if start < index:
                 spans.append((start, index))
             spans.append((index, index + 1))
@@ -351,6 +370,8 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     """`equation`'s outputs from `inputs`, and their energies where `wanted`, a body's runs of static
     steps compiled where `compiling` (`_evaluated`); a primitive's by `rule` where one is given."""
     name, params = equation.primitive.name, equation.params
+    if name == "platform_index":
+        return [_platform(equation)], [None]
     body = _body(equation)
     walked = wanted or rule is not None
     if walked and body is not None:
