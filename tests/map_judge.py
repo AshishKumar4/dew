@@ -6,11 +6,15 @@ witness of run options its outcomes; each reads and writes through `record_units
 """
 
 import hashlib
+import json
 import os
 import pickle
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
+
+import psutil
 
 DRAWS = "DEW_CHECK1_DRAWS"
 """The environment variable that runs every sharded site as one map task: `start:stop`, the units the task
@@ -67,7 +71,10 @@ def _file(site: str) -> str:
 
 def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
     """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's
-    record of those units (pickled whole, then moved into place), and True; else False."""
+    record of those units (pickled whole, then moved into place), and True; else False. Beside it, the
+    seconds from the task's process's start to its units (`before`: its imports, collection, the site's
+    setup and compiles) and those its units took (`draws`), so a run's map tasks say what each paid before
+    any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut)."""
     span = os.environ.get(DRAWS)
     if not span:
         return False
@@ -77,13 +84,23 @@ def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
         raise ValueError(f"{label}: a map task ({DRAWS}={span}) writes its records to {RECORDS}, which is "
                          f"unset")
     site = site_id(label)
+    # The process's start is on the wall clock; the draws' seconds on one that only moves forward.
+    began, drawing = time.time(), time.perf_counter()
     found = payload(start, stop)
+    seconds = {"site": site, "start": start, "stop": stop, "draws": time.perf_counter() - drawing,
+               "before": began - psutil.Process().create_time()}
     path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    written = path.with_name(path.name + ".partial")
-    written.write_bytes(pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
-    written.rename(path)
+    _published(path.with_suffix(".seconds.json"), json.dumps(seconds).encode())
+    _published(path, pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
     return True
+
+
+def _published(path: Path, data: bytes) -> None:
+    """`data` at `path` whole: written beside it, then moved into place, so no reader sees part of it."""
+    written = path.with_name(path.name + ".partial")
+    written.write_bytes(data)
+    written.rename(path)
 
 
 def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, object]] | None:

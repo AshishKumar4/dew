@@ -1043,6 +1043,43 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
+def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with one name, on their own decorators, run in one group of their
+    split file, so the setup they share (a module-scoped fixture's making) is paid once: the plan cuts
+    the file's record and the split plugin its collected tests alike, the marked tests one weight at
+    the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
+    plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
+    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
+    plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
+    to share its fixture). A mark written
+    elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
+    line, as the plan cannot read it."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_shared.py").write_text(
+        "from pathlib import Path\nimport pytest\n"
+        + "".join(("@pytest.mark.shared_setup('plan')\n" if index != 1 else "")
+                  + f"def test_{index}():\n"
+                  f"    with Path('runs').open('a') as runs: runs.write('{index}')\n" for index in range(4)))
+    nodes = [f"tests/test_shared.py::test_{index}" for index in range(4)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict.fromkeys(nodes[:3], 200.0)))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    together, alone = [nodes[0], nodes[2]], [nodes[1]]
+    assert {row["name"]: sorted(row["tests"]) for row in rows} == {
+        "3.12:tests/test_shared.py#1/2": [*together, nodes[3]], "3.12:tests/test_shared.py#2/2": alone}
+    assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
+    assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
+    for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
+                      "@pytest.mark.shared_setup(NAME)\n"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'plan'\n{misplaced}def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            ci.plan(300.0, {})
+
+
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
     """The durations record is no file's input but a split file's groups', which are cut from that file's
     own entries: a change to another file's entries reuses every row, and so does one to the split file's

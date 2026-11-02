@@ -1,12 +1,15 @@
 """A CI task's pytest session, as the plan (ci.py) and the plugins a task loads into it (split.py,
-executed.py) share it: how pytest runs and what it sees (`pytest_run`, `pytest_environment`), how long it
-runs (`DEADLINE`, `GRACE`), which tests take another path on a GPU (`MARKS`), and how a split file's tests
-are cut (`groups`). What it decides changes a task's outcome, so the test cache keys every file's record on
-it (ci.py's `SHARED`); the plan's own code does not, and a change to it reruns nothing. The standard library
-alone: the plan imports it where pytest is not installed."""
+executed.py) share it: how pytest runs and what it sees (`pytest_run`, `pytest_environment`), how long it runs
+(`DEADLINE`, `GRACE`), which tests take another path on a GPU (`MARKS`), and how a split file's tests are cut
+(`cut`, `groups`), those of one shared setup together (`SHARED_SETUP`). What it decides changes a task's
+outcome, so the test cache keys every file's record on it (ci.py's `SHARED`); the plan's own code does not,
+and a change to it reruns nothing. The standard library alone: the plan imports it where pytest is not
+installed."""
 
+import ast
+import functools
 import os
-from collections.abc import Mapping
+from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
@@ -62,6 +65,111 @@ MARKS = ("gpu",)
 """The marks of tests a GPU runs: its behavioural flows' (tests/test_gpu_*.py, the owner's rule of no unit
 tests on a GPU, ledger 2452), and the few gpu-marked tests not yet a flow's cells. A kernel's tests run on the
 CPU alone, interpreted; each kernel's native run is a flow's cell."""
+
+
+SHARED_SETUP = "shared_setup"
+"""The mark of tests that share one expensive setup (pyproject.toml's markers), a module- or
+class-scoped fixture's making: `@pytest.mark.shared_setup("name")` on each test's own decorator, of a
+literal name, as the plan reads it from the source (`shared_setups`). A split file's tests of one name
+run in one group (`cut`), so the setup is paid once; a fixture that only cleans up, or one every test
+takes (autouse), is no reason to mark (Main, 2026-11-02: the joint release's fit and an admitted plan,
+45-95 s each, paid twice where a cut parted their tests)."""
+
+
+def test_name(node: str) -> str:
+    """Test node `node`'s test's name in its file: its function's, or a class's method's
+    `Class.test_name`, its parameters' ids aside."""
+    return node.partition("::")[2].split("[")[0].replace("::", ".")
+
+
+def shared_setups(name: str) -> dict[str, str]:
+    """Test file `name`'s tests marked `SHARED_SETUP`, each by its name in the file (`test_name`) with
+    the setup it names. Read from the source, as the plan runs under a Python with no pytest and imports
+    no test: a mark written elsewhere than a test's own decorator (on a class or a module, in a
+    parameter's marks), or of a name not a literal string, would be cut apart by the plan and kept
+    together by nothing it can read, so the file is refused, by the line that holds it."""
+    path = Path(name)
+    text = path.read_text() if path.is_file() else ""
+    return marked_setups(name, text) if SHARED_SETUP in text else {}
+
+
+def decorated_tests(body: list[ast.stmt], prefix: str = "") -> Iterator[tuple[str, ast.Call]]:
+    """Each test function of a test file's `body` (`ast.parse`'s), by its name in the file (`test_name`'s
+    form), with each call its own decorators make (`@pytest.mark.<mark>(...)`): what the plan reads a test's
+    marks from, as it imports no test (`shared_setups`, ci.py's `sites`)."""
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            yield from decorated_tests(node.body, f"{prefix}{node.name}.")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name[:4] == "test":
+            for mark in node.decorator_list:
+                if isinstance(mark, ast.Call):
+                    yield prefix + node.name, mark
+
+
+@functools.cache
+def marked_setups(name: str, text: str) -> dict[str, str]:
+    """`shared_setups` of test file `name`, whose source is `text`, read once a text."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # Its collection fails its row, saying why.
+        return {}
+    found: dict[str, str] = {}
+    read: set[int] = set()
+    for test, mark in decorated_tests(tree.body):
+        if (ast.unparse(mark.func) == f"pytest.mark.{SHARED_SETUP}" and len(mark.args) == 1
+                and not mark.keywords and isinstance(mark.args[0], ast.Constant)
+                and isinstance(mark.args[0].value, str) and test not in found):
+            found[test] = mark.args[0].value
+            read.add(id(mark.func))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
+            raise SystemExit(f"{name}, line {node.lineno}: {SHARED_SETUP} is read on a test's own "
+                             f"decorator alone, once, as @pytest.mark.{SHARED_SETUP}(\"name\") of a literal "
+                             "name, which the plan reads from the source (tools/armada/session.py "
+                             "`shared_setups`)")
+    return found
+
+
+def units(nodes: list[str]) -> list[list[int]]:
+    """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone, but
+    those of one file marked with one `SHARED_SETUP`, together at the first one's place, whether the
+    durations record names them yet or not. Each file's marks are read once."""
+    marks: dict[str, dict[str, str]] = {}
+    held: list[list[int]] = []
+    at: dict[tuple[str, str], int] = {}
+    for index, node in enumerate(nodes):
+        name = node.split("::")[0]
+        if name not in marks:
+            marks[name] = shared_setups(name)
+        setup = marks[name].get(test_name(node))
+        if setup is None:
+            held.append([index])
+        elif (name, setup) in at:
+            held[at[name, setup]].append(index)
+        else:
+            at[name, setup] = len(held)
+            held.append([index])
+    return held
+
+
+def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
+    """Each of `units`' weights: its tests' `seconds` (each node's, in `nodes`' order) summed."""
+    return [sum(seconds[index] for index in unit) for unit in units(nodes)]
+
+
+def cut(nodes: list[str], seconds: list[float], count: int,
+        recorded: Container[str] | None = None) -> list[list[str]]:
+    """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
+    every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
+    setup's tests in one group. Where `recorded` is given (the nodes the durations record names), a test it
+    lacks weighs nothing in a unit it names another of: the plan, which reads the record alone, cuts where
+    the task does, and the test rides with its setup's."""
+    held = units(nodes)
+    runs = groups([sum(seconds[index] for index in unit
+                       if recorded is None or nodes[index] in recorded
+                       or not any(nodes[each] in recorded for each in unit)) for unit in held], count)
+    return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 
 def starts(weights: list[int], capacity: int) -> list[int]:

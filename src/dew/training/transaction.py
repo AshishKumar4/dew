@@ -17,7 +17,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Generic
 
 import jax
@@ -62,6 +62,7 @@ from dew.state import Accumulation, TrainState, apart, together
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
+from dew.training.staging import staged
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -460,7 +461,7 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
+                 record: bool = False, resting: Mapping[str, object] | None = None,
                  inspection: Inspection | None = None, examples: int | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
@@ -472,19 +473,20 @@ class Transaction:
         replay. `copies` names the parameters the forward reads through the
         state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
         evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
-        `fetch` brings the fields of `COMMIT_FIELDS` a resident step's state keeps in host memory to the
-        device (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit
+        `resting` places the fields of `COMMIT_FIELDS` a resident step's state keeps in pinned host memory,
+        each by its placement there: the step reads them only once its gradient is ready, as the commit
         does, so the device holds them through the update and not through the forward and backward, but
         for an EMA the objective reads in its forward. Fetched at the step's start, an A100 held them
         through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
         memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
-        hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
-        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way. `examples`
+        hostmem.json). Fetched whole there, XLA:GPU held the whole state for the update, so keeping it on
+        the host freed nothing at a step's peak (a Dew decoder's peaked at 8.427 GB either way): the
+        commit takes them a chunk at a time (`past`, `dew.training.staging`). `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
         which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
-        self.fetch = fetch
+        self.resting = dict(resting or {})
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
@@ -501,19 +503,33 @@ class Transaction:
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
     def fetched(self, state: TrainState) -> TrainState:
-        """`state` with the fields `fetch` brings to the device there, `state` itself where nothing is."""
-        return state if self.fetch is None else self.fetch(state)
+        """`state` with its host-resident fields (`resting`) brought to the device whole, for an EMA the
+        objective reads in its forward."""
+        return dataclasses.replace(state, **{
+            field: jax.device_put(getattr(state, field), jax.tree.map(lambda s: s.with_memory_kind("device"),
+                                                                      placement))
+            for field, placement in self.resting.items()})
 
-    def past(self, state: TrainState, gradient) -> TrainState:
-        """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
-        they pass an optimization barrier with it, so the device takes them only once it is ready. Where
-        nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
-        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at ada6c5686)."""
-        if self.fetch is None:
-            return state
-        resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
-        _, kept = jax.lax.optimization_barrier((gradient, resting))
-        return self.fetch(dataclasses.replace(state, **kept))
+    def past(self, finish: Callable, state: TrainState, gradient, *arguments) -> tuple:
+        """`finish(state, *arguments)`, the step's commit and what follows it, its host-resident fields
+        (`resting`) brought to the device a chunk at a time past `gradient` (`staged`): the first chunk
+        passes an optimization barrier with it, so the device takes none of them before it is ready, and
+        the commit's new fields go back to host memory chunk by chunk. Where nothing rests on the host the
+        state is the commit's as it is: with the barrier there too, a step that fit by a byte past its own
+        rung found no rung (tests/test_narrow.py, at ada6c5686)."""
+        if not self.resting:
+            return finish(state, *arguments)
+
+        def finished(fields, held, *arguments):
+            advanced, *outputs = finish(dataclasses.replace(held, **fields), *arguments)
+            return ({field: getattr(advanced, field) for field in fields},
+                    (dataclasses.replace(advanced, **dict.fromkeys(fields)), *outputs))
+
+        fields = {field: getattr(state, field) for field in self.resting}
+        kept, (advanced, *outputs) = staged(finished, fields, self.resting,
+                                            (dataclasses.replace(state, **dict.fromkeys(fields)), *arguments),
+                                            gradient)
+        return dataclasses.replace(advanced, **kept), *outputs
 
     def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
         """Evaluate the objective's loss and keep the pullback of that trace.
@@ -1000,8 +1016,8 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens,
-                              probed)
+                return self.past(finish, state, gradient, batch, aux, pending, gradient, attempt, tokens,
+                                 probed)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)

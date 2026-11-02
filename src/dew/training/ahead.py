@@ -38,11 +38,16 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import importlib.metadata
 import json
 import logging
+import os
 import pickle
+import platform
+import tempfile
+import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,7 +60,8 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
-from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target, tpu
+from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, runtime_facts, tpu
+from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, step_flops
@@ -240,10 +246,7 @@ class AheadOfTime:
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
-        loaded = pickle.loads(Path(path).read_bytes())
-        if not isinstance(loaded, AheadOfTime):
-            raise ValueError(f"{path} holds no step compiled ahead of time")
-        return loaded
+        return _saved(path, AheadOfTime, "step")
 
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
@@ -288,6 +291,221 @@ class AheadOfTime:
                              "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
                              "rung")
         return self.loaded()
+
+
+DUMP_FLAGS = ("--xla_dump", "--xla_gpu_dump")
+"""XLA_FLAGS that decide whether and what XLA dumps, which `dumps` sets for a run alone."""
+PHASE_FLAGS = (*DUMP_FLAGS, "--xla_gpu_load_autotune_results",
+               "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
+"""XLA_FLAGS of one phase's own (where a run dumps, what a build loads), which compute nothing a program
+does."""
+
+
+def computation_flags(flags: str | None = None) -> tuple[str, ...]:
+    """The XLA flags, `XLA_FLAGS` by default, that decide what a program computes (Dew's rounding and
+    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in their order, as
+    XLA reads a flag given twice by its last value."""
+    given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
+    return tuple(setting for setting in given.split() if not setting.startswith(PHASE_FLAGS))
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildTarget:
+    """What programs compiled ahead (`compile_programs`) were built for and with, which a process loading them
+    (`AheadPrograms.loaded`) must be: the generation whose facts XLA compiled for and their launches
+    derived for (`target_config`), its multiprocessors among them, which a launch's grid and XLA's fusions
+    read, and how many devices; the JAX and jaxlib that compiled them, the XLA flags that decide what they
+    compute (`computation_flags`), and the host architecture their host code was built for (a Mosaic
+    kernel carries host code beside its cubin). A GPU kind of the generation with as many multiprocessors
+    runs them: an A100 of 40 GB as one of 80 (2026-11-03, GS-compile-programs3-a100 was refused on the
+    kind's name alone); an H100 PCIe (114) does not run an SXM's (132). The CUDA plugin is not part of it:
+    an H100 ran sm90 programs a CUDA 12 plugin built, unchanged, under the CUDA 13 plugin of a node's own
+    environment, bit for bit as the jitted programs (2026-11-02, GS-compileahead-pilot-h100)."""
+
+    generation: str
+    multiprocessors: int | None
+    devices: int
+    jax: str
+    jaxlib: str
+    flags: tuple[str, ...]
+    host: str
+
+    @staticmethod
+    def of(devices: Sequence) -> BuildTarget:
+        """The target `devices` are, under this process's JAX, XLA flags and host."""
+        device = devices[0]
+        target = gpu_target(device.device_kind)
+        # A GPU's own multiprocessors as it reports them (`runtime_facts`), the table's where it is no GPU.
+        target = runtime_facts(target, device) if device.platform == "gpu" else target
+        return BuildTarget(target.generation, target.multiprocessors, len(devices),
+                           importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
+                           computation_flags(), platform.machine())
+
+    def differences(self, other: BuildTarget) -> list[str]:
+        """Each field `other` holds otherwise, said as this one's and other's."""
+        named = [field.name for field in dataclasses.fields(self)]
+        return [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
+                if getattr(self, name) != getattr(other, name)]
+
+
+@dataclasses.dataclass(frozen=True)
+class AheadPrograms:
+    """Named programs compiled ahead for GPUs this process need not have (`compile_programs`): each program's
+    executable (`AheadProgram`) and the target they were built for (`BuildTarget`). A process of that target
+    loads them (`loaded`) and runs them with no tracing, lowering or compile (`executable_only`): a GPU node
+    then spends its time on its device's work alone (ledger 2716)."""
+
+    target: BuildTarget
+    programs: dict[str, AheadProgram]
+
+    def save(self, path: str | Path) -> None:
+        """Write the programs to `path`, for `load` in a process of their target."""
+        Path(path).write_bytes(pickle.dumps(self))
+
+    @staticmethod
+    def load(path: str | Path) -> AheadPrograms:
+        """The programs `save` wrote to `path`."""
+        return _saved(path, AheadPrograms, "programs")
+
+    def loaded(self) -> dict[str, jax.stages.Compiled]:
+        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
+        it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
+        differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
+        for; each is admitted as a compiled program is (`dew.communicators.admit`)."""
+        devices = jax.devices()[:self.target.devices]
+        if differences := self.target.differences(BuildTarget.of(devices)):
+            raise ValueError(f"these programs were compiled for another target than this process's: "
+                             f"{'; '.join(differences)}")
+        programs = {}
+        for name, program in self.programs.items():
+            in_tree, out_tree = program.trees
+            programs[name] = serialize_executable.deserialize_and_load(
+                program.executable, in_tree, out_tree, backend=devices[0].client, execution_devices=devices)
+            communicators.admit(programs[name])
+        return programs
+
+
+def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
+    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds)."""
+    loaded = pickle.loads(Path(path).read_bytes())
+    if not isinstance(loaded, kind):
+        raise ValueError(f"{path} holds no {what} compiled ahead of time")
+    return loaded
+
+
+def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
+                     generation: str) -> AheadPrograms:
+    """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
+    one GPU of the CUDA `generation` on any host holding the CUDA plugin (`compile_only_gpus`), its launches
+    derived for that generation's facts (`assumed`), and serialized: a CPU host builds what a GPU node then
+    only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
+    GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
+    over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
+    serializes them."""
+    devices = compile_only_gpus(generation)
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    built = {}
+    for name, (function, arguments) in programs.items():
+        shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
+                       for argument in arguments)
+        # Through Dew's compile point, as a run compiles it: a launch whose kernel spills there is derived
+        # again at its next config.
+        program = owned_program(function, out_shardings=placed)
+        with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)), uncached():
+            compiled = program.compiled(*shapes)
+            lowered = program.lower(*shapes)
+        try:
+            built[name] = AheadProgram.of(program_of(lowered), compiled)
+        except (NotImplementedError, ValueError) as refused:
+            raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
+                             "constant of its program, which no executable serializes: pass it as an "
+                             f"argument): {refused}") from refused
+    target = BuildTarget(generation, gpu_target(generation).multiprocessors, 1,
+                         importlib.metadata.version("jax"),
+                         importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
+    return AheadPrograms(target, built)
+
+
+class ExecutableOnly(RuntimeError):
+    """A trace, lowering or compile in a process held to running loaded programs alone (`executable_only`)."""
+
+
+COMPILE_EVENTS = ("/jax/core/compile/jaxpr_trace_duration", "/jax/core/compile/jaxpr_to_mlir_module_duration",
+                  "/jax/core/compile/backend_compile_duration")
+"""JAX's own events of a trace, a lowering and a backend compile (`jax.monitoring`)."""
+
+
+class _Held(threading.local):
+    """How many `executable_only` blocks this thread is within."""
+
+    depth = 0
+
+
+_held = _Held()
+
+
+def _refused(event: str, duration_secs: float, **kwargs: str | int) -> None:
+    if _held.depth and event in COMPILE_EVENTS:
+        raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
+                             "program compiled ahead was missing, or code traced around it")
+
+
+@functools.cache
+def _listening() -> None:
+    jax.monitoring.register_event_duration_secs_listener(_refused)
+
+
+@contextlib.contextmanager
+def executable_only() -> Iterator[None]:
+    """Within the block, on this thread, a trace, a lowering or a backend compile raises `ExecutableOnly` as
+    JAX records it (`COMPILE_EVENTS`), and a loaded program (`AheadPrograms.loaded`) runs: a GPU node
+    measuring programs compiled ahead stops where one is missing (ledger 2716). JAX records an event as its
+    step ends, so this stops a run, not the step itself; that no compile ran anywhere in a run, children
+    included, is its compilers' own dumps left empty (`dumps`, `compiled_in`)."""
+    _listening()
+    _held.depth += 1
+    try:
+        yield
+    finally:
+        _held.depth -= 1
+
+
+def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
+    """`environment` for a run whose every compile, in it or any process it starts from any directory, its
+    compilers write under `directory`: XLA's (`--xla_dump_to`, unfiltered, whatever the environment said of
+    XLA's dumping) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin compile writes
+    nothing of XLA's). A run of programs compiled ahead leaves both empty (`compiled_in`). Refused where
+    either cannot be written, as a compiler that cannot write its dump compiles on."""
+    root = directory.resolve()
+    for part in ("xla", "mosaic"):
+        (root / part).mkdir(parents=True, exist_ok=True)
+        if (root / part).is_symlink():
+            raise ValueError(f"{root / part} is a link, whose writes compiled_in would not read")
+        # A file written and removed, as a compiler's dump would be: a full or read-only filesystem refuses
+        # it.
+        with tempfile.NamedTemporaryFile(dir=root / part, prefix=".written-"):
+            pass
+    given = environment.get("XLA_FLAGS", "").split()
+    flags = [setting for setting in given if not setting.startswith(DUMP_FLAGS)]
+    kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
+    dumping = [*flags, f"--xla_dump_to={root / 'xla'}"]
+    return {**kept, "XLA_FLAGS": " ".join(dumping), "MOSAIC_GPU_DUMP_TO": str(root / "mosaic")}
+
+
+def compiled_in(directory: Path) -> list[Path]:
+    """What the compilers of a run given `dumps(directory, ...)` wrote: none where nothing compiled. Refused
+    where `directory` is not one `dumps` made, or cannot be read, never read as empty."""
+    root = directory.resolve()
+    if linked := [part for part in ("xla", "mosaic") if (root / part).is_symlink()]:
+        raise ValueError(f"{root}'s {', '.join(linked)} dump directory is a link, whose writes go unread")
+    if missing := [part for part in ("xla", "mosaic") if not (root / part).is_dir()]:
+        raise FileNotFoundError(f"{root} holds no {', '.join(missing)} dump directory: dumps made none here")
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    return sorted(Path(top) / name for top, _, names in os.walk(root, onerror=unreadable) for name in names)
 
 
 @contextlib.contextmanager
