@@ -169,7 +169,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward in fp32 with its rows
-    (`attention_mosaic.forward`'s `splits`), merged with the initial state (`merged`) and unpacked. Its
+    (`attention_mosaic.forward`'s `splits`), merged with the initial state (`merged`) and unpacked; a row of
+    one slice finished by its own walk from the initial state, in the query's dtype. Its
     logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks
     walked again natural in one more launch over those rows alone, with no branch read on the host
     (`MosaicForward.masked`, row 1978)."""
@@ -180,13 +181,21 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     heads, kv_heads = query.shape[2], (key.shape[2] if pages is None else key.shape[0])
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
     walked = dataclasses.replace(hooks, initial=None)
-    work = plan(rows, key, value, row_spans, walked, scale=scale, target=generation.gpu_target(), pages=pages)
+    target = generation.gpu_target()
+    work = plan(rows, key, value, row_spans, walked, scale=scale, target=target, pages=pages)
+    if work.slices == 1:
+        # One slice a row: its walk merges the initial state itself (`algebra.merge`) and finishes its rows in
+        # the query's dtype, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at
+        # 4096 keys, ET-DECODE6-h100).
+        whole = dataclasses.replace(hooks, initial=initial)
+        work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, pages=pages)
+        with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
+            out = attention_mosaic.forward(rows, key, value, row_spans, whole, scale=scale, natural=False,
+                                           residuals=Kept.NONE, interpret=interpret, masked=True, pages=pages)
+        return unpacked(out, heads)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, pages=pages)[:3]
-    if work.slices == 1:
-        # One slice's launch gives its rows without a slices axis (`_plain_forward`).
-        out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
     merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
     return unpacked(merged_rows, heads).astype(query.dtype)
