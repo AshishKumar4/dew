@@ -55,6 +55,13 @@ from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
+from dew.interop.sequence_causality import (
+    CAUSAL_ATTENTION,
+    STATED_ATTENTION,
+    TOKENWISE,
+    attested,
+    causality_refusal,
+)
 from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
@@ -109,6 +116,10 @@ class TorchAdmission:
     reasons: Mapping[str, str]
     attends: bool = False
     why: str = ""
+    per_geometry: bool = False
+    """Whether its causality is proven per program it runs (`TorchGraph.certify`): a source qualified on
+    its full config without its probe (`qualified`), whose program at one length or in one call says
+    nothing of another's."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -171,6 +182,94 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     return TorchAdmission(model_type, dict(unmapped.reasons), attends=not why, why=why)
 
 
+type Traceable = jax.typing.ArrayLike | jax.ShapeDtypeStruct
+"""A value `TorchGraph.traced` traces the forward over: an array, or its shape and dtype alone, as an
+initialization and an unprobed source's qualification (`qualified`) hold them."""
+
+QUALIFYING = 13
+"""The most tokens a row `qualified` traces an unprobed source's forward over at its load, the largest
+prime up to it its context holds (one token for a context of one): no other size of its program is
+taken for the sequence's. Each program it then runs is proven on its own (`TorchGraph.certify`)."""
+
+
+def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable) -> TorchAdmission:
+    """Tier 3's decision on an unregistered causal LM whose shrunken probe cannot run
+    (`verify.ProbeUnavailable`), on its full config and no weights (ledger 1595, the 1493 design's H7):
+    transformers builds the type as a causal LM on torch's meta device; its forward, traced as tier 3
+    traces it over abstract weights (`TorchGraph.traced`), runs on Dew's attention in every decoder
+    layer, each passing only keywords Dew computes with a mask its causal visibility reproduces
+    (`_Probe`, read off the mask, `_masked`); an operation whose value the traced values decide (BLT's
+    `item()`) fails that trace with JAX's own error, naming it; the trace on Dew's attention at
+    `QUALIFYING` tokens is causal by its program (`sequence_causality.causality_refusal`: each output
+    position reading no later input through every operation); and its training forward draws nothing on
+    the host. Each refusal names its cause. torchax holds no symbolic length (its tensors' torch sizes
+    are integers), so no one trace proves every length: the admission is per geometry (`per_geometry`),
+    each program the model then runs proven before it runs (`TorchGraph.certify`)."""
+    from transformers import AutoConfig
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+    model_type = _records.text(config.get("model_type"), "model_type")
+    if model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and transformers "
+                         "builds no causal LM for it, which tier 3 runs")
+    fields = {key: value for key, value in _records.decoded_floats(config).items() if key != "model_type"}
+    source = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
+    _registered()
+    context = fields.get("max_position_embeddings")
+    stated = None if context is None else _records.integer(context, "max_position_embeddings")
+    length = max(prime for prime in (1, 2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated)
+    probe = _Probe(abstract=True)
+    try:
+        # Its masks evaluated as the trace runs, so the probe reads their values (`_masked`).
+        with probe.recording(), jax.ensure_compile_time_eval():
+            _abstract(source, _PROBE, length, train=False)
+        why = probe.kept_from_dew(int(source.num_hidden_layers))
+        if why:
+            raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and tier 3 "
+                             "holds an unprobed source causal by Dew's attention, which it cannot run on: "
+                             f"{why}")
+        closed, tokens, _ = _abstract(source, _ATTENTION, length, train=False)
+        trained = _abstract(source, _ATTENTION, length, train=True)[2]
+    except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
+            jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError) as error:
+        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
+                         f"does not trace at its full config: {type(error).__name__}: {error}") from error
+    refusal = causality_refusal(closed, tokens, length, (0, 1))
+    if refusal is not None:
+        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
+                         f"is not causal by its program: {refusal}")
+    if trained.host:
+        raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({trained.host} "
+                         "draws), which a traced step would fix for every step, and tier 3 trains the "
+                         "models it loads")
+    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True, per_geometry=True)
+
+
+def _abstract(source, attention: str, length: int, *, train: bool):
+    """`source`'s causal LM built on torch's meta device with `attention`, its forward over a row of
+    `length` tokens traced as tier 3 traces it (`TorchGraph.traced`) over abstract weights: the closed
+    program, the index of the tokens among its inputs (past the parameters' and the buffers' leaves,
+    as `traced` flattens them), and the draws it made."""
+    import torch
+    from torchax.interop import JittableModule, extract_all_buffers
+    from torchax.ops.mappings import t2j_dtype
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(source, trust_remote_code=False, dtype=torch.float32,
+                                                 attn_implementation=attention).eval()
+    functional_parts(model)
+    jittable = JittableModule(model)
+    params, buffers = ({name: jax.ShapeDtypeStruct(tuple(leaf.shape), t2j_dtype(leaf.dtype))
+                        for name, leaf in held.items()}
+                       for held in (jittable.params, extract_all_buffers(model)[1]))
+    graph = TorchGraph(jittable, (), attention_impl="reference" if attention == _ATTENTION else None)
+    tokens = jax.ShapeDtypeStruct((1, length), jnp.int32)
+    key = jax.random.key(0) if train else None
+    closed, _, draws = graph.traced(params, buffers, tokens, key, train=train)
+    return closed, len(params) + len(buffers), draws
+
+
 _ATTENTION = "dew"
 """The name Dew's attention is registered under in transformers' attention interface (`_registered`):
 a model built with it computes each layer's attention with `dew.nn.attention`, given no mask, as
@@ -186,6 +285,13 @@ _PLUMBING = frozenset({"position_ids", "cache_position", "position_embeddings", 
 attention computes: positions are already in the rotated queries and keys, and a decoding call's cache is
 Dew's (`_Cached`), not transformers'."""
 
+def _asked(kwargs: Mapping[str, object]) -> set[str]:
+    """The keywords an attention call passes that ask its attention a computation Dew's does not make:
+    past `_PLUMBING` and `_COMPUTED`, those that hold a value (a BERT decoder's `encoder_hidden_states`
+    of None asks no cross-attention)."""
+    return {name for name, value in kwargs.items() if value is not None} - _PLUMBING - _COMPUTED
+
+
 _COMPUTED = frozenset({"sliding_window", "softcap", "s_aux"})
 """The keywords Dew's attention computes (`_dew_attention`): a window over the most recent keys, a
 tanh cap on the logits, and one value-free logit a head (sinks)."""
@@ -198,10 +304,13 @@ class _Probe:
     passes past `_PLUMBING`, and whether the mask transformers built for it is the visibility Dew's
     attention computes from the module's causality and those keywords (`_visible`)."""
 
-    def __init__(self):
+    def __init__(self, *, abstract: bool = False):
         self.modules: set[int] = set()
         self.unknown: set[str] = set()
         self.unmatched = 0
+        self.abstract = abstract
+        """Whether the probed forward is traced over abstract weights (`qualified`), so the keys each
+        query sees are read off its mask (`_masked`), not its attention's weights."""
 
     @contextlib.contextmanager
     def recording(self):
@@ -213,9 +322,12 @@ class _Probe:
 
     def called(self, module, query, key, attention_mask, scaling, kwargs) -> None:
         self.modules.add(id(module))
-        self.unknown |= set(kwargs) - _PLUMBING - _COMPUTED
-        seen = _seen(module, query, key, attention_mask, scaling, kwargs)
-        if not _visible(seen, kwargs.get("sliding_window")):
+        self.unknown |= _asked(kwargs)
+        # A probe traced over abstract weights (`qualified`) reads the keys each query sees off the mask
+        # alone, whose values its trace holds; a mask it does not hold is no visibility it can verify.
+        seen = (_masked(module, query, key, attention_mask, scaling, kwargs) if self.abstract
+                else _seen(module, query, key, attention_mask, scaling, kwargs))
+        if seen is None or not _visible(seen, kwargs.get("sliding_window")):
             self.unmatched += 1
 
     def kept_from_dew(self, layers: int) -> str:
@@ -246,6 +358,25 @@ def _seen(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray:
     weights, _ = ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, identity, attention_mask,
                                                scaling=scaling, dropout=0.0, **kwargs)
     return weights.detach().cpu().numpy() > 0
+
+
+def _masked(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray | None:
+    """Which keys each query of a call traced over abstract weights reads (`_seen`'s), `[B, Q, H, K]`:
+    transformers' SDPA over zero queries and keys of the call's shapes, its mask's values held as the
+    trace evaluated them, and its other arguments the call's own that are no tensors; None where the
+    mask's values are traced, not held."""
+    import torch
+    from jax.core import Tracer
+    from torchax.interop import jax_view
+
+    mask = None
+    if attention_mask is not None:
+        held = jax_view(attention_mask)
+        if isinstance(held, Tracer):
+            return None
+        mask = torch.from_numpy(np.array(held))
+    plain = {name: value for name, value in kwargs.items() if not isinstance(value, torch.Tensor)}
+    return _seen(module, torch.zeros(tuple(query.shape)), torch.zeros(tuple(key.shape)), mask, scaling, plain)
 
 
 def _visible(seen: np.ndarray, window: int | None) -> bool:
@@ -360,7 +491,7 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     call = _ATTENDING.get()
     if call is None:
         raise ValueError("Dew's attention runs inside a tier-3 model's traced call")
-    unknown = sorted(set(kwargs) - _PLUMBING - _COMPUTED)
+    unknown = sorted(_asked(kwargs))
     if unknown:
         # `admitted` runs a model on Dew's attention only where its probe passed no such keyword.
         raise ValueError(f"Dew's attention does not compute {unknown}, which this call passes")
@@ -380,37 +511,58 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     dropping = {"dropout_rate": float(dropout) if drawn else 0.0, "deterministic": not drawn,
                 "dropout_rng": rng}
 
-    def attend(q, k, v, *, places, segment_ids, valid):
+    # Each path runs as a program of its own, attested under the rule a walk of the program's causality
+    # reads it by (`sequence_causality.attested`): the cached and the plain or packed paths causal over
+    # their keys by construction (`CAUSAL_ATTENTION`), a stated visibility the caller's
+    # (`STATED_ATTENTION`). Every array each reads is its argument, none a value of the enclosing trace.
+    def attend(q, k, v, *, places, segment_ids, valid, sinks, rng):
         del places, valid  # the documents hold the padding apart, as 0
         return scaled_dot_product_attention(
             q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
-            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments, **dropping)
+            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments,
+            **{**dropping, "dropout_rng": rng})
 
-    if call.cache is not None:
+    def causal(q, k, v, segment_ids, valid, sinks, rng):
+        if valid is None:
+            return attend(q, k, v, places=None, segment_ids=segment_ids, valid=None, sinks=sinks, rng=rng)
+        return compacted(functools.partial(attend, sinks=sinks, rng=rng), q, k, v, None, segment_ids, valid)
+
+    def cached(q, k, v, held_key, held_value, slots, filled, sinks, rng):
         # The call's tokens join the row's cache at their slots, and each attends over the whole row:
         # what it has filled, causal by slot and within the window, as Dew's decoders attend a cache.
-        held = call.cache.held.get(module.layer_idx)
-        if held is None:
-            # A cache being opened: its layer's keys and values give its shape, and nothing is held.
-            held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
-        keys, values = (write_cache(held[name], incoming, call.cache.slots)
-                        for name, incoming in (("cached_key", k), ("cached_value", v)))
-        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
-        keys, values = keys.astype(q.dtype), values.astype(q.dtype)
+        keys, values = write_cache(held_key, k, slots), write_cache(held_value, v, slots)
+        read_keys, read_values = keys.astype(q.dtype), values.astype(q.dtype)
         if q.shape[1] == 1 and not drawn:
             # One token a row reads its row's filled slots before its own, from its window's first: a
             # key count and start a row, which the decode kernels take as Dew's decoders give them
             # (`CausalSelfAttention._decode_attention`); a padding token reads one key, its output unused.
-            slot = call.cache.slots[:, 0]
+            slot = slots[:, 0]
             reads = jnp.maximum(slot + 1, 1).astype(jnp.int32)
             starts = None if window is None else jnp.maximum(slot + 1 - window, 0).astype(jnp.int32)
-            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation,
+            out = scaled_dot_product_attention(q, read_keys, read_values, implementation=call.implementation,
                                                causal=False, softcap=softcap, sinks=sinks,
                                                key_value_seq_lengths=reads, key_value_seq_starts=starts)
         else:
-            mask = causal_attention_mask(call.cache.slots, keys.shape[1], window, key_valid=call.cache.filled)
-            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation, mask=mask,
-                                               softcap=softcap, sinks=sinks, **dropping)
+            mask = causal_attention_mask(slots, keys.shape[1], window, key_valid=filled)
+            out = scaled_dot_product_attention(q, read_keys, read_values, implementation=call.implementation,
+                                               mask=mask, softcap=softcap, sinks=sinks,
+                                               **{**dropping, "dropout_rng": rng})
+        return out, keys, values
+
+    def stated(q, k, v, visible, sinks, rng):
+        return scaled_dot_product_attention(q, k, v, implementation=call.implementation,
+                                            mask=visible[:, None], softcap=softcap, sinks=sinks,
+                                            **{**dropping, "dropout_rng": rng})
+
+    if call.cache is not None:
+        held = call.cache.held.get(module.layer_idx)
+        if held is None:
+            # A cache being opened: its layer's keys and values give its shape, and nothing is held.
+            held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
+        out, keys, values = attested(cached, CAUSAL_ATTENTION)(q, k, v, held["cached_key"],
+                                                               held["cached_value"], call.cache.slots,
+                                                               call.cache.filled, sinks, rng)
+        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
         visible = jnp.asarray(call.visible, bool)
@@ -420,12 +572,9 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                       else call.places)
             reach = windowed(places[:, :, None], call.key_places[:, None, :], window, causal=False)
             visible = visible & reach
-        out = scaled_dot_product_attention(q, k, v, implementation=call.implementation,
-                                           mask=visible[:, None], softcap=softcap, sinks=sinks, **dropping)
-    elif call.valid is None:
-        out = attend(q, k, v, places=None, segment_ids=call.documents, valid=None)
+        out = attested(stated, STATED_ATTENTION)(q, k, v, visible, sinks, rng)
     else:
-        out = compacted(attend, q, k, v, None, call.documents, call.valid)
+        out = attested(causal, CAUSAL_ATTENTION)(q, k, v, call.documents, call.valid, sinks, rng)
     return torch_view(out.astype(q.dtype)), None
 
 
@@ -626,14 +775,23 @@ def _functional_experts() -> type:
             from torchax.interop import jax_view, torch_view
 
             x, index, weights = (jax_view(tensor) for tensor in (hidden_states, top_k_index, top_k_weights))
-            identity = index >= self.routed
-            slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
+            kernels = ()
             if self.routed:
                 # Under the trace these are its views of the parameters, not torch's parameters.
                 gate_up = jax_view(self.gate_up_proj)[:self.routed]
                 width = gate_up.shape[1] // 2
                 kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
                            jnp.swapaxes(jax_view(self.down_proj), 1, 2))
+            # A program of its own, attested token by token to a walk of the program's causality
+            # (`sequence_causality.TOKENWISE`): its dispatch sorts the tokens by expert, and each token's
+            # output reads its own input alone.
+            return torch_view(attested(self.tokenwise, TOKENWISE)(x, index, weights, kernels))
+
+        def tokenwise(self, x, index, weights, kernels):
+            """Each token's experts, weighted and summed, its slots routed or identity."""
+            identity = index >= self.routed
+            slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
+            if self.routed:
                 compute = expert_compute_dtype(x, *kernels, dtype=None)
 
                 def project(tokens, sizes, _ids, held):
@@ -648,8 +806,7 @@ def _functional_experts() -> type:
                                         num_experts=self.routed, dispatch="global", output_dtype=compute)
             held = jnp.where(identity[..., None], x[:, None, :], slots)
             wide = at_least_fp32(x.dtype)
-            out = jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1)
-            return torch_view(out.astype(x.dtype))
+            return jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1).astype(x.dtype)
 
     return FunctionalExperts
 
@@ -794,6 +951,10 @@ class TorchGraph:
     axes: tuple[tuple[str, LogicalAxes], ...] = ()
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
+    certified: dict[tuple, str | None] | None = None
+    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each program specialization it
+    has run, by the refusal its walk gave (None where causal); None for a probed source, whose causality
+    its probe decided (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -835,6 +996,7 @@ class TorchGraph:
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
+        self.certify(traced, arguments, train=train, max_segments=max_segments)
         outputs = jax.tree.unflatten(jax.tree.structure(shapes),
                                      _accumulating(traced, *jax.tree.leaves(arguments)))
         key = arguments[3]
@@ -847,8 +1009,27 @@ class TorchGraph:
             raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
         return outputs
 
-    def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
-               tokens: jax.typing.ArrayLike, key: jax.Array | None,
+    def certify(self, traced, arguments: tuple, *, train: bool, max_segments: int) -> None:
+        """For a source admitted per geometry (`certified`), prove the program about to run, `traced`
+        over `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
+        position no later token (`sequence_causality.causality_refusal`), once a specialization (its
+        arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
+        output position reads a later one."""
+        if self.certified is None:
+            return
+        leaves, structure = jax.tree.flatten(arguments)
+        signature = (structure, tuple((tuple(leaf.shape), str(leaf.dtype)) for leaf in leaves), train,
+                     max_segments)
+        if signature not in self.certified:
+            tokens = len(jax.tree.leaves(arguments[0])) + len(jax.tree.leaves(arguments[1]))
+            self.certified[signature] = causality_refusal(traced, tokens, int(arguments[2].shape[1]), (0, 1))
+        refusal = self.certified[signature]
+        if refusal is not None:
+            raise ValueError(f"tier 3 qualified this source without its probe, causal in each program its "
+                             f"own walk proves, and this one is not: {refusal}")
+
+    def traced(self, params: Mapping[str, Traceable], buffers: Mapping[str, Traceable], tokens: Traceable,
+               key: jax.Array | None,
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
@@ -1455,7 +1636,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
-                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes)
+                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
+                       certified={} if admission is not None and admission.per_geometry else None)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")

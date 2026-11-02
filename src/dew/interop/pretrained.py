@@ -1684,7 +1684,8 @@ def source_route(config: Mapping[str, object], *,
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
     or an unregistered model_type no registered family's convention computes and tier 3 does not run
-    (`torchax_fallback.admitted`; tier 3 reads float weights only).
+    (`torchax_fallback.admitted`; tier 3 reads float weights only), or whose shrunken probe cannot run
+    and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
@@ -1694,7 +1695,15 @@ def source_route(config: Mapping[str, object], *,
     decoder_parts.refuse_drafter(config)
     if (route := _native_route(config)) is not None:
         return route
-    match verified(config) if remote is None else verified(config, remote=remote, pinned=pinned):
+    try:
+        verdict = verified(config) if remote is None else verified(config, remote=remote, pinned=pinned)
+    except verify.ProbeUnavailable as unavailable:
+        # No shrunken model runs: tier 3 qualifies the source on its full config, no weights read.
+        from dew.interop import torchax_fallback
+
+        torchax_fallback.refuse_quantized(config)
+        return TorchRoute(torchax_fallback.qualified(config, unavailable))
+    match verdict:
         case verify.VerifiedMapping() as mapping:
             return VerifiedRoute(mapping)
         case verify.Unmapped() as unmapped:

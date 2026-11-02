@@ -63,6 +63,28 @@ def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_pat
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
 
 
+def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path):
+    """A MiMo-V2 model Dew holds (the fixture's: sinks on its sliding layers alone, over the full layers'
+    key heads) exports natively (`PretrainedDecoder.from_model`) as MiMo-V2 under its authors' config, with
+    its release's code named (`auto_map`) and its q, k and v stored apart, not as MiMo-V2-Flash, whose
+    sliding layers hold twice the key heads; the export loads back to the same variables, leaf for leaf
+    (ledger 2192)."""
+    import jax
+
+    from dew.interop import PretrainedDecoder, release_pins
+
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'export')
+    written = json.loads((tmp_path / 'export' / 'config.json').read_text())
+    assert (written['model_type'], written['architectures']) == ('mimo_v2', ['MiMoV2ForCausalLM'])
+    assert written['auto_map'] == release_pins.MIMO_V2[2]
+    assert written['attention_projection_layout'] == 'split'
+    assert not any('qkv_proj' in name for name in load_file(tmp_path / 'export' / 'model.safetensors'))
+    again = Pretrained.load(tmp_path / 'export', dtype='float32', attention_impl='reference')
+    assert again.model_config == loaded.model_config
+    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
+
+
 @pytest.mark.parametrize('stated', ['absent', 'null'])
 def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_path, stated):
     """The author's `sliding_window_size` sizes the sliding layers' window

@@ -94,8 +94,9 @@ RELEASES = {
     "dream-tiny": ("Dream-org/Dream-v0-Base-7B", "6572adb5535263e4d1a337b56942ba48b6dee2a9",
                    ("configuration_dream.py", "modeling_dream.py", "generation_utils.py"),
                    "AutoModel"),
-    "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
-                     ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
+    # The family's own pin (dew.interop.release_pins), as LFM3's.
+    "mimo-v2-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
+                     "AutoModelForCausalLM"),
     # The family's own pin (dew.interop.release_pins). modeling_lfm3.py imports its
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
     "lfm3-tiny": (*_PINNED["LFM3"][:2],
