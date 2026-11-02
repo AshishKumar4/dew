@@ -38,23 +38,25 @@ def compiled(trainer, batch=DEEP):
     return trainer.compile(state, batch)
 
 
-def room_for_full_recompute_only(monkeypatch, records) -> int:
+@pytest.fixture(scope="module")
+def room(tmp_path_factory) -> int:
     """Bytes free with room for the deep step under full recomputation, as compiled, and not under
-    none, as compiled or as derived, measured by runs that record their plans under `records`, apart
-    from the run the test makes."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    recomputed, base = deep(REMAT_POLICIES["full"]), deep()
-    full = needs(monkeypatch, recomputed, lambda: compiled(recomputed))
-    whole = needs(monkeypatch, base, lambda: compiled(base))
-    return (full + min(whole, LIMIT - base.plan["derived"][0]["headroom"])) // 2
+    none, as compiled or as derived, measured once for the module by runs that record their plans
+    apart from the runs its tests make."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("sizing")))
+        recomputed, base = deep(REMAT_POLICIES["full"]), deep()
+        full = needs(monkeypatch, recomputed, lambda: compiled(recomputed))
+        whole = needs(monkeypatch, base, lambda: compiled(base))
+        return (full + min(whole, LIMIT - base.plan["derived"][0]["headroom"])) // 2
 
 
-def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fits(monkeypatch, tmp_path):
+def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fits(
+        monkeypatch, tmp_path, room):
     """With room for the step under full recomputation and not under none, the search's first compile
     is at the least-recompute rung whose derived footprint fits, which the compile confirms: the step
     compiles once, where the climb from the base rung compiled every rung below. The plan records each
     rung the derivation read, refused below and fitting at its rung."""
-    room = room_for_full_recompute_only(monkeypatch, tmp_path / "sizing")
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, room)
     trainer = deep()
@@ -84,11 +86,10 @@ def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_
     assert trainer.plan["probes"][0]["remat"] is None
 
 
-def test_a_run_that_starts_from_a_recorded_plan_compiles_it_first(monkeypatch, tmp_path):
+def test_a_run_that_starts_from_a_recorded_plan_compiles_it_first(monkeypatch, tmp_path, room):
     """A restart whose plan an earlier run recorded (beside the compilation cache) compiles that plan
     first, with no derivation read, where its devices now hold room for full recomputation alone: the
     compile, not the derivation, decides whether it fits, and a miss climbs from there."""
-    room = room_for_full_recompute_only(monkeypatch, tmp_path / "sizing")
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, LIMIT)
     compiled(deep())
@@ -131,11 +132,11 @@ def test_a_run_set_to_full_recompute_with_room_for_every_rung_is_told_its_base_r
     assert_told_from_no_remat_up(deep(REMAT_POLICIES["full"]), "full", lighter=True)
 
 
-def test_a_run_set_to_the_least_rung_that_fits_is_told_every_rung_below_it_refused(monkeypatch, tmp_path):
+def test_a_run_set_to_the_least_rung_that_fits_is_told_every_rung_below_it_refused(
+        monkeypatch, tmp_path, room):
     """A run set to the least rung that fits, the rung a run that sets none compiles at with room for the
     step under full recomputation alone, reads every rung below it refused, and the derivation stops
     there."""
-    room = room_for_full_recompute_only(monkeypatch, tmp_path / "sizing")
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "unset"))
     free(monkeypatch, room)
     unset = deep()

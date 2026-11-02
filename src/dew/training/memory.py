@@ -32,6 +32,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+from dew.training.compiled_program import deviceless
 
 if TYPE_CHECKING:
     from dew.training.footprint import Footprint
@@ -182,6 +183,19 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
                                  mesh.devices.size)
+
+
+def deviceless_options(mesh: Mesh,
+                       options: jax.stages.CompilerOptions | None) -> jax.stages.CompilerOptions | None:
+    """`options` for a program compiled over `mesh`: on compile-only GPUs (`deviceless`) nothing runs to
+    autotune on, and XLA's config assigner already gives each matmul its default config there
+    (`dew.training.footprint.gemm_workspace`) while its autotuner still compiles the candidates it cannot
+    time, so the program skips them (`xla_gpu_autotune_level` 0), its memory the same (a frontier
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). Elsewhere `options` as given."""
+    device = mesh.devices.flat[0]
+    if device.platform != "gpu" or not deviceless(device) or xla_flag("xla_gpu_autotune_level") is not None:
+        return options
+    return {**(options or {}), "xla_gpu_autotune_level": 0}
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
