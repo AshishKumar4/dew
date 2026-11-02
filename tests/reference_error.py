@@ -1134,109 +1134,9 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
              one[5] and other[5]) for one, other in zip(first, later, strict=True)]
 
 
-@dataclasses.dataclass(frozen=True)
-class _Weighed:
-    """One truth's weighing for check 1's conditioning (`_Conditioning`): the `truth` on the host, the
-    reference program's rounding `scale` at its inputs (`rounding_scale`), each floating leaf's `unit`
-    roundoff, the reference's, applied to every arm alike, and the truth of zeros and unit sizes
-    (`zeros`, `ones`) every weighed arm is held to."""
-
-    truth: object
-    scale: object
-    units: list
-    zeros: object
-    ones: object
-
-    def weighed(self, tree, arm: str):
-        """`tree`, an arm's outputs, each floating element e at its truth t and scale c read as its residual
-        (e - t) / (u c), u the reference's unit roundoff for the leaf, against a truth of zeros: its error
-        in units of the rounding the reference's program does there, every row of unit size (`ones`, the
-        terms `_prepared` sizes rows by). Each leaf's shape is checked before any arithmetic. An element
-        no rounding reaches (c = 0) is exact in the reference's program, and an arm not exact there fails,
-        by name, as does an element whose scale is not finite, which no error can be read against."""
-        structure = jax.tree.structure(self.truth)
-        paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(self.truth)]
-        leaves = structure.flatten_up_to(jax.device_get(tree))
-        for path, leaf, true in zip(paths, leaves, jax.tree.leaves(self.truth), strict=True):
-            if np.shape(leaf) != np.shape(true):
-                raise AssertionError(f"{arm}, {path}: its shape is {np.shape(leaf)}, the truth's "
-                                     f"{np.shape(true)}")
-        weighed = []
-        for path, leaf, true, scale, unit in zip(paths, leaves, jax.tree.leaves(self.truth),
-                                                 _scales(self.scale), self.units, strict=True):
-            if unit is None:
-                weighed.append(leaf)
-                continue
-            value, true, scale = (np.asarray(part, np.float64) for part in (leaf, true, scale))
-            unweighable = ~np.isfinite(scale)
-            if unweighable.any():
-                at = tuple(int(index) for index in np.argwhere(unweighable)[0])
-                raise AssertionError(f"{arm}, {path}{list(at)}: the reference's rounding scale is "
-                                     f"{scale[at]!r} there, which no error can be weighed against")
-            exact = scale == 0
-            wrong = exact & ~(value == true)
-            if wrong.any():
-                at = tuple(int(index) for index in np.argwhere(wrong)[0])
-                raise AssertionError(f"{arm}, {path}{list(at)}: no rounding of the reference's program "
-                                     f"reaches it (its rounding scale is zero), and the arm is not exact: "
-                                     f"{value[at]!r} against {true[at]!r}")
-            weighed.append(np.where(exact, 0.0, (value - true) / (unit * np.where(exact, 1.0, scale))))
-        return structure.unflatten(weighed), self.zeros
-
-
-def _scales(scale) -> list:
-    """A rounding scale's leaves, a non-floating output's None among them (`rounding_scale`)."""
-    return jax.tree.leaves(scale, is_leaf=lambda leaf: leaf is None)
-
-
-def _float_leaf(leaf) -> bool:
-    """Whether `leaf` holds floats, bfloat16's among them, as JAX's dtypes read it."""
-    return jnp.issubdtype(jnp.result_type(leaf), jnp.floating)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Conditioning:
-    """Check 1's conditioning (`assert_as_exact`'s `conditioning`): the reference's `program`, whose
-    rounding scale at a draw's inputs (`rounding_scale`) weighs every arm's error there (`_Weighed`)."""
-
-    program: Callable
-
-    def at(self, cases) -> dict[int, _Weighed]:
-        """Each truth's weighing by its id, from `cases` of (truth, its inputs, its seed), a truth held
-        twice weighed once."""
-        weighed: dict[int, _Weighed] = {}
-        for truth, inputs, seed in cases:
-            if id(truth) not in weighed:
-                weighed[id(truth)] = self.of(truth, inputs, seed)
-        return weighed
-
-    def of(self, truth, inputs, seed) -> _Weighed:
-        """The weighing of `truth`, the truth of `inputs`, at the draw `seed`: a window loop's program
-        (`over_windows`) weighed window by window, as it runs, its scales stacked; each floating leaf's
-        unit roundoff the reference's output's (`jnp.finfo`, bfloat16's among them)."""
-        from rounding_bound import rounding_scale
-
-        truth = jax.device_get(truth)
-        if isinstance(self.program, _Windowed):
-            windows = [jax.tree.map(lambda leaf, at=index: leaf[at], inputs)
-                       for index in range(_window_count(inputs))]
-            scales = [rounding_scale(self.program.fn, *window, seed=seed)[1] for window in windows]
-            scale = jax.tree.map(lambda *each: None if each[0] is None else np.stack(each), *scales,
-                                 is_leaf=lambda leaf: leaf is None)
-            shapes = jax.eval_shape(self.program.fn, *windows[0])
-        else:
-            _, scale = rounding_scale(self.program, *inputs, seed=seed)
-            shapes = jax.eval_shape(self.program, *inputs)
-        units = [float(jnp.finfo(shape.dtype).eps) / 2 if jnp.issubdtype(shape.dtype, jnp.floating)
-                 else None for shape in jax.tree.leaves(shapes)]
-        zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if _float_leaf(leaf) else leaf, truth)
-        ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if _float_leaf(leaf) else None, truth)
-        return _Weighed(truth, scale, units, zeros, ones)
-
-
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
-           label: str = "", examples: bool = False, conditioning=None):
+           label: str = "", examples: bool = False):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1252,9 +1152,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     `terms_fn`, the truth is that program's evaluated op by op with each output's terms (`float64_terms`),
     every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
     terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
-    widened inputs. With `conditioning` (`_Conditioning`), every arm's leaves are read in units of the
-    reference program's rounding scale at the inputs its truth is of, against a truth of ones
-    (`_Conditioning.weighed`)."""
+    widened inputs."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1297,10 +1195,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         else:
             their_inputs = draw(reference_seeds[at])
             their_truth, their_terms = truth_and_terms(their_inputs)
-        # Each arm in units of the reference's rounding at its truth's inputs, the truth ones.
-        weighed = None if conditioning is None else conditioning.at(
-            ((truth, inputs, seed), (their_truth, their_inputs, seed if reference_seeds is None
-                                     else reference_seeds[at])))
         if orders is None:
             ordered = [(inputs, their_inputs)]
         else:
@@ -1321,8 +1215,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
             # Dew's side read once for every reference (`_prepared`).
-            prepared = _prepared(dew, truth, terms) if weighed is None else _prepared(
-                *weighed[id(truth)].weighed(dew, "Dew's arm"), weighed[id(truth)].ones)
+            prepared = _prepared(dew, truth, terms)
             for at_arm, arm in enumerate(arms):
                 # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
                 # sizing); the library arm runs on Dew's own inputs.
@@ -1332,18 +1225,15 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
                     if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
                         _of_its_inputs(label, "the reference", arm, here, other)
-                shared = true_here is truth
-                if weighed is not None:
-                    terms_here = weighed[id(true_here)].ones
-                    other, true_here = weighed[id(true_here)].weighed(other, f"reference {at_arm}")
                 if examples and mine_at is ordered[0][0]:
                     # The draw's own order's examples, paired where both arms hold the one truth.
                     held_here = jax.device_get(other)
                     stacked[at_arm], stacked_rows[at_arm] = (
                         (_example_ratios(prepared.leaves, held_here, prepared.truths),
                          _example_worst_rows(prepared.leaves, held_here, prepared.truths))
-                        if shared else ([None] * len(prepared.leaves),) * 2)
-                evidence = _evidence(prepared, other, true_here, shared=shared, their_terms=terms_here)
+                        if true_here is truth else ([None] * len(prepared.leaves),) * 2)
+                evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
+                                     their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else _over_orders(rows[at_arm], evidence)
         return rows
 
@@ -1785,8 +1675,7 @@ def _pooled_draws(label: str, references: int, arms):
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
-                    terms: bool | Callable | None = None, examples: bool = False,
-                    conditioning: bool = False) -> None:
+                    terms: bool | Callable | None = None, examples: bool = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1863,46 +1752,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     cancellation (tests/attention_oracle.py's `attention_terms`), every arm sized by it alike; the truth
     is as without, so it may run as given.
 
-    `conditioning` adds a second check where the first stays undecided (ledger 1714). The site is judged
-    first as without it, its terms sizing and seeds and stages whole: a decided failure fails it and a
-    decided pass passes it. Only where it is still Inconclusive after its last stage is it judged again,
-    each element's error weighed by the reference program's own rounding there: each arm's element e read
-    as its residual (e - t) / (u c), t its truth, u the reference's unit roundoff for the leaf (every arm
-    the same u) and c the reference program's rounding scale at the draw's inputs (`rounding_scale`,
-    tests/rounding_bound.py: the root mean square of the element's rounding error where every rounding
-    of the program moves its value by a normal multiple of its bound), against a truth of zeros, every
-    row of unit size, each grouped as its leaf groups it; that check must decide a pass. An element no
-    rounding reaches (c = 0) must be exact in every arm. Where a computation amplifies its rounding
-    unevenly (an inner step past its stable rate, where one row's rounding grows 10^4-fold), the
-    unweighted pool is the amplified rows' and its interval stays wide; weighed, a fault on the
-    well-conditioned rest shows. Each verdict is logged under the check that decided it, the weighed
-    one's label ending ", conditioned" (STAGES_LOG). Check 2, each element within its certified bound,
-    is never weighed.
-
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
-    if conditioning:
-        try:
-            assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                            library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
-                            also=also, terms=terms, examples=examples)
-        except Inconclusive:
-            # Undecided after its last stage: the weighed check decides, logged as its own.
-            _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=seeds, truth_fn=truth_fn,
-                         orders=orders, library_fn=library_fn, library_row=library_row,
-                         library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                         weighing=_Conditioning(reference_fn))
-        return
-    _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                 library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None)
-
-
-def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
-                 library_row, library_leaves, also, terms, examples: bool, weighing) -> None:
-    """`assert_as_exact`'s judgment of one site under `label`, its arms' errors weighed by `weighing`
-    (`_Conditioning`) where given."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     truth_program = _truth_program(truth_fn)
@@ -1924,7 +1776,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
-                               terms_fn=terms_fn, label=label, examples=examples, conditioning=weighing)
+                               terms_fn=terms_fn, label=label, examples=examples)
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -2061,8 +1913,7 @@ def recorded_pilots(reference_fn, draw, count: int):
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
-              truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
-              conditioning: bool = False) -> int:
+              truth_fn=None, dew_fn=None, orders=None, examples: bool = False) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -2101,8 +1952,6 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         most = min(most, len(pilots) // 2)
     paired = dew_fn is not None
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
-    # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed.
-    weighing = _Conditioning(reference_fn) if conditioning else None
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)
@@ -2115,8 +1964,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         held = 0 if drawn is None else len(drawn.theirs)
         block = 2 * count if dew_fn is None else count
         fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
-                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                       conditioning=weighing)
+                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None)
         drawn = fresh if drawn is None else drawn.joined(fresh)
         wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
@@ -2204,8 +2052,7 @@ def recording(path) -> dict[str, np.ndarray]:
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
               paired: bool = False, library_fn=None,
-              library_leaves: Sequence[str] = (), conditioning: bool = False
-              ) -> list[tuple[str, int, list[str]]]:
+              library_leaves: Sequence[str] = ()) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -2222,8 +2069,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     arms compile themselves where they are programs, and a fault injects itself on the host.
     `library_fn` judges each run against the larger of the reference's error and that library arm's
     on `library_leaves`, as `assert_as_exact` does (paired runs: the library arm is measured on Dew's
-    own draws). `conditioning` judges every run as a weighed site is (`assert_as_exact`): unweighted
-    first, and weighed where that stays undecided, the verdict then ", conditioned"'s."""
+    own draws)."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -2231,21 +2077,14 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     for run in range(first, first + runs):
         base = run * 2 * span
 
-        def judged(weighing, base=base):
-            def drawn(start, stop):
-                return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
-                              truth_fn, orders=orders,
-                              reference_seeds=None if paired else range(base + span + start,
-                                                                        base + span + stop),
-                              library_fn=library_fn, library_leaves=library_leaves, conditioning=weighing)
-            return _staged(drawn, seeds, label, two_stage=two_stage)
+        def drawn(start, stop, base=base):
+            return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
+                          truth_fn, orders=orders,
+                          reference_seeds=None if paired else range(base + span + start, base + span + stop),
+                          library_fn=library_fn, library_leaves=library_leaves)
 
-        over, unresolved, stage = judged(None)
-        verdict = _verdict(over, unresolved)
-        if conditioning and verdict == "inconclusive":
-            over, unresolved, stage = judged(_Conditioning(reference_fn))
-            verdict = f"{_verdict(over, unresolved)}, conditioned"
-        verdicts.append((verdict, stage, [str(finding) for finding in over + unresolved]))
+        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
+        verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))
     return verdicts
 
 

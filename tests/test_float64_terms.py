@@ -102,24 +102,6 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
     assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
 
 
-def test_a_sum_its_platform_picks_carries_the_terms_of_the_branch_it_runs():
-    """A sum whose form its platform picks (`jax.lax.platform_dependent`, as Dew's bias spread is) sums
-    the terms of the branch the evaluation's platform runs, inside a remat as at the top: here the CPU's
-    product, whose terms are its own, not the other platform's broadcast, which sums none."""
-    rng = np.random.default_rng(5)
-    x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
-
-    def picked(x, weight):
-        return jax.lax.platform_dependent(x, weight, cpu=lambda x, weight: x @ weight,
-                                          default=lambda x, weight: x[:, :3] * weight[0])
-
-    with jax.enable_x64(new_val=True):
-        for program in (picked, jax.checkpoint(picked)):
-            value, terms = float64_terms(program, x, weight)
-            np.testing.assert_allclose(value, x @ weight, rtol=1e-12)
-            np.testing.assert_allclose(terms, np.sqrt(np.square(x) @ np.square(weight)), rtol=1e-12)
-
-
 def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
     """An expert layer's grouped matmul (`jax.lax.ragged_dot`) and its kernel's gradient sum their
     rows' products within each group: their terms are each group's dense dot's, not their own
