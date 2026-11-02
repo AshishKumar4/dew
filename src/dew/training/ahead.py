@@ -280,7 +280,6 @@ class AheadOfTime:
         if len(found) != self.devices:
             raise ValueError(f"this step was compiled for {self.devices} {self.generation} devices; this "
                              f"process has {len(found)}")
-        self.built.held(found)
         return Executable(self.executable, self.trees).loaded(found)
 
 
@@ -418,7 +417,6 @@ class AheadPrograms:
         differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
         for; each is admitted as a compiled program is (`dew.communicators.admit`)."""
         devices = jax.devices()[:self.target.devices]
-        self.target.held(devices)
         return {name: program.loaded(devices) for name, program in self.programs.items()}
 
 
