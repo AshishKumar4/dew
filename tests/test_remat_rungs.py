@@ -222,9 +222,10 @@ def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
     variables = _zeros_drawn(variables)
     top, record, twin, wide = _against_its_twin(model, variables)
     if judged(model) is not model:
-        # The release's setting, whose gradient no float64 truth judges, steps finitely.
-        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(_stepped(top, variables, inputs,
-                                                                                **apply)))
+        # The release's setting, whose gradient no float64 truth judges, steps finitely: one compiled step,
+        # where run op by op it took 16 s of DeepSeek V4's 87 on armada.
+        stepped = jax.jit(lambda *drawn: _stepped(top, variables, drawn, **apply))(*inputs)
+        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(stepped))
     assert_as_exact(lambda *drawn: _stepped(judged(top), variables, drawn, **apply),
                     lambda *drawn: _stepped(judged(model), variables, drawn, **apply),
                     lambda seed: _redrawn(inputs, seed), f"gradient at {record}", seeds=GRADIENT_SEEDS[name],
