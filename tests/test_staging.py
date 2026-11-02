@@ -2,7 +2,8 @@
 
 The CPU backend exposes `pinned_host` beside `device`, so a staged commit runs here as written and is held to
 the whole one bit for bit; what it saves of a device is a GPU's measurement, which one backend's single
-memory cannot show (tests/test_host_placement.py)."""
+memory cannot show (tests/test_host_placement.py): the GPU flow's cell
+(`a_staged_commit_holds_two_layers_of_host_resident_moments_at_once`, tests/test_gpu_training.py)."""
 
 import jax
 import jax.numpy as jnp
@@ -121,3 +122,35 @@ def test_a_staged_weakly_typed_scalar_scales_as_it_does_unstaged():
     assert [leaf.dtype for leaf in jax.tree.leaves(found)] == [jnp.bfloat16] * len(SHAPES)
     assert all(np.array_equal(left, right) for left, right in zip(jax.tree.leaves(expected),
                                                                   jax.tree.leaves(found), strict=True))
+
+
+def a_staged_commit_holds_two_layers_of_host_resident_moments_at_once():
+    """On a GPU, whose pinned host memory is apart from its own: AdamW's commit over eight layers' moments in
+    pinned host memory, staged a layer at a time, compiles to temporaries of at most two layers' moments,
+    where the commit that fetched them whole behind the gradient (before row 3526) compiles to more."""
+    device = jax.devices()[0]
+    host, on_device = (SingleDeviceSharding(device, memory_kind=kind) for kind in ("pinned_host", "device"))
+    params = {f"layer{index}": jnp.ones((512, 512), jnp.float32) for index in range(8)}
+    optimizer = optax.adamw(1e-3)
+    state = jax.device_put(optimizer.init(params), host)
+    shardings = jax.tree.map(lambda _: host, state)
+
+    def commit(state, gradients, params):
+        updates, new = optimizer.update(gradients, state, params)
+        return new, optax.apply_updates(params, updates)
+
+    def whole(resting, gradients, params):
+        _, kept = jax.lax.optimization_barrier((gradients, resting))
+        new, moved = commit(jax.device_put(kept, on_device), gradients, params)
+        return jax.device_put(new, shardings), moved
+
+    def chunked(resting, gradients, params):
+        return staged(commit, resting, shardings, (gradients, params), gradients)
+
+    def temporaries(fn) -> int:
+        memory = jax.jit(fn).lower(state, params, params).compile().memory_analysis()
+        assert memory is not None
+        return memory.temp_size_in_bytes
+
+    layer = 2 * 512 * 512 * 4
+    assert temporaries(chunked) <= 2 * layer < temporaries(whole)
