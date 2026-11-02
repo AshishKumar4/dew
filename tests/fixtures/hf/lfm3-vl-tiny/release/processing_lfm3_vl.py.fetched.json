@@ -5,6 +5,6 @@
  "path": "releases/d770011e71c8b8e94ea9436d4f6768b42db60c5db70145d47f326f5d76f633f6/processing_lfm3_vl.py",
  "reference": "LiquidAI/LFM3-VL-2B@f83d2b0a2296aaa277f394990a9b8b949ddf9691/processing_lfm3_vl.py",
  "repo": "dewml/fixtures",
- "revision": null,
+ "revision": "697772fa0ed95cb6210c765ea161d4fcc4cb2b21",
  "sha256": "d770011e71c8b8e94ea9436d4f6768b42db60c5db70145d47f326f5d76f633f6"
 }
