@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
@@ -29,7 +30,7 @@ from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
-from dew.nn.protocols import Recomputing, TritonGemm
+from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import deviceless
@@ -619,11 +620,28 @@ def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
     """Move each module the objective trains one rung up its own remat ladder
     where it goes on (`Recomputing.recompute_more`), and return whether any
     moved."""
+    return moved(objective, lambda module: module.recompute_more() if isinstance(module, Recomputing)
+                 else None)
+
+
+def remat_offloaded[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+    """Move each module the objective trains at the top of its ladder to its sibling that offloads the
+    residuals it would recompute (`OffloadsResiduals.recompute_offloaded`), and return whether any
+    moved."""
+    return moved(objective, lambda module: module.recompute_offloaded()
+                 if isinstance(module, OffloadsResiduals) else None)
+
+
+def moved[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+          step: Callable[[nn.Module], nn.Module | None]) -> bool:
+    """Put each module the objective trains where `step` takes it (None leaves it), and return whether
+    `step` took any."""
     entries = objective.program_key()
-    stronger = [entry.module.recompute_more() if entry.trained and isinstance(entry.module, Recomputing)
-                else None for entry in entries]
-    if all(module is None for module in stronger):
+    stepped = [step(entry.module) if entry.trained else None for entry in entries]
+    if all(module is None for module in stepped):
         return False
     objective.substitute([entry.module if module is None else module
-                          for module, entry in zip(stronger, entries, strict=True)])
+                          for module, entry in zip(stepped, entries, strict=True)])
     return True
+
+

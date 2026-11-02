@@ -767,6 +767,16 @@ class Recomputing(Protocol):
     def restore_recompute(self, record: JSON) -> Self: ...
 
 
+@runtime_checkable
+class OffloadsResiduals(Protocol):
+    """A model at the top of its remat ladder with a sibling that keeps the residuals a lighter rung saves
+    in pinned host memory in place of recomputing them (`recompute_offloaded`), else None: no fit rung, as
+    it keeps as many device bytes as the top, but another speed, which only the GPUs' timing chooses
+    (`dew.training.ahead.compile_ahead`'s frontier)."""
+
+    def recompute_offloaded(self) -> Self | None: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectionGroup:
     """Projections under `path` in `params` that read one input: `members`,

@@ -53,6 +53,7 @@ from dew.training.memory import (
     recompute_record,
     remat_half,
     remat_more,
+    remat_offloaded,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -632,11 +633,13 @@ class FitSearch[LossT, EffectsT]:
         offline (`dew.training.ahead.compile_ahead`'s frontier). A rung at as many microbatches as one below
         it recomputes more for none fewer, which no speed favours, so it is not compiled; a remat rung takes
         the run's own head again (`recompute_more`), so a rung may fit at fewer than the one before it, and
-        the search reads the ladder to its end, or until a rung fits at the fewest. The objective is left
-        at the last rung read, the run's to restore."""
+        the search reads the ladder to its end, or until a rung fits at the fewest. Where the plan or the
+        last rung found is the ladder's top, its sibling that offloads the residuals it would recompute
+        (`remat_offloaded`) is compiled at its split too: as many device bytes, another speed (row 1932).
+        The objective is left at the last rung read, the run's to restore."""
         # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
         self.resumed = None
-        fewer, found = list(candidates[:candidates.index(split)]), []
+        fewer, found, plan = list(candidates[:candidates.index(split)]), [], self.current()
         while fewer and self.onward(lambda: recompute_more(self.objective, self.base)):
             asked = len(self.probes)
             fewest = planned(fewer, 0, self.fits_here, lambda: False,
@@ -645,6 +648,10 @@ class FitSearch[LossT, EffectsT]:
                 found.append(next(probe for probe in self.probes[asked:]
                                   if probe.fits and probe.split == fewest))
                 fewer = fewer[:fewer.index(fewest)]
+        last = found[-1].split if found and found[-1].rung == self.current() else (
+            split if not found and self.current() == plan else None)
+        if last is not None and remat_offloaded(self.objective) and self.fits_here(last):
+            found.append(self.probes[-1])
         return tuple(found)
 
     def derived_start(self, split: int) -> None:

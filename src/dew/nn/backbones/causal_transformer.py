@@ -116,6 +116,7 @@ from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
+    REMAT_POLICIES,
     BlockWiring,
     DecoderBlock,
     Mixture,
@@ -2330,6 +2331,15 @@ class CausalTransformer(LinearProducts):
         if kept(DECODER_REMAT[index]) == kept(self.remat):
             return None
         return self.clone(remat=DECODER_REMAT[index])
+
+    @nn.nowrap
+    def recompute_offloaded(self) -> Self | None:
+        """At the ladder's top ('full'), the decoder that keeps what 'minimal' saves in pinned host memory
+        ('minimal_offloaded'): as many device bytes as 'full' (tests/test_remat_rungs.py's `_saved`), the
+        recompute of 'minimal' and its residuals over the host link (row 1932); else None."""
+        if self.remat != DECODER_REMAT[-1]:
+            return None
+        return self.clone(remat=REMAT_POLICIES['minimal_offloaded'])
 
     @nn.nowrap
     def recompute_half(self) -> Self | None:

@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A step compiled ahead with its frontier (`--trainer.compile-ahead.frontier`) lists, where the plan or the
+  frontier reaches the remat ladder's top ('full'), its sibling that keeps what 'minimal' saves in pinned host
+  memory ('minimal_offloaded') at the same split. It holds as many device bytes as 'full', so the planner
+  never climbs to it; it trades recompute for host transfers, which only the GPUs' timing can choose. On an
+  H100, an 8-layer Qwen3.5-4B step at 2 x 2048 tokens ran 101.6 ms under 'full' and 113.6 ms offloaded.
 - API change: a model's `init` returns each parameter whose logical axes its module names in Flax's
   partitioning box (`nn.LogicallyPartitioned`), declared where the module draws it
   (`nn.with_logical_partitioning`, `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), as Flax's
