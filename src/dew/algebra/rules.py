@@ -339,6 +339,8 @@ def _linear() -> Ruleset:
             eq(lift).to(lifted(product_extent, i64(lift_axis))),
             *contracted, *facts, *dominated(power, "new")).then(
             union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
+            # The lifted broadcast lays the scale over the product's extent: its shape, so it is priced.
+            set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
             *made(product, power)))
     return ruleset(*sets, name="linear")
 
