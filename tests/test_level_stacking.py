@@ -14,6 +14,7 @@ from dew.batch import Coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import StackView, stack_layers
 from dew.nn.continuum import feedforward_levels
+from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.adaptation import ChunkAdaptation
 from dew.objectives.lm.stacking import stacked_scores
@@ -28,6 +29,12 @@ norm's gradient, one sum over every token the draw holds, has 16 elements a draw
 TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
 SCANNED = STACKED.clone(scan_layers=True)
 """`STACKED` scanning its run of layers, which stores them as its own layers, one subtree a layer."""
+BLOCKED = STACKED.clone(layer_types=("full_attention",) * 2,
+                        kinds={"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}})
+"""`STACKED` whose attention reads a row's blocks whole (`AttentionMixer.bidirectional_blocks`), as a prefix
+run's decoder does, and its float64 truth and scanned form."""
+BLOCKED_TRUTH = BLOCKED.clone(dtype=jnp.float64, attention_impl="reference")
+BLOCKED_SCANNED = BLOCKED.clone(scan_layers=True)
 """The decoder in float64 on the reference kernel: the loops' truth."""
 
 STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 512,
@@ -37,10 +44,10 @@ paired by `seeds_for` on armada (job 20261102200705-e3d60ec1), drawn by CI's map
 (`check1_shards`)."""
 
 
-def draw(seed: int, scale: float = 0.25):
-    """A seed's variables at `scale` N(0, 1) and `[ROWS, LENGTH + 1]` tokens."""
+def draw(seed: int, scale: float = 0.25, model=STACKED):
+    """A seed's variables of `model` at `scale` N(0, 1) and `[ROWS, LENGTH + 1]` tokens."""
     rng = np.random.default_rng(seed)
-    shapes = jax.eval_shape(lambda: STACKED.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
     variables = jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32),
                              shapes)
     return variables, rng.integers(0, VOCAB, (ROWS, LENGTH + 1)).astype(np.int32)
@@ -143,7 +150,7 @@ def banked(variables):
 def blocked_draw(seed: int):
     """A draw (`draw`) and each row's blocks: a prefix of the row a block (none, within the first chunk,
     across one bound or several), and a later run a block of its own, across a bound or within a chunk."""
-    variables, tokens = draw(seed)
+    variables, tokens = draw(seed, model=BLOCKED)
     rng = np.random.default_rng([seed, 0xB10C])
     blocks = np.full((ROWS, LENGTH), -1, np.int32)
     for at, prefix in enumerate((0, 2, 5, 10)[:ROWS]):
@@ -308,12 +315,13 @@ def test_a_rows_blocks_at_rate_zero_score_as_its_forward_reads_them():
         return jax.jit(lambda variables, tokens, blocks: token_losses(
             model.apply(variables, tokens[:, :-1], block_groups=blocks), tokens[:, 1:], truth=truth))
 
-    assert_as_exact(jax.jit(stacked(adaptation)), plain(STACKED, truth=False), blocked_draw,
+    assert_as_exact(jax.jit(stacked(adaptation, BLOCKED)), plain(BLOCKED, truth=False), blocked_draw,
                     "the stacked pass over blocks at rate zero", seeds=STACKING_SEEDS["zero"],
-                    truth_fn=plain(TRUTH, truth=True))
+                    truth_fn=plain(BLOCKED_TRUTH, truth=True))
 
 
-@pytest.mark.parametrize(("model", "store"), [(STACKED, None), (SCANNED, banked)], ids=["layers", "banked"])
+@pytest.mark.parametrize(("model", "store"), [(BLOCKED, None), (BLOCKED_SCANNED, banked)],
+                         ids=["layers", "banked"])
 def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(model, store):
     """A decoder's blocks step in context over rows whose attention reads blocks whole, each target's loss on
     par with the literal chunk loop's (`chunk_loop`, check 1), whose chunk holds a block's every token from
@@ -325,9 +333,9 @@ def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(model, store):
         return jax.jit(lambda variables, tokens, blocks: chunk_loop(reference, variables, tokens, adaptation,
                                                                     truth=truth, blocks=blocks))
 
-    assert_as_exact(jax.jit(stacked(adaptation, model, store)), literal(STACKED, truth=False), blocked_draw,
+    assert_as_exact(jax.jit(stacked(adaptation, model, store)), literal(BLOCKED, truth=False), blocked_draw,
                     "stacked blocks over a row's blocks", seeds=STACKING_SEEDS["blocks"],
-                    truth_fn=literal(TRUTH, truth=True))
+                    truth_fn=literal(BLOCKED_TRUTH, truth=True))
 
 
 def test_a_prefix_run_steps_its_blocks_in_context():
@@ -337,8 +345,8 @@ def test_a_prefix_run_steps_its_blocks_in_context():
     from dew.objectives.base import Step
 
     stepping = ChunkAdaptation(window=3, rate=0.0, layers=(0, 1))
-    objective = LMObjective(STACKED, LENGTH, prefix=5, adaptation=stepping)
-    plain = LMObjective(STACKED, LENGTH, prefix=5)
+    objective = LMObjective(BLOCKED, LENGTH, prefix=5, adaptation=stepping)
+    plain = LMObjective(BLOCKED, LENGTH, prefix=5)
 
     def scored(scorer):
         def losses(variables, tokens):
@@ -349,12 +357,13 @@ def test_a_prefix_run_steps_its_blocks_in_context():
 
     def truth(variables, tokens):
         blocks = jnp.where(jnp.arange(LENGTH) < 5, 1, -1)[None].repeat(ROWS, axis=0)
-        logits = TRUTH.apply(variables, tokens[:, :-1], block_groups=blocks)
+        logits = BLOCKED_TRUTH.apply(variables, tokens[:, :-1], block_groups=blocks)
         return token_losses(logits, tokens[:, 1:], truth=True) * (jnp.arange(1, LENGTH + 1) >= 5)
 
-    assert_as_exact(scored(objective), scored(plain), draw, "a prefix run's stacked pass at rate zero",
+    assert_as_exact(scored(objective), scored(plain), lambda seed: draw(seed, model=BLOCKED),
+                    "a prefix run's stacked pass at rate zero",
                     seeds=STACKING_SEEDS["zero"], truth_fn=jax.jit(truth))
-    trained = LMObjective(STACKED, LENGTH, prefix=5, adaptation=ChunkAdaptation(window=(3, 6), rate=0.05,
+    trained = LMObjective(BLOCKED, LENGTH, prefix=5, adaptation=ChunkAdaptation(window=(3, 6), rate=0.05,
                                                                                layers=(0, 1)))
     variables = trained.init(jax.random.key(0))
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)), jnp.int32)
