@@ -774,8 +774,8 @@ RECORD_TRIES = 4
 
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order, but its check-1 sites',
-    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's place
-    (`session.units`), as a cut takes them."""
+    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's
+    place (`session.units`), as a cut takes them."""
     nodes: dict[str, list[str]] = {}
     held: dict[str, dict[str, Mark]] = {}
     record = durations_record()
