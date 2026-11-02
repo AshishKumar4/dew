@@ -86,6 +86,12 @@ def terms_of(keep, heads: int, *, kind: template.Kind | None = None, softcap: fl
     return terms
 
 
+def _form(case: dict[str, str]) -> tuple[bool | None, bool]:
+    """`case`'s form, `(natural, accurate)`: the accurate form's natural logits and accurate sums
+    (docs/design/testing.md), or the fast form's default fold (None) and fast sums."""
+    return (True, True) if case["form"] == "accurate" else (None, False)
+
+
 def _backward_op(case: dict[str, str]):
     """`case`'s Mosaic backward op, its bound arguments and the device it is read for, under the case's
     generation (`attention_mosaic._backward_call`)."""
@@ -94,10 +100,11 @@ def _backward_op(case: dict[str, str]):
     key = jnp.zeros((1, LENGTH, kv_heads, width), dtype)
     params = tuple(jnp.zeros(_param_shape(BIAS[case["hook"]], heads), jnp.float32) for _ in range(2)
                    ) if case["hook"] in BIAS else ()
+    natural, accurate = _form(case)
+    natural = attention_mosaic.NATURAL if natural is None else natural
     op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query,
-                                               _residuals(query.shape), scale=None,
-                                               natural=attention_mosaic.NATURAL,
-                                               accurate=case["form"] == "accurate")
+                                               _residuals(query.shape), scale=None, natural=natural,
+                                               accurate=accurate)
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
@@ -149,14 +156,14 @@ def supported(case: dict[str, str]) -> bool:
 def _step(case: dict[str, str], spans, *, reference: bool):
     """`case`'s training step: the output, and the gradients of `sum(out * dout)` of its query, key, value
     and hook parameters, through the route (its launch form pinned) or the reference path."""
-    accurate = case["form"] == "accurate"
+    natural, accurate = _form(case)
 
     def step(query, key, value, dout, *params):
         def attended(query, key, value, *params):
             hooks = _hooks(case, params)
             if reference:
                 return template.reference(query, key, value, spans, hooks)
-            return attention_route.attend(query, key, value, spans, hooks, accurate=accurate)
+            return attention_route.attend(query, key, value, spans, hooks, natural=natural, accurate=accurate)
 
         out, pull = jax.vjp(attended, query, key, value, *params)
         return (out, *pull(dout.astype(out.dtype)))
@@ -208,7 +215,9 @@ CASES = (
 
 
 @cell("attention", covers=lambda case: dict(zip(AXES["attention"], case, strict=True)))
-@pytest.mark.parametrize("case", CASES, ids="-".join)
+@pytest.mark.parametrize("case", [pytest.param(case, marks=pytest.mark.skipif(
+    generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
+    for case in CASES], ids="-".join)
 def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The route's training step of `case` on its GPU on par with the reference path's (check 1), its launch
     form pinned (`pin_of`)."""
