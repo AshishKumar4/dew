@@ -33,6 +33,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra import derive
+from dew.algebra.forms import Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
@@ -48,6 +50,7 @@ from dew.nn.precision import (
     added_to,
     compensated_sum,
     compensates_loops,
+    float32_einsum,
     running_sum,
     running_total,
     two_product,
@@ -76,9 +79,13 @@ class Forward:
     rewalk, `unfolded`), the call's query count `queries` where a mainloop walks query rows past it
     without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
     tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does),
-    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), and the
+    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), the
     power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
-    is the call's scale over."""
+    is the call's scale over, the keys a launch's walk reaches where past the call's though they are
+    whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
+    it; None where none does), and whether the launch lowers its exponentials to the hardware's
+    approximations (`approximate`, `attention_mosaic_program.approximate`; false where a hook's tanh makes it
+    lower every transcendental exactly)."""
 
     form: str
     keys: int
@@ -92,6 +99,8 @@ class Forward:
     queries: int | None = None
     compensated: bool = False
     prescale: float = 1.0
+    walked_keys: int | None = None
+    approximate: bool = True
 
     @property
     def raw(self) -> bool:
@@ -142,9 +151,14 @@ class Forward:
         difference or of the scaled logits', as exact as the reference's `jnp.exp` on every backend, whose
         state (a resumed partial, a sink) may be any size: a Mosaic launch of approximate math lowers
         `jnp.exp` to the hardware's base-2 exponential of `x * log2(e)` rounded, about `|x|` ulps off for a
-        state carried far, where `natural_exp` keeps that product's residual."""
+        state carried far, where `natural_exp` keeps that product's residual. A launch that lowers its
+        exponentials exactly (`approximate` false) takes the fast form's `jnp.exp` as it is: its
+        range reduction would repeat the lowering's own (the softcap's forward, 68 of its conversions to
+        integers and back a tile)."""
         if self.base2:
             return jnp.exp2(x)
+        if not self.natural and not self.approximate:
+            return jnp.exp(x)
         return natural_exp(x, self.scale) if self.raw else natural_exp(x)
 
     def naturalized(self, m: jax.Array) -> jax.Array:
@@ -214,6 +228,12 @@ class Coords(NamedTuple):
     drop: Draw | None = None
     keys_first: bool = False
     tile_keys: int | None = None
+    key_start: jax.Array | None = None
+    """Where given, `k_pos` as `key_start + key_offsets`: a start each thread holds across a row (its first
+    key and the key bits its lane decides) and offsets its registers decide, constants the compiler folds
+    into each compare, so a row's bound takes the start once (`seen`; FA3's causal mask, against a key place
+    formed whole per entry: 36 bit operations a diagonal tile's trip at width 128 on an H100)."""
+    key_offsets: jax.Array | None = None
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
@@ -417,14 +437,20 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
 
 
 def reach_of(maxima: jax.Array, *, unseen: bool) -> jax.Array:
-    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): their largest magnitude,
-    and one whose maximum the fold took past fp32's largest, or to no number, past every reach, so the call
-    walks again natural, where its logits are finite (a product near fp32's largest before a small scale,
-    times log2(e)). A -inf maximum is a row that saw no key, none, where a row may see none (`unseen`, a
-    'spans' call); elsewhere every row sees a key, so it is a row whose products all passed fp32 below zero,
-    past every reach (`attention_mosaic_forward._prepared`'s raw products)."""
-    reached = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
-    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached) if unseen else reached)
+    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): the largest of their
+    reaches (`reached`)."""
+    return jnp.max(reached(maxima, unseen=unseen))
+
+
+def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
+    """How far each of a folded walk's row `maxima` reaches: its magnitude, and one whose maximum the fold
+    took past fp32's largest, or to no number, past every reach, so the row walks again natural, where its
+    logits are finite (a product near fp32's largest before a small scale, times log2(e)). A -inf maximum is
+    a row that saw no key, none, where a row may see none (`unseen`, a 'spans' call); elsewhere every row
+    sees a key, so it is a row whose products all passed fp32 below zero, past every reach
+    (`attention_mosaic_forward._prepared`'s raw products)."""
+    reach = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
+    return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
 
 
 type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
@@ -433,7 +459,8 @@ each row's running maximum and whether its weighted values overflowed; `again` a
 inside the guard's rare branch, a recomputation (its kernel named apart, its products counted once)."""
 
 
-def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O]) -> O:
+def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
+                       masked: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -442,7 +469,26 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     one's elsewhere, so every other row's bits are the plain walk's. The call walks again where `walked`'s
     program would, decided over the whole call: in the natural form (`unfolded`) where some row's maximum
     passes `FOLD_REACH` folded, guarded as the call's form is; under headroom, the rows whose weighted values
-    overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks."""
+    overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks.
+
+    `masked` (a spans call's, whose launch walks only its live rows' keys, every other row's none:
+    `launch(form, live)`'s program over its rows' spans) takes one more launch every time, no branch: a
+    branch's predicate is read on the host before its launch may run, a decode step's round trip (row 1978:
+    0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue. It walks
+    in the natural form (`unfolded`) the rows the fold's reach passes `FOLD_REACH` a row (`reached`) and
+    those whose weighted values overflowed, guarded as that form is, and `kept` takes each of its outputs
+    (its rows' finished maxima and denominators too) at those rows: the fold's plain launch costs its
+    exponential's two instructions an element where the natural form's costs about sixty
+    (ET-DECSASS-h100, ET-FOLDED-h100: Qwen3-8B's decode at 32 rows of 32768 keys, 1.35 ms folded against
+    2.11 natural, the H100's bandwidth floor 1.28)."""
+    if masked:
+        outputs, maxima, over = launch(spec, None)
+        if spec.base2:
+            # A padded query's maximum is -inf, a row that reads nothing, as is a slice's row of no keys.
+            live = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
+            return kept(live, launch(unfolded(spec), live)[0], outputs)
+        return kept(over, launch(spec, over)[0], outputs) if spec.headroom else outputs
+
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
             return outputs
@@ -654,11 +700,10 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], j
     return held.weights, alpha, held
 
 
-def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None, *,
-                      axis: int = -1) -> jax.Array:
-    """A row's denominator after a tile: the state's taken by `factor` (`carry_factor`) and the tile's
-    weights `p`, their keys along `axis`, added at the row's shift (`beyond_weights`)."""
-    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=axis), held)
+def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, *, axis: int = -1) -> jax.Array:
+    """A row's denominator after a tile on the plain walk: the state's taken by `factor` (`carry_factor`)
+    and the tile's weights `p` added, their keys along `axis` (the guarded walk's, `stepped`)."""
+    return carry_factor(total, factor, None) + p.sum(axis=axis)
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, products: tuple[jax.Array, ...],
@@ -837,7 +882,7 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     predicate, forward and backward; None where each sees every key. A spans call's intervals, the union
     of its runs' where it has them, and, with documents, ids (its mainloops give each tile its queries'
     intervals and both blocks' ids); a causal call's diagonal; the call's keys, where a tile reaches past
-    them: no walk visits a tile wholly past them, so a call whose keys are whole tiles reads no padding;
+    them or a launch's walk reaches a tile wholly past them (`Forward.walked_keys`: a common walk's holder);
     and, where the spec names them, its queries (a padding row sees no key, so a score hook's derivative
     there, undefined at its padded parameters, reaches no reduction over the rows)."""
     visible = None
@@ -848,14 +893,23 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
                                                            coords.queries(end, like), ids)
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
-        visible = coords.k_pos <= coords.q_pos
-    if spec.form != "spans" and spec.keys % coords.key_count(like):
-        # A tile past the call's last key reads padding.
-        visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+        visible = _keys_before(coords, coords.q_pos + 1)
+    if spec.form != "spans" and (spec.keys % coords.key_count(like) or spec.walked_keys is not None):
+        # A tile past the call's last key reads padding, a holder of a common walk wholly past it too.
+        past = _keys_before(coords, spec.keys)
+        visible = past if visible is None else visible & past
     if spec.form != "spans" and spec.queries is not None:
         rows = coords.q_pos < spec.queries
         visible = rows if visible is None else visible & rows
     return visible
+
+
+def _keys_before(coords: Coords, bound) -> jax.Array:
+    """Whether each key's place lies before `bound`: against its offsets past the row's start where the
+    coordinates split its places (`Coords.key_start`), one subtraction a row."""
+    if coords.key_offsets is None:
+        return coords.k_pos < bound
+    return coords.key_offsets < bound - coords.key_start
 
 
 def places_read(spec: Forward, *, masked: bool, hooked: tuple[bool, bool], dropped: bool,
@@ -975,14 +1029,15 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
     return state if live is None else headroomed(state, live)
 
 
-Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
+Parts = tuple[jax.Array | product.Scaled, ...]
 """A product's parts as a mainloop issues them (`cotangent_parts`, `weights_parts`): each a narrowed
 operand with the power of two its product takes back (None: none)."""
 
 
 class Keys(NamedTuple):
-    """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
-    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and on
+    """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`, its
+    values `[bk, Dv]` as an operand of their type (`Operand`), which a step loads after the softmax (where
+    jax's mha loads them; a derived step's evaluation where its form first reads them), and on
     the guarded walk their largest magnitude a key (`magnitudes`, or `largest()` where the mainloop holds the
     values where it cannot read them, a Mosaic slot's shared memory), the
     mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
@@ -994,7 +1049,7 @@ class Keys(NamedTuple):
 
     coords: Coords
     logits: jax.Array
-    load: Callable[[], jax.Array]
+    values: Operand
     dot: Callable[[jax.Array, jax.Array], jax.Array]
     accumulate: Callable[[Any, Callable | None, Parts, jax.Array], Any] | None = None
     products: jax.Array | None = None
@@ -1029,7 +1084,7 @@ def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p
     `p * multiplier` narrowed at the scale `weights_parts` gives them."""
     if multiplier is not None:
         return products_of(weights_parts(p * multiplier, value.dtype), value, dot, chunk)
-    return products_of(((narrow(p, value.dtype), None),), value, dot, chunk)
+    return products_of((narrow(p, value.dtype),), value, dot, chunk)
 
 
 def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Array], jax.Array],
@@ -1041,10 +1096,14 @@ def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Ar
         return (summed_products(parts, value, dot),)
     count = value.shape[0] // chunk
     values = jnp.split(value, count, axis=0)
-    pieces = [jnp.split(part, count, axis=-1) for part, _ in parts]
-    return tuple(summed_products(tuple((piece[index], exponent) for piece, (_, exponent) in zip(pieces, parts,
-                                                                                               strict=True)),
-                                 values[index], dot)
+    def pieces(part):
+        # A part's chunks of keys, a scaled one's each at its scale.
+        if isinstance(part, product.Scaled):
+            return [product.Scaled(piece, part.exponent) for piece in jnp.split(part.value, count, axis=-1)]
+        return jnp.split(part, count, axis=-1)
+
+    split = [pieces(part) for part in parts]
+    return tuple(summed_products(tuple(chunks[index] for chunks in split), values[index], dot)
                  for index in range(count))
 
 
@@ -1059,7 +1118,7 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
     m, alpha = peak(spec, state.m, keys.logits, keys.products, axis=keys.coords.key_axis)
     p = weights(spec, keys.logits, m, keys.coords)
-    value = keys.load()
+    value = keys.values.load()
     largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
     bound = 1.0 if keys.coords.drop is None else keys.coords.drop.bound
     p, factor, held = tile(state, alpha, p, largest, bound)
@@ -1075,13 +1134,18 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values, the
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form). A tile held keys first (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the
-    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk."""
+    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk. Behind the switch, the derived
+    forms' (`dew.algebra.forms.derived`, `_derived_step`), but for a dropping call's: the derivation narrows a
+    dropped weight unnormalized, past fp16's largest at a rate near 1 (a multiplier of 2^16), where this
+    step's scaled parts (`weights_parts`) keep it, a representation the declaration states none of."""
+    if states_derived(spec, state) and keys.coords.drop is None:
+        return _derived_step(spec, state, keys)
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     if held is None and keys.accumulate is not None:
         # The weights the walk accumulates dropped where the call drops (`_times`' parts); the denominator
         # the undropped weights'.
-        parts = (((narrow(p, value.dtype), None),) if multiplier is None
+        parts = ((narrow(p, value.dtype),) if multiplier is None
                  else weights_parts(p * multiplier, value.dtype))
         # `carry_factor`'s plain factor, each query's broadcast over its sums as the mainloop holds them.
         acc = keys.accumulate(state.acc, lambda acc: keys.coords.queries(factor, acc) * acc, parts, value)
@@ -1105,7 +1169,7 @@ def _split_tile(keys: Keys, p: jax.Array, dtype, anchor: Argmax, multiplier: jax
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     others, own_tile = anchor_split(narrow(p, dtype), at_anchor)
     if multiplier is None:
-        return ((others, None),), others, own_tile, anchor
+        return (others,), others, own_tile, anchor
     parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, dtype)
     # The anchor's multiplier by its query's vector and its key's, no unit axis (a Mosaic program's lowers
     # none beside a tile).
@@ -1175,7 +1239,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None)."""
     state, arg, own, others_total = carry
     p = weights(spec, keys.logits, state.m)
-    value = keys.load()
+    value = keys.values.load()
     parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
@@ -1242,7 +1306,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
 
     def walk(index, sums):
         keys = keys_at(index)
-        value = keys.load()
+        value = keys.values.load()
         rest, own_tile, small = normalized_terms(difference(keys.logits), total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  jnp.exp2 if spec.base2 else jnp.exp)
@@ -1402,7 +1466,10 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
-    keys), so `empty` is its identity under every spec."""
+    keys), so `empty` is its identity under every spec. Behind the switch, the derived forms'
+    (`dew.algebra.forms.derived`, `_derived_merge`)."""
+    if states_derived(spec, first, second):
+        return _derived_merge(spec, first, second)
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
     if first.guard is None and second.guard is None:
@@ -1437,6 +1504,42 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
 
 
+def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
+    """States over disjoint keys stacked on `axis` (a split launch's slices, `imported`) as one, at once:
+    `merge`'s fold over them, each taken to the largest maximum and summed along `axis`, so a combine of
+    many slices traces one sum, not a merge a slice (a decode step's 32 slices traced 44 thousand
+    operations an attention, which at Dory 4B's depth compiled for over eight minutes; row 2491). Each
+    state takes one factor to the largest maximum where the fold takes one a merge, so the sums round in
+    another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
+    path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
+    need, as `merge` shifts them. Behind the switch, the derived forms' (`_derived_merged`)."""
+    if states_derived(spec, stacked):
+        return _derived_merged(spec, stacked, axis)
+    m = jnp.max(stacked.m, axis=axis)
+    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
+    if stacked.guard is None:
+        acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
+        return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
+    guard = stacked.guard
+    reach = jnp.max(guard.reach, axis=axis)
+    natural = jnp.sum(power2(factors * stacked.total, guard.shift), axis=axis)
+
+    def joined(shift):
+        # Each state's factor, then its shift's change as a power of two on the product (`carry_factor`).
+        drops = guard.shift - jnp.expand_dims(shift, axis)
+        acc = power2(expand(factors, stacked.acc) * stacked.acc, expand(drops, stacked.acc))
+        return jnp.sum(acc, axis=axis), jnp.sum(power2(factors * stacked.total, drops), axis=axis)
+
+    plain = jnp.sum(expand(factors, guard.plain) * guard.plain, axis=axis)
+    plain_total = jnp.sum(factors * guard.plain_total, axis=axis)
+    held = jnp.max(guard.shift, axis=axis)
+    acc, _ = joined(held)
+    live = overflowed(acc) | jnp.any(guard.live, axis=axis)
+    shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
+    acc, total = joined(shift)
+    return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
+
+
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a guarded walk's or one from a state)."""
@@ -1465,8 +1568,12 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residual rows
-    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves."""
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves. Behind the switch, the
+    output the derived forms' (`dew.algebra.forms.derived`, `_derived_output`)."""
     m, denominator = finished_rows(spec, state, initial=initial)
+    if states_derived(spec, state):
+        out = _derived_output(spec, state)
+        return (out if output_mod is None else output_mod(out, *output_params)), m, denominator
     out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
     fields = state.guard
     if fields is not None:
@@ -1764,7 +1871,7 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
     return jnp.where(mantissa == 0, 0.0, power2(mantissa, exponent))
 
 
-def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
+def dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
     """A dQ tile's row sums (`dq_step`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
     the weights, the cotangents' and the weights' sums; and the weights pulled through the score hook."""
@@ -1786,12 +1893,12 @@ def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, se
     (`cotangent_parts`, `formed_parts`) a mainloop adds to dQ, into its accumulator in place where it can: the
     whole of the fast form's step, and the accurate form's with `keyed_terms` where it takes no score
     hook."""
-    terms, _ = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
+    terms, _ = dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
     return terms, pulled(cotangents, slopes, seen, kinds)[0] * scale
 
 
-def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype
-                ) -> tuple[DqSums, Parts]:
+def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype,
+                rows: bool = False) -> tuple[DqSums, Parts]:
     """The accurate form's keyed sums after a tile of a call without a score hook: their mass and exponent,
     and the parts of the weights' product with the keys (`weights_parts`, `DqSums.keyed`) a mainloop adds
     to them unscaled. Each coefficient is the scale times a weight over the prior denominator, which holds
@@ -1800,14 +1907,14 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
     (`dq_finish`). One product, no exponent a row; a score hook's coefficients rescale a row's sums each
     tile instead (`dq_step`)."""
     scale_mantissa, scale_exponent = _static_split(scale)
-    keyed = weights_parts(weights * expand(inverse(prior), weights), dtype)
+    keyed = weights_parts(weights * expand(inverse(prior), weights), dtype, rows)
     return (sums._replace(keyed_mass=jnp.full_like(sums.keyed_mass, scale_mantissa),
                           keyed_shift=jnp.full_like(sums.keyed_shift, scale_exponent)), keyed)
 
 
 def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, dtype,
-              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool
-              ) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
+              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool,
+              rows: bool = False) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
     """A dQ pass's row sums after a key tile and the products a mainloop issues for it, for keys of `dtype`:
     the sums with their row fields updated (the cotangents' and the weights' sums, the summed parameters'
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
@@ -1821,9 +1928,9 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
                                 summed=summed)
         if not accurate:
             return terms, parts, None
-        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype)
+        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype, rows=rows)
         return terms, parts, (None, keyed)
-    terms, pulled_weights = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
+    terms, pulled_weights = dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
     parts = pulled(cotangents, slopes, seen, kinds)[0] * scale
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
@@ -1843,7 +1950,7 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
     keyed_mass = before + jnp.abs(coefficients).sum(axis=-1)
     over = inverse(keyed_mass)
     return (terms._replace(keyed_mass=keyed_mass, keyed_shift=keyed_shift), parts,
-            (before * over, weights_parts(coefficients * expand(over, coefficients), dtype)))
+            (before * over, weights_parts(coefficients * expand(over, coefficients), dtype, rows)))
 
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
@@ -1902,18 +2009,30 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     return dq, delta + refined, total, mass, grads
 
 
-def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
+def safe_peak(peak: jax.Array) -> jax.Array:
+    """A query's forward maximum as `exponent` reads it unclamped (`safe`): +inf where it saw no key (its
+    -inf), so each of its weights is exp(-inf) = 0 whatever its logit, a row's select in place of each
+    entry's clamp (the fast backward's dQ launch: FMNMX 128 to 64 of 2080 instructions, its dK/dV's 48 to
+    32, at Qwen3-8B's widths, ptxas 12.9 sm90a)."""
+    return jnp.where(peak == -jnp.inf, jnp.inf, peak)
+
+
+def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, *, safe: bool = False) -> jax.Array:
     """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
     fp32, in the forward's units (`Recompute`): `m` is every key's maximum, so a logit past it by the
     rounding the two passes do not share (the forward's maximum taken in base 2 and back, or another tile
     shape's product) is the maximum itself, its weight 1, never past it; in the accurate form one at it
     weighs 1 however a compiler contracts its scaling into the subtraction (`weights`)."""
-    return jnp.exp(exponent(logits, peak, how))
+    return jnp.exp(exponent(logits, peak, how, safe=safe))
 
 
-def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
-    """The natural exponent `s - m` (at most 0) of `below`'s weights."""
+def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN, *, safe: bool = False) -> jax.Array:
+    """The natural exponent `s - m` (at most 0) of `below`'s weights; unclamped where `peak` is `safe_peak`'s
+    and the recompute plain, a logit past its maximum by the passes' rounding then weighing at most that
+    rounding past 1."""
     peak = expand(peak, logits)
+    if safe and how == PLAIN:
+        return logits - peak
     if how.factor is not None:
         # Raw products: the difference is taken first, so the largest's is exactly 0.
         return jnp.minimum(logits - peak, 0.0) * how.factor
@@ -1922,11 +2041,11 @@ def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.
     return jnp.minimum(logits - peak, 0.0)
 
 
-def normalized(logits: jax.Array, peak: jax.Array, inverse_total: jax.Array, how: Recompute = PLAIN
-               ) -> tuple[jax.Array, jax.Array]:
-    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, those over each query's
-    denominator (`inverse_total`, its `inverse`), fp32."""
-    exponentials = below(logits, peak, how)
+def normalized(logits: jax.Array, peak: jax.Array, inverse_total: jax.Array, how: Recompute = PLAIN, *,
+               safe: bool = False) -> tuple[jax.Array, jax.Array]:
+    """A tile's unnormalized weights `exp(s - m)` (`below`, unclamped where `safe`) and its weights `p`,
+    those over each query's denominator (`inverse_total`, its `inverse`), fp32."""
+    exponentials = below(logits, peak, how, safe=safe)
     return exponentials, exponentials * expand(inverse_total, exponentials)
 
 
@@ -1941,7 +2060,7 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
                 seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
-                multiplier: jax.Array | None = None) -> jax.Array:
+                multiplier: jax.Array | None = None, weights: jax.Array | None = None) -> jax.Array:
     """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
     `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
     denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
@@ -1950,11 +2069,18 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
     sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
     test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
-    key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
+    key" and causal windows' first queries: rows whose float64 gradient is exactly 0). That is the accurate
+    form's. The fast form's (`weights` given, the normalized weights its launch forms anyway) is
+    FlashAttention's order about the anchor, `weights ((dP - c) - (D - c))`, its anchor test the accurate
+    form's alone (`at_anchor` None)."""
     products = dropped_products(products, multiplier)
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
+    if weights is not None:
+        # The weights a launch forms anyway times `(dP - c) - (D - c)`: one product fewer an entry (the fast
+        # backward's dK/dV launch: FMUL 112 to 96 at Qwen3-8B's widths, ptxas 12.9 sm90a).
+        return where_seen(seen, weights * (relative - expand(delta, relative)), 0.0)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
     return where_seen(seen, exponentials * centred, 0.0)
 
@@ -2076,25 +2202,34 @@ def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Arr
             jnp.full((rows,), -1, jnp.int32))
 
 
-def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, fp32, and that power's
-    negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding)."""
-    top = jnp.max(jnp.abs(x))
+    negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding); with `rows`, a
+    power a row (its exponents `[rows]`), which a product of the rows (`a @ b`) takes back a row of its own
+    (`restored`): a tile's whole largest is a reduction to a scalar, which a tensor-core mainloop's lowering
+    has no form of (Mosaic GPU's: "Scalars must be represented by non-vector types", ET-FP16-h100)."""
+    top = jnp.max(jnp.abs(x), axis=-1) if rows else jnp.max(jnp.abs(x))
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
-    return power2(x, 14.0 - exponent), exponent - 14.0
+    return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
 
 
-def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+def restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
+    """A scaled part's product `value` taken back by its power of two (`product.Scaled`): a tile's one, or a
+    row's where the part is scaled a row at a time (`_scaled`'s `rows`)."""
+    return power2(value, exponent if exponent.ndim == 0 else expand(exponent, value))
+
+
+def _fp16_scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     """`_scaled`'s `x` in fp16 and its exponent: within fp16's range whatever `x`'s, an entry far below the
     largest losing only what is far below the product's own rounding."""
-    scaled, exponent = _scaled(x)
+    scaled, exponent = _scaled(x, rows)
     return scaled.astype(jnp.float16), exponent
 
 
 def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     """The parts a tile's score cotangents `[bq, bk]` (fp32, scaled) take to their product with an operand of
-    `dtype` (`cotangent_product`), each narrowed to it, with the power of two its product takes back (None:
-    none), so a mainloop may issue their products into one accumulator. An fp32 operand's part is the
+    `dtype` (`cotangent_product`), each narrowed to it, a `product.Scaled` where its product takes a power of
+    two back, so a mainloop may issue the others' products into one accumulator. An fp32 operand's part is the
     cotangents themselves. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
     FlashAttention's. fp16's take the accurate form's two products in both forms: one fp16 product of
     cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns in
@@ -2111,26 +2246,25 @@ def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     return tuple(formed_parts(cotangents, dtype, accurate=accurate))
 
 
-def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool
-                 ) -> Iterator[tuple[jax.Array, jax.Array | None]]:
+def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = False
+                 ) -> Iterator[jax.Array | product.Scaled]:
     """`cotangent_parts` a part at a time, each formed only as it is taken: a mainloop that retires each
     part's product before taking the next (`Family.register_products`' `retired`) holds one part's registers
-    beside the cotangents, not every part's."""
+    beside the cotangents, not every part's; fp16's scaled a row at a time with `rows` (`_scaled`)."""
     if dtype == jnp.float32:
-        yield cotangents, None
+        yield cotangents
         return
     if dtype == jnp.bfloat16:
         # The leading part saturates at bf16's largest: an fp32 cotangent past it by more than half its ulp
         # rounds to infinity in bf16, an infinite product, or a NaN against a zero operand. The accurate
         # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
-        for part in product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1):
-            yield part, None
+        yield from product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1)
         return
-    scaled, high_exponent = _scaled(cotangents)
+    scaled, high_exponent = _scaled(cotangents, rows)
     high = scaled.astype(dtype)
-    yield high, high_exponent
-    low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    yield low, low_exponent + high_exponent
+    yield product.Scaled(high, high_exponent)
+    low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32), rows)
+    yield product.Scaled(low, low_exponent + high_exponent)
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
@@ -2144,39 +2278,36 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
 
 def summed_products(parts: Parts, operand: jax.Array,
                     dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
-    """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), each taken
-    back by its power of two, in order."""
-    def taken(part: jax.Array, exponent: jax.Array | None) -> jax.Array:
-        product = dot(part, operand)
-        return product if exponent is None else power2(product, exponent)
+    """The sum of `parts`' products with `operand` by `dot` (`cotangent_parts`, `weights_parts`), a scaled
+    one's taken back by its power of two, in order."""
+    def taken(part) -> jax.Array:
+        if isinstance(part, product.Scaled):
+            return power2(dot(part.value, operand), part.exponent)
+        return dot(part, operand)
 
-    (first, first_exponent), *rest = parts
-    total = taken(first, first_exponent)
-    for part, exponent in rest:
-        total = total + taken(part, exponent)
+    first, *rest = parts
+    total = taken(first)
+    for part in rest:
+        total = total + taken(part)
     return total
 
 
-def weights_parts(weights: jax.Array, dtype) -> Parts:
-    """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`weights_product`):
-    fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`), which its product takes
-    back."""
+def weights_parts(weights: jax.Array, dtype, rows: bool = False) -> Parts:
+    """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
+    fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`, a row's with `rows`),
+    which its product takes back."""
     if dtype == jnp.float16:
-        return (_fp16_scaled(weights),)
-    return ((weights.astype(dtype), None),)
-
-
-def weights_product(weights: jax.Array, operand: jax.Array,
-                    dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
-    """Weights `[bq, bk]` (fp32) times the queries or keys `operand` in its dtype, fp32 (`weights_parts`)."""
-    return summed_products(weights_parts(weights, operand.dtype), operand, dot)
+        return (product.Scaled(*_fp16_scaled(weights, rows)),)
+    return (weights.astype(dtype),)
 
 
 def narrowed(x: jax.Array, dtype) -> jax.Array:
     """`x` (fp32) narrowed to `dtype` at the scale `weights_parts` gives it, held in fp32: the values a
     product takes, which a dropped weight's (`x * multiplier`) overflow at the 16-bit scale never meets."""
-    (part, exponent), = weights_parts(x, dtype)
-    return part.astype(jnp.float32) if exponent is None else power2(part.astype(jnp.float32), exponent)
+    (part,) = weights_parts(x, dtype)
+    if isinstance(part, product.Scaled):
+        return power2(part.value.astype(jnp.float32), part.exponent)
+    return part.astype(jnp.float32)
 
 
 
@@ -2207,3 +2338,170 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
     if dropped:
         return narrowed(exponentials, dtype)
     return exponentials.astype(dtype).astype(jnp.float32)
+
+
+def value_parts(weights: jax.Array, dtype) -> Parts:
+    """A tensor-core mainloop's dV left operand, `pᵀ·dO` against the output cotangent as it is in shared
+    memory (FlashAttention's form, `value_operands`' bf16 one): the normalized weights narrowed, bf16's as is,
+    fp16's at a power of two of their row's (`weights_parts`), which keeps a weight down to 2^-24 of the
+    row's largest where fp16's least subnormal (about 6e-8) would drop a normalized one."""
+    return weights_parts(weights, dtype, rows=True)
+
+
+def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False) -> jax.Array:
+    """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
+    query's softmax over its `logits` (scaled, in the exponent's base, -inf at each key it does not see, as
+    `modify` forms them; `[rows, keys]`, or `[keys, rows]` where the tile holds its keys first, a decode
+    program's `K Qᵀ`), its weights at the values' dtype (the reference's, as `narrow` takes them), summed over
+    the `values` `[keys, width]` by Dew's product in fp32 (`float32_einsum`, `[rows, width]`, or `[width,
+    rows]` keys first), over their total; its weights anchored at its largest logit, at least the dtype's
+    least finite value where it sees no key, so such a query's weights and output are zeros, with no mask an
+    element, and the anchor grows with the walk (a walked correction `exp(k_carried - k_now)` at most 1)."""
+    exponent = jnp.exp2 if base2 else jnp.exp
+    keys_axis = 0 if keys_first else 1
+    m = jnp.max(logits, axis=keys_axis)
+    safe = jnp.maximum(m, jnp.finfo(logits.dtype).min)
+    p = exponent(logits - (safe[None, :] if keys_first else safe[:, None]))
+    total = jnp.sum(p, axis=keys_axis)
+    over = jnp.where(total == 0, 1.0, total)
+    subscripts, per_query = ("kq,kd->dq", over[None, :]) if keys_first else ("qk,kd->qd", over[:, None])
+    summed = float32_einsum(subscripts, p.astype(values.dtype), values, preferred_element_type=jnp.float32)
+    return summed / per_query
+
+
+def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None):
+    """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
+    template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
+    where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
+    tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
+    derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
+    hand step's 62 fewer multiplies a step at Qwen3's tile. Its derived forms stand beside this module's
+    (`plain_step`, `merge`, `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`),
+    which they replace only on par with them against float64 and no slower in the kernel
+    (docs/design/algebra.md)."""
+    tile = ("keys", "rows") if keys_first else ("rows", "keys")
+
+    def walked(logits, values):
+        scaled = logits if factor is None else logits * np.float32(factor)
+        return softmax_of(scaled, values, base2=base2, keys_first=keys_first)
+
+    return derive.Reduction(walked, {"logits": tile, "values": ("keys", "width")}, walked="keys",
+                            exponent=2 if base2 else "e")
+
+
+@functools.cache
+def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None) -> derive.Derived:
+    """The forward's derived forms (`declaration`'s, the fast class), the template's behind the switch
+    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
+    step over raw products, their `factor` (`declaration`)."""
+    from dew.algebra import SATURATION
+    return derive.derive(declaration(base2=base2, keys_first=keys_first, factor=factor), accurate=False,
+                         saturation=SATURATION)
+
+
+def states_derived(spec: Forward, *states: Partial) -> bool:
+    """Whether the derived forms walk a state of `spec` (behind the switch, `dew.algebra.forms.derived`):
+    where the declaration states its walk. Its accurate forms (`Forward.natural`: the compensated exponent,
+    the largest weight held to 1, raw logits), its compensated running sums (`Forward.compensated`) and the
+    headroom guard's shifted sums (`Forward.headroom`, a state's `Guard`) are rounding and representation
+    choices the fast class's derivation does not make (error-aware extraction's compensation rules, §1.5, the
+    next build, docs/design/algebra.md §6.9): there the template's own forms run, under the replacement rule
+    (a derived form replaces a hand-written one only where it states the walk)."""
+    return derived_on() and not (spec.natural or spec.compensated or spec.headroom) and all(
+        state.guard is None and state.low is None for state in states)
+
+
+def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
+    """The `Partial` field each of the derived forms' (`derived_forms(*key)`) carried states is
+    (`Derived.slots`) at a walk of tiles of `shapes`, by its role: its maximum `m`, its sum `total`, its
+    contraction (the weights' product with the values) `acc`."""
+    slots = derived_forms(*key).slots
+    assert slots is not None, "a reduction's derived forms name their slots"
+    fields = tuple({"max": "m", "sum": "total", "contraction": "acc"}[role] for role, _ in slots(shapes))
+    if sorted(fields) != ["acc", "m", "total"]:
+        raise derive.Refused(f"the derived forms carry {fields}, not a softmax's maximum, total and sums")
+    return fields
+
+
+def _stated(spec: Forward, state: Partial) -> tuple[tuple[bool, bool], dict]:
+    """The derived forms a merge or a finish of `state` reads, and the walk's tiles it names them by: its
+    base's walk, queries first, over tiles of a key per query of fp32 values beside its rows: a merge's and a
+    finish's forms read the state alone, a maximum, a total and a row's sums a query, the same at any keys a
+    tile and any values' dtype (a product's fp32 sums, `softmax_of`), so the forms of any walk of the state's
+    are these, whatever walk came before (a hand-written step's, a dropping walk's, a supplied state)."""
+    rows, width = state.m.shape[-1], state.acc.shape[-1]
+    tiles = {"logits": ((rows, rows), jnp.float32), "values": ((rows, width), jnp.float32)}
+    return (spec.base2, False), tiles
+
+
+def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
+    """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
+    `modify` writes them) and values; the weighted values' sums the mainloop's own where it holds them
+    (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
+    # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
+    raw = keys.products is not None
+    key = (spec.base2, bool(keys.coords.keys_first), *((spec.factor,) if raw else ()))
+    forms = derived_forms(*key)
+    tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
+    fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
+    held_by = keys.accumulate
+
+    def accumulate(acc, factor, weights, values):
+        def scale(held):
+            return keys.coords.queries(factor, held) * held
+
+        assert held_by is not None
+        return held_by(acc, scale, (weights,), values)
+
+    stepped = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
+                         accumulate=None if held_by is None else accumulate)
+    return Partial(**dict(zip(fields, stepped, strict=True)))
+
+
+def _rows(state: Partial) -> Partial:
+    """`state` with its leading axes and its rows one axis of rows (`acc` `[rows, Dv]`, `m` and `total`
+    `[rows]`): each row's softmax is its own, so a merge or a finish of a split decode's states
+    (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their rows."""
+    return state._replace(acc=state.acc.reshape(-1, state.acc.shape[-1]), m=state.m.reshape(-1),
+                          total=state.total.reshape(-1))
+
+
+def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
+    """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
+    (`_rows`)."""
+    flat = _rows(first)
+    key, shapes = _stated(spec, flat)
+    fields = _slotted(key, shapes)
+    other = _rows(second)
+    merged = derived_forms(*key).merge(tuple(getattr(flat, field) for field in fields),
+                                       tuple(getattr(other, field) for field in fields), shapes=shapes)
+    return Partial(**{field: value.reshape(getattr(first, field).shape)
+                      for field, value in zip(fields, merged, strict=True)})
+
+
+def _derived_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
+    """`merged` by the derived forms: the slices merged a pair at a time, a level's pairs at once
+    (`_derived_merge` over their rows whatever their leading axes), so n slices trace about log2(n) merges,
+    not n - 1. The forms' merge is associative (tests/test_algebra_laws.py), so any tree of merges is the
+    fold's. A level of an odd count carries its last slice to the next."""
+    def taken(state: Partial, start: int, stop: int, stride: int = 1) -> Partial:
+        return jax.tree.map(lambda part: jax.lax.slice_in_dim(part, start, stop, stride, axis), state)
+
+    while (count := stacked.m.shape[axis]) > 1:
+        pairs = 2 * (count // 2)
+        level = _derived_merge(spec, taken(stacked, 0, pairs, 2), taken(stacked, 1, pairs, 2))
+        if count % 2:
+            level = jax.tree.map(lambda merged, last: jnp.concatenate([merged, last], axis), level,
+                                 taken(stacked, pairs, count))
+        stacked = level
+    return jax.tree.map(lambda part: jnp.squeeze(part, axis), stacked)
+
+
+def _derived_output(spec: Forward, state: Partial) -> jax.Array:
+    """`finish`'s output before its hook by the derived forms (`_stated`'s): the weighted values over their
+    total, zero for a query that saw nothing, over the state's rows whatever its leading axes (`_rows`)."""
+    flat = _rows(state)
+    key, shapes = _stated(spec, flat)
+    fields = _slotted(key, shapes)
+    finished = derived_forms(*key).finish(tuple(getattr(flat, field) for field in fields), shapes=shapes)
+    return finished.reshape(state.acc.shape)

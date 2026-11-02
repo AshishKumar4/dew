@@ -325,6 +325,15 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
         Family("causal_transformer+gated_delta_hybrid", "causal_transformer", DECODER_LM, 256,
                released("qwen35-tiny")),
         Family("causal_transformer+mamba2", "causal_transformer", DECODER_LM, 32, released("mamba2-tiny")),
+        # A parallel hybrid's layers (`dew.nn.mixers.parallel`, Falcon-H1's): Mamba-2 beside attention on one
+        # norm, each branch scaled in and out, their caches kept side by side.
+        Family("causal_transformer+parallel_hybrid", "causal_transformer", DECODER_LM, 256,
+               built("causal_transformer", **DECODER, mixer={"class": "parallel", "fields": {"branches": [
+                   {"name": "mamba", "input_multiplier": 1.3, "output_multiplier": 0.7,
+                    "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 8,
+                                                            "n_groups": 1, "chunk_size": 8}}},
+                   {"name": "attention", "input_multiplier": 0.8, "output_multiplier": 0.6,
+                    "mixer": {"class": "attention", "fields": {}}}]}})),
         Family("causal_transformer+mamba", "causal_transformer", DECODER_LM, 64, released("mamba-tiny")),
         Family("causal_transformer+mimo_v2_flash", "causal_transformer", DECODER_LM, 64,
                released("mimo-v2-flash-tiny")),
@@ -837,7 +846,8 @@ def refuse_shortcut(family: Family) -> None:
 def teacher_of(family: Family, model, inputs: InputSpec):
     """A teacher of the family's own kind, its variables drawn apart from the student's."""
     objective = denoising(model, process=presets.Flow(), inputs=inputs)
-    return objective.model_variables(jax.device_get(objective.initializer(jax.random.key(11))))
+    # Drawn by one compiled program, as a run's initial state is, not op by op.
+    return objective.model_variables(jax.device_get(jax.jit(objective.initializer)(jax.random.key(11))))
 
 
 def rcm(family: Family, directory: Path) -> None:

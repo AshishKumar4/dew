@@ -15,6 +15,7 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import Keeps
 from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
@@ -805,6 +806,24 @@ def test_the_images_preset_with_a_fixed_caption_and_a_cache_reads_in_its_uncache
         second.close()
 
 
+def test_a_cache_publishes_after_its_filling_epoch_reads_a_sealed_shard_again():
+    """A cache whose filling epoch reads a record again from a shard it sealed, as a repeat's next epoch
+    does, publishes that shard: its writer reads the shard by the declaration its segment published, so
+    the copy Dew's mirror holds open for that read is the one the publication checks, not another the
+    mirror has no room to keep beside it."""
+    source = Memory([{"id": index} for index in range(8)])
+    cache = Cache(f"memory://artifact-{uuid4().hex}")
+    key = _key()
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+    assert [rows[index] for index in range(8)] == [{"id": index} for index in range(8)]
+    rows.writer.seal_future.result(timeout=20)
+    assert rows[0] == {"id": 0}
+    published = cache.publish(key, source)
+    assert [published[index] for index in range(8)] == [{"id": index} for index in range(8)]
+    published.close()
+    rows.close()
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed"])
 def test_a_repeat_before_a_cache_of_one_record_for_each_input_counts_an_epoch_of_its_inputs(read):
     """A shuffle and a repeat written before a cache that keeps one record for each input, as a
@@ -840,18 +859,6 @@ def test_a_cache_followed_by_a_token_split_seals_the_fill_the_split_reads():
     publishing = Same()
     publish(Pipeline(documents).map(publishing), cache, read="indexed", loading=loading)
     assert publishing.calls == []
-
-
-@dataclass(frozen=True)
-class Keeps:
-    """Rejects a record whose id is a multiple of `every`, permanently: a record steps cannot make."""
-
-    every: int
-    identity = "keeps@1"
-    rejects = True
-
-    def __call__(self, row):
-        return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])

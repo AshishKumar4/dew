@@ -17,7 +17,10 @@ from flax import linen as nn
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
+from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 from dew.nn.mla import MLAMixer
 from dew.sampling import Sampling
 
@@ -152,6 +155,12 @@ def decoder(kind: str = "attention") -> CausalTransformer:
     elif kind == "recurrent":
         mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
                                   linear_key_head_dim=8, linear_value_head_dim=8)
+    elif kind == "parallel":
+        # Falcon-H1's layer: Mamba-2 beside attention on one norm, each scaled in and out.
+        mamba = Mamba2Mixer(num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=4)
+        mixer = ParallelMixer(branches=(
+            ParallelBranch("mamba", mamba, 1.3, 0.7),
+            ParallelBranch("attention", AttentionMixer(), 0.8, 0.6)))
     return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=12,
                              dtype="float32", mixer=mixer)

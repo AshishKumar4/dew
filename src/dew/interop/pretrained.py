@@ -70,7 +70,8 @@ from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
-from dew.nn.backbones.layer_plan import LayerKind, group_layers
+from dew.nn.backbones.layer_names import group_layers
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
@@ -677,13 +678,16 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.inference.projections import unpacked
+        from dew.nn.backbones.layer_names import stored_layers
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        # A tree enters plain: a draw's boxes are its model's table, which no export reads.
-        values = unpacked(self.model, unboxed(self.variables if variables is None else variables))
+        # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
+        # fit's store is read by its layers' names (`stored_layers`).
+        values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
+                                                                        else variables)))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -996,10 +1000,12 @@ class PretrainedPipeline(Pretrained):
         `adapter.save` writes the factors alone.
         """
         from dew.interop import diffusion
+        from dew.nn.backbones.layer_names import stored_layers
 
         self._quantization()
         self._text_encoder("a saved pipeline writes it back")
-        values = self.variables if variables is None else variables
+        # A stage-local fit's store is read by its layers' names (`stored_layers`).
+        values = stored_layers(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
         diffusion.save_source(self, values, Path(directory), max_shard_size)
@@ -1768,7 +1774,7 @@ def _media_wrapper(config: Mapping[str, object]) -> bool:
     (`DecoderFamily.wrapper`). DiffusionGemma nests its text config too.
     """
     family = config.get("model_type")
-    return (family != "diffusion_gemma" and "text_config" in config
+    return (family != "diffusion_gemma" and decoders.carries_text(config)
             and (family not in decoders.families() or decoders.bundles(config)))
 
 
@@ -1796,7 +1802,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
             # translate_config refused every model_type but a registered family's name.
             family = _records.text(config.get("model_type"), "model_type")
         case VerifiedRoute(verified=verified):
-            family = verified.entry(config)
+            family = verified.entry(config, tensors.keys())
             record = verified.translate(config, tensors, family)
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
@@ -2073,21 +2079,13 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         # The language model's config as its decoder reads it (`decoders.decoder_config`), a quantized
         # wrapper's module selection renamed with its tensors; a bundle its own family reads whole keeps
         # its decoder's names and their codec.
-        quantized = not decoders.bundles(config) and source_quantization(config) is not None
-        text = decoders.decoder_config(config)
-        if quantized:
-            quantization = decoders.language_model_quantization(config, language, inventory)
-            text = {key: value for key, value in text.items() if key != "quantization_config"}
-            if quantization is not None:
-                text["quantization_config"] = quantization
-        config = text
+        config = decoders.decoder_config(config, inventory)
         route = source_route(config, remote=remote, pinned=pinned)
     elif isinstance(route, WrapperRoute):
         # Before any weight downloads, as the routing of the wrapper's names would (`_wrapper_sources`).
         decoders.refuse_unported(route.wrapper)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
-        raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
-                         "its whole model")
+        raise ValueError(decoders.WHOLE_DECODER)
     if isinstance(route, TorchRoute | DiffusionGemmaRoute):
         _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
                           else "a diffusion Gemma's text tower")
@@ -2209,7 +2207,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
             depth = decoders.wrapper_source_depths(wrapper)
         case VerifiedRoute(verified=verified):
             # The record alone: the names checked are the kept ones, which the load translates.
-            family = verified.entry(config)
+            family = verified.entry(config, tensors.keys())
             depth = decoders.source_depths(verified.record(config, family), family)
         case _:
             return tensors

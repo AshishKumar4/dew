@@ -49,13 +49,14 @@ from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
+from dew.interop.weights import decoding_storage
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
-from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mla import MultiHeadLatentAttention, SparseIndexer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import (
     LongRopeScaling,
@@ -251,6 +252,28 @@ def block_draw(name: str):
     return draw
 
 
+def test_a_float16_indexer_weighs_its_heads_in_float32():
+    """V3.2's indexer at float16 weighs its heads by a float32 `weights_proj` over its input cast up, as
+    its reference keeps that module in a float16 load (`_keep_in_fp32_modules`,
+    modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830), and its kernel stays float32 through the
+    storage generation casts float32 master weights to (`decoding_storage`): the weights are bit for bit a
+    float32 indexer's over the float16 input cast up, as float32."""
+    hidden = jnp.asarray(np.random.default_rng(0x3080).standard_normal((2, 5, 32)), jnp.float16)
+
+    def weigh(module, x):
+        return module.weights_proj(x)
+
+    half = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float16)
+    variables = half.init(jax.random.key(0), hidden, method=weigh)
+    stored = decoding_storage(half, variables)
+    assert stored["params"]["weights_proj"]["kernel"].dtype == jnp.float32
+    weights = half.apply(stored, hidden, method=weigh)
+    single = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float32)
+    wide = single.apply(variables, hidden.astype(jnp.float32), method=weigh)
+    assert weights.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(weights), np.asarray(wide))
+
+
 def test_yarn_matches_the_reference_derivation():
     """The released YaRN spelling against transformers' rotary embedding, live: the inverse
     frequencies, the cos/sin amplitude and the query scale exactly (as computed, the same float32 and
@@ -358,7 +381,9 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
         batch, length, _ = x.shape
         capacity = m.max_seq_len
         place = down_projection(x, (m.q_lora_rank or 0) + m.kv_lora_rank + m.qk_rope_head_dim)
-        queries, q_resid = m._queries(x, place)
+        queries, q_resid, gate = m._queries(x, place)
+        # What the output gate reads, as the block's call hands it on (`_output`).
+        gating = x if gate is None else gate
         latent, rot = m._latents(x, place)
         q_pass, q_rot = jnp.split(queries, [m.qk_nope_head_dim], axis=-1)
         q_rot, rot, freqs_cos, freqs_sin = m._rotated(q_rot, rot, jnp.arange(length))
@@ -392,7 +417,7 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
             written = (slots <= step).reshape((1, capacity) + (1,) * (held[0].ndim - 2))
             first, second = (jnp.where(written, part, 0) for part in held)
             key, value = (first, second) if m.sparse else m._expand(first, second)
-            outputs.append(m._attend(query[:, step:step + 1], key, value, x[:, step:step + 1],
+            outputs.append(m._attend(query[:, step:step + 1], key, value, gating[:, step:step + 1],
                                      visible[:, None, step:step + 1], m.attention_impl))
         return jnp.concatenate(outputs, axis=1)
 

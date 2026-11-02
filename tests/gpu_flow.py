@@ -135,24 +135,51 @@ def _parameter_sets(mark) -> list[tuple[str, dict, list]]:
 def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
     """A cell for each parameter set `check`'s own `pytest.mark.parametrize` marks give (their product, as
     pytest collects them), each run with that set and those of `fixtures` it takes by name, under
-    `generation`; a `skipif` mark of `check`'s own, or of a set's, whose condition holds skips its cell
-    with its reason, as pytest would. So a cell function keeps its test's grid where its test kept it,
-    and a flow names the function alone."""
-    marks = list(getattr(check, "pytestmark", []))
+    `generation`, or a matrix cell's under the generation its set covers (`cell`); a `skipif` mark of
+    `check`'s own, or of a set's, whose condition holds skips its cell with its reason, as pytest would. So
+    a cell function keeps its test's grid where its test kept it, and a flow names the function alone."""
     taken = inspect.signature(check).parameters
-    grids = [_parameter_sets(mark) for mark in reversed(marks) if mark.name == "parametrize"]
     name = check.__name__.replace("_", " ")
     cells = []
+    for label, arguments, marks in _parameter_grid(check):
+        arguments = {**{key: value for key, value in fixtures.items() if key in taken}, **arguments}
+        run = _skipped(marks, name) or functools.partial(check, **arguments)
+        under = generation
+        if under is None and hasattr(check, "covers"):
+            under = check.covers(**arguments).get("generation")
+        cells.append(Cell(f"{name}: {label}" if label else name, run, under))
+    return cells
+
+
+def _parameter_grid(check) -> Iterable[tuple[str, dict, list]]:
+    """Each parameter set of `check`'s own `pytest.mark.parametrize` marks (their product, as pytest
+    collects them): its label, its arguments by name, and its marks, `check`'s own with the set's."""
+    marks = list(getattr(check, "pytestmark", []))
+    grids = [_parameter_sets(mark) for mark in reversed(marks) if mark.name == "parametrize"]
     for combination in itertools.product(*grids) if grids else [()]:
-        arguments = {name: value for name, value in fixtures.items() if name in taken}
-        own, labels = list(marks), []
+        arguments, own, labels = {}, list(marks), []
         for label, values, set_marks in combination:
             labels.append(label)
             arguments.update(values)
             own += set_marks
-        run = _skipped(own, name) or functools.partial(check, **arguments)
-        cells.append(Cell(f"{name}: {'-'.join(labels)}" if labels else name, run, generation))
-    return cells
+        yield "-".join(labels), arguments, own
+
+
+def cell(family: str, covers: Callable[..., dict[str, str]]) -> Callable:
+    """Marks a cell function one of `family`'s kernel matrix cells (tests/kernel_matrix.py): `covers` maps
+    a parameter set's arguments to the combination of the family's axes its cell covers, whose
+    `generation` the cell runs under (`cells_of`)."""
+    def marked(check):
+        check.family, check.covers = family, covers
+        return check
+    return marked
+
+
+def covered(check) -> list[tuple[str, dict[str, str]]]:
+    """Each cell of a matrix cell function (`cell`) by its label beside the combination it covers, read
+    from its parameter sets without running it."""
+    name = check.__name__.replace("_", " ")
+    return [(f"{name}: {label}", check.covers(**arguments)) for label, arguments, _ in _parameter_grid(check)]
 
 
 BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"

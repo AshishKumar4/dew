@@ -6,7 +6,9 @@ whose code renames every class and attribute (`renamed`), and a decoder built of
 Mixtral's routed experts and Gemma's (1 + w) norms (`mixed`). Each loads natively and its logits hold
 check 1 against its own code run by transformers, from that code's float64 twin.
 """
+import contextlib
 import json
+import shutil
 
 import jax
 import numpy as np
@@ -82,6 +84,55 @@ class MixedConfig(LlamaConfig):
     router_jitter_noise: float = 0.0
 '''
 
+LATENT = '''
+from torch import nn
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
+from transformers.models.olmo2.modeling_olmo2 import Olmo2DecoderLayer, Olmo2ForCausalLM, Olmo2Model
+
+from .configuration_latent import LatentConfig
+
+
+class LatentDecoderLayer(Olmo2DecoderLayer):
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        self.self_attn = DeepseekV3Attention(config, layer_idx)
+
+
+class LatentModel(Olmo2Model):
+    config_class = LatentConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.layers = nn.ModuleList(LatentDecoderLayer(config, index)
+                                    for index in range(config.num_hidden_layers))
+        self.post_init()
+
+
+class LatentForCausalLM(Olmo2ForCausalLM):
+    config_class = LatentConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LatentModel(config)
+        self.post_init()
+'''
+"""A decoder of DeepSeek V3's latent attention, its latents normed by Llama's RMSNorm, inside OLMo 2's
+output-normed layers of scale-first norms (ledger 3114), as remote code."""
+
+LATENT_CONFIG = '''
+from transformers.models.olmo2.configuration_olmo2 import Olmo2Config
+
+
+class LatentConfig(Olmo2Config):
+    model_type = "latent_olmo"
+    q_lora_rank: int | None = 24
+    kv_lora_rank: int = 16
+    qk_nope_head_dim: int = 16
+    qk_rope_head_dim: int = 8
+    v_head_dim: int = 16
+    rope_interleave: bool = True
+'''
+
 RENAMED_CONFIG = '''
 from transformers.models.llama.configuration_llama import LlamaConfig
 
@@ -139,24 +190,27 @@ SOURCES = {
     "mixed": ("mixed_parts", "mixed", lambda: MIXED, MIXED_CONFIG, "MixedConfig", "MixedForCausalLM"),
     "renamed-moe": ("renamed_moe", "renamedmoe", _renamed_mixtral, RENAMED_MOE_CONFIG, "RenamedMoeConfig",
                     "RenamedmoeForCausalLM"),
+    "latent": ("latent_olmo", "latent", lambda: LATENT, LATENT_CONFIG, "LatentConfig", "LatentForCausalLM"),
 }
 """Each source: its model_type, its modules' stem (`modeling_<stem>.py` and `configuration_<stem>.py`), its
 modeling code, its configuration code, and its config and causal LM classes."""
 
-FIELDS = {"renamed-moe": {"tie_word_embeddings": True}}
+FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
+          # The rotary turns DeepSeek's rotated slice of each head (`qk_rope_head_dim`).
+          "latent": {"head_dim": 8, "num_key_value_heads": 4}}
 """Each source's config fields beside `TINY`."""
 
-SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8}
+SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8}
 """Each source's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
-def write_source(directory, name: str, edit=lambda code: code) -> None:
+def write_source(directory, name: str, edit=lambda code: code, source: tuple | None = None) -> None:
     """The source's repository at `directory`: its code (`edit` of its modeling code), its config naming
     its classes by `auto_map`, and its weights at the probe's scatter (`scatter_weights`), saved by its
-    own class."""
+    own class; `source` in `SOURCES`' form where it is none of theirs."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    model_type, stem, modeling, configuration, config_class, model_class = SOURCES[name]
+    model_type, stem, modeling, configuration, config_class, model_class = source or SOURCES[name]
     directory.mkdir()
     (directory / f"modeling_{stem}.py").write_text(edit(modeling()))
     (directory / f"configuration_{stem}.py").write_text(configuration)
@@ -445,6 +499,57 @@ BUILT_IN = {
     "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
                  "conv_L_cache": 3, "num_dense_layers": 1, "num_experts": 8, "num_experts_per_tok": 2,
                  "moe_intermediate_size": 32, "routed_scaling_factor": 1.7},
+    "glm4": {"head_dim": None, "num_key_value_heads": 2, "attention_bias": True,
+             "partial_rotary_factor": 0.5},
+    "apertus": {"hidden_act": "xielu"},
+    "laguna": {"layer_types": ["full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+               "num_attention_heads_per_layer": [4, 8, 8, 4], "sliding_window": 6,
+               "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"], "num_experts": 8,
+               "num_experts_per_tok": 2, "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
+               "moe_routed_scaling_factor": 2.5, "moe_router_logit_softcapping": 3.0,
+               "rope_parameters": {
+                   "full_attention": {"rope_type": "yarn", "rope_theta": 500000.0, "factor": 4.0,
+                                      "original_max_position_embeddings": 16, "beta_slow": 1.0,
+                                      "beta_fast": 64.0, "attention_factor": 1.25,
+                                      "partial_rotary_factor": 0.5},
+                   "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0,
+                                         "partial_rotary_factor": 1.0}}},
+    "jamba": {"head_dim": None, "num_hidden_layers": 6, "attn_layer_period": 3, "attn_layer_offset": 1,
+              "expert_layer_period": 2, "expert_layer_offset": 1, "num_experts": 8, "num_experts_per_tok": 2,
+              "mamba_d_state": 8, "mamba_dt_rank": 8, "mamba_expand": 2, "mamba_d_conv": 4,
+              "use_mamba_kernels": False},
+    "falcon_h1": {"mamba_d_ssm": 128, "mamba_expand": 2, "mamba_n_heads": 8, "mamba_d_head": 16,
+                  "mamba_n_groups": 2, "mamba_d_state": 8, "mamba_chunk_size": 8, "mamba_rms_norm": True,
+                  "mamba_norm_before_gate": False, "embedding_multiplier": 2.5, "lm_head_multiplier": 0.25,
+                  "attention_in_multiplier": 0.8, "attention_out_multiplier": 0.6, "key_multiplier": 0.5,
+                  "ssm_in_multiplier": 1.3, "ssm_out_multiplier": 0.7, "mlp_multipliers": [0.9, 1.1],
+                  "ssm_multipliers": [1.1, 0.9, 1.2, 0.8, 1.05]},
+    "falcon_h1-norm-first": {"model_type": "falcon_h1", "mamba_d_ssm": 128, "mamba_expand": 2,
+                             "mamba_n_heads": 8, "mamba_d_head": 16, "mamba_n_groups": 2, "mamba_d_state": 8,
+                             "mamba_chunk_size": 8, "mamba_rms_norm": True, "mamba_norm_before_gate": True,
+                             "projectors_bias": True, "ssm_multipliers": [0.7, 1.2, 1.0, 0.9, 1.3]},
+    "falcon_h1-no-norm": {"model_type": "falcon_h1", "mamba_d_ssm": 128, "mamba_expand": 2,
+                          "mamba_n_heads": 8, "mamba_d_head": 16, "mamba_n_groups": 2, "mamba_d_state": 8,
+                          "mamba_chunk_size": 8, "mamba_rms_norm": False, "key_multiplier": 0.25},
+    "axk2": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8, "num_experts_per_tok": 2,
+             "n_shared_experts": 1, "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "n_group": 2, "topk_group": 1,
+             "routed_scaling_factor": 1.8, "index_n_heads": 16, "index_head_dim": 16, "index_topk": 6,
+             "gated_norm_rank": 4,
+             "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0, "beta_fast": 32.0,
+                                 "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                                 "original_max_position_embeddings": 16}},
+    "axk2-ungrouped": {"model_type": "axk2", "head_dim": None, "num_key_value_heads": 4,
+                       "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 1,
+                       "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
+                       "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "index_n_heads": 16,
+                       "index_head_dim": 16, "index_topk": 6, "gated_norm_rank": 4},
+    "laguna-per-channel": {"model_type": "laguna", "gating": "per-element",
+                           "layer_types": ["sliding_attention", "full_attention"] * 2,
+                           "num_attention_heads_per_layer": [8, 4, 8, 4], "sliding_window": 6,
+                           "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"], "num_experts": 8,
+                           "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+                           "shared_expert_intermediate_size": 32},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
@@ -459,11 +564,29 @@ convolutions between its attention layers, its modules under names of their own 
 balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
 first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
 rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
-and keys normed after their rotation, at its dynamic-alpha base."""
+and keys normed after their rotation, at its dynamic-alpha base; and GLM-4's sandwich-normed layers, its
+gate and up projections one fused Linear and its rotary turning adjacent pairs of half of each head
+(ledger 3077); and Apertus's ungated MLP, its activation xIELU with learned parameters and stored buffers,
+beside Qwen3's per-head query and key norms (ledger 3076); and Laguna's layers of two types, each its own
+query heads, window and rotary (a YaRN ramp over half of each full layer's head, its sliding layers' whole
+heads at their own base), its attention gated per head (or, `laguna-per-channel`, per channel) by a
+softplus, its routed layers past its first chosen by capped sigmoid scores and a correction bias beside a
+shared expert, their sum scaled (ledger 3070); and Jamba's Mamba layers, their raw step, B and C normed,
+between attention layers without positions, every second layer routed by a softmax over every expert
+whose chosen scores stay unrenormalized (ledger 3080); and Falcon-H1's Mamba-2 beside its attention in
+every layer, under its muP multipliers (its embedding's, its head's, each branch's input and output, its
+keys', its MLP's and its in projection's sections), its Mamba-2 output normed before or after its gate
+(`falcon_h1-norm-first`, with its out projection biased apart) or gated alone (`falcon_h1-no-norm`); and
+A.X-K2's latent attention, its query latent's normed and raw values projected together to its queries and
+an output gate, beside DeepSeek V3.2's indexer selecting six keys a query, its norms before its attention
+and before its routed feed-forwards gated by a low-rank map of their own output, its experts chosen within
+groups or (`axk2-ungrouped`) not (ledger 3080)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8}
+                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8, "laguna": 8, "laguna-per-channel": 8,
+                  "jamba": 8, "falcon_h1": 8, "falcon_h1-norm-first": 8, "falcon_h1-no-norm": 8,
+                  "axk2": 8, "axk2-ungrouped": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -475,18 +598,34 @@ STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
 """A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
 
-def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
+def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = (), *,
+                          fused: bool = False) -> None:
     """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as
     GLM-4.7-Flash's and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their
     projection, its output norm and a block, and GLM-4.7-Flash's copies of the trunk's table and head,
-    beside the trunk the source's own save writes; `extra` names more tensors under it."""
+    beside the trunk the source's own save writes; `extra` names more tensors under it. `fused` stores
+    the depth's experts as transformers' fused module holds them (`mlp.experts.gate_up_proj`,
+    `mlp.experts.down_proj`), not one by one."""
+    import re
+
     from safetensors.torch import load_file, save_file
 
     path = directory / "model.safetensors"
     tensors = load_file(path)
     last, depth = f"model.layers.{layers - 1}.", f"model.layers.{layers}."
-    tensors.update({depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
-                    if name.startswith(last)})
+    block = {depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
+             if name.startswith(last)}
+    if fused:
+        experts = {}
+        for name in list(block):
+            if (found := re.fullmatch(rf"{re.escape(depth)}mlp\.experts\.(\d+)\.(\w+)\.weight", name)):
+                experts.setdefault(found.group(2), {})[int(found.group(1))] = block.pop(name)
+        count = len(experts["gate_proj"])
+        block[depth + "mlp.experts.gate_up_proj"] = torch.stack(
+            [torch.cat([experts["gate_proj"][index], experts["up_proj"][index]]) for index in range(count)])
+        block[depth + "mlp.experts.down_proj"] = torch.stack([experts["down_proj"][index]
+                                                             for index in range(count)])
+    tensors.update(block)
     generator = torch.Generator().manual_seed(7)
     tensors.update({depth + "eh_proj.weight": torch.randn(width, 2 * width, generator=generator),
                     depth + "enorm.weight": torch.ones(width), depth + "hnorm.weight": torch.ones(width),
@@ -502,7 +641,8 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     of and its load leaves unread: a load reads the trunk alone, whether it keeps the depth or not
     (`prediction_depths=0`), and computes the same logits; the depth's copies of the table and head are
     the trunk's, so a save after the table changes writes the copy that reloads. A tensor under the depth
-    that is none of its own and no block's is refused."""
+    that is none of its own and no block's is refused; a depth stored with fused experts loads
+    too, its fused tensors kept whole (ledger 3141)."""
     from interop_support import tiny_config
     from safetensors import safe_open
     from transformers import AutoModelForCausalLM
@@ -528,6 +668,18 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     copy = f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
     with safe_open(tmp_path / "saved" / "model.safetensors", "np") as stored:
         np.testing.assert_array_equal(stored.get_tensor(copy), np.asarray(table) * 2)
+    # A depth stored with fused experts loads as the per-expert one does, its fused tensors kept whole
+    # for the save (ledger 3141).
+    model.save_pretrained(tmp_path / "fused")
+    with_prediction_depth(tmp_path / "fused", config.num_hidden_layers, config.hidden_size, fused=True)
+    fused = Pretrained.load(tmp_path / "fused", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(fused.model.apply(fused.variables, ids)),
+                                  np.asarray(trunk.model.apply(trunk.variables, ids)))
+    fused.save(tmp_path / "fused-saved")
+    gate_up = f"model.layers.{config.num_hidden_layers}.mlp.experts.gate_up_proj"
+    with (safe_open(tmp_path / "fused" / "model.safetensors", "np") as source,
+          safe_open(tmp_path / "fused-saved" / "model.safetensors", "np") as saved):
+        np.testing.assert_array_equal(saved.get_tensor(gate_up), source.get_tensor(gate_up))
     model.save_pretrained(tmp_path / "unknown")
     with_prediction_depth(tmp_path / "unknown", config.num_hidden_layers, config.hidden_size,
                           ("unknown.weight",))
@@ -570,10 +722,210 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
 
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case)
+    # The references select by torch's top-k, which breaks no tie as Dew's does: a draw a tie decides is
+    # none that clears.
+    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case,
+                               stable=False)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))
+
+
+LAGUNA_XS = {
+    "architectures": ["LagunaForCausalLM"], "model_type": "laguna", "vocab_size": 100352, "hidden_size": 2048,
+    "intermediate_size": 8192, "num_hidden_layers": 40, "num_attention_heads": 48, "num_key_value_heads": 8,
+    "head_dim": 128, "max_position_embeddings": 262144, "attention_bias": False, "rms_norm_eps": 1e-06,
+    "num_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512, "router_aux_loss_coef": 0.0, "bos_token_id": 2,
+    "eos_token_id": [2, 24], "pad_token_id": 9, "tie_word_embeddings": False, "gating": True,
+    "sliding_window": 512, "partial_rotary_factor": 0.5, "moe_routed_scaling_factor": 2.5,
+    "moe_apply_router_weight_on_input": False,
+    "rope_parameters": {
+        "full_attention": {"rope_theta": 500000.0, "rope_type": "yarn", "factor": 64.0,
+                           "original_max_position_embeddings": 4096, "beta_slow": 1.0, "beta_fast": 64.0,
+                           "attention_factor": 1.4158883083359672, "partial_rotary_factor": 0.5},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0}},
+    "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"] * 10,
+    "num_attention_heads_per_layer": [48, 64, 64, 64] * 10,
+    "mlp_layer_types": ["dense"] + ["sparse"] * 39}
+"""poolside/Laguna-XS.2's released config, its own-code `auto_map` aside (transformers builds the type)."""
+
+
+JAMBA_REASONING = {
+    "architectures": ["JambaForCausalLM"], "model_type": "jamba", "attention_dropout": 0.0,
+    "attn_layer_offset": 7, "attn_layer_period": 14, "bos_token_id": 1, "eos_token_id": [2, 519],
+    "expert_layer_offset": 1, "expert_layer_period": 2, "hidden_act": "silu", "hidden_size": 2560,
+    "intermediate_size": 8192, "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_state": 16,
+    "mamba_dt_rank": 160, "mamba_expand": 2, "mamba_proj_bias": False, "max_position_embeddings": 262144,
+    "num_attention_heads": 20, "num_experts": 1, "num_experts_per_tok": 1, "num_hidden_layers": 28,
+    "num_key_value_heads": 1, "num_logits_to_keep": 1, "output_router_logits": False, "pad_token_id": 0,
+    "rms_norm_eps": 1e-06, "router_aux_loss_coef": 0.001, "sliding_window": None, "tie_word_embeddings": True,
+    "use_cache": True, "use_mamba_kernels": True, "vocab_size": 65536}
+"""ai21labs/AI21-Jamba-Reasoning-3B's released config."""
+
+FALCON_H1_3B = {
+    "architectures": ["FalconH1ForCausalLM"], "model_type": "falcon_h1", "attention_bias": False,
+    "attention_dropout": 0.0, "attention_in_multiplier": 1.0, "attention_out_multiplier": 0.15,
+    "attn_layer_indices": None, "bos_token_id": 1, "embedding_multiplier": 5.656854249492381,
+    "eos_token_id": 11, "head_dim": 128, "hidden_act": "silu", "hidden_size": 2560, "initializer_range": 0.02,
+    "intermediate_size": 6144, "key_multiplier": 0.044194173824159216, "lm_head_multiplier": 0.015625,
+    "mamba_chunk_size": 128, "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_head": 128,
+    "mamba_d_ssm": 4096, "mamba_d_state": 256, "mamba_expand": 2, "mamba_n_groups": 1, "mamba_n_heads": 32,
+    "mamba_norm_before_gate": False, "mamba_proj_bias": False, "mamba_rms_norm": True, "mamba_use_mlp": True,
+    "max_position_embeddings": 131072, "mlp_bias": False, "mlp_expansion_factor": 8,
+    "mlp_multipliers": [0.3535533905932738, 0.078125], "num_attention_heads": 10, "num_hidden_layers": 32,
+    "num_key_value_heads": 2, "num_logits_to_keep": 1, "pad_token_id": 0, "projectors_bias": False,
+    "rms_norm_eps": 1e-05, "rope_scaling": None, "rope_theta": 100000000000.0, "ssm_in_multiplier": 0.5,
+    "ssm_multipliers": [0.3535533905932738, 0.25, 0.1767766952966369, 0.5, 0.3535533905932738],
+    "ssm_out_multiplier": 0.08838834764831845, "tie_word_embeddings": False, "use_cache": True,
+    "vocab_size": 65537}
+"""tiiuae/Falcon-H1-3B-Instruct's released config."""
+
+AXK2_RELEASE = {
+    "architectures": ["AXK2ForCausalLM"], "model_type": "axk2", "attention_bias": False,
+    "attention_dropout": 0.0, "attention_output_gate": True, "attn_gate_fused": True, "bos_token_id": 163691,
+    "dtype": "bfloat16", "eos_token_id": 163704, "first_k_dense_replace": 1, "gated_norm": True,
+    "gated_norm_rank": 16, "hidden_act": "silu", "hidden_size": 7168, "index_head_dim": 128,
+    "index_n_heads": 64, "index_topk": 2048, "initializer_range": 0.02, "intermediate_size": 18432,
+    "kv_lora_rank": 512, "max_position_embeddings": 262144, "moe_intermediate_size": 2048,
+    "moe_layer_freq": 1, "n_group": 8, "n_routed_experts": 256, "n_shared_experts": 1, "norm_topk_prob": True,
+    "num_attention_heads": 64, "num_experts_per_tok": 8, "num_hidden_layers": 61, "num_key_value_heads": 64,
+    "num_nextn_predict_layers": 0, "pad_token_id": 163692, "q_lora_rank": 1536, "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                            "weight_block_size": [128, 128],
+                            "modules_to_not_convert": ["lm_head", "W_up", "W_down", "weights_proj"]},
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000, "factor": 2.0, "beta_fast": 32.0,
+                        "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                        "original_max_position_embeddings": 131072},
+    "routed_scaling_factor": 2.5, "scoring_func": "sigmoid", "tie_word_embeddings": False, "topk_group": 4,
+    "topk_method": "noaux_tc", "use_cache": True, "v_head_dim": 128, "vocab_size": 163840}
+"""skt/A.X-K2's released config."""
+
+
+@pytest.mark.parametrize("released", [LAGUNA_XS, JAMBA_REASONING, FALCON_H1_3B, AXK2_RELEASE],
+                         ids=["laguna", "jamba", "falcon_h1", "axk2"])
+def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
+    """A release's config verifies from parts at the probe's sizes: Laguna-XS.2's 40 layers cut to the
+    five that hold each kind (`verify.shallow`), each layer's query heads shrunk with its key heads, so
+    its full and sliding layers keep their own counts; Jamba-Reasoning-3B's 28 cut to the eight that hold
+    its Mamba layers and its first attention layer; Falcon-H1-3B's, every layer Mamba-2 beside attention;
+    A.X-K2's 61 cut to its dense first and a routed one, its fp8 codec aside (ledgers 3070, 3080)."""
+    verdict = verify_mapping(released)
+    assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
+
+
+@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first", "axk2"])
+def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
+    """Apertus's xIELU parameters and the buffers Dew holds as constants, GLM-4's fused gate and up
+    Linear, which a load reads as two projections, Laguna's gate projection, router bias and shared
+    expert, which its load renames, Jamba's Mamba mixers and routers, Falcon-H1's mixers side by side and
+    A.X-K2's fused query and gate and gated norms, which its load renames, save back under their stored
+    names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
+    from interop_support import tiny_config
+    from safetensors.numpy import load_file
+    from transformers import AutoModelForCausalLM
+
+    fields = dict(BUILT_IN[case])
+    model_type = fields.pop("model_type", case)
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(tiny_config(model_type, **fields), dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path / "source")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded.save(tmp_path / "saved")
+    source, saved = (load_file(tmp_path / folder / "model.safetensors") for folder in ("source", "saved"))
+    assert set(saved) == set(source)
+    for name, tensor in source.items():
+        np.testing.assert_array_equal(saved[name], tensor, err_msg=name)
+        assert saved[name].dtype == tensor.dtype, name
+
+
+GROUPED = '''
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+from .configuration_grouped import GroupedConfig
+
+
+class GroupedForCausalLM(LlamaForCausalLM):
+    config_class = GroupedConfig
+'''
+"""Llama's causal LM as a repository's own type, whose checkpoint conversion renames by group."""
+
+GROUPED_CONFIG = '''
+from transformers.models.llama.configuration_llama import LlamaConfig
+
+
+class GroupedConfig(LlamaConfig):
+    model_type = "grouped_llama"
+'''
+
+
+@pytest.mark.parametrize("renamed_first", [False, True])
+def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory(tmp_path,
+                                                                                          renamed_first):
+    """A type of known parts whose checkpoint conversion renames a key by whether another is stored
+    (transformers' `GroupWeightRename`, as Kimi K2.5's vision tower's: an older checkpoint's `a_norm` is
+    the model's input norm and its `input_layernorm` the feed-forward's, a newer one stores the model's
+    own names) verifies from parts and loads either checkpoint as transformers' load reads it, over the
+    checkpoint's whole inventory (ledger 3114): both load to the same decoder, bit for bit, and its
+    translation over the older checkpoint's names maps them all. Each key is named as transformers' own
+    load names it, value for value, also where an ordinary renaming before the group takes `a_norm` (to
+    the feed-forward's norm), so the group never sees its first pattern's key and renames nothing
+    (`renamed_first`)."""
+    from safetensors.torch import load_file, save_file
+    from transformers.conversion_mapping import register_checkpoint_conversion_mapping
+    from transformers.core_model_loading import GroupWeightRename, WeightRenaming
+
+    renames = [GroupWeightRename(
+        source_patterns=[r"layers.(\d+).a_norm", r"layers.(\d+).input_layernorm"],
+        target_patterns=[r"layers.\1.input_layernorm", r"layers.\1.post_attention_layernorm"])]
+    if renamed_first:
+        renames.insert(0, WeightRenaming(r"layers.(\d+).a_norm", r"layers.\1.post_attention_layernorm"))
+    source = ("grouped_llama", "grouped", lambda: GROUPED, GROUPED_CONFIG, "GroupedConfig",
+              "GroupedForCausalLM")
+    # Saved under the model's own names (no conversion yet), the newer checkpoint; the older one renamed.
+    register_checkpoint_conversion_mapping("grouped_llama", [], overwrite=True)
+    write_source(tmp_path / "newer", "grouped", source=source)
+    register_checkpoint_conversion_mapping("grouped_llama", renames, overwrite=True)
+    path = tmp_path / "newer" / "model.safetensors"
+    newer = load_file(path)
+    held = (("post_attention_layernorm", "a_norm"),) if renamed_first else (
+        ("input_layernorm", "a_norm"), ("post_attention_layernorm", "input_layernorm"))
+    older = {}
+    for name, tensor in newer.items():
+        for own, stored in held:
+            if f".{own}." in name:
+                name = name.replace(f".{own}.", f".{stored}.")
+                break
+        older[name] = tensor
+    shutil.copytree(tmp_path / "newer", tmp_path / "older")
+    save_file(older, tmp_path / "older" / "model.safetensors", metadata={"format": "pt"})
+    assert any(".a_norm." in name for name in older) and not any(".a_norm." in name for name in newer)
+    # The older checkpoint's keys named as transformers' own load names them, value for value.
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import sources
+
+    theirs = AutoModelForCausalLM.from_pretrained(tmp_path / "older", trust_remote_code=True,
+                                                  dtype=torch.float32).state_dict()
+    names = sources.load_names(AutoModelForCausalLM.from_pretrained(
+        tmp_path / "newer", trust_remote_code=True, dtype=torch.float32), older.keys())
+    assert names is not None
+    for key, tensor in older.items():
+        np.testing.assert_array_equal(theirs[names(key).name].numpy(), tensor.numpy(), err_msg=key)
+    if renamed_first:
+        # Its save reverses the two renamings into one name (`a_norm` both), which no load reads back,
+        # so the probe, which loads its own save, has nothing to verify.
+        return
+    config = json.loads((tmp_path / "older" / "config.json").read_text())
+    verified = verify_mapping(config, remote=tmp_path / "older")
+    assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
+    verified.translate(config, older.keys())
+    loads = [Pretrained.load(tmp_path / folder, dtype="float32", attention_impl="reference",
+                             trust_remote_code=True) for folder in ("older", "newer")]
+    jax.tree.map(np.testing.assert_array_equal, loads[0].variables, loads[1].variables)
 
 
 def test_an_lfm2_of_convolutions_alone_assembles():
@@ -613,18 +965,79 @@ def test_closures_whose_containers_alias_apart_compute_apart():
     assert matched_class(Lfm2MoeShortConv, Lfm2ShortConv) is not None
 
 
-def test_a_biased_short_convolution_is_left_to_tier_3():
-    """LFM2's biased convolution zeroes its padded slots before its input projection, so they still convolve
-    their bias terms into the next real tokens' history, which Dew's held convolution keeps empty: tier 2
-    assembles none of it."""
+BIASED_CONV_SEEDS = 8
+"""The biased convolution's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tmp_path):
+    """LFM2's biased convolution zeroes its padded slots' input before its projections, so their bias
+    product reaches the real tokens' history after them (ledger 3165): tier 2 assembles it, and a
+    left-padded prompt prefilled through the cache and a token decoded after it give logits on par with
+    the source's forward over the same rows and mask, from its float64 twin (check 1); a paused slot of a
+    decode step, padding of no prompt, advances no convolution's history, and a continuation's masked
+    slot before its real token is no prompt's padding either: the real token reads as it would alone."""
     from interop_support import tiny_config
     from transformers import AutoModelForCausalLM
 
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_bias=True,
-                                                             layer_types=["conv", "full_attention"] * 2))
-    with pytest.raises(parts.Ambiguous):
-        parts.assemble(model)
+    def built(dtype):
+        return AutoModelForCausalLM.from_config(
+            tiny_config("lfm2", head_dim=None, conv_bias=True, layer_types=["conv", "full_attention"] * 2),
+            dtype=dtype)
+
+    torch.manual_seed(0)
+    model = built(torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", max_seq_len=32)
+    assert isinstance(verify_mapping(model.config.to_dict()), VerifiedMapping)
+    mask = np.ones((2, 12), bool)
+    mask[1, :5] = False
+    vocab = model.config.vocab_size
+
+    def draw(seed):
+        rng = np.random.default_rng([0x3165, seed])
+        return (rng.integers(0, vocab, (2, 12)).astype(np.int32),
+                rng.integers(0, vocab, (2, 1)).astype(np.int32))
+
+    def ours(ids, token):
+        _, cache = loaded.model.apply(loaded.variables, ids, attention_mask=mask, decode=True,
+                                      mutable=["cache"])
+        prompt, cache = loaded.model.apply({**loaded.variables, **cache}, ids, attention_mask=mask,
+                                           decode=True, mutable=["cache"])
+        step, _ = loaded.model.apply({**loaded.variables, **cache}, token, decode=True, mutable=["cache"])
+        return {"prompt": np.asarray(prompt, np.float64)[mask], "step": np.asarray(step, np.float64)[:, -1]}
+
+    def theirs(source, precision=None):
+        def run(ids, token):
+            joined = torch.from_numpy(np.concatenate([ids, token], 1)).long()
+            held = torch.from_numpy(np.concatenate([mask, np.ones((2, 1), bool)], 1)).long()
+            with (precision or contextlib.nullcontext)(), torch.no_grad():
+                logits = source(joined, attention_mask=held, use_cache=False).logits.double().numpy()
+            return {"prompt": logits[:, :-1][mask], "step": logits[:, -1]}
+        return as_given(run)
+
+    wide = float64_twin(model, lambda: built(torch.float64)).eval()
+    assert_as_exact(as_given(ours), theirs(model.eval()), draw, "a biased short convolution's padded rows",
+                    seeds=BIASED_CONV_SEEDS, truth_fn=theirs(wide, float64))
+
+    ids, token = draw(0)
+    _, cache = loaded.model.apply(loaded.variables, ids, attention_mask=mask, decode=True, mutable=["cache"])
+    _, cache = loaded.model.apply({**loaded.variables, **cache}, ids, attention_mask=mask, decode=True,
+                                  mutable=["cache"])
+    paused = np.array([[True], [False]])
+    _, stepped = loaded.model.apply({**loaded.variables, **cache}, token, attention_mask=paused, decode=True,
+                                    mutable=["cache"])
+    histories = [[np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+                  if "conv_state" in jax.tree_util.keystr(path)] for tree in (cache, stepped)]
+    assert histories[0]
+    for before, after in zip(*histories, strict=True):
+        np.testing.assert_array_equal(after[1], before[1])
+        assert not np.array_equal(after[0], before[0])
+    held = np.concatenate([token, token], axis=1)
+    continued, _ = loaded.model.apply({**loaded.variables, **cache}, held, attention_mask=np.array(
+        [[False, True], [False, True]]), decode=True, mutable=["cache"])
+    alone, _ = loaded.model.apply({**loaded.variables, **cache}, token, decode=True, mutable=["cache"])
+    np.testing.assert_array_equal(np.asarray(continued)[:, -1], np.asarray(alone)[:, -1])
 
 
 ERNIE_CLAMP_SEEDS = 8

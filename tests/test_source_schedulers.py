@@ -175,10 +175,11 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
 
 REPEATED_SEEDS = 8
 """Check 1's declared seeds for the repeated-model-time walks (`seeds_for`, paired)."""
+REPEATED_EULER_RANGE = {"sigma_min": 30000, "sigma_max": 80000}
 
 
 @pytest.mark.parametrize("kind, extra", [
-    ("EulerDiscrete", {"sigma_min": 30000, "sigma_max": 80000}),
+    ("EulerDiscrete", REPEATED_EULER_RANGE),
     ("KDPM2Discrete", {}),
     ("DPMSolverMultistep", {"solver_order": 1}),
 ])
@@ -187,6 +188,21 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     over drawn starting latents, each walked latent on par with the source's own float32 walk against
     the source's float64 walk (check 1). The float64 walk builds its tables in float64
     (`float64_scheduler`), at the float32 walk's integer times."""
+    _check_repeated_walk(kind, extra)
+
+
+def test_source_euler_walk_rounds_as_the_source_on_its_stored_rates():
+    """Hold the high-sigma walk to float64 on the stored float32 rates too.
+
+    Rebuilding the table in float64 includes table quantization in both arms'
+    errors. Widening the stored rates isolates the walk's arithmetic, where
+    summing the clean and noise components cancels terms of magnitude 80000
+    in the first step whose result is about 13000.
+    """
+    _check_repeated_walk("EulerDiscrete", REPEATED_EULER_RANGE, stored_rates=True)
+
+
+def _check_repeated_walk(kind, extra, *, stored_rates=False):
     import contextlib
 
     import torch
@@ -227,6 +243,7 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
 
     published = getattr(module, kind + "Scheduler").from_config(config)
     published.set_timesteps(6)
+    published_sigmas = published.sigmas.clone()
     published = published.timesteps.clone()
 
     def source_walk(initial, dtype):
@@ -234,6 +251,8 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
         with context:
             source = getattr(module, kind + "Scheduler").from_config(config)
             source.set_timesteps(6)
+            if stored_rates:
+                source.sigmas = published_sigmas.to(dtype)
             # A pipeline can choose its first sigma by index, without a model-time lookup.
             source.set_begin_index(0)
             if dtype == torch.float64 and not published.is_floating_point():

@@ -40,10 +40,10 @@ import dew
 from dew.accuracy import rms
 from dew.inference.serving import Server
 from dew.interop import Pretrained
+from dew.nn.categorical import token_log_probs
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.generation import chosen
 from dew.nn.kv_cache import KVCache
-from dew.objectives.base import token_log_probs
 from dew.sampling import Sampling
 from dew.sampling.text import decode_ops, prefill_state
 

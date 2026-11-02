@@ -1281,7 +1281,7 @@ and backward in ms, median of 20, jax 0.11.2:
 
 An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
 loses to the mask, and 64 wins at every document count. So flash takes packed calls wherever it
-takes the call, and `flash_refusal` takes a packed call there when its
+takes the call, and its requirements (`FLASH_SUPPORTS`) take a packed call there when its
 `Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`). A packed read declares the most
 documents its windows hold: what its plan or memory read placed in one, or a streamed pack's
 `segments`; a streamed pack without one declares the row length, which stays on the mask. Decision
@@ -3137,7 +3137,7 @@ jax 0.12.0.1.post25, each row one process:
     PYTHONPATH=src python tools/benchmark_kernels.py adam --state-dtype int8
     PYTHONPATH=src python tools/benchmark_kernels.py step --path lm-dense --batch 8 --remat full --state-dtype int8
 
-with `float32` and `bfloat16` for the other columns. `dew.optim.int8_moments` keeps each moment as torchao's `AdamW8bit` does: codes of Dettmers' dynamic map in blocks of 256 values, each block's largest magnitude in float32, a moment under 4096 values in float32. The update decodes a leaf's moments to fp32, runs optax's update and codes them again, a leaf at a time. Coding each value finds its nearest code among the six around an estimate, its decade by its logarithm and its place among the decade's evenly spaced values, each compared apart so the comparisons fuse with the rest of the coding (`dew.optim.quantized`), the code a search of the whole map gives. A search ran its eight halvings one after another: 60.39 ms an update, a 196.3 ms step and a 209.8 s compile, unrolled (`jnp.searchsorted`'s `scan_unrolled`); its default loop ran each halving over the whole moment and took a step's peak above fp32 state's. The coding is the update's added time: the step gives back 2.2 GB for 16 ms.
+with `float32` and `bfloat16` for the other columns. The int8 state (`OptimConfig.state_dtype='int8'`) keeps each moment as torchao's `AdamW8bit` does: codes of Dettmers' dynamic map in blocks of 256 values, each block's largest magnitude in float32, a moment under 4096 values in float32. The update decodes a leaf's moments to fp32, runs optax's update and codes them again, a leaf at a time. Coding each value finds its nearest code among the six around an estimate, its decade by its logarithm and its place among the decade's evenly spaced values, each compared apart so the comparisons fuse with the rest of the coding, the code a search of the whole map gives. A search ran its eight halvings one after another: 60.39 ms an update, a 196.3 ms step and a 209.8 s compile, unrolled (`jnp.searchsorted`'s `scan_unrolled`); its default loop ran each halving over the whole moment and took a step's peak above fp32 state's. The coding is the update's added time: the step gives back 2.2 GB for 16 ms.
 
 ### The vocabulary head: the compute dtype's product
 

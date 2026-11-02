@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,7 +69,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
               "dew.data.audio", "dew.data.preferences", "dew.data.prompts", "dew.data.processors",
               "dew.data.image_codec"]),
     ("Models", ["dew.registry", "dew.quantization", "dew.nn.backbones", "dew.nn.backbones.causal_transformer",
-                "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan", "dew.nn.kv_cache",
+                "dew.nn.backbones.decoder_block", "dew.nn.backbones.layer_plan",
+                "dew.nn.backbones.layer_names", "dew.nn.kv_cache", "dew.nn.mixers.parallel",
                 "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
                 "dew.nn.backbones.flux2",
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
@@ -77,8 +78,8 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
                 "dew.nn.dex", "dew.nn.progress", "dew.nn.memory", "dew.nn.ngpt", "dew.nn.hyper_connections",
                 "dew.nn.engram",
-                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
-                "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision", "dew.nn.nested",
+                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.algebra", "dew.nn.sharding",
+                "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision", "dew.nn.derivatives", "dew.nn.nested",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
@@ -105,7 +106,23 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
 # documented API. A landing snippet file shows only its marked regions.
 DEW_USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py",
          "tutorials/*.ipynb", "site/snippets/*.py", "site/src/data/*.py"]
-DEW_USAGE_SKIP = ("docs/research/", "docs/design/")
+MANIFEST = "site/src/manifest.mjs"
+"""The site's information architecture: the pages it shows (each item's `source`) and the folders it keeps
+in the repository (`repositoryOnly`), a page under one of them shown only where it is listed (`shown`)."""
+
+
+def shown(repo: Path, skip: tuple[str, ...] = ()) -> Callable[[str], bool]:
+    """Whether a repository path is a page the site shows a reader, read from the manifest (`MANIFEST`): every
+    check of what a reader sees runs on these, the architecture page among them, not on a folder list of its
+    own (review, train 456: a listed page under docs/design went unchecked). A package with no manifest shows
+    every path outside its folders `skip`."""
+    if not (repo / MANIFEST).is_file():
+        return lambda path: not path.startswith(skip)
+    text = (repo / MANIFEST).read_text()
+    listed = set(re.findall(r"source: '([^']+)'", text))
+    found = re.search(r"repositoryOnly = \[([^\]]*)\]", text)
+    kept = tuple(re.findall(r"'([^']+)'", found.group(1))) if found else ()
+    return lambda path: path in listed or not path.startswith(kept)
 
 
 
@@ -127,6 +144,8 @@ class Package:
     declared: str = "site/scripts/gen_api.py"  # the file declaring `groups` at any commit (`groups_at`)
     distribution: str = "dewml"  # the name pip installs the package by (`pinned`)
     usage_skip: tuple[str, ...] = ()
+    """Folders whose files show no reader Dew code, for a package without a site manifest (`MANIFEST`), whose
+    own pages decide instead (`usage_files`)."""
     special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
     fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
 
@@ -149,7 +168,7 @@ class Package:
 
 
 DEW = Package("dew", Path(__file__).resolve().parents[2], "https://github.com/AshishKumar4/dew/blob/main/",
-              DEW_GROUPS, usage=DEW_USAGE, usage_skip=DEW_USAGE_SKIP)
+              DEW_GROUPS, usage=DEW_USAGE)
 P = DEW
 
 
@@ -532,10 +551,12 @@ def import_statements(code: str) -> Iterator[ast.ImportFrom]:
 
 
 def usage_files() -> Iterator[tuple[str, Path]]:
+    """Each file of `P.usage` a reader sees (`shown`)."""
+    visible = shown(P.repo, P.usage_skip)
     for glob in P.usage:
         for path in sorted(P.repo.glob(glob)):
             relative = path.relative_to(P.repo).as_posix()
-            if not relative.startswith(P.usage_skip):
+            if visible(relative):
                 yield relative, path
 
 

@@ -254,6 +254,7 @@ seams: "decoder-families": {
 		QWEN3_5_TEXT:         "Qwen3_5ForCausalLM (qwen3_5_text)"
 		QWEN3_MOE:            "Qwen3MoeForCausalLM (qwen3_moe)"
 		QWEN3_NEXT:           "Qwen3NextForCausalLM (qwen3_next)"
+		QWEN3_VL_MOE_TEXT:    "Qwen3VLMoeTextModel (qwen3_vl_moe_text)"
 		QWEN4_EXP_TEXT:       "Qwen4ExpForCausalLM (qwen4_exp_text)"
 		STARCODER2:           "Starcoder2ForCausalLM (starcoder2)"
 	}

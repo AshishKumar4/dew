@@ -5,7 +5,7 @@ caller asked for, and keeps the declaration through every mainloop and its VJP's
 
 import dataclasses
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -135,3 +135,35 @@ class Exact:
     @property
     def shape(self) -> tuple:
         return self.value.shape
+
+
+@jax.tree_util.register_pytree_node_class
+class Scaled:
+    """A register operand stored scaled, its product taken back by `2**exponent` (traced: an fp16 part held
+    at its tile's, or each row's, largest magnitude's scale): a mainloop issues its product into an
+    accumulator of its own, which no unscaled product shares, and restores it. A pytree of both, so a
+    branch's parts leave it (`lax.cond`)."""
+
+    def __init__(self, value: jax.Array, exponent: jax.Array):
+        self.value, self.exponent = value, exponent
+
+    def tree_flatten(self):
+        return (self.value, self.exponent), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del aux
+        return cls(*children)
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape
+
+
+class Blocks:
+    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
+    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
+    (`operands.Issuer.summed`), where unrolled ptxas held every block's at once."""
+
+    def __init__(self, name: str, left: Callable, right: Callable, count: int):
+        self.name, self.left, self.right, self.count = name, left, right, count

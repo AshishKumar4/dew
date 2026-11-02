@@ -46,12 +46,12 @@ HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
 BANKS = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
 
 
-def fit(layout, directory, steps):
+def fit(layout, directory, steps, optimizer=None, **options):
     checkpoints = Checkpoints(str(directory), keep=3)
     # A validation pass needs a consumer, so the objective that scores
     # features stands in for the plain regression and a metric reads them.
-    trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
-                      checkpoints=checkpoints)
+    trainer = Trainer(Features(), optimizer or optax.adam(0.1), key=jax.random.key(0), layout=layout,
+                      checkpoints=checkpoints, **options)
     data = Loader(
         train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH
     )
@@ -75,6 +75,21 @@ def test_host_resident_state_trains_the_same_model(tmp_path):
     on_host = fit(HOST, tmp_path / "host", 4)
     assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
     assert memory_kinds(on_host.variables) == memory_kinds(on_device.opt_state) == {"device"}
+    assert identical(on_host.variables, on_device.variables)
+    assert identical(on_host.opt_state, on_device.opt_state)
+    assert identical(on_host.ema, on_device.ema)
+
+
+def test_host_resident_state_trains_the_same_model_over_a_scaled_window(tmp_path):
+    """A window of two microbatches commits under a conditional, and a dynamically scaled loss admits it
+    on the finiteness of the whole committed state: each reads every leaf of the host-resident state at
+    once, which its commit then stages as one chunk (`dew.training.staging`), and a clipped Adam's run
+    trains the model, moments and average the device-resident run trains, bit for bit."""
+    options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)), "accumulation": 2,
+               "dynamic_scale": True}
+    on_device = fit(DEVICE, tmp_path / "device", 4, **options)
+    on_host = fit(HOST, tmp_path / "host", 4, **options)
+    assert memory_kinds(on_host.opt_state) == memory_kinds(on_host.ema) == {"pinned_host"}
     assert identical(on_host.variables, on_device.variables)
     assert identical(on_host.opt_state, on_device.opt_state)
     assert identical(on_host.ema, on_device.ema)

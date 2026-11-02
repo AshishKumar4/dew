@@ -91,7 +91,8 @@ class KPoolIndexer(IndexerFront, nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = self.declare_front()
+        # Its reference keeps no module in float32 (modeling_glm5_next.py:1358).
+        dense = self.declare_front(fp32_weights_at_half=False)
         self.wk = dense(self.head_dim, name='wk', kernel_axes=('embed', 'index'))
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763), as wide as
         # the indexer.
@@ -334,6 +335,8 @@ class KPoolSparseAttentionMixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
+    reads_phase = True
+    shares_prediction_index = True
 
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512

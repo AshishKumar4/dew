@@ -90,7 +90,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import declaring, held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -157,6 +157,7 @@ from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
+    deviceless_options,
     first_run,
     head_tile_of,
     local_devices,
@@ -188,11 +189,12 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
+from dew.training.stages import StageLocal
 from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
@@ -329,8 +331,7 @@ class Trainer(Generic[Loss, Effects]):
         # The plan of the last compiled step: its split, the rows of its
         # microbatch and every compile its search made (`Probe`).
         self.plan: JSON = None
-        # The check that the last compiled step fits (`memory_record`), and whether a step compiled
-        # since has yet to run once.
+        # The check that the last compiled step fits (`memory_record`), and whether a step since has run.
         self.memory: JSON = None
         self._unproven = False
         # The last validation of the state between steps (`validate`): as placed, then as each step holds it.
@@ -339,9 +340,8 @@ class Trainer(Generic[Loss, Effects]):
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
         self._fresh_compile_state(links)
-        # The microbatches a step's batch is read in, once decided (`split`,
-        # 1 where `whole`, a pooling state's window, or the first plan), which
-        # cut every batch the run reads (`_rows`, read off `fit`'s data).
+        # The microbatches a step's batch is read in, once decided (`split`, 1 where `whole`, a pooling
+        # state's window, or the first plan): they cut every batch the run reads (`_rows`).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
         # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
@@ -384,8 +384,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def initial_state(self, initializer: Initializer | None = None,
                       key: int | jax.Array | None = None) -> TrainState:
-        """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`).
-        It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
+        """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`),
+        every layer whole, which a stage-local step stacks by stage (`_staged_start`). It is pure, so `fit`
+        traces it once for its shapes and once, sharded, for its values.
 
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
@@ -419,8 +420,11 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        # The optimizer reads the axes the tree boxes (`optim.declaring`), Muon's grouping among them.
-        ema, opt_state = self.objective.ema, self.optimizer.init(params["params"])
+        # The optimizer reads the axes the tree boxes (`optim.declaring`), Muon's grouping among them, each
+        # rule a stage-local run's leaves as its layers (`StageLocal.held`).
+        with self._staging.held():
+            opt_state = self.optimizer.init(params["params"])
+        ema = self.objective.ema
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -438,6 +442,20 @@ class Trainer(Generic[Loss, Effects]):
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
         return state if not self.diloco else self.diloco.started(state, self.device_mesh)
+
+    def staged(self, state: TrainState) -> TrainState:
+        """`state` (`initial_state`'s, `stored`'s) held and placed as the step holds it, as `fit` starts."""
+        return self._staging.supplied(self._staging.received(self.objective, state), self.shardings)[0]
+
+    def stored(self, state: TrainState) -> TrainState:
+        """`state` with a stage-local run's layers back on `layers_N`, whole on every stage, every mirror
+        alike: for a reader by layer name (an export), at the cost of every layer on every device."""
+        return self._staging.stored(state)
+
+    def _staged_start(self, initializer: Initializer | None = None, key: int | jax.Array | None = None
+                      ) -> TrainState:
+        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`staged`)."""
+        return self._staging.state(self.initial_state(initializer, key), self._staging.staged)
 
     @property
     def key(self) -> jax.Array:
@@ -479,12 +497,20 @@ class Trainer(Generic[Loss, Effects]):
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
+    @functools.cached_property
+    def _staging(self) -> StageLocal:
+        """Where the step keeps each pipelined run stacked by stage (`StageLocal.of`); none for a CPU-owned
+        state, which streams its stack's banks, nor a DiLoCo run, whose groups' copies stack apart."""
+        built = self._config is not None and self._config.optimizer in STACKED_OPTIMIZERS
+        return StageLocal.of(self.objective, self.device_mesh, optimizer=None if built else self.optimizer,
+                             local=self.layout.stage_local and self.diloco is None and not self.host_master)
+
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
-        modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
+        modules boxed, as the optimizer's state was initialized; None for an optimizer given built."""
         if self._config is None:
             return None
-        with boxed(self._boxed_axes()):
+        with self._staging.held(boxed(self._boxed_axes())):
             return self._config.groups(state.variables["params"])
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -501,12 +527,13 @@ class Trainer(Generic[Loss, Effects]):
         stays where the realization reads it (`execution.resident`) for the whole run.
         """
         with self._declared():
-            return self._shardings(state)
+            return self._staging.placed(state, self._shardings)
 
     def _declared(self):
         """The context in which the layout, the optimizer and the step read the axes the objective's
-        modules box: every one, which placement filters by its rules (`Layout._declared`)."""
-        return boxed(self._boxed_axes())
+        modules box: every one, which placement filters by its rules (`Layout._declared`), each rule a
+        stage-local run's leaves as its layers (`StageLocal.held`)."""
+        return self._staging.held(boxed(self._boxed_axes()))
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -569,7 +596,7 @@ class Trainer(Generic[Loss, Effects]):
         mesh lacks.
         """
         self.scheduled(None if steps is None else steps // self.accumulation)
-        state = jax.eval_shape(self.initial_state)
+        state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state, capacity)[1]
         return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch), capacity)
@@ -589,7 +616,7 @@ class Trainer(Generic[Loss, Effects]):
             placement = {**placement, FROZEN: spread(
                 placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
         with self._declared():
-            self.layout.check(variables, placement, self.device_mesh)
+            self._staging.check(self.layout, variables, placement, self.device_mesh)
         self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
                                                          dataclasses.replace(shardings, variables=placement)),
                                            capacity)
@@ -600,7 +627,7 @@ class Trainer(Generic[Loss, Effects]):
     def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
         """`Layout.validate` of `placed`, read in every axis the modules box, which every process
         agrees, each reading its own devices' memory."""
-        with boxed(self._boxed_axes()):
+        with self._staging.held(boxed(self._boxed_axes())):
             return agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed, capacity=capacity))
 
@@ -622,14 +649,15 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        abstract, through = traced_start(self.initial_state, initializer, key)
+        abstract, through = traced_start(self._staged_start, initializer, key)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
         step = (None if checkpoints is None
                 else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
         if checkpoints is not None and step is not None:
-            abstract = abstract.with_window(checkpoints.accumulation_template(step))
+            abstract = self._staging.state(abstract.with_window(checkpoints.accumulation_template(step)),
+                                          self._staging.staged_shapes)
         shardings, _ = self._validated(abstract)
         return Start(initializer, key, abstract, through, step, shardings)
 
@@ -644,9 +672,9 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is None or resume is None:
             if self.host_master:
                 from dew.training.execution import placed_host
-                return (placed_host(self.objective, lambda: self.initial_state(initializer, key),
+                return (placed_host(self.objective, lambda: self._staged_start(initializer, key),
                                     self.state_mesh, self.device_mesh, shardings), shardings, None)
-            return (placed_start(self.initial_state, initializer, key, abstract, shardings, start.through,
+            return (placed_start(self._staged_start, initializer, key, abstract, shardings, start.through,
                                  self.device_mesh), shardings, None)
         if self.host_master and FROZEN in abstract.variables:
             from dew.training.execution import banked_frozen
@@ -655,8 +683,8 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
-                                              served=self.objective.served_groups(abstract.variables))
+        state, position = self._staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
+                                               share, served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
@@ -896,19 +924,19 @@ class Trainer(Generic[Loss, Effects]):
         parameters, and the links of the axes the step measured, none by
         default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with (on, pipeline_microbatches(self.microbatches) as schedule,
+        with (on, pipeline_microbatches(self.microbatches) as schedule, self._staging.held(),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None,
+    def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,
                    sampled: bool = False):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
-        state's fields `fetch` brings to the device only once its gradient is ready, and, `sampled`,
-        summarizes what the run inspects at its commit; or a custom step with no invented commit
-        telemetry, which reads it whole."""
+        state's fields `resting` places in host memory to the device only once its gradient is ready, a
+        chunk at a time (`Transaction.past`), and, `sampled`, summarizes what the run inspects at its
+        commit; or a custom step with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record, fetch=fetch, examples=self._examples,
+                               split=split, record=self.record, resting=resting, examples=self._examples,
                                inspection=self.inspection if sampled else None).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
@@ -1057,8 +1085,8 @@ class Trainer(Generic[Loss, Effects]):
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
         search = FitSearch(
-            lower, lambda candidate: step_options(self.objective, candidate.micro,
-                                                  candidate.prepared.variables, mesh),
+            lower, lambda candidate: deviceless_options(mesh, step_options(
+                self.objective, candidate.micro, candidate.prepared.variables, mesh)),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
@@ -1152,7 +1180,7 @@ class Trainer(Generic[Loss, Effects]):
         with group_of(state, batch) as (view, rows):
             shapes = None if self.step is not None else self._loss_shape(view, rows, window, split)
         if shapes is not None:
-            self._refuse_unpipelined(schedule)
+            self._staging.refuse_unpipelined(schedule, self.objective)
         prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
             state, rows, shapes, window=window, shape_only=shape_only), state, batch)
         # DiLoCo's groups read their own parameters, which no narrow copy shadows.
@@ -1174,8 +1202,8 @@ class Trainer(Generic[Loss, Effects]):
         # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
         # from its start.
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
-        body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
-                               if late else None, sampled)
+        body = self._step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
+                               sampled)
         body = body if self.diloco is None else self.diloco.step(body, self.device_mesh, split)
         moving, frozen = apart(shardings)
 
@@ -1214,16 +1242,6 @@ class Trainer(Generic[Loss, Effects]):
             return self._candidate(state, batch, schedule, placement, replicated, split, None, None,
                                    mesh=mesh, platforms=('cuda',)).lowered
 
-    def _refuse_unpipelined(self, schedule: Schedule) -> None:
-        """Refuse a stage axis under a model whose traced step ran no pipeline."""
-        stages = self.device_mesh.shape.get(STAGE_AXIS, 1)
-        if stages > 1 and not schedule.pipelined:
-            raise LayoutRefused(
-                f"the stage axis of {stages} holds a pipeline's stages of a stack of like layers (a "
-                f"decoder's, a DiT's or a ViT's blocks, a UNet level's transformers) that it splits "
-                f"evenly, and {type(self.objective).__name__}'s model runs none, so every stage would "
-                f"compute the whole step; give those devices to the data or fsdp axis")
-
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
         from dew.training.execution import HostExecution, stack_sites
@@ -1233,7 +1251,7 @@ class Trainer(Generic[Loss, Effects]):
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch, self.accumulation)
-            self._refuse_unpipelined(schedule)
+            self._staging.refuse_unpipelined(schedule, self.objective)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
             placement = self.shardings(prepared)
@@ -1289,7 +1307,8 @@ class Trainer(Generic[Loss, Effects]):
         resume: Resume = "auto",
         cooldowns: Cooldowns | None = None,
     ) -> TrainState:
-        """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says.
+        """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says;
+        return the state as the run holds it, which its model reads off the mesh (`off_stages`).
 
         `resume="auto"` continues the checkpointer's latest checkpoint where it holds one and otherwise
         starts afresh; "require" refuses to start afresh, for a job that must continue, and "never" refuses
@@ -1357,8 +1376,8 @@ class Trainer(Generic[Loss, Effects]):
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state, resume)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
             trained = dataclasses.replace(trained, compute=None)
-            # Whether this fit trained or found the run complete, and inside
-            # the lifecycle, so a selection that fails is the run's outcome.
+            # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
+            # that fails is the run's outcome.
             if restore_best and run.preempted is None:
                 trained = self._best_model(trained, run)
         finally:
@@ -1506,16 +1525,16 @@ class Trainer(Generic[Loss, Effects]):
                     run.first_step = time.perf_counter() - run.started
                 stopped, state = self._between_steps(plan, run, interval, state, shardings, position,
                                                      loss, aux, accepted)
-                if stopped:
-                    break
-            # The step row is complete once its scope exits; closing the
-            # window here keeps the last iteration inside the capture.
+            # The step row is complete once its scope exits; closing the window here keeps the last
+            # iteration inside the capture, and counts the run's last step where the window outlives it.
             if run.tracing and profile is not None:
                 run.traced += 1
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
-                    self._stop_trace(run, profile, profiler)
+                    run.close_window(profiler)
+            if stopped:
+                break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
     def _closed(self, run: FitRun, primary: BaseException | None,
@@ -1536,7 +1555,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.tracing and profile is not None:
             run.tracing = False
             assert profiler is not None
-            stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
+            stop_trace = functools.partial(run.close_window, profiler)
         error = primary
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
@@ -1577,15 +1596,15 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
-            # accumulation's mirrors of the parameters with them. Its run reads its data afresh: a clock
-            # of examples starts at none consumed, a run on another clock keeps none, and its schedules
-            # take the run's own form (`reclocked`).
-            initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
-            with boxed(self._boxed_axes()):
+            # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
+            # run reads its data afresh: a clock of examples starts at none consumed, a run on another clock
+            # keeps none, and its schedules take the run's own form (`reclocked`).
+            initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
+                initial, variables=dict(initial.variables))))
+            with self._staging.held(boxed(self._boxed_axes())):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)
-            shardings, _ = self._validated(initial)
-            supplied = jax.device_put(initial, shardings)
+            supplied, shardings = self._staging.supplied(initial, lambda staged: self._validated(staged)[0])
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started(resume)
         if checkpoints is not None and checkpoints.latest is not None:
@@ -1951,7 +1970,7 @@ class Trainer(Generic[Loss, Effects]):
         template = {name: jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), value)
             for name in MODEL_STATE if (value := getattr(final, name)) is not None}
-        model, _ = checkpoints.restore(template, step="best")
+        model, _ = self._staging.restore(checkpoints, template, "best")
         return dataclasses.replace(final, **{name: model[name] for name in template})
 
     def _take(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, *,
@@ -2044,7 +2063,7 @@ class Trainer(Generic[Loss, Effects]):
             run.tracing = False
             # The window outlived the run, and a trace left running takes the next one down with it.
             assert profiler is not None
-            self._stop_trace(run, profile, profiler)
+            run.close_window(profiler)
         interval.check_finite(current, self._display)
         if loss is not None:
             # The last step has to land before the wall time is read.
@@ -2141,8 +2160,8 @@ class Trainer(Generic[Loss, Effects]):
         formed = {} if warm else {name: value for summary in plan.summaries
                                   for name, value in summary.formed(scores).items() if name not in scores}
         if formed:
-            self._report_evaluation(dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed,
-                                                        previews=(), coordinated_batches=0))
+            dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed, previews=(),
+                                coordinated_batches=0)._report(self._display, self.tracker)
         return dataclasses.replace(evaluations[0], scores={**scores, **formed},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
@@ -2251,8 +2270,8 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
-            checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**run.stop_control, **interval.token_control},
+            checkpoints.save, step, self._staging.saved(state), position, metadata, ranking=ranking,
+            share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes(), rollout=None if weights_only else _rollout_saved(self.rollout))
         with run.held():
@@ -2278,9 +2297,10 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         write = functools.partial(
-            checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**run.stop_control, **interval.token_control}, rung=self._checkpoint_rung(),
-            artifact=self._artifact(), boxed=self._boxed_axes(), rollout=_rollout_saved(self.rollout))
+            checkpoints.save_local, step, self._staging.saved(state), position,
+            share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
+            rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes(),
+            rollout=_rollout_saved(self.rollout))
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2444,33 +2464,8 @@ class Trainer(Generic[Loss, Effects]):
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
-            self._report_evaluation(dataclasses.replace(evaluation, scores={
-                name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
+            dataclasses.replace(evaluation, scores={
+                name: value for name, value in evaluation.scores.items() if name not in (training or {})}
+            )._report(self._display, self.tracker)
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
-
-    def _report_evaluation(self, advanced: Evaluation) -> None:
-        """Print one evaluation on rank zero and log its previews and scores."""
-        def report() -> None:
-            if jax.process_index() != 0:
-                return
-            self._display.evaluation(advanced)
-            if self.tracker is not None:
-                for artifact in advanced.previews:
-                    self.tracker.artifact(artifact, advanced.step)
-                scalars = advanced.scalars
-                if scalars:
-                    self.tracker.log(scalars, advanced.step)
-
-        agreed("evaluation reporting", report)
-
-
-    # ------------------------------------------------------------------ Telemetry
-    # ------------------------------------------------------------------
-
-    def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
-        it until the run's cleanup waits for them and its outcome reports the window
-        (`_reported_outcome`)."""
-        stop_capture(profiler, run.loss)
-        run.profiled = (run.traced, run.current)
 

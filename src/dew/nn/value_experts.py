@@ -21,7 +21,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from .moe import ExpertLinear, Router, expert_compute_dtype, expert_dispatch, expert_projection
+from .moe import ExpertLinear, Layered, Router, expert_compute_dtype, expert_dispatch, expert_projection
 from .precision import at_least_fp32, float32_einsum
 
 if TYPE_CHECKING:
@@ -84,7 +84,8 @@ class RoutedValues(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         weights, indices = self.router(x)
         kernel = self.projection.kernel
-        compute = expert_compute_dtype(x, kernel, dtype=self.dtype)
+        compute = expert_compute_dtype(x, kernel.stack if isinstance(kernel, Layered) else kernel,
+                                       dtype=self.dtype)
         slots = expert_dispatch(functools.partial(self._project, dtype=compute), x, indices, (kernel,),
                                 (VALUE_EXPERT_AXES,), num_experts=self.spec.experts,
                                 dispatch=self.mixture.dispatch, capacity_factor=self.mixture.capacity_factor,

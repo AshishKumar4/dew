@@ -75,17 +75,9 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
-def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
-    """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row` (`within`)."""
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
-    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
-
-
 def dense(spans: KeySpans) -> jax.Array:
-    """`visible` over every query and key: `[B, Q, K]` boolean, by broadcasting alone (`within`), so a
-    batch-sharded call's spans take no gather."""
+    """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
+    alone, so a batch-sharded call's spans take no gather."""
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
@@ -554,6 +546,22 @@ class Initial:
     acc: jax.Array
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Pages:
+    """A paged cache's map from a row's keys to its pool (dew.nn.kv_cache's layout): `table` `[B, pages a
+    row]` int32, row `b`'s key `s` at offset `s % size` of page `table[b, s // size]` of a pool `[KV, P,
+    size, D]`, `size` keys a page (static)."""
+
+    table: jax.Array
+    size: int = dataclasses.field(metadata={"static": True})
+
+    @property
+    def keys(self) -> int:
+        """The keys a row's table maps, its pages' slots."""
+        return self.table.shape[1] * self.size
+
+
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
     dtype (`at_least_fp32`)."""
@@ -563,10 +571,11 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
 
 
 @dataclasses.dataclass(frozen=True)
-class Capped:
+class Capped(tuning.FieldHook):
     """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
     `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
-    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+    its static facts serves every layer of one cap (`tuning.lowered_once`), and its call reads its cap
+    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`)."""
 
     softcap: float
 
@@ -576,11 +585,11 @@ class Capped:
 
 
 @dataclasses.dataclass(frozen=True)
-class Biased:
+class Biased(tuning.FieldHook):
     """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
     tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
     `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
-    equal inner hooks (`Capped`)."""
+    equal inner hooks (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
 
     score_mod: Callable | None = None
 
@@ -1007,6 +1016,13 @@ class PaddedCall:
     output_params: tuple[jax.Array, ...]
     queries: int
     keys: int
+    pages: Pages | None = None
+    """A paged call's table (`Pages`), its `key` and `value` its pools flattened, `[KV, P·size, D]`."""
+
+    @property
+    def key_rows(self) -> int:
+        """The call's padded key count: a paged call's table's slots, else its keys' rows."""
+        return self.pages.keys if self.pages is not None else self.key.shape[1]
 
     def rows(self, array: jax.Array, fill: float = 0.0) -> jax.Array:
         """A `[B, H, Q, ...]` row statistic at the padded queries."""
@@ -1015,13 +1031,17 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int) -> PaddedCall:
+                block: int, pages: Pages | None = None) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
-    whole `block`s (a backend's largest tile), its head widths at powers of two."""
+    whole `block`s (a backend's largest tile), its head widths at powers of two. A paged call's (`pages`)
+    `key` and `value` are its pools `[KV, P, size, D]`, flattened, padded in their widths alone: its keys
+    are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
-    keys, value_width = key.shape[1], value.shape[-1]
+    keys, value_width = (key.shape[1] if pages is None else pages.keys), value.shape[-1]
     padded_q, padded_k = whole(max(queries, 1), block), whole(max(keys, 1), block)
     padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
+    if pages is not None and keys % block:
+        raise ValueError(f"a paged call's {keys} slots are no whole number of {block}-key blocks")
 
     def pad(array, rows, columns):
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
@@ -1032,13 +1052,20 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     def pad_ids(array: jax.Array | None, rows: int) -> jax.Array | None:
         return None if array is None else pad_rows(array, rows)
 
-    return PaddedCall(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d),
-                   pad(value, padded_k, padded_dv), pad_rows(spans.start, padded_q),
-                   pad_rows(spans.end, padded_q), pad_ids(spans.query_ids, padded_q),
-                   pad_ids(spans.key_ids, padded_k),
+    def pool(array: jax.Array, columns: int) -> jax.Array:
+        flat = array.reshape(array.shape[0], -1, array.shape[-1])
+        return jnp.pad(flat, ((0, 0), (0, 0), (0, columns - flat.shape[-1])))
+
+    if pages is not None:
+        padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
+    else:
+        padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
+    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value,
+                   pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
+                   pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-                   queries, keys)
+                   queries, keys, pages)
 
 
 def kept_dtype(dtype) -> str:
@@ -1227,8 +1254,12 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
     power, scale = prescale(query.dtype, width, scale)
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
+    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it, none at
+    # a query a score hook leaves seeing no key (its denominator 0, its output the reference's zero), whose
+    # weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`).
     dout = dout.astype(query.dtype)
+    if hooks.score_mod is not None:
+        dout = jnp.where(jnp.swapaxes(residuals[1], 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:

@@ -49,3 +49,47 @@ def test_a_map_task_draws_and_a_judge_does_not(monkeypatch, tmp_path):
     monkeypatch.delenv(DRAWS)
     monkeypatch.setenv(POOL, str(tmp_path))
     assert not drawing()
+
+
+def test_a_map_task_records_how_long_it_took_to_reach_its_units_and_to_draw_them(monkeypatch, tmp_path):
+    """Beside its record, a map task writes the seconds from its process's start to its units' first (its
+    fixed cost: imports, collection, the site's setup and compiles) and those its units took, so a run's map
+    tasks say what of each was paid before any draw (Main, 2026-11-02: measure before cutting it)."""
+    import json
+    import time
+
+    monkeypatch.setenv(DRAWS, "0:2")
+    monkeypatch.setenv(RECORDS, str(tmp_path))
+
+    def slow(first, last):
+        time.sleep(0.3)
+        return list(range(first, last))
+
+    assert record_units("timed", slow)
+    [seconds] = [json.loads(path.read_text()) for path in tmp_path.glob("*.seconds.json")]
+    assert seconds["start"] == 0 and seconds["stop"] == 2
+    assert seconds["draws"] >= 0.3 and 0 < seconds["before"] < time.time()
+    monkeypatch.delenv(DRAWS)
+    monkeypatch.setenv(POOL, str(tmp_path))
+    assert [payload for _, _, payload in pooled_units("timed", 2)] == [[0, 1]]
+
+
+def test_a_map_tasks_draw_seconds_are_the_time_its_units_took_whatever_the_wall_clock_did(monkeypatch,
+                                                                                          tmp_path):
+    """The seconds a map task's units took are measured on a clock that only moves forward: a wall clock set
+    back an hour while it draws (an NTP step) leaves them the time the draws took."""
+    import json
+    import time
+
+    monkeypatch.setenv(DRAWS, "0:2")
+    monkeypatch.setenv(RECORDS, str(tmp_path))
+    wall = time.time
+
+    def stepped(first, last):
+        time.sleep(0.2)
+        monkeypatch.setattr(time, "time", lambda: wall() - 3600)
+        return list(range(first, last))
+
+    assert record_units("stepped", stepped)
+    [seconds] = [json.loads(path.read_text()) for path in tmp_path.glob("*.seconds.json")]
+    assert seconds["draws"] >= 0.2

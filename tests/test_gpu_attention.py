@@ -27,6 +27,9 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
 import dataclasses
 import functools
 
+import attention_inplace_operands as inplace
+import attention_matrix as matrix
+import attention_triton_stages as triton_stages
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -93,9 +96,27 @@ def test_the_attention_kernels_run_on_this_gpu():
     run_cells([
         sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
         sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
+        # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
+        # race, attention_triton_stages).
+        *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
         *(Cell(f"the Pallas-Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
+        # The stability cases whose kernel interpreted passes the CPU suite's target (`GPU_ONLY`), compiled.
+        *(Cell(f"the accurate form is finite and as exact as the reference at fp32's edges: {family} {name}",
+               functools.partial(
+                   stability.test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
+                   family, name))
+          for family, name in sorted(stability.GPU_ONLY["accurate"])),
+        *(Cell(f"the Pallas-Triton backward reads a guarded forward's rows whatever its pass: {family}",
+               functools.partial(
+                   stability.test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass,
+                   family))
+          for family in sorted(stability.GPU_ONLY["frozen rows"])),
+        *(Cell(f"decode is finite and as exact as the reference at fp32's edges: {family} {form}",
+               functools.partial(stability.test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
+                                 family, form))
+          for family, form in sorted(stability.GPU_ONLY["decode"])),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic"), "sm90")
           for family in stability.MOSAIC_FAMILIES),
@@ -178,6 +199,14 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_matrix_holds_on_this_gpu():
+    """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
+    reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
+    deterministic ops (a deterministic run never derives the one launch its cells pin)."""
+    run_cells(cells_of(matrix.a_routes_training_step_is_on_par))
+
+
+@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_mosaic_template_holds_on_an_h100():
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
     long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
@@ -189,5 +218,7 @@ def test_the_mosaic_template_holds_on_an_h100():
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
+        *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
+        *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
     ])
 

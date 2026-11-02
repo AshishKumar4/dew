@@ -52,7 +52,7 @@ from dew.inference.banks import (
 )
 from dew.mesh import batch_axes
 from dew.nn.backbones.decoder_stack import DecoderBank
-from dew.nn.backbones.layer_plan import layer_index
+from dew.nn.backbones.layer_names import layer_index
 from dew.nn.kernels.options import Option, program
 from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows

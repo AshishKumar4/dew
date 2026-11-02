@@ -642,6 +642,24 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     assert not np.array_equal(logits, model.apply(variables, ids))
 
 
+def test_a_banked_runs_expert_lookup_reads_served_quantized_kernels():
+    """A decoder quantized for serving holds Qwix's int8 kernels with their scales (struct dataclasses) in its
+    params; a banked stack's fetch looks for expert kernels among them first (`moe.holds_experts`,
+    `moe.experts_apart`, `decoder_stack._apart`): it finds none in a dense decoder and keeps every parameter,
+    quantized ones whole, where it was."""
+    pytest.importorskip("qwix")
+    from dew.nn.moe import BANKED_EXPERTS, experts_apart, holds_experts
+
+    spec = Quantization(patterns=(".*_proj",))
+    model, _, variables, ids = quantized_forward(spec)
+    _, served = quantize_for_serving(model, variables, spec, ids)
+    assert not holds_experts(served["params"])
+    apart = experts_apart({"params": served["params"]})
+    assert not jax.tree.leaves(apart[BANKED_EXPERTS])
+    for kept, given in zip(jax.tree.leaves(apart["params"]), jax.tree.leaves(served["params"]), strict=True):
+        assert kept is given
+
+
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 @pytest.mark.parametrize("weight_only", [False, True])
 def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, weight_only):

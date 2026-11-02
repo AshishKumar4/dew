@@ -53,7 +53,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
 
                     @pl.loop(0, tile + 1)
                     def _(step):
-                        ring.load(first + step, x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])])
+                        block = x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])]
+                        ring.load(ring.turn(first + step), block)
 
                 ring.drain(jnp.int32(_first_step(TILES)))
 
@@ -64,9 +65,9 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     first = _first_step(tile)
 
                     def step_sum(step, total):
-                        slot = ring.acquire(first + step)
+                        slot = ring.acquire(ring.turn(first + step))
                         block = slot[:, pl.ds(wg * columns, columns)].astype(jnp.float32)
-                        ring.release(first + step)
+                        ring.release(ring.turn(first + step))
                         return total + block
 
                     zero = jnp.zeros((BLOCK[0], columns), jnp.float32)
@@ -129,7 +130,8 @@ FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
 
-def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
+def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
+                  in_flight: int = 0):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
@@ -161,7 +163,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0):
                 return carry, (product,)
 
             return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
-                               interpret, first=first)[1][0]
+                               interpret, first=first, unrolled=unrolled, in_flight=in_flight)[1][0]
 
         summed = family.scoped(walked, streams=allocated)
 
@@ -191,14 +193,20 @@ def _fed_expected(p, x):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("unrolled", [False, True])
+@pytest.mark.parametrize("in_flight", [0, 1])
 @pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
-def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo):
+def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo, in_flight,
+                                                                                  unrolled):
     """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
     over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
     exactly the product and its double; a walk whose steps start past 0 (a later key block's), its ring
-    counters from its own first (`first`), alike."""
+    counters from its own first (`first`), alike; a step's products running on past it or not, and the
+    walk a step a trip or a rotation of its ring a trip (`mosaic.stepping`: two whole rotations and the
+    fifth step alone)."""
     p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo)
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo, unrolled=unrolled,
+                        in_flight=in_flight)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
@@ -222,6 +230,41 @@ def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
 
+@pytest.mark.parametrize("unrolled", [False, True])
+@pytest.mark.parametrize("stages", [2, 3, 4, 5])
+def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, unrolled):
+    """`mosaic.stepping`'s loops, run in turn as a walk's are, take steps `lo` to `hi` once each and in order,
+    each at its counter's slot and rotation, for every start, length and ring origin over three rotations:
+    rolled, a step a trip; unrolled, the steps taken one a trip are the fewer than `stages` before the whole
+    rotations and the fewer after them, and a rotation's steps know the steps before them in it are the
+    range's."""
+    taken = []
+
+    def turned(index, turn, *state, before=0):
+        taken.append((index, turn.slot, turn.rotation, before))
+        return state
+
+    for first in (0, 3):
+        for lo in range(first, first + 3 * stages):
+            for hi in range(lo, lo + 3 * stages + 1):
+                taken.clear()
+                singly = 0
+                for loop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
+                    run = loop.step
+                    for trip in range(int(loop.lo), int(loop.hi)):
+                        before = len(taken)
+                        run(trip)
+                        singly += len(taken) - before == 1
+                assert [step[0] for step in taken] == list(range(lo, hi)), (first, lo, hi)
+                for index, slot, rotation, before in taken:
+                    assert (slot, rotation) == ((index - first) % stages, (index - first) // stages)
+                    assert index - before >= lo, (first, lo, hi, index)
+                if unrolled:
+                    assert singly <= 2 * (stages - 1), (first, lo, hi)
+                else:
+                    assert singly == hi - lo
+
+
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
@@ -241,10 +284,11 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
 
 
 def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
-    """`resources.plan` on an A100 for one mma.sync consumer (two programs a multiprocessor, 81 KiB each):
-    a launch of 16 KiB a stage holds two programs at four stages; one of 40 KiB a stage holds two programs
-    at its floor of two only where it fits, else falls to one program and deepens there; one past every
-    residency at its floor plans nothing."""
+    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread, which leave a
+    multiprocessor four programs (`Family.programs` at the launch's own registers): a launch of 16 KiB a
+    stage holds all four at the deepest ring a quarter of its shared memory holds; one of 40 KiB a stage
+    holds the most programs whose share holds its floor of two stages; one past every residency at its
+    floor plans nothing."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
@@ -255,8 +299,195 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        share = resources.program_shared(generation.shared_budget(target), 2)
+        block = generation.shared_budget(target)
         small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
-    assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
-    assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
+    assert small is not None and (small[0].programs, small[0].stages) == (
+        4, min(8, resources.program_shared(block, 4) // (16 * 1024)))
+    assert wide is not None and wide[0].programs == max(
+        programs for programs in (1, 2, 3, 4) if resources.program_shared(block, programs) >= 2 * 40 * 1024)
     assert past is None
+
+
+ISSUED = 64
+
+
+@dataclasses.dataclass(frozen=True)
+class _Call:
+    """A call an `operands.Issuer` reads: the bundle its products issue by, interpreted."""
+    family: mosaic.Family
+    interpret: bool = True
+
+
+def _issued_sums(a, b, c, d, exponent, *, retired: bool):
+    """`restored(a @ b, exponent) + c @ d` through one prepared-operand issuer (`operands.Issuer.summed`) on
+    warpgroup MMA, interpreted: `a` a scaled register operand (`product.Scaled`), its product in an
+    accumulator of its own and restored by `2**exponent`, `c` a plain register operand, each staged into its
+    product's buffer, `b` and `d` shared tiles (`operands.Parts`); `retired`, each product done before the
+    next is formed."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands, product
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    tile = ((ISSUED, ISSUED), jnp.bfloat16)
+    call = _Call(family)
+
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, exponent_gmem, out_gmem):
+        def scoped(staged, b_smem, d_smem):
+            b_smem[...], d_smem[...] = b_gmem[...], d_gmem[...]
+            issuer = operands.Issuer(call, {"scaled": (staged,), "plain": (staged,)},
+                                     restored=lambda value, k: value * jnp.exp2(k.astype(jnp.float32)))
+            products = iter([("scaled", product.Scaled(a_gmem[...], exponent_gmem[0]),
+                              operands.Parts((b_smem,), jnp.bfloat16)),
+                             ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16))])
+            out_gmem[...] = issuer.summed(products, retired=retired)
+
+        pl.run_scoped(scoped, *(plgpu.SMEM(*tile) for _ in range(3)), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="issued")(a, b, c, d, exponent)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("retired", [False, True])
+def test_a_scaled_operands_product_is_summed_apart_and_restored(retired):
+    """Interpreted: a scaled operand's product restored by its power of two and a plain one's, summed by one
+    issuer, the plain product staged into the same buffer the scaled one's operand used: exactly
+    `2**k a @ b + c @ d`, products retired one at a time or not."""
+    keys = jax.random.split(jax.random.key(2), 4)
+    a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
+    exponent = jnp.array([3], jnp.int32)
+    summed = _issued_sums(a, b, c, d, exponent, retired=retired)
+    f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
+    np.testing.assert_array_equal(np.asarray(summed), 8 * f32[0] @ f32[1] + f32[2] @ f32[3])
+
+
+def _carried_sums(a, b, c, d):
+    """`a @ b + c @ d` issued in place into one accumulator a walk carries (`Issuer.summed`'s `into`),
+    interpreted: `a` a register left operand its product takes in registers (its buffers a count, wgmma's
+    register form), `c` staged into a shared buffer, `b` and `d` shared tiles, both products retired."""
+    from dew.nn.kernels.templates import mosaic_sm90, operands
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    call = _Call(family)
+
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, out_gmem):
+        def scoped(staged, b_smem, d_smem):
+            b_smem[...], d_smem[...] = b_gmem[...], d_gmem[...]
+            issuer = operands.Issuer(call, {"registered": 1, "plain": (staged,)})
+            products = (("registered", a_gmem[...], operands.Parts((b_smem,), jnp.bfloat16)),
+                        ("plain", c_gmem[...], operands.Parts((d_smem,), jnp.bfloat16)))
+            out_gmem[...] = issuer.summed(products, retired=True, into=family.zeros((ISSUED, ISSUED)))
+
+        pl.run_scoped(scoped, *(plgpu.SMEM((ISSUED, ISSUED), jnp.bfloat16) for _ in range(3)),
+                      collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((ISSUED, ISSUED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="carried")(a, b, c, d)
+
+
+@INTERPRETS
+def test_products_issue_in_place_into_a_carried_accumulator():
+    """Interpreted: a register-operand product and a staged one, issued into one carried accumulator in
+    place: exactly `a @ b + c @ d`."""
+    keys = jax.random.split(jax.random.key(3), 4)
+    a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
+    f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
+    np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
+
+
+def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
+    """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
+    registers would hold sixteen programs: on an A10 and an RTX PRO 6000, twelve, their 1536 resident
+    threads' worth of its one warpgroup; on an A100 with its 2048, sixteen."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    def scope(stages: int) -> resources.Scope:
+        return resources.Scope(program=(plgpu.SMEM((stages * 1024,), jnp.uint8),))
+
+    launch = resources.Launch(scope, consumers=1, registers=32, floor=1)
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+    for name, most in (("sm86", 12), ("sm120", 12), ("sm80", 16)):
+        with generation.assumed(name):
+            found = resources.plan([launch], family, generation.gpu_target())
+        assert found is not None and found[0].programs == most, name
+
+
+def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_flight():
+    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer shaped as the 27B gated
+    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers): one program five deep, 184
+    KiB in flight, where its most programs, two one deep, held 74 KiB and slowed its walk
+    (`resources.hidden`); a launch of one stage, 64 KiB at 128 registers, its most programs, three (their
+    75 KiB shares and 136-register raises hold it, four's 56 KiB and 104 do not), thrice one's bytes in
+    flight."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    def launch(fixed: int, step: int, registers: int, most: int) -> resources.Launch:
+        def scope(stages: int) -> resources.Scope:
+            return resources.Scope(program=(plgpu.SMEM((fixed + stages * step,), jnp.uint8),))
+
+        return resources.Launch(scope, consumers=1, registers=registers, floor=1, most=most)
+
+    with generation.assumed("sm90"):
+        family, target = bundles.of("sm90", jnp.bfloat16), generation.gpu_target()
+        (states,) = resources.plan([launch(42016, 36912, 96, 8)], family, target)
+        (single,) = resources.plan([launch(65536, 0, 128, 1)], family, target)
+    assert (states.programs, states.stages) == (1, 5)
+    assert (single.programs, single.stages) == (3, 1)
+
+
+def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
+    """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
+    the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
+    (`Family.registers`): a raise to the instruction's 256 made ptxas spill a launch it otherwise compiled
+    spill-free at any raise from 192 to 248."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+    assert resources.raised_registers(1, 1) == 248
+    assert family.registers(1) == 248
+
+
+def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
+    """One warpgroup-MMA consumer beside its producer on an H100, at one to four programs a multiprocessor:
+    the compile gate holds it at each residency to the registers its launch raises it to there
+    (`RegisterModel.cap`, `raised_registers`: 248, 232, 136 and 104), where its cap at three programs was the
+    multiprocessor's share less the producer's, 144, past the launch's raise, so a kernel of 137 to 144
+    registers passed the gate and spilled."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+        model = resources.register_model(family, 1, None)
+    assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
+
+
+def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
+    """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
+    dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
+    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each member its own
+    place: a launch writing a value of its own into each view (`stacked_views`) reads each back apart
+    (`stacked_read`), in its shapes' order."""
+    shapes = [(2, 3), (4,), (2, 3)]
+
+    def written(*refs):
+        for index, view in enumerate(mosaic.stacked_views(refs, groups)):
+            view[...] = jnp.full(view.shape, index + 1.0)
+
+    launched = mosaic.checked(written, "probe")
+
+    def apart():
+        launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
+
+    groups = mosaic.stacked_groups(shapes)
+    with pytest.raises(ValueError):
+        jax.jit(apart).trace()
+
+    def stacked():
+        refs = mosaic.stacked_zeros(shapes, groups)
+        launched(*refs)
+        return mosaic.stacked_read(refs, groups)
+
+    for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
+        np.testing.assert_array_equal(array, np.full(shape, index + 1.0))

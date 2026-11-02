@@ -415,7 +415,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 | --- | --- |
 | Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. A step over a model that reads the run's progress (`dew.nn.progress.ReadsProgress`, a DEX decoder) passes it `Progress(state.updates)` and its factory is wrapped, `Trainer(step=PassesProgress(make_my_step))`; the trainer refuses that model under any other custom step, which would train it at the run's end. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
-| Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
+| Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`), each stage's layers and their optimizer state stored on that stage's devices alone (`dew.training.stages`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |
 
 ## 8. How to build against this design

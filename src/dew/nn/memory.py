@@ -89,7 +89,13 @@ from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
-from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
+from dew.quantization import (
+    LinearProducts,
+    decoded_frozen_fp8,
+    decoded_stored,
+    moving_weights,
+    quantized_products,
+)
 
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .mlp import GatedMLP
@@ -231,7 +237,7 @@ class MLPMemory(nn.Module):
         return x
 
 
-class InContextMemory(nn.Module):
+class InContextMemory(LinearProducts):
     """The in-context memory layer `[B, S, D] -> [B, S, D]` (the module docstring).
 
     `network` is the inner network, any module that maps one vector of the view's width to one of the
@@ -380,15 +386,6 @@ class InContextMemory(nn.Module):
                                               if path not in held})))
         return tuple(heads)
 
-    def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name` (a head's network), or a module under it,
-        other than as a linear map of its input: as the Qwix quantization the call runs under quantizes
-        its activations or gradients (`dew.quantization.quantized_products`), and as a method
-        interceptor answers for itself (`dew.lora`'s dropout on a training forward, a checkpoint's input
-        quantization). A linear memory runs the shared recurrence only where every head is that map, by
-        the kernel its state moves (`_route`)."""
-        return quantized_products(self, name).inputs
-
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
         batch, length, _ = x.shape
@@ -471,8 +468,7 @@ class InContextMemory(nn.Module):
         quantized (Qwix's quantized weights, `dew.quantization.quantized_products`)."""
         hooks = self._recurrence()
         names = [f"head_{head}" for head in range(self.heads)]
-        if hooks is None or any(self.nonlinear_input(name) or quantized_products(self, name).weights
-                                for name in names):
+        if hooks is None or not all(self.linear_product(name) for name in names):
             return None
         return hooks
 

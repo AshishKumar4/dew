@@ -78,7 +78,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     (`Family.added`); where key heads are shared, each query head's dK and dV added into its key head's own
     (FlashAttention 3's grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step
     1.7% the faster causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), else
-    stored (their zeros cost an ungrouped D64 step 1.7%). Returns dQ `[B, Qp, H, D]`, dK and dV
+    stored (their zeros cost an ungrouped D64 step 1.7%). The grouped adds' zeros are one ref of both
+    (`mosaic.stacked_zeros`, `[2, B, Kp, KV, D]`): where XLA wraps the launch in a dynamic-slice fusion (a
+    step's stacked forward rows, sliced for this launch's operands), two refs of equal zeros were one buffer,
+    dK and dV each the sum of both (row 3180, ET-3180-PLAIN-h100). Returns dQ `[B, Qp, H, D]`, dK and dV
     `[B, Kp, KV, D]`, fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
@@ -89,11 +92,19 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped = heads != kv_heads
     leaves, treedef = jax.tree.flatten(spans)
+    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
+    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    groups = mosaic.stacked_groups(shapes)
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
-        dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
+        if grouped:
+            dq_ref, dkv_ref, *refs = refs
+            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
+        else:
+            dq_ref, dk_ref, dv_ref, *refs = refs
+        k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
@@ -155,14 +166,15 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
-    # dQ added into zeros in place, and grouped dK and dV: one copy, or dQ each consumer's own interpreted
-    # (`Family.added`), a consumer's keys its own.
+    # dQ added into zeros in place, and grouped dK and dV in one ref of both (`mosaic.stacked_zeros`): one
+    # copy, or dQ each consumer's own interpreted (`Family.added`), a consumer's keys its own.
     copies = consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
     if not grouped:
         dk, dv = launch(*operands)
         return jax.freeze(dq).sum(axis=0), dk, dv
-    dk, dv = (jax.new_ref(jnp.zeros(gradient.shape, jnp.float32)) for _ in range(2))
-    launch(*operands, dk, dv)
-    return jax.freeze(dq).sum(axis=0), jax.freeze(dk), jax.freeze(dv)
+    dkv = mosaic.stacked_zeros(shapes, groups)
+    launch(*operands, *dkv)
+    dk, dv = mosaic.stacked_read(dkv, groups)
+    return jax.freeze(dq).sum(axis=0), dk, dv

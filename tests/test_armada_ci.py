@@ -3,6 +3,7 @@
 import functools
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,56 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
     return loaded(tmp_path, monkeypatch)
+
+
+SITED = """
+import json
+import os
+
+import pytest
+
+
+def noted(name):
+    with open(os.environ["SEEN"], "a") as out:
+        out.write(json.dumps([name, {key: os.environ.get(key) for key in
+                                     ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")}]) + "\\n")
+
+
+def test_ordinary():
+    noted("ordinary")
+
+
+@pytest.mark.check1_shards(seeds=4, per_task=4)
+def test_check1():
+    noted("check1")
+
+
+@pytest.mark.shards(units=4, per_task=4)
+def test_witness():
+    noted("witness")
+"""
+
+
+@pytest.mark.parametrize("split", ["", "1/1", "test_check1.draws-0-4", "test_check1"])
+def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tasks_alone(ci, tmp_path,
+                                                                                        monkeypatch, split):
+    """A targeted run of a file's group (tmp/run_tests.py, the gangs) selects as CI's task does: a file's
+    group sets aside its sites, which run in their own tasks alone, a map task drawing its seeds into its
+    artifacts and the judge pooling them from its inputs (2026-11-02: a lane's targeted
+    chunk_adaptation#1/5 ran a site's every seed itself, 2233 s against CI's 8, and #2/5 timed out)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_sites.py"], split) == 0
+    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    unset = {"DEW_CHECK1_DRAWS": None, "DEW_CHECK1_RECORDS": None, "DEW_CHECK1_POOL": None}
+    expected = {"": [["ordinary", unset]], "1/1": [["ordinary", unset]],
+                "test_check1.draws-0-4": [["check1", {**unset, "DEW_CHECK1_DRAWS": "0:4",
+                                                      "DEW_CHECK1_RECORDS": str(tmp_path / "artifacts")}]],
+                "test_check1": [["check1", {**unset, "DEW_CHECK1_POOL": str(tmp_path / "inputs")}]]}
+    assert seen == expected[split]
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
@@ -93,6 +144,26 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
             "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
             "tests/test_new.py"}
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
+
+
+def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
+        ci, tmp_path, monkeypatch):
+    """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
+    recorded for a collection, and weighs that, so armada's heaviest-first order starts it beside the run's
+    other full tasks. Train 459's four collect tasks of 140 files, each weighed at the target, started last
+    and ran 485-910 s on Genoa hosts against 145 s on Turin ones; the run ended with the last of them."""
+    names = [f"tests/test_f{index:03}.py" for index in range(200)]
+    for name in names:
+        (tmp_path / name).write_text("")
+    monkeypatch.setattr(ci, "NEWEST_FILES", ())
+    # A collect task's rows split its seconds evenly: these files last ran on a fast host and a slow one.
+    rates = {ci.row("3.14", name, ci.COLLECT): 5.3 if index % 2 else 1.0 for index, name in enumerate(names)}
+    collecting = [entry for entry in ci.plan(120.0, {"rows": rates}) if entry["split"] == ci.COLLECT]
+    assert sorted(name for entry in collecting for name in entry["tests"].split()) == names
+    # 22 files fit the target at 5.3 s each.
+    assert len(collecting) == math.ceil(len(names) / 22), [entry["weight"] for entry in collecting]
+    assert all(entry["weight"] == len(entry["tests"].split()) * 5.3 <= 120.0 for entry in collecting), [
+        (len(entry["tests"].split()), entry["weight"]) for entry in collecting]
 
 
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):
@@ -970,6 +1041,41 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     (tmp_path / "runs").write_text("")
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:2], "3.12:tests/test_moved.py#2/2": nodes[2:]}
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
+
+
+def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with one name, on their own decorators, run in one group of their
+    split file, so the setup they share (a module-scoped fixture's making) is paid once: the plan cuts
+    the file's record and the split plugin its collected tests alike, the marked tests one weight at
+    the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
+    plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
+    yet stays at its own place, as the plan, reading the record, cuts as the task does. A mark written
+    elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
+    line, as the plan cannot read it."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_shared.py").write_text(
+        "from pathlib import Path\nimport pytest\n"
+        + "".join(("@pytest.mark.shared_setup('plan')\n" if index != 1 else "")
+                  + f"def test_{index}():\n"
+                  f"    with Path('runs').open('a') as runs: runs.write('{index}')\n" for index in range(4)))
+    nodes = [f"tests/test_shared.py::test_{index}" for index in range(4)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict.fromkeys(nodes[:3], 200.0)))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    together, alone = [nodes[0], nodes[2]], [nodes[1]]
+    assert {row["name"]: sorted(row["tests"]) for row in rows} == {
+        "3.12:tests/test_shared.py#1/2": together, "3.12:tests/test_shared.py#2/2": [*alone, nodes[3]]}
+    assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
+    assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
+    for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
+                      "@pytest.mark.shared_setup(NAME)\n"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'plan'\n{misplaced}def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            ci.plan(300.0, {})
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):

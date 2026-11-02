@@ -79,6 +79,36 @@ def float64_terms(fn, *args):
                                                    for energy, value in zip(energies, values, strict=True)])
 
 
+def compiled_terms(fn):
+    """`float64_terms` of `fn` as one compiled float64 program (`jax.jit`, traced once a signature): a check's
+    terms over its every draw on the device's own FP64 units, where `float64_terms` traces `fn` and
+    dispatches each of its equations from the host a draw (an H100's attention backward cells spent their
+    time on the host so, its GPU idle). A program whose evaluation reads its values on the host (a `cond`'s
+    branch, a `while`'s test) cannot trace so, and is evaluated by `float64_terms`."""
+    @jax.jit
+    def evaluated(*args):
+        closed = jax.make_jaxpr(fn)(*args)
+        values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
+        return values, [jnp.sqrt(jnp.asarray(_or_size(energy, value)))
+                        for energy, value in zip(energies, values, strict=True)]
+
+    hosted = False
+
+    def terms(*args):
+        nonlocal hosted
+        if not hosted:
+            try:
+                values, sizes = evaluated(*args)
+            except jax.errors.ConcretizationTypeError:
+                hosted = True
+            else:
+                tree = jax.tree.structure(jax.eval_shape(fn, *args))
+                return tree.unflatten(values), tree.unflatten([np.asarray(size) for size in sizes])
+        return float64_terms(fn, *args)
+
+    return terms
+
+
 def _evaluated(jaxpr, consts, args, given=None):
     """`jaxpr`'s outputs and their terms' energies, the sums of their squares
     (`float64_terms`), from `args` and the energies `given` for them (none for

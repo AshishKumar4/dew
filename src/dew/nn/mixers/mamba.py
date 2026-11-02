@@ -44,9 +44,10 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import recurrence_chunk
+from dew.nn.kernels import recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
@@ -82,8 +83,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
 
     def one_chunk(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
-        decay = jnp.exp(dt_c[..., None] * A)                # [B, C, D, N]
-        decay = jnp.where(reset_c[..., None, None], 0.0, decay)
+        # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
+        decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
+                                                   1.0 - reset_c[..., None, None].astype(work))
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
         # The reference's `combine_fn` (modeling_mamba.py:231-234).
         decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
@@ -123,6 +125,12 @@ class Mamba(nn.Module):
     false`, where Flax's Dense adds one; its conv's is `use_conv_bias`, true as published."""
     use_conv_bias: bool = True
     chunk_size: int = CHUNK_SIZE
+    step_norm_eps: float | None = None
+    """Where set, Jamba's RMSNorms of the raw step, B and C (`dt_layernorm`, `b_layernorm`, `c_layernorm`,
+    modeling_jamba.py:488-490, 557-560) at this epsilon, between `x_proj` and the step's projection and
+    the scan; None norms none, as Mamba's. `step_norm_after_cast` is their weight's place, after the cast
+    to the input's dtype (Llama's RMSNorm, Jamba's) or before it."""
+    step_norm_after_cast: bool = True
     init_std: float | None = None
     """Normal std of in_proj, x_proj and the conv taps; None keeps lecun normal."""
     output_init_std: float | None = None
@@ -162,6 +170,11 @@ class Mamba(nn.Module):
                             **normal_kernel(self.init_std))
         self.dt_proj = _StepProjection(self.intermediate_size, self.time_step_rank, dtype=self.dtype,
                                        precision=self.precision, name='dt_proj')
+        if self.step_norm_eps is not None:
+            norm = functools.partial(RMSNorm, epsilon=self.step_norm_eps,
+                                     scale_after_cast=self.step_norm_after_cast)
+            self.dt_layernorm, self.b_layernorm, self.c_layernorm = (
+                norm(name=name) for name in ('dt_layernorm', 'b_layernorm', 'c_layernorm'))
         # The reference's init (init_mamba_weights, modeling_mamba.py:337-343):
         # A_log = log(1..N) on every channel, D ones.
         self.A_log = self.param('A_log', _log_state_index, (self.intermediate_size, self.state_size))
@@ -211,6 +224,8 @@ class Mamba(nn.Module):
             xs = jnp.where(valid[:, :, None], xs, 0)
         raw, B, C = jnp.split(self.x_proj(xs), [self.time_step_rank, self.time_step_rank + self.state_size],
                               axis=-1)
+        if self.step_norm_eps is not None:
+            raw, B, C = self.dt_layernorm(raw), self.b_layernorm(B), self.c_layernorm(C)
         step = self.dt_proj(raw)
         if valid is not None:
             # A zero step neither decays nor writes the state.
@@ -284,6 +299,9 @@ class MambaMixer(MixerBase):
     false`, where Flax's Dense adds one; its conv's is `use_conv_bias`, true as published."""
     use_conv_bias: bool = True
     chunk_size: int = CHUNK_SIZE
+    step_norms: bool = False
+    """Whether the raw step, B and C are normed before the scan, Jamba's (`Mamba.step_norm_eps`), at the
+    block's epsilon and rounding."""
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
@@ -298,6 +316,8 @@ class MambaMixer(MixerBase):
             use_bias=self.use_bias,
             use_conv_bias=self.use_conv_bias,
             chunk_size=self.chunk_size,
+            step_norm_eps=ctx.norm_eps if self.step_norms else None,
+            step_norm_after_cast=ctx.scale_after_cast,
             init_std=ctx.init_std,
             output_init_std=ctx.output_init_std,
             dtype=ctx.dtype,

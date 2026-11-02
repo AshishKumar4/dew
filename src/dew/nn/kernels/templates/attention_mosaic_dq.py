@@ -17,8 +17,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _coords,
     _rows,
     _Spans,
+    issued_into,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -42,7 +44,9 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    # The logits' and dP's products read the keys and values transposed.
+    return scoped, family.streams(blocks, stages, consumers,
+                                  swizzles=transposed_swizzles(config, "keys", "values"))
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):
@@ -75,7 +79,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
-                                                summed=walk.summed, accurate=walk.accurate)
+                                                summed=walk.summed, accurate=walk.accurate, rows=True)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
         return row_sums, parts, keyed
@@ -87,15 +91,21 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
-    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
+    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate, rows=True)
     # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
     k_columns = k_slot.at[:, pl.ds(*share)]
-    dq_acc = family.register_products(dq_acc, parts, k_columns, walk.interpret)
+    dq_acc = issued_into(family, dq_acc, parts, k_columns, walk.interpret)
     if keyed is None:
         return rows, (dq_acc,)
     factor, keyed_parts = keyed
     if factor is None:
-        keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+    elif k_slot.dtype == jnp.float16:
+        # fp16's parts scaled (`product.Scaled`): the keyed sums rescaled by their row factor first, the
+        # tile's products then restored into them (`issued_into`).
+        keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
+                                             (), k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_acc, keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
         keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),

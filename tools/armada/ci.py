@@ -186,7 +186,9 @@ threads ended at interpreter exit), which no record sees; and the plan runs wher
 token is not. Across 34 suite runs no file was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
-COLLECT_TASKS = 4
+COLLECT_SECONDS = 6.0
+"""A file's collection where armada recorded none: past the slowest rate it has run at (train 459: 5.1 s a
+file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
@@ -772,16 +774,18 @@ RECORD_TRIES = 4
 
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order, but its check-1 sites',
-    which run in tasks of their own (`sites`)."""
-    tests: dict[str, list[float]] = {}
+    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's
+    place (`session.units`), as a cut takes them."""
+    nodes: dict[str, list[str]] = {}
     held: dict[str, dict[str, Mark]] = {}
-    for node, seconds in sorted(durations_record().items()):
+    record = durations_record()
+    for node in sorted(record):
         name = node.split("::")[0]
         if name not in held:
             held[name] = sites(name)
-        if site_name(node) not in held[name]:
-            tests.setdefault(name, []).append(seconds)
-    return tests
+        if session.test_name(node) not in held[name]:
+            nodes.setdefault(name, []).append(node)
+    return {name: session.unit_seconds(own, [record[node] for node in own]) for name, own in nodes.items()}
 
 
 def durations_record() -> dict[str, float]:
@@ -792,14 +796,13 @@ def durations_record() -> dict[str, float]:
 def members(name: str, split: str) -> list[str]:
     """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
     the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.groups`)."""
+    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together."""
     held = sites(name)
     recorded = {node: seconds for node, seconds in durations_record().items()
-                if node.split("::")[0] == name and site_name(node) not in held}
+                if node.split("::")[0] == name and session.test_name(node) not in held}
     ordered = sorted(recorded)
     index, count = (int(part) for part in split.split("/"))
-    run = session.groups([recorded[node] for node in ordered], count)[index - 1]
-    return ordered[run.start:run.stop]
+    return session.cut(ordered, [recorded[node] for node in ordered], count)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -989,9 +992,10 @@ INPUTS = "/armada/inputs"
 """Where a judge's task finds its map tasks' artifacts (armada's `{inputs}`), each task's under
 `<job>/<index>`, where armada names none (`armada_dir`)."""
 MAX_INPUTS = 1000
-"""The most tasks' artifacts one armada job takes as its inputs (armada's MAX_INPUT_RUNS, src/protocol.ts): a
-judges' job takes every map task its judges wait on, the judges of one environment and size together, so the
-plan's map tasks, every marked site's on every Python, stay within it (`refused_sites`)."""
+"""The most tasks' artifacts one armada job takes as its inputs (armada's MAX_INPUT_RUNS,
+src/protocol.ts): armada cuts the judges of one environment and size into as many judges' jobs as keep
+each within it (its `judgeChunks`), so a site's own map tasks, which one judge reads in one job, stay
+within it (`refused_sites`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1043,29 +1047,18 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         return {}
     found: dict[str, Mark] = {}
     read: set[int] = set()
-
-    def walked(body: list[ast.stmt], prefix: str) -> None:
-        for node in body:
-            if isinstance(node, ast.ClassDef):
-                walked(node.body, f"{prefix}{node.name}.")
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name[:4] != "test":
-                continue
-            for mark in node.decorator_list:
-                called = ast.unparse(mark.func) if isinstance(mark, ast.Call) else ""
-                kind = called.removeprefix("pytest.mark.")
-                if kind not in SHARDS or not isinstance(mark, ast.Call):
-                    continue
-                counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
-                          if isinstance(keyword.value, ast.Constant)}
-                if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
-                        and all(type(count) is int and count > 0 for count in counts.values())
-                        and prefix + node.name not in found):
-                    declared = counts[SHARDS[kind]]
-                    units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-                    found[prefix + node.name] = Mark(units, counts["per_task"], mark.lineno, declared)
-                    read.add(id(mark.func))
-
-    walked(tree.body, "")
+    for test, mark in session.decorated_tests(tree.body):
+        kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
+        if kind not in SHARDS:
+            continue
+        counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
+                  if isinstance(keyword.value, ast.Constant)}
+        if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
+                and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
+            declared = counts[SHARDS[kind]]
+            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
+            found[test] = Mark(units, counts["per_task"], mark.lineno, declared)
+            read.add(id(mark.func))
     unread = sorted(node.lineno for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute) and node.attr in SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
@@ -1077,12 +1070,6 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
     return found
 
 
-def site_name(node: str) -> str:
-    """Test node `node`'s test's name in its file, as `sites` names it: its function's, or a class's
-    method's `Class.test_name`, its parameters' ids aside."""
-    return node.partition("::")[2].split("[")[0].replace("::", ".")
-
-
 def draws_of(mark: Mark) -> list[tuple[int, int]]:
     """The units each map task of a site marked `mark` takes, at most its per_task each: together 0 to its
     units, every seed both of check 1's stages draw, or every unit of a `shards` test's work."""
@@ -1090,20 +1077,18 @@ def draws_of(mark: Mark) -> list[tuple[int, int]]:
 
 
 def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
-    """Refuse the marks of `marked` (each test file's sites, `sites`) where their map tasks on every Python
-    pass what one judges' job takes (`MAX_INPUTS`): armada would run every map task, then refuse to start the
-    judges' job, and the run would go ungraded. Counted on every Python whatever a run plans or keeps, as a
-    cold run plans every site on each and armada may hold all their judges in one job, so a mark is refused
-    on the run that adds it, naming each mark's line."""
-    counts = {(name, test): len(draws_of(mark))
-              for name, held in marked.items() for test, mark in held.items()}
-    total = sum(counts.values()) * len(PYTHONS)
-    if total > MAX_INPUTS:
-        each = "; ".join(f"{name}, line {marked[name][test].line}: {test}, {count} a Python"
-                         for (name, test), count in sorted(counts.items()))
-        raise SystemExit(f"the sites marked check1_shards or shards plan {total} map tasks over "
-                         f"{len(PYTHONS)} Pythons, past the {MAX_INPUTS} tasks' artifacts one armada judges' "
-                         f"job takes; give a map task more units (per_task): {each}")
+    """Refuse the marks of `marked` (each test file's sites, `sites`) whose own map tasks pass what one
+    judges' job takes (`MAX_INPUTS`): its judge reads them all in one job, which armada would refuse after
+    every map task ran, and the run would go ungraded; marks within it pass it together, armada cutting
+    their judges into jobs. A mark is refused on the run that adds it, naming its line."""
+    over = {(name, test): count for name, held in marked.items() for test, mark in held.items()
+            if (count := len(draws_of(mark))) > MAX_INPUTS}
+    if over:
+        each = "; ".join(f"{name}, line {marked[name][test].line}: {test}, {count} map tasks"
+                         for (name, test), count in sorted(over.items()))
+        raise SystemExit(f"a site marked check1_shards or shards plans more map tasks than the {MAX_INPUTS} "
+                         "tasks' artifacts its judges' job takes; give a map task more units (per_task): "
+                         f"{each}")
 
 
 def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = None) -> str:
@@ -1137,7 +1122,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 continue
             mark = held[test]
             whole = sum(seconds for node, seconds in record.items()
-                        if node.split("::")[0] == name and site_name(node) == test)
+                        if node.split("::")[0] == name and session.test_name(node) == test)
             maps = []
             for start, stop in draws_of(mark):
                 group = f"{test}.draws-{start}-{stop}"
@@ -1165,10 +1150,14 @@ def plan(target: float, timings: dict) -> list[dict]:
     # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
     cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    # Every file's check-1 sites its marks shard, refused where their map tasks outnumber what a judges' job
-    # takes (`refused_sites`).
+    # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
+    # judges' job takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
     refused_sites(shards)
+    # Every file's shared setups, read so a mark the plan cannot read refuses its file now
+    # (`session.shared_setups`), not where a cut first reads it.
+    for name in every:
+        session.shared_setups(name)
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
@@ -1220,16 +1209,28 @@ def plan(target: float, timings: dict) -> list[dict]:
                      "cache": cache, "whole": cells}
                     for entry in site_entries(python, marked, found, timings, target)]
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
-    # As many collect tasks as there are files to collect, up to COLLECT_TASKS: one that holds none reports no
-    # row its entry names, which armada cannot grade.
-    collecting = min(COLLECT_TASKS, len(rest))
-    for index in range(collecting):
-        names = rest[index::collecting]
-        entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
-                        "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
-                        "cache": cache, "whole": cells})
-    return entries
+    collecting = collect_entries(rest, timings, target)
+    return entries + [{**entry, "cache": cache, "whole": cells} for entry in collecting]
+
+
+def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
+    """The newest Python's tasks that import `names` without running them (`collect`): each at most
+    `target` seconds of files at the slowest per-file rate armada recorded for a collection (else
+    `COLLECT_SECONDS`), and weighed at that. A collect task's rows split its seconds evenly, and the same
+    files collect five times as long on one host class as on another, so the slowest rate keeps every task
+    within the target on any host; weighed at the target, train 459's four tasks of 140 files started last
+    and ran 485-910 s on Genoa hosts, and the run ended with them."""
+    rates = [seconds for name, seconds in timings.get("rows", {}).items()
+             if ":" in name and parsed_row(name)[0] == PYTHONS[-1] and parsed_row(name)[2] == COLLECT]
+    rate = max(rates, default=COLLECT_SECONDS)
+    # The files a task holds within the target, one where a file alone takes longer; and no task holds none:
+    # armada cannot grade a row its entry names that its task never reports.
+    each = max(math.floor(target / rate), 1)
+    count = math.ceil(len(names) / each)
+    return [{"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1], "tests": " ".join(held),
+             "split": COLLECT, "rows": [row(PYTHONS[-1], name, COLLECT) for name in held],
+             "weight": len(held) * rate}
+            for index, held in enumerate(names[at::count] for at in range(count))]
 
 
 MARKED = ("whole_suite", "release_env")
@@ -1315,10 +1316,12 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     """pytest's exit status on `arguments` (files, node ids and options) and `tests` in `split`'s group, run
     as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
     (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
-    chooses instead."""
-    return subprocess.run([*session.pytest_run(python, report), *arguments, *selection(list(tests), split)],
-                          env=session.pytest_environment(site_environment(SITE.fullmatch(split))),
-                          check=False).returncode
+    chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
+    tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
+    site = SITE.fullmatch(split)
+    run = selected(session.pytest_run(python, report), network=False, site=site is not None)
+    return subprocess.run([*run, *arguments, *selection(list(tests), split)],
+                          env=session.pytest_environment(site_environment(site)), check=False).returncode
 
 
 def flow_cells(cases) -> dict[str, dict]:
@@ -1952,14 +1955,18 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
     complete (its whole row, or every group of its cut) takes the times they observed where its record is
-    stale (`stale`); a file with a red or missing row keeps its entries, as does a file the verdict did not
-    run, and one the checkout has changed since the verdict's commit, whose rows observed tests it may no
-    longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids with main's old ones); a
-    file the checkout no longer has loses them. A reused row (the test cache) carries the times of the run
-    that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the record. A
-    site its file's marks shard (`sites`) keeps its entries: its judge's row times its pooling, no
-    measure of its draws, which the site's recorded seconds weigh before armada times its map tasks
-    (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    stale (`stale`); a file with a red or missing row keeps its entries, as does a file the verdict did
+    not run, and one the checkout has changed since the verdict's commit, whose rows observed tests it may
+    no longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids with main's old
+    ones); a file the checkout no longer has loses them. A file a task's deadline cut off, run whole,
+    takes the times its row observed of the tests it finished (all but the last, which the deadline
+    stopped) where its record lacks them: no green run would ever time it, and the plan cuts it by them, a
+    test it never reached weighing their mean (2026-11-02: base/kernels' test_algebra_laws, recorded
+    nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the test cache) carries the
+    times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
+    writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
+    its pooling, no measure of its draws, which the site's recorded seconds weigh before armada times its
+    map tasks (`site_entries`), and a judge armada did not run is a row of its task's name."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
@@ -1976,12 +1983,17 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         counts = {int(split_.split("/")[1]) for split_ in splits if split_}
         complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
                                                                       for group in range(1, count + 1)})
+        if splits == {""} and held[0].get("kind") == "deadline":
+            # Its last test, the one the deadline stopped, is timed only as far as it ran.
+            finished = list(held[0].get("tests", {}).items())[:-1]
+            kept.update({node: round(seconds, 3) for node, seconds in finished if node not in kept})
+            continue
         if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
             continue
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
         own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and site_name(node) not in marked}
+               if node.split("::")[0] == name and session.test_name(node) not in marked}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
@@ -2003,7 +2015,8 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     if seconds <= target or not own:
         return sum(own.values()) > target
     nodes = sorted(own)
-    recorded, ran = [own[node] for node in nodes], [observed[node] for node in nodes]
+    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
+    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:

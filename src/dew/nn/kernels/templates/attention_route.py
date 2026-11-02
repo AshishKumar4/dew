@@ -1,17 +1,17 @@
 """The attention template as a production route (`dew.nn.attention`'s `implementation='template'`): `attend`,
-the template's forward and backward under one `jax.custom_vjp`, on the mainloops the process's calls run on.
+the template's forward and backward under one `jax.custom_vjp`, on the mainloops the process's calls run
+on.
 
 On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
 backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the call on the device
-(`attention_mosaic.forward_takes`, `attention_mosaic.backward_takes`: its family has a bundle there, the call
-is one it takes and a config fits), else by legality on the Pallas-Triton mainloop (`attention_triton`, which
-walks no call's runs, `attention_triton.refused`). Everywhere else, or where neither takes the call, both run
-the plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
-the backward runs on whichever takes it by legality (a 16-bit call's fp16 backward on Triton's, which Mosaic's
-bf16 backward does not take). The route takes score hooks and the initial state. The caller
-applies an output hook past the kernel, because the template's backward takes the output before it
-(`templates/attention.py`'s `gradients`).
-"""
+(`attention_mosaic.forward_declined`, `attention_mosaic.backward_declined` none: its family has a bundle
+there, the call is one it takes and a config fits), else by legality on the Pallas-Triton mainloop
+(`attention_triton`, which walks no call's runs, `attention_triton.refused`). Everywhere else, or where
+neither takes the call, both run the plain-JAX mainloop (`attention_portable`). Every mainloop's training
+forward gives the same residuals, so the backward runs on whichever takes it by legality (a 16-bit call's fp16
+backward on Triton's, which Mosaic's bf16 backward does not take). The route takes score hooks and the initial
+state. The caller applies an output hook past the kernel, because the template's backward takes the output
+before it (`templates/attention.py`'s `gradients`). """
 
 import dataclasses
 import functools
@@ -105,7 +105,7 @@ def _on_gpu() -> bool:
     return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
-DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
+DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop takes none, "
              "and Mosaic's takes the weights hook next, ledger row 1521): a dropping call there runs the "
              "plain-JAX mainloop, so the selector leaves it to the reference path")
 """Why 'auto' leaves a dropping call on a GPU to the reference path (`drops`)."""
@@ -167,11 +167,11 @@ MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
         'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
-"""The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
-Triton one's, the plain-JAX one's, which a CPU runs. `generation.chosen(attention_mainloop=...)` names one
-for every pass in its block, which runs it or refuses it by name (`selection.select`); each pass reports its
-route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic template, with Mosaic's own
-reason."""
+"""The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the Pallas-Triton
+one's (a maintained backend, kernel-templates.md §0), the plain-JAX one's, which a CPU runs.
+`generation.chosen(attention_mainloop=...)` names one for every pass in its block, which runs it or refuses it
+by name (`selection.select`); each pass reports its route, so the kernel-route audit sees a call on a GPU that
+leaves the Mosaic template, with Mosaic's own reason."""
 
 
 def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:

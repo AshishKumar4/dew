@@ -1420,6 +1420,30 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     assert raised.type is GateFailure
 
 
+@pytest.mark.parametrize("planned", [False, True])
+def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
+    """A reference recorded on a CPU keeps the larger count a GPU's held-out paired sizing declared,
+    including every draw its second stage may read."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    draw, evaluate = _tiny_row_recording(_product)
+
+    def product(inputs):
+        return _product(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, product if planned else None,
+                                        summary=True, start=256)
+    seeds = int(recorded["site.seeds"])
+    assert seeds >= 256
+    assert len(recorded["site.input_digest"]) == (1 + REDRAW) * seeds
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                truth_fn=product)
+    assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",
+                    seeds=seeds, truth_fn=truth)
+
+
 def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
     """A summarized recording made in shards of seeds (`record_shard`), each drawn as one run draws it,
     and joined (`merge_shards`) is the recording `record_case`'s summary makes of the same reference:
