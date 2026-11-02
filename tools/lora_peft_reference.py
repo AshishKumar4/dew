@@ -198,13 +198,15 @@ def write_orders(out: Path) -> None:
 
 def drawn_axes(adapter) -> dict:
     """The axes the adapted model draws each parameter in (`dew.nn.sharding.boxed_axes`), its factors in
-    the box its kernel's axes give it: the table `residual_orders` reads a plain tree's axes from."""
+    the box its kernel's axes give it, by its path in the thawed tree an order permutes (`thaw`: the draw
+    holds its base frozen): the table `residual_orders` reads a plain tree's axes from."""
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.sharding import boxed_axes
+    from dew.batch import thaw
+    from dew.nn.sharding import abstract, boxed_axes
 
-    return boxed_axes(jax.eval_shape(adapter.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+    return boxed_axes(thaw(abstract(adapter.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32))))
 
 
 def adapter_orders(adapter) -> tuple[dict, set[str]]:
@@ -223,7 +225,8 @@ def adapter_orders(adapter) -> tuple[dict, set[str]]:
         residual_inputs = {
             "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
             for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
-            if parameter_path(path)[-1] == "lora_A" and (declared_axes(path, leaf.ndim) or (None,))[0] == "embed"}
+            if parameter_path(path)[-1] == "lora_A"
+            and (declared_axes(path, leaf.ndim) or (None,))[0] == "embed"}
     return whole, residual_inputs
 
 
