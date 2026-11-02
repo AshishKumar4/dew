@@ -2114,9 +2114,11 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_share_one_key_and_nam
     # Each ran first in a fresh container, so each keeps a key, and each read and ran the same files: one key,
     # whose rows a kept task still tells apart by their place (`green_key`).
     common = ci.shared("3.12")
-    keys = [ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
-                        "token")["key"] for name in "abc"]
-    assert None not in keys and len(set(keys)) == 1, keys
+    records = [ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common), "token")
+               for name in "abc"]
+    keys = [record["key"] for record in records]
+    inputs = [set(ci.inputs(f"tests/test_{name}.py", record["depends"])) for name, record in zip("abc", records)]
+    assert None not in keys and len(set(keys)) == 1, (inputs[0] ^ inputs[1], inputs[0] ^ inputs[2])
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
