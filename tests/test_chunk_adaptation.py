@@ -568,14 +568,7 @@ def test_a_chain_levels_damped_rate_holds_below_one_over_its_curvature(index):
                               {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
-    def curvature(at) -> float:
-        point, unflatten = jax.flatten_util.ravel_pytree(widened(at))
-        wide = widened((states, weighed, variables))
-        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector), *wide))(point))
-        return float(np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max())
-
-    with jax.enable_x64(new_val=True):
-        largest = [curvature(kernels), curvature(reached)]
+    largest = [largest_curvature(loss, at, (states, weighed, variables)) for at in (kernels, reached)]
     assert all(damped * value <= 1 for value in largest), (index, damped, largest)
     assert rate * largest[0] > 2 and damped * largest[0] >= MOVES, (index, damped * largest[0])
 
@@ -899,15 +892,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
-    def curvature(at) -> float:
-        """The largest |eigenvalue| of the loss's float64 Hessian in the kernels at `at`."""
-        point, unflatten = jax.flatten_util.ravel_pytree(widened(at))
-        wide = widened((variables, states, weighed))
-        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector), *wide))(point))
-        return float(np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max())
-
-    with jax.enable_x64(new_val=True):
-        largest = [curvature(kernels), curvature(reached)]
+    largest = [largest_curvature(loss, at, (variables, states, weighed)) for at in (kernels, reached)]
     assert all(damped * curvature <= 1 for curvature in largest), (head, parts, damped, largest)
     assert rate * largest[0] > 2
     assert damped * largest[0] >= MOVES, (head, parts, damped * largest[0])
@@ -959,6 +944,16 @@ def differentiated(fn):
     """`fn` of a draw differentiated in its variables and states under a cotangent (`with_gradients`)."""
     return lambda variables, hidden, targets, weights, cotangent: with_gradients(
         lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+
+
+def largest_curvature(loss, kernels, given: tuple) -> float:
+    """The largest |eigenvalue| of `loss(kernels, *given)`'s float64 Hessian in `kernels`, at float32
+    `kernels` and `given` widened."""
+    with jax.enable_x64(new_val=True):
+        point, unflatten = jax.flatten_util.ravel_pytree(widened(kernels))
+        wide = widened(given)
+        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector), *wide))(point))
+    return float(np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max())
 
 
 DAMPED_GRADIENT_SEEDS = {("documents", "up"): 32, ("packed", "up"): 128, ("padded", "up"): 64,

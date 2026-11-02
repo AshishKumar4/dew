@@ -31,11 +31,19 @@ from flax import linen as nn
 from dew.batch import token_coordinates
 from dew.nn.inputs import sequence_blocks
 from dew.nn.protocols import SteppedFeedForward
-from dew.objectives.lm.adaptation import CARRIED, Adapted, ChunkAdaptation, _moved, _rows, _stepped_mask
+from dew.objectives.lm.adaptation import (
+    CARRIED,
+    Adapted,
+    ChunkAdaptation,
+    _moved,
+    _rejoined,
+    _rows,
+    _stepped_mask,
+)
 
 
 def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.Array, weights: jax.Array,
-                   fields: Mapping[str, jax.Array], adaptation: ChunkAdaptation, *, predict: bool,
+                   fields: Mapping, adaptation: ChunkAdaptation, *, predict: bool,
                    logits: bool, train: bool = False, rngs=None) -> tuple[jax.Array, Adapted]:
     """Each target's next-token loss with the decoder's feed-forward blocks of `adaptation.layers`
     stepped in context (module docstring), over `inputs` `[B, S]` and their `targets` `[B, S]`, each
@@ -125,9 +133,7 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     (levels, partials, _), (losses, top, log_z, whole, states) = jax.lax.scan(
         jax.checkpoint(chunk_step), (started, zeros, caches), blocked)
 
-    def joined(value: jax.Array) -> jax.Array:
-        """A scan's `[chunks, B, chunk, ...]` output as the row's `[B, S, ...]`."""
-        return jnp.moveaxis(value, 0, 1).reshape(rows, chunks * chunk, *value.shape[3:])[:, :length]
+    joined = functools.partial(_rejoined, length=length)
 
     moved = None
     if adaptation.carry == "run":

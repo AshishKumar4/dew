@@ -388,8 +388,8 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     block = min(windows)
     straddles, weights, runs, keys = _laid_out(fields, weights, rows, length, adaptation, windows)
     chain = _Chain(model, variables, names, tuple(starts), adaptation, straddles, predict, rows)
-    head, levels_read = chain.bounds(hidden) if adaptation.damped else (None, None)
-    chain = dataclasses.replace(chain, head=head, read=levels_read)
+    if adaptation.damped:
+        chain = dataclasses.replace(chain, damping=chain.bounds(hidden))
     blocks = -(-length // block)
     # The last block's slots past the row weigh nothing and belong to the row's last window.
     edge = ((0, 0), (0, blocks * block - length))
@@ -404,10 +404,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     (levels, partials, energies, _, _), (losses, top, log_z, whole) = jax.lax.scan(
         jax.checkpoint(functools.partial(chain.block, logits=logits)), first, inputs)
 
-    def joined(value: jax.Array) -> jax.Array:
-        """A scan's `[blocks, B, block, ...]` output as the row's `[B, S, ...]`."""
-        return jnp.moveaxis(value, 0, 1).reshape(rows, blocks * block, *value.shape[3:])[:, :length]
-
+    joined = functools.partial(_rejoined, length=length)
     moved = None
     if adaptation.carry == "run":
         # Each row's levels with their open windows' steps applied.
@@ -424,9 +421,9 @@ class _Chain:
     `starts` (a chain's, by their `names`, or one level's). A level whose window closes inside a block
     finishes its gradient over the block's slots before the boundary (its tail) at its open version, the
     levels of smaller windows read there as their slots read them, as their boundaries fall on its own,
-    so the levels finish in order of their windows. A damped step reads the head's bounds (`head`) and
-    each level's activation bounds and rounding growth (`read`, `LevelTerms`) once, and its slots' terms
-    as the scan reads them."""
+    so the levels finish in order of their windows. A damped step (`damping`) reads the head's bounds and
+    each level's activation bounds and rounding growth (`LevelTerms`) once, and its slots' terms as the
+    scan reads them."""
 
     model: nn.Module
     variables: object
@@ -436,8 +433,7 @@ class _Chain:
     straddles: bool
     predict: bool
     rows: int
-    head: HeadTerms | None = None
-    read: tuple | None = None
+    damping: tuple[HeadTerms, tuple[LevelTerms, ...]] | None = None
 
     @functools.cached_property
     def started(self) -> tuple:
@@ -514,8 +510,9 @@ class _Chain:
         step takes from the window's gathered terms `energy` (`_step_rate`), one rate a row."""
         plain = self.adaptation.rates(len(self.starts))[index]
         rate = None
-        if self.adaptation.damped:
-            rate = _step_rate(plain, self.parts, self.head, self.read[index], energy, gradient)
+        if self.damping is not None:
+            head, read = self.damping
+            rate = _step_rate(plain, self.parts, head, read[index], energy, gradient)
 
         def step(leaf, grad, moves):
             if not moves:
@@ -531,7 +528,10 @@ class _Chain:
         opens, partials, energies, run, places = carry
         states, block_targets, block_weights, block_runs, block_keys = block_inputs
         count = len(self.starts)
-        versions, chosen, closed, closing = [None] * count, [None] * count, [None] * count, list(energies)
+        versions: list = [None] * count
+        chosen: list = [None] * count
+        closed: list = [None] * count
+        closing = list(energies)
         nothing = jnp.zeros_like(block_runs, jnp.int32)
         if not self.straddles:
             # One document a row and no padding: every level's windows open at blocks' starts.
@@ -594,9 +594,15 @@ class _Chain:
                 kept = closing[index] if self.straddles else _joined(energies[index], arrived)
                 energy = jnp.where(continuing[:, None], kept, arrived)
             carried.append((level, _where(continuing, following, reached), energy, last_place))
-        state = (*(tuple(item[at] for item in carried) for at in range(3)), last_run,
-                 tuple(item[3] for item in carried))
+        levels, gradients, energies, places = (tuple(parts) for parts in zip(*carried, strict=True))
+        state = (levels, gradients, energies, last_run, places)
         return state, (losses, top, log_z, block_logits if logits else None)
+
+
+def _rejoined(value: jax.Array, length: int) -> jax.Array:
+    """A scan's `[blocks, B, block, ...]` output over a row's blocks as the row's `[B, length, ...]`."""
+    blocks, rows, block = value.shape[:3]
+    return jnp.moveaxis(value, 0, 1).reshape(rows, blocks * block, *value.shape[3:])[:, :length]
 
 
 def _chosen_by(chosen: jax.Array, values) -> jax.Array:

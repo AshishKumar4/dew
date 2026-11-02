@@ -72,8 +72,8 @@ class AccuracyMatrix:
                 "continual/backward_transfer": self.backward_transfer()}
 
 
-def continual_run(tasks: Sequence, fit: Callable[[int, object], None],
-                  accuracy: Callable[[int, int], float]) -> AccuracyMatrix:
+def continual_run[Task](tasks: Sequence[Task], fit: Callable[[int, Task], None],
+                        accuracy: Callable[[int, int], float]) -> AccuracyMatrix:
     """Train on `tasks` in order and score every task after each: `fit(i, task)` trains on task `i`, and
     `accuracy(i, j)` scores task `j` after it, in [0, 1]. A class-incremental `accuracy` chooses among
     every class of tasks 0 to `i`, a task-incremental one among task `j`'s own (module docstring)."""
