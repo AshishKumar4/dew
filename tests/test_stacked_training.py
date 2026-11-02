@@ -45,27 +45,6 @@ def test_a_banked_stores_blocks_step_as_the_literal_chunk_loop(layers, windows):
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
 
-def test_a_run_continues_pretraining_through_its_blocks_steps():
-    """An objective that steps a decoder's own blocks in context trains, its loss finite and its blocks'
-    starts moved by the outer step (`LMObjective(adaptation=ChunkAdaptation(layers=...))`)."""
-    import optax
-
-    adaptation = ChunkAdaptation(window=(3, 6), rate=0.05, layers=(0, 1))
-    objective = LMObjective(STACKED, LENGTH, adaptation=adaptation)
-    variables = objective.init(jax.random.key(0))
-    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)), jnp.int32)
-
-    def loss(params):
-        return jnp.mean(objective.token_scores(params, tokens).losses)
-
-    value, gradient = jax.value_and_grad(loss)(variables)
-    assert np.isfinite(float(value))
-    blocks = gradient["params"]["layers_0"]["mlp"]
-    assert any(float(jnp.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(blocks))
-    updates, _ = optax.sgd(0.1).update(gradient, optax.sgd(0.1).init(variables))
-    assert np.isfinite(float(loss(optax.apply_updates(variables, updates))))
-
-
 def test_a_training_step_continues_pretraining_through_the_blocks_steps():
     """A training step's loss (`LMObjective.loss`, its summed head and z-loss) of a decoder stepping its
     own blocks in context is finite and moves the blocks' starts, as continued pre-training trains them."""
