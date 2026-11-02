@@ -604,8 +604,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the blocks leave the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the blocks leave the program, so the source's own draws are dead code to XLA; they
+            # join the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: path[0] == "params" and crossing(path))
 
         blocks = owned_program(drawn)(request_key(key))
@@ -639,8 +640,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the extension leaves the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the extension leaves the program, so the source's own draws are dead code to XLA; it
+            # joins the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
                           or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 

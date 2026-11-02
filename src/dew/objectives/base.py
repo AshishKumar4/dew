@@ -1012,8 +1012,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         off a fresh draw of every module traced for its shapes alone (`init` given an empty tree under
         `jax.eval_shape`), which placement, the optimizer and a checkpoint read for a drawn tree and a
         held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
-        refused by its path: its axes would name another parameter's dimensions."""
-        drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+        refused by its path: its axes would name another parameter's dimensions. An objective that draws
+        no fresh tree (`fresh_variables`' `NotImplementedError`, its documented answer) holds no draw to
+        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables."""
+        try:
+            drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+        except NotImplementedError:
+            return self.tower_axes()
         held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
