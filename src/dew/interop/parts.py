@@ -271,6 +271,13 @@ def _read_stablelm_layer(view: PartView) -> Mapping[str, object]:
     return {'parallel_residual': parallel, 'shared_parallel_norm': parallel}
 
 
+def _read_sandwich_layer(view: PartView) -> Mapping[str, object]:
+    """GLM-4's layer: Gemma 2's sandwich, each sublayer's input and output normed (`sandwich_norms`),
+    its norms renamed onto Gemma 2's (`post_self_attn_layernorm` the attention's output norm,
+    `post_attention_layernorm` the feed-forward's input norm, `post_mlp_layernorm` its output norm)."""
+    return {'sandwich_norms': True}
+
+
 def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
     """OLMo 2's layer: each sublayer's output normed before it joins the residual, its input not
     (`sandwich_norms` without `pre_norms`, OLMo 3's)."""
@@ -344,6 +351,25 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
     weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
                      'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_glm4_attention(view: PartView) -> Mapping[str, object]:
+    """GLM-4's attention: Llama's, its rotary turning adjacent pairs of the heads' rotated channels (its
+    `apply_rotary_pos_emb` repeats each angle over a pair and rotates `(x[2i], x[2i+1])` over the first
+    `rotary_dim` channels, the rest passed through) in the queries' dtype, which Dew's rotation, in at
+    least float32 rounded once, holds within that dtype's rounding; a per-layer fact
+    (`_with_attention_fields`)."""
+    return {**_read_attention(view), _LAYER: {'attention': {'rotary_pairs': 'adjacent'}}}
+
+
+def _read_fused_mlp(view: PartView) -> Mapping[str, object]:
+    """GLM-4's MLP: Llama's with the gate and up projections one Linear (`gate_up_proj`, the gate's rows
+    first, `chunk(2)`), read as the two (`KnownPart.split`)."""
+    fused = view.gate_up_proj
+    if fused.out_features % 2:
+        raise Ambiguous("the fused gate and up projection holds an odd number of rows")
+    return {'mlp': gated_activation(view.activation_fn), 'mlp_features': fused.out_features // 2,
+            'mlp_bias': _biased(fused, view.down_proj)}
 
 
 def _read_ernie_attention(view: PartView) -> Mapping[str, object]:
@@ -546,6 +572,10 @@ class KnownPart:
     flat: tuple[str, ...] = ()
     """The parameters the source stores with leading unit axes that its leaf holds flat (ERNIE 4.5's
     `[1, experts]` correction bias), by the known class's names (`Assembly.flat`)."""
+    split: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """The children whose weight holds several canonical projections concatenated on its output rows,
+    by the known class's attribute name, onto the projections in their order (GLM-4's `gate_up_proj`,
+    the gate's rows first): each reads as its parts (`_fused_linear`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -571,6 +601,7 @@ _HUNYUAN = 'transformers.models.hunyuan_v1_moe.modeling_hunyuan_v1_moe'
 _LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
+_GLM4 = 'transformers.models.glm4.modeling_glm4'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -654,6 +685,17 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('layer', f'{_OLMO2}:Olmo2DecoderLayer',
               {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'post_attention_layernorm': ('norm',),
                'post_feedforward_layernorm': ('norm',)}, _read_output_normed_layer),
+    KnownPart('layer', f'{_GLM4}:Glm4DecoderLayer',
+              {**_LAYER_CHILDREN, 'post_self_attn_layernorm': ('norm',), 'post_mlp_layernorm': ('norm',)},
+              _read_sandwich_layer,
+              canonical={'post_self_attn_layernorm': 'post_attention_layernorm',
+                         'post_attention_layernorm': 'pre_feedforward_layernorm',
+                         'post_mlp_layernorm': 'post_feedforward_layernorm'}),
+    KnownPart('attention', f'{_GLM4}:Glm4Attention', _ATTENTION_CHILDREN, _read_glm4_attention),
+    KnownPart('mlp', f'{_GLM4}:Glm4MLP', {'gate_up_proj': ('linear',), 'down_proj': ('linear',)},
+              _read_fused_mlp, canonical={'gate_up_proj': ''},
+              split={'gate_up_proj': ('gate_proj', 'up_proj')}),
+    KnownPart('rotary', f'{_GLM4}:Glm4RotaryEmbedding', {}, _read_partial_rotary, whole=True),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -777,6 +819,15 @@ class Assembly:
         name, a part a fused tensor splits into (`_SPLIT`) by its own, one expert's tensor of a
         checkpoint stored per expert by its index and projection; None where no part holds it."""
         loaded, expert = self.loaded(name)
+        stem, marked, split = loaded.partition(f'.{_SPLIT}')
+        if marked and '.' in split:
+            # A part of a fused Linear's weight (`_fused_linear`): the canonical projection it is, under
+            # the canonical path its Linear's parameters read as.
+            held = self.names.get(stem)
+            projection, _, parameter = split.partition('.')
+            if held is None or parameter not in held[1]:
+                return None
+            return f'{held[0]}.{projection}.{held[1][parameter]}'
         module, _, parameter = loaded.rpartition('.')
         held = self.names.get(module)
         if held is None:
@@ -887,6 +938,8 @@ class _Assembler:
             self.tables[table] = (f'{path}.{view.name("weight")}', view.weight)
         if part.role == 'experts':
             self.packed.extend(_fused_experts(path.rpartition('.')[2], view))
+        self.packed.extend(_fused_linear(path.rpartition('.')[2], view.name(known), halves)
+                           for known, halves in part.split.items())
         if part.role == 'attention':
             self.dropouts.append((path, view.name('attention_dropout')))
         held = {name for name, _ in module.named_parameters(recurse=False)}
@@ -1051,8 +1104,17 @@ def _fused_experts(module: str, view: PartView) -> tuple[decoder_parts.Packed, .
 
 
 _SPLIT = '~'
-"""The mark of a part a fused tensor splits into (`_fused_experts`), already canonical: no Python
-attribute holds it, so it names no stored parameter, whatever the source renames its own to."""
+"""The mark of a part a fused tensor splits into (`_fused_experts`, `_fused_linear`), already canonical:
+no Python attribute holds it, so it names no stored parameter, whatever the source renames its own to."""
+
+
+def _fused_linear(module: str, linear: str, projections: tuple[str, ...]) -> decoder_parts.Packed:
+    """The weight of `module`'s fused Linear `linear` (`KnownPart.split`) as its canonical `projections`,
+    concatenated on its output rows in their order: each part names the projection after the split mark,
+    its parameter after it (`Assembly.canonical`)."""
+    return decoder_parts.Packed(f'.{module}.{linear}.weight',
+                                tuple(f'.{module}.{linear}.{_SPLIT}{projection}.weight'
+                                      for projection in projections), 0)
 
 
 _STACKED_EXPERTS: decoder_parts.Leaves = {
