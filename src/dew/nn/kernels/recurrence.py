@@ -570,16 +570,12 @@ class Launch:
 
 WARPS = Launch(0, 8)
 """The launch over a whole head."""
-COLUMNS = Launch(32, 4)
-"""The launch over value columns: 32 a program (16 to 64 measured within 3% on an RTX 4080), its four warps
-as fast as eight or faster on an H100 and an A100 at 32 and 128 rows, two percent at Kimi Linear's and
-Mamba-2 2.7B's states (step-configs at b98bf618f)."""
-
-KEYED_COLUMNS = 64
-"""The value columns a program takes under a decay a key dimension: its key dimension's decays, a program's
-own exponentials, amortized over twice the block. Kimi Linear's decode token at 128 rows took 0.209 ms on an
-H100 at 64 against 0.229 at 32, an A100 0.437 against 0.439, where a rated scan's (Mamba-2 2.7B's) took no
-less at 64 than at 32 on an H100 and 14% more on an A100 (step-configs at b98bf618f)."""
+COLUMNS = Launch(64, 4)
+"""The launch over value columns: 64 a program, four warps, under every decay. With a head's column blocks
+the fastest program axis, a decode token at 128 rows took on an H100 0.2005 ms at 64 against 0.2084 at 32
+(Kimi Linear's KDA) and 0.2399 against 0.2452 (Mamba-2 2.7B's SSD), on an A100 0.4338 against 0.4272 and
+0.5205 against 0.515; one warp held 1.5 times as long, two within 1% of four (step-configs at 8163d5862,
+H100 and A100)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -678,8 +674,7 @@ class StepLaunch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Launch:
         if _whole(ba.kwargs['hooks']):
             return WARPS
-        widest = KEYED_COLUMNS if ba.kwargs['hooks'].decay == 'vector' else COLUMNS.block
-        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1], widest))
+        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1]))
 
     def pinnable(self, ba, config) -> bool:
         # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
