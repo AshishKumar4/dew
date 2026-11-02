@@ -445,9 +445,17 @@ def _fused_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] 
     return renamed_path((), name, config, layer_leaves=_QWEN_MOE_LEAVES)
 
 
+def _qwen3_vl_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read a Qwen3-VL-MoE text config as Qwen3-MoE's (`_qwen3_moe_config`), its router renormalizing its
+    selected weights whatever `norm_topk_prob` states: `Qwen3VLMoeTextTopKRouter` always divides them by
+    their sum (modeling_qwen3_vl_moe.py, transformers 5.17), and its config reads no such field."""
+    used.add('norm_topk_prob')
+    return _qwen3_moe_config({**hf_config, 'norm_topk_prob': True}, used)
+
+
 QWEN3_VL_MOE_TEXT = DecoderFamily(
     ('qwen3_vl_moe_text',),
-    _qwen3_moe_config,
+    _qwen3_vl_moe_config,
     # A text decoder read from a Qwen3-VL-MoE release (`hf_decoders.TEXT_FAMILIES`), never the family a
     # model exports as: it exports as Qwen3-MoE.
     lambda fields: False,
@@ -457,7 +465,8 @@ QWEN3_VL_MOE_TEXT = DecoderFamily(
     weight_path=_fused_moe_path,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
-    defaults={'max_position_embeddings': 32768},
+    # Qwen3VLMoeTextConfig's defaults for the fields its decoder reads.
+    defaults={'max_position_embeddings': 128000},
     padding_idx=True,
 )
 """Qwen3-VL-MoE's text decoder: Qwen3-MoE's (`QWEN3_MOE`), its release storing each projection over every
