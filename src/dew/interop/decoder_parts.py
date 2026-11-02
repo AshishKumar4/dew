@@ -1552,7 +1552,8 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
-    return layout_tensors(packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+    packed = family.packed if family.packs(config) else ()
+    return layout_tensors(packed_layouts(layouts, packed, geometry), tree, model.layer_scalar)
 
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
@@ -2039,6 +2040,10 @@ class DecoderFamily:
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""
+    packs: Callable[[Mapping[str, object]], bool] = lambda _config: True
+    """Whether an export under the written config packs them (`packed`): every
+    export, but a family whose config states the layout, MiMo-V2's
+    `attention_projection_layout`, packs where it says so."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""
