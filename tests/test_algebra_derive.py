@@ -460,3 +460,19 @@ def test_a_keys_first_walk_derives_whatever_its_queries_and_width(base2):
                           saturation=SATURATION)
     slots = forms.slots({"logits": ((32, 64), jnp.float32), "values": ((32, 128), jnp.bfloat16)})
     assert sorted(monoid for monoid, _ in slots) == ["max", "sum", "sum"]
+
+
+def sinh_total(q, k, v, rows, keys):
+    """Attention's total under an equation outside the language (`sinh`)."""
+    del v, rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    return jnp.sinh(jnp.sum(jnp.exp(s - jnp.max(s, axis=-1)[:, None]), axis=-1) * 1e-3)
+
+
+def test_an_equation_outside_the_language_over_a_walks_total_is_refused():
+    """A declaration that applies an equation outside the language to a value a walked reduction gave is
+    refused: no form computes it from the walk's state, where evaluating it at the finish read the operands
+    whole."""
+    forms = derive.derive(declared(sinh_total), accurate=False, saturation=SATURATION)
+    with pytest.raises(derive.Refused, match="a walked reduction gave"):
+        walked_whole(forms)(*draw(0))
