@@ -88,12 +88,17 @@ class ParallelMixers(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Its branches' work; the scalings and the sum are elementwise."""
-        return sum(counted_flops(factory(parent=None), lengths) for _, factory, _, _, _ in self.branches)
+        return self._branches_counted(counted_flops, lengths)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Its branches' learned maps."""
-        return sum(parameter_flops(factory(parent=None), lengths) for _, factory, _, _, _ in self.branches)
+        return self._branches_counted(parameter_flops, lengths)
+
+    @nn.nowrap
+    def _branches_counted(self, counter, lengths) -> float:
+        """`counter`'s count of each branch, summed."""
+        return sum(counter(factory(parent=None), lengths) for _, factory, *_ in self.branches)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its branches declare (`dew.nn.protocols.ProjectionSites`)."""
