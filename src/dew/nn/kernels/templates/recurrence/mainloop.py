@@ -1103,7 +1103,10 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
 
             if system:
                 betas = family.rows_of(beta_ref.at[h, span])
-                rows = lambda c: operand("keys")(c) * betas[:, None]  # noqa: E731
+
+                def rows(c):
+                    # The system's rows: each key scaled by its write strength.
+                    return operand("keys")(c) * betas[:, None]
             else:
                 rows = operand("queries")
             pairs = algebra.key_decayed_pairs(rows, operand("keys"), 1, lambda c: prefix, reference,
