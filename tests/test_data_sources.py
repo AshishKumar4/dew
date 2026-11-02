@@ -359,8 +359,8 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     """A server that sends its headers or its body a byte every tenth of a second holds a fetch
     no longer than its timeout: the attempt is dropped as transient while the server still has bytes
     to send, where it once read on byte by byte, each byte inside the socket's timeout, to the
-    response's end (row 1947: the end is the timeout's, read off the response, not a wall-clock
-    bound)."""
+    response's end, and not before its timeout (row 1947: the end is the timeout's, read off the
+    response, not a wall-clock bound)."""
     import time
 
     from dew.data.pipeline import Rejected
@@ -389,15 +389,19 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
     try:
+        began = time.monotonic()
         fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
-        sent_by_then = len(sent)
+        waited, sent_by_then = time.monotonic() - began, len(sent)
     finally:
         server.shutdown()
         server.server_close()
     assert isinstance(fetched, Rejected) and not fetched.permanent
     # A byte every tenth of a second: a fetch held to its one-second timeout leaves the server about ten
-    # sent, and twice that at most, not the sixty of a response read to its end (row 2447).
+    # sent, and twice that at most, not the sixty of a response read to its end (row 2447), and ends at
+    # its deadline, set after `began`, not before it (asyncio runs a timer up to its clock's resolution
+    # early; row 2091).
     assert sent_by_then <= 2 * 10
+    assert waited >= 1.0 - time.get_clock_info("monotonic").resolution
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
