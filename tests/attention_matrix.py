@@ -103,12 +103,11 @@ def _backward_op(case: dict[str, str]):
     """`case`'s Mosaic backward op, its bound arguments and the device it is read for, under the case's
     generation (`attention_mosaic._backward_call`)."""
     heads, kv_heads, width, dtype, spans, _ = _case(case)
-    # Shapes alone: the analyses read the call's facts, not its values.
-    query = jax.ShapeDtypeStruct((1, LENGTH, heads, width), dtype)
-    key = jax.ShapeDtypeStruct((1, LENGTH, kv_heads, width), dtype)
-    params = tuple(jax.ShapeDtypeStruct(_param_shape(BIAS[case["hook"]], heads), jnp.float32)
-                   for _ in range(2)) if case["hook"] in BIAS else ()
-    residuals = jax.eval_shape(_residuals, query.shape)
+    query = jnp.zeros((1, LENGTH, heads, width), dtype)
+    key = jnp.zeros((1, LENGTH, kv_heads, width), dtype)
+    params = tuple(jnp.zeros(_param_shape(BIAS[case["hook"]], heads), jnp.float32) for _ in range(2)
+                   ) if case["hook"] in BIAS else ()
+    residuals = _residuals(query.shape)
     natural, accurate = _form(case)
     natural = attention_mosaic.NATURAL if natural is None else natural
     op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query, residuals,
