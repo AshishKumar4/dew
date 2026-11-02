@@ -252,15 +252,17 @@ class CheckpointBanks(LayerBanks):
                                                                   namespace=namespace)),
                              index, namespace=namespace)
 
-        # The bank donated to each write, so a row is all a write holds beside it.
-        written = program(_written, donate_argnames=("bank",), out_shardings=placement)
+        # The bank built in device memory, where the rows are, and donated to each write, so a row is all a
+        # write holds beside it; then moved where the store places it, host memory alike.
+        building = _on_device(placement)
+        written = program(_written, donate_argnames=("bank",), out_shardings=building)
         held = row(layers[0])
-        bank = written(program(_emptied, static_argnames=("count",), out_shardings=placement)(
+        bank = written(program(_emptied, static_argnames=("count",), out_shardings=building)(
             held, count=len(layers)), held, 0)
         del held
         for at, index in enumerate(layers[1:], start=1):
             bank = written(bank, row(index), at)
-        return bank
+        return jax.device_put(bank, placement)
 
     def _restored(self, checkpoints: Checkpoints, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings through `checkpoints`, as every load
@@ -815,6 +817,15 @@ def _written(bank: Variables, row: Variables, at: jax.Array) -> Variables:
     """`bank` with `row` as its layer `at`."""
     return jax.tree.map(lambda stack, leaf: jax.lax.dynamic_update_index_in_dim(stack, leaf, at, 0),
                         bank, row)
+
+
+def _on_device(placement: Placement) -> Placement:
+    """A bank's placement in device memory, where its rows are written into it (`_written`)."""
+    def device(target):
+        sharding = target.sharding if isinstance(target, Format) else target
+        return sharding.with_memory_kind("device")
+
+    return jax.tree.map(device, placement)
 
 
 def _row_placement(placement: Placement) -> Placement:
