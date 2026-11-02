@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from affine_run import Features
+from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from token_support import token_rows
@@ -19,7 +20,14 @@ from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead, compile_only_gpus
 from dew.training.compiled_program import compiled
-from dew.training.footprint import Workspace, consumed_where_made, gradient_peak, leaf_local, peak_bytes
+from dew.training.footprint import (
+    Workspace,
+    consumed_where_made,
+    gradient_peak,
+    leaf_local,
+    peak_bytes,
+    staged_bytes,
+)
 
 TOKENS, VOCAB, WIDTH = 256, 4096, 64
 PRODUCT = TOKENS * VOCAB * 4
@@ -234,6 +242,33 @@ def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_s
                           dynamic_scale=scaled)
         state, _, _ = trainer.place()
         assert consumed_where_made(trainer.optimizer, state, 1) is consumed
+
+
+class Layers(Features):
+    """`Features` over four like layers, each a 32 x 32 kernel and its bias."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential([nn.Dense(32) for _ in range(3)] + [nn.Dense(2)])
+
+    def fresh_variables(self, key, held):
+        return self.model.init(key, jnp.zeros((1, 32)))
+
+
+def test_a_commit_over_host_resident_state_holds_two_of_its_chunks():
+    """A step whose Adam moments and EMA rest in pinned host memory stages them a parameter at a time,
+    each parameter's moments and average one chunk (`dew.training.staging`): its commit holds the two
+    largest, two 32 x 32 kernels' three copies, beside its gradient; one whose state the device holds
+    stages none, and a window of two, committing under a conditional, stages it whole."""
+    device = Layout(min_shard=1, tolerance=1.0)
+    host = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
+    trainer = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host)
+    state, _, _ = trainer.place()
+    whole = sum(leaf.nbytes for leaf in jax.tree.leaves((state.opt_state, state.ema)))
+    assert staged_bytes(trainer.optimizer, state, 1) == 2 * 3 * 32 * 32 * 4
+    assert staged_bytes(trainer.optimizer, state, 2) == whole
+    resident = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=device)
+    assert staged_bytes(resident.optimizer, resident.place()[0], 1) == 0
 
 
 def test_a_differentiated_checkpoint_keeps_its_operands_behind_its_barrier():
