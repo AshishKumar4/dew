@@ -4,8 +4,11 @@ refused and the program lowered afresh, the launch's derivation taking its next 
 run keeps, its plan, its step compiled ahead and the executable it runs, is the program it lowered
 then. A program with no template launch compiles as jit compiles it."""
 
+import dataclasses
+import gc
 import os
 import time
+import weakref
 
 import flax.linen as nn
 import jax
@@ -20,7 +23,7 @@ from process_support import fresh
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.instrumentation import Compiles
@@ -303,6 +306,41 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
+class Slots:
+    """A state of two arrays, as a server's resident slots are, placed by a tree of its own shape."""
+
+    rows: jax.Array
+    columns: jax.Array
+
+
+def test_a_program_donates_its_state_and_places_it_by_a_tree_of_formats():
+    """A program a server steps its state with (`program`, row 3327) donates the state it is handed
+    (`donate_argnums`, `donate_argnames`), the state's arrays deleted once it ran, and places its arguments
+    and results by a tree of formats of the state's own structure, each array in the layout its format
+    names."""
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    formats = Slots(Format(Layout((0, 1)), sharding), Format(Layout((1, 0)), sharding))
+
+    def stepped(slots: Slots, scale):
+        return Slots(slots.rows + scale, slots.columns * scale)
+
+    run = program(stepped, donate_argnums=0, in_shardings=(formats, None), out_shardings=formats)
+    slots = Slots(jax.device_put(jnp.ones((2, 3)), formats.rows),
+                  jax.device_put(jnp.ones((2, 3)), formats.columns))
+    stepped_slots = run(slots, 2.0)
+    assert slots.rows.is_deleted() and slots.columns.is_deleted()
+    assert [leaf.format.layout.major_to_minor for leaf in (stepped_slots.rows, stepped_slots.columns)] == [
+        (0, 1), (1, 0)]
+    np.testing.assert_array_equal(np.asarray(stepped_slots.rows), np.full((2, 3), 3.0))
+    named = program(lambda scale, slots: stepped(slots, scale), donate_argnames="slots",
+                    out_shardings=formats)
+    again = named(2.0, slots=stepped_slots)
+    assert stepped_slots.rows.is_deleted() and stepped_slots.columns.is_deleted()
+    np.testing.assert_array_equal(np.asarray(again.columns), np.full((2, 3), 4.0))
+
+
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
     """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs, its
     tracers its arguments or ones its function closes over, and under `jax.disable_jit` Python; called
@@ -427,3 +465,56 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     assert len(found) == 2 and all(binary.registers > 0 and not binary.frame for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
+
+def test_a_program_its_caller_owns_is_released_with_its_caller():
+    """A program over a closure or a bound method its caller owns (`owned_program`), as a run's placement
+    and its host phases compile, keeps no reference of Dew's: once the caller lets it go, the owner the
+    closure holds (a trainer, its objective and their arrays) is released, as no process-wide cache holds
+    the closure. A program over a module's function (`program`) is kept for every caller alike."""
+
+    class Owner:
+        """A run's stand-in, holding an array its closure reads."""
+
+        def __init__(self):
+            self.held = jnp.arange(4.0)
+
+        def scaled(self, x):
+            return x * self.held
+
+    def reading(held: Owner):
+        return lambda x: x + held.held
+
+    owner = Owner()
+    released = weakref.ref(owner)
+    closure = owned_program(reading(owner))
+    bound = owned_program(owner.scaled)
+    np.testing.assert_array_equal(np.asarray(closure(jnp.ones(4))), np.arange(4.0) + 1)
+    np.testing.assert_array_equal(np.asarray(bound(jnp.ones(4))), np.arange(4.0))
+    del owner, closure, bound
+    gc.collect()
+    assert released() is None
+    assert program(jnp.sum) is program(jnp.sum)
+
+def test_a_program_within_another_takes_the_enclosing_programs_options():
+    """A program called within another trace (a kernel's own program inside a step) is the enclosing
+    program's part and compiles under its options, as JAX takes compiler options on the outermost jit
+    alone: a program opened with options is called inside another without refusal."""
+    with compiled_with({"xla_cpu_enable_fast_math": False}):
+        inner = owned_program(lambda x: x * 2.0)
+        outer = owned_program(lambda x: inner(x) + 1.0)
+        np.testing.assert_array_equal(np.asarray(outer(jnp.ones(3))), np.full(3, 3.0))
+
+def test_a_program_under_an_eager_transformation_compiles_under_its_own_options():
+    """A program called under an eager `jax.vmap` or `jax.grad`, which no enclosing program compiles,
+    compiles under its own options as a direct call does, so an option XLA does not know is refused
+    there too; within another program's trace it is that program's part and takes its options."""
+    with compiled_with({"xla_dew_no_such_option": True}):
+        unknown = owned_program(lambda x: x * 2.0)
+    rows = jnp.ones((2, 3))
+    for called in (lambda: unknown(rows), lambda: jax.vmap(unknown)(rows),
+                   lambda: jax.grad(lambda x: jnp.sum(unknown(x)))(rows)):
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            called()
+    enclosing = owned_program(lambda x: unknown(x) + 1.0)
+    np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
+

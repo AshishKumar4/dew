@@ -9,6 +9,7 @@ Design record. Tests run real use cases through public interfaces. Kernel math i
 | Dense language-model pretraining | Build a decoder, train, save, resume, evaluate, export, reload and generate. |
 | Pretrained fine-tuning | Load a published decoder, train full weights or LoRA, then export and reload both forms. |
 | Structured prediction | Train and serve a decision task (dew.decision) |
+| Decision ablation workflow | Train a decision task of many options through `dew train` in each cell of a pairwise set over head (joint, question, letters), context, consistency and bound (an examples budget, a share of one), and hold each cell to the conservation contract (`tests/test_decision_workflow.py`). |
 | Diffusion training | Train an image or video model, checkpoint, resume, sample and export. |
 | Published diffusion pipelines | Load a text-to-image pipeline and sample with its processor, guidance and solver settings. |
 | Distributed training | Train dense FSDP and expert-sharded MoE models on real meshes. |
@@ -28,7 +29,8 @@ The whole flow, once: load or build the model → train several steps on real-sh
 - sharded equals unsharded (on the device mesh of scenario 6 and on CPU multi-device);
 - export then reload is identical;
 - loaded checkpoints match their reference (HF transformers, diffusers) within the float64 gate.
-- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling).
+- a repeated or resumed run reuses its compiled programs: a fresh process hits the persistent cache with an identical program fingerprint (training, evaluation, sampling);
+- conservation: a bound in examples counts source examples, whatever rows a layout makes of each; `data/rows` counts the source examples whose rows were delivered, each once, an example refused by any step carried as refused rather than kept (`REFUSED`); where a layout refuses whole examples before it expands them (a decision layout's fit), `data/rejected` counts those examples too, so a run that reads its data whole counts every example written as trained or refused; a step after the expansion counts the rows or windows it rejects in its own unit; and the saved task holds every axis the run sets.
 
 An exact cache's decode agrees with full forward under the numerical rule below. A cache explicitly defined as approximate is compared with the reference implementation's own decode under that same cache. Approximate and exact cache claims remain distinct.
 
@@ -43,7 +45,8 @@ Each scenario runs a small covering set over the settings axes, chosen pairwise,
 - memory: no remat, the planner's rung;
 - devices: 1, 2 (CPU multi-device), the GPU mesh;
 - quantization: none, QAT, PTQ (scenarios 2, 9, 10);
-- data read: memory, indexed, streamed.
+- data read: memory, indexed, streamed;
+- decision runs: head, context, consistency, and bound kind (examples, a share of them).
 
 Implementations come from their registries. A new implementation cannot opt out by being absent from a hand-kept test list.
 
@@ -115,6 +118,14 @@ The suite holds a CPU to wide arithmetic, a test setting and not a user option: 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 
 **Layout invariance.** Raw random bits, and what exact operations alone derive from them (uniforms, bit-compare masks such as dropout's), are bit-identical on every layout. Floats derived through rounding chains (normals, Gumbel noise, initial weights) are held equal across layouts by check 1 of `tests/reference_error.py`. A discrete result taken from them, such as a categorical sample by the argmax of Gumbel noise plus logits, can flip near a tie, and its check says so. Every other exact contract stays exact: checkpoint and resume, caches, serialization, and the same program run twice in deterministic mode. A bitwise claim across programs moves to check 1 only where it is shown invalid.
+
+## Property tests
+
+Hypothesis is for property, metamorphic and fuzz tests: an invariant held over drawn inputs (an operation's algebraic law, an equivalence between two forms of one computation, a parser or planner's behavior on generated input). It is not an accuracy gate. A property test that judges numerics draws its shapes or configuration from Hypothesis and holds each with `assert_as_exact`, whose seeds draw the values; it carries no tolerance of its own.
+
+The suite's profile, `dew` (tests/conftest.py), draws the same examples on every run, so a red reproduces anywhere; keeps no example database, and stores nothing in the checkout (its storage goes under the system temp directory unless `HYPOTHESIS_STORAGE_DIRECTORY` is set); and runs 50 generated examples, each under a soft 2 s deadline. Those are workload targets, not a wall-time bound: explicit examples, discarded draws and shrinking run beyond them, and the deadline is checked after an example runs. A test whose examples compile (a new shape each draw) sizes its own `settings` deadline and count from its measured runtime, within a test's 120 s with room for generation and shrinking.
+
+A failure shrinks to a minimal example. That example joins the test as a regular case (`@example`, or a test of its own), so the defect stays covered whatever later strategies draw.
 
 ## Tests must catch a defect
 

@@ -7,11 +7,12 @@ import functools
 import io
 import json
 import math
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -763,12 +764,13 @@ class Decide(SavedRunTask, InItsForm):
         return self._pass(rows, self.variables if variables is None else variables)
 
     def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
-              shape: PassShape | None = None) -> list[np.ndarray]:
+              shape: PassShape | None = None, counted: "PassTokens | None" = None) -> list[np.ndarray]:
         """Each of `rows`' raw `[Q, K]` logits from one forward pass at its declared shape (`pass_shapes`,
         the shortest that holds `rows` unless `shape` is given): the rows packed first-fit into its
         windows as a run packs its rows (`packing`), each window read as a run reads one
         (`dew.decision.rows.PackedRows`, `laid_out`), so each row attends its own tokens alone and is
-        scored as it is alone, the windows placed on the weights' mesh (`RowPlan`)."""
+        scored as it is alone, the windows placed on the weights' mesh (`RowPlan`). A server's pass counts
+        its tokens in `counted` (`PassTokens`), the windows the mesh computes among them."""
         from dew.data.packing import first_fit_windows
         from dew.decision.rows import PackedRows, model_row
 
@@ -796,6 +798,8 @@ class Decide(SavedRunTask, InItsForm):
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)
+        if counted is not None:
+            counted.add(shape, plan.count, rows)
         logits = plan.host(self._forward(held, plan.place(plan.pad(padded))))
         found: list[np.ndarray] = [np.empty(0)] * len(rows)
         for window, (_, standing) in enumerate(windows):
@@ -1145,6 +1149,47 @@ class PassPlan:
         return list(self.placing[self.alive[0]].windows)
 
 
+class _Passes(NamedTuple):
+    """One pass shape's passes so far (`PassTokens`): how many, the windows they computed, the declared
+    ones and those a mesh's devices padded them to (`RowPlan.count`), and their rows' real tokens."""
+
+    passes: int = 0
+    windows: int = 0
+    real: int = 0
+
+
+@dataclass
+class PassTokens:
+    """What padding costs a served task's passes (`_DecideScoring.forward`), per pass shape: the windows
+    its passes computed, each `length` tokens, their rows' real tokens among them and the passes.
+    `metrics` reads the share of each shape's tokens, and of every pass's, its rows held, as a run reads
+    its own (`train/real_token_share`, row 2772)."""
+
+    shapes: dict[PassShape, _Passes] = field(default_factory=dict)
+
+    def add(self, shape: PassShape, windows: int, rows: Sequence[Encoded]) -> None:
+        """Count a pass at `shape` over `rows`, computed in `windows` windows."""
+        held = self.shapes.get(shape, _Passes())
+        self.shapes[shape] = _Passes(held.passes + 1, held.windows + windows,
+                                     held.real + sum(len(row.tokens) for row in rows))
+
+    def metrics(self) -> dict[str, float]:
+        """`served/real_token_share`, of every pass's tokens the share its rows held, and each shape's
+        under `served/passes/<rows>x<length>/` beside its passes; none before a pass. Read from another
+        thread than the engine's that adds passes, it reads one moment's shapes (a copy taken at once)."""
+        shapes = dict(self.shapes)
+        computed = {shape: held.windows * shape.length for shape, held in shapes.items()}
+        if not sum(computed.values()):
+            return {}
+        shares = {}
+        for shape, held in shapes.items():
+            named = f"served/passes/{shape.rows}x{shape.length}"
+            shares.update({f"{named}/real_token_share": held.real / computed[shape],
+                           f"{named}/passes": float(held.passes)})
+        return {"served/real_token_share": sum(held.real for held in shapes.values())
+                / sum(computed.values()), **shares}
+
+
 @dataclass(frozen=True)
 class _Admitted:
     """A Jev body as `WireScoring` admitted it: its questions and its rows, laid out by the task."""
@@ -1202,6 +1247,18 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
     bodies (`WireScoring`), runs these passes over the same compiled programs."""
 
     decide: Decide
+    passes: PassTokens = field(default_factory=PassTokens, compare=False)
+    """The tokens each pass shape's text passes computed and their rows held (`PassTokens.metrics`)."""
+
+    @property
+    def model(self) -> DecisionModel:
+        """The decision's model, whose weights every pass reads (`ModelScoring.model`)."""
+        return self.decide.model
+
+    def metrics(self) -> dict[str, float]:
+        """Its passes' share of their tokens its rows held (`PassTokens.metrics`), as its server reports it
+        (`dew.inference.scoring.Metered`)."""
+        return self.passes.metrics()
 
     def planned(self) -> "_WirePlan":
         return _WirePlan(self.decide)
@@ -1210,7 +1267,7 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
         # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
         # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
-            return self.decide.scored([row.encoded for row in rows], variables)
+            return self.decide._pass([row.encoded for row in rows], variables, counted=self.passes)
         return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
                                       variables)
 
@@ -1248,7 +1305,17 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
     """What the task admitted and refused, as a run's data counters count its rows (`CorpusCounts`):
     each request it answers, cut short where any row's state was, and each cut's rows and tokens;
     each it refuses under its reason (`Refused`), `unfit`, `options_alike`, or `cut` under `whole`. A
-    server reads them as a run reads its own (`CorpusCounts.metrics`)."""
+    server reports them as a run reports its own (`CorpusCounts.metrics`, `metrics`)."""
+    counting: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+    """Held while `counts` changes or is read, as requests are admitted on threads of their own."""
+
+    def metrics(self) -> dict[str, float]:
+        """Its passes' share of their tokens its rows held (`PassTokens.metrics`) and what it admitted and
+        refused (`counts`, under `data/.../served`, one moment's), as its server reports them
+        (`dew.inference.scoring.Metered`)."""
+        with self.counting:
+            counted = self.counts.metrics("served")
+        return {**self.passes.metrics(), **counted}
 
     def admit(self, request: Mapping[str, object]) -> scoring.ScoringRequest[_Row, _Admitted]:
         decide = self.decide
@@ -1260,17 +1327,20 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             else:
                 rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         except Refused as refused:
-            self.counts.dropped(Rejected(refused.reason))
+            with self.counting:
+                self.counts.dropped(Rejected(refused.reason))
             raise
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
             removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
-            self.counts.dropped(Rejected("cut", cut=removed))
+            with self.counting:
+                self.counts.dropped(Rejected("cut", cut=removed))
             cut = "state" if usage.truncated else "instructions or options"
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
-        self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
+        with self.counting:
+            self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.ScoringRequest(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:

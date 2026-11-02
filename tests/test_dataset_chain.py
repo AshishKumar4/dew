@@ -1,10 +1,12 @@
 """The chain surface: stores carry the verbs, mix reads members of every kind, holdout splits by identity."""
 
+import collections
 import dataclasses
 import hashlib
 import itertools
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import grain.python as grain
 import numpy as np
@@ -12,6 +14,7 @@ import pytest
 from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
+from dew.batch import EXAMPLES_CONSUMED
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
@@ -778,6 +781,146 @@ class ThirdQuestionRefused:
         return Rejected("third question") if int(row["question"]) == 2 else row
 
 
+def _same(row):
+    return row
+
+
+def _kept_rows(rows):
+    """A Grain step of a mixture's own that keeps every row."""
+    return rows.map(_same)
+
+
+def _members_asked(read: str, *, native: bool = False) -> Dataset:
+    """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike (a
+    stream's mix shuffled), each record's `id % 3 + 1` questions refused at the third (`Questioned`,
+    `ThirdQuestionRefused`) after the mix, as `read` reads them; behind a Grain step of the mixture's own
+    that keeps every row (`native`)."""
+    corpora = [Memory([{"id": np.int32(start + index)} for index in range(12)], shard_rows=4).named(name)
+               for name, start in (("left", 1), ("right", 101))]
+    chain = mix(corpora)
+    if native:
+        chain = chain.grain(_kept_rows, identity="kept@1")
+    return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain).batch(2)
+
+
+def _member_counts(batches, statistics) -> dict[str, tuple[int, int, int, int]]:
+    """Each member's examples read, the rows its counters say it delivered and refused, and the examples
+    whose last row was refused, by the ids of the rows its batches delivered: every record delivers its
+    first question, so the records read are the ids delivered, those of three questions refused at the
+    third."""
+    seen = {int(identity) for batch in batches for identity in np.asarray(batch["id"])}
+    counts = {}
+    for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
+        read = {identity for identity in members if identity in seen}
+        refused = sum(identity % 3 == 2 for identity in read)
+        counts[name] = (len(read), statistics.get(f"data/rows/{name}", 0),
+                        statistics.get(f"data/rejected/{name}/third question", 0), refused)
+    return counts
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered(read, workers, native):
+    """A mixture of two named corpora read bounded to 18 of their records, behind a Grain step of its own
+    or not, through an objective's questions and a step after the mix that refuses each record's third
+    question: each member's rows (data/rows) are its own source examples whose last rows were delivered by
+    each batch, and its rejections the third questions refused of its own records, under its name, so its
+    rows and the examples it counts refused are the records it read; no refusal is the mixture's (row
+    3312)."""
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+    data = compile(_members_asked(read, native=native), objective=objective, read=read,
+                   loading=dataclasses.replace(READ, workers=workers), examples=18)
+    stream = data.train(DataPartition())
+    batches = []
+    try:
+        for batch in stream:
+            batches.append(batch)
+            # By each batch, no member is counted a record whose last row is not yet delivered.
+            for name, (_, rows, _, _) in _member_counts(batches, data.statistics()).items():
+                assert rows <= _completed(batches, name), name
+        statistics = data.statistics()
+    finally:
+        stream.close()
+    counts = _member_counts(batches, statistics)
+    for name, (examples, rows, rejected, refused) in counts.items():
+        assert (rows, rejected) == (examples - refused, refused), name
+    assert sum(examples for examples, *_ in counts.values()) == 18
+    assert not [name for name in statistics if name.startswith("data/rejected/mixture")]
+
+
+def _completed(batches, name: str) -> int:
+    """The records of member `name` whose every question the batches delivered, none refused: each record
+    of `id % 3 + 1` questions, the third of three refused."""
+    delivered = collections.Counter(int(identity) for batch in batches
+                                    for identity in np.asarray(batch["id"]))
+    members = range(1, 13) if name == "left" else range(101, 113)
+    return sum(identity % 3 != 2 and delivered[identity] == identity % 3 + 1 for identity in members)
+
+
+def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_counts_them():
+    """The read of `test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered`,
+    streamed, its position saved after three batches: restored, it delivers the batches the uninterrupted
+    read does after them and ends with its members' counts (row 3312)."""
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+
+    def read():
+        return compile(_members_asked("streamed"), objective=objective, read="streamed", loading=READ,
+                       examples=18)
+
+    whole = read()
+    stream = whole.train(DataPartition())
+    batches = [next(stream) for _ in range(3)]
+    state = stream.get_state()
+    after = list(stream)
+    stream.close()
+    expected = whole.statistics()
+    resumed = read()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    again = list(restored)
+    restored.close()
+    assert [np.asarray(batch["id"]).tolist() for batch in again] == [
+        np.asarray(batch["id"]).tolist() for batch in after]
+    statistics = resumed.statistics()
+    assert {name: value for name, value in statistics.items() if name.startswith("data/r")} == {
+        name: value for name, value in expected.items() if name.startswith("data/r")}
+    assert _member_counts([*batches, *after], expected) == _member_counts([*batches, *again], statistics)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock(native):
+    """The streamed read of the resume test above, behind a Grain step of the mixture's own that keeps
+    every row or not, its position saved after three batches by main 87e6e0965, before a mixture's members
+    were counted where their rows are delivered (tests/fixtures/bounded_mixture_position.json,
+    bounded_native_mixture_position.json): restored, it delivers the batches that read did after them, each
+    consuming the source examples it did there, and counts each member afresh from the resume, its examples
+    counted where they are delivered (row 3312)."""
+    name = "bounded_native_mixture_position.json" if native else "bounded_mixture_position.json"
+    recorded = json.loads((Path(__file__).with_name("fixtures") / name).read_text())
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+    data = compile(_members_asked("streamed", native=native), objective=objective, read="streamed",
+                   loading=READ, examples=18)
+    stream = data.train(DataPartition())
+    stream.set_state(recorded["state"].encode())
+    after = list(stream)
+    stream.close()
+    assert [np.asarray(batch["id"]).tolist() for batch in after] == recorded["after_ids"]
+    assert [np.asarray(batch[EXAMPLES_CONSUMED]).tolist() for batch in after] == recorded["after_consumed"]
+    # Each member counted afresh from the resume: its records whose last row it delivered since, not
+    # refused at the third question.
+    statistics = data.statistics()
+    since = {int(identity) for ids in recorded["after_ids"] for identity in ids}
+    for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
+        assert statistics[f"data/rows/{name}"] == sum(identity in since and identity % 3 != 2
+                                                      for identity in members), name
+    # The refusals it counted under the mixture before it was saved stay its own; none since.
+    from dew.data.mixing import state_counts
+
+    before = state_counts(json.loads(recorded["state"])["iterator"])["mixture"].rejected["third question"]
+    assert statistics["data/rejected/mixture/third question"] == before
+
+
 def _asked(read: str, *, shuffled: bool = True) -> Dataset:
     """12 records, ids 1 to 12, each with `id % 3 + 1` pairs of tokens, as `read` reads them: in one
     order or each share its own, shuffled where `shuffled`."""
@@ -797,9 +940,10 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
     """A training read bounded to its 12 records, in one order or each share its own, read alone or by
     loading workers, through an objective's step that makes 24 rows of them, a question's each
     (`Questioned`) or a chunk of two tokens each (`text.Chunks`), and one that refuses 4 of those
-    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are its 12 source examples,
-    counted before the step makes rows of them, and not the rows it delivers again after; its
-    rejections are the rows refused after it (row 1944)."""
+    (`ThirdQuestionRefused`) where it asks: the corpus's rows (data/rows) are the source examples whose last
+    rows it delivered, each once (`CONSUMED`), the 12 or, where the 4 whose last row is refused are counted
+    refused (`REFUSED`), the 8 left, and not the rows it delivers; its rejections are the rows refused
+    after it, so the examples it counts as rows or refused are the 12 it read (row 1944)."""
     steps = ((Questioned(), ThirdQuestionRefused()) if expansion == "questions"
              else (text.Chunks(2, fields=("tokens",)),))
     data = compile(_asked(read).batch(2), objective=ObjectiveData(train=steps), read=read,
@@ -810,12 +954,12 @@ def test_a_corpus_counts_the_source_examples_an_objective_makes_its_rows_of(read
         counts = data.statistics()
     finally:
         stream.close()
-    assert counts["data/rows/asked"] == 12
     if expansion == "questions":
         assert rows == 24 - 4 == 20
-        assert counts["data/rejected/asked/third question"] == 4
+        assert (counts["data/rows/asked"], counts["data/rejected/asked/third question"]) == (8, 4)
     else:
         assert rows == 24
+        assert counts["data/rows/asked"] == 12
 
 
 def wide_draw(metadata):

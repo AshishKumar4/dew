@@ -4,20 +4,33 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import urllib.parse
+from datetime import timedelta
 from pathlib import Path
 
 import lane_environment
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
+import hypothesis
 import jax
 import pytest
 import remote_cache
 from tool_support import load
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+
+# The suite's Hypothesis profile (docs/design/testing.md): the same examples on every run, so a red
+# reproduces anywhere; no example database; 50 generated examples, each under a soft 2 s deadline. A test
+# whose examples compile sizes its own deadline and count from its measured runtime, within a test's 120 s
+# with room for generation and shrinking. What Hypothesis stores besides (its constants and character
+# caches) goes under the system temp directory, not the checkout.
+os.environ.setdefault("HYPOTHESIS_STORAGE_DIRECTORY", os.path.join(tempfile.gettempdir(), "hypothesis"))
+hypothesis.settings.register_profile("dew", derandomize=True, database=None, deadline=timedelta(seconds=2),
+                                     max_examples=50, print_blob=True)
+hypothesis.settings.load_profile("dew")
 
 # The suite compiles the same kernels every run, on both lanes, in every xdist
 # worker. XLA's persistent cache is keyed by the executable, so a second run
@@ -33,8 +46,10 @@ else:
     _cache = default_compilation_cache_dir()
     if _cache:
         # A worker that keeps bundles of the shared cache below writes a directory of its own, so the
-        # programs a bundle gains are that worker's whole writes, not another's half-written one.
-        if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
+        # programs a bundle gains are that worker's whole writes, not another's half-written one; with no
+        # shared cache the workers share one, each reading what another compiled (2026-11-02: a URL with no
+        # token gave 16 workers 16 caches, 33 s a case against 4).
+        if os.environ.get("PYTEST_XDIST_WORKER") and remote_cache.requested():
             _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
         # The processes its tests start (a checker run as a script, a CLI) compile into the same cache under
@@ -83,7 +98,11 @@ def pytest_configure(config):
 
 
 def pytest_collectstart(collector):
-    if _remote is not None and isinstance(collector, pytest.Module):
+    """A module's bundle of the shared cache, restored as it is collected, before its tests run; none for a
+    collection that runs no test (`--collect-only`, ci.py's `collect`), which compiles nothing a bundle holds
+    (train 459: 6 GB of programs for 140 files none of whose tests ran, 735 s of a 54 s collection)."""
+    running = not collector.config.option.collectonly
+    if _remote is not None and running and isinstance(collector, pytest.Module):
         _remote.opened(bundle(collector))
 
 

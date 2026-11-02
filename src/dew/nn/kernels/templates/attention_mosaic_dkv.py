@@ -232,17 +232,30 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
         # Each key gradient, the walk's row sums, added into its own `[B or 1, H or 1, Kp]`.
         family.added(key_sum, key_view, interpret, smem=rows_smem.at[index])
 
-def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], *, widths: bool, split: bool, fused: bool
-              ) -> tuple:
+def _grad_buffers(graded: list[Kind], shapes: list, batch: int, heads: int, queries: int, keys_padded: int
+                  ) -> list[tuple]:
+    """Each graded parameter's gradient buffer's shape (`_dkv_launched`): its own batch rows and heads
+    (`shapes`, `[B or 1, H or 1, ...]`), or the call's in deterministic mode, then its keys, and for a tile
+    its queries."""
+    if deterministic_ops_requested():
+        shapes = [(batch, heads)] * len(shapes)
+    return [(*shape[:2], keys_padded) if kind == Kind.KEY else (*shape[:2], keys_padded, queries)
+            for shape, kind in zip(shapes, graded, strict=True)]
+
+
+def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
+              fused: bool) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
-    `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place
-    (`_dkv_launched`), its dK and dV outputs, and its scoped allocations (`_dkv_scoped`)."""
+    `leaves`), a fused launch's dQ and the hook's key and tile gradients, each added into in place, a ref a
+    group of equal shapes (`_dkv_launched`, `mosaic.stacked_groups`), its dK and dV outputs, and its scoped
+    allocations (`_dkv_scoped`)."""
     inputs, refs = refs[:9], refs[9:]
     unflattened, refs = treedef.unflatten(refs[:leaves]), refs[leaves:]
     dq_ref, refs = (refs[0], refs[1:]) if fused else (None, refs)
-    grad_refs, refs = refs[:len(graded)], refs[len(graded):]
+    grad_refs, refs = refs[:len(groups)], refs[len(groups):]
+    views = mosaic.stacked_views(grad_refs, groups)
     dk_ref, dv_ref, *refs = refs
-    keyed = tuple([ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == wanted]
+    keyed = tuple([ref for ref, kind in zip(views, graded, strict=True) if kind == wanted]
                   for wanted in (Kind.KEY, Kind.TILE))
     return inputs, unflattened, (dq_ref, dk_ref, dv_ref), _dkv_scoped(refs, widths=widths, split=split), keyed
 
@@ -364,6 +377,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
     graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
+    graded_shapes = [param.shape for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
+    buffers = _grad_buffers(graded, graded_shapes, query.shape[0], heads, queries, key.shape[1])
+    groups = mosaic.stacked_groups(buffers)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     staged_logits = program.tiles.staged_logits
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
@@ -373,7 +389,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
 
     def body(*refs, streams):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
-            refs, treedef, len(leaves), graded, widths=value_width == width, split=split, fused=walk.fused)
+            refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
+            fused=walk.fused)
         (spans_of, score_refs, drop_of, l_ref), (dq_ref, dk_ref, dv_ref) = unflattened, outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
@@ -447,36 +464,31 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
         if summed is not None:
             first = 9 + len(leaves) + walk.fused
-            grads = refs[first:first + len(graded)]
-            outputs = refs[first + len(graded):first + len(graded) + 2]
+            grads = mosaic.stacked_views(refs[first:first + len(groups)], groups)
+            outputs = refs[first + len(groups):first + len(groups) + 2]
             _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
-    return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],
-                         key.shape[1])
+    return _dkv_launched(walk, launch, operands, graded, buffers, groups)
 
-def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], shapes: list,
-                  keys_padded: int) -> tuple[jax.Array, ...]:
+def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], buffers: list,
+                  groups: tuple) -> tuple[jax.Array, ...]:
     """The dK/dV launch `launch` over `operands`: dK, dV and the hook's key and tile gradients in kind order,
-    each parameter's (of `shapes`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
+    each parameter's (`buffers`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
     place by every program that reads it, the tiles' keys first `[., ., Kp, Qp]` (row 2577: a bias every row
     shares summed in the program, not written a row at a time); in deterministic mode each program's own
     place, the call's `[B, H, ...]`, written once, the shared rows summed in a fixed order after
     (`template.shared_sum`; row 2620: the adds of the programs sharing one place land in no fixed order); a
     fused one's dQ before them, added into zeros too, one copy, or each consumer's own interpreted
-    (`Family.added`)."""
+    (`Family.added`). The gradients of one shape (`groups`) are one ref, a leading axis of them
+    (`mosaic.stacked_zeros`, row 3180)."""
     batch, queries, heads, _ = operands[0].shape
-    if deterministic_ops_requested():
-        shapes = [(batch, heads)] * len(shapes)
-    grads = [jax.new_ref(jnp.zeros((*shape[:2], keys_padded) if kind == Kind.KEY
-                                   else (*shape[:2], keys_padded, queries), jnp.float32))
-             for shape, kind in zip(shapes, graded, strict=True)]
+    grads = mosaic.stacked_zeros(buffers, groups)
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
-        return dk, dv, *_keys_last([jax.freeze(grad) for grad in grads], graded)
+        return dk, dv, *_keys_last(mosaic.stacked_read(grads, groups), graded)
     width = operands[0].shape[3]
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))

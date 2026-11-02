@@ -115,6 +115,13 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """The call's spans from its arrays and the op's static form and key count."""
         return KeySpans(start, end, query_ids, key_ids, self.keys, self.form)
 
+    def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
+        """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
+        past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
+        queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
+        padded_queries, padded_keys = _padded(queries, keys, config)
+        return 1 - queries * keys / (padded_queries * padded_keys)
+
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
         file (`mosaic.roles`)."""
@@ -691,10 +698,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); otherwise (the accurate form, a hooked
         or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds,
-        a call over key spans, windows, documents or runs, whose one launch's dK and dV an H100 got wrong,
-        1.27 and 0.79 times their RMS from the two launches' and different on a rerun at a packed windowed
-        call of width 64, interpreted exact, ET-3171-BAND-h100, row 3171) two launches, the dQ launch then
-        the keys-first dK/dV one, in a fixed order."""
+        a call over key spans, windows, documents or runs, whose one launch is on par but the slower: row
+        3171's packed windowed call, 1 x 1024, 8 query heads over 2, its step 0.082 ms against the two
+        launches' 0.062 at width 64 and 0.106 against 0.073 at 128, ET-SPAN-h100, its dK and dV wrong there
+        before row 3180's fix) two launches, the dQ launch then the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None

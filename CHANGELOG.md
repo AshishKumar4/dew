@@ -7,6 +7,79 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A layout that keeps the optimizer state or the EMA in pinned host memory (`Layout(host=...)`) now brings
+  it to the device a chunk at a time as the step commits: the leaves the commit reads together, under AdamW
+  one parameter's moments and average, each chunk stored back as soon as it is updated. It used to fetch the
+  whole state at once, and XLA held all of it beside the parameters and the gradient, so a whole
+  Qwen3.5-4B's AdamW step with its moments on the host never fit a GH200. The memory planner's derived
+  footprint counts what a commit stages.
+- A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
+  a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
+  curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and
+  it stays non-expansive where the loss is convex (an affine head, `up` alone). A head transform's norm is
+  bounded at the states the step can reach from the window's, not at a zero state (a norm declares its
+  bounds through `dew.nn.protocols.BoundedNorm`, `RMSNorm`, `LayerNorm` and `OffsetLayerNorm` among them).
+  Its terms read the level's inputs as its maps multiply them, a checkpoint's quantizer applied, and under
+  Qwix's forward quantization every operand as its rounding can grow it (`dew.quantization.rounding_growth`,
+  Qwix's unit scale for small float16 groups included), a step following Qwix's straight-through gradient:
+  the bound holds for the surrogate's smooth part, and a step that crosses a rounding cell adds the
+  quantization's own jump. Its rate is a constant of the step. Refused, as no curvature bounds them: a step
+  of `down` under ReLU; a head map, or an `up` a step of `down` reads, that a method interceptor computes
+  other than as a linear map (a checkpoint's quantizer of a head map's input, a frozen FP8 product, an
+  adapter's dropout); a head norm that declares no bounds; a Qwix weight calibration other than absmax,
+  clipped or not; and a Qwix rule that quantizes the backward, whose rounded gradient need not descend.
+- API changes for a model that holds a continuum level: `dew.nn.continuum.Continuum` takes the residual
+  stream's width as a required `features` field, as its maps are built in `setup`; the `SteppedInContext`
+  hook `affine_head` is gone, replaced by `head_bounds(states)` (what bounds a slot loss's curvature and
+  slope in the states the head reads, `dew.nn.continuum.HeadTerms`) and `level_terms` (what bounds a damped
+  step of the level), which `CausalTransformer` and `MultimodalTransformer` implement. The functions
+  `head_curvature`, `up_energy` and `damping` of `dew.objectives.lm.adaptation` are gone, private to a
+  damped step now. `CausalTransformer`, `MultiHeadLatentAttention` and `InContextMemory` read their
+  submodules' products through one mixin, `dew.quantization.LinearProducts` (`applied_kernel`,
+  `nonlinear_input`, `linear_product`).
+- A pipelined run's state is stage-local: over a stage axis of S, each device holds its own stage's layers
+  of each run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run, and every rule
+  of Dew's optimizers reads a stacked leaf as its stored layers. An LM's decoder, a decision's backbone,
+  PPO's policy and critic, a DiT's, a JEPA's and a UNet level's stacks are stage-local; an objective that
+  declares no stack logs that its run keeps every layer whole. `fit` returns and an `Observe` reads the
+  state as the run holds it, which the model reads off the mesh as its stored layers; `Trainer.stored`
+  and `Trainer.staged` convert between that state and every layer whole. A checkpoint holds every layer
+  as one device's would and resumes onto any stage count.
+  `Layout(stage_local=False)` keeps every layer whole on every stage, as does a run whose optax
+  transformation may read a parameter whole, a Gauss-Newton run and a DiLoCo run.
+- A mixture a run bounds in examples counts each member's source examples where their rows are delivered,
+  and what a step after the mix refuses of a member's rows under that member, through objective steps,
+  batched steps, packs, windows and the shuffles after them (they were counted as the mix drew them, and
+  refused under the mixture). A data position now records its counters' format. A position saved before
+  counts its mixture's members afresh from the resume. The examples a counter, a causal window or a
+  completion held in flight count in its total and on its clock as before, and complete no member's.
+- A step compiled ahead for GPUs with none attached compiles with XLA's autotuning off, unless `XLA_FLAGS` sets it: its programs
+  and their memory are the same, and its fit search compiles each rung about a third faster.
+- A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
+  them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
+  memory read that packs them as it holds them bounds the passes with its pack. A run bounded in
+  examples or epochs can shuffle the windows a concatenating pack or windows cut its examples across:
+  each example counts once every window holding a piece of it is drawn (this was refused), and windows
+  that overlap count each token at the last of them that holds it. A memory read that shuffles such
+  windows holds the bound before the layout, and each share lays out its own examples. A version 7
+  position that version 8 reads otherwise says why and how the run goes on.
+- `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
+  (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
+  damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that
+  sets no learning rate takes the optimizer's own, Gauss-Newton's whole step (1.0), the rest's 2.7e-4;
+  param groups scale their leaves of one solve, and `clip_grads` caps its step's norm. A run that set
+  `damping` on its objective steps by its optimizer's rule instead, so give it this optimizer.
+- A scoring server reports what its task's passes cost and what it admitted and refused
+  (`ScoringServer.metrics`); the decision serving example serves them at `GET /metrics`.
+- A corpus whose objective makes several rows of each example counts its examples as `data/rows`, not the
+  rows or windows made of them: a run bounded in examples counts those whose last rows were delivered, an
+  example a step refused or made no row of under `data/rejected`; any other run counts the examples read
+  before the objective's step. A streamed read's examples bound and `.take(n)` read by loading workers take
+  their count once across the workers (each worker took it of its own slice). A run bounded in examples
+  trains with a rollout, and with a custom `step=` whose schedule decays over its own steps. In a pool, a
+  read of the training stream after its first is agreed over the coordination service only where its
+  shares may run out apart, so a global order, arrays handed whole and a handed map dataset step without a
+  round a step.
 - Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
@@ -17,11 +90,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
-- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
-  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
-  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
-  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
-  (docs/installation.md lists each fix).
+- Dew requires its JAX build 0.12.0.1.post45, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins and their PJRT plugins, which Dew's package index serves: Mosaic GPU honours a kernel's
+  register raises (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC
+  blocks by their strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and
+  `griddepcontrol`, and Triton's pipeliner gives a tile a wgmma reads from shared memory, and another use
+  reads in registers, a buffer of its own a stage, so Pallas Triton attention's dK on an H100 is right and the
+  same every run (docs/installation.md lists each fix). The register raises hold from post43, whose PJRT
+  plugin, where Mosaic GPU compiles a kernel, is Dew's build too.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.

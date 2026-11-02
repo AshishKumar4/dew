@@ -10,7 +10,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/kimi_support.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/moe_biased_exchange_worker.py": {
@@ -213,10 +213,6 @@
    "comparisons": 9,
    "lane": "Training"
   },
-  "tests/test_dory.py": {
-   "comparisons": 6,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_dpo.py": {
    "comparisons": 7,
    "lane": "Models, Serving & RL"
@@ -394,7 +390,7 @@
    "lane": "Kernels"
   },
   "tests/test_kimi_k3.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_kv_cache.py": {
@@ -402,7 +398,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {
-   "comparisons": 20,
+   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {

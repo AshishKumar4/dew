@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 import grain.python as pygrain
 
 from dew._records import json_value, record
+from dew.data.completion import cuts
 from dew.data.dataset import Records, SourceSlice
 from dew.data.pipeline import (
     TOKEN_FIELDS,
@@ -50,6 +51,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    MarkConsumed,
     Measure,
     Mixture,
     Native,
@@ -70,6 +72,7 @@ from dew.data.pipeline import (
     _declares_rejects,
     chains,
     children,
+    examples_bound,
     record_stage,
     runs,
     with_children,
@@ -632,6 +635,32 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 """The stages a memory read runs over the whole source before the first other stage."""
 
 
+def _held_bound(stages: Sequence[Stage], at: int) -> int:
+    """The stages of a bound in examples standing at `at` before a pack a memory read runs over its whole
+    source, or a layout a shuffle draws after (`_drawn_cut`) (`dew.data.compile._bounded`: a repeat without
+    a count where it reads on, its limit and its marks): the memory read runs them as it holds the rest,
+    the source examples cycled to the limit and marked before the layout lays them out, so its windows
+    carry the examples they consume. None (0) where no such bound stands there."""
+    first = stages[at] if at < len(stages) else None
+    repeats = int(isinstance(first, Repeat) and first.epochs is None)
+    bound = stages[at + repeats:at + repeats + 3]
+    marked = (len(bound) == 3 and isinstance(bound[0], Limit) and isinstance(bound[1], Map)
+              and isinstance(bound[1].step, MarkConsumed)
+              and (isinstance(bound[2], Pack) or _drawn_cut(stages, at + repeats + 2)))
+    return repeats + 2 if marked else 0
+
+
+def _drawn_cut(stages: Sequence[Stage], at: int) -> bool:
+    """Whether the stage at `at` lays its examples across windows (`completion.cuts`) and a shuffle draws
+    the windows after it, before the batch: where a bound in examples stands before such a layout, a
+    memory read holds the bound and each share lays its own examples, so each example's windows are one
+    share's, whose shuffle releases its count once it draws them all (`dew.data.completion`)."""
+    if at >= len(stages) or not cuts((stages[at],)):
+        return False
+    batched = _until(stages, (BatchStage, TokenBudget))
+    return any(isinstance(stage, Shuffle) for stage in stages[at + 1:batched])
+
+
 _LOCAL = (Map, MapWithIndex, Filter, FlatMap)
 """The deterministic record steps that run before a cache or an interleave,
 inside the reader of each input or shard."""
@@ -842,13 +871,16 @@ def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
 
 
 def _analyzed(
-    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False
+    pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False, bound: bool = False
 ) -> _Lowering:
     """The analysis of `pipeline` at `read`, a scored branch with
     `validation`. A token split in a training order cut per share is refused
     once the steps are bound, since an unbound configured step may still be
     one a memory read runs eagerly; a scored branch reads its whole order in
-    one canonical pass, so its split is whole."""
+    one canonical pass, so its split is whole. With `bound`, a cache after
+    configured steps is analyzed as it is once they bind: each binds to the
+    step its declaration states (`_bind`), and a prefix no cache can key is
+    refused, so the cache holds what they make."""
     source = pipeline.source
     nested = children(pipeline)
     if isinstance(source, Mixture):
@@ -862,21 +894,31 @@ def _analyzed(
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
     cache = _at(stages, Artifact)
-    if nested or (cache is not None and any(isinstance(stage, Configured) for stage in stages[:cache])):
+    if nested or (cache is not None and not bound
+                  and any(isinstance(stage, Configured) for stage in stages[:cache])):
         cache = None
     # A view of the inputs before a cache leaves the cache to the lowering, which reads it by input
     # as an indexed read does; a memory read runs the steps before the first view over the whole
     # source first, as it does without a cache, and the cache holds the rest.
     viewed = cache is not None and any(isinstance(stage, _VIEWS) for stage in stages[:cache])
     eager = 0 if cache is None or viewed else cache + 1
-    while read == "memory" and not nested and eager < len(stages) and isinstance(stages[eager], _EAGER):
-        eager += 1
+    ran = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
+    while read == "memory" and not nested and eager < len(stages):
+        if _drawn_cut(stages, eager) and examples_bound((*ran, *stages[:eager])) is not None:
+            # A shuffle draws the windows a layout cuts counted examples across: each share lays its own.
+            break
+        held = 1 if isinstance(stages[eager], _EAGER) else _held_bound(stages, eager)
+        if not held:
+            break
+        eager += held
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
     per_share = per_share or any(child.per_share for child in lowered)
     lowered = tuple(_cut(child, per_share, validation) for child in lowered)
-    steps = (*ancestry, *stages)
+    # The stages a memory read already ran over its rows read its order too: a bound it held with its
+    # pack (`_held_bound`) repeats and ends it before the rows it holds.
+    steps = (*ancestry, *ran, *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     parts_unending, unending, records_unending, onward = _finiteness(
         stages, lowered, per_share and not validation and not repeats)
@@ -1002,6 +1044,11 @@ def _checked(
     combined = "mix" if isinstance(pipeline.source, (Mixture, Phases)) else None
     per_share = read == "streamed"
     prefix = list(ancestry)
+    # Where a memory read's share lays the examples a bound counts across windows (`_drawn_cut`), it holds
+    # them all to draw them in any order (`dew.data.completion.released`).
+    source = pipeline.source
+    ran = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
+    laid = False
     for index, stage in enumerate(pipeline.stages):
         name = _name(pipeline)
         if not isinstance(stage, _STAGES):
@@ -1048,7 +1095,8 @@ def _checked(
             if refused is not None:
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
-        if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
+        laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
+        if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion and not laid:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")

@@ -44,16 +44,9 @@ import tyro
 from etils import epath
 
 import dew.io
-from dew import registry, training
+from dew import _records, registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import (
-    JSON,
-    duration,
-    earlier_fields,
-    is_share,
-    json_value as field_value,
-    recorded_duration,
-)
+from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -74,6 +67,7 @@ from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
+    Configured,
     ModelConfig,
     Registered,
     declared_type,
@@ -90,13 +84,14 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
-from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
+from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns
 from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
-from dew.training.evaluation import EvalSuite, Summary
+from dew.training.evaluation import EvalSuite, Split, Summary
 from dew.training.inspection import Inspection
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
@@ -179,7 +174,8 @@ def _metric_class(name: str) -> type:
     return member
 
 
-def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
+def _member_flags(member: type | Callable[..., Configured],
+                  given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
     `given` over the member's defaults, and the value each flag starts at.
 
@@ -794,11 +790,11 @@ class TrainerConfig:
         # A window the run ends inside is never committed, as the trainer counts its updates.
         return None if steps is None else steps // trainer.accumulation
 
-    def eval_interval(self, dataset: Loader) -> int | str | None:
+    def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Loader) -> int | str | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | str | Counted | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -807,10 +803,14 @@ class TrainerConfig:
             return value
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | None:
-        """Steps for `epoch`; steps, a share of the run (which `fit` resolves) or None as given."""
+    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | Counted | None:
+        """Steps for `epoch`, or the source examples a pass holds where the run reads its epochs as
+        passes over them (`Loader.epochs`, `Loader.pass_examples`); steps, a share of the run (which `fit`
+        resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
+        if dataset.steps_per_epoch is None and dataset.epochs is not None and dataset.pass_examples:
+            return Counted(dataset.pass_examples, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
@@ -888,7 +888,7 @@ class Prepared[LossT, EffectsT]:
     metrics: Sequence[Metric] = ()
     rollout: Rollout | None = None
     summary: Mapping[str, object] | None = None
-    validation: Dataset | Mapping[str, Dataset | Reader] | None = None
+    validation: Dataset | Mapping[str, Dataset | Split] | None = None
     after: Callable[[TrainState, str], None] | None = None
 
     def train(self, name: str) -> TrainState:
@@ -984,127 +984,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
-    chain's store under the fields its class renamed since, by today's names (`earlier_chains`).
+    chain's store under the fields its class renamed since, by today's names
+    (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return earlier_chains(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
-
-
-RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
-"""The fields a store's class renamed after runs recorded chains with them, by its import path, each earlier
-name by today's: an iterator's content version, `identity` as every opaque source names it (row 3031)."""
-
-
-def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose chains (`_CHAINS`) hold a store under fields its class renamed since
-    (`RENAMED_FIELDS`), with them under today's names, wherever a chain holds the store: its source, a mix's
-    or a phase's member, a store's field that holds stores (a concatenation's parts, a view's source). Data a
-    store holds (a Memory's columns) is read as it was. Carried to 1.0 (ledger 1552)."""
-    fields = record.get("fields")
-    if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
-        return record
-    return {**record, "fields": {name: _renamed_chain(field_value(value, name)) if name in _CHAINS else value
-                                 for name, value in fields.items()}}
-
-
-def _renamed_chain(chain: JSON) -> JSON:
-    """A chain's record (`dew.data.records`), or a run's named splits of them, as a saved run's record holds
-    it, read at that boundary: its stores' renamed fields under today's names (`_renamed_stores`)."""
-    if not isinstance(chain, dict):
-        return chain
-    splits = chain.get("splits")
-    if isinstance(splits, list):
-        pairs: list[JSON] = [[pair[0], _renamed_chain(pair[1])] if isinstance(pair, list) and len(pair) == 2
-                             else pair for pair in splits]
-        return {**chain, "splits": pairs}
-    stages = chain.get("stages")
-    if isinstance(stages, list):
-        chain = {**chain, "stages": [_renamed_call(stage) for stage in stages]}
-    source = chain.get("source")
-    if not isinstance(source, dict):
-        return chain
-    members = next((key for key in ("mix", "phases") if isinstance(source.get(key), list)), None)
-    if members is not None:
-        member_chains = source[members]
-        assert isinstance(member_chains, list)
-        return {**chain, "source": {**source, members: [_renamed_chain(member) for member in member_chains]}}
-    if "pipe" in source:
-        called = _renamed_call(source)
-        assert isinstance(called, dict)
-        return {**chain, "source": {**called, "input": _renamed_chain(source.get("input"))}}
-    return {**chain, "source": _renamed_stores(source)}
-
-
-def _renamed_call(call: JSON) -> JSON:
-    """A call of `pipe` a saved chain records (`{"pipe": ..., "settings": {...}}`), read at that boundary:
-    each setting its function declares a store (`_holds_store`) with its stores' renamed fields under today's
-    names (`_renamed_stores`); any other setting or entry as it is."""
-    if not isinstance(call, dict) or not isinstance(call.get("pipe"), str):
-        return call
-    settings, named = call.get("settings"), call["pipe"]
-    if not isinstance(settings, dict) or not isinstance(named, str) or not named.startswith("dew."):
-        return call
-    taken = parameters(registry.imported(named))[0]
-    hints = {name: registry.parameter_type(taken[name][1], name) if name in taken else None
-             for name in settings}
-    return {**call, "settings": {name: _renamed_stores(value) if _holds_store(hints[name]) else value
-                                 for name, value in settings.items()}}
-
-
-def _renamed_stores(value: JSON) -> JSON:
-    """`value`, a store's class record or a list of them as a saved chain holds them, read at that boundary:
-    each store's fields its class renamed (`RENAMED_FIELDS`) under today's names, and each of its fields its
-    class declares a store (`_store_fields`) the same; any other field, a store's data among them, as it
-    is."""
-    if isinstance(value, list):
-        return [_renamed_stores(part) for part in value]
-    named = _store_class(value)
-    if named is None:
-        return value
-    assert isinstance(value, dict)
-    fields = value["fields"]
-    assert isinstance(fields, dict)
-    renamed, holding = RENAMED_FIELDS.get(named, {}), _store_fields(named)
-    held = {renamed.get(name, name): _renamed_stores(field) if renamed.get(name, name) in holding else field
-            for name, field in fields.items()}
-    return {**value, "fields": held}
-
-
-def _store_class(value: JSON) -> str | None:
-    """The import path of the store whose class record `value` is, read from a saved chain at its boundary:
-    one of Dew's stores (`dew.data.pipeline.Dataset`) or views of one (`dew.data.sources.base.View`); else
-    None."""
-    from dew.data.sources.base import View
-
-    if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
-        return None
-    named = value.get("class")
-    if not isinstance(named, str) or not named.startswith("dew.") or ":" not in named:
-        return None
-    built = registry.imported(named)
-    return named if isinstance(built, type) and issubclass(built, Dataset | View) else None
-
-
-def _store_fields(named: str) -> frozenset[str]:
-    """The fields of the store class at import path `named` that its declared types say hold stores (a
-    concatenation's parts, a view's source)."""
-    built = registry.imported(named)
-    assert isinstance(built, type)
-    return frozenset(field.name for field in dataclasses.fields(built)
-                     if _holds_store(declared_type(built, field.name)))
-
-
-def _holds_store(hint: Annotation | typing.TypeVar) -> bool:
-    """Whether a declared type `hint` holds stores: Dew's store protocol (`Source`), a store or view class, or
-    any type made of one (a tuple of them, an optional one, a view's type variable bound to one)."""
-    from dew.data.sources.base import Source, View
-
-    if isinstance(hint, typing.TypeVar):
-        return hint.__bound__ is not None and _holds_store(hint.__bound__)
-    if hint is Source or (isinstance(hint, type) and issubclass(hint, Dataset | View)):
-        return True
-    return any(_holds_store(argument) for argument in typing.get_args(hint))
+    return records.earlier_chains(earlier_profile(earlier_newton_schulz(earlier_trainer(record))), _CHAINS)
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1115,7 +1000,7 @@ def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(fields, Mapping) and isinstance(segments, list):
         # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
         # segments alone, where a layout's components are, never a field of data a row holds.
-        migrated = earlier_fields(field_value(segments, "segments"))
+        migrated = earlier_fields(_records.json_value(segments, "segments"))
         assert isinstance(migrated, list)
         fields = {**fields, "segments": migrated}
         record = {**record, "fields": fields}
@@ -1325,8 +1210,8 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
         if not (dataclasses.is_dataclass(held) and group in _names(held)):
             raise KeyError(f"{path} names no group of the run record")
         held = getattr(held, group)
-    if isinstance(held, ModelConfig | ObjectiveConfig) and field not in _names(held):
-        member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
+    if isinstance(held, Registered) and field not in _names(held):
+        member = held.member
         # A flag's annotation types the value, as `--model.<field>` reads it;
         # an argument without a flag (the loss a `Supervised` is given) takes JSON.
         annotation = declared_type(_member_flags(member, held.fields)[0], field)
@@ -1759,7 +1644,7 @@ class RunConfig:
         `validates`: what each split scores where `val_metrics` names none (`suites`)."""
         return tuple(self.metric(config) for config in self.default_metrics(validates=validates))
 
-    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None, metrics: Sequence[Metric] = (),
+    def suites(self, dataset: Loader, validation: Mapping[str, Split] | None, metrics: Sequence[Metric] = (),
                ) -> Mapping[str, EvalSuite] | None:
         """Each split the run validates, `validation`'s or `dataset.val` as `val`, with the metrics
         `val_metrics` names for it built (`metric`), else the kind's own `metrics`, at its cadence in
@@ -1789,14 +1674,15 @@ class RunConfig:
                              "preset (dew.data.presets), in Python or in run.json")
         return self.data
 
-    def compiled(self, objective: ObjectiveData, dataset: Dataset | Loader,
-                 validation: Dataset | Mapping[str, Dataset | Reader] | None,
-                 ) -> tuple[Loader, Mapping[str, Reader] | None]:
+    def compiled[Entry: Split](self, objective: ObjectiveData, dataset: Dataset | Loader,
+                               validation: Dataset | Mapping[str, Dataset | Entry] | None,
+                               ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
-        them, so its length is read off the loader this returns."""
+        them, or to `trainer.epochs` passes over its source examples where its read has no record count,
+        so its length is read off the loader this returns."""
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples)
+                      examples=self.trainer.examples, epochs=self.trainer.epochs)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1917,8 +1803,8 @@ class RunConfig:
                              "with them before anything calls JAX")
 
     def readied(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader,
-                validation: Dataset | Mapping[str, Dataset | Reader] | None, metrics: Sequence[Metric],
-                name: str) -> tuple[Self, Loader, Mapping[str, Reader] | None, Mapping[str, EvalSuite] | None,
+                validation: Dataset | Mapping[str, Dataset | Split] | None, metrics: Sequence[Metric],
+                name: str) -> tuple[Self, Loader, Mapping[str, Split] | None, Mapping[str, EvalSuite] | None,
                                     int | None]:
         """This run as it trains `objective` under `name`, and what it trains on, before anything is
         placed (`train`, `viewed`): its data compiled with the objective's own stages and its validation
@@ -1941,7 +1827,7 @@ class RunConfig:
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
-              validation: Dataset | Mapping[str, Dataset | Reader] | None = None,
+              validation: Dataset | Mapping[str, Dataset | Split] | None = None,
               after: Callable[[TrainState, str], None] | None = None) -> TrainState:
         """Train `objective` on `dataset` as this config describes; every kind of run calls this after
         building both.
@@ -2005,8 +1891,8 @@ class RunConfig:
                     display.note(f"Experiment_Name: {name}")
                     display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
-                    tracker.artifact(RunRecord(name, json_value(self.to_dict()),
-                        json_value(summary or {}), steps, packages_installed(),
+                    tracker.artifact(RunRecord(name, tracker_json(self.to_dict()),
+                        tracker_json(summary or {}), steps, packages_installed(),
                         device_kind=jax.devices()[0].device_kind, devices=jax.device_count(),
                         processes=jax.process_count()), 0)
 
@@ -2023,7 +1909,7 @@ class RunConfig:
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
-                    examples=trainer.examples if steps is None else None,
+                    examples=dataset.examples if steps is None else None,
                     eval_every=trainer.eval_interval(dataset),
                     checkpoint_every=trainer.checkpoint_interval(dataset),
                     checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
@@ -2063,11 +1949,12 @@ class RunConfig:
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it (`viewed`).
+            return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None)
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,
-               validation: Dataset | Mapping[str, Dataset | Reader] | None = None) -> dict[str, float]:
+               validation: Dataset | Mapping[str, Dataset | Split] | None = None) -> dict[str, float]:
         """The run's inspection of one sampled update over the batch its first step takes
         (`dew.training.inspected`, `first_step_batch`), the run readied as `train` readies it
         (`readied`) and its trainer built as `train` builds it, from the checkpoints its directory `name`
@@ -2080,7 +1967,9 @@ class RunConfig:
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
         with generation.run_precision(run.trainer.precision):
-            batch = first_step_batch(trainer, loader, steps, run.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it: its `examples`, or its `epochs`'
+            # passes over a read with no record count (`fitted`).
+            batch = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)
             return inspected(trainer, batch, steps=steps)
 
     def inspected(self) -> dict[str, float]:

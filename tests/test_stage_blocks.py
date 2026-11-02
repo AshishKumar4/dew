@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import as_given, assert_as_exact, widened, without_ynn
-from whole_suite import timed
 
 from dew.diffusion.process import DenoisingCondition
 from dew.mesh import batch_axes
@@ -70,13 +69,9 @@ CASES = {
 """Each model by its registry name and fields, and the inputs it reads."""
 
 CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "fsdp2_stage2"),
-         ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2"), ("unet", "fsdp2_stage2"),
-         ("unet", "stage2_sequence2")]
-
-PAST_TARGET = {"stack": {("unet", "stage2_sequence2"): 153}}
-"""The cells past a group's 120 s (`timed`), each its seconds in train 284's CI (1d680d0d1, ledger 2200):
-the UNet beside the sequence axis; every train stacks the UNet's stages over fsdp2_stage2 and the DiT's
-and the JEPA encoder's beside the sequence axis."""
+         ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2"), ("unet", "fsdp2_stage2")]
+"""The cells each a task runs whole; the UNet beside the sequence axis, CI's map tasks draw
+(`test_a_unets_stages_beside_the_sequence_axis_compute_what_one_device_computes`)."""
 
 SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 128, "patch_conv": 8}
 """Each model's check-1 seeds, the most any of its layouts took (`LAYOUT_SEEDS` where a layout took
@@ -175,10 +170,7 @@ def runs_a_pipeline(spec: MeshSpec, model, variables, call, inputs, microbatches
     return schedule.pipelined
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("case", "layout"), timed(PAST_TARGET, "stack", CELLS),
-                         ids=[f"{case}-{layout}" for case, layout in CELLS])
-def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(case, layout):
+def stacks_as_one_device(case: str, layout: str) -> None:
     """The model runs its blocks as a pipeline over the stage axis, and its output and gradients are
     on par with one device's, both measured from float64 (check 1). Before, every model but a
     decoder ran its whole stack on every stage, which the trainer refused."""
@@ -193,6 +185,22 @@ def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(ca
                     on_mesh(MeshSpec(), 1, model, variables, call), draw, f"{case} over {layout}",
                     seeds=LAYOUT_SEEDS.get((case, layout), SEEDS[case]),
                     truth_fn=float64_pulled(model, variables, call))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("case", "layout"), CELLS, ids=[f"{case}-{layout}" for case, layout in CELLS])
+def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(case, layout):
+    """`stacks_as_one_device` over each cell a task runs whole (`CELLS`)."""
+    stacks_as_one_device(case, layout)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.check1_shards(seeds=128, per_task=96)
+def test_a_unets_stages_beside_the_sequence_axis_compute_what_one_device_computes():
+    """`stacks_as_one_device` over the UNet's stages beside the sequence axis, its 128 seeds and their
+    redraws drawn by CI's map tasks (`check1_shards`), 96 a task: a task's compile took 40 s and each
+    seed 0.53 s on armada (cProfile, 62a555f178)."""
+    stacks_as_one_device("unet", "stage2_sequence2")
 
 
 @pytest.mark.mesh(devices=8)

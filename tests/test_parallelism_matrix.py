@@ -53,7 +53,6 @@ them."""
 import jax
 import pytest
 from tool_support import load
-from whole_suite import timed
 
 CELLS: dict[str, tuple[str, ...]] = {
     "dense_sft": ("fsdp4", "tensor2_sequence2"),
@@ -111,15 +110,6 @@ def references(tmp_path_factory):
     return tool, tool.References(tmp_path_factory.mktemp("layout-draws"), prepare=True, reserve=4 << 30)
 
 
-PAST_TARGET = {"test_each_layout_of_a_model_runs_or_is_refused_as_stated": {
-    ("edm2", "tensor4", None): 123.0, ("edm2", "fsdp2_tensor2", None): 131.7}}
-"""The run-once cells past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`):
-compile-bound, each timed alone on an armada 25/17 worker (om-edm2-time, 2026-10-29), about 1.35 times
-that on the fleet's 26/17 workers. EDM2's one-level model (`edm2_level`) splits over the same tensor
-layouts in every train's run, its step judged by the floor judge as every cell's is, 73.6 s and 78.2 s
-alone (IGEDMJ, 2026-10-30, ledger 2504)."""
-
-
 def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
     """The cells as a test's arguments, their layouts on every device but CELLS_ON_FOUR's, on four:
     for the accuracy test (`judged`) every cell but the run-once ones (`RUN_ONCE`), and for the
@@ -165,13 +155,12 @@ def statuses(rows):
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"),
-                         timed(PAST_TARGET, "test_each_layout_of_a_model_runs_or_is_refused_as_stated",
-                               cells(judged=False)), ids=named(cells(judged=False)))
+@pytest.mark.parametrize(("model", "layout", "devices"), cells(judged=False), ids=named(cells(judged=False)))
 def test_each_layout_of_a_model_runs_or_is_refused_as_stated(model, layout, devices, references):
     """Each run-once layout (`RUN_ONCE`) compiles and takes its first step, its sample the one-device
     reference's and its FLOPs an even split, or is refused for the reason REFUSED gives: a refused cell
-    that runs fails, as does a supported one that raises."""
+    that runs fails, as does a supported one that raises. EDM2's cells, the slowest, compile-bound, took 49
+    to 64 s each over CI's shared XLA cache on armada's 25/17 workers (62a555f178)."""
     tool, draws = references
     with jax.enable_x64(new_val=True):
         rows = tool.run([model], (layout,), dtype="float32", seeds=0, mixture={}, objective={},

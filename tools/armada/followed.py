@@ -1,19 +1,16 @@
 """The processes a test file starts, as executed.py's records count them: a native tool's start keeps the
-file's key (`TOOLS`), a Python child that records itself is followed, a forked child writes into its
-parent's log and is followed with it, and any other start leaves the file without a key, as code no event
-sees ran.
+file's key (`TOOLS`), a Python child that records itself is followed, and any other start leaves the
+file without a key, as code no event sees ran.
 
 A child is this checkout's Python started with an environment that names DEW_EXECUTED_CHILDREN, the
-parent's or one passed on with it, and with its site: a child multiprocessing spawns is started so
-(lifetime.py's `followed_spawn`). The `.pth` the parent installs in the environment (`installed`)
+parent's or one passed on with it. The `.pth` the parent installs in the environment (`installed`)
 runs `follow` as the child starts: it logs the checkout's files the child executed and read (`read`, as
 the parent logs its own, lifetime.py), the modules it imported, where it read the backend, the processes it
 started in turn and the GPU pool it held, each as it happens, and a closing line as its last atexit runs.
-A child killed or leaving through os._exit has no closing line but every line it wrote before its end,
-which is all it ran: its file keeps its key, and no GPU memory is known of it (`gathered`). A child that
-left no log at all (killed before its site ran), or more logs than starts the parent saw, is a count that
-does not match: the parent then counts its file's starts as unfollowed. It imports the standard library
-alone, since the `.pth` runs it in every child before the child's own imports."""
+A child whose log never closed (killed, or leaving through os._exit) is lost, and the parent then counts
+its file's starts as unfollowed (`gathered`), as it does a count of logs other than the starts it saw.
+It imports the standard library alone, since the `.pth` runs it in every child before the child's own
+imports."""
 
 import atexit
 import dis
@@ -30,21 +27,14 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas", "ffmpeg", "ffplay", "cc", "rsync", "wandb-core"}
+TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas"}
 """The programs a test file may start and keep its key: git (a run's commit), nvidia-smi (the GPUs),
-uname and file (the `platform` module's answers), ptxas (a GPU kernel's PTX compiled to machine
-code, on the host alone), ffmpeg and ffplay (the media binary imageio-ffmpeg ships, which moviepy reads
-clips with, named for its platform: `ffmpeg-linux-x86_64-v7.0.2`), cc (a stand-in driver compiled for a
-test), rsync and wandb-core (wandb's service, a binary of the package). Each is a native program that
-runs no checkout code and holds no GPU; the data files it opens under tests/ and src/ are the watch's
-(watched.py). Any other start, a shell's or a launcher's included, may run the checkout's code or hold
-the GPU."""
+uname and file (the `platform` module's answers) and ptxas (a GPU kernel's PTX compiled to machine
+code, on the host alone). Any other start, a shell's or a launcher's included, may run the
+checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
-"""Audit events of a process start; a multiprocessing child's is `spawned`'s."""
-MULTIPROCESSING = os.path.join("multiprocessing", "process.py")
-"""Where `multiprocessing` starts every child (`BaseProcess.start`): Python 3.12 audits no spawn or forkserver
-start, and 3.14 audits the helper that execs one (`start`)."""
+"""Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
 HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
 the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
@@ -149,108 +139,13 @@ def reads_backend(code: types.CodeType) -> bool:
     return decided[code]
 
 
-DIGEST = (os.path.join("src", "dew", "cache.py"), "package_digest")
-"""The code that reads the checkout's source only to digest it (`dew.cache.package_digest`), into the key of a
-record Dew's caches keep: CI gives each file's process caches of its own (ci.py's `alone`, `private`), so a
-record a file finds there is one its own process wrote, by code its record holds, and the digest's reads are
-no input of it (ledger 3220: they keyed 37-45% of rows on every source file)."""
-
-
-PRIVATE = "DEW_EXECUTED_CACHES"
-"""Where ci.py's `alone` gives a test file's process its own caches, named in its environment."""
-CACHES = ("JAX_COMPILATION_CACHE_DIR", "DEW_RUNG_RECORDS")
-"""The settings that would place a record named by the source digest (`DIGEST`) outside the caches of a file's
-own (`PRIVATE`): JAX's cache directory and the rungs' (dew.cache's `beside_compilation_cache`)."""
-
-
-def digesting(frame: types.FrameType | None) -> bool:
-    """Whether `frame`, or a frame it was called from, runs `DIGEST`'s code in a process whose every store
-    of what the digest names is its own (`PRIVATE`), as only then is no record it finds another's."""
-    while frame is not None:
-        if frame.f_code.co_name == DIGEST[1] and frame.f_code.co_filename.endswith(DIGEST[0]):
-            return private()
-        frame = frame.f_back
-    return False
-
-
-CONFIGURATION = os.path.join("_pytest", "config", "findpaths.py")
-"""Where pytest loads its own settings from pyproject.toml among its candidates (`locate_config`): ci.py's
-`shared` keys the part it reads (`pytest_settings`) and each file the markers its tests carry (`marks`,
-executed.py's), so that read of the whole file is no input. A test's own read, pytest.main beneath it, is."""
-
-
-def configuring(frame: types.FrameType | None) -> bool:
-    """Whether `frame`, or a frame it was called from, is pytest loading its settings (`CONFIGURATION`)."""
-    while frame is not None:
-        if frame.f_code.co_filename.endswith(CONFIGURATION):
-            return True
-        frame = frame.f_back
-    return False
-
-
-def private() -> bool:
-    """Whether Dew's caches (XDG_CACHE_HOME) and every store set apart from them (`CACHES`) lie in the caches
-    ci.py's `alone` gave this process (`PRIVATE`)."""
-    if not (own := os.environ.get(PRIVATE)):
-        return False
-    own = os.path.join(os.path.abspath(own), "")
-    beneath = lambda where: os.path.join(os.path.abspath(where), "").startswith(own)  # noqa: E731
-    # The store JAX writes to now, which `jax.config.update` or `enable_compilation_cache` set whatever the
-    # environment says, and beside which Dew keeps its rungs (`dew.cache.beside_compilation_cache`).
-    jax = sys.modules.get("jax")
-    configured = getattr(getattr(jax, "config", None), "jax_compilation_cache_dir", None) if jax else None
-    return all(beneath(os.environ.get(name, own)) for name in ("XDG_CACHE_HOME", *CACHES)) and (
-        not configured or beneath(configured))
-
-
-OUTSIDE = "outside:"
-"""A file read where another process of the task may have left it (`outside`): its record has no key."""
-SHARED_ROOTS = ("/tmp", "/var/tmp", "/dev/shm")
-"""The machine's scratch every process shares, beside the user's home (`outside`)."""
-STARTED_AT = "DEW_EXECUTED_STARTED"
-"""The epoch second the task began, which ci.py's `task` sets for every process it records: a program made
-since is no tool (`tool`), and a file in shared scratch or the home made or changed since may be another
-process's leaving (`outside`)."""
-CREATED: set[str] = set()
-"""The files this process opened to write: what it reads of them again is its own (`outside`)."""
-
-
-def outside(name: str, root: str) -> bool:
-    """Whether a read of file `name` reads what another process of the task may have left there, which no key
-    holds: an existing file in the machine's shared scratch (`SHARED_ROOTS`) or the user's home, made or
-    changed since the task began (`STARTED_AT`; its change time too, which a copy's mtime from its source
-    hides), outside the checkout `root`, this file's own scratch and caches (ci.py's `alone`: TMPDIR,
-    `PRIVATE`), the interpreter and its environment and compiled bytecode, and not one this process wrote
-    (`CREATED`): one file of a task writes /tmp/result and the next reads it, an edit to the first then
-    failing the second, whose record never named the first's code. What was there before the task began no
-    process of it left: the environment's files and the harness's own where a test runs these tools on a
-    checkout of its own (the venv's pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to
-    the venv, its packages' metadata, the plugins), a tool or a fixture a test put in place ahead of it."""
-    import tempfile
-
-    beneath = lambda where: name.startswith(os.path.join(os.path.realpath(where), ""))  # noqa: E731
-    if not any(beneath(shared) for shared in (*SHARED_ROOTS, os.path.expanduser("~"))):
-        return False
-    own = [root, tempfile.gettempdir(), sys.prefix, sys.base_prefix, sys.exec_prefix,
-           *(where for where in (os.environ.get(PRIVATE), os.environ.get("UV_CACHE_DIR")) if where)]
-    if any(beneath(where) for where in own) or name in CREATED or "__pycache__" in name.split(os.sep):
-        return False
-    try:
-        found = os.stat(name)
-    except OSError:
-        return False
-    started = os.environ.get(STARTED_AT)
-    return os.path.isfile(name) and (not started or max(found.st_mtime, found.st_ctime) >= float(started))
-
-
 def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
     calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
-    record is the code it ran (`code_unit`), nor a read of the source to digest it (`digesting`). An open
-    relative to a directory descriptor is `opening`'s to place. The interpreter audits the main script's open
-    from no frame at all."""
+    record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
+    place. The interpreter audits the main script's open from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -258,8 +153,6 @@ def read(event: str, args: tuple, root: str) -> str | None:
         mode, flags = args[1], args[2]
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
-        if written:
-            CREATED.add(os.path.abspath(os.fsdecode(path)))
         if written or (mode is None and getattr(placing, "relative", False)):
             return None
         # The source loader's read of the module's text on its way to compiling it (its get_code beneath
@@ -273,13 +166,7 @@ def read(event: str, args: tuple, root: str) -> str | None:
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
-    # The interpreter audits the main script's open from no frame (`sys._getframe(1)` is the audit hook's).
-    if digesting(sys._getframe(1).f_back) or (os.path.basename(os.fsdecode(path or "")) == "pyproject.toml"
-                                                and configuring(sys._getframe(1).f_back)):
-        return None
     name = os.path.abspath(os.fsdecode(path if path is not None else "."))
-    if event == "open" and outside(name, root):
-        return f"{OUTSIDE}{name}"
     # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
     cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
     if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
@@ -323,11 +210,8 @@ body lacks: the child imports no more of the standard library than it must."""
 TOP = "<module>"
 """The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 IMPORTED = "import:"
-"""What a module a run imported, or tried to, is recorded under (executed.py), by its top-level name and, for
-a submodule, its dotted name: a helper of the top-level name under tests/, which leads sys.path, would
-shadow it, and a module, package or namespace of the dotted name under src/ or tools/ is what the import
-finds, so ci.py's `contents` keys whether each exists (not the listing of every directory above a module
-the run executed, which a module added under a name no run tried moved for every row: ledger 3220)."""
+"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
+tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
@@ -379,140 +263,20 @@ def programs(event: str, args: tuple) -> list:
     return []
 
 
-def same_program(first: str, second: str) -> bool:
-    """Whether files `first` and `second` hold the same bytes."""
-    try:
-        if os.stat(first).st_size != os.stat(second).st_size:
-            return False
-        with open(first, "rb") as one, open(second, "rb") as other:
-            while (block := one.read(1 << 20)) == other.read(1 << 20):
-                if not block:
-                    return True
-        return False
-    except OSError:
-        return False
-
-
-def tool(path) -> str | None:
-    """The name of the program at `path` as `TOOLS` has it, or None where it is no tool: its file's, but for
-    imageio-ffmpeg's binary, which names its platform and version (`ffmpeg-linux-x86_64-v7.0.2`), and only
-    where it is a native binary (ELF) outside the checkout but for its environment (`sys.prefix`) and outside
-    the file's scratch (TMPDIR), not a script nor a program the checkout holds or a test wrote, which may run
-    any code under a tool's name."""
-    import shutil  # on a start alone: every child imports this module before its own imports
-    import tempfile
-
-    name = os.fsdecode(path)
-    found = name if os.sep in name else shutil.which(name)
-    if found is None:
-        return None
-    real = os.path.realpath(found)
-    # A tool's name on an interpreter (a link named git to Python, a copy of it) runs any code under it.
-    if os.path.basename(real).startswith("python") or same_program(real, os.path.realpath(sys.executable)):
-        return None
-    # The environment's and the system's programs predate the task (ci.py's `alone` names its start): one made
-    # since, a copy or a launcher a test wrote wherever it could, is none of theirs.
-    started = os.environ.get(STARTED_AT)
-    try:
-        if started and os.stat(real).st_mtime >= float(started):
-            return None
-    except OSError:
-        return None
-    inside = lambda directory: real.startswith(os.path.join(os.path.realpath(directory), ""))  # noqa: E731
-    checkout = os.environ.get("DEW_EXECUTED_ROOT") or os.getcwd()
-    if (inside(checkout) and not inside(sys.prefix)) or inside(tempfile.gettempdir()):
-        return None
-    try:
-        with open(real, "rb") as program:
-            if program.read(4) != b"\x7fELF":
-                return None
-    except OSError:
-        return None
-    base = os.path.basename(name)
-    return "ffmpeg" if base.startswith("ffmpeg-") else base
-
-
 def native(names: list) -> bool:
-    """Whether every one of `names` that exists, and at least one, is a program of `TOOLS` (`tool`): a
-    start's candidates along PATH (`_posixsubprocess`'s) run the first that exists. A start that names its
-    program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
-    if not names or not all(isinstance(name, (str, bytes, os.PathLike)) for name in names):
-        return False
-    existing = [name for name in names if os.sep not in os.fsdecode(name) or os.path.exists(name)]
-    return bool(existing) and all(tool(name) in TOOLS for name in existing)
+    """Whether every one of `names`, and at least one, is a program of `TOOLS`. A start that names
+    its program by a file descriptor (`os.execve`'s), or by nothing, is no tool's."""
+    return bool(names) and all(isinstance(name, (str, bytes, os.PathLike))
+                               and os.path.basename(os.fsdecode(name)) in TOOLS for name in names)
 
 
-def spawned(code: types.CodeType, frame: types.FrameType) -> str | None:
-    """How the child that `code`, run in `frame`, starts counts for its file, where `code` is
-    multiprocessing's `Process.start`: "followed" for a spawned child, which starts with the site, so the
-    `.pth` (`installed`) runs `follow` in it (lifetime.py's `followed_spawn`); "forked" for a forked one,
-    which runs this process's own code under its hooks and writes into its log, so it counts for no start;
-    "unfollowed" for a forkserver one, whose server no hook reaches; None for any other code."""
-    if code.co_qualname != "BaseProcess.start" or not code.co_filename.endswith(MULTIPROCESSING):
-        return None
-    # multiprocessing is imported once a Process starts; the default context's Process names no method.
-    from multiprocessing import context
-
-    process = frame.f_locals["self"]
-    return ("followed" if isinstance(process, context.SpawnProcess) else
-            "forked" if isinstance(process, context.ForkProcess) else "unfollowed")
-
-
-def tracker() -> bool:
-    """Whether this process is multiprocessing's resource tracker, which a process that uses its semaphores
-    and queues starts once and which runs the standard library alone: it records nothing."""
-    argv = sys.orig_argv
-    return argv[-2:-1] == ["-c"] and argv[-1].startswith("from multiprocessing.resource_tracker import main")
-
-
-def _beneath_spawnv() -> bool:
-    """Whether the start being audited is multiprocessing's own exec of a child or of its resource tracker (a
-    standard library process), which `spawned` counts for the child: Python 3.14 audits it, 3.12 does not."""
-    frame = sys._getframe(2)
-    for _ in range(4):
-        if frame is None:
-            return False
-        if frame.f_code.co_name == "spawnv_passfds" and frame.f_code.co_filename.endswith(
-                os.path.join("multiprocessing", "util.py")):
-            return True
-        frame = frame.f_back
-    return False
-
-
-def sited(argv) -> bool:
-    """Whether Python started with command line `argv` makes its site, where the `.pth` that starts `follow`
-    runs (`installed`): no -S among the options before its program."""
-    arguments = [os.fsdecode(argument) for argument in list(argv)[1:]]
-    for index, argument in enumerate(arguments):
-        if argument in ("-c", "-m", "-") or not argument.startswith("-"):
-            return True
-        if argument.startswith("--") or (index and arguments[index - 1] in ("-X", "-W")):
-            continue
-        if argument.startswith(("-X", "-W")):
-            continue
-        if "S" in argument[1:]:
-            return False
-    return True
-
-
-def start(event: str, args: tuple, directory: str, child: bool = False) -> str | None:
+def start(event: str, args: tuple, directory: str) -> str | None:
     """How a process start the audit names counts for its test file: None for none of its own (a
-    native tool, `subprocess`'s own start beneath the Popen its audit already named, multiprocessing's
-    exec of a spawned child, which `spawned` counts, a fork, whose child runs this process's own code
-    under its hooks, and, in a followed `child`, its exec of this Python again with the recorder's
-    environment and its site (`sited`), which records into its log, the pid's), "followed" for a child that
-    records itself into
-    `directory`, else "unfollowed"."""
+    native tool, or `subprocess`'s own start beneath the Popen its audit already named), "followed"
+    for a child that records itself into `directory`, else "unfollowed"."""
     if event not in SPAWNS:
         return None
-    if event in ("os.fork", "os.forkpty"):
-        return None
     if event != "subprocess.Popen" and _beneath_popen():
-        return None
-    if event == "_posixsubprocess.fork_exec" and _beneath_spawnv():
-        return None
-    if child and event == "os.exec" and _this_python(args[0]) and sited(args[1]) and \
-            (os.environ if args[2] is None else args[2]).get(CHILDREN) == directory:
         return None
     if native(programs(event, args)):
         return None
@@ -600,36 +364,15 @@ def closed_imports(seen: set[str], root: str):
     return Closed
 
 
-ROOTS = "@"
-"""Between a module's name and where its import searched for it, in an `IMPORTED` item (`imports`)."""
-
-
-def searched(entries, root: str) -> str:
-    """The checkout's directories among import search `entries` (sys.path, or a package's `__path__`), in
-    order and relative to `root` ("." the checkout's own), joined by os.pathsep: where an import of a name
-    looks for it, each a directory whose candidates for the name ci.py's `contents` keys. The environment's
-    packages, which the locks key, hidden directories and those outside the checkout are none."""
-    found = []
-    for entry in entries:
-        if not isinstance(entry, str):
-            continue
-        relative = os.path.relpath(os.path.abspath(entry or "."), root)
-        if relative == "." or not (relative.startswith(".") or "site-packages" in relative):
-            found.append(relative)
-    return os.pathsep.join(dict.fromkeys(found))
-
-
-def imports(write: Callable[[str], None], root: str):
+def imports(write: Callable[[str], None]):
     """The import system's first finder that passes each module imported by name, a statement's or
-    `importlib.import_module`'s, found or not, to `write` (`IMPORTED`): its dotted name, and the checkout's
-    directories it is searched for in (`searched`, after `ROOTS`), the import system's own search path for a
-    top-level name or its package's path for a submodule, so a module or package of that name arriving in any
-    of them ahead of what the import found is keyed (ledger 3220); it finds nothing itself."""
+    `importlib.import_module`'s, to `write` as the top-level name a helper under tests/ would shadow
+    (`IMPORTED`); it finds nothing itself."""
 
     class Imports:
         @staticmethod
         def find_spec(name, path=None, target=None):
-            write(f"{IMPORTED}{name}{ROOTS}{searched(sys.path if path is None else list(path), root)}")
+            write(f"{IMPORTED}{name.partition('.')[0]}")
 
     return Imports
 
@@ -641,7 +384,7 @@ def follow() -> None:
     records no files, and says so (`unfollowed`): its file then has no key, and the child starts as it would
     without the recorder."""
     holder = sys.monitoring.get_tool(FOLLOWER_TOOL)
-    if holder == FOLLOWER or tracker():
+    if holder == FOLLOWER:
         return
     directory, root = Path(os.environ[CHILDREN]), os.environ["DEW_EXECUTED_ROOT"]
     log = (directory / f"{os.getpid()}.log").open("a", buffering=1)
@@ -666,18 +409,12 @@ def follow() -> None:
     write("began", time.time())
     for name in list(sys.modules):
         write("file", f"{IMPORTED}{name.partition('.')[0]}")
-        if "." in name:
-            write("file", f"{IMPORTED}{name}")
 
     def started(code, offset):
         if code.co_name == OPENED[0] and code.co_filename.endswith(OPENED[1]):
             # Registered after jax's own clean-up, so it reads the pool before the backend closes.
             if sys._getframe(1).f_locals.get("platform") in GPUS:
                 atexit.register(held)
-            return None
-        if (how := spawned(code, sys._getframe(1))) is not None:
-            # A child this one starts through multiprocessing: counted as the parent's own are (lifetime.py).
-            counted(how)
             return None
         name = code.co_filename
         if checkout(name, root):
@@ -703,10 +440,7 @@ def follow() -> None:
         if (taken := coded(event, args, root)) is not None:
             recorded(taken)
             return
-        counted(start(event, args, str(directory), child=True))
-
-    def counted(kind: str | None) -> None:
-        # A start's count (`start`, `spawned`): a followed child's start a line each, any unfollowed once.
+        kind = start(event, args, str(directory))
         if kind == "followed":
             log.write("start\tfollowed\n")
         elif kind == "unfollowed":
@@ -718,12 +452,10 @@ def follow() -> None:
         sys.meta_path.insert(0, closed_imports(seen, root))
 
     atexit.register(closing)
-    # A forked child writes into this log as this process does, and its end is not this process's.
-    os.register_at_fork(after_in_child=lambda: atexit.unregister(closing))
     if holder is not None:
         write("unfollowed", 1)
         return
-    sys.meta_path.insert(0, imports(lambda item: write("file", item), root))
+    sys.meta_path.insert(0, imports(lambda item: write("file", item)))
     opening(lambda item: write("file", item), root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, FOLLOWER)
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
@@ -777,13 +509,10 @@ def logged(path: Path) -> dict:
 def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
     """What each test file's children logged in `directory`, by the file that started them (`""`, every
     file's, for those started outside a file's tests), given how many children each file's own process
-    started (`expected`): their files and reads, whether every start was followed (`followed`: each left a
-    log naming its file, and none started a process no event follows; a child killed or leaving through
-    os._exit is followed, its log whole up to its end, as it writes each event as it happens) and every
-    child's log closed (`measured`: only a child that ran to its end read the GPU memory it held), the most
-    GPU memory a child that took the parent's fraction held (`peak`), and the GPU pools they held at once,
-    the parent's share counted apart (`shares`, the children that took its fraction) from the bytes of
-    those that named their own. Read once the process group has exited, so every log is whole."""
+    started (`expected`): their files and reads, whether every start was followed and every child's log
+    closed, the most GPU memory a child that took the parent's fraction held (`peak`), and the GPU pools they
+    held at once, the parent's share counted apart (`shares`, the children that took its fraction) from the
+    bytes of those that named their own. Read once the process group has exited, so every log is whole."""
     records = [logged(path) for path in directory.glob("*.log")] if directory.is_dir() else []
     found: dict[str, dict] = {}
     for name in {*expected, *(record["file"] for record in records)}:
@@ -795,8 +524,7 @@ def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
-            "followed": len(own) == starts and not any(r["unfollowed"] for r in own),
-            "measured": len(whole) == len(own),
+            "followed": len(whole) == len(own) == starts and not any(r["unfollowed"] for r in own),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -826,8 +554,7 @@ def recorded(path: Path) -> dict[str, dict]:
     closed = [SHARED, CLOSED] in lines
     starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
     children = gathered(path.with_name(f"{path.name}.children"), dict(starts))
-    blank = {"files": set(), "reads": set(), "followed": True, "measured": True, "peak": None, "shares": 0,
-             "pools": 0}
+    blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
     shared_child = children.get(SHARED, blank)
     visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
     files = list(dict.fromkeys(name for _, name in visits if name != SHARED))
@@ -842,21 +569,15 @@ def recorded(path: Path) -> dict[str, dict]:
         child = children.get(file, blank)
         unfollowed = any(item == f"{STARTED}unfollowed" for _, item in before) or \
             f"{STARTED}unfollowed" in shared
+        whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
         inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
             item for item in shared if not item.startswith(EVIDENCE)}
-        # A file read where another process of the task may have left it holds what no key names (`outside`).
-        read_outside = any(item.startswith(OUTSIDE)
-                           for item in inputs | child["files"] | shared_child["files"])
-        whole = (closed and not unfollowed and not read_outside and child["followed"]
-                 and shared_child["followed"])
         held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
         out[file] = {
             "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
             "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
-            # A child that never closed held a pool its record does not name: the file's peak is not known.
-            "peak": max(held) if len(files) == 1 and whole and child["measured"] and shared_child["measured"]
-                    and held else None,
+            "peak": max(held) if len(files) == 1 and whole and held else None,
             # The shared children may run beside the file's own: their counts together bound both.
             "shares": child["shares"] + shared_child["shares"],
             "pools": child["pools"] + shared_child["pools"]}

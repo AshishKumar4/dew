@@ -18,6 +18,7 @@ import jax
 import pytest
 
 from dew import communicators
+from dew.cache import package_digest
 from dew.communicators import Collectives, CommunicatorRoom, Needs
 from dew.devices import POOL_NAMES, pool_bound
 
@@ -185,6 +186,32 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     with pytest.raises(CommunicatorRoom):
         resident.admit(pair, FOUR, room, lambda gpu: GIB, evaluation)
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
+
+
+def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_path, monkeypatch):
+    """A program's communicators are kept under the digest of Dew's own code (`dew.cache.package_digest`),
+    the key every cache of what Dew's code computed reads: those kept under this Dew's digest are taken as
+    they are kept, its text unread, and those kept by another Dew's code, under its digest or none, are read
+    again from the program's text."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    kept = tmp_path / "dew" / "communicators" / "programs"
+    planted = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+
+    def unread() -> str:
+        raise AssertionError("the text of a program whose communicators this Dew kept is read again")
+
+    ours = kept / package_digest() / f"{b'kept'.hex()}.json"
+    ours.parent.mkdir(parents=True)
+    ours.write_text(json.dumps(planted.to_json()))
+    assert communicators.collectives_kept(b"kept", (0, 1, 2, 3), unread) == planted
+    for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 64) / f"{b'step'.hex()}.json"):
+        earlier.parent.mkdir(parents=True, exist_ok=True)
+        earlier.write_text(json.dumps(planted.to_json()))
+    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+               "  %x = f32[8] parameter(0)\n"
+               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: program) == Collectives(
+        groups=frozenset({(0, 1), (2, 3)}))
 
 
 def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
@@ -469,3 +496,80 @@ def test_import_dew_connects_nccls_peers_at_creation_unless_told_otherwise(set_b
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True,
                           env={**env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert json.loads(done.stdout.strip().splitlines()[-1]) == expected
+
+def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a program compiled through Dew's compile point
+    (`options.program`) on this host's GPU is admitted against the sizing the process holds: refused before
+    it runs, naming the GPU's bytes, where the room left outside XLA's pool holds less than the runtime
+    needs, and admitted with its code held to what the GPU has free where the room holds it."""
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import options
+
+    gpu = jax.devices("gpu")[0]
+    ordinal = communicators.ordinal(gpu)
+    needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20},
+                  seconds=1.0)
+    rows = jax.device_put(jnp.ones(8), gpu)
+    held = communicators.held()
+    try:
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: 1}, {ordinal: 1}))
+        with pytest.raises(CommunicatorRoom) as refused:
+            options.program(lambda x: x * 3.0).compiled(rows)
+        assert refused.value.room == {ordinal: 1}
+        communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: GIB}, {ordinal: GIB}))
+        assert float(options.program(lambda x: x * 5.0)(rows)[0]) == 5.0
+    finally:
+        communicators.hold(held)
+
+
+COMPILED_ON_GPU = """\
+import json
+
+import jax
+import jax.numpy as jnp
+
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
+from dew import communicators
+from dew.communicators import Needs
+from dew.nn.kernels import options
+
+
+def tripled(rows):
+    return rows * 3.0
+
+
+gpu = jax.devices("gpu")[0]
+ordinal = communicators.ordinal(gpu)
+needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20}, seconds=1.0)
+communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: 2**30}, {ordinal: 2**30}))
+assert float(options.program(tripled)(jax.device_put(jnp.ones(8), gpu))[0]) == 3.0
+print(json.dumps([events.count("/jax/compilation_cache/compile_requests_use_cache"),
+                  events.count("/jax/compilation_cache/cache_hits")]))
+"""
+"""A process that compiles a program on its GPU through Dew's compile point under a sizing that admits it,
+printing its compilation-cache requests and hits."""
+
+
+def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_communicators(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a program a process compiled and admitted on its GPU
+    keeps its communicators in Dew's cache under its executable's fingerprint (`collectives_kept`), and a
+    second process that loads it from the compilation cache, every request a hit, admits it from that
+    record as it is, the file neither rewritten nor replaced (row 3316, 3474)."""
+    cache, compiled = tmp_path / "cache", tmp_path / "xla"
+    environment = {**os.environ, "XDG_CACHE_HOME": str(cache), "JAX_COMPILATION_CACHE_DIR": str(compiled),
+                   "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+                   "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0"}
+    kept = cache / "dew" / "communicators" / "programs" / package_digest()
+
+    def ran() -> tuple[list[int], dict[str, tuple[int, int]]]:
+        done = subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment,
+                              capture_output=True, text=True)
+        requests = json.loads(done.stdout.strip().splitlines()[-1])
+        return requests, {path.name: (path.stat().st_ino, path.stat().st_mtime_ns) for path in kept.iterdir()}
+
+    _, written = ran()
+    (requests, hits), read = ran()
+    assert len(written) == 1 and read == written
+    assert requests and hits == requests

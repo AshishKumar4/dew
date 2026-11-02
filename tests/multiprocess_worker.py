@@ -769,6 +769,11 @@ def mode_fit(args) -> dict:
         "local_steps": None if args.local_dir is None else sorted(
             int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
+        # Each probe's derived residuals (`dew.training.footprint`), None where the process's own device,
+        # a CPU here, judges no footprint (row 3093).
+        "derived_residuals": [probe["derived"]["residuals"]
+                              for probe in (trainer.plan or {}).get("probes", [])
+                              if probe.get("derived") is not None],
     }
 
 
@@ -1106,7 +1111,8 @@ def mode_pipeline(args) -> dict:
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
-    dump_params(args.out.with_suffix(".npz"), state.variables)
+    # A stage-local state holds each stage's layers stacked on its own devices; the dump reads every layer.
+    dump_params(args.out.with_suffix(".npz"), trainer.stored(state).variables)
     return {
         "process_index": jax.process_index(),
         "losses": losses,
@@ -1274,7 +1280,7 @@ def mode_evaluation_contract(args) -> dict:
             result = Evaluation.run(objective, state.variables, data.val, metrics=scoring, key=state.key,
                               step=state.step, schedule_step=state.microstep,
                               preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-            trainer._report_evaluation(result)
+            result._report(trainer._display, trainer.tracker)
             results[failure] = {"scores": result.scalars, "events": list(events)}
         except (ValueError, RuntimeError, OSError) as error:
             results[failure] = {"error": str(error), "events": list(events)}

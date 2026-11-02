@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
+    from dew.objectives.rl.control import ControlRollout
+    from dew.objectives.rl.dreamer import DreamerRollout
     from dew.optim import ScheduleBase
     from dew.sampling.solvers import Solver
 
@@ -236,8 +238,10 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         self.kind = kind
         self.paths = types.MappingProxyType(dict(paths))
         self.base = base
-        """The import path of the class every member derives from, or None
-        where the members share only a protocol."""
+        """The import path of the class every member derives from, or of the
+        protocol they share, whose members are then classes of Dew's or of a
+        trusted package, or functions declared to return one (`_derives`); None
+        where the members share only an unnamed protocol."""
         # What a lookup imported, untyped as an import is; typed on the way out.
         self._imported: dict[str, Any] = {}
 
@@ -262,7 +266,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
             return _owned(member, called=False)
         module, _, qualified = self.base.partition(":")
         base = getattr(importlib.import_module(module), qualified)
-        return issubclass(member, base) if isinstance(member, type) else _returns(member, base)
+        return _derives(member, base) if isinstance(member, type) else _returns(member, base)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.paths)
@@ -1449,6 +1453,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
+    "parallel": "dew.nn.mixers.parallel:ParallelMixer",
     "qsa_attention": "dew.nn.mixers.attention:QSAAttentionMixer",
     "short_conv": "dew.nn.mixers.short_conv:ShortConvMixer",
 }, base="dew.nn.mixer_base:MixerBase")
@@ -1490,9 +1495,26 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 runs: Aliases[Callable[..., Any], Any] = Aliases("run", {
     "decision": "dew.decision.config:DecisionRunConfig",
     "diffusion": "dew.config.diffusion:DiffusionRunConfig",
+    "env": "dew.objectives.rl.config:EnvRunConfig",
     "jepa": "dew.config.jepa:JepaRunConfig",
     "lm": "dew.config.lm:LMRunConfig",
 }, base="dew.config:RunConfig")
+
+
+# An environment's types live in `dew.rl`, which only `dew.rl` and `dew.objectives.rl` import
+# (docs/design/architecture.md), so the table's type names none; its base is read by path.
+envs: Aliases[type | Callable[..., Configured], Any] = Aliases("env", {
+    "flight": "dew.rl.flight:FlightEnv",
+    "gate_race": "dew.rl.flight:GateRace",
+    "playground": "dew.rl.playground:Playground.load",
+    "skydreamer": "dew.rl.skydreamer:SkyDreamerRace",
+}, base="dew.rl.env:Env")
+"""The environments an environment run names (`dew.objectives.rl.config.EnvConfig`): a JAX `Env` class, a
+host `Simulator` class, or a function or classmethod that returns one; any other by its import path."""
+rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | ControlRollout] = Aliases(
+    "rollout", {"control": "dew.objectives.rl.control:ControlRollout",
+                "dreamer": "dew.objectives.rl.dreamer:DreamerRollout"})
+"""The rollouts an environment run collects its batches with (`dew.objectives.rl.config.RolloutConfig`)."""
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
@@ -1532,8 +1554,9 @@ class Registered(ABC):
 
     @staticmethod
     @abstractmethod
-    def _member(name: str) -> type:
-        """The class `name` names, from the kind's aliases (`models`, `objectives`, `metrics`)."""
+    def _member(name: str) -> type | Callable[..., Configured]:
+        """The class `name` names, from the kind's aliases (`models`, `objectives`, `metrics`), or a
+        function or classmethod that builds one (`envs`)."""
 
     def __post_init__(self) -> None:
         member = self._member(self.name)
@@ -1543,9 +1566,14 @@ class Registered(ABC):
         object.__setattr__(self, "defaults", recorded_defaults(member, self.fields, self.defaults))
 
     @property
+    def member(self) -> type | Callable[..., Configured]:
+        """The class, or function, `name` names (`_member`)."""
+        return self._member(self.name)
+
+    @property
     def arguments(self) -> JsonDict:
         """The arguments the class is built from, before those the caller derives (`built_arguments`)."""
-        return built_arguments(self._member(self.name), self.fields, self.defaults)
+        return built_arguments(self.member, self.fields, self.defaults)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1606,16 +1634,17 @@ class ModelConfig(Registered):
         return model
 
 
-def member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
+def member_fields(member: type | Callable[..., Configured]) -> Iterator[tuple[str, Configured, Annotation]]:
     """Each field `_member_flags` flags: its name, its default
     (`dataclasses.MISSING` for none) and its annotation (None where its
     module cannot resolve it). A dataclass with a constructor of its own (a
     metric over its base's fields) has that constructor's arguments, as the
     registry builds it (`record_class`)."""
-    if record_class(member) is not None:
-        for field in constructor_fields(member):
+    held = record_class(member)
+    if held is not None:
+        for field in constructor_fields(held):
             default = (field.default_factory() if callable(field.default_factory) else field.default)
-            yield field.name, default, declared_type(member, field.name)
+            yield field.name, default, declared_type(held, field.name)
         return
     for name, (parameter, owner) in parameters(member)[0].items():
         if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
@@ -1643,7 +1672,8 @@ def default_record(name: str, declared: Configured, annotation: Annotation) -> J
     return record
 
 
-def recorded_defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
+def recorded_defaults(member: type | Callable[..., Configured], stated: Mapping[str, object],
+                      recorded: Mapping[str, object]) -> JsonDict:
     """The record of each field or argument `member` defaults that `stated`
     leaves out: as `recorded` holds it, or else as the class defaults it now.
     A default no record carries (a callable, say) is left to the class, and
@@ -1665,7 +1695,8 @@ def recorded_defaults(member: type, stated: Mapping[str, object], recorded: Mapp
     return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
 
 
-def built_arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
+def built_arguments(member: type | Callable[..., Configured], fields: Mapping[str, object],
+                    defaults: Mapping[str, object]) -> JsonDict:
     """What a config builds `member` from beside what its caller derives:
     `fields`, over each of `defaults` the class no longer defaults the same.
     A default the class still has is left to it, so a class that treats an

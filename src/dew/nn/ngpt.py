@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import L2NORM_EPS, at_least_fp32
@@ -174,7 +175,7 @@ def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain:
 def _gated(factor: float, gate, up, gate_gain, up_gain):
     """The gained gate and up rows as the forward rounds them, in at least fp32, and the gains."""
     wide = at_least_fp32(jnp.result_type(gate, up))
-    gains = gain(gate_gain, factor), gain(up_gain, factor)
+    gains = gain(gate_gain, factor, wide), gain(up_gain, factor, wide)
     gated = (gate.astype(wide) * gains[0]).astype(gate.dtype).astype(wide)
     upped = (up.astype(wide) * gains[1]).astype(up.dtype).astype(wide)
     return gated, upped, gains
@@ -213,7 +214,10 @@ def _hidden_backward(factor: float, product, saved, operands, cotangent):
             (jnp.sum(d_upped * up.astype(gated.dtype), axis=leading) * factor).astype(up_gain.dtype))
 
 
-def gain(scale: jax.Array, factor: float) -> jax.Array:
+def gain(scale: jax.Array, factor: float, dtype: DTypeLike | None) -> jax.Array:
     """A learned per-feature gain stored at the initializer's scale, as the multiplier it stands for in
-    at least fp32: `scale * factor` (nGPT's s_qk, s_u, s_v and s_z, and Dory's output-gate scale)."""
-    return scale.astype(at_least_fp32(scale.dtype)) * factor
+    at least fp32 of its own dtype and the computation's `dtype`: `scale * factor` (nGPT's s_qk, s_u,
+    s_v and s_z, and Dory's output-gate scale), so a float64 run over a narrower stored gain takes its
+    product in float64."""
+    wide = scale.dtype if dtype is None else jnp.promote_types(scale.dtype, dtype)
+    return scale.astype(at_least_fp32(wide)) * factor

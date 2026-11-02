@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import dew
+from tools import gen_exports
 
 SOURCE = Path(dew.__file__).parent.parent
 
@@ -164,13 +165,20 @@ FOREIGN = {
 """Each run configuration's module and the modules outside its domain it must not import: an LM's no image
 diffusion, vision tower, autoencoder or media data; a diffusion model's no decoder language model or chat
 data, its text encoders' decoder blocks its own; a decision task's no image generation or autoencoder,
-the vision towers its multimodal reader reads its own (row 2042)."""
+the vision towers its multimodal reader reads its own (row 2042); and the shared modules an objective, a
+sampler or a model imports (row 2043): a LoRA reads a stack's layer names, not its plan's mixers; a
+sampler's tokens and rounding stream and a saved run's record are the categorical's, the precision's and
+the records' own, not an objective's."""
+FOREIGN |= {"dew.lora": ("dew.nn.backbones.layer_plan", "dew.nn.mixer_base", "dew.objectives"),
+            "dew.sampling.text": ("dew.objectives",),
+            "dew.sampling.strategies": ("dew.objectives",),
+            "dew.inference.tasks": ("dew.objectives",)}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
-def test_a_run_configuration_imports_its_own_domain_alone(module):
-    """A run configuration's module imports, in a fresh interpreter, none of the modules outside its
-    domain (`FOREIGN`): a change there re-runs none of its tests."""
+def test_a_module_imports_its_own_domain_alone(module):
+    """A run configuration's or a shared module's module imports, in a fresh interpreter, none of the
+    modules outside its domain (`FOREIGN`): a change there re-runs none of its tests."""
     script = f"""
 import json, sys
 import {module}
@@ -253,12 +261,12 @@ def test_a_lazy_packages_star_import_binds_its_modules_as_its_eager_one_did(pack
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 
 
-@pytest.mark.parametrize("package", ["dew", "dew.data", "dew.diffusion", "dew.eval", "dew.inference",
-                                     "dew.nn.autoencoders", "dew.nn.backbones", "dew.nn.vision",
-                                     "dew.sampling", "dew.training"])
+@pytest.mark.parametrize("package", [".".join(path.parent.relative_to(SOURCE).parts)
+                                     for path in gen_exports.packages(SOURCE / "dew")])
 def test_a_lazy_packages_listing_names_what_it_exports(package):
-    """A lazily exporting package lists every name it exports to `dir()`, which an editor and an
-    interpreter complete from, though it has imported none of them (row 3206)."""
+    """Each lazily exporting package, every one that declares its exports (`gen_exports.packages`), lists
+    every name it exports to `dir()`, which an editor and an interpreter complete from, though it has
+    imported none of them (rows 3206, 3217)."""
     script = (f"import importlib\nmodule = importlib.import_module({package!r})\n"
               "missing = sorted(set(module.__all__) - set(dir(module)))\nassert not missing, missing\n")
     subprocess.run([sys.executable, "-c", script], check=True,

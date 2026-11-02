@@ -29,6 +29,7 @@ import numpy as np
 from dew._records import JSON, integer, json_value
 from dew.batch import Batch
 from dew.data.analysis import (
+    _EAGER,
     Measuring,
     _analyzed,
     _at,
@@ -38,8 +39,10 @@ from dew.data.analysis import (
     _capabilities,
     _configured,
     _cut,
+    _drops,
     _external,
     _identity,
+    _in_memory,
     _leaves,
     _Lowering,
     _manifest,
@@ -61,6 +64,7 @@ from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
+    Ends,
     FilledBatch,
     Forwarding,
     GlobalReader,
@@ -74,13 +78,13 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
-from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
     _epoch_records,
     _Locality,
     _order_records,
+    _Present,
     _split_spans,
     _tail,
     _weights,
@@ -339,17 +343,6 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def _stores(source: Source) -> Iterator[Source]:
-    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
-    selects from."""
-    for _, selected in selecting(source):
-        if isinstance(selected, Concatenate):
-            for part in selected.sources:
-                yield from _stores(part)
-        else:
-            yield selected
-
-
 def _token_stores(source: Source) -> Iterator[TokenFiles]:
     """The token stores `source` reads, through every view and a concatenation's parts."""
     for each in beneath(source, typing.get_args(Rows.__value__)):
@@ -428,17 +421,6 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
-def _shuffles_windows(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
-    shuffles in a window after a stage that packs or windows its rows."""
-    stages = pipeline.stages
-    if examples_bound(stages) is None:
-        return False
-    packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
-    return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
-                                      for stage in stages[packed:])
-
-
 def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
     reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
@@ -447,11 +429,11 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
-    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares each
-    read records of their own takes on each its part of the pool's first `examples`
-    (`dew.data.lowering._Build.bounded`). Refuses a bound it cannot place: a repeat with a count before
-    it, or any repeat after it, the batch's included, a mixed corpus that packs on its own, and phases,
-    which end by steps. A chain without a batch is left for `compile` to refuse."""
+    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares, or a
+    share's loading workers, each read records of their own takes on each its part of the pool's first
+    `examples` (`dew.data.lowering._Build.bound_at`). Refuses a bound it cannot place: a repeat with a
+    count before it, or any repeat after it, the batch's included, a mixed corpus that packs on its own,
+    and phases, which end by steps. A chain without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):
@@ -631,6 +613,10 @@ class _Measured:
     branches: tuple[Pipeline, ...]
     metadata: Mapping[str, object] | None
     counts: tuple[dict[str, CorpusCounts], ...]
+    ahead: str | None = None
+    """Where its training read is bounded ahead of what its memory would hold (`_held_ahead`): its
+    expansion, to a count set once it holds the examples (`_UNCOUNTED`, `_staged`), or its pack, the bound
+    held with it, its passes counted as it holds them (`Limit.passes`); None for neither."""
 
 
 def _measure(
@@ -643,6 +629,7 @@ def _measure(
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
     automatic: str | None = None,
     examples: int | None = None,
+    epochs: int | None = None,
 ) -> _Measured:
     """`_prepared`'s first part: each branch checked, its generations promoted and checked again, its
     sources provisioned and pinned, the objective's steps placed, a training read's bound taken, and with
@@ -665,8 +652,14 @@ def _measure(
             _objective_branch(branch, objective, train=not scored, read=read)
             for branch, scored in zip(branches, held, strict=True)
         )
+    # A memory read whose expansion it would hold is bounded before that expansion as it holds the rest, to
+    # a count set once it holds them (`_staged`).
+    ahead = None if epochs is None or not training else _held_ahead(branches[0], read)
+    examples = _UNCOUNTED if ahead is not None else examples
     if examples is not None and training:
         branches = (_bounded(branches[0], examples), *branches[1:])
+        if ahead == "layout":
+            branches = (_rebound(branches[0], _UNCOUNTED, epochs), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -682,8 +675,8 @@ def _measure(
             if training and not stored(branches[0]):
                 raise ValueError(f"no accepted rows of {_name(branches[0])}; raise the row budgets")
             metadata = _metadata(branches, read)
-        return _Measured(tuple(branches), metadata, tuple(counts or ()))
-    return _Measured(tuple(branches), None, tuple(counts or ()))
+        return _Measured(tuple(branches), metadata, tuple(counts or ()), ahead)
+    return _Measured(tuple(branches), None, tuple(counts or ()), ahead)
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
@@ -723,13 +716,16 @@ def compile(
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
+    epochs: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
     measurement prepared it (`_training_measure`), which it binds as it stands.
     With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
     its first that many source examples, before they are packed and before the objective makes rows
-    of them (`_bounded`), a run's `examples=` budget."""
+    of them (`_bounded`), a run's `examples=` budget. `epochs` reads the chain endlessly, or, where its
+    read has no record count, bounds it to that many passes over the source examples it states a pass
+    holds once it is prepared (`_staged`, `Loader.pass_examples`)."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
@@ -747,8 +743,12 @@ def compile(
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured)
+                     seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
+                     epochs=epochs)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+    if staged.passes is not None and epochs is not None:
+        return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
+                                   pass_examples=staged.passes, bound_ends=_bound_ends(staged.original))
     if examples is None:
         return loader
     return dataclasses.replace(loader, examples=examples, bound_ends=_bound_ends(staged.original))
@@ -763,7 +763,8 @@ def _bound_ends(pipeline: Pipeline) -> bool:
 
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
-                      read: Read, provision: bool, loading: Loading, examples: int | None) -> _Measured:
+                      read: Read, provision: bool, loading: Loading, examples: int | None,
+                      epochs: int | None = None) -> _Measured:
     """A compile's training branch, and its `validation`, prepared through their source's own steps as
     the compile reads them (`_measure`): bounded to `examples`, a chain's own layout as written, before
     preparation could plan it into its source, and the objective's with its preparation; each corpus's
@@ -784,6 +785,7 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
         counts=(counts,) if validation is None else (counts, validation_counts),
         automatic=automatic_root(loading) if read != "streamed" else None,
         examples=examples if written is None else None,
+        epochs=epochs,
     )
 
 
@@ -800,6 +802,9 @@ class _Staged:
     counts: dict[str, CorpusCounts]
     validation_counts: dict[str, CorpusCounts]
     batch_tokens: int | None
+    passes: int | None = None
+    """The source examples one pass of a training read bounded to its epochs holds (`_staged`); None for
+    one not bounded so."""
 
 
 def _staged(
@@ -815,6 +820,7 @@ def _staged(
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
     measured: _Measured | None = None,
+    epochs: int | None = None,
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -824,7 +830,7 @@ def _staged(
     batch_tokens = None if stated is None else stated.tokens
     if measured is None:
         measured = _training_measure(train, validation, objective=objective, read=read, provision=provision,
-                                     loading=loading, examples=examples)
+                                     loading=loading, examples=examples, epochs=epochs)
     counts, validation_counts = (*measured.counts, {})[:2]
     branches = _prepared(measured.branches, read, provision=provision, training=True, objective=objective,
                          widths=widths, measured=measured)
@@ -837,7 +843,145 @@ def _staged(
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
         validation = None
     build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
-    return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
+    passes = None
+    if epochs is not None and measured.ahead == "layout":
+        # The bound it held with its pack counted its passes as it held the documents (`Limit.passes`). The
+        # prepared chain states that count where it holds the bound unrun; one its measure held already (a
+        # configured chain's, `_measure`) ran it to that count.
+        count = _held_count(train)
+        passes = count // epochs
+        if examples_bound(original.stages) is not None:
+            original = _rebound(original, count)
+    elif epochs is not None and measured.ahead == "expansion":
+        # Bounded before the expansion it would hold, it now holds the examples a pass reaches it with.
+        passes = _pass_examples(train, read)
+        if passes is not None:
+            original, train = _rebound(original, epochs * passes), _rebound(train, epochs * passes)
+            build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+    elif epochs is not None:
+        # Epochs of a read with a record count count it, read endlessly; of one with none, the source
+        # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
+        passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read)
+        original, train = ((_endless(original), _endless(train)) if passes is None else
+                           (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
+        build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
+    return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
+
+
+_UNCOUNTED = 1 << 62
+"""The bound in examples a memory read whose expansion it would hold takes before it holds them, past any
+count, set to its epochs' passes once it holds them (`_rebound`, `_staged`)."""
+
+
+def _pass_examples(train: Pipeline, read: Read) -> int | None:
+    """The source examples one pass of a training read with no record count holds (`_epoch_records`,
+    `Loader.pass_examples`): those reaching where a bound in examples stands (`dew.data.compile._bounded`:
+    the first step that packs or windows them or makes several rows of each, else the batch), before any
+    repeat. Its source's records, as a memory read holds them (its leading steps run, the present ones),
+    or a streamed source's rows as its shards state them, each slice and limit before that place applied;
+    a mixture by weights, those in which every part it mixes comes round once (`Proportions.covering`). None
+    for a mixture by tokens, a memory read that laid its examples out as it held them, or where a
+    step before that place drops or adds one, or keeps them by a rule not yet bound, or nothing states
+    the count."""
+    source = train.source
+    if isinstance(source, Phases):
+        return None
+    batched = _until(train.stages, (BatchStage, TokenBudget))
+    at = next((index for index, stage in enumerate(train.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
+              batched)
+    # Every step before the bound's place reads the pass, a repeat's included; its slices and limits before
+    # the first repeat bound it.
+    if any(_drops(stage) or isinstance(stage, Native)
+           or (isinstance(stage, Configured) and not stage.one_to_one) for stage in train.stages[:at]):
+        return None
+    # A memory read that laid its examples out as it held them (a pack before its shuffle) holds no source
+    # example a bound before that layout could count, as a run bounded in examples refuses it too.
+    held = () if isinstance(source, Mixture) else _written(source, ())
+    if any(isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)
+           for stage in held):
+        return None
+    prefix = train.stages[:min(at, _until(train.stages, (Repeat,)))]
+    if isinstance(source, Mixture):
+        if source.tokens is not None:
+            # A mix by tokens draws each part as its tokens fall short (`TokenDeficit`), which no count of its
+            # examples states ahead.
+            return None
+        sizes = [_pass_examples(child, read) for child in source.pipelines]
+        known = [size for size in sizes if size is not None]
+        if len(known) != len(sizes):
+            return None
+        count = Proportions.of(_weights(source)).covering(known)
+    elif read == "streamed" and not _in_memory(source):
+        stated = [shard.rows for shard in source.manifest().shards]
+        held = [rows for rows in stated if rows is not None]
+        if len(held) != len(stated):
+            return None
+        count = sum(held)
+    else:
+        records = source.records(read)
+        present = _Present.of(records) if _in_memory(source) else None
+        count = len(records) if present is None else len(present.positions)
+    for stage in prefix:
+        if isinstance(stage, Limit):
+            count = min(count, stage.count)
+        elif isinstance(stage, Slice):
+            count = len(range(count)[stage.selection])
+    return count
+
+
+def _held_ahead(train: Pipeline, read: Read) -> str | None:
+    """Where a run of epochs bounds a memory read before it holds anything, as a run bounded in examples
+    does (`_bounded`), its bound standing among the steps the read runs over its whole source (`_EAGER`):
+    "expansion" where the read would make rows of its source examples as it holds them, the bound then
+    ahead of that step, its count set once the read holds the rest (`_UNCOUNTED`, `_rebound`); "layout"
+    where it would pack or window them as it holds them and reads the windows per share after (an
+    objective's rows), the bound held before the layout, its passes counted as the read holds the documents
+    (`Limit.passes`).
+    None for any other read, whose pass is counted once it is prepared (`_staged`)."""
+    if read != "memory" or isinstance(train.source, (Mixture, Phases)):
+        return None
+    # The steps the read runs as it holds its rows, as the analysis places them once its configured steps
+    # bind (after a cache it fills), and a configured step's after them, which binds to such a step unless
+    # it draws (a random map).
+    eager = _analyzed(train, read, bound=True).eager
+    while eager < len(train.stages) and _held_once_bound(train.stages[eager]):
+        eager += 1
+    batched = _until(train.stages, (BatchStage, TokenBudget))
+    at = next((index for index, stage in enumerate(train.stages[:batched])
+               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
+    if at >= eager:
+        return None
+    if _expands(train.stages[at]):
+        return "expansion"
+    after = dataclasses.replace(train, stages=train.stages[eager:])
+    laid = isinstance(train.stages[at], (Pack, Windows))
+    return "layout" if laid and _analyzed(after, read).per_share else None
+
+
+def _held_once_bound(stage: Stage) -> bool:
+    """Whether a memory read holds what `stage` makes as it holds its rows: an eager step (`_EAGER`), or a
+    configured one, which binds to such a step unless it draws (a random map)."""
+    return isinstance(stage, _EAGER) or (isinstance(stage, Configured) and not stage.random)
+
+
+def _rebound(pipeline: Pipeline, examples: int, passes: int | None = None) -> Pipeline:
+    """`pipeline`, bounded (`_bounded`), its bound's limit `examples`, or `passes` over the rows reaching
+    it, which a memory read holding them counts (`Limit.passes`)."""
+    at = examples_bound(pipeline.stages)
+    assert at is not None and isinstance(pipeline.stages[at - 1], Limit)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at - 1], Limit(examples, passes),
+                                                 *pipeline.stages[at:]))
+
+
+def _held_count(train: Pipeline) -> int:
+    """The examples a memory read's held bound resolved to (`Limit.passes`), as the stages it ran state."""
+    source = train.source
+    ran = () if isinstance(source, (Mixture, Phases)) else _written(source, ())
+    at = examples_bound(ran)
+    limit = None if at is None else ran[at - 1]
+    assert isinstance(limit, Limit), "a held bound is among the stages it ran"
+    return limit.count
 
 
 def _output_batch(pipeline: Pipeline) -> int:
@@ -925,12 +1069,6 @@ def _compiled(
         raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
                          "keeps no count of the examples its rows consume: run it before the bound, as a "
                          "step Dew names, or read the data in a global order")
-    if order_records is None and _shuffles_windows(train):
-        # A run no plan counts ahead reads its progress off the windows that end its examples
-        # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.
-        raise ValueError(f"{_name(train)} shuffles the windows it packs, which a run bounded in examples "
-                         "and read in its own order reads in the order they end their examples; shuffle "
-                         "the records before the pack, or read it in a global order")
     held_out = sum(integer(source.metadata().get("held_out", 0), "held_out") for _, source in _leaves(train))
     return Loader(
         training,
@@ -1414,10 +1552,10 @@ elements, or arrays whole."""
 
 class _Whole:
     """The same batch every step, the arrays a run was handed whole; its position the steps read. It
-    never runs out (`Identified.endless`), and names what it reads as a stream Dew names no further does:
+    never runs out (`Identified.ends`), and names what it reads as a stream Dew names no further does:
     by its type (`stream_identity`)."""
 
-    endless = True
+    ends: Ends = "never"
 
     def __init__(self, batch: Batch):
         self.batch, self.read = batch, 0
@@ -1455,16 +1593,16 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
 
 class _Shared(Forwarding):
     """The `partition`'s share of each batch a stream yields (`_share`), its position, stop and close
-    the stream's; `endless` where it reads a map dataset repeated without end (`native`), which says
-    so of nothing it reads."""
+    the stream's; it never ends where it reads a map dataset repeated without end (`native`, `endless`),
+    which says so of nothing it reads."""
 
     def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition, *, held: bool,
                  endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
 
     @property
-    def endless(self) -> bool:
-        return self._endless or super().endless
+    def ends(self) -> Ends:
+        return "never" if self._endless else super().ends
 
     def __iter__(self):
         return self
@@ -1540,6 +1678,7 @@ def fitted[Entry](
     objective: ObjectiveData,
     seed: int = 0,
     examples: int | None = None,
+    epochs: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1551,7 +1690,10 @@ def fitted[Entry](
     validation dataset without a batch takes the
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
-    is passed on as it is."""
+    is passed on as it is. A run of `epochs` over a chain whose read has no
+    record count, but states the source examples a pass holds
+    (`Loader.pass_examples`), reads it bounded to that many passes, as
+    `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
             raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
@@ -1570,16 +1712,20 @@ def fitted[Entry](
     scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
     if isinstance(dataset, Dataset):
         chain = dataset._chain()
-        trained = chain if examples is not None else _endless(chain)
+        # A run of epochs reads its chain as written, which staging reads endlessly or bounds to its
+        # epochs' passes over its examples (`_staged`).
+        trained = chain if examples is not None or epochs is not None else _endless(chain)
         read = trained.mode or _preferred_read((trained,), provision=True)
         # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
-                                      loading=trained._loading or _DEFAULT_LOADING, examples=examples))
+                                      loading=trained._loading or _DEFAULT_LOADING, examples=examples,
+                                      epochs=epochs if examples is None else None))
         widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
-                         widths=widths, read=read, measured=measured)
+                         widths=widths, read=read, measured=measured,
+                         epochs=epochs if examples is None else None)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

@@ -6,12 +6,14 @@ Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
 import dataclasses
+import functools
 import importlib
 import json
 import typing
 from pathlib import Path
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -33,6 +35,7 @@ from test_nested_learning_optim import muon_orthogonalized, newton_schulz_refere
 from torch_layout import node
 
 from dew.batch import coordinates
+from dew.gauss_newton import RowEquations
 from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -1143,9 +1146,11 @@ def program_of(closed) -> tuple:
     steps = []
     for equation in equations(closed.jaxpr):
         literals = [operand.val for operand in equation.invars if isinstance(operand, Literal)]
-        # The sub-programs a parameter holds are walked as equations of their own.
+        # The sub-programs a parameter holds, one or a cond's branches, are walked as equations of their own.
         params = tuple(sorted((name, value) for name, value in equation.params.items()
-                              if not isinstance(value, (Jaxpr, ClosedJaxpr))))
+                              if not isinstance(value, (Jaxpr, ClosedJaxpr)) and not (
+                                  isinstance(value, tuple) and value
+                                  and all(isinstance(each, (Jaxpr, ClosedJaxpr)) for each in value))))
         steps.append((equation.primitive.name, params, constants(literals)))
     return tuple(steps), constants(closed.consts)
 
@@ -1170,12 +1175,19 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
         return OptimConfig(optimizer=optimizer, learning_rate=rate if schedule is None else schedule,
                            param_groups=groups)
 
+    # Gauss-Newton solves its update's system, which a run hands it (`dew.gauss_newton`): four rows of it.
+    flat = jax.flatten_util.ravel_pytree(params)[0]
+    drawn = jax.random.normal(jax.random.key(1), (4, flat.size + 1))
+    system = {} if optimizer != "gauss_newton" else {"statistics": RowEquations(
+        total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(4), jacobian=drawn[:, :-1],
+        residual=drawn[:, -1], update=4)}
     programs, updates = [], []
     for rate in (1e-3, 4e-3):
         solver = config(rate).build(10)
         state = solver.init(params)
-        programs.append(program_of(jax.make_jaxpr(solver.update)(grads, state, params)))
-        updates.append(solver.update(grads, state, params)[0])
+        programs.append(program_of(jax.make_jaxpr(functools.partial(solver.update, **system))(grads, state,
+                                                                                            params)))
+        updates.append(solver.update(grads, state, params, **system)[0])
     assert programs[0] == programs[1]
     assert any(not np.array_equal(left, right) for left, right in
                zip(jax.tree.leaves(updates[0]), jax.tree.leaves(updates[1]), strict=True))
@@ -1559,7 +1571,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     twice its real part to the bit, as each update scales both alike and a doubling rounds as its half
     does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real, and so is
     the rate the tree steps at: no step casts a complex value to a real one."""
-    from dew.optim import OptimConfig, QuantizedMoments, learning_rate
+    from dew._moments import QuantizedMoments
+    from dew.optim import OptimConfig, learning_rate
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}
@@ -1584,7 +1597,7 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
 def test_adams_default_first_moment_keeps_its_promoted_dtype():
     """With no requested moment dtype, Adam's first moment of a bf16 parameter under fp32 gradients is
     the promoted fp32 moment Optax keeps, not rounded back to the parameter's bf16."""
-    from dew.optim import scale_by_adam
+    from dew._moments import scale_by_adam
 
     params = {"w": jnp.ones((8,), jnp.bfloat16)}
     transform = scale_by_adam()

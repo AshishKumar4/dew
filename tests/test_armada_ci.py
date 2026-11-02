@@ -3,6 +3,7 @@
 import functools
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,56 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
     return loaded(tmp_path, monkeypatch)
+
+
+SITED = """
+import json
+import os
+
+import pytest
+
+
+def noted(name):
+    with open(os.environ["SEEN"], "a") as out:
+        out.write(json.dumps([name, {key: os.environ.get(key) for key in
+                                     ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")}]) + "\\n")
+
+
+def test_ordinary():
+    noted("ordinary")
+
+
+@pytest.mark.check1_shards(seeds=4, per_task=4)
+def test_check1():
+    noted("check1")
+
+
+@pytest.mark.shards(units=4, per_task=4)
+def test_witness():
+    noted("witness")
+"""
+
+
+@pytest.mark.parametrize("split", ["", "1/1", "test_check1.draws-0-4", "test_check1"])
+def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tasks_alone(ci, tmp_path,
+                                                                                        monkeypatch, split):
+    """A targeted run of a file's group (tmp/run_tests.py, the gangs) selects as CI's task does: a file's
+    group sets aside its sites, which run in their own tasks alone, a map task drawing its seeds into its
+    artifacts and the judge pooling them from its inputs (2026-11-02: a lane's targeted
+    chunk_adaptation#1/5 ran a site's every seed itself, 2233 s against CI's 8, and #2/5 timed out)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_sites.py"], split) == 0
+    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    unset = {"DEW_CHECK1_DRAWS": None, "DEW_CHECK1_RECORDS": None, "DEW_CHECK1_POOL": None}
+    expected = {"": [["ordinary", unset]], "1/1": [["ordinary", unset]],
+                "test_check1.draws-0-4": [["check1", {**unset, "DEW_CHECK1_DRAWS": "0:4",
+                                                      "DEW_CHECK1_RECORDS": str(tmp_path / "artifacts")}]],
+                "test_check1": [["check1", {**unset, "DEW_CHECK1_POOL": str(tmp_path / "inputs")}]]}
+    assert seen == expected[split]
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
@@ -95,6 +146,26 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
+def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
+        ci, tmp_path, monkeypatch):
+    """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
+    recorded for a collection, and weighs that, so armada's heaviest-first order starts it beside the run's
+    other full tasks. Train 459's four collect tasks of 140 files, each weighed at the target, started last
+    and ran 485-910 s on Genoa hosts against 145 s on Turin ones; the run ended with the last of them."""
+    names = [f"tests/test_f{index:03}.py" for index in range(200)]
+    for name in names:
+        (tmp_path / name).write_text("")
+    monkeypatch.setattr(ci, "NEWEST_FILES", ())
+    # A collect task's rows split its seconds evenly: these files last ran on a fast host and a slow one.
+    rates = {ci.row("3.14", name, ci.COLLECT): 5.3 if index % 2 else 1.0 for index, name in enumerate(names)}
+    collecting = [entry for entry in ci.plan(120.0, {"rows": rates}) if entry["split"] == ci.COLLECT]
+    assert sorted(name for entry in collecting for name in entry["tests"].split()) == names
+    # 22 files fit the target at 5.3 s each.
+    assert len(collecting) == math.ceil(len(names) / 22), [entry["weight"] for entry in collecting]
+    assert all(entry["weight"] == len(entry["tests"].split()) * 5.3 <= 120.0 for entry in collecting), [
+        (len(entry["tests"].split()), entry["weight"]) for entry in collecting]
+
+
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):
     """A file 3.14 has no measured time for (3.14 runs every file only on the daily run) weighs, and
     splits, by 3.12's measured time of it, not by its tests' least recorded times, so armada's
@@ -157,6 +228,46 @@ def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_
     assert ran("-k", "nothing_matches")[0] == 5
 
 
+SITE_TEST = """import json, os
+
+
+def note(test):
+    with open(os.environ["SEEN"], "a") as out:
+        names = ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")
+        out.write(json.dumps([test] + [os.environ.get(name) for name in names]) + "\\n")
+
+
+def test_site():
+    note("test_site")
+
+
+def test_other():
+    note("test_other")
+"""
+
+
+def test_a_targeted_pytest_runs_a_group_as_its_ci_task_would(ci, tmp_path, monkeypatch):
+    """`ci.py pytest --split` runs a file's group as CI's task of it does (`selection`, `site_environment`):
+    a check-1 site's map task its test alone, drawing its span into its artifacts, its judge that test
+    alone pooling from its inputs, and the file whole without a group; the lane's targeted run passes the
+    group straight through (2026-11-01: a draws task run as a split.py group failed)."""
+    seen = tmp_path / "seen.jsonl"
+    written(tmp_path, {"test_site.py": SITE_TEST})
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(seen))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+
+    def ran(split: str) -> list[list]:
+        seen.unlink(missing_ok=True)
+        assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_site.py"], split) == 0
+        return [json.loads(line) for line in seen.read_text().splitlines()]
+
+    assert ran("test_site.draws-8-16") == [["test_site", "8:16", str(tmp_path / "artifacts"), None]]
+    assert ran("test_site") == [["test_site", None, None, str(tmp_path / "inputs")]]
+    assert sorted(test for test, *_ in ran("")) == ["test_other", "test_site"]
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an
@@ -186,13 +297,12 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
                                                                "tests/test_pass.py::test_skip"}
     assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
-    # A process that dies after its report is written leaves the file it ran red, green cases included; each
-    # file runs in a process of its own (`alone`), so its taskmate keeps its row.
+    # A process that dies after its report is written leaves every row it ran red, green cases included.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    found = {row["name"]: (row["exitCode"], row.get("kind")) for row in json.loads(out.read_text())["rows"]}
-    assert found == {"3.12:tests/test_pass.py": (0, None), "3.12:tests/test_dies.py": (1, "whole")}
+    assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
@@ -243,10 +353,10 @@ def test_a_file_pytest_reports_nothing_of_is_red_unless_its_collection_shows_eve
 
 
 def install_compiler(directory: Path) -> None:
-    """A kernel's compiler under `directory`, outside the checkout as the CUDA toolkit is, named as it
-    installs it (ptxas): a native binary (`true`'s) that answers its version (followed.py's `tool`)."""
-    directory.mkdir(parents=True, exist_ok=True)
-    shutil.copy(os.path.realpath(shutil.which("true")), directory / "ptxas")
+    """A kernel's compiler under `directory`, named as the CUDA toolkit installs it (ptxas)."""
+    directory.mkdir()
+    (directory / "ptxas").write_text("#!/bin/sh\necho 'ptxas: NVIDIA (R) Ptx assembler'\n")
+    (directory / "ptxas").chmod(0o755)
 
 
 def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_for_a_gpu(
@@ -259,24 +369,16 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     test module's under whose body it ran, though another file imported it
     first, beside others. The `sys` and `platform` modules are no read. A
     file that started a process a record does not follow
-    (test_a_python_child_joins_its_files_record), a shell's or a forkserver
-    multiprocessing child's, has no key, so it is in, and no task reuses its
-    row, whatever names its program (a descriptor, for `os.execve`); one that
-    asked a native tool about the host or compiled a kernel with ptxas
-    (`followed.TOOLS`), or spawned or forked a multiprocessing child
-    (test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs_it),
-    keeps its key. The command line
+    (test_a_python_child_joins_its_files_record), a shell's or any
+    multiprocessing context's, has no key, so it is in, and no task reuses
+    its row, whatever names its program (a descriptor, for `os.execve`); one
+    that asked a native tool about the host or compiled a kernel with ptxas
+    (`followed.TOOLS`) keeps its key. The command line
     spreads the tier over its shards, each file once, and per batch names
     the files the checkout marks for a GPU."""
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
     device = "class Device:\n    platform = 'gpu'\n"
-    children = {method: "import multiprocessing, os\n"
-                        "def test_child():\n"
-                        f"    context = multiprocessing.get_context('{method}')\n"
-                        "    child = context.Process(target=os.getpid)\n"
-                        "    child.start()\n    child.join()\n    assert child.exitcode == 0\n"
-                for method in ("spawn", "forkserver", "fork")}
     files = {
         "devices.py": device + "def placed(device): return device.platform\n",
         "conftest.py": "import pytest\nfrom devices import Device, placed\n"
@@ -302,13 +404,8 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "test_tool.py": "import platform, subprocess\n"
                         "def test_tool():\n"
                         "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"
-                        f"    compiler = {str(tmp_path.parent / 'cuda/bin/ptxas')!r}\n"
-                        "    subprocess.run([compiler, '--version'], check=True)\n"
+                        "    subprocess.run(['tests/compiler/ptxas', '--version'], check=True)\n"
                         "    assert platform.platform()\n",
-        # Before the files whose starts no record follows: such a start leaves each file after it in its
-        # process without a key too (followed.py's `recorded`).
-        "test_spawn.py": children["spawn"],
-        "test_fork.py": children["fork"],
         "test_shell.py": "import os, subprocess, sys\n"
                          "def test_shell(): subprocess.run('git --version', shell=True, check=True)\n"
                          "def test_by_descriptor():\n"
@@ -320,11 +417,16 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
                          "        finally:\n"
                          "            os._exit(1)\n"
                          "    assert os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]) == 0\n",
-        "test_forkserver.py": children["forkserver"],
+        **{f"test_{method}.py": "import multiprocessing, os\n"
+                                "def test_child():\n"
+                                f"    context = multiprocessing.get_context('{method}')\n"
+                                "    child = context.Process(target=os.getpid)\n"
+                                "    child.start()\n    child.join()\n    assert child.exitcode == 0\n"
+           for method in ("spawn", "forkserver", "fork")},
         "test_new.py": "def test_unrun(): pass\n",
     }
     written(tmp_path, files)
-    install_compiler(tmp_path.parent / "cuda/bin")
+    install_compiler(tmp_path / "tests/compiler")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     # The session fixture's files in a task of their own, where it reads for every file, and the file whose
@@ -348,14 +450,16 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         "tests/test_one.py": ["tests/devices.py:placed"],
         "tests/test_passed.py": ["tests/test_passed.py:chosen"],
         "tests/test_plain.py": ["changed"],
+        "tests/test_fork.py": ["changed"],
         "tests/test_forkserver.py": ["changed"],
         "tests/test_shell.py": ["changed"],
         "tests/test_routes.py": ["tests/test_routes.py:chosen"],
+        "tests/test_spawn.py": ["changed"],
         "tests/test_two.py": ["tests/devices.py:placed"]}
     common = ci.shared("3.12")
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
-                         "test_fork.py", "test_shell.py")] == [True, True, True, False, True, False]
+                         "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
     # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
     # --evidence prints each beside its reads.
     tier = functools.partial(named_tier, ci, monkeypatch, capsys)
@@ -715,11 +819,24 @@ def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
+def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
+    """A task's wall time split among its files in proportion to their tests'
+    own times, and evenly over its rows where no test recorded one: recorded
+    times whose shares are exact in binary."""
+    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0, 2) == {
+        "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 2) == {
+        "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
+    # A file named twice is two of the task's rows.
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 3) == {
+        "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
+
+
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included: each file's own process's wall time (`alone`), so a
-    task's rows add up to at most its wall time, each at least what its tests
-    slept, and the longer sleep the larger row."""
+    collection included, so a task's rows add up to its wall time, split by
+    their tests' own times (`apportioned`): at least what the tests slept, at
+    most the task's wall time, and the longer sleep the larger row."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
@@ -855,7 +972,7 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
-    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "on"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
     ({"tools/armada/session.py": "# the session\n"}, "off"),
     ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
@@ -873,9 +990,8 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
     where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
     is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
-    off, and 0.75% of rows were reused), and pyproject.toml is placed too: its pytest settings every row keys,
-    its markers each row that uses one (ledger 3220). The recorder (executed.py, followed.py, watched.py)
-    stays every file's input: an old record may lack a dependency a new recorder finds."""
+    off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
+    file's input: an old record may lack a dependency a new recorder finds."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
@@ -925,6 +1041,41 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     (tmp_path / "runs").write_text("")
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:2], "3.12:tests/test_moved.py#2/2": nodes[2:]}
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
+
+
+def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Tests marked shared_setup with one name, on their own decorators, run in one group of their
+    split file, so the setup they share (a module-scoped fixture's making) is paid once: the plan cuts
+    the file's record and the split plugin its collected tests alike, the marked tests one weight at
+    the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
+    plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
+    yet stays at its own place, as the plan, reading the record, cuts as the task does. A mark written
+    elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
+    line, as the plan cannot read it."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
+    (tmp_path / "tests/test_shared.py").write_text(
+        "from pathlib import Path\nimport pytest\n"
+        + "".join(("@pytest.mark.shared_setup('plan')\n" if index != 1 else "")
+                  + f"def test_{index}():\n"
+                  f"    with Path('runs').open('a') as runs: runs.write('{index}')\n" for index in range(4)))
+    nodes = [f"tests/test_shared.py::test_{index}" for index in range(4)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict.fromkeys(nodes[:3], 200.0)))
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    together, alone = [nodes[0], nodes[2]], [nodes[1]]
+    assert {row["name"]: sorted(row["tests"]) for row in rows} == {
+        "3.12:tests/test_shared.py#1/2": together, "3.12:tests/test_shared.py#2/2": [*alone, nodes[3]]}
+    assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
+    assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
+    for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
+                      "@pytest.mark.shared_setup(NAME)\n"):
+        (tmp_path / "tests/test_refused.py").write_text(
+            f"import pytest\nNAME = 'plan'\n{misplaced}def test_one():\n    pass\n")
+        with pytest.raises(SystemExit):
+            ci.plan(300.0, {})
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
@@ -1399,18 +1550,15 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     assert run() == 1
 
 
-@pytest.mark.parametrize("order", [("lone", "uses"), ("uses", "lone")], ids=["lone first", "lone after uses"])
 def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests_executed(
-        ci, tmp_path, monkeypatch, cache_worker, order):
+        ci, tmp_path, monkeypatch, cache_worker):
     """A train that loses a head loses the test modules and modules the head added, and its other
-    files keep their rows (the land queue's recompose after a pull): a test module, a module in a
-    package no test imported, or one beside a module a file's tests executed under a name no run
-    tried to import, added or taken away runs no file again (ledger 3220: a listing of every package
-    above an executed module keyed 82% of rows, and each added module reran them). An __init__.py
-    added to, or taken from, a namespace package on the way to a module a file imported, which that
-    import finds, runs that file again, and that one alone, whatever its order in the task: each file
-    runs in a process of its own (`alone`), so no file's key holds another's imports; a top-level
-    package added under src/, which may shadow any import, runs every file."""
+    files keep their rows (the land queue's recompose after a pull): a test module, or a module in a
+    package no test imported, added or taken away runs no other file again. A module added beside
+    one a file's tests executed under src/, which an import there may now find, runs that file
+    again, and only that one, and so does its removal, and so does an __init__.py added to, or taken
+    from, a namespace package on the way to one; a top-level package added under src/, which may
+    shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1433,16 +1581,16 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     out = tmp_path / "verdict.json"
 
     def run():
-        ci.task("3.12", [f"tests/test_{name}.py" for name in order], "", out, 600.0)
+        ci.task("3.12", ["tests/test_uses.py", "tests/test_lone.py"], "", out, 600.0)
         assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
         return [len((tmp_path / f"runs-{name}").read_text()) for name in ("uses", "lone")]
 
     changes = [(None, None, [1, 1]), ("tests/test_added.py", "def test_added(): pass\n", [1, 1]),
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
-               ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
-               ("src/other/extra.py", None, [1, 1]), ("tests/test_added.py", None, [1, 1]),
-               ("src/pkg/space/__init__.py", "", [2, 1]),
-               ("src/pkg/space/__init__.py", None, [3, 1]), ("src/top/__init__.py", "", [4, 2])]
+               ("src/other/extra.py", "def value(): return 4\n", [1, 2]),
+               ("src/other/extra.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
+               ("src/pkg/space/__init__.py", "", [2, 3]), ("src/pkg/space/__init__.py", None, [3, 3]),
+               ("src/top/__init__.py", "", [4, 4])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
@@ -1453,12 +1601,12 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         assert run() == runs, path
 
 
-def test_a_task_past_its_deadline_is_interrupted_and_the_files_it_held_up_are_red(ci, tmp_path):
-    """A hang is graded: the task interrupts the hanging file's pytest at its deadline, short of armada's own
-    timeout, kills its process group where the interrupt is not heard, and writes a red row for it and for the
-    files whose turn never came; a file that finished in its own process before (`alone`) keeps its row."""
+def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
+    """A hang is graded: the task interrupts pytest at its deadline, short of
+    armada's own timeout, kills its process group where the interrupt is not
+    heard, and writes a red row for each of its files, the one that finished
+    first included."""
     (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
-    (tmp_path / "tests/test_later.py").write_text("def test_ok(): pass\n")
     # A hang that ignores ^C, beside a child that holds pytest's output open:
     # neither may keep the task from writing its verdict.
     (tmp_path / "tests/test_hangs.py").write_text(
@@ -1470,15 +1618,12 @@ def test_a_task_past_its_deadline_is_interrupted_and_the_files_it_held_up_are_re
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py", "tests/test_later.py"], "", out, 30.0,
-            grace=2.0)
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
     # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
-    assert time.monotonic() - began < 30.0 + 2.0 + ci.SETTLE + 10 + 15
+    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": 0, "3.12:tests/test_hangs.py": 1, "3.12:tests/test_later.py": 1}
-    assert "interrupted" in rows["3.12:tests/test_hangs.py"]["output"]
-    assert "before its file started" in rows["3.12:tests/test_later.py"]["output"]
+        "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
 
 
 def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
@@ -1917,9 +2062,8 @@ def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_
 def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_file(
         ci, tmp_path, monkeypatch, cache_worker):
     """A module only a test's child process imports (a tool run as a script) is that file's input as one its
-    own process imports is: a helper of its name added where the child's import searched (its `-c`'s '', the
-    checkout's root) reruns the file (row 2502: the recorder named the pytest process's imports alone, so
-    such a helper kept the file's green key), and one added where it did not (tests/) leaves it."""
+    own process imports is: a helper of its name added under tests/ reruns the file (row 2502: the recorder
+    named the pytest process's imports alone, so such a helper kept the file's green key)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     written(tmp_path, {"test_c.py": "import subprocess, sys\nfrom pathlib import Path\n"
                                     "def test_c():\n"
@@ -1929,8 +2073,6 @@ def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_fil
     armada_task(ci, monkeypatch, verdict)
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     (tmp_path / "tests/wave.py").write_text("")
-    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
-    (tmp_path / "wave.py").write_text("")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 

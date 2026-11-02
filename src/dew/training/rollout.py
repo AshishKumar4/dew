@@ -9,9 +9,12 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import numpy as np
 from jax.sharding import Mesh
 
-from dew.batch import Batch
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
+from dew.data.dataset import rows_of
+from dew.nn.inputs import local_rows
 from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
@@ -46,6 +49,21 @@ class Rollout(Protocol):
     the branch's own (`cooldown-<step>`, the step it branches at), after which
     the rollout stands as the run left it (`_branched`). One without it is
     called alike there.
+
+    A rollout whose next batches depend on state it carries between calls (its
+    environments mid episode, a collection it serves in minibatches, a replay)
+    may have `saved()`, that state as a mapping of arrays (host arrays of 32
+    bits or fewer a leaf, which the trainer places), None before its first
+    call; `saved_shapes()`, its leaves' shapes and dtypes, readable before any
+    call; `restored(tree)`, which carries on from a saved tree; and
+    `branch(name)`, so a cooldown branch leaves that state as the run left it.
+    Each checkpoint of the run holds the run's rollout's tree beside its state
+    (`dew.training._fit._rollout_saved`), and a resume hands it back, placed
+    as the run's key is (`_rollout_resumed`), so a resumed run samples the
+    batches the run that never stopped did. It is the pool's: a run of several
+    processes with a checkpointer is refused one as its fit starts
+    (`_rollout_admitted`). The
+    contract is the post-training spec's (docs/design/post-training.md, §14).
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
@@ -58,10 +76,17 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
 
 
 def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
-               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun) -> Batch:
-    """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
+               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
+               examples: int | None = None, closes: bool = False) -> tuple[Batch, bytes | None]:
+    """`batch` sampled through `rollout` from `state`, as the run holds it, which its policy reads off
+    the mesh (`decoder_stack.off_stages`), its host preparation `marked` and placed on `mesh`
     (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
-    (`FitRun.held`); without a rollout, the batch as it is.
+    (`FitRun.held`); without a rollout, the batch as it is. In a run on the examples clock the
+    batch it makes consumes the examples of the batches it read, its step's and each it drew further
+    (`clocked_rollout`). Where it `closes` a step of the run bounded to `examples`, the batch is closed
+    (`FitRun.closing`) after the rollout's last draw, so the look-ahead that finds the stream's end, and
+    the position the step saves, come after every batch it read, in a pool each a pooled read
+    (`FitRun.further`). With the batch, the position the step saves, or None.
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -71,14 +96,76 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     from dew.distributed.batches import shard_batch
 
     if rollout is None:
-        return batch
+        return run.closing(interval, batch, examples) if closes else (batch, None)
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-    further = {"further": run.further(interval)} if _draws_further(rollout) else {}
+    consumed = _Consumed(batch)
+    further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
-        batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
+        made = clocked_rollout(rollout(state, _unclocked(batch), key, **further), batch, consumed)
+        prepared = marked(made)
+        # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
+        batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {
+            **prepared, CONSUMED_COUNT: made[CONSUMED_COUNT]})
     interval.rollout_seconds += time.perf_counter() - began
-    return batch
+    # Placed, as a step's read batch is closed: what the stream's end leaves goes to the pool's first row.
+    return run.closing(interval, batch, examples) if closes else (batch, None)
+
+
+CLOCK = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW)
+"""The fields a batch of a run on the examples clock carries for the run's progress, which the batch it
+makes of it carries instead (`clocked_rollout`): none reaches the rollout."""
+
+
+def _unclocked(batch: Batch) -> Batch:
+    """`batch` as a rollout reads it: without the fields of the run's clock (`CLOCK`)."""
+    return {name: value for name, value in batch.items() if name not in CLOCK}
+
+
+class _Consumed:
+    """The examples the batches a rollout reads consume, added as each arrives, none of them kept: this
+    process's rows' (`local_rows`, `EXAMPLES_CONSUMED`) and their counts (`ConsumedCount`); a run on
+    another clock's batches carry none."""
+
+    def __init__(self, first: Batch):
+        self.clocked, self.rows, self.count = CONSUMED_COUNT in first, 0, 0
+        self.add(first)
+
+    def add(self, batch: Batch) -> None:
+        if self.clocked:
+            self.rows += int(np.sum(local_rows(batch[EXAMPLES_CONSUMED])))
+            self.count += batch[CONSUMED_COUNT].examples
+
+    def reading(self, read: Callable[[], Batch | None]) -> Callable[[], Batch | None]:
+        """`read`, each batch it reads added and handed on without the clock's fields."""
+        def drawn() -> Batch | None:
+            batch = read()
+            if batch is None:
+                return None
+            self.add(batch)
+            return _unclocked(batch)
+        return drawn
+
+
+def clocked_rollout(made: Batch, read: Batch, consumed: _Consumed) -> Batch:
+    """The batch a rollout `made` of the batch it `read` and those it drew further, as a run on the
+    examples clock steps it: consuming the examples they consumed (`consumed`), all on its first row, as a
+    step sums them over its rows, counted as they counted them (`ConsumedCount`), and closing the update
+    window where the read batch does (`CLOSES_WINDOW`), where the run closed it before the rollout; a
+    batch with no real row on this process (a pool's share whose stream ran out,
+    `dew.training._fit.pooled_read`) makes one with none. Each process counts the rows it holds, so the
+    step's sum over the pool's rows counts each once. A run on another clock reads no count: its
+    rollout's batch is as made."""
+    if not consumed.clocked:
+        return made
+    held = np.zeros(rows_of(made), np.int32)
+    held[0] = consumed.rows
+    clocked = {**made, EXAMPLES_CONSUMED: held, CONSUMED_COUNT: ConsumedCount(consumed.count)}
+    if CLOSES_WINDOW in read:
+        clocked[CLOSES_WINDOW] = read[CLOSES_WINDOW]
+    if VALID_ROWS in read and not np.any(local_rows(read[VALID_ROWS])):
+        clocked[VALID_ROWS] = np.zeros(len(held), bool)
+    return clocked
 
 
 def _draws_further(rollout: Rollout) -> bool:

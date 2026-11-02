@@ -137,7 +137,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels import generation
-from dew.nn.kernels.options import OuterProgram, compiler_options
+from dew.nn.kernels.options import compiler_options, program as outer_program
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
@@ -234,7 +234,7 @@ def _seed(key: int | jax.Array) -> int | jax.Array:
     return jax.random.key_data(typed)
 
 
-@OuterProgram
+@outer_program
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
               folds: jax.Array) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
@@ -818,7 +818,11 @@ class Server:
         if progress is not None and (progress.updates is None) != (self.progress.updates is None):
             raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
                              "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
-        packed = pack_projections(normalized(variables, self._source_shapes), self._weight_groups)
+        # A stage-local run's state is read on its stored layers, as the served tree holds them.
+        from dew.nn.backbones.layer_names import stored_layers
+
+        packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
+                                  self._weight_groups)
         self.variables = reloaded(packed, self.variables)
         if progress is not None:
             self.progress = progress

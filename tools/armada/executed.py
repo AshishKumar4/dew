@@ -20,9 +20,6 @@ import lifetime
 import pytest
 from session import MARKS
 
-MARKER = "marker:"
-"""A marker's registration, an input (ci.py's `MARKER`, `registered`)."""
-
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
 
@@ -113,29 +110,6 @@ def pytest_collection_modifyitems(items):
                 f"{', '.join(f'args {mark.args} kwargs {mark.kwargs}' for mark in marks)}")
         checks = released.setdefault(item.nodeid.split("::")[0], {})
         checks.setdefault(named.pop(), []).append(item.nodeid)
-
-
-@pytest.hookimpl(specname="pytest_collection_modifyitems", trylast=True)
-def pytest_collection_modifyitems_markers(items):
-    """Every marker each test carries once collection settled them (a helper's alias, a conftest's
-    `add_marker` among them), its file's input: its registration's (ci.py's `registered`). Named `pytest_...`:
-    pytest registers a plugin's function as a hook only where its name has that prefix, `specname` or not."""
-    for item in items:
-        for name in sorted({mark.name for mark in item.iter_markers()}):
-            lifetime.write(item.nodeid.split("::")[0], f"{MARKER}{name}")
-
-
-def pytest_configure(config):
-    """A test's or a conftest's read of every registration (`config.getini("markers")`), its owner's input:
-    pytest's own reads of them, at configure and at a mark's first use, are none."""
-    getini = config.getini
-
-    def watched(name):
-        if name == "markers" and os.sep + "_pytest" + os.sep not in sys._getframe(1).f_code.co_filename:
-            lifetime.write(lifetime.owner(), f"{MARKER}*")
-        return getini(name)
-
-    config.getini = watched
 
 
 def pytest_deselected(items):

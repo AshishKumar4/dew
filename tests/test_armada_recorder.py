@@ -2,14 +2,7 @@
 record keys the file's row in the test cache (tools/armada/ci.py's `cache_key`): the code its run executed,
 read, imported and started, for the process's whole life, and its children's."""
 
-import ast
 import json
-import os
-import shutil
-import sys
-import tempfile
-import time
-from pathlib import Path
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
@@ -26,12 +19,8 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     (tools/armada/followed.py), once and silently though its site-packages are
     processed again: its reads of the backend join the file's evidence, and
     the files it executed and the pages it read the file's key, which holds
-    until one changes, though it leaves through os._exit, it writes each as it
-    happens, or execs itself again (dew.devices' restart under XLA's flags),
-    whose new image writes on into the log of the old. A child given an
-    environment of its own, one that execs itself again with no site (-S),
-    whose .pth never runs, or one killed before it wrote its record, leaves its
-    file without a key."""
+    until one changes. A child given an environment of its own, or killed
+    before it wrote its record, leaves its file without a key."""
     url, _, _ = cache_worker
     cached(monkeypatch, url)
     started = "import os, subprocess, sys\ndef test_child():\n    "
@@ -43,26 +32,10 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                     "import devices, plain\n"
                     "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n"
                     "assert open('notes/page.md').read()\n",
-        "exit.py": "import os, plain\nassert plain.helper()\nos._exit(0)\n",
-        "reexec.py": "import os, sys\nimport plain\n"
-                     "if os.environ.get('REEXECED') != '1':\n"
-                     "    again = {**os.environ, 'REEXECED': '1'}\n"
-                     "    os.execve(sys.executable, [sys.executable, __file__], again)\n"
-                     "assert plain.helper()\n",
-        # A new image with no site, whose .pth never runs: what it executes no log holds.
-        "reexec_bare.py": "import os, sys\n"
-                          "if os.environ.get('REEXECED') != '1':\n"
-                          "    again = {**os.environ, 'REEXECED': '1'}\n"
-                          "    os.execve(sys.executable, [sys.executable, '-S', __file__], again)\n"
-                          "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
         "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
                                    "                      capture_output=True, text=True)\n"
                                    "    assert not done.stderr, done.stderr\n",
         "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
-        "test_exits.py": started + "subprocess.run([sys.executable, 'tests/exit.py'], check=True)\n",
-        "test_reexecs.py": started + "subprocess.run([sys.executable, 'tests/reexec.py'], check=True)\n",
-        "test_reexecs_bare.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare.py'],\n"
-                                          "                   check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -78,120 +51,16 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
 
-    assert reused() == [True, True, True, True, False, False, False]
+    assert reused() == [True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, True, True, False, False, False]
+    assert reused() == [False, True, False, False]
     (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, True, True, False, False, False]
+    assert reused() == [True, True, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False, False, False, False]
+    assert reused() == [False, True, False, False]
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
-                                   "tests/test_exits.py": ["changed"],
                                    "tests/test_killed.py": ["changed"],
-                                   "tests/test_own_environment.py": ["changed"],
-                                   "tests/test_reexecs.py": ["changed"],
-                                   "tests/test_reexecs_bare.py": ["changed"]}
-
-
-def test_a_multiprocessing_child_joins_its_files_record_unless_a_forkserver_runs_it(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """A child multiprocessing spawns (a `Process` of its `spawn` context: Grain's loading workers, whose
-    start Python 3.12 audits no event of) records itself as a Python child any other start makes does
-    (test_a_python_child_joins_its_files_record), though this process runs with -S, which multiprocessing
-    passes on to the children it spawns: the functions they ran and the pages they read are their file's
-    key, those of a child one of them spawns in turn too (and the resource tracker it starts, which runs
-    the standard library alone, records nothing), and an edit to what only a child ran reruns the file. A
-    forked child, whose code runs under its parent's hooks and writes into its log, joins the record as it
-    is; one a forkserver runs, which no hook reaches, leaves its file without a key."""
-    url, _, _ = cache_worker
-    cached(monkeypatch, url)
-    spawned = ("import multiprocessing\ndef test_child():\n"
-               "    child = multiprocessing.get_context('spawn').Process(")
-    started = "child.start()\n    child.join()\n    assert child.exitcode == 0\n"
-    files = {
-        "plain.py": "def helper(): return 1\n",
-        "inner.py": "def inner(): return 2\n",
-        "forked.py": "def in_fork(): return 3\ndef in_mp_fork(): return 4\n",
-        "worker.py": "import multiprocessing\nimport plain\n"
-                     "def work(path):\n    assert plain.helper() and open(path).read()\n"
-                     "def spawn_inner():\n    import inner\n"
-                     "    context = multiprocessing.get_context('spawn')\n"
-                     "    done = context.Event()\n"
-                     "    child = context.Process(target=inner.inner)\n"
-                     "    child.start()\n    child.join()\n    done.set()\n    assert child.exitcode == 0\n",
-        "test_spawn.py": "import worker\n" + spawned + "target=worker.work, args=('notes/page.md',))\n    "
-                         + started,
-        "test_nested.py": "import worker\n" + spawned + "target=worker.spawn_inner)\n    " + started,
-        "test_os_fork.py": "import os, forked\ndef test_child():\n    pid = os.fork()\n    if pid == 0:\n"
-                           "        try:\n            forked.in_fork()\n"
-                           "        finally:\n            os._exit(0)\n"
-                           "    assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 0\n",
-        "test_fork.py": "import multiprocessing, forked\ndef test_child():\n"
-                        "    child = multiprocessing.get_context('fork').Process(target=forked.in_mp_fork)\n"
-                        "    " + started,
-        "test_forkserver.py": "import multiprocessing, os\ndef test_child():\n"
-                              "    context = multiprocessing.get_context('forkserver')\n"
-                              "    child = context.Process(target=os.getpid)\n    " + started,
-    }
-    written(tmp_path, files)
-    (tmp_path / "notes").mkdir()
-    (tmp_path / "notes/page.md").write_text("page\n")
-    interpreter(tmp_path, "3.12")
-    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
-
-    def reused() -> list[bool]:
-        return reusable_now(ci, tests)
-
-    def edited(name: str, source: str) -> list[bool]:
-        """Whether each file is reused with `name` as `source`, which `name` is restored from after."""
-        path = tmp_path / name
-        original = path.read_text()
-        path.write_text(source)
-        try:
-            return reused()
-        finally:
-            path.write_text(original)
-
-    assert reused() == [True, True, True, True, False]
-    assert edited("notes/page.md", "page again\n") == [False, True, True, True, False]
-    assert edited("tests/inner.py", "def inner(): return 3 - 1\n") == [True, False, True, True, False]
-    assert edited("tests/plain.py", "def helper(): return 2 - 1\n") == [False, True, True, True, False]
-    # What only a forked child ran reruns its file alone, each file in a process of its own (ci.py's `alone`).
-    assert edited("tests/forked.py", "def in_fork(): return 3\ndef in_mp_fork(): return 5 - 1\n") == [
-        True, True, True, False, False]
-    assert edited("tests/forked.py", "def in_fork(): return 4 - 1\ndef in_mp_fork(): return 4\n") == [
-        True, True, False, True, False]
-
-
-def test_a_native_media_binary_keeps_its_files_key_and_what_it_opened_is_that_keys_input(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """The media binary imageio-ffmpeg ships, named for its platform and version, and the other native
-    programs of `followed.TOOLS` the environment or the system owns run no checkout code and hold no GPU: a
-    file that starts one keeps its key, whose inputs include the data files the program opened under tests/
-    (the watch's: it raises no Python audit event). A script under the same name, which may run any code,
-    leaves its file without a key, the checkout's or a test's alike (`followed.tool`)."""
-    url, _, _ = cache_worker
-    cached(monkeypatch, url)
-    written(tmp_path, {"clip.bin": "frames\n"})
-    (tmp_path / "tests/bin").mkdir()
-    script = tmp_path / "tests/bin/ffmpeg-linux-x86_64-v7.0.2"
-    script.write_text("#!/bin/sh\ncat tests/clip.bin\n")
-    script.chmod(0o755)
-    written(tmp_path, {
-        "test_media.py": "import imageio_ffmpeg, subprocess\ndef test_run():\n"
-                         "    program = imageio_ffmpeg.get_ffmpeg_exe()\n"
-                         "    subprocess.run([program, '-v', 'quiet', '-i', 'tests/clip.bin'],\n"
-                         "                   capture_output=True)\n",
-        "test_shell_script.py": "import subprocess\ndef test_run():\n"
-                                "    subprocess.run(['tests/bin/ffmpeg-linux-x86_64-v7.0.2'], check=True,\n"
-                                "                   capture_output=True)\n"})
-    interpreter(tmp_path, "3.12")
-    tests = ["tests/test_media.py", "tests/test_shell_script.py"]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
-    assert reusable_now(ci, tests) == [True, False]
-    (tmp_path / "tests/clip.bin").write_text("more frames\n")
-    assert reusable_now(ci, tests) == [False, False]
+                                   "tests/test_own_environment.py": ["changed"]}
 
 
 def test_what_a_conftest_starts_before_any_test_is_every_files_input(ci, tmp_path, monkeypatch,
@@ -268,6 +137,24 @@ def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, t
     assert reused() == [True, False]
 
 
+def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(ci, tmp_path, monkeypatch,
+                                                                                cache_worker):
+    """A session-scoped parameter runs A[0], B[0], A[1], B[1]: what B's first visit executed and cached
+    serves A's second, so it is A's input though A ran first; an edit to it reruns A."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "conftest.py": ON_SRC + "import pytest\n@pytest.fixture(scope='session', params=[0, 1])\n"
+                                "def visit(request):\n    return request.param\n",
+        "holder.py": "VALUES = {}\n",
+        "test_a.py": "import holder\ndef test_a(visit):\n"
+                     "    assert visit == 0 or holder.VALUES['m'] == 1\n",
+        "test_b.py": "import holder\ndef test_b(visit):\n    import m\n"
+                     "    holder.VALUES.setdefault('m', m.VALUE)\n"},
+        {"m.py": "VALUE = 1\n"})
+    assert reused() == [True, True]
+    (tmp_path / "src/m.py").write_text("VALUE = 2\n")
+    assert reused() == [False, False]
+
+
 def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
     """Two children a file starts alike are two starts, each owing a record: two that record themselves
     keep the file's key, and one that records itself beside one that starts with no site (-S), which no
@@ -306,7 +193,7 @@ class Shape:
 
 @pytest.mark.parametrize(("edit", "rerun"), [
     (("def unused(x):\n    return x - 1", "def unused(x):\n    return x - 2"), [False, False]),
-    (("    return x * by", "    return by * x + 0"), [True, False]),
+    (("    return x * by", "    return by * x + 0"), [True, True]),
     (("        return side * side", "        return side ** 2"), [False, True]),
     (("        return self.sides * side", "        return side * self.sides"), [False, False]),
     (("def scaled(x, by=2):", "def scaled(x, by=3):"), [True, True]),
@@ -320,8 +207,8 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
     """A file's key covers the code its run executed, each function it ran and the top level of each module
     it imported (all but function bodies: its imports, constants, classes' attributes and methods'
     signatures, defaults and decorators), not a module's whole text: an edit to a function no run executed,
-    or one that only moves lines, reruns no file, and an edit to what a run executed reruns that file alone,
-    each file in a process of its own (ci.py's `alone`)."""
+    or one that only moves lines, reruns no file, and an edit to what a run executed reruns it and the files
+    its process ran after it, which what it ran may serve."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
         "test_a.py": ON_SRC + "import m\ndef test_a():\n    assert m.scaled(2) == 4\n",
         "test_b.py": ON_SRC + "import m\ndef test_b():\n    assert m.Shape().area(3) == 9\n"},
@@ -334,23 +221,18 @@ def test_an_edit_reruns_the_files_whose_run_executed_what_it_changed(ci, tmp_pat
 
 @pytest.mark.parametrize(("seen", "edit"), [
     ("assert m.unused.__doc__ == 'Less one.'", ('"""Less one."""', '"""Less two."""')),
-    ("import inspect\n    assert str(inspect.signature(m.unused)) == '(x)'",
-     ("def unused(x):", "def unused(y):")),
     ("import inspect\n    assert inspect.isgeneratorfunction(m.counted)", ("    yield x", "    return x")),
     ("assert 'one' in m.unused.__code__.co_consts", ("    return x, 'one'", "    return x, 'two'")),
     ("namespace = {}\n    exec(m.__spec__.loader.get_source('m'), namespace)\n"
      "    assert namespace['unused'](2) == (2, 'one')", ("    return x, 'one'", "    return x, 'two'")),
     ("pass", ("    return x, 'one'", "    return x, 'one'\n    break")),
-], ids=["a bare docstring read", "a signature read", "a generator's kind", "a function's code",
-        "a module's text it executed itself",
+], ids=["a docstring", "a generator's kind", "a function's code", "a module's text it executed itself",
         "a body that no longer compiles"])
 def test_what_a_run_sees_of_code_it_never_entered_is_its_input(ci, tmp_path, monkeypatch, cache_worker,
                                                                seen, edit):
-    """What a run sees of a function it never entered is its input as the code it ran is: its docstring,
-    which a bare `__doc__` read takes with no code and no audit seeing it, and its signature, both kept in its
-    module's top level (ci.py's `Hollow`), the function value's kind (a generator's), its code object
-    (`__code__`), the module's text it compiled itself, and whether the module still compiles, which a body
-    left out would hide."""
+    """What a run sees of a function it never entered is its input as the code it ran is: the function
+    value's docstring and kind (a generator's), its code object (`__code__`), the module's text it compiled
+    itself, and whether the module still compiles, which a body left out would hide."""
     # The body's constant a string, which every Python keeps in co_consts (3.14 loads a small int inline).
     module = ('import sys\n\n\ndef unused(x):\n    """Less one."""\n    return x, \'one\'\n\n\n'
               'def counted(x):\n    yield x\n')
@@ -426,12 +308,11 @@ def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypa
         == [(1, True)] * 2
 
 
-def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, monkeypatch, cache_worker):
+def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker):
     """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
-    prober, the task's last file, alone; a helper shadowing a name only a file's child imported, where the
-    child's import searched for it, reruns that file alone; a module one file imported lazily reruns it
-    alone, as each file runs in a process of its own (ci.py's `alone`) that nothing it left can serve; and
-    two files whose records share inputs never take each other's row."""
+    prober, the process's last file, alone; a helper shadowing a name only a file's child imported reruns
+    that file alone; a module one file imported lazily reruns it and every file the process ran after it,
+    which what it left may serve; and two files whose records share inputs never take each other's row."""
     child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
              "import tabnanny")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
@@ -448,16 +329,11 @@ def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, mon
     (tmp_path / "tests/fixtures/f.txt").write_text("")
     assert reused() == [True, True, True, False]
     (tmp_path / "tests/fixtures/f.txt").unlink()
-    # The child's import searched the checkout's root (its `-c`'s ''), not tests/, which a helper there
-    # cannot shadow.
     (tmp_path / "tests/tabnanny.py").write_text("")
-    assert reused() == [True, True, True, True]
-    (tmp_path / "tests/tabnanny.py").unlink()
-    (tmp_path / "tabnanny.py").write_text("")
     assert reused() == [False, True, True, True]
-    (tmp_path / "tabnanny.py").unlink()
+    (tmp_path / "tests/tabnanny.py").unlink()
     (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
-    assert reused() == [True, False, True, True]
+    assert reused() == [True, False, False, False]
     (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")
     common = ci.shared("3.12")
     names = ("tests/test_lazy.py", "tests/test_later.py")
@@ -465,15 +341,12 @@ def test_each_files_record_is_its_own_where_files_share_a_task(ci, tmp_path, mon
     assert found == [f"3.12:{name}" for name in names]
 
 
-def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source_file(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """`dew.cache.package_digest` reads every source file of the package only to name the records Dew's
-    caches keep (the rung cache's, a verified mapping's, a saved source's export), and each file's process
-    has a cache directory of its own (ci.py's `alone`), so no record another file wrote serves it: its reads
-    are no input (followed.py's `DIGEST`). A file that calls it runs again for an edit of the code it ran,
-    the digest's own included, and not for one of a module it never ran, nor for a release's version (train
-    396 reused 1 of 2,279 rows for its version bump; ledger 3220: the digest keyed 37-45% of rows on every
-    source file)."""
+def test_a_release_runs_none_of_the_files_that_digest_dews_source_again(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """`dew.cache.package_digest` names the records Dew's caches look for (the rung cache's, a verified
+    mapping's, a saved source's export) by every source file of the package, so a file that calls it runs
+    again for any edit to Dew, which a cache hit may have hidden from it, but not for a release's version
+    (`dew._version`), which no code computes from: train 396 reused 1 of 2,279 rows for its version bump."""
     import shutil
 
     package = tmp_path / "src" / "dew"
@@ -487,149 +360,15 @@ def test_a_file_that_digests_dews_source_keys_on_what_it_ran_not_on_every_source
     (package / "_version.py").write_text('__version__ = "0.3.0"\n')
     assert reused() == [True]
     (package / "spare.py").write_text("def spare():\n    return 2\n")
-    assert reused() == [True]
-    cache = package / "cache.py"
-    source = cache.read_text()
-    assert source.count('+ b"\\0" +') == 1
-    cache.write_text(source.replace('+ b"\\0" +', '+ b"\\1" +'))
     assert reused() == [False]
-
-
-def test_a_marker_registered_in_pyproject_reruns_the_files_that_use_it_and_its_other_parts_none(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """pytest's load of pyproject.toml as it starts is no input of any row (followed.py's `configuring`):
-    its pytest settings are every row's (ci.py's `pytest_settings`), a marker's registration the input of the
-    files whose tests carry that marker however they came by it, a helper's alias among them (`marks`,
-    executed.py's), and its other parts the input of a test that reads them itself alone (ledger 3220: train
-    416 registered two markers and reran all 3,445 rows)."""
-    project = ("[project]\nname = 'x'\n\n[tool.pytest.ini_options]\naddopts = \"--strict-markers\"\n"
-               "markers = [\"tidy: {}\"]\n")
-    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_marked.py": "import pytest\n@pytest.mark.tidy\ndef test_marked():\n    pass\n",
-        # A marker a helper names, which the test file never spells.
-        "helpers_marks.py": "import pytest\ntidy = pytest.mark.tidy\n",
-        "test_aliased.py": "from helpers_marks import tidy\n@tidy\ndef test_aliased():\n    pass\n",
-        "test_plain.py": "def test_plain():\n    pass\n",
-        # A test's own read of the project's table, which pytest's settings read is not.
-        "test_project.py": "import tomllib\ndef test_project():\n"
-                           "    with open('pyproject.toml', 'rb') as project:\n"
-                           "        assert tomllib.load(project)['project']['name'] == 'x'\n"}, {})
-    assert reused() == [True, True, True, True]
-    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
-    assert reused() == [False, False, True, False]
-    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test").replace("'x'", "'y'"))
-    assert reused() == [True, True, True, False]
-    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test").replace("--strict-markers", "-ra"))
-    assert reused() == [False, False, False, False]
-
-
-def test_a_file_reading_what_another_left_in_shared_scratch_has_no_key(
-        ci, tmp_path, monkeypatch, cache_worker):
-    """A file that reads a file another process of its task may have left in the machine's shared scratch
-    or the home directory, outside its own scratch and caches (a literal /tmp path), has no key, as no record
-    names the code that wrote it: one file writes the result its helper builds there, the next asserts on it,
-    and an edit to the helper would leave the second's green row standing (followed.py's `outside`); a file
-    reading back what its own process wrote there keeps its key."""
-    shared = tmp_path.parent / f"{tmp_path.name}-shared.txt"
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "build.py": "def build(): return 1\n",
-        "test_writer.py": f"from build import build\ndef test_writer():\n"
-                          f"    open({str(shared)!r}, 'w').write(str(build()))\n"
-                          f"    assert open({str(shared)!r}).read() == '1'\n",
-        "test_reader.py": f"def test_reader():\n    assert open({str(shared)!r}).read() == '1'\n"}, {})
-    assert reused() == [True, False]
-
-
-def test_only_what_another_process_of_the_task_made_in_shared_scratch_is_read_outside_the_checkout(
-        ci, tmp_path, monkeypatch):
-    """A file in the machine's shared scratch or the user's home that was there before the task began no
-    process of it left (followed.py's `outside`): the harness's plugins, the venv and its metadata that a
-    task's pytest reads from the checkout the harness is in, which lies in the home as CI's does
-    (/home/ci/work/dew/dew) when these tests run it on a scratch checkout of its own, among them the venv's
-    pyvenv.cfg, which Python 3.12's site reads before it sets sys.prefix to the venv (the recorder runs before
-    the site), and a tool or fixture a test put beside the checkout ahead of the task. A file made since is,
-    and a copy of an old one, which keeps its mtime, is."""
-    monkeypatch.setenv("HOME", str(REPO_ROOT.parent))
-    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-    monkeypatch.setattr(sys, "exec_prefix", sys.base_exec_prefix)
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "scratch"))
-    root = f"{tmp_path}{os.sep}"
-    ahead = tmp_path.parent / f"{tmp_path.name}-ahead.txt"
-    ahead.write_text("1")
-    time.sleep(0.05)
-    monkeypatch.setenv(ci.followed.STARTED_AT, str(time.time()))
-    time.sleep(0.05)
-    read = [path for path in (REPO_ROOT / "tools/armada/executed.py", REPO_ROOT / "tools/armada/followed.py",
-                              Path(sys.executable).parents[1] / "pyvenv.cfg") if path.is_file()]
-    assert len(read) >= 2
-    assert [ci.followed.outside(str(path), root) for path in read] == [False] * len(read)
-    made = tmp_path.parent / f"{tmp_path.name}-made.txt"
-    made.write_text("1")
-    copied = tmp_path.parent / f"{tmp_path.name}-copied.txt"
-    shutil.copy2(ahead, copied)
-    monkeypatch.setenv("HOME", str(made.parent))
-    assert [ci.followed.outside(str(path), root) for path in (ahead, made, copied)] == [False, True, True]
-
-
-@pytest.mark.parametrize("plugin", ["executed", "release", "split"])
-def test_each_hook_a_plugin_of_the_harness_defines_is_one_pytest_registers(plugin):
-    """pytest registers a plugin's function as a hook only where its name starts with `pytest_` (its plugin
-    manager's `parse_hookimpl_opts`), whatever `specname` the hookimpl names: one named otherwise never runs
-    and no other test says so (executed.py's marker hook went unregistered, so a marker a helper gave a test
-    was never keyed)."""
-    source = ast.parse((REPO_ROOT / "tools/armada" / f"{plugin}.py").read_text())
-    unregistered = [function.name for function in source.body if isinstance(function, ast.FunctionDef)
-                    and any("hookimpl" in ast.unparse(each) for each in function.decorator_list)
-                    and not function.name.startswith("pytest_")]
-    assert unregistered == []
-
-
-def test_a_copy_of_the_interpreter_under_a_tools_name_is_no_tool(ci, tmp_path, monkeypatch, cache_worker):
-    """A program named for a tool that is a copy of the interpreter, or made since the task began, runs code
-    no record follows (followed.py's `tool`): the file that starts one has no key, as one starting the
-    system's own native tool keeps it."""
-    home = tmp_path.parent / f"{tmp_path.name}-home"
-    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_copied.py": "import os, shutil, subprocess, sys\ndef test_copied():\n"
-                          f"    os.makedirs({str(home)!r}, exist_ok=True)\n"
-                          "    program = shutil.copy(os.path.realpath(sys.executable),\n"
-                          f"                          {str(home / 'git')!r})\n"
-                          "    subprocess.run([program, '-S', '-c', 'pass'], check=False)\n",
-        "test_system.py": "import subprocess\ndef test_system():\n"
-                          "    subprocess.run(['git', '--version'], check=True, capture_output=True)\n"}, {})
-    assert reused() == [False, True]
-
-
-def test_each_file_of_a_task_finds_its_cache_and_scratch_directories_empty(ci, tmp_path):
-    """No record one file's process leaves in its caches (XDG_CACHE_HOME: Dew's, the compilation cache and
-    a step's rungs beside it) or its scratch (TMPDIR, pytest's tmp_path among it) serves another file of its
-    task (`alone`), which no key would hold, as reads outside the checkout are none: what lets a file's key
-    leave out what its taskmates ran, and the source digest those records are named by (followed.py's
-    `DIGEST`, `private`)."""
-    (tmp_path / "tests").mkdir(exist_ok=True)
-    for name in ("first", "second"):
-        (tmp_path / f"tests/test_{name}.py").write_text(
-            "import os, tempfile\nfrom pathlib import Path\n"
-            f"def test_{name}():\n"
-            "    for record in (Path(os.environ['XDG_CACHE_HOME']) / 'dew' / 'left.txt',\n"
-            "                   Path(tempfile.gettempdir()) / 'left.txt'):\n"
-            "        assert not record.exists()\n"
-            "        record.parent.mkdir(parents=True, exist_ok=True)\n"
-            "        record.write_text('x')\n")
-    interpreter(tmp_path, "3.12")
-    out = tmp_path / "verdict.json"
-    ci.task("3.12", ["tests/test_first.py", "tests/test_second.py"], "", out, 600.0)
-    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0, 0]
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
     """The children's logs join the file that started them (`followed.gathered`): their files, and the
     GPU they held, the most a child that took the parent's fraction used, those children as shares and
     the bytes of those that named their own, counted only while they lived at once. A file is followed
-    only where every start it and its children saw left a log naming it and none started a process it
-    did not follow; a child killed before its end left its log as far as it got, which is what it ran,
-    but its pool is not known (`measured`), as the child reads it as its last atexit runs."""
+    only where every start it and its children saw left a closed log naming it and none started a
+    process it did not follow; one whose child's log never closed, killed before its end, is not."""
     followed = load("followed", "tools/armada")
     gib = 2 ** 30
 
@@ -652,8 +391,5 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(9, "tests/d.py", 0, 1, unfollowed=True)
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "measured": True, "peak": 5 * gib, "shares": 2,
-                                   "pools": 5 * gib}
-    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [
-        False, True, False]
-    assert [found[name]["measured"] for name in ("tests/c.py", "tests/d.py")] == [False, True]
+                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
+    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3

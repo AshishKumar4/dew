@@ -101,7 +101,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     # whole model and whose text_config holds the decoder;
     # translate_wrapper_config reads the wrappers that load. A wrapper whose
     # own model_type is a registered family (kimi_k25) is read here instead.
-    if model_type not in families() and 'text_config' in hf_config:
+    if model_type not in families() and carries_text(hf_config):
         # google/gemma-4-E2B is one of these. The decoder is real and its
         # text_config translates, but the repo is a multimodal model whose
         # weights sit under model.language_model.* beside vision and audio
@@ -140,9 +140,101 @@ def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: 
     return {"model_type": default, **nested}
 
 
+_QWEN_VL_TEXT_FIELDS = frozenset({
+    "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+    "num_key_value_heads", "hidden_act", "max_position_embeddings", "initializer_range", "rms_norm_eps",
+    "use_cache", "use_sliding_window", "sliding_window", "max_window_layers", "layer_types",
+    "attention_dropout", "rope_parameters", "rope_scaling", "rope_theta", "bos_token_id", "eos_token_id",
+    "pad_token_id"})
+"""The decoder fields Qwen2-VL's and Qwen2.5-VL's configs read off the wrapper's root, as the Hub's flat
+configs state them (`Qwen2_5_VLConfig.__post_init__`, transformers 5.17: its text config's fields and
+the rope's spellings): the text_config where none is nested, else ignored beside the nested one."""
+
+_FLAT_TEXT_TYPES = ("qwen2_vl", "qwen2_5_vl")
+_TEXT_VLMS = (*_FLAT_TEXT_TYPES, "qwen3_vl", "qwen3_vl_moe")
+"""The VLMs whose text decoder a registered family computes and whose vision tower Dew has no port of
+(`TEXT_FAMILIES`, `_text_vlm_wrapper`)."""
+"""The VLM wrappers whose config reads a flat root as its text config (`_QWEN_VL_TEXT_FIELDS`)."""
+
+
+def carries_text(hf_config: Mapping[str, object]) -> bool:
+    """Whether a config is a wrapper's, its decoder its text config: nested under text_config, or a flat
+    Qwen2-VL's or Qwen2.5-VL's root (`vlm_text`)."""
+    return "text_config" in hf_config or hf_config.get("model_type") in _FLAT_TEXT_TYPES
+
+
+def vlm_text(hf_config: Mapping[str, object], used: set[str]) -> Mapping[str, object]:
+    """A Qwen VLM's text config as its config class reads it, its root decoder fields counted read: Qwen2-VL's
+    and Qwen2.5-VL's from the flat root where no text_config is nested (the published Qwen2.5-VL-7B's),
+    the nested one otherwise, the root's then ignored; a Qwen3-VL's nested one. Its head is tied as its
+    class decides (`vlm_tied`)."""
+    model_type = _records.text(hf_config["model_type"], "model_type")
+    flat = model_type in _FLAT_TEXT_TYPES
+    if flat:
+        used.update(field for field in _QWEN_VL_TEXT_FIELDS if field in hf_config)
+    nested = hf_config.get("text_config")
+    if flat and nested is None:
+        text = {field: hf_config[field] for field in _QWEN_VL_TEXT_FIELDS if field in hf_config}
+        dtype = hf_config.get("torch_dtype", hf_config.get("dtype"))
+        nested = {**text, **({} if dtype is None else {"torch_dtype": dtype})}
+    return {**dict(_typed(hf_config, _records.record(nested, "text_config"), "text")),
+            "tie_word_embeddings": vlm_tied(hf_config)}
+
+
+def vlm_tied(hf_config: Mapping[str, object]) -> bool:
+    """Whether a Qwen VLM ties its head to its table, as its config class decides: the root's field,
+    False where unset, and for Qwen2-VL's and Qwen2.5-VL's a nested text_config's True where the root's
+    is False (pre-v5 saves placed it there, `Qwen2_5_VLConfig.__post_init__`)."""
+    tied = _records.boolean(hf_config.get("tie_word_embeddings", False), "tie_word_embeddings")
+    nested = hf_config.get("text_config")
+    if not tied and hf_config.get("model_type") in _FLAT_TEXT_TYPES and isinstance(nested, Mapping):
+        tied = _records.boolean(nested.get("tie_word_embeddings", False), "text_config.tie_word_embeddings")
+    return tied
+
+
+TEXT_FAMILIES = {"qwen2_vl_text": "qwen2", "qwen2_5_vl_text": "qwen2", "qwen3_vl_text": "qwen3",
+                 "qwen3_vl_moe_text": "qwen3_vl_moe_text"}
+"""A VLM's text decoder type, which transformers builds no causal LM for, by the family its decoder
+follows: Qwen2-VL's and Qwen2.5-VL's are Qwen2's, Qwen3-VL's Qwen3's, Qwen3-VL-MoE's Qwen3-MoE's as its
+release stores its experts (`families.qwen.QWEN3_VL_MOE_TEXT`), each rotating text by plain positions
+(`plain_text_rope`)."""
+
+
+def plain_text_rope(text: Mapping[str, object]) -> dict:
+    """A VLM text decoder's config as its family reads text alone (`TEXT_FAMILIES`): each rope record
+    without its M-RoPE layout, since a text-only row puts every rotary axis at the token's position, so
+    the sections of `mrope_section`, interleaved or not, rotate every channel pair at that one position,
+    the plain table. The sections must cover the rotated pairs."""
+    text = dict(text)
+    head_dim = _records.integer(text.get("head_dim") or _records.integer(text["hidden_size"], "hidden_size")
+                                // _records.integer(text["num_attention_heads"], "num_attention_heads"),
+                                "head_dim")
+    for key in ("rope_parameters", "rope_scaling"):
+        entry = text.get(key)
+        if isinstance(entry, Mapping) and "mrope_section" in entry:
+            entry = dict(entry)
+            section = _records.integers(entry.pop("mrope_section"), "mrope_section")
+            _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
+            if sum(section) != head_dim // 2:
+                raise ValueError(f"mrope_section {section} covers {sum(section)} channel pairs, not the "
+                                 f"{head_dim // 2} each head rotates: pass a config whose mrope_section "
+                                 f"sums to {head_dim // 2}")
+            if entry.get("type") == "mrope":
+                entry["type"] = "default"
+            if entry.get("rope_type") == "mrope":
+                entry["rope_type"] = "default"
+            text[key] = entry
+    return text
+
+
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The decoder config a wrapper's language model is: its text_config, typed as the wrapper declares
-    it (`_typed`), with the wrapper's own head policy."""
+    it (`_typed`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
+    head policy."""
+    if hf_config.get("model_type") in _TEXT_VLMS:
+        text = dict(vlm_text(hf_config, set()))
+        family_type = TEXT_FAMILIES[_records.text(text["model_type"], "model_type")]
+        return {**plain_text_rope(text), "model_type": family_type}
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         refuse("text_config",
@@ -392,11 +484,33 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
                            _wrapper_audio(hf_config, used, record_int(text, "emb_features"), audio))
 
 
+def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a VLM whose text decoder a registered family computes and whose vision tower Dew has no port
+    of (`TEXT_FAMILIES`: Qwen2-VL's, Qwen2.5-VL's, Qwen3-VL's and Qwen3-VL-MoE's): a load reads its
+    language model alone (`text_only`; `WrapperFields.unported`), as the family it follows. A release
+    saved before transformers nested it (Qwen2.5-VL-7B's) keeps that model's modules at the top
+    (`text_unprefixed`)."""
+    vlm_text(hf_config, used)
+    text = _wrapper_text(hf_config, used)
+    model_type = _records.text(hf_config["model_type"], "model_type")
+    used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id", "vision_token_id",
+                 "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
+    fields = _wrapper_fields(model_type, used, text, None, None, image, None,
+                             video=_records.integer(hf_config["video_token_id"], "video_token_id")
+                             if hf_config.get("video_token_id") is not None else None)
+    fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
+    fields["unported"] = {"visual.": f"{model_type}'s vision tower has no Dew port"}
+    fields["text_unprefixed"] = ("embed_tokens.", "layers.", "norm.")
+    return fields
+
+
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
-    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper}
+    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
+    **dict.fromkeys(_TEXT_VLMS, _text_vlm_wrapper)}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -457,6 +571,8 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     for prefix in record.get("unported", {}):
         if bare.startswith(prefix):
             return "unported", bare
+    if bare.startswith(tuple(record.get("text_unprefixed", ()))):
+        return "language_model", f"model.{bare}"
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
         return "language_model", tail if tail.startswith(
@@ -1351,18 +1467,35 @@ def bundles(config: Mapping[str, object]) -> bool:
             and config.get("vision_config") is not None)
 
 
-def decoder_config(config: Mapping[str, object]) -> Mapping[str, object]:
-    """A checkpoint's config as its decoder reads it, as a load of its language model reads it
-    (`Pretrained.load(..., text_only=True)`): a media bundle its own family reads whole, without its
-    vision_config (`bundle_text_config`); another wrapper's language model as its text family states it,
-    the wrapper's head policy, dtype and overrides over its text_config (`language_model_config`); and
-    any other config, a registered family's that reads its whole record among them (kimi_k25's), as it
-    is. A tool that builds a checkpoint's decoder from its config reads it here (ledger 3006)."""
+WHOLE_DECODER = ("text_only takes a media wrapper's language model; DiffusionGemma's decoder is its whole "
+                 "model")
+"""Why a text-only decoder of DiffusionGemma is refused (`decoder_config`, `Pretrained.load`)."""
+
+
+def decoder_config(config: Mapping[str, object],
+                   inventory: Callable[[], Collection[str] | None] = lambda: None) -> Mapping[str, object]:
+    """A checkpoint's config as its decoder reads it, the one routing a load of its language model reads
+    (`Pretrained.load(..., text_only=True)`) and a tool that builds a checkpoint's decoder (ledger 3006,
+    3138): a media bundle its own family reads whole, without its vision_config (`bundle_text_config`);
+    another wrapper's language model as its text family states it, the wrapper's head policy, dtype and
+    overrides over its text_config (`language_model_config`), a quantized wrapper's module selection
+    renamed with its tensors (`language_model_quantization`, over `inventory`'s tensor names); and any
+    other config, a registered family's that reads its whole record among them (kimi_k25's), as it is.
+    DiffusionGemma's decoder is its whole model, refused (`WHOLE_DECODER`)."""
+    from dew.interop.codecs import source_quantization
+
     if bundles(config):
         return bundle_text_config(config)
-    if config.get("model_type") in families() or "text_config" not in config:
+    if config.get("model_type") == "diffusion_gemma":
+        raise ValueError(WHOLE_DECODER)
+    if config.get("model_type") in families() or not carries_text(config):
         return config
-    return language_model_config(config)
+    text = language_model_config(config)
+    if source_quantization(config) is None:
+        return text
+    quantization = language_model_quantization(config, translate_wrapper_config(config), inventory)
+    text = {key: value for key, value in text.items() if key != "quantization_config"}
+    return text if quantization is None else {**text, "quantization_config": quantization}
 
 
 def bundle_text_config(config: Mapping[str, object]) -> Mapping[str, object]:

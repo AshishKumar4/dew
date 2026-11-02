@@ -14,7 +14,6 @@ import sys
 
 import numpy as np
 import pytest
-from lane_environment import outside_suite
 from tool_support import REPO_ROOT, load
 
 from tools.benchmark_cases import cpu_smoke_cases
@@ -72,7 +71,8 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     `platform` with `arguments` and the environment's `settings`, its peak measured in a process of the
     case's own."""
     out = tmp_path / "rows.json"
-    environment = outside_suite(os.environ) | (settings or {})
+    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    environment |= settings or {}
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
     done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
                            "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
@@ -83,29 +83,6 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     assert done.returncode == 0, done.stderr[-4000:]
     (row,) = json.loads(out.read_text())
     return row
-
-
-def test_the_tool_runs_as_a_reader_runs_it_with_none_of_the_suites_settings(tmp_path):
-    """The tool a test runs runs in the environment a reader's process has (`outside_suite`): none of the
-    settings the suite gives itself (its simulated devices and their threads, its matmul precision, its wide
-    CPU arithmetic) reach it or its peak processes, whose context records what each saw (row 2784)."""
-    from lane_environment import configured
-
-    # XLA_FLAGS aside: Dew's own runtime sets its numerics flags in every process, and the suite's device
-    # count in it is the row's `devices`, which the peak test holds to one.
-    suite = sorted(set(configured({})) - {"JAX_PLATFORMS", "XLA_FLAGS"})
-    (tmp_path / "marking.py").write_text(
-        "import contextlib, json, os\n"
-        "@contextlib.contextmanager\n"
-        "def marked():\n"
-        f"    names = {suite!r}\n"
-        f"    with open({str(tmp_path / 'seen.jsonl')!r}, 'a') as file:\n"
-        "        seen = {name: os.environ[name] for name in names if name in os.environ}\n"
-        "        print(json.dumps(seen), file=file)\n"
-        "    yield\n")
-    peak_row(tmp_path, "cpu", "--within", "marking:marked")
-    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
-    assert suite and len(seen) == 3 and seen == [{}] * 3, seen
 
 
 def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(tmp_path):

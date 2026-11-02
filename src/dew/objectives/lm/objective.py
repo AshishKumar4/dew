@@ -826,9 +826,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         params = thaw(params)
         replay = {}
         if routes is not None:
-            # The last id is never forwarded, so its row drops with it.
+            # The last id is never forwarded, so its row drops with it, from each site's record where the
+            # record is keyed by site (`dew.nn.inputs.LayerInputs.experts`).
             routed, covered = routes
-            replay["routed_experts"] = jnp.asarray(routed)[:, :-1]
+            replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-1], routed)
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-1]
         collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])

@@ -72,6 +72,7 @@ from jax.extend.backend import get_default_device
 from dew import _coordination, _records, cache
 from dew._records import JSON
 from dew.files import write_atomically
+from dew.nn.kernels.options import owned_program
 
 from . import generation
 from .templates import report
@@ -532,6 +533,12 @@ class KernelOp(tokamax.Op):
                           else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
+    def padded(self, ba: tokamax.BoundArguments, config) -> float | None:
+        """The share of the launch's tile grid at `config` outside its operands' extents, the work its
+        tiles' tails compute of nothing (`report.Launch.padded`, row 2772); None where the launch states
+        none, as a launch of no template's."""
+        return None
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The hook field or argument `name`'s value as this op's picks key it: what each function in it
         computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op
@@ -584,7 +591,7 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
         @functools.cache
         def jitted(digest: str | None) -> Callable:
             del digest
-            return jax.jit(functools.partial(launch), static_argnames=names)
+            return owned_program(functools.partial(launch), static_argnames=names)
 
         @functools.wraps(launch)
         def called(*args, **kwargs):
@@ -755,7 +762,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timing
 
     arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
-    evicting = jax.jit(jnp.sum).lower(flush).compile()
+    evicting = owned_program(jnp.sum).executable(flush)
 
     def compiled(config):
         configured = op.replace(config=config)
@@ -767,7 +774,9 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timing
             return total, configured(*args, **kwargs)
 
         start = time.perf_counter()
-        lowered = jax.jit(run).lower(flush, arrays)
+        # A candidate's lowering and its compile timed apart, the compile of its config as it is: a config
+        # that spills is measured slow, never refused and lowered afresh (`OuterProgram.compiled`).
+        lowered = owned_program(run).lower(flush, arrays)
         middle = time.perf_counter()
         executable = lowered.compile()
         return executable, (middle - start) * 1e3, (time.perf_counter() - middle) * 1e3

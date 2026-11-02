@@ -103,10 +103,17 @@ class Reads(NamedTuple):
 
 
 @functools.cache
+def tokens(name: str, dtype: str = "float32") -> jax.Array:
+    """The token rows a checkpoint is read over (`reads`), drawn in its vocabulary, seed 0: the same rows
+    whatever `dtype` it is loaded in."""
+    vocabulary = loaded(name, dtype).model.vocab_size
+    return jnp.asarray(np.random.RandomState(0).randint(0, vocabulary, (ROWS, LENGTH)), jnp.int32)
+
+
+@functools.cache
 def reads(name: str, dtype: str) -> Reads:
     source = loaded(name, dtype)
-    model, variables = source.model, source.variables
-    tokens = jnp.asarray(np.random.RandomState(0).randint(0, model.vocab_size, (ROWS, LENGTH)), jnp.int32)
-    return Reads(tokens, model.apply(variables, tokens, method="logits"),
-                 model.apply(variables, tokens, method="hidden_states"),
+    model, variables, rows = source.model, source.variables, tokens(name, dtype)
+    return Reads(rows, model.apply(variables, rows, method="logits"),
+                 model.apply(variables, rows, method="hidden_states"),
                  model.apply(variables, method="output_table"))

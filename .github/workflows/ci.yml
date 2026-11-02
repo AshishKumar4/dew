@@ -6,9 +6,10 @@ name: CI
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands; base/kernels, where the template lanes push
-    # straight, runs on each push, its reds fixed forward by the lane that pushed (owner, 2026-10-26).
-    branches: [ "main", "ci/**", "base/kernels" ]
+    # ci/** is where a branch goes for its own run before it lands. base/kernels runs on no push while it
+    # consolidates (owner, 2026-11-01): one run there by hand (workflow_dispatch) and one review once it is
+    # declared complete, then its per-push run returns.
+    branches: [ "main", "ci/**" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -23,14 +24,17 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run's verdict moot.
+# A newer push to the same ref makes the older run's verdict moot, but on base/kernels, whose lanes push more
+# often than a run takes (about 47 minutes), a running run finishes: GitHub keeps the newest push pending behind it,
+# cancelling an older pending one, so each run that finishes grades the newest tip it could and its reds page
+# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' }}
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#a8b23968a77c9c43d5868f027e43d2a1d245734c
+  ARMADA: github:AshishKumar4/armada#d78c94bec72dccb90832b5749506e2d3896fa257
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -94,6 +98,7 @@ jobs:
       run: |
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
+        node site/scripts/render-posts.mjs --check
 
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement

@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import logging
 import math
 import time
 import types
@@ -22,7 +23,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
-from dew._coordination import agreed, agreed_next, agreed_reads
+from dew._coordination import agreed, agreed_next, agreed_reads, pool_size
 from dew._records import JSON, integers
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
@@ -31,12 +32,11 @@ from dew.data.dataset import (
     Checkpointable,
     Closeable,
     DataPartition,
+    Ends,
     Loader,
     PhasedStream,
-    Reader,
     rows_of,
-    stream_endless,
-    stream_together,
+    stream_ends,
 )
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
@@ -50,16 +50,19 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.diloco import regrouped
-from dew.training.evaluation import EvalSuite, Evaluation, Summary
+from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
-from dew.training.profiling import ProfileWindow, start_capture
+from dew.training.profiling import ProfileWindow, start_capture, stop_capture
+from dew.training.rollout import Rollout
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
 
+_log = logging.getLogger(__name__)
 
-def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+
+def validation_suites(dataset: Loader, validation: Mapping[str, Split | EvalSuite] | None,
                       metrics: Sequence[Metric], eval_every: Cadence) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
@@ -74,7 +77,9 @@ def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSui
     suites = {}
     for name, entry in validation.items():
         suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
-        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
+        # A split scored by its episodes scores what they declare; fit's metrics are its data splits'.
+        inherited = suite.data.metrics if episodic(suite.data) else tuple(metrics)
+        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or inherited,
                                  eval_every if suite.every is None else suite.every)
     return suites
 
@@ -216,9 +221,9 @@ class FitPlan:
         return isinstance(every, int) and bool(every) and step % every == 0
 
     @staticmethod
-    def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+    def cadences(loader: Loader, validation: Mapping[str, Split | EvalSuite] | None,
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
-                 written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
+                 written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
                  checkpoints: Checkpoints | None = None, examples: int | None = None) -> tuple[
                      int | Counted, Cadence, Cadence | datetime.timedelta, Cadence,
                      dict[str, EvalSuite]]:
@@ -338,9 +343,8 @@ class FitRun:
     preempted: int | None = None
     paused: int | None = None
     notice: PreemptionNotice | None = None
-    endless: bool = False
-    together: bool = False
-    """Whether every share of the training stream runs out at the same read (`stream_together`)."""
+    ends: Ends = "apart"
+    """Where the training stream ends (`stream_ends`)."""
     taken: Taken | None = None
     writer: LogWriter = dataclasses.field(default_factory=LogWriter)
     """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
@@ -385,6 +389,13 @@ class FitRun:
             start_capture(profiler)
             self.tracing = True
 
+    def close_window(self, profiler: Profiler) -> None:
+        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
+        it until the run's cleanup waits for them and its outcome reports the window
+        (`Trainer._reported_outcome`)."""
+        stop_capture(profiler, self.loss)
+        self.profiled = (self.traced, self.current)
+
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
                            window: int) -> tuple[int, int]:
         """Where the state's update window of `window` microsteps has just committed (read off `state`
@@ -404,10 +415,10 @@ class FitRun:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
         position the step saves taken before it. A run whose stream is closed (`Trainer._wind_down`)
-        ends on this step without another read, and an endless stream never ends here otherwise."""
+        ends on this step without another read, and a stream that never ends never ends here otherwise."""
         if self.ahead is None and self.train is None:
             return True
-        if self.endless:
+        if self.ends == "never":
             return False
         if self.ahead is None:
             self.ahead = (waited_read(self, interval, agree=self.agrees(first=False)),)
@@ -442,32 +453,35 @@ class FitRun:
     def further(self, interval: Interval) -> Callable[[], Batch | None]:
         """A read of the training stream's next batch for a rollout that draws past its step's
         (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
-        step's read after its first is (`agrees`), its wait counted in `interval`; None where the stream
-        ran out on every process. Its position is the stream's after it, which the step saves as any
-        read's."""
+        step's read after its first is (`agrees`), or pooled as a pool's step's read is (`pooled_read`), its
+        wait counted in `interval`; None where the stream ran out on every process. Its position is the
+        stream's after it, which the step saves as any read's."""
         def read() -> Batch | None:
             assert self.train is not None
             asked = time.perf_counter()
             held = iter(self.train.read_held, None)
-            batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
+            if self.pooled:
+                batch = pooled_read(self, held, phase="rollout read")
+            else:
+                batch = agreed_next("rollout read", held) if self.agrees(first=False) else next(held, None)
             interval.waited += time.perf_counter() - asked
             return batch
 
         return read
 
     def opened(self, source: Iterator[Batch], examples: int | None) -> None:
-        """Take what the training stream `source` says of its reads (`stream_endless`, `stream_together`)
+        """Take where the training stream `source` says it ends (`stream_ends`)
         and whether the run reads it as a pool on the examples clock (`pooled`, bounded to `examples`)."""
-        self.endless, self.together = stream_endless(source), stream_together(source)
+        self.ends = stream_ends(source)
         self.pooled = pooled(examples)
 
     def agrees(self, *, first: bool) -> bool:
         """Whether a read of the training stream is agreed over the pool (`agreed_next`): its `first`,
-        and every read of a stream that may run out on some processes and not others. An endless
-        stream's later reads are not, nor those of one whose every share runs out at the same read
-        (`together`): a read that fails on one process stops its peers by the failure it publishes
+        and every read of a stream that may run out on some processes and not others (`ends`). Later
+        reads of one that never ends, or ends on every share at the same read, are not: a read that
+        fails on one process stops its peers by the failure it publishes
         (`dew._coordination.end_pool_on_failure`), as any error outside an agreement does."""
-        return first or not (self.endless or self.together)
+        return first or self.ends == "apart"
 
     def read(self) -> Batch | None:
         """The training stream's next batch, or None where it ran out, read through this run each
@@ -481,20 +495,25 @@ CLOCK_LIMIT = 2 ** 31 - 1
 """The most examples a clock counts: the devices hold it as int32 (`TrainState.consumed`)."""
 
 
-def clocked(examples: int | None, steps: int | None, *, custom: bool, rollout: bool,
+def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = False,
             bound_ends: bool = True) -> int | None:
     """The examples bound of a run that no plan counts steps ahead of, which keeps its progress in the
     examples its batches consume (`TrainState.consumed`), its schedule and cadences reading it; None for
-    a run counted otherwise. The transaction hands the run's optimizer that progress and the batches
-    carry the count, which a `custom` step or a `rollout`'s batches do not: refused there. Its progress
-    reaches its end where its read ends at its bound (`Loader.bound_ends`), so a take or slice after
-    the bound, which would end it first, is refused, as is a bound past what the clock counts."""
+    a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
+    step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
+    whole run) is refused. A rollout's batch consumes what the batches it read did
+    (`dew.training.rollout.clocked_rollout`), the run reading ahead for its stream's end after the
+    rollout's last draw. Its progress reaches its end where its read ends at its bound
+    (`Loader.bound_ends`), so a
+    take or slice after the bound, which would end it first, is refused, as is a bound past what the
+    clock counts."""
     if examples is None or steps is not None:
         return None
-    if custom or rollout:
-        raise ValueError("a run bounded in examples that no plan counts ahead reads its progress off the "
-                         "examples its batches consume, which a custom step= or a rollout does not carry; "
-                         "give steps=, or read the data in a global order its plan counts")
+    if custom_progress:
+        raise ValueError("a run bounded in examples that no plan counts ahead hands its optimizer the run's "
+                         "progress, which a custom step='s update is not handed, and this optimizer's "
+                         "schedule decays over the whole run: give the schedule its own decay_steps, or "
+                         "give steps=")
     if not bound_ends:
         raise ValueError("a run bounded in examples that no plan counts ahead ends where its bound does, "
                          "which its schedule's end reads; a take or slice after the bound would end it "
@@ -585,11 +604,12 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
             "or leave eval_every unset")
 
 
-def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
+def consumption_counted(batch: Batch, *, clocked: bool, marks_rows: bool = True) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
-    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
+    its start, and each marks its real rows (`VALID_ROWS`) where it `marks_rows`, as a step's batch does;
+    a rollout's read keeps its rows as read. A run on another clock, one bounded in examples whose plan
+    counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -598,7 +618,7 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
     counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
-    if VALID_ROWS not in batch:
+    if VALID_ROWS not in batch and marks_rows:
         # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
         # its real rows, so every one is the same tree, the run's one program.
         counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
@@ -842,13 +862,13 @@ def _first_read(loader: Loader, partition: DataPartition, position: bytes | None
 
 
 type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
-                     | Mapping[str, Dataset | Handed | Reader | EvalSuite])
+                     | Mapping[str, Dataset | Handed | Split | EvalSuite])
 """`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
 Grain dataset, NumPy arrays, a reader or an evaluation suite."""
 
 
 def handed_splits(
-        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None:
+        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Split | EvalSuite] | None:
     """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
     Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
     Arrays are a split by name alone, as a mapping of splits is one by its names."""
@@ -859,7 +879,7 @@ def handed_splits(
     return {name: _handed_split(entry) for name, entry in validation.items()}
 
 
-def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Reader | EvalSuite:
+def _handed_split(entry: Dataset | Handed | Split | EvalSuite) -> Dataset | Split | EvalSuite:
     """One split of `handed_splits`: read as handed where it is a Grain dataset or arrays."""
     if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
         return native(entry, training=False)
@@ -943,3 +963,74 @@ class Start:
     through: dict[int, int]
     resume: int | None
     shardings: Placement[TrainState]
+
+
+def _rollout_admitted(rollout: Rollout | None) -> Rollout | None:
+    """`rollout`, refused where it checkpoints state (`Rollout`'s `saved_shapes` not None) in a pool of
+    several processes: each process holds its own environments and a checkpoint holds the pool's tree.
+    A run with a checkpointer reads this as its fit starts, before it restores or steps and after any
+    pool its program formed, and again as it restores the rollout (`_rollout_resumed`), which `place`
+    does too; the pool's size is read without opening the backend (`pool_size`). Read at this boundary,
+    as the trainer reads a rollout's optional members."""
+    shapes = getattr(rollout, "saved_shapes", None)
+    if shapes is not None and pool_size() > 1 and shapes() is not None:
+        raise ValueError(f"{type(rollout).__name__} checkpoints the state it carries, which a run of "
+                         f"{pool_size()} processes holds one of a process, and a checkpoint holds the "
+                         "pool's; train it on one process")
+    return rollout
+
+
+def _rollout_saved(rollout: Rollout | None) -> Mapping[str, object] | None:
+    """The state a checkpoint holds of `rollout` (`Rollout`'s `saved`), read at this boundary, its host
+    leaves placed on the default device as every checkpoint's leaves are arrays; None for none. A 64-bit
+    host leaf is refused: JAX keeps it in 32 bits unless it runs in 64, so a rollout writes a wide count
+    as 32-bit words."""
+    saved = getattr(rollout, "saved", None)
+    tree = None if saved is None else saved()
+    if tree is None:
+        return None
+
+    def placed(leaf):
+        if isinstance(leaf, jax.Array):
+            return leaf
+        host = np.asarray(leaf)
+        if host.dtype.itemsize > 4 and not jax.config.read("jax_enable_x64"):
+            raise ValueError(f"{type(rollout).__name__} saves a {host.dtype} leaf, which a checkpoint keeps "
+                             "in 32 bits with JAX's 64-bit mode off: save it as 32-bit words")
+        return jax.device_put(host)
+
+    return jax.tree.map(placed, dict(tree))
+
+
+def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: int,
+                     where: jax.sharding.Sharding) -> None:
+    """`rollout` carrying on from the state the step it resumes from holds (`Rollout`'s `restored`, read at
+    this boundary, as `saved_shapes` is: a rollout is any callable), a key read back typed, as the run's
+    own key is (`request_key`); a rollout that saves none (its `saved_shapes` None, or absent) resumes as
+    it starts, and one whose step holds none (a checkpoint written before rollouts saved theirs) starts
+    its state afresh, said. A pool of several processes is refused one that saves its state before it
+    restores any (`_rollout_admitted`): `place` restores here as `fit` does."""
+    _rollout_admitted(rollout)
+    shapes, restored = getattr(rollout, "saved_shapes", None), getattr(rollout, "restored", None)
+    if shapes is None:
+        return
+    if restored is None:
+        raise TypeError(f"{type(rollout).__name__} saves its state and holds no `restored` to carry on "
+                        "from it")
+    shaped = shapes()
+    if shaped is None:
+        return
+    # The pool's state, placed as the run's key is, every device holding it whole.
+    template = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), shaped)
+    tree = checkpoints.rollout_state(step, template)
+    if tree is None:
+        _log.warning("step %d holds no state of the run's %s: it starts its environments afresh", step,
+                     type(rollout).__name__)
+        return
+
+    def typed(leaf, want):
+        keyed = jnp.issubdtype(want.dtype, jax.dtypes.prng_key) and not jnp.issubdtype(
+            leaf.dtype, jax.dtypes.prng_key)
+        return jax.random.wrap_key_data(leaf) if keyed else leaf
+
+    restored(jax.tree.map(typed, tree, dict(template)))

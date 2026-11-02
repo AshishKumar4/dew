@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 from contract_support import EDGES, FORWARD_ORDERS, OWN_FORWARD_ORDERS, assert_contract, normal_draw
 
-from dew.interop import torchax_fallback
 from dew.nn import precision
 from dew.nn.blocks import table_rows
 from dew.nn.kernels.templates.gemm import template
@@ -332,15 +331,15 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
-    """`torchax_fallback._accumulated` (a broadcast whose gradient sums in float32 and rounds once to its
-    value's dtype, as torch's autograd reduces a bf16 gradient): every order runs, forward mode's included
-    (ledger 2653), finite wherever float64 is a normal float32, at values near float32's ends, beside the
-    plain broadcast."""
+    """`precision.broadcast_summed` (a broadcast whose gradient sums in float32 and rounds once to its
+    value's dtype, as torch's autograd reduces a bf16 gradient, which tier 3's broadcasts run): every
+    order runs, forward mode's included (ledger 2653), finite wherever float64 is a normal float32, at
+    values near float32's ends, beside the plain broadcast."""
     value, direction = normal_draw(959, (3, 1, 4), (3, 1, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(961, (3, 5, 4))
 
     def broadcast(value):
-        return torchax_fallback._accumulated(value, (3, 5, 4), (0, 1, 2))
+        return precision.broadcast_summed(value, (3, 5, 4), (0, 1, 2))
 
     def plain(value):
         return jnp.broadcast_to(value, (3, 5, 4))
@@ -351,7 +350,7 @@ def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
-    """`torchax_fallback._accumulated`'s transpose sums in float32 and rounds once wherever a derivative
+    """`precision.broadcast_summed`'s transpose sums in float32 and rounds once wherever a derivative
     forms one: a weighted square's gradient, the gradient's tangent (forward over reverse) and its gradient
     (reverse over reverse) each sum 4096 terms of the value's narrow dtype, every product exact, to the
     float32 sum rounded once, where a sum in the narrow dtype rounds its partial sums (ledger 2653)."""
@@ -360,7 +359,7 @@ def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
     ones = jnp.ones(4, dtype)
 
     def loss(value):
-        return jnp.sum(weights * jnp.square(torchax_fallback._accumulated(value, (rows, 4), (1,))))
+        return jnp.sum(weights * jnp.square(precision.broadcast_summed(value, (rows, 4), (1,))))
 
     # Each term 2 w, exact in the narrow dtype, summed exactly in float32 and rounded once.
     expected = np.asarray(2 * np.asarray(weights, np.float32).sum(0)).astype(dtype)

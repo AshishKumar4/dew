@@ -32,7 +32,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import compiler_options, program
 from dew.nn.kernels.templates import report
 from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
@@ -45,6 +45,7 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
+    deviceless_options,
     head_fused_of,
     head_tile_of,
     local_devices,
@@ -170,7 +171,7 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-@jax.jit
+@program
 def whole_step(outputs):
     """A step's outputs from those of the microbatches it was read in: the
     last one's loss, pooled over the window where it commits, and its
@@ -590,8 +591,9 @@ class FitSearch[LossT, EffectsT]:
         # Whether any module the run trains sets its own remat, which it compiles at alone.
         self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
                                                              else [record]))
-        # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
-        self.required = compiler_options(*self.objective.towers()) or None
+        # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
+        # target compiles them (`deviceless_options`), as the step's own (`options`) are made.
+        self.required = deviceless_options(self.mesh, compiler_options(*self.objective.towers()) or None)
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its

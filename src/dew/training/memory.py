@@ -32,6 +32,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+from dew.training.compiled_program import deviceless
 
 if TYPE_CHECKING:
     from dew.training.footprint import Footprint
@@ -184,6 +185,19 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
                                  mesh.devices.size)
 
 
+def deviceless_options(mesh: Mesh,
+                       options: jax.stages.CompilerOptions | None) -> jax.stages.CompilerOptions | None:
+    """`options` for a program compiled over `mesh`: on compile-only GPUs (`deviceless`) nothing runs to
+    autotune on, and XLA's config assigner already gives each matmul its default config there
+    (`dew.training.footprint.gemm_workspace`) while its autotuner still compiles the candidates it cannot
+    time, so the program skips them (`xla_gpu_autotune_level` 0), its memory the same (a frontier
+    search's every probe and rung, 142 s to 99 s on armada, 11-02). Elsewhere `options` as given."""
+    device = mesh.devices.flat[0]
+    if device.platform != "gpu" or not deviceless(device) or xla_flag("xla_gpu_autotune_level") is not None:
+        return options
+    return {**(options or {}), "xla_gpu_autotune_level": 0}
+
+
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
     """The tokens one device steps of `batch`, split over `shards` row shards, or infinity where its
     rows hold no token geometry (`Objective.row_tokens`), an image's. Rows are counted only then, so
@@ -299,16 +313,18 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
                      built: int = 0) -> int | None:
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
     `step_headroom` reads a compiled step's: its temporaries the derivation names, the most its gradient
-    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, in one block beside what
-    it holds (`Footprint.held`), twice where the allocator strands them; None where
+    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, or its commit's gradient
+    and the host-resident fields it stages where they are more (`Footprint.temporaries`), in one block
+    beside what it holds (`Footprint.held`), twice where the allocator strands them; None where
     the derivation names no peak or a device states no memory. The resident state is in use already,
     or, on a stated device, its arguments but the `built` bytes its first call builds, which `held`
     counts. What else XLA's buffer assignment and scheduling make of the program is no term of it
     (`dew.training.footprint`): a compile confirms, and a miss is the derivation's to fix."""
-    if footprint.peak is None:
+    temporaries = footprint.temporaries
+    if temporaries is None:
         return None
     resident = sum(footprint.resident.values()) - built
-    return admitted(devices, capacity, resident, footprint.held, footprint.peak)
+    return admitted(devices, capacity, resident, footprint.held, temporaries)
 
 
 def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int,

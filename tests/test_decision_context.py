@@ -268,16 +268,27 @@ def assert_packed_as_alone(packed: DecisionObjective, alone: DecisionObjective, 
     assert_as_exact(dew, reference, draw, what, seeds=seeds, truth_fn=truth)
 
 
-@pytest.mark.parametrize("encoder", ["table", "backbone"])
-def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
+def packed_contexts_read_as_alone(encoder: str):
     """Rows that carry a context, three packed a window, decide each row's options as the row does in a
     window of its own beside its context alone, through the unmodified objective, its cross-attention
-    open (every gate 1): each row's tokens read its own context and no other row's, the context read
-    through the token table and through the backbone's own pass over each context as its own
-    document, the real options' logits on par from float64 (check 1, over drawn parameters)."""
+    open (every gate 1): each row's tokens read its own context and no other row's, the real options'
+    logits on par from float64 (check 1, over drawn parameters)."""
     packed, alone = conditioned(encoder=encoder, segments=3), conditioned(encoder=encoder, segments=1)
     assert_packed_as_alone(packed, alone, examples()[:12], f"packed contexts by {encoder}",
                            PACKED_CONTEXT_SEEDS[encoder])
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_packed_rows_each_read_their_own_context_through_the_token_table_as_each_does_alone():
+    """Packed rows read their own contexts through the token table as each row alone does
+    (`packed_contexts_read_as_alone`), its 128 seeds drawn by CI's map tasks (`check1_shards`)."""
+    packed_contexts_read_as_alone("table")
+
+
+def test_packed_rows_each_read_their_own_context_through_the_backbone_as_each_does_alone():
+    """Packed rows read their own contexts through the backbone's own pass over each context as its own
+    document as each row alone does (`packed_contexts_read_as_alone`)."""
+    packed_contexts_read_as_alone("backbone")
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():

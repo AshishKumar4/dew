@@ -445,6 +445,33 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
             np.testing.assert_array_equal(np.asarray(target), 0.5 * np.asarray(online))
 
 
+def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_progress(tmp_path):
+    """A JEPA run of `--trainer.epochs` over a streamed read, whose order counts no updates ahead, is bounded
+    in examples once its data compiles (`Loader.examples`), so the target's momentum ramps over the run's
+    progress, as a run given `--trainer.examples` does, rather than being refused as a run bounded by tokens
+    alone (row 3430)."""
+    from dew.config import TrainerConfig
+    from dew.data import TFDS, Loading, presets
+    from dew.registry import ModelConfig
+
+    images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
+                  split="all")
+    run = JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
+                                           "attention_impl": "xla"}),
+        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
+        data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
+        .loading(Loading(workers=0)),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=None, epochs=2, log_every=1,
+                              eval_every=None, checkpoint_every=None))
+    prepared = run.prepare()
+    # Bounded to the passes' 40 examples, whose steps its per-share order counts none of ahead.
+    assert prepared.dataset.examples == 40 and prepared.dataset.example_steps(40) is None
+    assert prepared.objective.ema.progressed
+
+
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     """A group's schedule is the record that names it, as the run's record
     writes it, and the config's own rate is one value: a number, or a schedule's record that steps

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -1218,6 +1219,134 @@ def cfg_sweep_figure():
     svg.save(HERE / "cfg-sweep.svg")
 
 
+Part = tuple[str, Sequence[str], str, tuple[float, float, float, float], int]
+"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; or
+"plain"), where it sits in the wide layout (x, y, width, height), and its row: parts of one row are
+alternatives, drawn side by side wide and boxed together on a phone, never with an arrow between them."""
+
+
+def part(svg: Figure, x, y, w, h, title, lines, kind: str):
+    """One part, drawn as its kind is (`Part`)."""
+    box(svg, x, y, w, h, title, lines, accent=kind == "dew")
+
+
+def drawn(name: str, label: str, size: tuple[int, int], parts: Sequence[Part],
+          wide: Callable[[Figure], None] | None = None, note: Sequence[str] = (), flows: Collection[int] = (),
+          headings: Mapping[int, str] | None = None) -> None:
+    """A figure from one list of its `parts`: wide, each at its place with `wide`'s arrows and labels, as
+    <name>.svg; for a phone, the same parts row by row, as <name>-narrow.svg: a row's parts (`Part`) boxed
+    together, an arrow from a row to the next only where the row `flows` on, a row's heading above it
+    (`headings`), and `note` beneath. The parts are declared once, so the two layouts never say different
+    things (review; train 462: a phone's arrows ran between alternatives)."""
+    svg = Figure(*size, label=label)
+    for title, lines, kind, (x, y, w, h), _ in parts:
+        part(svg, x, y, w, h, title, lines, kind)
+    if wide is not None:
+        wide(svg)
+    save_both(svg, name, narrow=False)
+    headings = headings or {}
+    rows = [[found for found in parts if found[4] == row] for row in sorted({found[4] for found in parts})]
+    width, x, gap = 360, 12, 18
+
+    def tall(row: list[Part]) -> float:
+        boxed = len(row) > 1
+        return sum(36 + 19 * len(lines) for _, lines, _, _, _ in row) + 6 * (len(row) - 1) + (16 if boxed else 0)
+
+    height = (12 + sum(tall(row) for row in rows) + gap * (len(rows) - 1) + 24 * len(headings)
+              + (22 * len(note) + 16 if note else 0) + 12)
+    svg = Figure(width, height, label=label)
+    y = 12
+    for k, row in enumerate(rows):
+        number = row[0][4]
+        if number in headings:
+            svg.text(x, y + 14, headings[number], size=11, weight=600, color="muted")
+            y += 24
+        boxed = len(row) > 1
+        if boxed:
+            svg.rect(x - 4, y, width - 2 * x + 8, tall(row), fill="none", stroke="muted")
+        inner = y + (8 if boxed else 0)
+        for title, lines, kind, _, _ in row:
+            h = 36 + 19 * len(lines)
+            part(svg, x + (4 if boxed else 0), inner, width - 2 * x - (8 if boxed else 0), h, title, lines, kind)
+            inner += h + 6
+        y += tall(row)
+        if k < len(rows) - 1:
+            if number in flows:
+                svg.arrow(width / 2, y, width / 2, y + gap - 2)
+            y += gap
+    for k, line in enumerate(note):
+        svg.text(x, y + 26 + 22 * k, line, size=12, color="muted")
+    save_both(svg, name, narrow=True)
+
+
+def architecture_flow_figure():
+    """One training run through Dew, from the user's code to the GPU (docs/design/architecture.md)."""
+    label = ("One training run through Dew. A script calls Trainer(objective, optax, key).fit(data), or "
+             "dew train builds the same Trainer from a RunConfig. Trainer.fit compiles the step: jax.jit "
+             "traces it, it is lowered to StableHLO with kernels as custom calls, and XLA compiles it. "
+             "Kernels come from Dew's templates, vendor libraries or XLA, and run in one executable per "
+             "step.")
+    parts = [
+        ("Trainer(…).fit(data)", ["a script or notebook"], "plain", (110, 16, 340, 62), 0),
+        ("or: dew train run.json", ["RunConfig builds the same Trainer"], "plain", (462, 16, 282, 62), 0),
+        ("Trainer.fit", ["compiles a step per batch shape,", "runs it every micro-batch"], "plain",
+         (110, 100, 634, 81), 1),
+        ("jax.jit", ["traces the step"], "plain", (110, 203, 206, 62), 2),
+        ("lower", ["StableHLO"], "plain", (324, 203, 206, 62), 3),
+        ("XLA compile", ["fuses, runs ptxas"], "plain", (538, 203, 206, 62), 4),
+        ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62), 5),
+        ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62), 5),
+        ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62), 5),
+        ("one executable per step", ["its kernels run in order"], "plain", (110, 371, 634, 62), 6),
+    ]
+
+    def wide(svg: Figure) -> None:
+        for y, lane in ((49, "YOUR CODE"), (142, "TRAINER"), (236, "COMPILE"), (320, "KERNELS"),
+                        (404, "GPU")):
+            svg.text(16, y, lane, size=11, weight=600, color="muted")
+        for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 181, 427, 201), (316, 234, 322, 234),
+                               (530, 234, 536, 234), (427, 265, 427, 285), (427, 349, 427, 369)):
+            svg.arrow(x1, y1, x2, y2)
+
+    drawn("architecture-flow", label, (760, 449), parts, wide, flows=range(6))
+
+
+def architecture_template_figure():
+    """A kernel template's layers, and an attention forward call through them."""
+    label = ("A template's layers, top deciding: choice derives one config from device facts; the mainloop "
+             "orders the bundle's steps; the toolkit holds one Family per instruction family, and the bundles "
+             "WGMMA, FED and Mma; then structure, hooks and the algebra. An "
+             "attention forward call goes from attention_route through MosaicForward.derived, bundles.of, "
+             "the launch and each consumer's walk.")
+    parts = [
+        ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62), 0),
+        ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62), 1),
+        ("toolkit: one Family each", ["instructions, rings, roles, registers;",
+                                      "bundles: WGMMA, FED, Mma"], "dew", (16, 174, 400, 81), 2),
+        ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62), 3),
+        ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62), 4),
+        ("algebra", ["init, step, merge, finish on tiles"], "dew", (16, 403, 400, 62), 5),
+        ("attention_route.attend", ["selector: mosaic, triton, portable"], "plain", (440, 34, 304, 62), 6),
+        ("MosaicForward.derived", ["choice: tiles, stages, consumers"], "plain", (440, 112, 304, 62), 7),
+        ("bundles.of(target)", ["toolkit: WGMMA on an H100"], "plain", (440, 190, 304, 62), 8),
+        ("_launched", ["mainloop: roles and the kernel"], "plain", (440, 268, 304, 62), 9),
+        ("each consumer's walk", ["algebra: plain_step, merge, finish"], "plain", (440, 346, 304, 62), 10),
+    ]
+    layers, call = "LAYERS, TOP DECIDES", "AN ATTENTION FORWARD CALL"
+    recurrence = "The recurrence takes the same path on the same bundles."
+
+    def wide(svg: Figure) -> None:
+        svg.text(16, 22, layers, size=11, weight=600, color="muted")
+        svg.text(440, 22, call, size=11, weight=600, color="muted")
+        for k in range(1, 5):
+            svg.arrow(592, 34 + 78 * k - 16, 592, 34 + 78 * k - 2)
+        svg.text(440, 440, recurrence, size=12, color="muted")
+
+    # The layers are a stack, no arrow between them; the call steps from one to the next.
+    drawn("architecture-template", label, (760, 481), parts, wide, note=[recurrence], flows=range(6, 10),
+          headings={0: layers, 6: call})
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
@@ -1227,7 +1356,8 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "cfg-step": cfg_step_figure, "cfg-sweep": cfg_sweep_figure, "sft-mask": sft_mask_figure,
            "pretrained-round-trip": pretrained_round_trip_figure, "jepa-step": jepa_step_figure,
            "lm-next-token": lm_next_token_figure, "agent-episode": agent_episode_figure,
-           "agent-lanes": agent_lanes_figure}
+           "agent-lanes": agent_lanes_figure, "architecture-flow": architecture_flow_figure,
+           "architecture-template": architecture_template_figure}
 
 
 if __name__ == "__main__":

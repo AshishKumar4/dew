@@ -111,13 +111,12 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tomllib
 import types
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
@@ -187,14 +186,15 @@ threads ended at interpreter exit), which no record sees; and the plan runs wher
 token is not. Across 34 suite runs no file was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
-COLLECT_TASKS = 4
+COLLECT_SECONDS = 6.0
+"""A file's collection where armada recorded none: past the slowest rate it has run at (train 459: 5.1 s a
+file on a Genoa host, 1.0 on a Turin one)."""
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 HARNESS = "tools/armada/"
-"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this
-file."""
-SHARED = ("constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
+"""The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
+SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
           "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
@@ -220,45 +220,6 @@ def armada_seen(text: str | None) -> str:
     task = config.get("task", {})
     return json.dumps({**{part: config.get(part) for part in ARMADA_SEEN},
                        "command": task.get("command"), "secrets": task.get("secrets")}, sort_keys=True)
-
-
-def pytest_settings(pyproject: Path) -> str:
-    """The part of `pyproject` every test process's pytest reads as it starts, which no record keeps
-    (followed.py's `configuring`): its own settings (`[tool.pytest]`: its options and filters), as one text,
-    or "missing". The rest of the file is the input of each run that opens it, not of every row's: a train
-    that registered two markers there and changed nothing pytest reads reran all 3,445 rows (ledger 3220,
-    train 416)."""
-    if not pyproject.is_file():
-        return "missing"
-    settings = dict(tomllib.loads(pyproject.read_text()).get("tool", {}).get("pytest", {}))
-    # The markers it registers are the input of each file that uses one (`MARKER`), not of every file's.
-    options = {key: value for key, value in settings.pop("ini_options", {}).items() if key != "markers"}
-    return json.dumps({**settings, "ini_options": options}, sort_keys=True)
-
-
-MARKER = "marker:"
-"""How a key names a marker a test file uses (`marks`): its registration in pyproject.toml's pytest settings,
-or "missing" (`contents`)."""
-
-
-def marks(path: str) -> list[str]:
-    """The markers test file `path` names (`pytest.mark.<name>`, `mark.<name>`), each a `MARKER` input of its
-    key, beside those its collected tests carry however they came by them (a helper's alias, a conftest's
-    `add_marker`: executed.py records them): a registration added, changed or removed changes what a run finds
-    for those files alone."""
-    text = Path(path).read_text(errors="replace") if Path(path).is_file() else ""
-    return sorted({f"{MARKER}{name}" for name in re.findall(r"\bmark\.(\w+)", text)})
-
-
-def registered(name: str) -> bytes:
-    """Marker `name`'s registration line in pyproject.toml's pytest settings, every line for `*` (a test that
-    read them all: executed.py's `getini` watch), or b"missing"."""
-    if not Path("pyproject.toml").is_file():
-        return b"missing"
-    lines = tomllib.loads(Path("pyproject.toml").read_text()).get("tool", {}).get("pytest", {}).get(
-        "ini_options", {}).get("markers", [])
-    found = [line for line in lines if name == "*" or line.split(":")[0].split("(")[0].strip() == name]
-    return hashlib.sha256("\n".join(found).encode()).digest() if found else b"missing"
 
 
 def environment_files() -> list[str]:
@@ -313,7 +274,6 @@ def shared(python: str) -> str:
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
-    digest.update(pytest_settings(Path("pyproject.toml")).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -350,8 +310,6 @@ def contents(name: str) -> bytes:
     where it is a directory, whose probe never reads its entries, and as read otherwise."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
-    if name.startswith(MARKER):
-        return registered(name.removeprefix(MARKER))
     if name.startswith("probe:"):
         probed = name.removeprefix("probe:")
         return b"directory" if Path(probed).is_dir() else contents(probed)
@@ -359,25 +317,9 @@ def contents(name: str) -> bytes:
         path, _, executed = name.partition(followed.CODE)
         return unit(path, executed) if Path(path).is_file() else b"missing"
     if name.startswith("import:"):
-        # A module a run imported or tried to (followed.py's `imports`), with the checkout's directories it
-        # was searched for in, in order: whether each holds a module, a package, a namespace or an extension
-        # of its name, any of which arriving ahead of what the import found shadows it.
-        module, searched, roots = name.removeprefix("import:").partition(followed.ROOTS)
-        if searched:
-            last = module.rpartition(".")[2]
-            return b"".join(b"1" if candidate.exists() else b"0" for root in roots.split(os.pathsep) if root
-                            for candidate in (Path(root, f"{last}.py"), Path(root, last, "__init__.py"),
-                                              Path(root, last), *sorted(Path(root).glob(f"{last}.*.so"))))
-        # A module the process held before its recorder ran (lifetime.py's `boot`, a child's start): a
-        # top-level one, whether a helper under tests/, which leads sys.path, would shadow it; a submodule,
-        # what its import finds under src/ or tools/.
-        if "." in module:
-            *parents, last = module.split(".")
-            return b"".join(b"1" if candidate.exists() else b"0" for root in ("src", "tools")
-                            for candidate in (Path(root, *parents, f"{last}.py"), Path(root, *parents, last,
-                                                                                         "__init__.py"),
-                                              Path(root, *parents, last),
-                                              *sorted(Path(root, *parents).glob(f"{last}.*.so"))))
+        # A top-level module a run imported (followed.py's `IMPORTED`): whether a helper under tests/, which
+        # leads sys.path, would shadow it, a module or a package of that name.
+        module = name.removeprefix("import:")
         return b"".join(b"1" if path.exists() else b"0"
                         for path in (Path("tests", f"{module}.py"), Path("tests", module, "__init__.py")))
     path = Path(name)
@@ -550,7 +492,7 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
     import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
     entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
-    return sorted({name, *(path for path in depends if not built_input(path)), *marks(name),
+    return sorted({name, *(path for path in depends if not built_input(path)),
                    *(package for path in depends for package in packages(path.partition(followed.CODE)[0]))})
 
 
@@ -559,7 +501,7 @@ def packages(path: str) -> tuple[str, ...]:
     """The directories under src/ or tools/ above module `path` whose entries an import of it reads
     (`inputs`), none for any other path. A function of the path's text alone, kept: a plan asks it of each of
     a row's ~3,000 inputs for every row."""
-    if not path.startswith("tools/") or not path.endswith(".py") or path.startswith(HARNESS):
+    if not path.startswith(("src/", "tools/")) or not path.endswith(".py") or path.startswith(HARNESS):
         return ()
     return tuple(str(parent) for parent in Path(path).parents
                  if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src"))
@@ -639,9 +581,9 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     apart from the last run's record (`record_key`): every green run of a row on any inputs stays found by
     its own key, so a run of another commit, which replaces the last record, loses none of them
     (`green_record`; owner, 2026-10-29: a lane's one-line change over a green verdict reran half its suite,
-    its records replaced). The row's own place holds it, as two files' records may share every input and so
-    their keys: kept by the key alone, one file's run stood for each of them (2026-10-30: a kept task
-    reported one file's row for six files)."""
+    its records replaced). The row's own place holds it, as the files one process ran share what it executed
+    before them and so their keys (`executed.py`): kept by the key alone, one file's run stood for each of
+    them (2026-10-30: a kept task reported one file's row for six files)."""
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
@@ -832,16 +774,18 @@ RECORD_TRIES = 4
 
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order, but its check-1 sites',
-    which run in tasks of their own (`sites`)."""
-    tests: dict[str, list[float]] = {}
+    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's
+    place (`session.units`), as a cut takes them."""
+    nodes: dict[str, list[str]] = {}
     held: dict[str, dict[str, Mark]] = {}
-    for node, seconds in sorted(durations_record().items()):
+    record = durations_record()
+    for node in sorted(record):
         name = node.split("::")[0]
         if name not in held:
             held[name] = sites(name)
-        if site_name(node) not in held[name]:
-            tests.setdefault(name, []).append(seconds)
-    return tests
+        if session.test_name(node) not in held[name]:
+            nodes.setdefault(name, []).append(node)
+    return {name: session.unit_seconds(own, [record[node] for node in own]) for name, own in nodes.items()}
 
 
 def durations_record() -> dict[str, float]:
@@ -852,14 +796,13 @@ def durations_record() -> dict[str, float]:
 def members(name: str, split: str) -> list[str]:
     """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
     the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.groups`)."""
+    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together."""
     held = sites(name)
     recorded = {node: seconds for node, seconds in durations_record().items()
-                if node.split("::")[0] == name and site_name(node) not in held}
+                if node.split("::")[0] == name and session.test_name(node) not in held}
     ordered = sorted(recorded)
     index, count = (int(part) for part in split.split("/"))
-    run = session.groups([recorded[node] for node in ordered], count)[index - 1]
-    return ordered[run.start:run.stop]
+    return session.cut(ordered, [recorded[node] for node in ordered], count)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -951,6 +894,12 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
     return None if whole is None else (whole, 1)
 
 
+APART = re.compile(r"\bpytest\.mark\.torchax\b")
+"""A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
+the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
+MXFP4, armada dew-20261011231242-dd32ac90): its tasks hold only files so marked."""
+
+
 def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]]]:
     """The names of `weights` packed heaviest first into the lightest of `count` bins: each bin's
     weight and its names, sorted, in bin order."""
@@ -967,13 +916,11 @@ notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its op
 elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
 no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
 reused)."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "pyproject.toml")
-"""The checkout's own files at its root that tests read as a page is read; the changelog, which no test
-reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none, it turned the
-cache off for every train holding such a head, which then ran its whole suite on every round (train 149: 30
-task-hours, twice); and pyproject.toml, whose pytest settings every row keys (`pytest_settings`), whose
-markers each row that uses one (`marks`), and whose rest each run that opens it (ledger 3220: train 416
-registered two markers and reran all 3,445 rows)."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
+"""The checkout's own files at its root that tests read as a page is read, and the changelog, which
+no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
+it turned the cache off for every train holding such a head, which then ran its whole suite on every
+round (train 149: 30 task-hours, twice)."""
 
 
 def policy(base: str) -> str:
@@ -1099,29 +1046,18 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         return {}
     found: dict[str, Mark] = {}
     read: set[int] = set()
-
-    def walked(body: list[ast.stmt], prefix: str) -> None:
-        for node in body:
-            if isinstance(node, ast.ClassDef):
-                walked(node.body, f"{prefix}{node.name}.")
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name[:4] != "test":
-                continue
-            for mark in node.decorator_list:
-                called = ast.unparse(mark.func) if isinstance(mark, ast.Call) else ""
-                kind = called.removeprefix("pytest.mark.")
-                if kind not in SHARDS or not isinstance(mark, ast.Call):
-                    continue
-                counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
-                          if isinstance(keyword.value, ast.Constant)}
-                if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
-                        and all(type(count) is int and count > 0 for count in counts.values())
-                        and prefix + node.name not in found):
-                    declared = counts[SHARDS[kind]]
-                    units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-                    found[prefix + node.name] = Mark(units, counts["per_task"], mark.lineno, declared)
-                    read.add(id(mark.func))
-
-    walked(tree.body, "")
+    for test, mark in session.decorated_tests(tree.body):
+        kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
+        if kind not in SHARDS:
+            continue
+        counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
+                  if isinstance(keyword.value, ast.Constant)}
+        if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
+                and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
+            declared = counts[SHARDS[kind]]
+            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
+            found[test] = Mark(units, counts["per_task"], mark.lineno, declared)
+            read.add(id(mark.func))
     unread = sorted(node.lineno for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute) and node.attr in SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
@@ -1131,12 +1067,6 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
                          f"@pytest.mark.shards(units=N, per_task=P) of literal counts above zero, which the "
                          f"plan reads from the source (tools/armada/ci.py `sites`)")
     return found
-
-
-def site_name(node: str) -> str:
-    """Test node `node`'s test's name in its file, as `sites` names it: its function's, or a class's
-    method's `Class.test_name`, its parameters' ids aside."""
-    return node.partition("::")[2].split("[")[0].replace("::", ".")
 
 
 def draws_of(mark: Mark) -> list[tuple[int, int]]:
@@ -1193,7 +1123,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 continue
             mark = held[test]
             whole = sum(seconds for node, seconds in record.items()
-                        if node.split("::")[0] == name and site_name(node) == test)
+                        if node.split("::")[0] == name and session.test_name(node) == test)
             maps = []
             for start, stop in draws_of(mark):
                 group = f"{test}.draws-{start}-{stop}"
@@ -1210,7 +1140,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on; each file of a task runs in a process of its own (`alone`). Each entry carries
+    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
     whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
     which look each up again in their containers, so the verdict names every file and containers scale with
@@ -1225,6 +1155,10 @@ def plan(target: float, timings: dict) -> list[dict]:
     # takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
     refused_sites(shards)
+    # Every file's shared setups, read so a mark the plan cannot read refuses its file now
+    # (`session.shared_setups`), not where a cut first reads it.
+    for name in every:
+        session.shared_setups(name)
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
@@ -1257,8 +1191,11 @@ def plan(target: float, timings: dict) -> list[dict]:
                   if (name, group) not in found]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and name not in groups and (name, "") not in found}
-        count = max(math.ceil(sum(light.values()) / target), 1)
-        tasks += [([(name, "") for name in names], held) for held, names in packed(light, count) if names]
+        apart = {name for name in light if APART.search(Path(name).read_text())}
+        for family in (sorted(set(light) - apart), sorted(apart)):
+            count = max(math.ceil(sum(light[name] for name in family) / target), 1)
+            tasks += [([(name, "") for name in names], held)
+                      for held, names in packed({name: light[name] for name in family}, count) if names]
         for index, (held_rows, weight) in enumerate(tasks, start=1):
             # A kept row says where its green run is kept, and its group where it has one (`kept_of`); a task
             # of one file's group runs that group (`split`).
@@ -1273,16 +1210,28 @@ def plan(target: float, timings: dict) -> list[dict]:
                      "cache": cache, "whole": cells}
                     for entry in site_entries(python, marked, found, timings, target)]
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
-    # As many collect tasks as there are files to collect, up to COLLECT_TASKS: one that holds none reports no
-    # row its entry names, which armada cannot grade.
-    collecting = min(COLLECT_TASKS, len(rest))
-    for index in range(collecting):
-        names = rest[index::collecting]
-        entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
-                        "tests": " ".join(names), "split": COLLECT,
-                        "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
-                        "cache": cache, "whole": cells})
-    return entries
+    collecting = collect_entries(rest, timings, target)
+    return entries + [{**entry, "cache": cache, "whole": cells} for entry in collecting]
+
+
+def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
+    """The newest Python's tasks that import `names` without running them (`collect`): each at most
+    `target` seconds of files at the slowest per-file rate armada recorded for a collection (else
+    `COLLECT_SECONDS`), and weighed at that. A collect task's rows split its seconds evenly, and the same
+    files collect five times as long on one host class as on another, so the slowest rate keeps every task
+    within the target on any host; weighed at the target, train 459's four tasks of 140 files started last
+    and ran 485-910 s on Genoa hosts, and the run ended with them."""
+    rates = [seconds for name, seconds in timings.get("rows", {}).items()
+             if ":" in name and parsed_row(name)[0] == PYTHONS[-1] and parsed_row(name)[2] == COLLECT]
+    rate = max(rates, default=COLLECT_SECONDS)
+    # The files a task holds within the target, one where a file alone takes longer; and no task holds none:
+    # armada cannot grade a row its entry names that its task never reports.
+    each = max(math.floor(target / rate), 1)
+    count = math.ceil(len(names) / each)
+    return [{"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1], "tests": " ".join(held),
+             "split": COLLECT, "rows": [row(PYTHONS[-1], name, COLLECT) for name in held],
+             "weight": len(held) * rate}
+            for index, held in enumerate(names[at::count] for at in range(count))]
 
 
 MARKED = ("whole_suite", "release_env")
@@ -1363,19 +1312,23 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     return 0
 
 
-def targeted(python: str, arguments: list[str], report: Path) -> int:
-    """pytest's exit status on `arguments` (files, node ids and options) run as a CI task runs its files
-    (`session.pytest_run`): a lane's targeted run (tmp/run_tests.py) and the gangs select as CI does, and an
-    option of their own (a `-m` after CI's) chooses instead."""
-    return subprocess.run([*session.pytest_run(python, report), *arguments],
-                          env=session.pytest_environment({}),
-                          check=False).returncode
+def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[str] = (),
+             split: str = "") -> int:
+    """pytest's exit status on `arguments` (files, node ids and options) and `tests` in `split`'s group, run
+    as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
+    (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
+    chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
+    tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
+    site = SITE.fullmatch(split)
+    run = selected(session.pytest_run(python, report), network=False, site=site is not None)
+    return subprocess.run([*run, *arguments, *selection(list(tests), split)],
+                          env=session.pytest_environment(site_environment(site)), check=False).returncode
 
 
 def flow_cells(cases) -> dict[str, dict]:
     """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
-    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
-    empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
+    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
     unqualified, and a reused row keeps its counts (ledger 2643)."""
     return {node_of(case): json.loads(item.get("value") or "null") for case in cases
             for item in case.iter("property") if item.get("name") == "cells"}
@@ -1391,29 +1344,33 @@ def ynn_switched(cases) -> list[dict]:
             for site in json.loads(item.get("value") or "[]")]
 
 
+def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
+    """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
+    even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
+    total = sum(own_seconds.values())
+    pace = wall / total if total > 0 else 0.0
+    return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "") -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
-    Each file runs in a pytest process of its own (`alone`), and a row's seconds are that process's wall
-    time: the plan weighs a file by what it costs a container (its import, its collection, the container's
-    pace), which pytest's case times leave out. Weighed by case times, tasks planned at 300 seconds ran a
-    median of 392. With `coverage`, pytest runs under coverage.py, whose data file goes there
-    (`coverage_items`)."""
+    A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
+    the plan weighs a file by what it costs a container (its import, its collection, the
+    container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
+    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
+    file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
     began = time.monotonic()
-    # The task's start, one for every call below (a heavy file's kept groups run after its whole files): what
-    # one file's process leaves for another's, whichever call runs it, is made after it (followed.py's
-    # `outside`).
-    started = {followed.STARTED_AT: str(time.time())}
     common = shared(python)
     names, kept = kept_of(tests)
     whole_files = {name: at for (name, group), at in kept.items() if not group}
-    code = tested(python, names, split, out, deadline, cache, grace, common, started, coverage, whole=whole,
+    code = tested(python, names, split, out, deadline, cache, grace, common, {}, coverage, whole=whole,
                   release=release, kept=whole_files)
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
@@ -1436,23 +1393,29 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                          "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
             continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, left, cache, grace, common, started, coverage,
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
                                 whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
 
 
-def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
-    """CI's pytest `run` over `tests`, with the plugins that record what ran (executed.py), keep one group
-    of a split file (`split`, split.py) and a release check's tests (`release`, release.py), or a check-1
-    site's test alone (`split` its group, `SITE`). A release check's pytest runs with its requirement over the
-    suite's environment, whose torch and jax it keeps: uv's overlay."""
+def selection(tests: list[str], split: str, release: str = "") -> list[str]:
+    """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
+    split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
+    group, `SITE`)."""
     site = SITE.fullmatch(split)
     grouping = (["-p", "split", f"--ci-group={split}"] if split and not site else []) + (
         ["-p", "release", f"--ci-release={release}"] if release else [])
     named = [f"{name}::{site['test'].replace('.', '::')}" for name in tests] if site else tests
-    command = [*run, "-p", "executed", *named, *grouping]
+    return [*named, *grouping]
+
+
+def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
+    """CI's pytest `run` over `tests`, with the plugin that records what ran (executed.py), as `selection`
+    selects them. A release check's pytest runs with its requirement over the suite's environment, whose
+    torch and jax it keeps: uv's overlay."""
+    command = [*run, "-p", "executed", *selection(tests, split, release)]
     return ["uv", "run", "--no-project", "--python", command[0], "--with", release, "--", "python",
             *command[1:]] if release else command
 
@@ -1516,56 +1479,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    # Each file in a pytest process of its own (`alone`), one after another: a file's record is what its own
-    # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
-    # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
-    ran = []
-    # The task's start (`task` names it; a call made on its own, its own), before which every program it may
-    # run as a tool was made and every file it reads in shared scratch or the home was (followed.py's `tool`,
-    # `outside`).
-    environ = {followed.STARTED_AT: str(time.time()), **environ}
-    for index, name in enumerate(tests):
-        left = deadline - (time.monotonic() - began)
-        alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
-                       coverage, network, whole, release, site) if left > 0 else None
-        ran.append(file_row(python, name, group, site, alone_, deadline))
-        # The verdict first, so no cache write that waits on the Worker keeps it from armada.
-        out.write_text(json.dumps({"rows": rows + ran}))
-        if coverage is None and not release and alone_ is not None:
-            # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
-            # runs under its requirement's overlay and on the whole suite's run alone.
-            record(python, ran[-1:], alone_.log, common, network, alone_.opened)
-    return 0
-
-
-@dataclasses.dataclass(frozen=True)
-class Alone:
-    """One test file's pytest process (`alone`): its exit, output, JUnit cases and collection counts, every
-    data file its processes opened (`watched`: None where the watch was blind), whether it ran past its
-    deadline, its wall time, and its recorder's log (lifetime.py)."""
-
-    returncode: int | None
-    output: str
-    reported: bool
-    cases: list[ET.Element]
-    counts: dict
-    opened: set[str] | None
-    expired: bool
-    seconds: float
-    log: Path
-
-
-def alone(python: str, name: str, split: str, base: Path, deadline: float, grace: float,
-          environ: Mapping[str, str], coverage: Path | None, network: bool, whole: bool, release: str,
-          site: re.Match | None) -> Alone:
-    """Test file `name` (`tested`) in a pytest process of its own under `environ`, its files beside `base`,
-    interrupted past `deadline` seconds and its process group killed `grace` seconds after that."""
-    began = time.monotonic()
     # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
     # group has exited (`record`).
-    log = base.with_name(f"{base.name}.lifetime.log")
-    collection = base.with_name(f"{base.name}.collected.json")
-    report = base.with_name(f"{base.name}.junit.xml")
+    log = out.with_name(f"{out.name}.lifetime.log")
+    collection = out.with_name(f"{out.name}.collected.json")
+    report = out.with_name(f"{out.name}.junit.xml")
     for stale in (report, log, collection):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1575,32 +1493,17 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    command = pytest_command(run, [name], split, release)
+    command = pytest_command(run, tests, split, release)
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    # A cache directory of the file's own, empty as a cold container's: no record another file's process wrote
-    # beside the compilation cache (a step's rungs, keyed by Dew's source digest, followed.py's `DIGEST`)
-    # serves this file by code its record never held (its bundle of programs fetched into it as before).
-    # Its scratch too (TMPDIR, which tempfile and pytest's tmp_path take), so what one file's tests leave
-    # there is no other's to read. uv's cache, which only holds packages by their digests, stays shared.
-    caches = base.with_name(f"{base.name}.caches")
-    shutil.rmtree(caches, ignore_errors=True)
-    caches.mkdir()
-    # Short, under the system's own: a Unix socket's path (multiprocessing's forkserver, its resource tracker)
-    # holds 107 bytes at most.
-    scratch = tempfile.mkdtemp(prefix="dew-file-")
-    environment = session.pytest_environment({
-        **environ, **site_environment(site), "XDG_CACHE_HOME": str(caches), "TMPDIR": scratch,
-        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache" / "uv")),
-        followed.PRIVATE: str(caches), "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
-    # A store elsewhere, inherited, would be one every file of the task shared.
-    environment = {name: value for name, value in environment.items() if name not in followed.CACHES}
+    environment = session.pytest_environment({**environ, **site_environment(site),
+                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # Every data file the process's group opens, held from before pytest starts until its group stopped
-    # (`watched`): each is the file's input.
+    # Every data file the task's processes open, held from before pytest starts until its group stopped
+    # (`watched`): each is the input of every file the task runs.
     opens = watched.Opens(os.getcwd())
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=environment)
@@ -1622,62 +1525,63 @@ def alone(python: str, name: str, split: str, base: Path, deadline: float, grace
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
-    # A process of the group still running may yet open a file: no record of this file keeps a key.
+    # A process of the group still running may yet open a file: no record of this task keeps a key.
     closed = opens.closed()
+    opened = None if left else closed
     reader.join(10)
-    shutil.rmtree(scratch, ignore_errors=True)
-    # How collection found the file: a file with no row is green only where every test it holds was set aside
+    output = "".join(lines)
+    cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
+    # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
-    return Alone(done.returncode, "".join(lines), report.is_file(),
-                 list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else [],
-                 json.loads(collection.read_text()) if collection.is_file() else {},
-                 None if left else closed, expired, time.monotonic() - began, log)
-
-
-def file_row(python: str, name: str, group: str, site: re.Match | None, run: Alone | None,
-             deadline: float) -> dict:
-    """Test file `name`'s verdict row from its process's `run` (`alone`), or, where the task's `deadline` came
-    before its turn (`run` None), red as interrupted."""
-    if run is None:
-        return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
-                "output": f"{INTERRUPTED} of {deadline:.0f} s before its file started", "tests": {},
-                "ynn_switched": [], "cells": {}, "timings": {}, **red_as("deadline", [])}
-    own = [case for case in run.cases if file_of(case) == name]
-    failed = [(case, kind, node) for case in own for kind in ("failure", "error")
-              if (node := case.find(kind)) is not None]
-    red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
-           for case, kind, node in failed]
-    skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-               f"{node.get('message')}" for case in own for node in case.iter("skipped")
-               if "could not import" in f"{node.get('message')} {node.text}"]
-    counted = run.counts.get(name, {})
-    deselected = bool(counted) and counted["collected"] == counted["deselected"]
-    exited = exit_red(run.returncode, run.cases, own, deselected, name)
-    unaccounted = ([] if exited or (run.reported and (own or deselected))
-                   else [f"no evidence {name} ran: " + ("pytest wrote no report" if not run.reported
-                                                        else "pytest reported none of its tests, and its "
-                                                             "collection shows them not all deselected")])
-    red += skipped + exited + unaccounted
-    if run.expired:
-        red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
-    # A failed case with no class path is a file that did not collect, no test of it.
-    nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-    whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
-                                                                  for case, _, _ in failed)
-    cause = ({} if not red else red_as("deadline", []) if run.expired else red_as("whole", []) if whole
-             else red_as("nodes", nodes))
-    # armada times a file at the sum of its rows' timings, a split file's groups together, each Python's
-    # apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
-    return {"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": run.seconds,
-            "output": "\n".join(red + ([run.output[-4000:]] if red else [])),
-            # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which `exhausted`
-            # reads.
-            **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
-            "tests": {node_of(case): float(case.get("time") or 0) for case in own},
-            # Its whole_suite cells, every one collected, run or set aside (executed.py).
-            **{key: cells for key, cells in counted.items() if key in MARKED},
-            "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-            "timings": {row(python, name, group if site else ""): run.seconds}, **cause}
+    counts = json.loads(collection.read_text()) if collection.is_file() else {}
+    ran = []
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
+    for name in tests:
+        own = [case for case in cases if file_of(case) == name]
+        failed = [(case, kind, node) for case in own for kind in ("failure", "error")
+                  if (node := case.find(kind)) is not None]
+        red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
+               for case, kind, node in failed]
+        skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
+                   f"{node.get('message')}" for case in own for node in case.iter("skipped")
+                   if "could not import" in f"{node.get('message')} {node.text}"]
+        counted = counts.get(name, {})
+        deselected = bool(counted) and counted["collected"] == counted["deselected"]
+        exited = exit_red(done.returncode, cases, own, deselected, name)
+        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
+                       else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
+                                                            else "pytest reported none of its tests, and its "
+                                                                 "collection shows them not all deselected")])
+        red += skipped + exited + unaccounted
+        if expired:
+            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
+        # A failed case with no class path is a file that did not collect, no test of it.
+        nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
+        whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
+                                                                      for case, _, _ in failed)
+        cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
+                 else red_as("nodes", nodes))
+        seconds = shares[name]
+        # armada times a file at the sum of its rows' timings, a split file's groups together, each
+        # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
+        ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
+                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
+                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
+                     # `exhausted` reads.
+                     **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
+                     "tests": {node_of(case): float(case.get("time") or 0) for case in own},
+                     # Its whole_suite cells, every one collected, run or set aside (executed.py).
+                     **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
+                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
+                     "timings": {row(python, name, group if site else ""): seconds}, **cause})
+    out.write_text(json.dumps({"rows": rows + ran}))
+    if coverage is None and not release:
+        # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
+        # under its requirement's overlay and on the whole suite's run alone.
+        record(python, ran, log, common, network, opened)
+    return 0
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
@@ -1999,9 +1903,6 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
-    # The lane's start, for every file's process alike (the files run at once): what one leaves for another is
-    # made after it (followed.py's `outside`).
-    started = str(time.time())
 
     def run(names: list[str]) -> None:
         waiting = sorted(names, key=lambda name: -holds[name])
@@ -2016,7 +1917,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     # says whatever its own environment does: a GPU node's session grows every job's pool.
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                               "OMP_NUM_THREADS": threads, followed.STARTED_AT: started}
+                               "OMP_NUM_THREADS": threads}
                     running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
                                         session.GRACE, common, environ, None, network)] = fits
                     continue
@@ -2084,7 +1985,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
         own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and site_name(node) not in marked}
+               if node.split("::")[0] == name and session.test_name(node) not in marked}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
@@ -2106,7 +2007,8 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     if seconds <= target or not own:
         return sum(own.values()) > target
     nodes = sorted(own)
-    recorded, ran = [own[node] for node in nodes], [observed[node] for node in nodes]
+    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
+    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:
@@ -2295,6 +2197,9 @@ def main() -> int:
         "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
     selecting.add_argument("--python", choices=PYTHONS, required=True)
     selecting.add_argument("--report", type=Path, required=True, help="where pytest writes its JUnit report")
+    selecting.add_argument("--tests", default="", help="the files --split's group is of, space-separated")
+    selecting.add_argument("--split", default="",
+                           help="--tests' group as CI names it: 1/3, a check-1 site's test or its draws")
     selecting.add_argument("arguments", nargs=argparse.REMAINDER,
                            help="after --, pytest's own: files, node ids and options")
     measuring = operations.add_parser("coverage")
@@ -2367,7 +2272,7 @@ def main() -> int:
     if args.operation == "pytest":
         # argparse keeps the `--` that sets pytest's arguments apart from these.
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-        return targeted(args.python, arguments, args.report)
+        return targeted(args.python, arguments, args.report, args.tests.split(), args.split)
     if args.operation == "gpu-lane":
         if args.tests is None and not args.network:
             parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "

@@ -16,13 +16,12 @@ earlier ones (dory.py:146-149).
 writes tests/fixtures/hf/dory-tiny/: a random DoryForCausalLM of eight
 layers, attentions and MLPs alternating as the release's do, over a width
 of 32 with a window of 5, its middle four layers looped, a tokenizer of the
-release's kind, fp32 and float64 logits at one, two and four loops and of
-the variant configs, both caches' greedy continuations with each step's
-logits at two and four loops, packed documents, prompts of two lengths, and the cotangent of a
-loss over the logits, whose gradients the tests take from this reference
-live. The four-loop continuations were added under torch 2.14, whose fp32
-and float64 sums differ in their last bits from those that wrote the rest,
-which a rewrite takes as they come.
+release's kind, the float64 logits at one, two and four loops a float64 Dew
+is held to, the first layer's keys, both caches' greedy continuations at two
+and four loops, packed documents' ids and places, prompts of two lengths and
+their continuations, and the cotangent of a loss over the logits. The float32
+runs the tests compare Dew's logits and gradients with are this reference's,
+drawn live (tests/test_dory.py's check 1).
 """
 
 from __future__ import annotations
@@ -384,27 +383,19 @@ def write_tiny() -> None:
     ids = rng.integers(12, CONFIG['vocab_size'], (2, 9))
     arrays = {'input_ids': ids}
 
-    def both(name, compute, config=CONFIG, **fields):
-        arrays[name] = compute(DoryReference(config, tensors, torch.float32, **fields))
-        arrays[f'{name}_f64'] = compute(DoryReference(config, tensors, torch.float64, **fields))
-
+    # The float64 logits a float64 Dew is held to; the float32 runs the tests compare are drawn live.
     for loops in (1, 2, 4):
-        both(f'logits_{loops}', lambda reference: reference.forward(ids), loops=loops)
-    both('keys', lambda reference: reference.first_keys(ids))
+        wide = DoryReference(CONFIG, tensors, torch.float64, loops=loops)
+        arrays[f'logits_{loops}_f64'] = wide.forward(ids)
+    arrays['keys_f64'] = DoryReference(CONFIG, tensors, torch.float64).first_keys(ids)
     arrays['keys_bf16'] = DoryReference(CONFIG, tensors, torch.bfloat16).first_keys(ids)
     for mode, loops in itertools.product(('per_loop', 'last_loop'), (None, 4)):
         # The tiny's own two loops, and four, whose cached passes a decode step scans.
         tag = mode if loops is None else f'{mode}_{loops}'
-        tokens, steps = DoryReference(CONFIG, tensors, torch.float64, mode=mode,
-                                      loops=loops).decode(ids[0, :6], 8)
-        arrays[f'generated_{tag}'], arrays[f'step_logits_{tag}_f64'] = tokens, steps
-        _, steps32 = DoryReference(CONFIG, tensors, torch.float32, mode=mode,
-                                   loops=loops).decode(ids[0, :6], 8)
-        arrays[f'step_logits_{tag}'] = steps32
-    for name, change in VARIANTS.items():
-        both(f'logits_{name}', lambda reference: reference.forward(ids), {**CONFIG, **change})
+        arrays[f'generated_{tag}'], _ = DoryReference(CONFIG, tensors, torch.float64, mode=mode,
+                                                      loops=loops).decode(ids[0, :6], 8)
 
-    # Packed rows: each document's own logits, laid out where the row holds it.
+    # Packed rows: each row's documents side by side, each restarting its positions.
     width = sum(PACKING[0])
     documents = [[rng.integers(12, CONFIG['vocab_size'], length) for length in row] for row in PACKING]
     arrays['packed_ids'] = np.stack([np.concatenate(row) for row in documents])
@@ -413,8 +404,6 @@ def write_tiny() -> None:
     arrays['packed_positions'] = np.asarray([[step for length in row for step in range(length)]
                                              for row in PACKING], np.int32)
     assert arrays['packed_ids'].shape == (len(PACKING), width)
-    both('packed_logits', lambda reference: np.stack([np.concatenate(
-        [reference.forward(document[None])[0] for document in row]) for row in documents]))
 
     prompts = [rng.integers(12, CONFIG['vocab_size'], length) for length in RAGGED]
     arrays['ragged_prompts'] = np.stack([np.pad(prompt, (0, max(RAGGED) - len(prompt)))

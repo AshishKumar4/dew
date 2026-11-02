@@ -3,19 +3,24 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import itertools
+import json
+from pathlib import Path
 
 import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from examples_clock_worker import Questioned
+from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
-from dew.data import Memory
+from dew.data import Files, Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import ObjectiveData, Pipeline
@@ -139,6 +144,424 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
         {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
 
 
+SHARDED_RECORDS = 15
+"""The ids, 1 to 15, that the sharded sources of the worker reads below hold, in five physical shards of
+three rows."""
+
+
+def sharded_records(kind: str, directory: Path) -> Pipeline:
+    """The ids in five physical shards of three rows: held in memory, or in five files of `kind` ("jsonl",
+    whose shards state no row count, or "parquet", whose footers state it)."""
+    ids = np.arange(1, SHARDED_RECORDS + 1, dtype=np.int32)
+    if kind == "memory":
+        return Pipeline(Memory({"id": ids}, shard_rows=3))
+    for part in range(5):
+        rows = [{"id": int(record)} for record in ids[part * 3:(part + 1) * 3]]
+        if kind == "jsonl":
+            (directory / f"part-{part}.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        else:
+            pq.write_table(pa.Table.from_pylist(rows), directory / f"part-{part}.parquet")
+    return Pipeline(Files(str(directory / f"part-*.{kind}"), format=kind))
+
+
+def bound_read(
+        chain: Pipeline, examples: int, workers: int, shares: int = 1) -> tuple[collections.Counter, int]:
+    """The real ids that the `shares` of a pool, each read in turn, hand out of a streamed training read of
+    `chain` bounded to `examples`, in batches of four read by `workers` loading workers, and the examples
+    their batches consume (`EXAMPLES_CONSUMED`)."""
+    loader = compile(chain.batch(4), read="streamed", examples=examples, loading=Loading(workers=workers))
+    read: collections.Counter = collections.Counter()
+    consumed = 0
+    for index in range(shares):
+        stream = loader.train(DataPartition(index=index, count=shares))
+        try:
+            for batch in stream:
+                real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+                read.update(np.asarray(batch["id"])[real].tolist())
+                consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+        finally:
+            if isinstance(stream, Closeable):
+                stream.close()
+    return read, consumed
+
+
+@pytest.mark.parametrize("expands", [False, True])
+@pytest.mark.parametrize("examples", [7, 10, 23])
+def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(examples, expands):
+    """Ten documents a memory read packs as it holds them, before a global shuffle of its windows, read
+    alone or through an objective that makes two rows of each window after: bounded to 7, 10 or 23
+    examples, it holds that many documents, cycling them past a pass, and packs those, each window
+    consuming the documents it ends (`EXAMPLES_CONSUMED`), so a read of it consumes the bound whole, each
+    document's tokens held as many times as the bound reads it (row 1902)."""
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read="memory", examples=examples, objective=objective)
+    stream = loader.train(DataPartition())
+    consumed, tokens = 0, collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+            for row in np.asarray(batch["id"])[real][::2 if expands else 1]:
+                tokens.update(int(token) for token in row if token)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert consumed == examples
+    reads = [examples // 10 + (index < examples % 10) for index in range(10)]
+    assert tokens == collections.Counter({index: reads[index] * (index % 3 + 2)
+                                          for index in range(1, 10) if reads[index]})
+
+
+def _consumed_of(loader) -> int:
+    """The examples a read of `loader`'s training stream consumes, read to its end."""
+    stream = loader.train(DataPartition())
+    consumed = 0
+    try:
+        for batch in stream:
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return consumed
+
+
+def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_around_them():
+    """Bounds in examples over memory reads that pack: a configured random step before the pack, which no
+    memory read holds, so the bound streams before it (row 1902's review); a first-fit plan that leaves a
+    window out (two documents of one and two tokens, a window of a single segment, so the singleton's
+    window holds no target), which passes its document's count to the next window it keeps; a first-fit
+    pack whose windows a shuffle draws in any order, each document whole in one window; and a
+    concatenating pack's windows, which cut documents, each count released once a shuffle has drawn every
+    window holding a piece of its document (`dew.data.completion`)."""
+    from dew.data.pipeline import Configured
+
+    documents = [{"id": np.full(index % 3 + 2, index + 1, np.int32)} for index in range(10)]
+    configured = Configured(jittered, needs=(), scope="run", random=True, one_to_one=True)
+    chain = (Pipeline(Memory(documents)).map(configured).pack(8, fields=("id",)).shuffle(seed=1, window=4)
+             .read("memory").batch(2))
+    assert _consumed_of(compile(chain, read="memory", examples=7,
+                                objective=ObjectiveData(train=(Twice(),)))) == 7
+    lone = [{"id": np.asarray([5], np.int32)}, {"id": np.asarray([6, 7], np.int32)}]
+    single = (Pipeline(Memory(lone)).pack(2, fields=("id",), segments=1).shuffle(seed=1).read("memory")
+              .batch(1))
+    assert _consumed_of(compile(single, read="memory", examples=2)) == 2
+    # Through an objective's rows, the singleton, whose window holds no target, is consumed and refused.
+    counted = compile(single, read="memory", examples=2, objective=ObjectiveData(train=(Twice(),)))
+    assert _consumed_of(counted) == 2
+    stated = counted.statistics()
+    assert [value for name, value in stated.items() if name.startswith("data/rows/")] == [1]
+    assert [value for name, value in stated.items() if name.endswith("/zero_targets")] == [1]
+    whole = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    twice = ObjectiveData(train=(Twice(),))
+    assert _consumed_of(compile(whole, read="memory", examples=10, objective=twice)) == 10
+    cut = (Pipeline(Memory(documents)).pack(8, fields=("id",), policy="concat").shuffle(seed=1).read("memory")
+           .batch(2))
+    assert _consumed_of(compile(cut, read="memory", examples=10, objective=twice)) == 10
+
+
+_LENGTHS = (3, 11, 5, 17, 2, 9, 4, 13, 6, 8, 3, 21)
+"""Documents' lengths, several longer than a window, so a layout cuts them across two, three or more."""
+
+
+def _pieces():
+    """Documents of `_LENGTHS` tokens, each token unique: document `index`'s are `1000 * (index + 1)` on."""
+    return [{"id": np.arange(length, dtype=np.int32) + 1000 * (index + 1)}
+            for index, length in enumerate(_LENGTHS)]
+
+
+_SPLIT = {
+    "concat": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4),
+               "streamed"),
+    "overlap": (lambda chain: chain.pack(8, fields=("id",), policy="concat", overlap=2)
+                .shuffle(seed=2, window=3), "streamed"),
+    "windows": (lambda chain: chain.windows(4, fields=("id",)).shuffle(seed=3, window=5), "streamed"),
+    "strided": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=8, window=5),
+                "streamed"),
+    "twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4)
+              .shuffle(seed=5, window=3), "streamed"),
+    "held": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"),
+    "held windows": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=7), "memory"),
+    "held twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4)
+                   .shuffle(seed=6, window=5), "memory"),
+}
+"""Layouts that cut documents across windows, each with a shuffle after it, or two: read as a stream, its
+window shuffled, or by a memory read, which shuffles them all; windows `stride` apart overlap."""
+
+
+def _drawn(loader, share, shares):
+    """Each batch's tokens, each as often as the batch holds it, and the examples it consumes, as share
+    `share` of `shares` reads them."""
+    stream = loader.train(DataPartition(index=share, count=shares))
+    read = []
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            tokens = collections.Counter(int(token) for token in held if token)
+            read.append((tokens, int(np.sum(batch[EXAMPLES_CONSUMED]))))
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return read
+
+
+@pytest.mark.parametrize("expands", [False, True])
+@pytest.mark.parametrize("shares", [1, 2])
+@pytest.mark.parametrize("layout", sorted(_SPLIT))
+def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_window_is_drawn(layout, shares,
+                                                                                            expands):
+    """Twelve documents of unique tokens, a run bounded to all twelve, laid across windows that cut them (a
+    concatenating pack, one that starts each cut 2 tokens back, or windows over the stream, overlapping
+    where they stand 2 tokens apart) and shuffled after, once or twice, read as a stream or by a memory
+    read, by one share or two, alone or through an objective that makes two rows of each window: no step's
+    batches take a document's count before the shares have drawn every window that holds a token of it,
+    each token as often as the whole read draws it, and the read takes every count it draws whole, none
+    twice. Each share lays its own documents, so each document's windows are one share's, and two shares
+    each lay some (row 1902)."""
+    laid, read = _SPLIT[layout]
+    chain = laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2 * shares)
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read=read, examples=len(_LENGTHS), objective=objective)
+    drawn = [_drawn(loader, share, shares) for share in range(shares)]
+    total = sum((tokens for batches in drawn for tokens, _ in batches), collections.Counter())
+    seen, consumed, whole = collections.Counter(), 0, 0
+    for step in itertools.zip_longest(*drawn, fillvalue=(collections.Counter(), 0)):
+        for tokens, examples in step:
+            seen += tokens
+            consumed += examples
+        whole = sum(all(seen[token] and seen[token] == total[token]
+                        for token in range(1000 * (index + 1), 1000 * (index + 1) + length))
+                    for index, length in enumerate(_LENGTHS))
+        assert consumed <= whole
+    assert consumed == whole
+    if not layout.endswith(("windows", "strided")):
+        # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
+        # past every window out.
+        assert consumed == len(_LENGTHS)
+    assert loader.order_records is None
+    owners = collections.defaultdict(set)
+    for share, batches in enumerate(drawn):
+        for tokens, _ in batches:
+            for token in tokens:
+                owners[token // 1000].add(share)
+    assert all(len(held) == 1 for held in owners.values())
+    if shares > 1:
+        assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
+
+
+def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_each_token_to_its_first():
+    """A streamed read of twelve documents in windows of 4 tokens 2 apart, bounded to all twelve, its
+    position saved by main 91527d9fe, which credited each token to the first window holding it, where it
+    had credited a document's last token the next window holds too (tests/fixtures/
+    overlapping_windows_position.json): restored where each token goes to the last window holding it, it
+    credits none twice, the read consuming the 11 examples whose last tokens a window holds, as the saving
+    read did (review of row 1902)."""
+    fixture = Path(__file__).with_name("fixtures") / "overlapping_windows_position.json"
+    recorded = json.loads(fixture.read_text())
+    chain = Pipeline(Memory(_pieces(), shard_rows=3)).windows(4, stride=2, fields=("id",))
+    chain = chain.read("streamed").batch(1)
+    stream = compile(chain, read="streamed", examples=len(_LENGTHS)).train(DataPartition())
+    try:
+        stream.set_state(recorded["state"].encode())
+        after = [int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in stream]
+    finally:
+        stream.close()
+    assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
+
+
+_MAPPED = {
+    "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
+                      .shuffle(seed=1, window=4), "streamed"),
+    "held mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept).shuffle(seed=4),
+                    "memory"),
+}
+"""Concatenating packs with a step that keeps each window between the pack and the shuffle."""
+
+
+def _kept(row):
+    return row
+
+
+@pytest.mark.parametrize("layout", ["concat", "overlap", "windows", "strided", "held", "concat mapped",
+                                    "held mapped"])
+def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutting_them_are_drawn(layout):
+    """Two named corpora of the twelve documents (`_pieces`, the right's tokens offset by 100,000), mixed
+    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`, a step that
+    keeps each window between them or not): by each batch, each member's rows (data/rows) are its documents
+    every token of which the batches delivered, which a window can hold pieces of two members' documents
+    (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = {**_SPLIT, **_MAPPED}[layout]
+    corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+               .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+    loader = compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+    # Every draw of each token the whole read makes, which a document's every window holds once drawn.
+    total = sum((tokens for tokens, _ in _drawn(loader, 0, 1)), collections.Counter())
+
+    def whole(seen, offset):
+        return sum(all(seen[token] and seen[token] == total[token]
+                       for token in range(offset + 1000 * (index + 1), offset + 1000 * (index + 1) + length))
+                   for index, length in enumerate(_LENGTHS))
+
+    stream = loader.train(DataPartition())
+    seen = collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            seen += collections.Counter(int(token) for token in held if token)
+            statistics = loader.statistics()
+            for name, offset in (("left", 0), ("right", 100_000)):
+                assert statistics.get(f"data/rows/{name}", 0) <= whole(seen, offset), name
+    finally:
+        stream.close()
+    for name, offset in (("left", 0), ("right", 100_000)):
+        assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
+
+
+@pytest.mark.parametrize("layout", ["strided", "concat"])
+def test_a_bounded_mixtures_member_counts_resume_while_a_layout_holds_a_document(layout):
+    """The mixed read of the test above, its windows 2 tokens apart or packed, its position saved after two
+    batches while its layout holds pieces of a document: restored, it delivers the batches and counts each
+    member as the uninterrupted read does (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = _SPLIT[layout]
+
+    def loader():
+        corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+                   .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+        return compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+
+    def rest(stream):
+        held = [np.asarray(batch["id"]).tolist() for batch in stream]
+        stream.close()
+        return held
+
+    whole = loader()
+    stream = whole.train(DataPartition())
+    for _ in range(2):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    resumed = loader()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert {name: value for name, value in resumed.statistics().items() if name.startswith("data/rows/")} == {
+        name: value for name, value in whole.statistics().items() if name.startswith("data/rows/")}
+
+
+@pytest.mark.parametrize("layout", ["concat", "held"])
+def test_a_shuffle_of_windows_cutting_documents_resumes_its_counts_where_it_saved_them(layout):
+    """A bounded read of a concatenating pack shuffled after, read as a stream or held by a memory read, its
+    position saved after three batches: restored, it reads the batches and counts the uninterrupted read
+    reads after them, the counts held for windows not yet drawn among them (row 1902)."""
+    laid, read = _SPLIT[layout]
+    loader = compile(laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2), read=read,
+                     examples=len(_LENGTHS))
+
+    def rest(stream):
+        held = [(np.asarray(batch["id"]).tolist(), np.asarray(batch[EXAMPLES_CONSUMED]).tolist())
+                for batch in stream]
+        stream.close()
+        return held
+
+    stream = loader.train(DataPartition())
+    for _ in range(3):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    restored = loader.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert sum(sum(consumed) for _, consumed in after) > 0
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("kind", ["memory", "parquet"])
+@pytest.mark.parametrize("examples", [15, 7, 20])
+def test_a_bounded_streamed_read_of_stated_shards_hands_out_each_example_once_a_pass_whatever_its_workers(
+        examples, kind, workers, tmp_path):
+    """A streamed read of five shards of three rows that state their rows, bounded to `examples` of its 15
+    examples, hands out each example once for each pass its bound reaches and consumes exactly its bound,
+    and the examples are those a read without workers hands out. Workers change how a stream is read and
+    leave the examples a run sees as they were (`Loading`)."""
+    chain = sharded_records(kind, tmp_path)
+    read, consumed = bound_read(chain, examples, workers)
+    assert sum(read.values()) == consumed == examples
+    assert max(read.values()) == -(-examples // SHARDED_RECORDS)
+    if workers:
+        assert read == bound_read(chain, examples, 0)[0]
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("examples", [15, 7])
+def test_a_bounded_streamed_read_of_unstated_shards_consumes_its_bound_whatever_its_workers(
+        examples, workers, tmp_path):
+    """The same read over five files of jsonl, whose shards state no rows, so a bound reaches its examples
+    by count and not by place: its loading workers hand out the bound's examples between them, as many as
+    it names and each consumed once, and no worker reads a bound of its own."""
+    read, consumed = bound_read(sharded_records("jsonl", tmp_path), examples, workers)
+    assert sum(read.values()) == consumed == examples
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("kind", ["memory", "jsonl"])
+def test_a_bounded_read_whose_bound_one_worker_holds_resumes_from_before_the_other_started(kind, tmp_path):
+    """Seven examples of shards of ten rows, read by two loading workers: the bound lies within one shard,
+    so one worker is dealt all of it and the other none. A position saved after the first batch, before the
+    worker dealt nothing has read, resumes: the batches after it hand out the rest of the seven, each once,
+    as the read it was saved from does."""
+    ids = np.arange(1, 51, dtype=np.int32)
+    if kind == "memory":
+        chain = Pipeline(Memory({"id": ids}, shard_rows=10))
+    else:
+        for part in range(5):
+            (tmp_path / f"part-{part}.jsonl").write_text(
+                "".join(json.dumps({"id": int(record)}) + "\n" for record in ids[part * 10:(part + 1) * 10]))
+        chain = Pipeline(Files(str(tmp_path / "part-*.jsonl"), format="jsonl"))
+    loader = compile(chain.batch(4), read="streamed", examples=7, loading=Loading(workers=2))
+
+    def real(batch) -> list[int]:
+        kept = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+        return np.asarray(batch["id"])[kept].tolist()
+
+    whole = loader.train(DataPartition())
+    try:
+        first = real(next(iter(whole)))
+        saved = whole.get_state()
+        rest = [record for batch in whole for record in real(batch)]
+    finally:
+        if isinstance(whole, Closeable):
+            whole.close()
+    assert len(first) + len(rest) == 7 and len(set(first + rest)) == 7
+    resumed = loader.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert [record for batch in resumed for record in real(batch)] == rest
+    finally:
+        if isinstance(resumed, Closeable):
+            resumed.close()
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("kind", ["memory", "jsonl"])
+@pytest.mark.parametrize("examples", [15, 7])
+def test_a_pools_bounded_streamed_read_is_dealt_between_its_workers_as_between_its_shares(
+        examples, kind, workers, tmp_path):
+    """Two shares of a pool, each read by `workers` loading workers, hand out between them exactly the
+    bound's examples, each consumed once, and where the shards state their rows each example goes to one
+    share and one of its workers."""
+    read, consumed = bound_read(sharded_records(kind, tmp_path), examples, workers, shares=2)
+    assert sum(read.values()) == consumed == examples
+    if kind == "memory":
+        assert max(read.values()) == 1
+
+
 POOLED = 3
 """The shares of the pools a bound in examples is dealt between, which the ten records' passes do not
 split evenly."""
@@ -204,6 +627,20 @@ POOL_DEALS = {
     "dealt shards rewound interleaved": lambda rows: rows.interleave(2).random_map(
         Untouched(), identity="untouched@1").repeat(),
 }
+
+
+@pytest.mark.parametrize("workers", [2, 3])
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_a_streams_take_read_by_loading_workers_takes_its_count_of_the_rows_they_read(shuffled, workers):
+    """A streamed read of 12 records in shards of 4, in order or shuffled in a window, read once and its
+    first 5 rows taken (`.take(5)`), by `workers` loading workers, each of which reads its own slice of the
+    shards: the take counts the rows the workers hand on together, so the read holds 5 rows, each record
+    once, where each worker took 5 of its own slice (row 3296)."""
+    stored = Memory({"id": np.arange(1, 13, dtype=np.int32)}, shard_rows=4)
+    chain = Pipeline(stored).shuffle(seed=3, window=12) if shuffled else Pipeline(stored)
+    taken = ids_read(compile(chain.repeat(1).take(5).batch(1), read="streamed",
+                             loading=Loading(workers=workers, threads=1, read_buffer=2)), "id")
+    assert sum(taken.values()) == len(taken) == 5
 
 
 @pytest.mark.parametrize("examples", [1, 7, 23])
@@ -291,15 +728,6 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
     assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
     assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
         [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
-
-
-class Fanned:
-    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
-    tokens naming it (`id * 10 + question`)."""
-
-    def flat_map(self, element):
-        record = int(element["id"])
-        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
 
 
 class LastDropped(grain.MapTransform):
@@ -515,16 +943,17 @@ def clocked_descent(accumulation: int):
 
 
 def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
-                learning_rate=None, examples: int = CLOCKED_RECORDS):
+                learning_rate=None, examples: int = CLOCKED_RECORDS, rollout=None):
     """A run bounded to `examples` examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
-    batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
+    batches of BATCH rows, through `rollout` where given, checkpointed to `directory` where given: its
+    final state and its tracker."""
     tracker = RecordingTracker()
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
     optim = OptimConfig(optimizer="adam", learning_rate=learning_rate or Linear(peak_value=PEAK,
                                                                                 end_value=CLOCKED_END))
-    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
+    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation, rollout=rollout,
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
 
@@ -600,8 +1029,79 @@ def test_a_clocked_run_names_its_length_once():
     with pytest.raises(ValueError):
         thin_fit(x, chain=clocked_chain(x).take(2), examples=CLOCKED_RECORDS)
     with pytest.raises(ValueError):
-        clocked(CLOCK_LIMIT + 1, None, custom=False, rollout=False)
-    assert clocked(CLOCK_LIMIT, None, custom=False, rollout=False) == CLOCK_LIMIT
+        clocked(CLOCK_LIMIT + 1, None)
+    assert clocked(CLOCK_LIMIT, None) == CLOCK_LIMIT
+
+
+def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_at_its_bound():
+    """A run bounded to its CLOCKED_RECORDS records, read as a stream no plan counts steps ahead of (its
+    objective makes 0 to 2 rows of each, `Thin`), whose rollout hands back the batch it reads, each batch
+    it makes consuming the examples of those it read (`dew.training.rollout.clocked_rollout`), steps as
+    the run without a rollout, over its progress: every step's loss and the final weight, its last short
+    window closed, and its clock at its bound (row 2437)."""
+    (x,) = clocked_records(0)
+    plain, rolled = RecordingTracker(), RecordingTracker()
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    alone = Trainer(Thin(), optim, key=0, accumulation=2, tracker=plain).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    handed = Trainer(Thin(), optim, key=0, accumulation=2, tracker=rolled,
+                     rollout=lambda state, batch, key: batch).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
+                                                                  log_every=1)
+    assert int(handed.consumed) == int(alone.consumed) == CLOCKED_RECORDS
+    np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
+                                  np.asarray(alone.variables["params"]["w"]))
+    assert losses(rolled) == losses(plain) != []
+
+
+class DrawingFurther:
+    """A rollout that draws one batch past its step's (`draws_further`) and makes its step of that one,
+    or of the step's where the stream has run out, each its rows as host code reads them (`local_rows`)."""
+
+    draws_further = True
+
+    def __call__(self, state, batch, key, further):
+        from dew.nn.inputs import local_rows
+
+        drawn = further()
+        return {name: local_rows(column) for name, column in (batch if drawn is None else drawn).items()}
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_rollout_drawing_further_on_the_examples_clock_resumes_as_it_ran(accumulation, tmp_path):
+    """A run bounded to its CLOCKED_RECORDS examples, read as a stream no plan counts ahead, whose rollout
+    draws a batch past each step's (`DrawingFurther`): every batch it read consumes its examples, the run
+    reading ahead for its stream's end after the rollout's last draw, so it ends at its bound; paused at
+    half its examples and resumed, it trains on as the run that never paused, step for step and in its
+    weight, its checkpoint holding the position after every batch the rollout drew (row 3329)."""
+    (x,) = clocked_records(0)
+    whole, ran = clocked_fit(x, accumulation, rollout=DrawingFurther())
+    paused, before = clocked_fit(x, accumulation, directory=tmp_path, stop=Pause(0.5),
+                                 rollout=DrawingFurther())
+    resumed, after = clocked_fit(x, accumulation, directory=tmp_path, rollout=DrawingFurther())
+    assert int(paused.consumed) < int(resumed.consumed) == int(whole.consumed) == CLOCKED_RECORDS
+    np.testing.assert_array_equal(np.asarray(resumed.variables["params"]["w"]),
+                                  np.asarray(whole.variables["params"]["w"]))
+    assert losses(before) + losses(after) == losses(ran) != []
+
+
+def test_a_custom_step_trains_a_run_bounded_in_examples_whose_schedule_reads_no_progress():
+    """A custom step (`Trainer(step=...)`), whose update the run's progress is not handed, trains a run
+    bounded in examples that no plan counts steps ahead of (`clocked_chain`) to its bound under a schedule
+    of its own steps, its clock at the bound; under one that decays over the whole run, which reads that
+    progress, the run is refused before a step (row 2437)."""
+    def stepped(objective, optimizer):
+        def step(state, batch):
+            return (state.replace(microstep=state.microstep + 1, updates=state.updates + 1),
+                    jnp.zeros([], jnp.float32), Aux({}))
+        return step
+
+    (x,) = clocked_records(0)
+    own = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, decay_steps=4))
+    state = Trainer(Thin(), own, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
+    assert int(state.consumed) == CLOCKED_RECORDS
+    whole = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK))
+    with pytest.raises(ValueError):
+        Trainer(Thin(), whole, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
 
 
 def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_clock_keeps_none(tmp_path):

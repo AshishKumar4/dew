@@ -10,9 +10,8 @@ name, for what runs for every file: collection, conftests, session- and package-
 from the session's end on. A file's record (`recorded`) is everything the process did up to the end of the
 file's last visit, its owner's and any earlier file's alike, as what ran before it may serve it from a
 cache or a module it left, everything `SHARED` did, whenever, and its own children's and `SHARED`'s
-children's records (followed.py). CI gives each test file a process of its own (ci.py's `alone`), so no
-file's record holds another's; a process that runs several, as a local run does, keeps the rule. A process
-whose log never closed, or one with a start no event follows, leaves the files it reached without a key. The standard library alone: it runs before site-packages are
+children's records (followed.py). A process whose log never closed, or one with a start no event follows,
+leaves the files it reached without a key. The standard library alone: it runs before site-packages are
 on the path."""
 
 import atexit
@@ -32,8 +31,7 @@ TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's;
 followed.py's children hold 4."""
 CHILD_START = BaseProcess.start.__code__
-"""Where every multiprocessing context starts a child: Python 3.12 audits no spawn or forkserver start, and
-3.14 audits the exec beneath it (followed.py's `start`)."""
+"""Where every multiprocessing context starts a child: Python 3.12 audits no spawn or forkserver start."""
 
 root = os.getcwd() + os.sep
 owners: list[str] = [SHARED]
@@ -107,11 +105,9 @@ def kept(read: str | None) -> None:
 
 def started(code, offset):
     """sys.monitoring's PY_START: the checkout's code a run executes, once an owner, and where it reads the
-    backend; a multiprocessing child's start, followed where it spawns the child (`followed.spawned`)."""
+    backend; a multiprocessing child's start, whose child no event follows."""
     if code is CHILD_START:
-        # The callback runs in the frame of the `start` it is called for: a spawned child records itself.
-        if (how := followed.spawned(code, sys._getframe(1))) != "forked":
-            write(owner(), f"{STARTED}{how}")
+        write(owner(), f"{STARTED}unfollowed")
         return None
     if code.co_name == followed.OPENED[0] and code.co_filename.endswith(followed.OPENED[1]):
         # Registered after jax's own clean-up, so it reads the pool before the backend closes.
@@ -194,8 +190,6 @@ def boot() -> None:
     path = Path(os.environ[LOG])
     log = path.open("a", buffering=1)
     atexit.register(closing)
-    # A forked child writes into this log as this process does, and its end is not this process's.
-    os.register_at_fork(after_in_child=lambda: atexit.unregister(closing))
     directory = path.with_name(f"{path.name}.children")
     directory.mkdir(exist_ok=True)
     children = str(directory)
@@ -203,7 +197,7 @@ def boot() -> None:
         write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
             write(SHARED, file[len(root):])
-    importer = followed.imports(lambda item: write(owner(), item), root)
+    importer = followed.imports(lambda item: write(owner(), item))
     sys.meta_path.insert(0, importer)
     followed.opening(kept, root)
     sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
@@ -219,24 +213,6 @@ def followed_children() -> None:
                    "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                    "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, ""), "DEW_EXECUTED_FILE": SHARED}
     followed.installed()
-    followed_spawn()
-
-
-def followed_spawn() -> None:
-    """The children `multiprocessing` spawns (a `Process` of its `spawn` context: Grain's loading workers)
-    start with the site, as a Python child of any other start does, so the `.pth` (followed.py's `installed`)
-    runs `follow` in them: this process runs with -S (session.py's `BOOT`), which `multiprocessing` passes
-    on to its children, whose site (and so the `.pth`) is then never made."""
-    import multiprocessing.spawn
-
-    command_line = multiprocessing.spawn.get_command_line
-
-    def with_site(**keywords):
-        command = command_line(**keywords)
-        code = command.index("-c")
-        return [argument for at, argument in enumerate(command) if argument != "-S" or at > code]
-
-    multiprocessing.spawn.get_command_line = with_site
 
 
 def run(installed=lambda: None) -> None:

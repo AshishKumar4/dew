@@ -88,8 +88,9 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     of a key head resident, walked by the query tiles that see them, streamed with their output cotangents
     through one ring its consumers read (`_coop_step`), under the first pass's D and the forward's
     denominator; each consumer's share of the columns of dQ added a tile at a time, and of dK and dV into
-    its key head's own (`Family.added`, zeros: a key head's query heads add theirs). Returns dQ
-    `[B, Qp, H, D]`, dK and dV `[B, Kp, KV, D]`, fp32."""
+    its key head's own (`Family.added`, zeros: a key head's query heads add theirs; dK's and dV's zeros one
+    ref of both, `mosaic.stacked_zeros`, row 3180).
+    Returns dQ `[B, Qp, H, D]`, dK and dV `[B, Kp, KV, D]`, fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
     program, consumers = walk.program, walk.consumers
@@ -102,7 +103,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
-        dq_ref, dk_ref, dv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
+        dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
+        dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], ((0, 1),))
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
@@ -167,6 +169,9 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
-    dk, dv = (jax.new_ref(jnp.zeros((batch, keys_padded, kv_heads, width), jnp.float32)) for _ in range(2))
-    launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, dk, dv)
-    return jax.freeze(dq), jax.freeze(dk), jax.freeze(dv)
+    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    groups = mosaic.stacked_groups(shapes)
+    dkv = mosaic.stacked_zeros(shapes, groups)
+    launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)
+    dk, dv = mosaic.stacked_read(dkv, groups)
+    return jax.freeze(dq), dk, dv

@@ -254,6 +254,9 @@ GATE_ACTIVATIONS = {
     'silu': jax.nn.silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
     'softplus2': lambda gate: jax.nn.softplus(gate * math.log(2)) / math.log(2),
+    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
+    # product casts back (modeling_laguna.py:410).
+    'softplus': lambda gate: jax.nn.softplus(gate.astype(at_least_fp32(gate.dtype))),
 }
 """The output gate's activations (`MixerContext.output_gate_activation`)."""
 
@@ -459,7 +462,7 @@ class CausalSelfAttention(nn.Module):
     def _ngpt_rotated(self, ngpt: NGPT, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
         learned gain, in at least fp32 and back to its dtype (dory.py:139-149)."""
-        heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
+        heads = gain(self.sqk, ngpt.query(self.ctx.head_dim), query.dtype)
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
         query = (jnp.square(heads) * l2norm(query).astype(at_least_fp32(query.dtype))).astype(query.dtype)
         return query, l2norm(key)
@@ -648,6 +651,9 @@ class CausalSelfAttention(nn.Module):
                      else self.v_proj(x))
         else:
             key, value = projected
+        if self.ctx.key_multiplier is not None:
+            # Before its norm and rotation, as Falcon-H1's keys (`k_proj(x) * key_multiplier`).
+            key = scaled(key, self.ctx.key_multiplier)
         key = checkpoint_name(key, 'k_proj')
         if not self.ctx.k_eq_v:
             value = checkpoint_name(value, 'v_proj')
@@ -1488,7 +1494,7 @@ class CausalSelfAttention(nn.Module):
             # nGPT scales the gate's logits by the square of their learned gain, gates in at least
             # fp32 and unit-norms the gated heads together (dory.py:154-157).
             wide = at_least_fp32(jnp.result_type(gate, attention))
-            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
+            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features), wide)
             logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
             attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
