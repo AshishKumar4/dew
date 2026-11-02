@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_matrix import operands, terms_of
 from attention_oracle import attention_terms, kept
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
@@ -56,11 +57,6 @@ def _route(causal: bool, implementation: AttentionImpl = "template"):
     return step
 
 
-def _hook_shape(kind) -> tuple:
-    """A parameter of `kind`'s shape: a key's `[B, H, K]`, a tile's `[B, H, Q, K]`."""
-    return (1, HEADS, LENGTH) if kind is template.Kind.KEY else (1, HEADS, LENGTH, LENGTH)
-
-
 def _hooked_route(kind, *, reference: bool = False):
     """The route's training step (`attention_route.attend`, or the template's reference path) under a score
     hook of two parameters of `kind`, `s + a + 2 b`: the gradients of `sum(attention * dout)` of the query,
@@ -84,50 +80,16 @@ def _hooked_route(kind, *, reference: bool = False):
     return step
 
 
-def _drawn(width: int, heads: int, kv_heads: int, kind=None):
-    """A draw of a training step's operands at `width`, bf16 (and two parameters of `kind`, fp32)."""
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 6)
-        query, dout = (jax.random.normal(stream, (1, LENGTH, heads, width), jnp.bfloat16)
-                       for stream in streams[:2])
-        key, value = (jax.random.normal(stream, (1, LENGTH, kv_heads, width), jnp.bfloat16)
-                      for stream in streams[2:4])
-        if kind is None:
-            return query, key, value, dout
-        a, b = (0.5 * jax.random.normal(stream, _hook_shape(kind), jnp.float32) for stream in streams[4:])
-        return query, key, value, dout, a, b
+def _terms(causal: bool, kind=None):
+    """The gradients' float64 terms (`terms_of`, without the output's): a causal query that keeps few keys
+    has a dQ that cancels toward zero in float64, held to its terms' rounding, not to its own size; under a
+    hook of `kind`, its two parameters' terms beside them."""
+    terms = terms_of(kept(LENGTH, LENGTH, causal=causal), HEADS, kind=kind)
 
-    return draw
+    def gradients(*drawn):
+        return terms(*drawn)[1:]
 
-
-def _terms(causal: bool):
-    """The gradients' float64 terms (`attention_terms`): a causal query that keeps few keys has a dQ that
-    cancels toward zero in float64, held to its terms' rounding, not to its own size."""
-    keep = kept(LENGTH, LENGTH, causal=causal)
-
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[1:4])
-
-    return terms
-
-
-def _hooked_terms(kind):
-    """`_terms` of the hooked step `s + a + 2 b` (`_hooked_route`): the hook's parameters a bias of the logits
-    (`attention_terms`' fifth, an entry's), summed over the queries a key parameter shares, and twice it for
-    `b`."""
-    keep = kept(LENGTH, LENGTH, causal=True)
-
-    def terms(query, key, value, dout, a, b):
-        def tile(param):
-            param = np.asarray(param, np.float64)
-            return param[:, :, None, :] if kind is template.Kind.KEY else param
-
-        bias = np.broadcast_to(tile(a) + 2.0 * tile(b), (1, HEADS, LENGTH, LENGTH))
-        _, dq, dk, dv, entries = attention_terms(query, key, value, dout, keep, bias=bias)
-        shared = np.sqrt(np.sum(np.square(entries), axis=2)) if kind is template.Kind.KEY else entries
-        return dq, dk, dv, shared, 2.0 * shared
-
-    return terms
+    return gradients
 
 
 @ON_HOPPER
@@ -143,7 +105,8 @@ def a_routes_one_launch_backward_is_on_par_on_an_h100(name: str, causal: bool) -
         with tuning.pinned({attention_mosaic.MosaicBackward: config}):
             return _route(causal)(*operands)
 
-    assert_as_exact(jax.jit(ours), jax.jit(_route(causal, "reference")), _drawn(width, heads, kv_heads),
+    assert_as_exact(jax.jit(ours), jax.jit(_route(causal, "reference")),
+                    operands(width, heads, kv_heads, jnp.bfloat16),
                     f"one launch {name} {'causal' if causal else 'full'}", seeds=SEEDS, terms=_terms(causal))
 
 
@@ -154,4 +117,57 @@ def a_routes_hooked_backward_is_on_par_on_an_h100(name: str) -> None:
     reference path's (check 1), the dK/dV launch's two hook gradients two buffers (row 3180)."""
     kind = HOOKED[name]
     assert_as_exact(jax.jit(_hooked_route(kind)), jax.jit(_hooked_route(kind, reference=True)),
-                    _drawn(64, HEADS, 2, kind), f"hooked {name}", seeds=SEEDS, terms=_hooked_terms(kind))
+                    operands(64, HEADS, 2, jnp.bfloat16, kind), f"hooked {name}", seeds=SEEDS,
+                    terms=_terms(causal=True, kind=kind))
+
+
+WINDOW = 256
+SPANNED = {"fused-64": (64, TILES(128, 64, 2, 2, fused=True, family="wgmma.fed")),
+           "fused-128": (128, TILES(64, 64, 2, 2, fused=True, family="wgmma.fed"))}
+"""Row 3171's call (ET-3171-BAND-h100), the one launch pinned at the tiles a plain call derives: a packed
+windowed causal call, three documents and padding over 1024 keys (ids from 1: 0 is padding), a window of
+256, 8 query heads over 2, at width 64 and at 128."""
+
+
+def _spanned(width: int, implementation: str):
+    """Row 3171's training step through the route (`attention_route.attend`) or the template's reference path:
+    the output, and the gradients of `sum(out * dout)` of the query, key and value, and the keys each query
+    keeps."""
+    lengths = (300, 400, 200)
+    padding = np.zeros(LENGTH - sum(lengths), int)
+    segments = np.concatenate([np.repeat(np.arange(1, 4), lengths), padding])[None]
+    spans = template.spans(LENGTH, LENGTH, 1, causal=True, sliding_window=WINDOW,
+                           segment_ids=jnp.asarray(segments, jnp.int32))
+
+    def step(query, key, value, dout):
+        def attended(query, key, value):
+            if implementation == "reference":
+                return jnp.asarray(template.reference(query, key, value, spans))
+            return jnp.asarray(attention_route.attend(query, key, value, spans))
+
+        out, pull = jax.vjp(attended, query, key, value)
+        return (out, *pull(dout))
+
+    return step, kept(LENGTH, LENGTH, causal=True, sliding_window=WINDOW, segment_ids=segments)
+
+
+@ON_HOPPER
+@pytest.mark.parametrize("name", SPANNED)
+def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
+    """Row 3171's packed windowed call through the route on an H100, its backward pinned to the one launch,
+    on par with the reference path's (check 1): its dK and dV, wrong and unrepeatable there before row 3180's
+    fix, on par with it (ET-SPAN-h100). The derivation still gives span calls two launches, the faster there
+    (`MosaicBackward.derived`)."""
+    width, config = SPANNED[name]
+    step, keep = _spanned(width, "template")
+
+    def ours(*operands):
+        with tuning.pinned({attention_mosaic.MosaicBackward: config}):
+            return step(*operands)
+
+    def terms(query, key, value, dout):
+        return tuple(attention_terms(query, key, value, dout, keep)[:4])
+
+    assert_as_exact(jax.jit(ours), jax.jit(_spanned(width, "reference")[0]),
+                    operands(width, HEADS, 2, jnp.bfloat16),
+                    f"span call one launch {name}", seeds=SEEDS, terms=terms)

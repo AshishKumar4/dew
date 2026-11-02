@@ -49,12 +49,13 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel
+from dew.nn.continuum import Continuum, ContinuumLevel, _head_loss_bounds, _squared_norm
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.quantization import quantized_products
 from dew.registry import from_record, read_arguments
 
-from ..activations import GatedActivation, Situ, ungated_activation
+from ..activations import _SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
@@ -948,8 +949,8 @@ class CausalTransformer(nn.Module):
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
-            self.continuum_level = Continuum(self.continuum, dtype=self.dtype, precision=self.precision,
-                                             name='continuum')
+            self.continuum_level = Continuum(self.continuum, self.emb_features, dtype=self.dtype,
+                                             precision=self.precision, name='continuum')
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -1273,17 +1274,30 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
-    def affine_head(self) -> bool:
-        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
-        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
-        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
-        modules alone leaves it affine, and a tied head reads its table with none."""
-        # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
-        heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
-                                                                  else [self.project_out])]
-        quantized = any(self._quantizer(head) is not None for head in heads)
-        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
-                and not quantized)
+    def head_bounds(self) -> tuple[jax.Array, jax.Array]:
+        """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states
+        `head_logits` reads (`dew.nn.continuum._head_loss_bounds`, `SteppedInContext`), from the bound model's
+        rows (`vocabulary_rows`, an adapter applied), softcap and transform. A head map (`lm_head`,
+        `project_out`, `head_dense`, or a tied head's product in the model's own scope) that rounds its
+        input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel
+        Qwix rounds multiplies by a matrix these norms do not read: refused."""
+        heads = [*([] if self.tie_embeddings else ["lm_head"]),
+                 *([] if self.embedding_features is None else ["project_out"]),
+                 *([] if self.head_transform is None else ["head_dense"])]
+        rounded = [name for name in heads
+                   if self.nonlinear_input(name) or quantized_products(self, name).weights]
+        tied = quantized_products(self) if self.tie_embeddings else None
+        rounded += ["the tied table's product"] if tied is not None and (tied.inputs or tied.weights) else []
+        if rounded:
+            raise ValueError(f"a damped step bounds the head's curvature in its states, and the head's "
+                             f"{rounded} round their inputs, making it piecewise constant there, which no "
+                             f"curvature bounds, or their kernels, a matrix these bounds do not read: step "
+                             f"it undamped")
+        transform = None if self.head_transform is None else (
+            _SLOPES[UNGATED[self.head_transform]], _squared_norm(self.applied_kernel("head_dense")),
+            self.head_norm.largest_gain(), self.head_norm.epsilon)
+        return _head_loss_bounds(_squared_norm(jnp.asarray(self.vocabulary_rows())), self.final_logit_softcap,
+                                transform)
 
     @nn.nowrap
     def in_context_level(self, variables):
@@ -1301,6 +1315,13 @@ class CausalTransformer(nn.Module):
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
         return self.continuum_level(hidden)
+
+    def level_terms(self, hidden, parts: tuple[str, ...]):
+        """What bounds a damped step of the continuum level's `parts` at final states `hidden`, its maps'
+        inputs as a checkpoint's quantizers round them (`Continuum.step_terms`, `SteppedInContext`)."""
+        if self.continuum is None:
+            raise ValueError("this model has no continuum level")
+        return self.continuum_level.step_terms(hidden, parts, self._quantizer)
 
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a
@@ -2130,6 +2151,11 @@ class CausalTransformer(nn.Module):
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
         return getattr(self, name).get_variable("params", "kernel")
+
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` other than as a linear map of its input
+        (`dew.nn.continuum.Continuum.nonlinear_input`), which a damped step's head bounds read."""
+        return quantized_products(self, name).inputs
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
