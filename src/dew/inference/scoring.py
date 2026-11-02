@@ -60,12 +60,6 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     of its own: the server holds them resident, and hands them to every pass, so a task and the weights
     it scores with are one pair the server swaps whole (`ScoringServer.reload`)."""
 
-    @property
-    def model(self) -> StagedStacks:
-        """The model whose weights the task's passes read, which names the layers a stage-local run's
-        store holds stacked (`ScoringServer.reload`, `stored_layers`)."""
-        ...
-
     def admit(self, request: Request) -> ScoringRequest[Row, Payload]:
         """`request` laid out as the rows the task's passes read; raises ValueError for a request it
         refuses."""
@@ -87,6 +81,17 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
 
     def answer(self, payload: Payload, outputs: Sequence[Output]) -> Answer:
         """A request's answer from what it admitted and its rows' outputs, in its rows' order."""
+        ...
+
+
+@runtime_checkable
+class ModelScoring(Protocol):
+    """A scoring task that names the model its passes read (a decision's), through which a stage-local
+    run's store is read on its stored layers (`ScoringServer.reload`, `stored_layers`)."""
+
+    @property
+    def model(self) -> StagedStacks:
+        """The model whose weights the task's passes read."""
         ...
 
 
@@ -268,11 +273,16 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         task with its own weights, as a task's calibration is fitted to the weights it came with.
         The tree must match the served one (`dew.inference.engine.normalized`), and its leaves are
         copied onto the served placement before the swap. Safe against a `step` on another thread."""
-        # A stage-local run's state is read on its stored layers, as the served tree holds them.
-        from dew.nn.backbones.layer_names import stored_layers
+        # A stage-local run's store is read on its stored layers, as the served tree holds them, by the
+        # layers its task's model names.
+        from dew.nn.backbones.layer_names import stage_count, stored_layers
 
-        self._served = (task, reloaded(normalized(stored_layers(task.model, variables), self._source_shapes),
-                                       self.variables))
+        if stage_count(variables) > 1:
+            if not isinstance(task, ModelScoring):
+                raise ValueError(f"a stage-local run's store reloads into a scoring task that names the "
+                                 f"model its passes read (ModelScoring); a {type(task).__name__} names none")
+            variables = stored_layers(task.model, variables)
+        self._served = (task, reloaded(normalized(variables, self._source_shapes), self.variables))
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the task's pass traces under."""
