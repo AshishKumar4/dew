@@ -1329,10 +1329,12 @@ def targeted(python: str, arguments: list[str], report: Path, tests: Sequence[st
     """pytest's exit status on `arguments` (files, node ids and options) and `tests` in `split`'s group, run
     as a CI task runs them (`session.pytest_run`, `selection`, `site_environment`): a lane's targeted run
     (tmp/run_tests.py) and the gangs select as CI does, and an option of their own (a `-m` after CI's)
-    chooses instead."""
-    return subprocess.run([*session.pytest_run(python, report), *arguments, *selection(list(tests), split)],
-                          env=session.pytest_environment(site_environment(SITE.fullmatch(split))),
-                          check=False).returncode
+    chooses instead. A file's group sets aside its sites as CI's does (`selected`), which run in their own
+    tasks alone (2026-11-02: a targeted group ran a site's every seed itself, 2233 s against CI's 8)."""
+    site = SITE.fullmatch(split)
+    run = selected(session.pytest_run(python, report), False, site=site is not None)
+    return subprocess.run([*run, *arguments, *selection(list(tests), split)],
+                          env=session.pytest_environment(site_environment(site)), check=False).returncode
 
 
 def flow_cells(cases) -> dict[str, dict]:
