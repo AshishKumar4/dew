@@ -761,6 +761,27 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
 
 
+def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
+    """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
+    resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an
+    sm90 kind the table names no SKU of its own kind, its peaks unknown, never the generation's canonical
+    device's."""
+    from types import SimpleNamespace
+
+    from dew.nn.kernels.generation import device_target
+
+    def device(kind, cores):
+        return SimpleNamespace(platform="gpu", device_kind=kind, compute_capability="9.0", core_count=cores,
+                               local_hardware_id=0)
+
+    pcie = device_target(device("NVIDIA H100 PCIe", 114))
+    unnamed = device_target(device("NVIDIA H20", 78))
+    assert (pcie.generation, pcie.device_kind, pcie.bf16_peak, pcie.multiprocessors) == (
+        "sm90", "NVIDIA H100 PCIe", 756e12, 114)
+    assert (unnamed.generation, unnamed.device_kind, unnamed.bf16_peak, unnamed.multiprocessors) == (
+        "sm90", "NVIDIA H20", None, 78)
+
+
 def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
     """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
     compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
