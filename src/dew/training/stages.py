@@ -399,7 +399,8 @@ def _states(node) -> list:
     if node is None:
         return []
     children, structure = jax.tree_util.tree_flatten(node, is_leaf=lambda child: child is not node)
-    if jax.tree_util.treedef_is_leaf(structure):
+    # A leaf is one value; an empty node (a transform's state of no fields, Gauss-Newton's) is a state.
+    if jax.tree_util.treedef_is_leaf(structure) and structure.num_leaves == 1:
         return []
     own = [] if type(node) in (tuple, list, dict) else [node]
     return own + [state for child in children for state in _states(child)]
