@@ -175,16 +175,23 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
 def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
     """Dew's head, the release's fp32 head, its float64 head, and the terms
     Dew's float64 head sums for each logit (`float64_forward`), all on the
-    same fp32 backbone states, over every question of every case."""
+    same fp32 backbone states, over every question of every case. Each case
+    runs alone, padded to the cases' widest layout, so every case is one
+    program, compiled once, and padding reaches none of the head's pooling
+    (`test_a_padded_batch_scores_every_row_as_it_scores_alone`)."""
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     # Dew's head compiled, as a served task's pass runs it.
     head = jax.jit(loaded.model.apply)
     found, reference, truth, terms = [], [], [], []
+    rows = laid_out(tokenizer)
+    widest = DecisionInputs.collate([row for _, row in rows.values()], 0)
+    length = widest.tokens.shape[1]
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
-        for case, (_, row) in laid_out(tokenizer).items():
-            inputs = DecisionInputs.collate([row], 0)
-            given = (loaded.variables, states[case][None], inputs, table)
+        for index, (case, (_, row)) in enumerate(rows.items()):
+            inputs = jax.tree.map(lambda leaf, at=index: leaf[at:at + 1], widest)
+            padded = np.pad(states[case], ((0, length - len(states[case])), (0, 0)))[None]
+            given = (loaded.variables, padded, inputs, table)
             scores = head(*given)
             _, summed = float64_forward(loaded.model, *given)
             for slot, laid in enumerate(row.questions):
@@ -477,7 +484,8 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
-    task = Decide.averaged(runs, calibrate_on=examples * 4)
+    # Each example twice: a temperature fit's optimum is the examples' own, whatever their copies.
+    task = Decide.averaged(runs, calibrate_on=examples * 2)
     assert task.calibration != Calibration()
     averaged = str(tmp_path / "averaged")
     task.save(averaged)
