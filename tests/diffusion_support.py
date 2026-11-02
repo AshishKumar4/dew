@@ -175,9 +175,14 @@ def trained_step(objective, batch, checkpoints=None):
     initial = trainer.initial_state()
     fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
 
-    def value(params) -> float:
+    @jax.jit
+    def mean(params):
         loss, _ = objective.loss(params, batch, fixed)
-        return float(loss.total / loss.mass)
+        return loss.total / loss.mass
+
+    def value(params) -> float:
+        # One compiled loss read before and after the step, as the trainer's own step compiles it.
+        return float(mean(params))
 
     before = value(initial.variables)
     # The step donates the state it is given, the loaded source's own arrays among its leaves, so

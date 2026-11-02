@@ -9,6 +9,7 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 import dataclasses
 import itertools
 import json
+import os
 
 import jax
 import jax.numpy as jnp
@@ -95,6 +96,27 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
              for entry in (plan, *frontier)]
     assert len(set(rungs)) == len(rungs)
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+
+
+def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
+    """A step compiled for compile-only GPUs takes autotuning off (`deviceless_options`), its programs' bytes
+    the same: XLA's config assigner gives each matmul its default config where no device is attached, while
+    its autotuner would still compile every candidate it cannot time. A run's own XLA_FLAGS setting, and a
+    mesh of devices that run, keep the options as given."""
+    from dew.training.ahead import compile_only_gpus
+    from dew.training.memory import deviceless_options
+
+    monkeypatch.setenv("XLA_FLAGS", " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                                             if not flag.startswith("--xla_gpu_autotune_level")))
+    deviceless = MeshSpec().build(compile_only_gpus("sm90", 1))
+    assert deviceless_options(deviceless, None) == {"xla_gpu_autotune_level": 0}
+    assert deviceless_options(deviceless, {"xla_gpu_enable_triton_gemm": False}) == {
+        "xla_gpu_enable_triton_gemm": False, "xla_gpu_autotune_level": 0}
+    running = MeshSpec().build(jax.devices()[:1])
+    assert deviceless_options(running, {"xla_gpu_enable_triton_gemm": False}) == {
+        "xla_gpu_enable_triton_gemm": False}
+    monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
+    assert deviceless_options(deviceless, None) is None
 
 
 def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refused(tmp_path, monkeypatch):
