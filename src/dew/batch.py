@@ -17,7 +17,7 @@ from typing import Any, ClassVar
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import struct
+from flax import struct, traverse_util
 from flax.core import FrozenDict, meta
 
 type Variables = Mapping[str, Any]
@@ -630,20 +630,20 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     attached over another keeps both training. Raises `ValueError` when the
     split keeps every leaf or none, since then there is nothing to split.
     """
-    variables = unboxed(variables)
+    # A leaf is what a dict holds, a parameter's box as its array (as `select` walks it), so a draw
+    # splits in the boxes its modules made it in.
     training = (frozenset() if FROZEN not in variables else frozenset(
-        ("params", *(entry.key for entry in path))
-        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+        ("params", *path) for path in traverse_util.flatten_dict(variables["params"])))
     variables = thaw(variables)
 
     def trains(path: Path) -> bool:
         return path in training or trainable(path)
 
-    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
-    if kept in (0, len(leaves)):
+    paths = [("params", *path) for path in traverse_util.flatten_dict(variables["params"])]
+    kept = sum(map(trains, paths))
+    if kept in (0, len(paths)):
         raise ValueError(
-            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
+            f"trainable keeps {kept} of {len(paths)} parameter leaves, which "
             f"{'freezes' if kept else 'trains'} nothing")
     moving = select(variables, lambda path: path[0] == "params" and trains(path))
     frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
