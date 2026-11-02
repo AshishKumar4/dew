@@ -46,7 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import meta
+from flax.core import FrozenDict, meta
 
 from dew.mesh import (
     SEQUENCE_AXIS,
@@ -581,6 +581,21 @@ def unboxed(tree):
             return leaf.unbox(apply_constraint=False)
         return leaf.unbox() if isinstance(leaf, meta.AxisMetadata) else leaf
     return jax.tree.map(value, tree, is_leaf=is_boxed)
+
+
+def boxed_like(template, values):
+    """`values`, a tree of `template`'s structure read from elsewhere (a checkpoint's arrays), each leaf in
+    the box `template`'s leaf at its path has (a draw's, `jax.eval_shape(module.init, ...)`), so it carries
+    the axes its module declares; a leaf `template` leaves unboxed, or one `values` boxed already, stays as
+    it is. The one translation of a tree that never passed through its module's init: a loaded tree."""
+    if isinstance(template, meta.AxisMetadata):
+        return values if isinstance(values, meta.AxisMetadata) else template.replace_boxed(values)
+    if not (isinstance(template, Mapping) and isinstance(values, Mapping)):
+        return values
+    # Walked by key, so a tree keeps its own container (a FrozenDict, a dict) whatever the draw's is.
+    kept = {name: boxed_like(template[name], value) if name in template else value
+            for name, value in values.items()}
+    return FrozenDict(kept) if isinstance(values, FrozenDict) else kept
 
 
 def rows_boxed(boxed, value):

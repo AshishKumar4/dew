@@ -35,7 +35,7 @@ from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
 from dew.nn.precision import FP32_SUMS
 from dew.nn.quantizers import nearest_codewords
-from dew.nn.sharding import pipeline_microbatches
+from dew.nn.sharding import pipeline_microbatches, unboxed
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -745,7 +745,8 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
                                                 jnp.zeros(example.noise.shape[:1]), **example.conditions))
-    expected = {**own, "params": qwix.quantize_params(jax.tree.map(jnp.asarray, own["params"]),
+    # The task's tree boxes the axes its modules declare; Qwix quantizes their values.
+    expected = {**own, "params": qwix.quantize_params(jax.tree.map(jnp.asarray, unboxed(own["params"])),
                                                       abstract["params"])}
     def assert_same_leaves(found, wanted):
         for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(wanted), strict=True):

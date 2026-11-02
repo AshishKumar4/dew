@@ -2128,7 +2128,8 @@ def every_layer_windowed(fields: CausalTransformer) -> bool:
                for layer in fields.layer_types or ('full_attention',))
 
 
-def check_decoder_tree(variables: Mapping[str, object], model) -> None:
+def check_decoder_tree[TreeT: Mapping[str, object]](variables: TreeT, model) -> TreeT:
     """`check_tree` against a decoder or its media wrapper, whose `init` reads one row of token ids
-    (a wrapper's conditioners then build the smallest media their towers take)."""
-    check_tree(variables, model, np.zeros((1, 2), np.int32))
+    (a wrapper's conditioners then build the smallest media their towers take): `variables` with the axes
+    the model's modules declare boxed on them."""
+    return check_tree(variables, model, np.zeros((1, 2), np.int32))

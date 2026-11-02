@@ -29,7 +29,7 @@ from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import Link, declarations, declared_axes
+from dew.nn.sharding import Link, declarations, declared_axes, unboxed
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -611,8 +611,8 @@ def test_a_dit_steps_under_a_tensor_axis():
         mesh, jax.eval_shape(model.init, jax.random.key(0), images, times))
 
     with jax.set_mesh(mesh):
-        placed = jax.jit(model.init, out_shardings=shardings)(
-            jax.random.key(0), images, times)
+        # The draw boxes the parameters its modules declare the axes of; the checks read their values.
+        placed = unboxed(jax.jit(model.init, out_shardings=shardings)(jax.random.key(0), images, times))
         loss, grads = jax.jit(jax.value_and_grad(
             lambda trainable: jnp.mean(
                 (model.apply({**placed, "params": trainable}, images, times) - images) ** 2)))(

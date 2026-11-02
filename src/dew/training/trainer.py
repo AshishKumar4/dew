@@ -79,7 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, unboxed
+from dew.nn.sharding import Link, Schedule, boxed, boxed_axes, measured_links, pipeline_microbatches, unboxed
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -404,7 +404,7 @@ class Trainer(Generic[Loss, Effects]):
         initialized = initializer(init_key)
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
-        self._boxed = self.objective.parameter_axes(initialized)
+        self._boxed = boxed_axes(initialized)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
@@ -425,7 +425,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        # The optimizer reads the axes `parameter_axes` gave (`optim.declaring`), Muon's grouping among them.
+        # The optimizer reads the axes the tree boxes (`optim.declaring`), Muon's grouping among them.
         ema, opt_state = self.objective.ema, self.optimizer.init(params["params"])
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
@@ -499,8 +499,7 @@ class Trainer(Generic[Loss, Effects]):
         unboxes: what `initial_state` last traced, else one abstract init, for
         a state the trainer did not build. A checkpoint records them for its restore."""
         if self._boxed is None:
-            self._boxed = self.objective.parameter_axes(
-                jax.eval_shape(self.objective.initializer, jax.random.key(0)))
+            self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
 
     @ruled

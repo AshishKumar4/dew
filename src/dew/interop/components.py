@@ -71,5 +71,5 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
             params.update(scoring)
             layouts += state_layouts
     if inputs:
-        check_tree({"params": params}, model, *inputs)
+        params = check_tree({"params": params}, model, *inputs)["params"]
     return wrap(params), params, layouts, config
