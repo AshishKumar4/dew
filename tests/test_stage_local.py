@@ -2,10 +2,11 @@
 stage's layers of the run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run,
 as the compiled step's own arguments measure it; that state trains on par with the same pipeline with
 every layer whole on every stage (`Layout.stage_local`), through each of Dew's optimizers and their
-per-layer rules, and a LoRA adapter's (check 1 against float64); a checkpoint it writes holds every layer
-as one device's would and resumes onto another stage count; and an optax transformation that may read a
-stacked leaf whole is refused by name, naming the replicated layout that takes it. The pipeline's own
-parity with one device is the pipeline's (ledger 3369), whatever its state's storage."""
+per-layer rules, and a LoRA adapter's (check 1 against float64); `fit` hands the state as it holds it,
+which the model reads off the mesh and every reader by layer name reads on its stored layers; a
+checkpoint it writes holds every layer as one device's would and resumes onto another stage count; and an
+optax transformation that may read a stacked leaf whole keeps every layer whole on every stage. The
+pipeline's own parity with one device is the pipeline's (ledger 3369), whatever its state's storage."""
 
 import dataclasses
 import functools
@@ -580,3 +581,65 @@ def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
     ((spared, (held, whole)),) = read
     assert spared
     np.testing.assert_array_equal(held, whole)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layers():
+    """The state a two-stage fit hands on starts a run of another layout as its stored layers do (ledger
+    3487): a run over four stages given it by `fit(state=...)`, and a run with no stage axis given its
+    variables by its objective (SFT into DPO), each start from every layer of it, where placement refused
+    a store stacked over another count."""
+    model, optimizer = decoder(), optax.adam(1e-2)
+    trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
+    stored = on_host(trainer(model, optimizer, STAGED, 8).stored(trained).variables)
+    four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
+    restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
+    assert int(restarted.step) == 2
+    flat = Trainer(LMObjective(model, SEQ, variables=trained.variables), optimizer, key=jax.random.key(0),
+                   mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=TINY_SHARD), tracker=None)
+    started = on_host(flat.initial_state().variables)
+    assert jax.tree.structure(started) == jax.tree.structure(stored)
+    for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
+    """A rollout server reloads the state a stage-local fit holds, which an asynchronous RL run pushes it
+    (`NativeRolloutServer.load`, `Server.reload`), serving what the same state with every layer whole
+    serves (ledger 3488), where it refused the stage form; a host copy is cut on the host (ledger 3489)."""
+    from dew.inference import NativeRolloutServer, TextGeneration
+    from dew.inference.serving import Server
+    from dew.nn.backbones.decoder_stack import stored_layers
+    from dew.sampling import Sampling
+
+    model = decoder()
+    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    trained = run.fit(stream(), steps=1, log_every=1)
+    whole = jax.device_get(run.stored(trained).variables)
+    assert all(isinstance(leaf, np.ndarray)
+               for leaf in jax.tree.leaves(stored_layers(model, jax.device_get(trained.variables))))
+    served = []
+    for variables in (trained.variables, whole):
+        task = TextGeneration(model, whole, None, sampling=Sampling(temperature=0.0))
+        server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+        try:
+            server.load(variables, 1)
+            served.append(server.submit([1, 2, 3], 4, key=5).result().tokens)
+        finally:
+            server.close()
+    assert served[0] == served[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_generation_from_a_stage_local_state_packs_its_projections():
+    """A generation from the state a stage-local fit holds packs the projections the same state with every
+    layer whole packs (ledger 3490), cutting its store onto its layers inside its call, where it packed
+    none."""
+    from dew.inference.projections import pending
+
+    model = decoder()
+    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    trained = run.fit(stream(), steps=1, log_every=1)
+    groups = [pending(model, variables) for variables in (trained.variables, run.stored(trained).variables)]
+    assert groups[1] and groups[0] == groups[1]
