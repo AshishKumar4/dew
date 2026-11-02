@@ -25,6 +25,7 @@ are evaluated as Dew's (`float32_dot_general`). The decoupling reorders rounding
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -54,12 +55,12 @@ from egglog import (
     vars_,
 )
 from egglog.bindings import EggSmolError
-from jax._src import config as jax_config
 
 from dew.algebra import cost, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 
 Axes = tuple[str, ...]
@@ -499,6 +500,11 @@ class _Forms:
     product's weights and values, extracted with the forms; None for a step of no such rule."""
 
 
+FORMS_HELD = 64
+"""The derived forms one declaration keeps, its least recently traced dropped past them: a process's distinct
+meshes, targets, numerics and tile shapes, each a saturation's seconds to derive again."""
+
+
 def derive(declaration: Reduction, *, accurate: bool, saturation: program.Saturation) -> Derived:
     """`declaration`'s monoid forms along its walked axis (the module's account), saturated beside the
     engine's sets `accurate` admits under `saturation`'s limits, each tile shape's rewrite in the kernel
@@ -506,19 +512,24 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
     names = tuple(declaration.operands)
     walked_axes = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
                    if declaration.walked in axes}
-    cache: dict = {}
+    @functools.lru_cache(maxsize=FORMS_HELD)
+    def derived_at(contexts: tuple, keyed: tuple) -> _Forms:
+        del contexts  # The key alone: the derivation reads them where it runs.
+        shapes = {name: (shape, dtype) for name, shape, dtype in keyed}
+        made = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
+        kernel_report.record_rewrite(made.report)
+        return made
 
     def forms(shapes: Mapping) -> _Forms:
-        # Each trace context's own (JAX's: its abstract mesh, precision and the user contexts that hold the
-        # pass's target and the run's numerics), as JAX keys its trace caches: forms traced under one hold
-        # its avals in their literals and are priced for its target, so a second context's trace derives
-        # its own (a sharded step's literals bound under a local one's mesh refused to lower).
-        key = (jax_config.trace_context(),
-               *((name, tuple(shapes[name][0]), str(shapes[name][1])) for name in names))
-        if key not in cache:
-            cache[key] = _derived(declaration, names, walked_axes, shapes, accurate, saturation)
-            kernel_report.record_rewrite(cache[key].report)
-        return cache[key]
+        # Each context's own that changes a derivation: forms traced under one abstract mesh hold its avals in
+        # their literals (a sharded step's bound under a local one's mesh refused to lower), and are priced
+        # for one target, under one run's numerics and one matmul precision. Not the whole trace context,
+        # whose identity-keyed collections (`dew.cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each
+        # lowering: every lowering derived again and the cache grew without end.
+        contexts = (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
+                    jax.config.jax_default_matmul_precision)
+        return derived_at(contexts, tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1]))
+                                          for name in names))
 
     def shaped(values):
         return {name: (value.shape, value.dtype) for name, value in values.items()}

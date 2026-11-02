@@ -209,6 +209,25 @@ def prefix(g):
     return jax.lax.associative_scan(compensated_add, (scaled, error), axis=g.ndim - 2)
 
 
+def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk: int) -> tuple:
+    """`prefix`'s pair of a chunk's decay tile `g` `[C, BK]` (natural log) within a launch, its compensated
+    sums taken by doubling (Hillis-Steele's scan: `log2(C)` steps, each row's running pair added to the one
+    `e` rows above it, `e` doubling), each step's pair staged by `stage(pair)` in shared memory, whose reader
+    gives it shifted down `e` rows, zeros above (a padded tile's): the same exact terms as `prefix`'s, summed
+    in another association, a difference of two positions as precise as its own range either way. The
+    prefix a launch's own: as its own XLA scan, thirteen launches took 0.30 ms of Kimi Linear's 1.57 ms
+    template forward on an H100 (prefix-probe-h100-9e3be6213, kda-profile-h100-69233abb8)."""
+    # The factor split where it is known (`two_product` of a constant), `g` by its bits in the launch.
+    scale = np.float32(LOG2_E)
+    scaled, error = two_product(g, scale, bit_split=True)
+    pair = scaled, error + g * float(np.float32(LOG2_E - float(scale)))
+    shift = 1
+    while shift < chunk:
+        pair = compensated_add(pair, stage(pair)(shift))
+        shift *= 2
+    return pair
+
+
 def raised(whole, part):
     """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
     `n = floor(whole)` an exact power of two (`attention_algebra.power2`, the attention template's) and its

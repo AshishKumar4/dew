@@ -184,6 +184,24 @@ def unshifted(q, k, v, rows, keys):
     return (p @ v) / jnp.sum(p, axis=-1)[:, None]
 
 
+def test_a_declaration_derives_once_whatever_routes_block_its_traces_record_into():
+    """A declaration's forms traced in two route-collecting blocks (`generation.routes`, a fresh collection
+    JAX keys its traces on by identity): its forms derive once, its cache keyed by what changes a
+    derivation (its mesh, its pricing target, the run's numerics and precision, its shapes), where keyed on
+    the whole trace context every lowering derived again and the cache grew without end (row 3647)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+
+    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False, saturation=SATURATION)
+    tiles = shaped(tile_of(operands(*draw(0)), 0))
+    with generation.routes():
+        forms.init(tiles)
+    before = len(report.rewrites())
+    with generation.routes():
+        forms.init(tiles)
+    assert len(report.rewrites()) == before
+
+
 def test_sums_no_maximum_scales_walk_as_plain_sums():
     """A declaration whose walked sums read no walked maximum derives plain sums: on par with the function."""
     forms = derive.derive(declared(unshifted), accurate=False, saturation=SATURATION)
