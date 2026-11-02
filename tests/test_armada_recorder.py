@@ -80,6 +80,13 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                           "    again = {**os.environ, 'REEXECED': '1'}\n"
                           "    os.execve(sys._base_executable, [sys._base_executable, __file__], again)\n"
                           "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
+        # This Python's path with the base interpreter as argv[0], from which CPython finds its environment
+        # (review: the path alone passed as this Python's, and the image ran without the `.pth`).
+        "reexec_argv0.py": "import os, sys\n"
+                           "if os.environ.get('REEXECED') != '1':\n"
+                           "    again = {**os.environ, 'REEXECED': '1'}\n"
+                           "    os.execve(sys.executable, [sys._base_executable, __file__], again)\n"
+                           "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
         # The same with the option grouped with another (review: `-BX utf8` read the `utf8` as the program).
         "reexec_bare_bx.py": "import os, sys\n"
                              "if os.environ.get('REEXECED') != '1':\n"
@@ -103,6 +110,8 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                              "                   check=True)\n",
         "test_reexecs_base.py": started + "subprocess.run([sys.executable, 'tests/reexec_base.py'],\n"
                                           "                   check=True)\n",
+        "test_reexecs_argv0.py": started + "subprocess.run([sys.executable, 'tests/reexec_argv0.py'],\n"
+                                           "                   check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -118,13 +127,13 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     def reused() -> list[bool]:
         return reusable_now(ci, tests)
 
-    assert reused() == [True, True, True, True, False, False, False, False, False, False, False]
+    assert reused() == [True, True, True, True, False, False, False, False, False, False, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, True, True, False, False, False, False, False, False, False]
+    assert reused() == [False, True, True, True, False, False, False, False, False, False, False, False]
     (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, True, True, False, False, False, False, False, False, False]
+    assert reused() == [True, True, True, True, False, False, False, False, False, False, False, False]
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False, False, False, False, False, False, False, False]
+    assert reused() == [False, True, False, False, False, False, False, False, False, False, False, False]
     # A keyed file whose inputs moved is in as changed; one whose records keep no key (a child unfollowed) as
     # unrecorded, as no record is evidence of it.
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
@@ -135,6 +144,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_reexecs_bare.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_bx.py": ["unrecorded"],
                                    "tests/test_reexecs_base.py": ["unrecorded"],
+                                   "tests/test_reexecs_argv0.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_w.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_x.py": ["unrecorded"]}
 

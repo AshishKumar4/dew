@@ -27,7 +27,7 @@ import threading
 import time
 import types
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 TOOLS = {"git", "nvidia-smi", "uname", "file", "ptxas", "ffmpeg", "ffplay", "cc", "rsync", "wandb-core"}
@@ -509,8 +509,8 @@ def start(event: str, args: tuple, directory: str, child: bool = False) -> str |
         return None
     if event == "_posixsubprocess.fork_exec" and _beneath_spawnv():
         return None
-    if child and event == "os.exec" and _this_python(args[0]) and sited(args[1]) and \
-            (os.environ if args[2] is None else args[2]).get(CHILDREN) == directory:
+    environment = os.environ if event != "os.exec" or args[2] is None else args[2]
+    if child and event == "os.exec" and restarts(args[0], args[1], environment, directory):
         return None
     if native(programs(event, args)):
         return None
@@ -520,6 +520,23 @@ def start(event: str, args: tuple, directory: str, child: bool = False) -> str |
         if named == directory and _this_python(program):
             return "followed"
     return "unfollowed"
+
+
+PREFIXED = ("PYTHONHOME", "PYTHONEXECUTABLE")
+"""The settings that move where a starting Python finds its prefix, so its environment and the `.pth` that
+starts `follow` (`restarts`)."""
+
+
+def restarts(program, argv, environment: Mapping[str, str], directory: str) -> bool:
+    """Whether a followed child's exec of `program` with `argv` and `environment` starts this Python again as
+    one that records into `directory`, its log the pid's: this interpreter by its path (`_this_python`), and
+    by its argv[0], from which CPython finds its environment (review: an exec of this path with the base
+    interpreter as argv[0] ran without the environment's `.pth`), its prefix settings (`PREFIXED`) as here,
+    its site made (`sited`), and the recorder's environment."""
+    named = list(argv)[:1]
+    return (_this_python(program) and bool(named) and _this_python(named[0]) and sited(argv)
+            and all(environment.get(name) == os.environ.get(name) for name in PREFIXED)
+            and environment.get(CHILDREN) == directory)
 
 
 def _beneath_popen() -> bool:
