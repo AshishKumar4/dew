@@ -1577,10 +1577,10 @@ def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) ->
     under, as stored, which the load casts to their storage leaf by leaf where it places them
     (`_in_storage`): each key named as transformers' load names it (`sources.load_names`), a key the model
     holds nothing under left out, and a tied parameter (an output table that is its input table) under
-    each of its names from the one the checkpoint stores it under. None where a key takes one of the
-    mapping's tensor conversions (a fused expert's merge), or the mapping renames a key by whether
-    another is stored, which transformers' own load applies."""
-    names = sources.load_names(model)
+    each of its names from the one the checkpoint stores it under, a key renamed by whether another is
+    stored read over the shards' names. None where a key takes one of the mapping's tensor conversions
+    (a fused expert's merge), which transformers' own load applies."""
+    names = sources.load_names(model, shards.keys())
     if names is None:
         return None
     held = model.state_dict()

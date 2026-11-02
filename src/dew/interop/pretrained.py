@@ -1773,7 +1773,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
             # translate_config refused every model_type but a registered family's name.
             family = _records.text(config.get("model_type"), "model_type")
         case VerifiedRoute(verified=verified):
-            family = verified.entry(config)
+            family = verified.entry(config, tensors.keys())
             record = verified.translate(config, tensors, family)
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
@@ -2167,7 +2167,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
             depth = decoders.wrapper_source_depths(wrapper)
         case VerifiedRoute(verified=verified):
             # The record alone: the names checked are the kept ones, which the load translates.
-            family = verified.entry(config)
+            family = verified.entry(config, tensors.keys())
             depth = decoders.source_depths(verified.record(config, family), family)
         case _:
             return tensors

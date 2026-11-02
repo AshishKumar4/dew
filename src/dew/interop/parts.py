@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from functools import cache
 from types import FunctionType, MethodType
@@ -876,7 +876,8 @@ _PER_EXPERT = {'gate_up_proj': ('gate_proj', 'up_proj'), 'down_proj': ('down_pro
 holds it as, in the order the fused one concatenates them."""
 
 
-def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
+def _load_names(model: PreTrainedModel, inventory: Collection[str] | None
+                ) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
     """The name `model`'s load gives a stored tensor (`sources.load_names`: HY-3's `mlp.expert_bias` is its
     `mlp.e_score_correction_bias`), an expert's own tensor, `{experts}.{index}.{stored}.weight`, named as
     the fused tensor the load stacks it into, with its index and its canonical projection, the one at its
@@ -884,12 +885,14 @@ def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str,
     A merge is read only where it stacks experts on the first axis and concatenates its sources in
     `_PER_EXPERT`'s order on the second, as the fused tensor `_fused_experts` splits holds them; any other
     conversion's tensor keeps its stored name, which no part holds. A mapping that renames a key by
-    whether another is stored is `Ambiguous`: no read of one name tells it."""
+    whether another is stored reads the checkpoint's `inventory` (`sources.load_names`), and without one
+    is `Ambiguous`: no read of one name tells it."""
     from transformers.core_model_loading import Concatenate, MergeModulelist, WeightConverter
 
-    names = sources.load_names(model)
+    names = sources.load_names(model, inventory)
     if names is None:
-        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored")
+        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored, and no "
+                        "inventory of the checkpoint is given")
     prefix = model.base_model_prefix
 
     def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
@@ -1003,9 +1006,10 @@ class _Assembler:
         return part.role
 
 
-def assemble(model: PreTrainedModel) -> Assembly:
+def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -> Assembly:
     """`model`, a source's causal LM, assembled from known parts, or `Ambiguous` naming the module that
-    is not one."""
+    is not one; its stored names read as its load names them, over the checkpoint's `inventory` where
+    its conversion needs the whole of it (`_load_names`)."""
     assembler = _Assembler()
     assembler.walk(model, ('causal_lm',), '', '', None)
     (head, head_weight), (table, table_weight) = assembler.tables['head'], assembler.tables['embedding']
@@ -1048,7 +1052,7 @@ def assemble(model: PreTrainedModel) -> Assembly:
     depths = _records.integer(model.config.to_dict().get('num_nextn_predict_layers') or 0,
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat),
+                    tuple(assembler.dropouts), _load_names(model, inventory), frozenset(assembler.flat),
                     frozenset(assembler.constants), depths)
 
 

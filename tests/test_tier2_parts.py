@@ -8,6 +8,7 @@ check 1 against its own code run by transformers, from that code's float64 twin.
 """
 import contextlib
 import json
+import shutil
 
 import jax
 import numpy as np
@@ -203,13 +204,13 @@ SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8}
 """Each source's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
-def write_source(directory, name: str, edit=lambda code: code) -> None:
+def write_source(directory, name: str, edit=lambda code: code, source: tuple | None = None) -> None:
     """The source's repository at `directory`: its code (`edit` of its modeling code), its config naming
     its classes by `auto_map`, and its weights at the probe's scatter (`scatter_weights`), saved by its
-    own class."""
+    own class; `source` in `SOURCES`' form where it is none of theirs."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    model_type, stem, modeling, configuration, config_class, model_class = SOURCES[name]
+    model_type, stem, modeling, configuration, config_class, model_class = source or SOURCES[name]
     directory.mkdir()
     (directory / f"modeling_{stem}.py").write_text(edit(modeling()))
     (directory / f"configuration_{stem}.py").write_text(configuration)
@@ -686,23 +687,65 @@ def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, ca
         assert saved[name].dtype == tensor.dtype, name
 
 
-def test_every_conversion_that_renames_by_another_key_is_a_registered_familys():
-    """A checkpoint conversion that renames a key by whether another is stored (transformers'
-    `GroupWeightRename`) is read by no part's name map, which reads one name at a time
-    (`parts._load_names` refuses it, ledger 3114): every type whose conversion holds one is a registered
-    family's, which the parts route never reads (Kimi K2.5's, whose vision tower's renames these are).
-    A type of the parts route that holds one fails here, to be read by its inventory then."""
-    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+GROUPED = '''
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+from .configuration_grouped import GroupedConfig
+
+
+class GroupedForCausalLM(LlamaForCausalLM):
+    config_class = GroupedConfig
+'''
+"""Llama's causal LM as a repository's own type, whose checkpoint conversion renames by group."""
+
+GROUPED_CONFIG = '''
+from transformers.models.llama.configuration_llama import LlamaConfig
+
+
+class GroupedConfig(LlamaConfig):
+    model_type = "grouped_llama"
+'''
+
+
+def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory(tmp_path):
+    """A type of known parts whose checkpoint conversion renames a key by whether another is stored
+    (transformers' `GroupWeightRename`, as Kimi K2.5's vision tower's: an older checkpoint's `a_norm` is
+    the model's input norm and its `input_layernorm` the feed-forward's, a newer one stores the model's
+    own names) verifies from parts and loads either checkpoint as transformers' load reads it, over the
+    checkpoint's whole inventory (ledger 3114): both load to the same decoder, bit for bit."""
+    from safetensors.torch import load_file, save_file
+    from transformers.conversion_mapping import register_checkpoint_conversion_mapping
     from transformers.core_model_loading import GroupWeightRename
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
-    from dew.interop.hf_decoders import families
-
-    grouped = {model_type for model_type in CONFIG_MAPPING_NAMES
-               if any(isinstance(transform, GroupWeightRename)
-                      for transform in get_checkpoint_conversion_mapping(model_type) or ())}
-    assert grouped
-    assert grouped <= set(families())
+    renames = GroupWeightRename(
+        source_patterns=[r"layers.(\d+).a_norm", r"layers.(\d+).input_layernorm"],
+        target_patterns=[r"layers.\1.input_layernorm", r"layers.\1.post_attention_layernorm"])
+    register_checkpoint_conversion_mapping("grouped_llama", [renames], overwrite=True)
+    source = ("grouped_llama", "grouped", lambda: GROUPED, GROUPED_CONFIG, "GroupedConfig",
+              "GroupedForCausalLM")
+    write_source(tmp_path / "older", "grouped", source=source)
+    path = tmp_path / "older" / "model.safetensors"
+    stored = load_file(path)
+    if any(".a_norm." in name for name in stored):
+        # The save wrote the conversion's source names; the newer checkpoint is the model's own.
+        newer = {name.replace(".input_layernorm.", ".post_attention_layernorm.").replace(".a_norm.",
+                 ".input_layernorm.") if ".input_layernorm." in name or ".a_norm." in name else name:
+                 tensor for name, tensor in stored.items()}
+        older = stored
+    else:
+        older = {name.replace(".input_layernorm.", ".a_norm.").replace(".post_attention_layernorm.",
+                 ".input_layernorm."): tensor for name, tensor in stored.items()}
+        newer = stored
+    shutil.copytree(tmp_path / "older", tmp_path / "newer")
+    save_file(older, path, metadata={"format": "pt"})
+    save_file(newer, tmp_path / "newer" / "model.safetensors", metadata={"format": "pt"})
+    assert any(".a_norm." in name for name in older) and not any(".a_norm." in name for name in newer)
+    config = json.loads((tmp_path / "older" / "config.json").read_text())
+    verified = verify_mapping(config, remote=tmp_path / "older")
+    assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
+    loads = [Pretrained.load(tmp_path / folder, dtype="float32", attention_impl="reference",
+                             trust_remote_code=True) for folder in ("older", "newer")]
+    jax.tree.map(np.testing.assert_array_equal, loads[0].variables, loads[1].variables)
 
 
 def test_an_lfm2_of_convolutions_alone_assembles():

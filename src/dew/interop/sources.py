@@ -478,13 +478,15 @@ class LoadName:
     pattern: str | None
 
 
-def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
+def load_names(model: PreTrainedModel, inventory: Collection[str] | None = None
+               ) -> Callable[[str], LoadName] | None:
     """The name `model`'s transformers load gives each stored key (`convert_and_load_state_dict_in_model`,
     by the conversion mapping it keeps for the model, `get_model_conversion_mapping`): every renaming,
     then at most one converter, the base model's prefix added or dropped as the model holds the name,
-    and the stored name itself where only it is held. None where a renaming renames a key by whether
-    another is stored (`GroupWeightRename`), which no read of one name tells: the caller leaves such a
-    checkpoint to transformers' own load."""
+    and the stored name itself where only it is held. A renaming that renames a key by whether another
+    is stored (`GroupWeightRename`) reads the checkpoint's whole `inventory`, which each such group is
+    first run over in sorted order, as transformers' load iterates it, so it renames each key as that
+    load does; None where it holds one and no inventory is given, which no read of one name tells."""
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
         GroupWeightRename,
@@ -494,8 +496,14 @@ def load_names(model: PreTrainedModel) -> Callable[[str], LoadName] | None:
     )
 
     transforms = get_model_conversion_mapping(model)
-    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+    groups = [transform for transform in transforms if isinstance(transform, GroupWeightRename)]
+    if groups and inventory is None:
         return None
+    for group in groups:
+        # Seen over the whole checkpoint first: a group renames its keys once its first pattern's key
+        # is seen (`GroupWeightRename.rename_source_key`), which transformers' sorted pass sees first.
+        for stored in sorted(inventory or ()):
+            group.rename_source_key(stored)
     renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
     held, prefix = model.state_dict(), model.base_model_prefix

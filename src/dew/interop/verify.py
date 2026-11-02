@@ -520,12 +520,14 @@ class VerifiedMapping:
     source: ModelSource | None = None
     """Where the type's classes came from, where not transformers' own (remote code, opted into)."""
 
-    def entry(self, hf_config: Mapping[str, object]) -> decoder_parts.DecoderFamily:
+    def entry(self, hf_config: Mapping[str, object],
+              inventory: Collection[str] | None = None) -> decoder_parts.DecoderFamily:
         """The family the real config loads through: the convention's, or, for a type verified from parts,
-        the one its real-sized skeleton assembles (`parts.family`)."""
+        the one its real-sized skeleton assembles (`parts.family`), its stored names read over the
+        checkpoint's `inventory` (`parts.assemble`)."""
         if self.family == PARTS:
             source = self.source or ModelSource(self.model_type)
-            return parts.family(self.model_type, _assembled(source, hf_config))
+            return parts.family(self.model_type, _assembled(source, hf_config, inventory))
         return dict(CONVENTIONS)[self.family]
 
     def record(self, hf_config: Mapping[str, object],
@@ -565,9 +567,22 @@ class VerifiedMapping:
         return record
 
 
-def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.Assembly:
+def _saved_names(directory: Path) -> frozenset[str]:
+    """The tensor names a source's `save_pretrained` wrote to `directory`, read from its safetensors'
+    headers."""
+    from safetensors import safe_open
+
+    names: set[str] = set()
+    for shard in sorted(directory.glob("*.safetensors")):
+        with safe_open(shard, "np") as stored:
+            names.update(stored.keys())
+    return frozenset(names)
+
+
+def _assembled(source: ModelSource, hf_config: Mapping[str, object],
+               inventory: Collection[str] | None = None) -> parts.Assembly:
     """The source's causal LM at `hf_config`'s own sizes, built on torch's meta device (so no layer
-    allocates), assembled from parts (`parts.assemble`)."""
+    allocates), assembled from parts over the checkpoint's `inventory` (`parts.assemble`)."""
     import torch
 
     fields = {key: value for key, value in hf_config.items()
@@ -575,7 +590,7 @@ def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.As
     with torch.device('meta'):
         skeleton = source.causal_lm(source.configured(fields))
     try:
-        return parts.assemble(skeleton)
+        return parts.assemble(skeleton, inventory)
     except parts.Ambiguous as error:
         raise _refuse(source.model_type, f"its real-sized model does not assemble as its probe did "
                       f"({error})") from error
@@ -1030,30 +1045,32 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "
                                f"({type(error).__name__}: {error})") from error
-        assembly = None
-        try:
-            assembly = parts.assemble(reference)
-        except parts.Ambiguous as ambiguous:
-            reasons[PARTS] = str(ambiguous)
-        else:
-            record = assembly.fields
-            try:
-                model = models.build("causal_transformer",
-                                     {**record, "dtype": "float32", "attention_impl": "reference"})
-            except ValueError as refused:
-                # Parts each read alike may still combine into a decoder Dew refuses to build.
-                reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
-            else:
-                sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
         # The row the source's table pads, nn.Embedding's notion (Gemma's scaled table is one); a lookup
         # of another kind has no padding_idx to pad by. The reference ran, so torch is installed.
         import torch
 
         lookup = reference.get_input_embeddings()
         pad = lookup.padding_idx if isinstance(lookup, torch.nn.Embedding) else None
-        if sized:
-            with tempfile.TemporaryDirectory() as scratch:
-                reference.save_pretrained(scratch)
+        with tempfile.TemporaryDirectory() as scratch:
+            # Saved first: the parts read the checkpoint's names as its load does, over its whole
+            # inventory where its conversion renames a key by another's presence (`parts.assemble`).
+            reference.save_pretrained(scratch)
+            assembly = None
+            try:
+                assembly = parts.assemble(reference, _saved_names(Path(scratch)))
+            except parts.Ambiguous as ambiguous:
+                reasons[PARTS] = str(ambiguous)
+            else:
+                record = assembly.fields
+                try:
+                    model = models.build("causal_transformer",
+                                         {**record, "dtype": "float32", "attention_impl": "reference"})
+                except ValueError as refused:
+                    # Parts each read alike may still combine into a decoder Dew refuses to build.
+                    reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
+                else:
+                    sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
+            if sized:
                 for convention, family, model, record, inert in sized:
                     try:
                         error, bound = _agreement(convention, family, model, record, inert, name, expected,
