@@ -453,7 +453,8 @@ each row's running maximum and whether its weighted values overflowed; `again` a
 inside the guard's rare branch, a recomputation (its kernel named apart, its products counted once)."""
 
 
-def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O]) -> O:
+def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O], *,
+                       masked: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -462,10 +463,20 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     one's elsewhere, so every other row's bits are the plain walk's. The call walks again where `walked`'s
     program would, decided over the whole call: in the natural form (`unfolded`) where some row's maximum
     passes `FOLD_REACH` folded, guarded as the call's form is; under headroom, the rows whose weighted values
-    overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks."""
+    overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks.
+
+    `masked` (a natural spans call's, whose launch walks only its live rows' keys, every other row's none:
+    `launch(form, live)`'s program over its rows' spans) takes the guarded launch every time, no branch: a
+    branch's predicate is read on the host before its launch may run, a decode step's round trip (row 1978:
+    0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue."""
+    if masked and spec.base2:
+        raise ValueError("a masked guard takes the natural form, whose launch has no fold to rewalk")
+
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
             return outputs
+        if masked:
+            return kept(over, launch(form, over)[0], outputs)
         # The rows kept plain read from the plain launch run again inside the rare branch (`again`), so the
         # plain launch's outputs reach one branch alone, whose result their buffer then is: read by both,
         # XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047 ms of

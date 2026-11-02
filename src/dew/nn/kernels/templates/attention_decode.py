@@ -28,7 +28,7 @@ from jax.extend import core as jaxpr_core
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, resources
-from dew.nn.kernels.templates.attention import NATURAL, Hooks, Initial, Kept, KeySpans, prescale
+from dew.nn.kernels.templates.attention import Hooks, Initial, Kept, KeySpans, prescale
 from dew.nn.kernels.templates.attention_mosaic_program import bundle_of
 
 
@@ -104,7 +104,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     rows, and slices opened until the items fill the multiprocessors at the config's residency
     (`resources.resident_programs`, its registers; its shared memory's), each at least a key tile."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                                              out_dtype=jnp.float32)
+                                              out_dtype=jnp.float32, masked=True)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
     if config is None:
@@ -191,12 +191,14 @@ def _natural_units(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: fl
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
-           scale: float | None = None, natural: bool = NATURAL, interpret: bool = False) -> jax.Array:
+           scale: float | None = None, interpret: bool = False) -> jax.Array:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]`, the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), cut into
     the derived work list (`plan`, `sliced`), walked by the template's forward in fp32 with its rows
-    (`attention_mosaic.forward`), merged (`merged`) and unpacked."""
+    (`attention_mosaic.forward`), merged (`merged`) and unpacked. Its logits natural, so the guard runs as a
+    launch over its live rows with no branch read on the host (`MosaicForward.masked`, row 1978)."""
+    natural = True
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
@@ -210,7 +212,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total, *_ = attention_mosaic.forward(
             items, key, value, item_spans, dataclasses.replace(hooks, initial=item_initial), scale=scale,
-            natural=natural, residuals=Kept.OUTPUT, interpret=interpret, out_dtype=jnp.float32)
+            natural=natural, residuals=Kept.OUTPUT, interpret=interpret, out_dtype=jnp.float32, masked=True)
     units = _natural_units(rows, row_spans, row_hooks, scale=scale, natural=natural)
     out = merged(out, maximum * units, total, work.slices, rows.shape[1])
     return unpacked(out, heads).astype(query.dtype)

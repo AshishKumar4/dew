@@ -229,6 +229,9 @@ class MosaicForward(_Mainloop[Tiles]):
     out_dtype: str | None = None
     """The inference walk's output dtype, the query's where None: fp32 for a split launch's slices, which a
     merge takes (`attention_decode`)."""
+    masked: bool = False
+    """Whether a natural spans call's guard runs as a launch every time over its live rows alone, no branch
+    (`algebra.walked_launches`' `masked`: a decode step's, row 1978)."""
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, *, residuals: Kept, interpret: bool, config: Tiles,
@@ -246,7 +249,7 @@ class MosaicForward(_Mainloop[Tiles]):
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                                      out_dtype=self.out_dtype, **form), None
+                                      out_dtype=self.out_dtype, masked=self.masked, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -480,7 +483,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
-            residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None) -> jax.Array:
+            residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
+            masked: bool = False) -> jax.Array:
     ...
 
 
@@ -488,13 +492,13 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
-            out_dtype=None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            out_dtype=None, masked: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
-            interpret: bool = False, out_dtype=None):
+            interpret: bool = False, out_dtype=None, masked: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -507,7 +511,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     family `generation.assumed` names; `out_dtype` the inference walk's output's (`MosaicForward.out_dtype`).
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             out_dtype=out_dtype)
+                             out_dtype=out_dtype, masked=masked)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -521,7 +525,8 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
-                  scale: float | None, natural: bool, out_dtype=None) -> tuple[MosaicForward, tuple]:
+                  scale: float | None, natural: bool, out_dtype=None, masked: bool = False
+                  ) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -532,7 +537,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
-                       out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name)
+                       out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop)

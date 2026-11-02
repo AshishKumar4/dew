@@ -146,7 +146,7 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                    scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
-                   out_dtype=None):
+                   out_dtype=None, masked: bool = False):
     """`MosaicForward`'s launch without residuals, at `tiles`, under the default's guards over whole launches
     (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a block of the family's swizzled value
     columns at a time: its walk carries its shifted and unshifted sums and forms both tiles' products a step
@@ -192,8 +192,16 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
-        # A spans call's block map counts blocks of the launch's own key tile.
-        guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
+        # A spans call's block map counts blocks of the launch's own key tile; a masked guard's (`masked`)
+        # rows past its live ones see no key, so their programs walk none.
+        walked_call = call
+        if masked:
+            # A query row's keys walked where any of its heads' rows is live, `[B, Qp]` (a call's runs,
+            # `[B, R, Qp]`, alike).
+            live_rows = jnp.any(live, axis=1)
+            live_rows = live_rows[:, None] if call.end.ndim == 3 else live_rows
+            walked_call = dataclasses.replace(call, end=jnp.where(live_rows, call.end, call.start))
+        guarded_spans = _spans_of(spec, walked_call, guarded.block_q, guarded.block_k)
         blocks = []
         # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
         # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
@@ -212,7 +220,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
         return (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]), *plain[1:])
 
-    out, *finished = algebra.walked_launches(spec, launch, kept)
+    out, *finished = algebra.walked_launches(spec, launch, kept, masked=masked)
     out = out[:, :call.queries, :, :value.shape[3]]
     if not rows:
         return out
