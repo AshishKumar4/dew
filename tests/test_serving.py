@@ -1496,7 +1496,9 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
 
     scanned = routed(scanned=True)
     weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    bound = TextGeneration(scanned, HeldBanks(weights).place(scanned), RunProcessor(Digits()),
+    # On one device, as the task's lone calls run: a mesh over the suite's devices splits the slots.
+    banked = HeldBanks(weights).place(scanned, mesh=MeshSpec().build([jax.devices()[0]]))
+    bound = TextGeneration(scanned, banked, RunProcessor(Digits()),
                            sampling=Sampling(temperature=0, eos_token_ids=EOS))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
