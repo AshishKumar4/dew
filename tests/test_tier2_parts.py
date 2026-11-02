@@ -502,6 +502,54 @@ BUILT_IN = {
     "glm4": {"head_dim": None, "num_key_value_heads": 2, "attention_bias": True,
              "partial_rotary_factor": 0.5},
     "apertus": {"hidden_act": "xielu"},
+    "laguna": {"layer_types": ["full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+               "num_attention_heads_per_layer": [4, 8, 8, 4], "sliding_window": 6,
+               "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"], "num_experts": 8,
+               "num_experts_per_tok": 2, "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
+               "moe_routed_scaling_factor": 2.5, "moe_router_logit_softcapping": 3.0,
+               "rope_parameters": {
+                   "full_attention": {"rope_type": "yarn", "rope_theta": 500000.0, "factor": 4.0,
+                                      "original_max_position_embeddings": 16, "beta_slow": 1.0,
+                                      "beta_fast": 64.0, "attention_factor": 1.25,
+                                      "partial_rotary_factor": 0.5},
+                   "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0,
+                                         "partial_rotary_factor": 1.0}}},
+    "jamba": {"head_dim": None, "num_hidden_layers": 6, "attn_layer_period": 3, "attn_layer_offset": 1,
+              "expert_layer_period": 2, "expert_layer_offset": 1, "num_experts": 8, "num_experts_per_tok": 2,
+              "mamba_d_state": 8, "mamba_dt_rank": 8, "mamba_expand": 2, "mamba_d_conv": 4,
+              "use_mamba_kernels": False},
+    "falcon_h1": {"mamba_d_ssm": 128, "mamba_expand": 2, "mamba_n_heads": 8, "mamba_d_head": 16,
+                  "mamba_n_groups": 2, "mamba_d_state": 8, "mamba_chunk_size": 8, "mamba_rms_norm": True,
+                  "mamba_norm_before_gate": False, "embedding_multiplier": 2.5, "lm_head_multiplier": 0.25,
+                  "attention_in_multiplier": 0.8, "attention_out_multiplier": 0.6, "key_multiplier": 0.5,
+                  "ssm_in_multiplier": 1.3, "ssm_out_multiplier": 0.7, "mlp_multipliers": [0.9, 1.1],
+                  "ssm_multipliers": [1.1, 0.9, 1.2, 0.8, 1.05]},
+    "falcon_h1-norm-first": {"model_type": "falcon_h1", "mamba_d_ssm": 128, "mamba_expand": 2,
+                             "mamba_n_heads": 8, "mamba_d_head": 16, "mamba_n_groups": 2, "mamba_d_state": 8,
+                             "mamba_chunk_size": 8, "mamba_rms_norm": True, "mamba_norm_before_gate": True,
+                             "projectors_bias": True, "ssm_multipliers": [0.7, 1.2, 1.0, 0.9, 1.3]},
+    "falcon_h1-no-norm": {"model_type": "falcon_h1", "mamba_d_ssm": 128, "mamba_expand": 2,
+                          "mamba_n_heads": 8, "mamba_d_head": 16, "mamba_n_groups": 2, "mamba_d_state": 8,
+                          "mamba_chunk_size": 8, "mamba_rms_norm": False, "key_multiplier": 0.25},
+    "axk2": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8, "num_experts_per_tok": 2,
+             "n_shared_experts": 1, "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "n_group": 2, "topk_group": 1,
+             "routed_scaling_factor": 1.8, "index_n_heads": 16, "index_head_dim": 16, "index_topk": 6,
+             "gated_norm_rank": 4,
+             "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0, "beta_fast": 32.0,
+                                 "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                                 "original_max_position_embeddings": 16}},
+    "axk2-ungrouped": {"model_type": "axk2", "head_dim": None, "num_key_value_heads": 4,
+                       "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 1,
+                       "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
+                       "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "index_n_heads": 16,
+                       "index_head_dim": 16, "index_topk": 6, "gated_norm_rank": 4},
+    "laguna-per-channel": {"model_type": "laguna", "gating": "per-element",
+                           "layer_types": ["sliding_attention", "full_attention"] * 2,
+                           "num_attention_heads_per_layer": [8, 4, 8, 4], "sliding_window": 6,
+                           "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"], "num_experts": 8,
+                           "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+                           "shared_expert_intermediate_size": 32},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
@@ -519,11 +567,26 @@ rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared 
 and keys normed after their rotation, at its dynamic-alpha base; and GLM-4's sandwich-normed layers, its
 gate and up projections one fused Linear and its rotary turning adjacent pairs of half of each head
 (ledger 3077); and Apertus's ungated MLP, its activation xIELU with learned parameters and stored buffers,
-beside Qwen3's per-head query and key norms (ledger 3076)."""
+beside Qwen3's per-head query and key norms (ledger 3076); and Laguna's layers of two types, each its own
+query heads, window and rotary (a YaRN ramp over half of each full layer's head, its sliding layers' whole
+heads at their own base), its attention gated per head (or, `laguna-per-channel`, per channel) by a
+softplus, its routed layers past its first chosen by capped sigmoid scores and a correction bias beside a
+shared expert, their sum scaled (ledger 3070); and Jamba's Mamba layers, their raw step, B and C normed,
+between attention layers without positions, every second layer routed by a softmax over every expert
+whose chosen scores stay unrenormalized (ledger 3080); and Falcon-H1's Mamba-2 beside its attention in
+every layer, under its muP multipliers (its embedding's, its head's, each branch's input and output, its
+keys', its MLP's and its in projection's sections), its Mamba-2 output normed before or after its gate
+(`falcon_h1-norm-first`, with its out projection biased apart) or gated alone (`falcon_h1-no-norm`); and
+A.X-K2's latent attention, its query latent's normed and raw values projected together to its queries and
+an output gate, beside DeepSeek V3.2's indexer selecting six keys a query, its norms before its attention
+and before its routed feed-forwards gated by a low-rank map of their own output, its experts chosen within
+groups or (`axk2-ungrouped`) not (ledger 3080)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8}
+                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8, "laguna": 8, "laguna-per-channel": 8,
+                  "jamba": 8, "falcon_h1": 8, "falcon_h1-norm-first": 8, "falcon_h1-no-norm": 8,
+                  "axk2": 8, "axk2-ungrouped": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -659,23 +722,115 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
 
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case)
+    # The references select by torch's top-k, which breaks no tie as Dew's does: a draw a tie decides is
+    # none that clears.
+    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case,
+                               stable=False)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))
 
 
-@pytest.mark.parametrize("case", ["apertus", "glm4"])
+LAGUNA_XS = {
+    "architectures": ["LagunaForCausalLM"], "model_type": "laguna", "vocab_size": 100352, "hidden_size": 2048,
+    "intermediate_size": 8192, "num_hidden_layers": 40, "num_attention_heads": 48, "num_key_value_heads": 8,
+    "head_dim": 128, "max_position_embeddings": 262144, "attention_bias": False, "rms_norm_eps": 1e-06,
+    "num_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512, "router_aux_loss_coef": 0.0, "bos_token_id": 2,
+    "eos_token_id": [2, 24], "pad_token_id": 9, "tie_word_embeddings": False, "gating": True,
+    "sliding_window": 512, "partial_rotary_factor": 0.5, "moe_routed_scaling_factor": 2.5,
+    "moe_apply_router_weight_on_input": False,
+    "rope_parameters": {
+        "full_attention": {"rope_theta": 500000.0, "rope_type": "yarn", "factor": 64.0,
+                           "original_max_position_embeddings": 4096, "beta_slow": 1.0, "beta_fast": 64.0,
+                           "attention_factor": 1.4158883083359672, "partial_rotary_factor": 0.5},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0}},
+    "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"] * 10,
+    "num_attention_heads_per_layer": [48, 64, 64, 64] * 10,
+    "mlp_layer_types": ["dense"] + ["sparse"] * 39}
+"""poolside/Laguna-XS.2's released config, its own-code `auto_map` aside (transformers builds the type)."""
+
+
+JAMBA_REASONING = {
+    "architectures": ["JambaForCausalLM"], "model_type": "jamba", "attention_dropout": 0.0,
+    "attn_layer_offset": 7, "attn_layer_period": 14, "bos_token_id": 1, "eos_token_id": [2, 519],
+    "expert_layer_offset": 1, "expert_layer_period": 2, "hidden_act": "silu", "hidden_size": 2560,
+    "intermediate_size": 8192, "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_state": 16,
+    "mamba_dt_rank": 160, "mamba_expand": 2, "mamba_proj_bias": False, "max_position_embeddings": 262144,
+    "num_attention_heads": 20, "num_experts": 1, "num_experts_per_tok": 1, "num_hidden_layers": 28,
+    "num_key_value_heads": 1, "num_logits_to_keep": 1, "output_router_logits": False, "pad_token_id": 0,
+    "rms_norm_eps": 1e-06, "router_aux_loss_coef": 0.001, "sliding_window": None, "tie_word_embeddings": True,
+    "use_cache": True, "use_mamba_kernels": True, "vocab_size": 65536}
+"""ai21labs/AI21-Jamba-Reasoning-3B's released config."""
+
+FALCON_H1_3B = {
+    "architectures": ["FalconH1ForCausalLM"], "model_type": "falcon_h1", "attention_bias": False,
+    "attention_dropout": 0.0, "attention_in_multiplier": 1.0, "attention_out_multiplier": 0.15,
+    "attn_layer_indices": None, "bos_token_id": 1, "embedding_multiplier": 5.656854249492381,
+    "eos_token_id": 11, "head_dim": 128, "hidden_act": "silu", "hidden_size": 2560, "initializer_range": 0.02,
+    "intermediate_size": 6144, "key_multiplier": 0.044194173824159216, "lm_head_multiplier": 0.015625,
+    "mamba_chunk_size": 128, "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_head": 128,
+    "mamba_d_ssm": 4096, "mamba_d_state": 256, "mamba_expand": 2, "mamba_n_groups": 1, "mamba_n_heads": 32,
+    "mamba_norm_before_gate": False, "mamba_proj_bias": False, "mamba_rms_norm": True, "mamba_use_mlp": True,
+    "max_position_embeddings": 131072, "mlp_bias": False, "mlp_expansion_factor": 8,
+    "mlp_multipliers": [0.3535533905932738, 0.078125], "num_attention_heads": 10, "num_hidden_layers": 32,
+    "num_key_value_heads": 2, "num_logits_to_keep": 1, "pad_token_id": 0, "projectors_bias": False,
+    "rms_norm_eps": 1e-05, "rope_scaling": None, "rope_theta": 100000000000.0, "ssm_in_multiplier": 0.5,
+    "ssm_multipliers": [0.3535533905932738, 0.25, 0.1767766952966369, 0.5, 0.3535533905932738],
+    "ssm_out_multiplier": 0.08838834764831845, "tie_word_embeddings": False, "use_cache": True,
+    "vocab_size": 65537}
+"""tiiuae/Falcon-H1-3B-Instruct's released config."""
+
+AXK2_RELEASE = {
+    "architectures": ["AXK2ForCausalLM"], "model_type": "axk2", "attention_bias": False,
+    "attention_dropout": 0.0, "attention_output_gate": True, "attn_gate_fused": True, "bos_token_id": 163691,
+    "dtype": "bfloat16", "eos_token_id": 163704, "first_k_dense_replace": 1, "gated_norm": True,
+    "gated_norm_rank": 16, "hidden_act": "silu", "hidden_size": 7168, "index_head_dim": 128,
+    "index_n_heads": 64, "index_topk": 2048, "initializer_range": 0.02, "intermediate_size": 18432,
+    "kv_lora_rank": 512, "max_position_embeddings": 262144, "moe_intermediate_size": 2048,
+    "moe_layer_freq": 1, "n_group": 8, "n_routed_experts": 256, "n_shared_experts": 1, "norm_topk_prob": True,
+    "num_attention_heads": 64, "num_experts_per_tok": 8, "num_hidden_layers": 61, "num_key_value_heads": 64,
+    "num_nextn_predict_layers": 0, "pad_token_id": 163692, "q_lora_rank": 1536, "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                            "weight_block_size": [128, 128],
+                            "modules_to_not_convert": ["lm_head", "W_up", "W_down", "weights_proj"]},
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000, "factor": 2.0, "beta_fast": 32.0,
+                        "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                        "original_max_position_embeddings": 131072},
+    "routed_scaling_factor": 2.5, "scoring_func": "sigmoid", "tie_word_embeddings": False, "topk_group": 4,
+    "topk_method": "noaux_tc", "use_cache": True, "v_head_dim": 128, "vocab_size": 163840}
+"""skt/A.X-K2's released config."""
+
+
+@pytest.mark.parametrize("released", [LAGUNA_XS, JAMBA_REASONING, FALCON_H1_3B, AXK2_RELEASE],
+                         ids=["laguna", "jamba", "falcon_h1", "axk2"])
+def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
+    """A release's config verifies from parts at the probe's sizes: Laguna-XS.2's 40 layers cut to the
+    five that hold each kind (`verify.shallow`), each layer's query heads shrunk with its key heads, so
+    its full and sliding layers keep their own counts; Jamba-Reasoning-3B's 28 cut to the eight that hold
+    its Mamba layers and its first attention layer; Falcon-H1-3B's, every layer Mamba-2 beside attention;
+    A.X-K2's 61 cut to its dense first and a routed one, its fp8 codec aside (ledgers 3070, 3080)."""
+    verdict = verify_mapping(released)
+    assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
+
+
+@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first", "axk2"])
 def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
-    """Apertus's xIELU parameters and the buffers Dew holds as constants, and GLM-4's fused gate and up
-    Linear, which a load reads as two projections, save back under their stored names bit for bit, the
-    buffers in their stored dtype (ledgers 3076, 3077)."""
+    """Apertus's xIELU parameters and the buffers Dew holds as constants, GLM-4's fused gate and up
+    Linear, which a load reads as two projections, Laguna's gate projection, router bias and shared
+    expert, which its load renames, Jamba's Mamba mixers and routers, Falcon-H1's mixers side by side and
+    A.X-K2's fused query and gate and gated norms, which its load renames, save back under their stored
+    names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
     from interop_support import tiny_config
     from safetensors.numpy import load_file
     from transformers import AutoModelForCausalLM
 
+    fields = dict(BUILT_IN[case])
+    model_type = fields.pop("model_type", case)
     torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(tiny_config(case, **BUILT_IN[case]), dtype=torch.float32)
+    model = AutoModelForCausalLM.from_config(tiny_config(model_type, **fields), dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path / "source")
     loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")

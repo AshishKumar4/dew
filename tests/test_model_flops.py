@@ -32,7 +32,7 @@ from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import RematPolicy
+from dew.nn.backbones.decoder_block import Mixture, NormSpec, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
@@ -635,6 +635,53 @@ def convolution_tap(equation, producers):
             if len(original) == 3 and len(narrowed) == 1 and narrowed[0] in (1, 2):
                 shifted = True
     return tapped and shifted
+
+
+GATED_NORM_SITES = ("embedding_layernorm", "norm", "input_layernorm", "post_attention_layernorm")
+
+
+@pytest.mark.parametrize("fields", [
+    {"embedding_norm": True, "embedding_norm_reads": "lookup", "embedding_features": 4},
+    {"loop": Loop(3, reinject=True)},
+    {"loop": Loop(3, layers=(1, 2)), "final_norm": False},
+], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end"])
+def test_gated_norms_count_each_run_at_its_width(fields):
+    """A norm gated by a low-rank map of its own output (`NormSpec.gate_rank`, A.X-K2's) counts its gate's
+    two maps each time a call runs it, at its width: the embedding's at the lookup's where it norms the
+    lookup before `project_in`, the final one's after the stack and before or between a loop's passes
+    (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm), and a
+    layer's before its sublayers: as many products as the forward traces beside the ungated decoder's."""
+    lengths = np.array([4, 4], np.int64)
+    operands = (jnp.ones((2, 4), jnp.int32),)
+
+    def counted_and_traced(model):
+        variables = model.init(jax.random.key(201), *operands)
+        return (model.model_flops(lengths) + model.logits_flops(lengths),
+                forward_products(model.apply, variables, *operands))
+
+    base = {"causal": False, "attention_impl": "reference", **fields}
+    plain = counted_and_traced(decoder(**base))
+    gated = counted_and_traced(decoder(**base, norms=dict.fromkeys(GATED_NORM_SITES, NormSpec(gate_rank=2))))
+    assert gated[0] - plain[0] == gated[1] - plain[1] > 0
+
+
+def test_a_norm_gated_on_the_routed_layers_counts_there_alone():
+    """A layer's norm gated on the routed layers alone (`gated_layers='routed'`, A.X-K2's feed-forward
+    norm) adds its gate's maps on those layers, as many products as the forward traces beside the
+    ungated decoder's."""
+    routed = {"mixture": Mixture(experts=4, top_k=2, layers=(1, 2), expert_features=8),
+              "causal": False, "attention_impl": "reference"}
+    gate = NormSpec(gate_rank=2, gated_layers="routed")
+    lengths = np.array([4, 4], np.int64)
+    operands = (jnp.ones((2, 4), jnp.int32),)
+
+    def counted_and_traced(model):
+        variables = model.init(jax.random.key(201), *operands)
+        return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
+
+    plain = counted_and_traced(decoder(**routed))
+    gated = counted_and_traced(decoder(**routed, norms={"post_attention_layernorm": gate}))
+    assert gated[0] - plain[0] == gated[1] - plain[1] == 2 * 2 * 2 * 8 * 2 * 8
 
 
 @pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
