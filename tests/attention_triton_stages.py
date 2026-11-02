@@ -22,16 +22,16 @@ from dew.nn.kernels import generation
 
 LENGTH = 1024
 SEEDS = 8
+REPEATS = 5
 CALLS: dict[str, tuple] = {
-    "gemma-softcap-256": (256, 8, 4, jnp.bfloat16, 50.0, "auto", None),
-    "triton-bf16-128": (128, 8, 2, jnp.bfloat16, None, "template", "triton"),
-    "template-fp32-128": (128, 8, 2, jnp.float32, None, "template", None),
-    "template-fp32-256": (256, 8, 4, jnp.float32, None, "template", None),
+    "gemma-softcap-256": (256, 16, 8, jnp.bfloat16, 50.0, "auto", None),
+    "triton-bf16-128": (128, 32, 8, jnp.bfloat16, None, "template", "triton"),
+    "template-fp32-128": (128, 32, 8, jnp.float32, None, "template", None),
 }
 """Causal calls that reach the Pallas-Triton backward on an H100, by width, query and key heads, dtype,
-softcap, implementation and the mainloop named (`generation.chosen`): Gemma's softcap at its default route
-(the Mosaic backward takes no hooked call 256 wide), a bf16 call on the Triton mainloop named, and fp32 calls,
-which the Mosaic mainloop takes none of, 256 wide among them."""
+softcap, implementation and the mainloop named (`generation.chosen`): Gemma 2 9B's heads under its softcap at
+its default route (the Mosaic backward takes no hooked call 256 wide), Qwen3-8B's heads on the Triton mainloop
+named (FS-TRITON-RACE1-h100's call), and in fp32, which the Mosaic mainloop takes none of."""
 
 
 def _step(name: str, implementation: AttentionImpl):
@@ -66,7 +66,8 @@ def _drawn(name: str):
         query, dout = (jax.random.normal(stream, (1, LENGTH, heads, width), dtype) for stream in streams[:2])
         key, value = (jax.random.normal(stream, (1, LENGTH, kv_heads, width), dtype)
                       for stream in streams[2:])
-        return query, key, value, dout
+        # Keys of 0.3, as FS-TRITON-RACE1-h100's: logits of an ordinary spread.
+        return query, (0.3 * key).astype(dtype), value, dout
 
     return draw
 
@@ -85,6 +86,7 @@ def a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100(name: str) -> 
     ours = jax.jit(_step(name, implementation))
     assert_as_exact(ours, jax.jit(_step(name, "reference")), _drawn(name), name, seeds=SEEDS, terms=terms)
     operands = _drawn(name)(0)
-    first, again = ours(*operands), ours(*operands)
-    for index, (a, b) in enumerate(zip(first, again, strict=True)):
-        assert np.array_equal(np.asarray(a), np.asarray(b)), f"{name}: leaf {index} differs run again"
+    first = ours(*operands)
+    for _ in range(REPEATS - 1):
+        for index, (a, b) in enumerate(zip(first, ours(*operands), strict=True)):
+            assert np.array_equal(np.asarray(a), np.asarray(b)), f"{name}: leaf {index} differs run again"
