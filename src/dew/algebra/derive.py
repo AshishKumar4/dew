@@ -150,10 +150,17 @@ def anchor(term: Term) -> Unit: ...
 
 
 @function
-def scales(term: Term, by: Term, name: String, exponent: i64, difference: i64) -> Unit: ...
+def scales(term: Term, by: Term, name: String, exponent: i64, difference: i64, at: i64) -> Unit: ...
 """A value that scales as `exp(-by)` (`name` the exponential, `exponent` and `difference` its and its
 subtraction's parameters): `exp(x - by)` with `x` local, and what multiplies, selects or sums it with local
-values."""
+values; `at` the value's axis along which the anchor's own lies (-1 for a scalar anchor), as its broadcast
+placed it and each equation since moved it."""
+
+
+@function(merge=lambda old, new: old)
+def anchored(term: Term) -> i64: ...
+"""The axis of a walked sum (`summed`) along which its anchor's lies (-1 for a scalar anchor): where its
+correction broadcasts (`lifts`)."""
 
 
 @function
@@ -162,8 +169,9 @@ def zero(term: Term) -> Unit: ...
 
 
 @function(merge=lambda old, new: old)
-def lifts(given: Vec[i64], to: Vec[i64]) -> i64: ...
-"""The parameters of a broadcast of a value of shape `given` to `to`, its axes the leading ones."""
+def lifts(given: Vec[i64], to: Vec[i64], at: i64) -> i64: ...
+"""The parameters of a broadcast of an anchor of shape `given` to `to`, its axis at `to`'s `at` (none for a
+scalar anchor's, -1)."""
 
 
 @function(merge=lambda old, new: old)
@@ -188,7 +196,7 @@ def _walking():
     """The facts' rules (the module's account)."""
     x, y, z, k, t, base = vars_("x y z k t base", Term)
     name, layout = vars_("name layout", String)
-    p, q, a, b, e, s = vars_("p q a b e s", i64)
+    p, q, a, b, c, d, e, s = vars_("p q a b c d e s", i64)
     axes = var("axes", Vec[i64])
     walking = []
     for constructor in ("binary", "compare"):
@@ -254,43 +262,49 @@ def _walking():
         rule(eq(t).to(x.shaped(name, p)), zero(x)).then(zero(t)),
         rule(eq(t).to(x.convert(p)), zero(x)).then(zero(t)),
     ]
-    # What scales as exp(-k): an exponential of a local value less an anchor (or its broadcast), and what
-    # multiplies, divides, selects against zeros, sums, casts or lays it out with local values.
-    walking += [
-        rule(eq(t).to(x.binary(String("sub"), base, s).unary(name, e)), local(x),
-             eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
-             eq(name).to(String("exp"))).then(scales(t, k, name, e, s)),
-        rule(eq(t).to(x.binary(String("sub"), base, s).unary(name, e)), local(x),
-             eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
-             eq(name).to(String("exp2"))).then(scales(t, k, name, e, s)),
-    ]
+    # What scales as exp(-k): an exponential of a local value less an anchor's broadcast, and what multiplies,
+    # divides, selects against zeros, sums, casts or lays it out with local values; with the axis along which
+    # the anchor's own lies (`at`, -1 for a scalar anchor's), as its broadcast placed it and each equation
+    # moved it.
+    for power in ("exp", "exp2"):
+        exponential = x.binary(String("sub"), base, s).unary(name, e)
+        broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
+                     eq(name).to(String(power)))
+        walking += [
+            rule(eq(t).to(exponential), *broadcast, lays(q, i64(0), c)).then(
+                scales(t, k, name, e, s, c)),
+            rule(eq(t).to(exponential), *broadcast, eq(rules.shape(k)).to(Vec[i64]())).then(
+                scales(t, k, name, e, s, i64(-1))),
+        ]
     for side in (0, 1):
         def product(scaled, other, params, side=side):
             return scaled.binary(String("mul"), other, params) if side == 0 else other.binary(
                 String("mul"), scaled, params)
-        walking.append(rule(eq(t).to(product(x, y, p)), scales(x, k, name, e, s), local(y)).then(
-            scales(t, k, name, e, s)))
-        walking.append(rule(eq(t).to(x.dot(y, p) if side == 0 else y.dot(x, p)), scales(x, k, name, e, s),
-                            local(y)).then(scales(t, k, name, e, s)))
+        moved = left_of(p, c, d) if side == 0 else right_of(p, c, d)
+        walking.append(rule(eq(t).to(product(x, y, p)), scales(x, k, name, e, s, c), local(y)).then(
+            scales(t, k, name, e, s, c)))
+        walking.append(rule(eq(t).to(x.dot(y, p) if side == 0 else y.dot(x, p)), scales(x, k, name, e, s, c),
+                            local(y), moved).then(scales(t, k, name, e, s, d)))
     walking += [
-        rule(eq(t).to(x.binary(String("div"), y, p)), scales(x, k, name, e, s), local(y)).then(
-            scales(t, k, name, e, s)),
-        rule(eq(t).to(x.binary(String("add"), y, p)), scales(x, k, name, e, s),
-             scales(y, k, name, e, s)).then(scales(t, k, name, e, s)),
-        rule(eq(t).to(z.select(y, x)), scales(x, k, name, e, s), zero(y), local(z)).then(
-            scales(t, k, name, e, s)),
-        rule(eq(t).to(z.select(x, y)), scales(x, k, name, e, s), zero(y), local(z)).then(
-            scales(t, k, name, e, s)),
-        rule(eq(t).to(x.convert(p)), scales(x, k, name, e, s)).then(scales(t, k, name, e, s)),
-        rule(eq(t).to(x.shaped(layout, p)), scales(x, k, name, e, s)).then(scales(t, k, name, e, s)),
-        rule(eq(t).to(x.reduce(String("sum"), axes, p)), scales(x, k, name, e, s), eq(walked(x)).to(a),
-             reduces(p, a, b)).then(scales(t, k, name, e, s)),
+        rule(eq(t).to(x.binary(String("div"), y, p)), scales(x, k, name, e, s, c), local(y)).then(
+            scales(t, k, name, e, s, c)),
+        rule(eq(t).to(x.binary(String("add"), y, p)), scales(x, k, name, e, s, c),
+             scales(y, k, name, e, s, c)).then(scales(t, k, name, e, s, c)),
+        rule(eq(t).to(z.select(y, x)), scales(x, k, name, e, s, c), zero(y), local(z)).then(
+            scales(t, k, name, e, s, c)),
+        rule(eq(t).to(z.select(x, y)), scales(x, k, name, e, s, c), zero(y), local(z)).then(
+            scales(t, k, name, e, s, c)),
+        rule(eq(t).to(x.convert(p)), scales(x, k, name, e, s, c)).then(scales(t, k, name, e, s, c)),
+        rule(eq(t).to(x.shaped(layout, p)), scales(x, k, name, e, s, c), lays(p, c, d)).then(
+            scales(t, k, name, e, s, d)),
+        rule(eq(t).to(x.reduce(String("sum"), axes, p)), scales(x, k, name, e, s, c), eq(walked(x)).to(a),
+             reduces(p, a, b), reduces(p, c, d)).then(scales(t, k, name, e, s, d)),
         rule(eq(t).to(x.reduce(String("sum"), axes, p)), eq(walked(x)).to(a), eq(axes).to(Vec[i64](a)),
-             scales(x, k, name, e, s)).then(summed(t)),
-        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), contracts_left(p, a), scales(x, k, name, e, s),
-             local(y)).then(summed(t)),
-        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s),
-             local(x)).then(summed(t)),
+             scales(x, k, name, e, s, c), reduces(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(x)).to(a), contracts_left(p, a), scales(x, k, name, e, s, c),
+             local(y), left_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
+        rule(eq(t).to(x.dot(y, p)), eq(walked(y)).to(a), contracts_right(p, a), scales(y, k, name, e, s, c),
+             local(x), right_of(p, c, d)).then(summed(t), set_(anchored(t)).to(d)),
     ]
     return ruleset(*walking, name="walking")
 
@@ -300,7 +314,7 @@ def _shapes():
     merge, finish or carried state reads its own, a select its operands', a lifted correction its broadcast's
     target."""
     x, y, z = vars_("x y z", Term)
-    side = var("side", i64)
+    side, at = vars_("side at", i64)
     extent = var("extent", Vec[i64])
     given, to = vars_("given to", Vec[i64])
     shape = rules.shape
@@ -310,7 +324,8 @@ def _shapes():
         rule(eq(extent).to(shape(x)), eq(y).to(x.merged())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(x)), eq(y).to(x.finished())).then(set_(shape(y)).to(extent)),
         rule(eq(extent).to(shape(y)), eq(z).to(x.select(y, z))).then(set_(shape(x.select(y, z))).to(extent)),
-        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to)))).then(set_(shape(y)).to(to)),
+        rule(eq(y).to(x.shaped(String("broadcast_in_dim"), lifts(given, to, at)))).then(
+            set_(shape(y)).to(to)),
         name="derived shapes")
 
 
@@ -323,8 +338,8 @@ def _decoupled():
     reduction's step, merge and finish are its monoid's, a sum that scales with an anchor rescaled first."""
     x, y, z, k, t = vars_("x y z k t", Term)
     name = var("name", String)
-    p, e, s, side, a, b, lift, added, multiplied, largest, i, floor, typed = vars_(
-        "p e s side a b lift added multiplied largest i floor typed", i64)
+    p, e, s, side, a, b, at, along, lift, added, multiplied, largest, i, floor, typed = vars_(
+        "p e s side a b at along lift added multiplied largest i floor typed", i64)
     axes = var("axes", Vec[i64])
     given, to = vars_("given to", Vec[i64])
     stock = rules.stock
@@ -376,13 +391,14 @@ def _decoupled():
         lifted = correction.shaped(String("broadcast_in_dim"), lift)
         return Term.state(i, carried_side).binary(String("mul"), lifted, multiplied)
 
-    lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(lift).to(lifts(given, to)),
+    lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(along).to(anchored(t)),
+              eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least()), eq(typed).to(retype(i)), slotted)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
-        conditions = (eq(t).to(summed_term), summed(t), scales(x, k, name, e, s), *lifted)
+        conditions = (eq(t).to(summed_term), summed(t), scales(x, k, name, e, s, at), *lifted)
         derived += [
             rewrite(t.stepped()).to(rescaled(0, k.stepped()).binary(String("add"), tile, added), *conditions),
             rewrite(t.merged()).to(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
@@ -696,6 +712,11 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
                 graph.register(contracts_left(i64(index), i64(int(axis))))
             for axis in right_contracted:
                 graph.register(contracts_right(i64(index), i64(int(axis))))
+    # A scalar anchor's axis (`scales`' -1) is none, through every equation.
+    for index in range(len(region.params)):
+        none = i64(-1)
+        graph.register(lays(i64(index), none, none), reduces(i64(index), none, none),
+                       left_of(i64(index), none, none), right_of(i64(index), none, none))
     for index in range(len(closed.jaxpr.constvars)):
         graph.register(local(Term.leaf(i64(index))), unwalked(Term.leaf(i64(index))))
     first = len(closed.jaxpr.constvars)
@@ -781,8 +802,10 @@ def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
 
 
 def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
-    """Each broadcast a rescaled sum needs, an anchor's shape to the sum's (`lifts`), its parameters added to
-    the region's table: the anchor's axes its leading ones."""
+    """Each broadcast a rescaled sum may need (`lifts`), its parameters added to the region's table: a scalar
+    anchor's to the sum's shape along no axis, a vector's along each of the sum's axes of its extent, of which
+    the rules take the one its anchor's lies along (`anchored`). An anchor of more axes has none: its sum's
+    correction is no broadcast of these, and the declaration is refused."""
     anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
     lifted = set()
     for reduction in reductions:
@@ -790,13 +813,19 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
         if to is None:
             continue
         for given in anchors:
-            if tuple(to[:len(given)]) != tuple(given) or (given, tuple(to)) in lifted:
+            if len(given) > 1:
                 continue
-            lifted.add((given, tuple(to)))
-            params = {"shape": tuple(to), "broadcast_dimensions": tuple(range(len(given))), "sharding": None}
-            region.params.append((jax.lax.broadcast_in_dim_p, params))
-            graph.register(set_(lifts(Vec[i64](*(i64(size) for size in given)),
-                                      Vec[i64](*(i64(size) for size in to)))).to(i64(len(region.params) - 1)))
+            for at in ((-1,) if not given else tuple(axis for axis, extent in enumerate(to)
+                                                      if extent == given[0])):
+                if (given, tuple(to), at) in lifted:
+                    continue
+                lifted.add((given, tuple(to), at))
+                dimensions = () if at < 0 else (at,)
+                params = {"shape": tuple(to), "broadcast_dimensions": dimensions, "sharding": None}
+                region.params.append((jax.lax.broadcast_in_dim_p, params))
+                graph.register(set_(lifts(Vec[i64](*(i64(size) for size in given)),
+                                          Vec[i64](*(i64(size) for size in to)), i64(at))).to(
+                    i64(len(region.params) - 1)))
 
 
 def _walked(graph: EGraph, term: Term) -> bool:
