@@ -366,7 +366,7 @@ class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_sa
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),
         over the last axis it reduces; another reduction is refused."""
         axes = self.reduction_axes if isinstance(self.reduction_axes, tuple) else (self.reduction_axes,)
-        if tuple(axis % x.ndim for axis in axes) != (x.ndim - 1,):
+        if tuple(int(axis) % x.ndim for axis in axes) != (x.ndim - 1,):
             raise ValueError("a layer norm's derivative bounds read its statistic over the last axis, and "
                              f"this one reduces {self.reduction_axes}")
         return _centered_spread(x)

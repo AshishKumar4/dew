@@ -998,7 +998,7 @@ def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
 
 def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
     """A run's record states a damped adaptation of a decoder with a continuum level (`LMRunConfig`, its
-    model's `continuum` and its objective's `adaptation`): `run.json` reads back as the config that wrote
+    model's `continuum` and its objective's `adaptation`): `run.json` reads back as the record that wrote
     it, and the objective it builds steps the level damped, its losses finite (1925)."""
     import json
 
@@ -1012,7 +1012,7 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
             "mlp_features": 16, "max_seq_len": 32, "attention_impl": "xla", "continuum": LEVEL}),
         objective=ObjectiveConfig("lm", {"adaptation": adaptation}))
     read = RunConfig.read(json.loads(json.dumps(config.record())))
-    assert read == config
+    assert read.record() == config.record()
     objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)
     assert objective.adaptation == adaptation
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)

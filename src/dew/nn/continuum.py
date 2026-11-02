@@ -178,7 +178,7 @@ class HeadTerms:
         return jnp.square(jacobian) * self.curvature + self.slope * bent, jacobian * self.slope
 
 
-def _head_growth(model: nn.Module, maps: dict[str | None, int]) -> dict[str | None, float]:
+def _head_growth(model: LinearProducts, maps: dict[str | None, int]) -> dict[str | None, float]:
     """How much Qwix's rounding can grow each head map's kernel's norm (`rounding_growth`), `maps` each map's
     contraction by its submodule's name (None for a tied table's product in the model's own scope). A map
     a method interceptor computes other than as a linear map of its input (`intercepted_nonlinear`: a

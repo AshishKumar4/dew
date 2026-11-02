@@ -1251,17 +1251,18 @@ class CausalTransformer(LinearProducts):
         bounds no derivatives is refused), each kernel's norm as Qwix's rounding can grow it, a step
         following its straight-through gradient (`_head_growth`, which refuses a map an interceptor
         rounds)."""
-        table, projection = self._head_table(), self.embedding_features is not None
+        table = self._head_table()
+        projection = table.projection
         maps = {None if self.tie_embeddings else "lm_head": jnp.shape(table.rows())[-1],
-                **({"project_out": jnp.shape(table.projection.kernel)[0]} if projection else {}),
+                **({} if projection is None else {"project_out": jnp.shape(projection.kernel)[0]}),
                 **({} if self.head_transform is None else {"head_dense": self.emb_features})}
         growth = _head_growth(self, maps)
         logits = growth[None if self.tie_embeddings else "lm_head"]
         squared = jnp.square(logits) * _squared_norm(jnp.asarray(self.vocabulary_rows()))
-        if projection and logits * growth["project_out"] > 1:
+        if projection is not None and logits * growth["project_out"] > 1:
             # Two rounded matrices' product, bounded by their norms'.
             squared = (jnp.square(logits * growth["project_out"]) * _squared_norm(table.rows())
-                       * _squared_norm(table.projection.kernel))
+                       * _squared_norm(projection.kernel))
         if self.head_transform is None:
             return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
         if not isinstance(self.head_norm, BoundedNorm):

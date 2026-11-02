@@ -30,6 +30,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Mapping
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -204,7 +205,9 @@ def _damping(model: nn.Module, variables, start, hidden, weights, adaptation: Ch
         return head, zero, zero, zero, zero, jnp.zeros((*weights.shape, _TERMS + 3), jnp.float32)
     parts = _damped_parts(start, adaptation)
     held = model.with_in_context_level(variables, start)
-    head = model.apply(variables, model.apply(held, hidden, method="continuum_states"), method="head_bounds")
+    # `nn.Module.apply` returns the method's value untyped: `SteppedInContext.head_bounds`' `HeadTerms`.
+    head = cast(HeadTerms, model.apply(variables, model.apply(held, hidden, method="continuum_states"),
+                                       method="head_bounds"))
     squares, inputs, norm, growth, p1, p2 = _arrays(model.apply(held, hidden, parts, method="level_terms"))
     lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
     counted = weights > 0
