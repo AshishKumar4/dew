@@ -6,6 +6,7 @@ witness of run options its outcomes; each reads and writes through `record_units
 """
 
 import hashlib
+import json
 import os
 import pickle
 import sys
@@ -25,6 +26,14 @@ POOL = "DEW_CHECK1_POOL"
 """The environment variable that runs every sharded site as the judge of its map tasks (DRAWS): a directory
 whose tree holds their records. The site judges them pooled (`pooled_units`), the same units by the same
 rules as a site that does them itself, and refuses what the pool does not hold."""
+
+
+LATER = "DEW_CHECK1_LATER"
+"""A judge's file to write where its judgement needs the units its pool does not hold yet, from the first it
+does not on (`ask_later`): the plan marks a check-1 site's second-stage map tasks later (tools/armada/ci.py's
+`site_entries`), which armada runs only where the judge's first judgement asks for them, and the judge then
+judges again over all its map tasks (Main, 2026-11-02: those draws were drawn every run and read only where
+the first stage found something). Unset, a judge refuses a short pool (`PoolRefused`)."""
 
 
 class PoolRefused(AssertionError):
@@ -111,3 +120,19 @@ def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, o
         raise PoolRefused(f"{label}: the map tasks' records under {root} hold units 0 to {held} of {units}",
                           held)
     return pieces
+
+
+class LaterUnits(AssertionError):
+    """A judge's judgement needs units its pool does not hold yet, which it asked for (`ask_later`): its row
+    reads red until it judges again over them."""
+
+
+def ask_later(label: str, held: int, stop: int) -> None:
+    """Where LATER names a file, raise `LaterUnits` for site `label`, whose judgement needs units `held` to
+    `stop` its pool does not hold, the file written first; else nothing (the pool is short, `PoolRefused`)."""
+    asked = os.environ.get(LATER)
+    if asked:
+        Path(asked).parent.mkdir(parents=True, exist_ok=True)
+        Path(asked).write_text(json.dumps({"site": site_id(label), "from": held, "to": stop}))
+        raise LaterUnits(f"{label}: its judgement needs units {held} to {stop}, which its later map tasks "
+                         "draw")
