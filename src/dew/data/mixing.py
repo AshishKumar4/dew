@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import CONSUMED, REFUSED, Owed, Record, Rejected
+from dew.data.pipeline import Owed, Record, Rejected, accounts
 
 _log = logging.getLogger(__name__)
 
@@ -91,8 +91,8 @@ class CorpusCounts:
             self.accepted += int(self.rows)
             return
         if self.examples:
-            self.accepted += (integer(element.get(CONSUMED, 0), "a row's consumed examples")
-                              - integer(element.get(REFUSED, 0), "a row's refused examples"))
+            consumed, refused = accounts(element)
+            self.accepted += consumed - refused
         else:
             self.accepted += int(self.rows)
         self.truncated += int(bool(element.get("_dew_truncated", False)))
@@ -227,7 +227,7 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
-            self.owed.owe(integer(element.get(CONSUMED, 0), "a row's consumed examples"))
+            self.owed.owe_row(element)
             self.counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:

@@ -27,22 +27,13 @@ import numpy as np
 
 from dew._records import integer, integers, listed, record
 from dew.batch import Batch
-from dew.data.pipeline import CONSUMED, REFUSED, Pack, Rejected, Stage, Windows
+from dew.data.pipeline import CONSUMED, REFUSED, Pack, Stage, Windows, accounts
 
 UNIT = "_dew_unit"
 """A window's place among the units its share's layout made, in their order (`Numbered`)."""
 
 SINCE = "_dew_since"
 """The first unit that can hold a piece of the examples a unit counts (`Numbered`)."""
-
-
-def accounts(row: Batch | Rejected) -> tuple[int, int]:
-    """The source examples `row` consumes and the part of them refused (`CONSUMED`, `REFUSED`): a rejected
-    row's are all refused, as the row kept after it is paid them (`dew.data.pipeline.Owed`)."""
-    if isinstance(row, Rejected):
-        return row.consumed, row.consumed
-    return (integer(row.get(CONSUMED, 0), "a row's consumed examples"),
-            integer(row.get(REFUSED, 0), "a row's refused examples"))
 
 
 def cuts(stages: Sequence[Stage]) -> bool:

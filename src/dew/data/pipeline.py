@@ -92,6 +92,15 @@ def joined(*members: Members) -> dict[int, tuple[int, int]]:
     return total
 
 
+def accounts(row: Batch | Rejected) -> tuple[int, int]:
+    """The source examples `row` consumes and the part of them refused (`CONSUMED`, `REFUSED`), none where
+    it holds neither: a rejected row's are all refused, as the row kept after it is paid them (`Owed`)."""
+    if isinstance(row, Rejected):
+        return row.consumed, row.consumed
+    return (integer(row.get(CONSUMED, 0), "a row's consumed examples"),
+            integer(row.get(REFUSED, 0), "a row's refused examples"))
+
+
 @dataclasses.dataclass(frozen=True)
 class MarkConsumed:
     """The step that marks each source example a run bounded in examples reads as one consumed by the row it
@@ -128,8 +137,8 @@ class Owed:
         members, self.members = self.members, {}
         if not owed:
             return row
-        paid = {**row, CONSUMED: owed + integer(row.get(CONSUMED, 0), "a row's consumed examples"),
-                REFUSED: owed + integer(row.get(REFUSED, 0), "a row's refused examples")}
+        consumed, refused = accounts(row)
+        paid = {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
         if members:
             refused = {member: (count, count) for member, count in members.items()}
             paid[MEMBERS] = joined(members_of(row), refused)
@@ -137,7 +146,7 @@ class Owed:
 
     def owe_row(self, row: Batch) -> None:
         """Owe the examples a row left out was the last of (`CONSUMED`), by member (`MEMBERS`)."""
-        self.owe(integer(row.get(CONSUMED, 0), "a row's consumed examples"),
+        self.owe(accounts(row)[0],
                  {member: consumed for member, (consumed, _) in members_of(row).items()})
 
     def owe_rejected(self, rejected: Rejected) -> None:

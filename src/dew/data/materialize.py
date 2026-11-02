@@ -430,7 +430,7 @@ def _targeted(
             total += count
         else:
             counter.rejected["zero_targets"] += 1
-            owed.owe(integer(window.get(CONSUMED, 0), "a window's consumed examples"))
+            owed.owe_row(window)
     if owed.examples and kept:
         identifier, last = kept[-1]
         kept[-1] = (identifier, owed.paid(last))

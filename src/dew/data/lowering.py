@@ -120,6 +120,7 @@ from dew.data.pipeline import (
     TokenSplit,
     Windows,
     Workers,
+    accounts,
     children,
     examples_bound,
 )
@@ -497,16 +498,15 @@ def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) ->
     the rows of one read hold the same fields."""
     if given is None or isinstance(given, (bytes, Rejected)) or CONSUMED not in given:
         return step(given)
-    consumed = integer(given[CONSUMED], "a row's consumed examples")
-    refused = integer(given.get(REFUSED, 0), "a row's refused examples")
+    consumed, refused = accounts(given)
     outputs = step({name: column for name, column in given.items() if name not in ACCOUNTS})
     *rest, last = outputs
     rest = [{CONSUMED: 0, REFUSED: 0, **row} if isinstance(row, Mapping) else row for row in rest]
     if isinstance(last, Rejected):
         carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
     elif isinstance(last, Mapping):
-        carried = {**last, CONSUMED: consumed + integer(last.get(CONSUMED, 0), "a row's consumed examples"),
-                   REFUSED: refused + integer(last.get(REFUSED, 0), "a row's refused examples")}
+        own, owned = accounts(last)
+        carried = {**last, CONSUMED: consumed + own, REFUSED: refused + owned}
     else:
         raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
                          "count of the examples it consumes; a step after the bound returns records")
@@ -699,8 +699,8 @@ class _Groups:
         # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
         # last row, as a record step's expansion does (`_consumed_by`).
         counted = [row for row in rows if CONSUMED in row]
-        consumed = [integer(row[CONSUMED], "a row's consumed examples") for row in counted]
-        refused = [integer(row.get(REFUSED, 0), "a row's refused examples") for row in counted]
+        held = [accounts(row) for row in counted]
+        consumed, refused = [count for count, _ in held], [part for _, part in held]
         rows = [{name: value for name, value in row.items() if name not in ACCOUNTS} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
         made = dict(self.stage.step(columns))
@@ -2420,7 +2420,7 @@ class _Payload:
     def __call__(self, row: Batch) -> Batch:
         payload = {name: value for name, value in row.items() if not name.startswith("_dew_")}
         if CONSUMED in row:
-            payload[EXAMPLES_CONSUMED] = np.int32(integer(row[CONSUMED], "a row's consumed examples"))
+            payload[EXAMPLES_CONSUMED] = np.int32(accounts(row)[0])
         return payload
 
 
