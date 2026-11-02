@@ -35,6 +35,7 @@ from collections.abc import Mapping
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.typing import PRNGKey, RNGSequences
 
 from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, TOKEN_LAYOUT_FIELDS, Coordinates, field_coordinates
 from dew.nn.backbones.decoder_stack import StackView
@@ -156,7 +157,7 @@ class _Reads:
     rowed: Mapping
     blocks: jax.Array | None
     train: bool
-    rngs: object
+    rngs: PRNGKey | RNGSequences | None
     predict: bool
     logits: bool
 
