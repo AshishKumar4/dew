@@ -25,8 +25,10 @@ norm's gradient, one sum over every token the draw holds, has 16 elements a draw
 TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
 """The decoder in float64 on the reference kernel: the loops' truth."""
 
-STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 8}
-"""Check 1's declared seeds for the stacked sites, by their layers and windows."""
+STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 512}
+"""Check 1's declared seeds for the stacked sites, by their layers and windows; the gradient's sized
+paired by `seeds_for` on armada (job 20261102200705-e3d60ec1), drawn by CI's map tasks
+(`check1_shards`)."""
 
 
 def draw(seed: int, scale: float = 0.25):
@@ -147,6 +149,7 @@ def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows):
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=64)
 def test_training_differentiates_through_the_blocks_steps():
     """The outer loss's gradient flows through every chunk's steps of the blocks to their starts, the
     meta-gradient continued pre-training trains (section 7.3): the gradient of the summed losses, second
