@@ -79,7 +79,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
-                                                summed=walk.summed, accurate=walk.accurate)
+                                                summed=walk.summed, accurate=walk.accurate, rows=True)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
         return row_sums, parts, keyed
@@ -91,7 +91,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
-    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
+    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate, rows=True)
     # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
     k_columns = k_slot.at[:, pl.ds(*share)]
     dq_acc = issued_into(family, dq_acc, parts, k_columns, walk.interpret)

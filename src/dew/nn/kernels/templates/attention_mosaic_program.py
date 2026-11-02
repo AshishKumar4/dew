@@ -241,8 +241,8 @@ def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
     """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
     (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
     taken (`algebra.formed_parts`); an fp16 part's (`product.Scaled`) its own accumulator, restored by its
-    power of two (`algebra.power2`) and added in."""
-    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.power2)
+    row's power of two (`algebra.restored`) and added in."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     return issuer.summed((("part", part, right) for part in parts), into=acc)
 

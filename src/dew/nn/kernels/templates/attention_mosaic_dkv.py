@@ -178,7 +178,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
                          walk.interpret)
     if not fused:
         # Each part formed as its product is issued (`algebra.formed_parts`).
-        parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
+        parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate,
+                                     rows=True)
         dk_acc = issued_into(family, dk_acc, parts, q_columns, walk.interpret)
     else:
         # The fused launch's (the fast form's one part, `_weighed`'s): dK's left operand from the registers,

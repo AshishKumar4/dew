@@ -672,7 +672,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # fp16's dV and dK parts scaled (`product.Scaled`): each product its own accumulator, restored and
         # added into dV's or dK's (`operands.Issuer.summed`), beside the cotangents and both parts, formed
         # first.
-        fragments.append([step[0], weights, weights, (block_k, max(width, value_width) // columns, jnp.float32)])
+        restore = (block_k, max(width, value_width) // columns, jnp.float32)
+        fragments.append([step[0], weights, weights, restore])
     phases = resources.live_registers(family, carried, step, pullback, *added, *fragments)
     return phases + statistics + vectors
 

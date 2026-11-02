@@ -1871,8 +1871,8 @@ def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, se
     return terms, pulled(cotangents, slopes, seen, kinds)[0] * scale
 
 
-def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype
-                ) -> tuple[DqSums, Parts]:
+def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype,
+                rows: bool = False) -> tuple[DqSums, Parts]:
     """The accurate form's keyed sums after a tile of a call without a score hook: their mass and exponent,
     and the parts of the weights' product with the keys (`weights_parts`, `DqSums.keyed`) a mainloop adds
     to them unscaled. Each coefficient is the scale times a weight over the prior denominator, which holds
@@ -1881,14 +1881,14 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
     (`dq_finish`). One product, no exponent a row; a score hook's coefficients rescale a row's sums each
     tile instead (`dq_step`)."""
     scale_mantissa, scale_exponent = _static_split(scale)
-    keyed = weights_parts(weights * expand(inverse(prior), weights), dtype)
+    keyed = weights_parts(weights * expand(inverse(prior), weights), dtype, rows)
     return (sums._replace(keyed_mass=jnp.full_like(sums.keyed_mass, scale_mantissa),
                           keyed_shift=jnp.full_like(sums.keyed_shift, scale_exponent)), keyed)
 
 
 def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, dtype,
-              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool
-              ) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
+              prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool,
+              rows: bool = False) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
     """A dQ pass's row sums after a key tile and the products a mainloop issues for it, for keys of `dtype`:
     the sums with their row fields updated (the cotangents' and the weights' sums, the summed parameters'
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
@@ -1902,7 +1902,7 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
                                 summed=summed)
         if not accurate:
             return terms, parts, None
-        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype)
+        terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype, rows=rows)
         return terms, parts, (None, keyed)
     terms, pulled_weights = dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
     parts = pulled(cotangents, slopes, seen, kinds)[0] * scale
@@ -1924,7 +1924,7 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
     keyed_mass = before + jnp.abs(coefficients).sum(axis=-1)
     over = inverse(keyed_mass)
     return (terms._replace(keyed_mass=keyed_mass, keyed_shift=keyed_shift), parts,
-            (before * over, weights_parts(coefficients * expand(over, coefficients), dtype)))
+            (before * over, weights_parts(coefficients * expand(over, coefficients), dtype, rows)))
 
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
@@ -2176,18 +2176,27 @@ def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Arr
             jnp.full((rows,), -1, jnp.int32))
 
 
-def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, fp32, and that power's
-    negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding)."""
-    top = jnp.max(jnp.abs(x))
+    negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding); with `rows`, a
+    power a row (its exponents `[rows]`), which a product of the rows (`a @ b`) takes back a row of its own
+    (`restored`): a tile's whole largest is a reduction to a scalar, which a tensor-core mainloop's lowering
+    has no form of (Mosaic GPU's: "Scalars must be represented by non-vector types", ET-FP16-h100)."""
+    top = jnp.max(jnp.abs(x), axis=-1) if rows else jnp.max(jnp.abs(x))
     exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
-    return power2(x, 14.0 - exponent), exponent - 14.0
+    return power2(x, expand(14.0 - exponent, x) if rows else 14.0 - exponent), exponent - 14.0
 
 
-def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+def restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
+    """A scaled part's product `value` taken back by its power of two (`product.Scaled`): a tile's one, or a
+    row's where the part is scaled a row at a time (`_scaled`'s `rows`)."""
+    return power2(value, exponent if exponent.ndim == 0 else expand(exponent, value))
+
+
+def _fp16_scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:
     """`_scaled`'s `x` in fp16 and its exponent: within fp16's range whatever `x`'s, an entry far below the
     largest losing only what is far below the product's own rounding."""
-    scaled, exponent = _scaled(x)
+    scaled, exponent = _scaled(x, rows)
     return scaled.astype(jnp.float16), exponent
 
 
@@ -2211,10 +2220,11 @@ def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     return tuple(formed_parts(cotangents, dtype, accurate=accurate))
 
 
-def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Iterator[jax.Array | product.Scaled]:
+def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool, rows: bool = False
+                 ) -> Iterator[jax.Array | product.Scaled]:
     """`cotangent_parts` a part at a time, each formed only as it is taken: a mainloop that retires each
     part's product before taking the next (`Family.register_products`' `retired`) holds one part's registers
-    beside the cotangents, not every part's."""
+    beside the cotangents, not every part's; fp16's scaled a row at a time with `rows` (`_scaled`)."""
     if dtype == jnp.float32:
         yield cotangents
         return
@@ -2224,10 +2234,10 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Iterator[ja
         # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
         yield from product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1)
         return
-    scaled, high_exponent = _scaled(cotangents)
+    scaled, high_exponent = _scaled(cotangents, rows)
     high = scaled.astype(dtype)
     yield product.Scaled(high, high_exponent)
-    low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
+    low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32), rows)
     yield product.Scaled(low, low_exponent + high_exponent)
 
 
@@ -2256,12 +2266,12 @@ def summed_products(parts: Parts, operand: jax.Array,
     return total
 
 
-def weights_parts(weights: jax.Array, dtype) -> Parts:
+def weights_parts(weights: jax.Array, dtype, rows: bool = False) -> Parts:
     """Weights `[bq, bk]` (fp32) narrowed for their product with an operand of `dtype` (`summed_products`):
-    fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`), which its product takes
-    back."""
+    fp16's at a power-of-two scale that keeps them in its range (`_fp16_scaled`, a row's with `rows`),
+    which its product takes back."""
     if dtype == jnp.float16:
-        return (product.Scaled(*_fp16_scaled(weights)),)
+        return (product.Scaled(*_fp16_scaled(weights, rows)),)
     return (weights.astype(dtype),)
 
 
@@ -2307,9 +2317,9 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
 def value_parts(weights: jax.Array, dtype) -> Parts:
     """A tensor-core mainloop's dV left operand, `pᵀ·dO` against the output cotangent as it is in shared
     memory (FlashAttention's form, `value_operands`' bf16 one): the normalized weights narrowed, bf16's as is,
-    fp16's at a power of two of their tile's (`weights_parts`), which keeps a weight down to 2^-24 of the
-    tile's largest where fp16's least subnormal (about 6e-8) would drop a normalized one."""
-    return weights_parts(weights, dtype)
+    fp16's at a power of two of their row's (`weights_parts`), which keeps a weight down to 2^-24 of the
+    row's largest where fp16's least subnormal (about 6e-8) would drop a normalized one."""
+    return weights_parts(weights, dtype, rows=True)
 
 
 def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False) -> jax.Array:
