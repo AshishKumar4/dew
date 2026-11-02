@@ -16,11 +16,11 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
     CHUNK,
     FAST_PARTS,
-    Work,
     _Call,
     _column,
     _column_scratch,
@@ -108,7 +108,7 @@ def _key_scores_back(scores, do, corrected, taken, call: _Call):
     return _kernel(program, call,
                    out_type=(square.shape(call.heads * CHUNK), grads.shape(call.heads * value_width)),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
-                   live=_taken(3), work=Work(4 * CHUNK * CHUNK * value_width), held=held_tiles,
+                   live=_taken(3), work=Work(flops=4 * CHUNK * CHUNK * value_width, span=1), held=held_tiles,
                    landing={"square": square.landing(CHUNK, CHUNK), "row": grads.landing(CHUNK, call.block)},
                    persistent=True)(scores, do, corrected, taken)
 
@@ -202,7 +202,7 @@ def _key_memory_back(q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken
     products = 2 * CHUNK * keys * value_width * 3 * steps + 2 * 2 * CHUNK * CHUNK * width
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(11),
-                   work=Work(products, steps), held=_key_memory_held(call, keys), staging=staging,
+                   work=Work(flops=products, span=steps), held=_key_memory_held(call, keys), staging=staging,
                    landing=landing)(
         q, k, hi, lo, do, corrected, dv, memory, dh, a, beta, taken)
 
@@ -266,7 +266,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: _Call):
     out_type = (square.shape(call.heads * value_width), square.shape(call.heads * CHUNK),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The values' two products a value block, then the system's two.
-    work = Work(2 * 2 * CHUNK * CHUNK * value_width + 2 * 2 * CHUNK ** 3)
+    work = Work(flops=2 * 2 * CHUNK * CHUNK * value_width + 2 * 2 * CHUNK ** 3, span=1)
     landing = {"values": square.landing(CHUNK, call.block), "square": square.landing(CHUNK, CHUNK)}
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(5), work=work,
@@ -419,7 +419,8 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: _Call, 
     products = 2 * 2 * 2 * CHUNK * CHUNK * keys * (CHUNK // algebra.SUB) * steps
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(7),
-                   work=Work(products, steps, exponentials=(CHUNK // algebra.SUB + 1) * CHUNK * width),
+                   work=Work(flops=products, span=steps,
+                             exponentials=(CHUNK // algebra.SUB + 1) * CHUNK * width),
                    held=_key_pairs_held(call, keys), staging=staging, landing=landing)(
         q, k, hi, lo, beta, d_scores, d_system, taken)
 

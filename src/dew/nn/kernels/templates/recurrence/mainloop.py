@@ -60,6 +60,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.gemm import cost
 from dew.nn.kernels.templates.operands import Issuer, Parts
 
@@ -414,16 +415,6 @@ def _taken(index: int):
 
 
 @dataclasses.dataclass(frozen=True)
-class Work:
-    """A program's work as a launch states it for the cost model: its products' FLOPs, each an operand's
-    part's (`_kernel` counts an fp32 call's parts), its exponentials, and the steps its walk takes."""
-
-    flops: float
-    steps: float = 1
-    exponentials: float = 0
-
-
-@dataclasses.dataclass(frozen=True)
 class _Held:
     """What a launch's consumer thread holds in registers, as its program states it: the tiles it carries
     across its steps (`carried`, each `(rows, columns, dtype)`) and the tiles each of its phases holds at once
@@ -714,7 +705,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             # The products the issuer takes for its parts (`product.terms`).
             flops = work.flops * len(product.terms(call.held.parts, call.held.parts)) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
-                                    registers, work.steps * each, stages, stepped, flops,
+                                    registers, work.span * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
                                     consumers, family))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
@@ -872,7 +863,8 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True, appli
         return mosaic.Walk(views, step, prologue=None if streamed else lambda: read(None))
 
     # The keys' products and the inverse's doubling, then the inverse against each key and value block.
-    work = Work(2 * CHUNK * CHUNK * width + _inverse_flops() + 2 * CHUNK * CHUNK * (width + value_width))
+    work = Work(flops=2 * CHUNK * CHUNK * width + _inverse_flops() + 2 * CHUNK * CHUNK * (width + value_width),
+                span=1)
     # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
     # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
     # held beside a block's product, its decay and its keys or values.
@@ -997,7 +989,7 @@ def _intra_solve(system, taken, call: _Call):
 
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), systems)),
-                   stages=2, live=_taken(1), work=Work(_inverse_flops()),
+                   stages=2, live=_taken(1), work=Work(flops=_inverse_flops(), span=1),
                    held=_Held(phases=(_doubling_held(call),)),
                    staging=_merges(call), landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True)(
         system, taken)
@@ -1092,7 +1084,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     # Each sub-chunk's and key block's gated rows and keys and their product, for the scores and the system.
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
     # The exponentials: a key block's rows gated down once, its keys up a sub-chunk at a time.
-    work = Work(pairs * 2 * CHUNK * CHUNK * width,
+    work = Work(flops=pairs * 2 * CHUNK * CHUNK * width, span=1,
                 exponentials=(CHUNK // algebra.SUB + 1) * (1 + call.delta) * CHUNK * width)
     staging, landing = _intra_staged(call, keys)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
@@ -1234,7 +1226,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     out_type = ((held.shape(call.heads * width), held.shape(call.heads * value_width)) * call.delta
                 + (held.shape(call.heads * width),) * call.per_key)
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
-    work = Work(2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0,
+    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0, span=1,
                 exponentials=CHUNK * width if call.per_key else 0)
     staging, landing = _weighted_staged(call, keyed)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
@@ -1578,7 +1570,7 @@ def _states_launch(call: _Call, tiles: Tiles, delta: bool, keys: _Operand, value
                             for i in range(width // call.block)})
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences
-    return out_type, blocks, initials, Work(4 * CHUNK * width * walked_width * steps, steps)
+    return out_type, blocks, initials, Work(flops=4 * CHUNK * width * walked_width * steps, span=steps)
 
 
 def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
@@ -1767,7 +1759,7 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
     # memory and local products.
     scored = 0 if call.per_key else 2 * CHUNK * CHUNK * width
-    work = Work(scored + 2 * CHUNK * (width + CHUNK) * value_width, steps)
+    work = Work(flops=scored + 2 * CHUNK * (width + CHUNK) * value_width, span=steps)
     landing = {"out": ((CHUNK, bv), out_dtype)}
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}

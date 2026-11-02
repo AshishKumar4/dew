@@ -15,6 +15,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product, resources
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -22,7 +23,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     CHUNK,
     Launch,
     Tiles,
-    Work,
     _allocated,
     _block_stored,
     _Call,
@@ -334,7 +334,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
                       out=((CHUNK, value_width), given))
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
-    work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
+    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width), span=1, exponentials=CHUNK * CHUNK)
     staging, landing = _local_back_staged(call, vb)
     return _kernel(program, call, out_type=grads.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
@@ -533,7 +533,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
-    work = Work(2 * (2 + call.delta) * CHUNK * width * walked_width * steps, steps)
+    work = Work(flops=2 * (2 + call.delta) * CHUNK * width * walked_width * steps, span=steps)
     final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type,
                    grid=(value_width // walked_width, sequences.shape[0], call.heads),
@@ -831,7 +831,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     # scores' gradient's two, a key head's two without the delta rule.
     scores = 2 * CHUNK * CHUNK * call.block
     each = (2 + call.delta) * CHUNK * value_width * call.block + scores * call.delta
-    work = Work(2 * (each * group + scores * (not call.delta)), group)
+    work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
     dq, dk, dw, after, leaving, memory = _kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
@@ -971,7 +971,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     out_type = (grads.shape((call.heads // group) * CHUNK),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The scores' gradient, the scores and the pairs' sums, each value head's.
-    work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK) * group, group,
+    work = Work(flops=2 * CHUNK * CHUNK * (value_width + width + CHUNK) * group, span=group,
                 exponentials=CHUNK * CHUNK * group)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: three fp32 tiles at once, the decays taken before the scores' product and
@@ -1036,7 +1036,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                       values=((CHUNK, value_width), given), w_grads=((CHUNK, width), held),
                       u_grads=((CHUNK, value_width), held))
     # The weighted keys' and values' products into the inverse's gradient, and its products through it.
-    work = Work(2 * CHUNK * CHUNK * (width + value_width + 2 * CHUNK))
+    work = Work(flops=2 * CHUNK * CHUNK * (width + value_width + 2 * CHUNK), span=1)
     # A block's keys or values scaled, narrow, beside the inverse's gradient; then it masked, its products
     # through the inverse and the pairs' decays with their masks (`algebra.system_gradient`).
     held_tiles = _Held(phases=(
@@ -1087,7 +1087,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
                       u_grads=((CHUNK, value_width), held))
     out_type = (held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
-    work = Work(2 * CHUNK * CHUNK * value_width)
+    work = Work(flops=2 * CHUNK * CHUNK * value_width, span=1)
     # A value block's gradient in fp32 and narrow, its product through the inverse, and the values in fp32.
     held_tiles = _Held(phases=(
         [_f32(CHUNK, call.block)] * 3 + _held(held, CHUNK, call.block)
@@ -1152,7 +1152,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
     terms = jax.ShapeDtypeStruct((blocks, call.heads, call.rows), jnp.float32)
     out_type = (held.shape(call.heads * width), terms, terms, terms)
     # The key block's products through `w` and the system, and its keys' own pairs.
-    work = Work(2 * CHUNK * CHUNK * (4 * call.block))
+    work = Work(flops=2 * CHUNK * CHUNK * (4 * call.block), span=1)
     # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
     # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
     # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
