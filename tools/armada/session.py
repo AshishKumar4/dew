@@ -9,7 +9,7 @@ installed."""
 import ast
 import functools
 import os
-from collections.abc import Mapping
+from collections.abc import Container, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
@@ -129,14 +129,20 @@ def marked_setups(name: str, text: str) -> dict[str, str]:
     return found
 
 
-def units(nodes: list[str]) -> list[list[int]]:
-    """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone,
-    but those of one file marked with one `SHARED_SETUP`, together at the first one's place."""
+def units(nodes: list[str], recorded: Container[str] | None = None) -> list[list[int]]:
+    """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone, but
+    those of one file marked with one `SHARED_SETUP`, together at the first one's place. Where `recorded`
+    is given (the nodes the durations record names), a test it lacks stays at its own place, alone, as the
+    plan, which reads the record alone, sees no such test: the plan and a task then cut the recorded tests
+    alike, and a test joins its setup's unit once the record names it. Each file's marks are read once."""
+    marks: dict[str, dict[str, str]] = {}
     held: list[list[int]] = []
     at: dict[tuple[str, str], int] = {}
     for index, node in enumerate(nodes):
         name = node.split("::")[0]
-        setup = shared_setups(name).get(test_name(node))
+        if name not in marks:
+            marks[name] = shared_setups(name)
+        setup = marks[name].get(test_name(node)) if recorded is None or node in recorded else None
         if setup is None:
             held.append([index])
         elif (name, setup) in at:
@@ -152,12 +158,13 @@ def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
     return [sum(seconds[index] for index in unit) for unit in units(nodes)]
 
 
-def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
-    """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
-    every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
-    setup's tests in one group."""
-    held = units(nodes)
-    runs = groups(unit_seconds(nodes, seconds), count)
+def cut(nodes: list[str], seconds: list[float], count: int,
+        recorded: Container[str] | None = None) -> list[list[str]]:
+    """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units` (those
+    `recorded` alone joined to their setup's): how every task of a split file and the plan alike cut its
+    tests (split.py, ci.py's `members`), a shared setup's tests in one group."""
+    held = units(nodes, recorded)
+    runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 

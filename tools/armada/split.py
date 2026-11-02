@@ -5,8 +5,8 @@
 with tools/armada on the path, as `ci.py task --split=G/N` runs it. Every
 container collects the same tests and cuts them alike (`session.cut`): in
 node-id order, each weighing its time in tests/test_durations.json and a test
-that file lacks the mean of the others, those marked with one shared setup one
-weight (`session.SHARED_SETUP`), into N runs of consecutive tests whose
+that file lacks the mean of the others, those it records marked with one shared
+setup one weight (`session.SHARED_SETUP`), into N runs of consecutive tests whose
 heaviest is as light as N runs can be. This keeps the Gth run and deselects
 the rest, after CI's own selection (`session.SELECTION`).
 """
@@ -31,7 +31,7 @@ def pytest_collection_modifyitems(config, items):
     nodes = sorted(item.nodeid for item in items)
     known = [recorded[node] for node in nodes if node in recorded]
     mean = sum(known) / len(known) if known else 1.0
-    kept_nodes = set(cut(nodes, [recorded.get(node, mean) for node in nodes], count)[index - 1])
+    kept_nodes = set(cut(nodes, [recorded.get(node, mean) for node in nodes], count, recorded)[index - 1])
     kept = {id(item) for item in items if item.nodeid in kept_nodes}
     config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
     items[:] = [item for item in items if id(item) in kept]
