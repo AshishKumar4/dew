@@ -452,22 +452,25 @@ COUNTERS = 2
 examples by member where its rows are delivered (row 3312), which a position of an earlier format, holding
 no `counters`, does not (`_by_member`)."""
 
-_AFTER_BATCH = frozenset({"dew.data.pipeline.MapBatch", "dew.data.pipeline.Prefetch",
-                          "dew.data.pipeline.Workers"})
-"""Steps after a batch whose positions hold none of their own around the rows (`_by_member`)."""
+_PLACED = frozenset({"dew.data.pipeline.Shuffle", "dew.data.pipeline.Repeat", "dew.data.pipeline.Limit",
+                     "dew.data.pipeline.Slice"})
+"""Steps after a batch with positions of their own around the rows (`_by_member`); a map of batches, a
+prefetch or the workers hold none."""
 
 
 def _by_member(iterator: JSON, plan: Plan) -> JSON:
     """A per-share position of the counters' format 1 as format 2 holds it (`COUNTERS`). Each counter holds
-    its members' counts (none: the members of a mixture's counter past its mix count afresh) and the
-    examples it owes by member (none), as does each carrier (`owed_members`) and each held count of a
-    completion (`dew.data.completion`); a mixture a run bounds in examples counts its members where its
-    rows are delivered, a counter of its own above the rows, which counts each member afresh from the
-    resume (its draws counted each example as the mix drew it, a refused one too). What a position held
-    in flight by member, it held as no member's: a run saved before counts the examples in flight in its
-    total and on its clock, and of no member; tokens a causal window or a pack held start no member's
-    count (a member that joined since holds none of them, `dew.data.steps.windows`)."""
+    its members' counts, none (the members of a mixture's counter past its mix count afresh), as does each
+    held count of a completion (`dew.data.completion`). A mixture a run bounds in examples counts its
+    members where its rows are delivered, a counter of its own above the rows, which counts each member
+    afresh from the resume (its draws counted each example as the mix drew it, a refused one too), and its
+    layouts say which document each token is of (`DOCUMENT`): the tokens a causal window held are of no
+    document, and a pack's remainder, which it reads again, is cut as its counts are. What a position held
+    in flight by member, it held as no member's: the examples a counter, a window or a completion held count
+    in the run's total and on its clock as they did, and complete no member's; a document a pack or a draw
+    reads again completes its member's."""
     from dew.data.mixing import COUNTER, CorpusCounts
+    from dew.data.pipeline import CONSUMED, DOCUMENT
 
     def filled(branch: JSON) -> JSON:
         match branch:
@@ -479,10 +482,8 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
                 return branch
         match node.get(COUNTER):
             case {"consecutive": _} as counter if "members" not in counter:
-                node[COUNTER] = {**counter, "consumed_members": {}, "members": {}}
+                node[COUNTER] = {**counter, "members": {}}
         match node:
-            case {"parent": _, "owed": int()} if "owed_members" not in node:
-                node["owed_members"] = {}
             case {"parent": _, "floor": _, "drawn": _, "held": list(held)}:
                 node["held"] = [[*entry, {}] if isinstance(entry, list) and len(entry) == 4 else entry
                                 for entry in held]
@@ -496,22 +497,46 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
         return iterator
     batch = "dew.data.pipeline.BatchStage"
     batched = names.index(batch) if batch in names else len(names)
-    if any(name not in _AFTER_BATCH for name in names[batched + 1:]):
+    if any(name in _PLACED for name in names[batched + 1:]):
         raise ValueError(
             "this run's mixture is bounded in examples and its position was saved before Dew counted a "
-            "mixture's members where their rows are delivered, under a step after the batch with a position "
-            "of its own (a shuffle, repeat or take of batches), which this translation does not place the "
-            "members' counter beneath; resume with the Dew that wrote it, or go on from its weights as a new "
-            "run (`--pretrained <run directory>`)")
+            "mixture's members where their rows are delivered, under a shuffle, repeat or take of batches, "
+            "whose position the translation does not place the members' counter beneath; resume with the Dew "
+            "that wrote it, or go on from its weights as a new run (`--pretrained <run directory>`)")
+
+    def laid(branch: JSON) -> JSON:
+        """The mixture's layouts past its mix, each document a token is of (`DOCUMENT`): none of the tokens
+        a causal window held, a pack's remainder cut as its counts; the members' own beneath the mix as
+        they were."""
+        match branch:
+            case {"parents": dict(), "index": _}:
+                return branch
+            case list():
+                return [laid(child) for child in branch]
+            case dict():
+                node = {name: laid(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node:
+            case {"windows": _, "rule": _} if "documents" not in node:
+                node["documents"] = 1
+            case {"parent": _, "skip": _, "credited": _, "held": {**held}} if (
+                    CONSUMED in held and DOCUMENT not in held):
+                tokens = record(held[CONSUMED], "held counts").get("tokens", [])
+                none: list[JSON] = [0] * (len(tokens) if isinstance(tokens, list) else 0)
+                node["held"] = {**held, DOCUMENT: {"dtype": "<i8", "tokens": none}}
+                node["documents"] = {}
+            case {"remainder_slices": {**slices}} if CONSUMED in slices and DOCUMENT not in slices:
+                node["remainder_slices"] = {**slices, DOCUMENT: slices[CONSUMED]}
+        return node
 
     def counter(rows: JSON) -> JSON:
         """`rows`, the mixture's rows as format 1 saved them, beneath its members' counter, which counts
         each member afresh: its draws counted each example as the mix drew it, a refused one too."""
         own = json_value(CorpusCounts("mixture", "mixture", rows=False).state(), "mixture counts")
         node: dict[str, JSON] = {"corpus": "mixture", "label": "mixture", "counts": own, "rows": False,
-                                 "consecutive": 0, "warned": False, "consumed": 0, "consumed_members": {},
-                                 "members": {}}
-        return {"parent": rows, COUNTER: node}
+                                 "consecutive": 0, "warned": False, "consumed": 0, "members": {}}
+        return {"parent": laid(rows), COUNTER: node}
 
     match iterator:
         case {"workers_state": {**workers}} as pooled:

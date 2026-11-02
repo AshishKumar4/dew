@@ -125,7 +125,7 @@ class _Held:
     since: int
     consumed: int
     refused: int
-    members: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    members: dict[str, int] = dataclasses.field(default_factory=dict)
     missing: int = 0
 
 
@@ -184,8 +184,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
         released.add(held.consumed, held.refused, held.members)
 
     def get_state(self) -> Mapping[str, object]:
-        held = [[unit, counts.since, counts.consumed, counts.refused,
-                 {member: list(split) for member, split in counts.members.items()}]
+        held = [[unit, counts.since, counts.consumed, counts.refused, dict(counts.members)]
                 for unit, counts in self._held.items()]
         return {"parent": self._rows.get_state(), "floor": self._floor, "drawn": sorted(self._drawn),
                 "held": held}
@@ -198,9 +197,8 @@ class _CompletedIterator(pygrain.DatasetIterator):
         for entry in listed(state["held"], "held counts", read=json_value, what="a list of held counts"):
             match entry:
                 case [unit, since, consumed, refused, dict(split)]:
-                    pairs = {member: integers(held, "a held member's counts")
-                             for member, held in split.items()}
-                    members = {member: (pair[0], pair[1]) for member, pair in pairs.items()}
+                    members = {member: integer(count, "a held member's examples")
+                               for member, count in split.items()}
                     at = integer(unit, "a held count's unit")
                     counts = integer(consumed, "a held count"), integer(refused, "a held refusal")
                     self._held[at] = _Held(integer(since, "a held count's first unit"), *counts, members)
@@ -228,7 +226,9 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
                                                     window_size=size, seed=seed), np.int64, units_count)
     place_of = np.empty(units_count, np.int64)
     place_of[drawn] = np.arange(units_count)
-    table = [_Released() for _ in range(units_count)]
+    table = np.zeros((units_count, 2), np.int64)
+    # A mixture's examples by member, sparse: of the units whose draws release any.
+    split: dict[int, dict[str, int]] = {}
     # The latest place among each span's units, the spans' first units never falling back (`Numbered`):
     # the units still in the latest span, by falling place.
     latest: collections.deque[int] = collections.deque()
@@ -239,39 +239,51 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
         if consumed or refused:
             while latest[0] < since:
                 latest.popleft()
-            table[int(drawn[place_of[latest[0]]])].add(consumed, refused, members)
+            at = int(drawn[place_of[latest[0]]])
+            table[at] += (consumed, refused)
+            if members:
+                split[at] = joined(split.get(at, {}), members)
     shuffled = gx.WindowShuffleIterDataset(units, window_size=size, seed=seed)
-    return shuffled.map(_Release(tuple(table)))
+    return shuffled.map(_Release(table, split, any(counted for *_, counted in held)))
 
 
 @dataclasses.dataclass
 class _Released:
-    """The counts a drawn unit's window releases: consumed, refused, and a mixture's by member."""
+    """The counts a drawn unit's window releases: consumed, refused, and a mixture's examples by member."""
 
     consumed: int = 0
     refused: int = 0
-    members: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    members: dict[str, int] = dataclasses.field(default_factory=dict)
 
     def add(self, consumed: int, refused: int, members: Members) -> None:
         self.consumed, self.refused = self.consumed + consumed, self.refused + refused
         self.members = joined(self.members, members)
 
     def on(self, window: Batch) -> Batch:
-        """`window` with these counts in place of its own, a mixture's by member where it counts them."""
+        """`window` with these counts in place of its own, a mixture's by member where it counts them or
+        any are released on it."""
         counted = {**window, CONSUMED: self.consumed, REFUSED: self.refused}
-        if MEMBERS in window:
+        if MEMBERS in window or self.members:
             counted[MEMBERS] = dict(self.members)
         return counted
 
 
 @dataclasses.dataclass(frozen=True)
 class _Release:
-    """A drawn unit with the counts its draw releases (`released`), in place of its own."""
+    """A drawn unit with the counts its draw releases (`released`), in place of its own: its aggregate
+    counts, and a mixture's examples by member (`members`, of the units that release any) where its
+    windows count them (`counted`)."""
 
-    table: tuple[_Released, ...]
+    table: np.ndarray
+    members: Mapping[int, Mapping[str, int]]
+    counted: bool
 
     def __call__(self, row: Batch) -> Batch:
         window = dict(row)
         unit = integer(window.pop(UNIT), "a window's unit")
         window.pop(SINCE)
-        return self.table[unit].on(window)
+        consumed, refused = self.table[unit]
+        released = {**window, CONSUMED: int(consumed), REFUSED: int(refused)}
+        if self.counted or MEMBERS in window:
+            released[MEMBERS] = dict(self.members.get(unit, {}))
+        return released

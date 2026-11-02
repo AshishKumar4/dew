@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import MEMBER, Owed, Record, Rejected, accounts, members_of, owed_members
+from dew.data.pipeline import MEMBER, Owed, Record, Rejected, accounts, members_of
 
 _log = logging.getLogger(__name__)
 
@@ -233,7 +233,7 @@ class _KeepAccepted:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
             reason = element.reason
-            self.owed.owe_rejected(element)
+            self.owed.owe(element.consumed)
             self._of(element.member).dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
@@ -244,15 +244,17 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
-            self.owed.owe_row(element)
+            self.owed.owe(accounts(element)[0])
             self._of(element.get(MEMBER)).rejected[reason] += 1
         self.consecutive += 1
-        if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
+        # What it rejected, its own and its members' (a mixture's counter past the mix).
+        rejected = sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
+        if not self.warned and sum(rejected.values()) / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
         if self.certain_after is not None and self.consecutive >= self.certain_after:
-            reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            reasons = ", ".join(f"{name} {count}" for name, count in rejected.most_common(3))
             raise ValueError(
                 f"corpus {self.counts.label} rejected its last {self.consecutive} records, every record of "
                 f"two whole passes of what it reads ({reasons}), and its steps reject the same records each "
@@ -260,9 +262,9 @@ class _KeepAccepted:
                 "records: read it with fewer shares, or elastically (`.elastic()`), every reader filtering "
                 "every record")
         if logged_run(self.consecutive, LONG_RUN):
-            reasons = ", ".join(f"{name} {count}" for name, count in self.counts.rejected.most_common(3))
+            reasons = ", ".join(f"{name} {count}" for name, count in rejected.most_common(3))
             # What it kept, which a counter past an objective's expansion reads but counts as no rows.
-            kept = self.counts.attempted - sum(self.counts.rejected.values())
+            kept = self.counts.attempted - sum(rejected.values())
             _log.warning("corpus %s rejected its last %d records and has kept %d; the read goes on until "
                          "one is kept (most rejected: %s)", self.counts.label, self.consecutive, kept,
                          reasons)
@@ -276,8 +278,7 @@ class _KeepAccepted:
             self.counts.delivered(element)
             return
         tag = element.get(MEMBER)
-        completed = {member: consumed - refused
-                     for member, (consumed, refused) in members_of(element).items()}
+        completed = members_of(element)
         owner = self._of(tag)
         own = None if tag is None else text(tag, "a row's mixture member")
         for member, examples in completed.items():
@@ -356,14 +357,13 @@ class _AcceptedIterator(_CountedIterator[Batch]):
                    for key, counts in self._predicate.members.items()}
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
-                "consumed_members": dict(self._predicate.owed.members), "members": members}
+                "members": members}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
         self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
         self._predicate.warned = boolean(counted["warned"], "warned")
-        self._predicate.owed = Owed(integer(counted["consumed"], "consumed examples pending"),
-                                    owed_members(counted["consumed_members"], "consumed examples pending"))
+        self._predicate.owed = Owed(integer(counted["consumed"], "consumed examples pending"))
         # A member that joined since starts its counts; one that left takes its counts with it.
         members = record(counted["members"], "a mixture counter's members")
         for key, counts in self._predicate.members.items():
@@ -395,18 +395,16 @@ class _CarriedIterator(pygrain.DatasetIterator[Batch]):
         while True:
             element = next(self._read)
             if isinstance(element, Rejected):
-                self._owed.owe_rejected(element)
+                self._owed.owe(element.consumed)
                 continue
             return self._owed.paid(element)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "owed": self._owed.examples,
-                "owed_members": dict(self._owed.members)}
+        return {"parent": self._read.get_state(), "owed": self._owed.examples}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "carried parent"))
-        self._owed = Owed(integer(state["owed"], "examples owed"),
-                          owed_members(state["owed_members"], "examples owed"))
+        self._owed = Owed(integer(state["owed"], "examples owed"))
 
     def close(self) -> None:
         self._read.close()

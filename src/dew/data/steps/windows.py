@@ -15,7 +15,7 @@ import numpy as np
 
 from dew._records import integer, integers, record
 from dew.batch import Batch
-from dew.data.pipeline import CONSUMED, Windows, counted
+from dew.data.pipeline import ACCOUNTS, CONSUMED, DOCUMENT, Documents, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import aligned
@@ -107,9 +107,9 @@ class WindowSource(View[TokenFiles]):
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):
-    def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows):
+    def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows, documents: Documents | None):
         super().__init__(parent)
-        self._read, self._windows = parent, windows
+        self._read, self._windows, self._documents = parent, windows, documents
         self._held: Batch = {name: np.zeros(0, np.int32) for name in windows.fields}
         self._skip = 0
         # The leading held tokens whose counts of examples a window already took (`ACCOUNTS`).
@@ -151,13 +151,22 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             # token went to the first window holding it among them.
             upto = max(self._credited, kept if overlapping and len(windows) > 1 else end)
             emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : upto]))
-                                     for name in self._held if counted(name)}}
+                                     for name in ACCOUNTS if name in self._held}}
+            if DOCUMENT in self._held:
+                # A mixture's documents (`DOCUMENT`): those the window holds, and those whose last tokens
+                # it is credited, as it is their counts, which end in it.
+                ids = self._held[DOCUMENT]
+                credited = ids[self._credited : upto]
+                emitted[DOCUMENT] = np.concatenate([np.abs(emitted[DOCUMENT]), credited[credited < 0]])
             self._credited = max(0, upto - kept)
         self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)
         return emitted
 
     def get_state(self) -> Mapping[str, object]:
+        # A mixture's documents its held tokens are of, which no read before it holds again.
+        documents = {} if self._documents is None else {"documents": self._documents.saved(
+            np.abs(self._held.get(DOCUMENT, np.zeros(0, np.int64))).tolist())}
         return {
             "parent": self._read.get_state(),
             "skip": self._skip,
@@ -166,6 +175,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
                 name: {"dtype": value.dtype.str, "tokens": value.tolist()}
                 for name, value in self._held.items()
             },
+            **documents,
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -177,11 +187,8 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             for name, tokens in held.items()
         }
-        # A mixture member that joined since (`member_fields`) holds none of the tokens held.
-        length = len(next(iter(self._held.values()), ()))
-        for name in self._windows.fields:
-            if counted(name) and name not in self._held and CONSUMED in self._held:
-                self._held[name] = np.zeros(length, self._held[CONSUMED].dtype)
+        if self._documents is not None:
+            self._documents.restore(state["documents"])
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
@@ -193,9 +200,13 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
 
 
 class CausalWindows(grain.IterDataset[Batch]):
-    def __init__(self, parent: grain.IterDataset[Batch], windows: Windows):
+    """Windows over a stream of documents; a mixture's (`documents`) say, by id, which documents each holds
+    and which end in it (`DOCUMENT`)."""
+
+    def __init__(self, parent: grain.IterDataset[Batch], windows: Windows,
+                 documents: Documents | None = None):
         super().__init__(parent)
-        self._records, self._windows = parent, windows
+        self._records, self._windows, self._documents = parent, windows, documents
 
     def __iter__(self) -> grain.DatasetIterator[Batch]:
-        return _WindowIterator(iter(self._records), self._windows)
+        return _WindowIterator(iter(self._records), self._windows, self._documents)

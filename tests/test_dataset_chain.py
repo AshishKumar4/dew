@@ -1,5 +1,6 @@
 """The chain surface: stores carry the verbs, mix reads members of every kind, holdout splits by identity."""
 
+import collections
 import dataclasses
 import hashlib
 import itertools
@@ -780,13 +781,16 @@ class ThirdQuestionRefused:
         return Rejected("third question") if int(row["question"]) == 2 else row
 
 
-def _members_asked(read: str) -> Dataset:
+def _members_asked(read: str, *, native: bool = False) -> Dataset:
     """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike (a
     stream's mix shuffled), each record's `id % 3 + 1` questions refused at the third (`Questioned`,
-    `ThirdQuestionRefused`) after the mix, as `read` reads them."""
+    `ThirdQuestionRefused`) after the mix, as `read` reads them; behind a Grain step of the mixture's own
+    that keeps every row (`native`)."""
     corpora = [Memory([{"id": np.int32(start + index)} for index in range(12)], shard_rows=4).named(name)
                for name, start in (("left", 1), ("right", 101))]
     chain = mix(corpora)
+    if native:
+        chain = chain.grain(lambda rows: rows.map(lambda row: row), identity="kept@1")
     return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain).batch(2)
 
 
@@ -805,20 +809,27 @@ def _member_counts(batches, statistics) -> dict[str, tuple[int, int, int, int]]:
     return counts
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered(read, workers):
-    """A mixture of two named corpora read bounded to 18 of their records, through an objective's questions
-    and a step after the mix that refuses each record's third question: each member's rows (data/rows) are
-    its own source examples whose last rows were delivered, and its rejections the third questions refused
-    of its own records, under its name, so its rows and the examples it counts refused are the records it
-    read; no refusal is the mixture's (row 3312)."""
+def test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered(read, workers, native):
+    """A mixture of two named corpora read bounded to 18 of their records, behind a Grain step of its own
+    or not, through an objective's questions and a step after the mix that refuses each record's third
+    question: each member's rows (data/rows) are its own source examples whose last rows were delivered by
+    each batch, and its rejections the third questions refused of its own records, under its name, so its
+    rows and the examples it counts refused are the records it read; no refusal is the mixture's (row
+    3312)."""
     objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
-    data = compile(_members_asked(read), objective=objective, read=read,
+    data = compile(_members_asked(read, native=native), objective=objective, read=read,
                    loading=dataclasses.replace(READ, workers=workers), examples=18)
     stream = data.train(DataPartition())
+    batches = []
     try:
-        batches = list(stream)
+        for batch in stream:
+            batches.append(batch)
+            # By each batch, no member is counted a record whose last row is not yet delivered.
+            for name, (_, rows, _, _) in _member_counts(batches, data.statistics()).items():
+                assert rows <= _completed(batches, name), name
         statistics = data.statistics()
     finally:
         stream.close()
@@ -827,6 +838,15 @@ def test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_deliv
         assert (rows, rejected) == (examples - refused, refused), name
     assert sum(examples for examples, *_ in counts.values()) == 18
     assert not [name for name in statistics if name.startswith("data/rejected/mixture")]
+
+
+def _completed(batches, name: str) -> int:
+    """The records of member `name` whose every question the batches delivered, none refused: each record
+    of `id % 3 + 1` questions, the third of three refused."""
+    delivered = collections.Counter(int(identity) for batch in batches
+                                    for identity in np.asarray(batch["id"]))
+    members = range(1, 13) if name == "left" else range(101, 113)
+    return sum(identity % 3 != 2 and delivered[identity] == identity % 3 + 1 for identity in members)
 
 
 def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_counts_them():

@@ -59,6 +59,7 @@ from dew.data.pipeline import (
     Stage,
     TokenSplit,
     Windows,
+    accounts,
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
@@ -430,7 +431,7 @@ def _targeted(
             total += count
         else:
             counter.rejected["zero_targets"] += 1
-            owed.owe_row(window)
+            owed.owe(accounts(window)[0])
     if owed.examples and kept:
         identifier, last = kept[-1]
         kept[-1] = (identifier, owed.paid(last))

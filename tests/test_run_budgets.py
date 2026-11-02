@@ -371,27 +371,55 @@ def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_
     assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
 
 
-@pytest.mark.parametrize("layout", ["concat", "overlap", "windows"])
+_MAPPED = {
+    "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
+                      .shuffle(seed=1, window=4), "streamed"),
+    "held mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept).shuffle(seed=4),
+                    "memory"),
+}
+"""Concatenating packs with a step that keeps each window between the pack and the shuffle."""
+
+
+def _kept(row):
+    return row
+
+
+@pytest.mark.parametrize("layout", ["concat", "overlap", "windows", "strided", "held", "concat mapped",
+                                    "held mapped"])
 def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutting_them_are_drawn(layout):
     """Two named corpora of the twelve documents (`_pieces`, the right's tokens offset by 100,000), mixed
-    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`): each
-    member's rows (data/rows) are its documents every token of which the read delivered, which a window
-    can hold pieces of two members' documents (row 3312)."""
+    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`, a step that
+    keeps each window between them or not): by each batch, each member's rows (data/rows) are its documents
+    every token of which the batches delivered, which a window can hold pieces of two members' documents
+    (row 3312)."""
     from dew.data.pipeline import mix
 
-    laid, read = _SPLIT[layout]
+    laid, read = {**_SPLIT, **_MAPPED}[layout]
     corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
                .named(name) for name, offset in (("left", 0), ("right", 100_000))]
     loader = compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
-    drawn = _drawn(loader, 0, 1)
-    statistics = loader.statistics()
-    seen = sum((tokens for tokens, _ in drawn), collections.Counter())
+    # Every draw of each token the whole read makes, which a document's every window holds once drawn.
+    total = sum((tokens for tokens, _ in _drawn(loader, 0, 1)), collections.Counter())
+
+    def whole(seen, offset):
+        return sum(all(seen[token] and seen[token] == total[token]
+                       for token in range(offset + 1000 * (index + 1), offset + 1000 * (index + 1) + length))
+                   for index, length in enumerate(_LENGTHS))
+
+    stream = loader.train(DataPartition())
+    seen = collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            seen += collections.Counter(int(token) for token in held if token)
+            statistics = loader.statistics()
+            for name, offset in (("left", 0), ("right", 100_000)):
+                assert statistics.get(f"data/rows/{name}", 0) <= whole(seen, offset), name
+    finally:
+        stream.close()
     for name, offset in (("left", 0), ("right", 100_000)):
-        whole = sum(all(seen[offset + 1000 * (index + 1) + token] for token in range(length))
-                    for index, length in enumerate(_LENGTHS))
-        assert statistics[f"data/rows/{name}"] == whole, name
-    assert sum(examples for _, examples in drawn) == sum(statistics[f"data/rows/{name}"]
-                                                          for name in ("left", "right"))
+        assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
 
 
 @pytest.mark.parametrize("layout", ["concat", "held"])
