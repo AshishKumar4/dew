@@ -488,15 +488,10 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if identifier is None:
         import jax
         device = jax.local_devices()[0]
-        generation, kind = device_generation(), device.device_kind
         real = device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
             _one_kind(jax.devices())
-        target = gpu_target(kind)
-        if target.generation != generation:
-            canonical = TARGETS.get(generation, GpuTarget(generation, kind))
-            target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
-        return runtime_facts(target, device) if real else target
+        return _resolved(device, device_generation(), real)
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
@@ -635,7 +630,12 @@ def device_generation() -> str:
         return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    device = jax.local_devices()[0]
+    return _generation(jax.local_devices()[0])
+
+
+def _generation(device) -> str:
+    """`device`'s own generation: a CUDA device's by its compute capability, a TPU's by its kind, another
+    platform's its name."""
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
@@ -643,6 +643,27 @@ def device_generation() -> str:
         kind = device.device_kind or 'tpu'
         return gpu_target(kind).generation
     return device.platform
+
+
+def device_target(device) -> GpuTarget:
+    """`device`'s own target, whatever `assumed` says, as `gpu_target` resolves this process's first device
+    unassumed (`_resolved`): its generation (`_generation`), its kind's SKU and, a CUDA device's, the facts it
+    reports of itself (`runtime_facts`), its multiprocessors among them. What a program compiled for a target
+    is checked against before it loads (`dew.training.ahead.BuildTarget`)."""
+    return _resolved(device, _generation(device), device.platform == 'gpu')
+
+
+def _resolved(device, generation: str, real: bool) -> GpuTarget:
+    """`device`'s target within `generation`: its kind picks the SKU's peaks within it, and where the table
+    names no SKU of that kind of the generation, a `real` device keeps its own kind, so its peaks stay
+    unknown, and another takes the generation's canonical device; a `real` one carries the facts it reports
+    (`runtime_facts`)."""
+    kind = device.device_kind
+    target = gpu_target(kind)
+    if target.generation != generation:
+        canonical = TARGETS.get(generation, GpuTarget(generation, kind))
+        target = dataclasses.replace(canonical, device_kind=kind) if real else canonical
+    return runtime_facts(target, device) if real else target
 
 
 def chosen_kernel(choice: str, default: str) -> str:
