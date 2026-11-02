@@ -1469,7 +1469,7 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
-def _processor_code(directory: Path) -> dict[str, object]:
+def _processor_code(directory: Path) -> Mapping[str, object]:
     """The `auto_map` entries a source's processor files name its own code by (LFM3-VL's processor and
     its image and video processors, each file's own and its components'), the files `Processor` saves
     beside a bundle (`Processor.save_pretrained`) and its tokenizer's."""
