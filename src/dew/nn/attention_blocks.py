@@ -36,18 +36,21 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     `flat` stores the matrix as the published diffusion and vision attentions
     do, `[C, heads * head_dim]`, and splits its product into heads; otherwise
     it is `[C, heads, head_dim]` (`DenseGeneral`), Dew's own, whose heads a
-    tensor axis splits. A checkpoint's reader maps one layout or the other, so
+    tensor axis splits; each declares its axes, `[embed, heads]` flat, `[embed, heads, head_dim]`
+    headed. A checkpoint's reader maps one layout or the other, so
     each attention keeps its own. `norm` normalizes each head's channels, or
     with `across_heads` each token's whole projection before it splits, as
     Wan's `rms_norm_across_heads` does: another function, not another order.
     """
     width = heads * head_dim
     if flat:
+        # The flat width holds whole heads in order, so a split of its heads keeps each head whole.
         projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                          dot_general=float32_dot_general)(x)
+                          dot_general=float32_dot_general, kernel_axes=("embed", "heads"))(x)
     else:
         projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                 name=name, dot_general=float32_dot_general)(x)
+                                 name=name, dot_general=float32_dot_general,
+                                 kernel_axes=("embed", "heads", "head_dim"))(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -62,10 +65,11 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
         return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                     dot_general=float32_dot_general)(
+                     dot_general=float32_dot_general, kernel_axes=("heads", "embed"))(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                        name=name, dot_general=float32_dot_general)(attended)
+                        name=name, dot_general=float32_dot_general,
+                        kernel_axes=("heads", "head_dim", "embed"))(attended)
 
 
 @dataclasses.dataclass(frozen=True)
