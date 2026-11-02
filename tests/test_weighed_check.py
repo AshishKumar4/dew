@@ -25,6 +25,10 @@ REDRAW stage the unweighted check stays undecided on every arm below that its ro
 NULL_RUNS = 32
 """The null control's runs: the reference against itself on disjoint draws, judged as a weighed site is."""
 
+NULL_WEIGHED_SEEDS = 64
+"""The null control's weighed seeds: the reference against itself unpaired, its heavy class one element a
+draw, sized by the null runs' own verdicts on armada."""
+
 
 def draw(seed: int):
     """A seed's two `[ROWS, HALF]` standard normal operands, float32, and its amplification 2^k."""
@@ -115,7 +119,7 @@ def test_the_weighed_check_passes_the_reference_against_itself():
     passes every one of `NULL_RUNS` runs, each verdict naming the check that decided it, its false-failure
     rate bounded by `null_rate_bound`."""
     verdicts = null_runs(jax.jit(reference), draw, "the reference against itself, weighed",
-                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=WEIGHED_SEEDS)
+                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=NULL_WEIGHED_SEEDS)
     reds = sum(not verdict.startswith("pass") for verdict, _, _ in verdicts)
     assert reds == 0, (reds, null_rate_bound(reds, NULL_RUNS), verdicts)
 
