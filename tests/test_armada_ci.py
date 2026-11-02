@@ -27,6 +27,56 @@ def ci(tmp_path, monkeypatch):
     return loaded(tmp_path, monkeypatch)
 
 
+SITED = """
+import json
+import os
+
+import pytest
+
+
+def noted(name):
+    with open(os.environ["SEEN"], "a") as out:
+        out.write(json.dumps([name, {key: os.environ.get(key) for key in
+                                     ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")}]) + "\\n")
+
+
+def test_ordinary():
+    noted("ordinary")
+
+
+@pytest.mark.check1_shards(seeds=4, per_task=4)
+def test_check1():
+    noted("check1")
+
+
+@pytest.mark.shards(units=4, per_task=4)
+def test_witness():
+    noted("witness")
+"""
+
+
+@pytest.mark.parametrize("split", ["", "1/1", "test_check1.draws-0-4", "test_check1"])
+def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tasks_alone(ci, tmp_path,
+                                                                                        monkeypatch, split):
+    """A targeted run of a file's group (tmp/run_tests.py, the gangs) selects as CI's task does: a file's
+    group sets aside its sites, which run in their own tasks alone, a map task drawing its seeds into its
+    artifacts and the judge pooling them from its inputs (2026-11-02: a lane's targeted
+    chunk_adaptation#1/5 ran a site's every seed itself, 2233 s against CI's 8, and #2/5 timed out)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_sites.py"], split) == 0
+    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    unset = {"DEW_CHECK1_DRAWS": None, "DEW_CHECK1_RECORDS": None, "DEW_CHECK1_POOL": None}
+    expected = {"": [["ordinary", unset]], "1/1": [["ordinary", unset]],
+                "test_check1.draws-0-4": [["check1", {**unset, "DEW_CHECK1_DRAWS": "0:4",
+                                                      "DEW_CHECK1_RECORDS": str(tmp_path / "artifacts")}]],
+                "test_check1": [["check1", {**unset, "DEW_CHECK1_POOL": str(tmp_path / "inputs")}]]}
+    assert seen == expected[split]
+
+
 def gpu_driver(root: Path, monkeypatch) -> None:
     """nvidia-smi as the driver answers it for an 80 GiB GPU, first on PATH."""
     tools = root / "bin"

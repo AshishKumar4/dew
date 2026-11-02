@@ -29,7 +29,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import Plan, earlier_position
+from dew.data.plan import COUNTERS, Plan, earlier_position
 
 
 @dataclasses.dataclass(frozen=True)
@@ -204,7 +204,7 @@ class _PerShare(Forwarding):
         if state is None:
             state = self._reader().get_state()
             self._publish(state)
-        saved = {"dew_data_plan": self._plan.record(), "iterator": state}
+        saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
         return json.dumps({position.REPLICATED: saved} if self._replicated else saved).encode()
 
     def set_state(self, state: bytes) -> None:

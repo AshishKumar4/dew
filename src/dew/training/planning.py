@@ -603,8 +603,9 @@ class FitSearch[LossT, EffectsT]:
         # Whether any module the run trains sets its own remat, which it compiles at alone.
         self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
                                                              else [record]))
-        # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
-        self.required = compiler_options(*self.objective.towers()) or None
+        # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
+        # target compiles them (`deviceless_options`), as the step's own (`options`) are made.
+        self.required = deviceless_options(self.mesh, compiler_options(*self.objective.towers()) or None)
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
@@ -775,8 +776,7 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
-        rung = self.required if self.xla_defaults else self.options(candidate)
-        options = deviceless_options(self.mesh, rung)
+        options = self.required if self.xla_defaults else self.options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
         if ahead is not None:
@@ -864,9 +864,8 @@ class FitSearch[LossT, EffectsT]:
             self.lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
-        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89). Both
-        # are compared as the target compiles them (`deviceless_options`).
-        if not self.xla_defaults and self.chosen != deviceless_options(self.mesh, self.required):
+        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
+        if not self.xla_defaults and self.chosen != self.required:
             self.xla_defaults = True
             return True
         self.xla_defaults = False

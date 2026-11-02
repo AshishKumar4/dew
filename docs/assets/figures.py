@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -1219,9 +1219,11 @@ def cfg_sweep_figure():
     svg.save(HERE / "cfg-sweep.svg")
 
 
-Part = tuple[str, Sequence[str], str, tuple[float, float, float, float]]
+Part = tuple[str, Sequence[str], str, tuple[float, float, float, float], int]
 """A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; "plain";
-"elsewhere", built on another branch, amber) and where it sits in the wide layout (x, y, width, height)."""
+"elsewhere", built on another branch, amber), where it sits in the wide layout (x, y, width, height), and its
+row: parts of one row are alternatives, drawn side by side wide and boxed together on a phone, never with an
+arrow between them."""
 
 
 def part(svg: Figure, x, y, w, h, title, lines, kind: str):
@@ -1236,26 +1238,49 @@ def part(svg: Figure, x, y, w, h, title, lines, kind: str):
 
 
 def drawn(name: str, label: str, size: tuple[int, int], parts: Sequence[Part],
-          wide: Callable[[Figure], None] | None = None, note: Sequence[str] = ()) -> None:
+          wide: Callable[[Figure], None] | None = None, note: Sequence[str] = (), flows: Collection[int] = (),
+          headings: Mapping[int, str] | None = None) -> None:
     """A figure from one list of its `parts`: wide, each at its place with `wide`'s arrows and labels, as
-    <name>.svg; for a phone, the same parts one under another and `note` beneath, as <name>-narrow.svg. The
-    parts are declared once, so the two layouts never say different things (review)."""
+    <name>.svg; for a phone, the same parts row by row, as <name>-narrow.svg: a row's parts (`Part`) boxed
+    together, an arrow from a row to the next only where the row `flows` on, a row's heading above it
+    (`headings`), and `note` beneath. The parts are declared once, so the two layouts never say different
+    things (review; train 462: a phone's arrows ran between alternatives)."""
     svg = Figure(*size, label=label)
-    for title, lines, kind, (x, y, w, h) in parts:
+    for title, lines, kind, (x, y, w, h), _ in parts:
         part(svg, x, y, w, h, title, lines, kind)
     if wide is not None:
         wide(svg)
     save_both(svg, name, narrow=False)
-    width, x, y = 360, 12, 12
-    heights = [36 + 19 * len(lines) for _, lines, _, _ in parts]
-    height = 12 + sum(heights) + 18 * (len(parts) - 1) + (22 * len(note) + 16 if note else 0) + 12
+    headings = headings or {}
+    rows = [[found for found in parts if found[4] == row] for row in sorted({found[4] for found in parts})]
+    width, x, gap = 360, 12, 18
+
+    def tall(row: list[Part]) -> float:
+        boxed = len(row) > 1
+        return sum(36 + 19 * len(lines) for _, lines, _, _, _ in row) + 6 * (len(row) - 1) + (16 if boxed else 0)
+
+    height = (12 + sum(tall(row) for row in rows) + gap * (len(rows) - 1) + 24 * len(headings)
+              + (22 * len(note) + 16 if note else 0) + 12)
     svg = Figure(width, height, label=label)
-    for k, ((title, lines, kind, _), h) in enumerate(zip(parts, heights, strict=True)):
-        part(svg, x, y, width - 2 * x, h, title, lines, kind)
-        y += h
-        if k < len(parts) - 1:
-            svg.arrow(width / 2, y, width / 2, y + 16)
-            y += 18
+    y = 12
+    for k, row in enumerate(rows):
+        number = row[0][4]
+        if number in headings:
+            svg.text(x, y + 14, headings[number], size=11, weight=600, color="muted")
+            y += 24
+        boxed = len(row) > 1
+        if boxed:
+            svg.rect(x - 4, y, width - 2 * x + 8, tall(row), fill="none", stroke="muted")
+        inner = y + (8 if boxed else 0)
+        for title, lines, kind, _, _ in row:
+            h = 36 + 19 * len(lines)
+            part(svg, x + (4 if boxed else 0), inner, width - 2 * x - (8 if boxed else 0), h, title, lines, kind)
+            inner += h + 6
+        y += tall(row)
+        if k < len(rows) - 1:
+            if number in flows:
+                svg.arrow(width / 2, y, width / 2, y + gap - 2)
+            y += gap
     for k, line in enumerate(note):
         svg.text(x, y + 26 + 22 * k, line, size=12, color="muted")
     save_both(svg, name, narrow=True)
@@ -1270,19 +1295,19 @@ def architecture_flow_figure():
              "and run in one executable per step, where on sm90 and later a Mosaic launch may start the next "
              "early.")
     parts = [
-        ("Trainer(…).fit(data)", ["a script or notebook"], "plain", (110, 16, 340, 62)),
-        ("or: dew train run.json", ["RunConfig builds the same Trainer"], "plain", (462, 16, 282, 62)),
+        ("Trainer(…).fit(data)", ["a script or notebook"], "plain", (110, 16, 340, 62), 0),
+        ("or: dew train run.json", ["RunConfig builds the same Trainer"], "plain", (462, 16, 282, 62), 0),
         ("Trainer.fit", ["compiles a step per batch shape,", "runs it every micro-batch"], "plain",
-         (110, 100, 634, 81)),
-        ("jax.jit", ["traces the step"], "plain", (110, 203, 140, 62)),
-        ("algebra pass", ["rewrites the jaxpr"], "dew", (258, 203, 160, 62)),
-        ("lower", ["StableHLO"], "plain", (426, 203, 150, 62)),
-        ("XLA compile", ["fuses, runs ptxas"], "plain", (584, 203, 160, 62)),
-        ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62)),
-        ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62)),
-        ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62)),
+         (110, 100, 634, 81), 1),
+        ("jax.jit", ["traces the step"], "plain", (110, 203, 140, 62), 2),
+        ("algebra pass", ["rewrites the jaxpr"], "dew", (258, 203, 160, 62), 3),
+        ("lower", ["StableHLO"], "plain", (426, 203, 150, 62), 4),
+        ("XLA compile", ["fuses, runs ptxas"], "plain", (584, 203, 160, 62), 5),
+        ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62), 6),
+        ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62), 6),
+        ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62), 6),
         ("one executable per step", ["its kernels run in order; from sm90 a",
-                                     "Mosaic launch may start the next early"], "plain", (110, 371, 634, 81)),
+                                     "Mosaic launch may start the next early"], "plain", (110, 371, 634, 81), 7),
     ]
 
     def wide(svg: Figure) -> None:
@@ -1294,7 +1319,7 @@ def architecture_flow_figure():
                                (427, 349, 427, 369)):
             svg.arrow(x1, y1, x2, y2)
 
-    drawn("architecture-flow", label, (760, 468), parts, wide)
+    drawn("architecture-flow", label, (760, 468), parts, wide, flows=range(7))
 
 
 def architecture_template_figure():
@@ -1305,30 +1330,33 @@ def architecture_template_figure():
              "attention forward call goes from attention_route through MosaicForward.derived, bundles.of, "
              "the launch and each consumer's walk.")
     parts = [
-        ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62)),
-        ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62)),
+        ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62), 0),
+        ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62), 1),
         ("toolkit: Family = Issuer + Transport", ["products, waits, walks, rings, roles;",
                                                   "WGMMA, FED, Mma, MmaFed; TCGEN05 unrouted"], "dew",
-         (16, 174, 400, 81)),
-        ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62)),
-        ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62)),
-        ("algebra", ["init, step, merge, finish on tiles"], "dew", (16, 403, 400, 62)),
-        ("attention_route.attend", ["selector: mosaic, triton, portable"], "plain", (440, 34, 304, 62)),
-        ("MosaicForward.derived", ["choice: tiles, stages, consumers"], "plain", (440, 112, 304, 62)),
-        ("bundles.of(target)", ["toolkit: WGMMA on an H100"], "plain", (440, 190, 304, 62)),
-        ("_launched", ["mainloop: roles and the kernel"], "plain", (440, 268, 304, 62)),
-        ("each consumer's walk", ["algebra: plain_step, merge, finish"], "plain", (440, 346, 304, 62)),
+         (16, 174, 400, 81), 2),
+        ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62), 3),
+        ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62), 4),
+        ("algebra", ["init, step, merge, finish on tiles"], "dew", (16, 403, 400, 62), 5),
+        ("attention_route.attend", ["selector: mosaic, triton, portable"], "plain", (440, 34, 304, 62), 6),
+        ("MosaicForward.derived", ["choice: tiles, stages, consumers"], "plain", (440, 112, 304, 62), 7),
+        ("bundles.of(target)", ["toolkit: WGMMA on an H100"], "plain", (440, 190, 304, 62), 8),
+        ("_launched", ["mainloop: roles and the kernel"], "plain", (440, 268, 304, 62), 9),
+        ("each consumer's walk", ["algebra: plain_step, merge, finish"], "plain", (440, 346, 304, 62), 10),
     ]
+    layers, call = "LAYERS, TOP DECIDES", "AN ATTENTION FORWARD CALL"
+    recurrence = "The recurrence takes the same path on the same bundles."
 
     def wide(svg: Figure) -> None:
-        svg.text(16, 22, "LAYERS, TOP DECIDES", size=11, weight=600, color="muted")
-        svg.text(440, 22, "AN ATTENTION FORWARD CALL", size=11, weight=600, color="muted")
+        svg.text(16, 22, layers, size=11, weight=600, color="muted")
+        svg.text(440, 22, call, size=11, weight=600, color="muted")
         for k in range(1, 5):
             svg.arrow(592, 34 + 78 * k - 16, 592, 34 + 78 * k - 2)
-        svg.text(440, 440, "The recurrence takes the same path on the same bundles.", size=12, color="muted")
+        svg.text(440, 440, recurrence, size=12, color="muted")
 
-    drawn("architecture-template", label, (760, 481), parts, wide,
-          note=["The first six are the layers, top deciding;", "the last five an attention forward call."])
+    # The layers are a stack, no arrow between them; the call steps from one to the next.
+    drawn("architecture-template", label, (760, 481), parts, wide, note=[recurrence], flows=range(6, 10),
+          headings={0: layers, 6: call})
 
 
 def architecture_pass_figure():
@@ -1339,16 +1367,16 @@ def architecture_pass_figure():
              "DAG extraction picks each form by its price in seconds; a region's forms go in only where "
              "it costs less, and the outer jit lowers the result for XLA.")
     parts = [
-        ("traced jaxpr", ["the whole step,", "backward included"], "plain", (16, 16, 170, 81)),
-        ("terms", ["language equations become terms;", "the rest stay opaque"], "dew", (204, 16, 260, 81)),
+        ("traced jaxpr", ["the whole step,", "backward included"], "plain", (16, 16, 170, 81), 0),
+        ("terms", ["language equations become terms;", "the rest stay opaque"], "dew", (204, 16, 260, 81), 1),
         ("windows", ["each cheapenable head, two producer", "levels; clusters of 64 equations"], "dew",
-         (482, 16, 262, 81)),
+         (482, 16, 262, 81), 2),
         ("saturate", ["each cluster its own e-graph:", "identities, linear, joined"], "dew",
-         (16, 137, 240, 81)),
+         (16, 137, 240, 81), 3),
         ("extract", ["greedy DAG, priced by cost.fused", "a shared value counted once"], "dew",
-         (274, 137, 220, 81)),
-        ("splice", ["a region's forms, where the", "region costs less"], "dew", (512, 137, 232, 81)),
-        ("outer jit lowers → XLA", [], "plain", (512, 259, 232, 54)),
+         (274, 137, 220, 81), 4),
+        ("splice", ["a region's forms, where the", "region costs less"], "dew", (512, 137, 232, 81), 5),
+        ("outer jit lowers → XLA", [], "plain", (512, 259, 232, 54), 6),
     ]
 
     def wide(svg: Figure) -> None:
@@ -1362,7 +1390,7 @@ def architecture_pass_figure():
         svg.arrow(494, 177, 510, 177)
         svg.arrow(628, 218, 628, 257)
 
-    drawn("architecture-pass", label, (760, 329), parts, wide,
+    drawn("architecture-pass", label, (760, 329), parts, wide, flows=range(6),
           note=["dew.algebra.passes(on, target), on by default;", "loop bodies rewritten in place"])
 
 
@@ -1374,14 +1402,14 @@ def architecture_derived_figure():
              "refuses. The switch dew.cache.DERIVED, off by default, chooses the derived forms or the "
              "hand-written ones for the template's plain_step, merge and finish.")
     parts = [
-        ("declaration", ["a Reduction:", "softmax(s)·v by keys"], "plain", (16, 16, 172, 81)),
-        ("traced at a tile", ["terms; facts mark", "walked sums, maxima"], "dew", (200, 16, 172, 81)),
-        ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81)),
-        ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81)),
-        ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81)),
-        ("dew.cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81)),
-        ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81)),
-        ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40)),
+        ("declaration", ["a Reduction:", "softmax(s)·v by keys"], "plain", (16, 16, 172, 81), 0),
+        ("traced at a tile", ["terms; facts mark", "walked sums, maxima"], "dew", (200, 16, 172, 81), 1),
+        ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81), 2),
+        ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81), 3),
+        ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81), 4),
+        ("dew.cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
+        ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81), 4),
+        ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40), 6),
     ]
 
     def wide(svg: Figure) -> None:
@@ -1390,7 +1418,8 @@ def architecture_derived_figure():
                                (392, 224, 392, 250)):
             svg.arrow(x1, y1, x2, y2)
 
-    drawn("architecture-derived", label, (760, 300), parts, wide)
+    drawn("architecture-derived", label, (760, 300), parts, wide, flows=range(6),
+          headings={4: "DERIVED, OR HAND-WRITTEN"})
 
 
 def architecture_cost_figure():
@@ -1400,13 +1429,13 @@ def architecture_cost_figure():
              "of GpuTarget. cost.fused, XLA's fusion, prices the compile-time pass; cost.walk, the "
              "template's tile walk, prices derived forms.")
     parts = [
-        ("GpuTarget + Architecture", ["rates, bandwidth, clock, SMs"], "plain", (230, 16, 300, 62)),
+        ("GpuTarget + Architecture", ["rates, bandwidth, clock, SMs"], "plain", (230, 16, 300, 62), 0),
         ("templates.cost.Work", ["tensor FLOPs, fp32 ops, SFU exp,", "conversions, device, shared bytes"],
-         "dew", (170, 104, 420, 81)),
+         "dew", (170, 104, 420, 81), 1),
         ("cost.fused: XLA's fusion", ["whole-device rates, in series", "with memory: prices the pass"], "dew",
-         (16, 229, 350, 81)),
+         (16, 229, 350, 81), 2),
         ("cost.walk: the tile walk", ["one tile on one SM, units", "overlapped: prices derived forms"], "dew",
-         (394, 229, 350, 81)),
+         (394, 229, 350, 81), 2),
     ]
 
     def wide(svg: Figure) -> None:
@@ -1414,7 +1443,7 @@ def architecture_cost_figure():
         svg.arrow(300, 185, 200, 227, color="accent")
         svg.arrow(460, 185, 560, 227, color="accent")
 
-    drawn("architecture-cost", label, (760, 326), parts, wide)
+    drawn("architecture-cost", label, (760, 326), parts, wide, flows=range(2))
 
 
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
