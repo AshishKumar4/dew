@@ -943,6 +943,70 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+def _squared_rows(rows: int, block: int):
+    """A consumer adding to the product a residual's row block `(i * i) % n` at the product's row block `i`
+    (n the blocks a column of `block` rows holds), as a custom fusion whose pull rule says so: block 1 reads
+    block 1, so the index map agrees with the identity at the probe's (1, 2), and block 2 reads block 4."""
+    from jax.experimental.pallas import fuser as pallas_fuser
+
+    def moved(row, count):
+        return (row * row) % count
+
+    @pallas_fuser.custom_fusion
+    def added(prod, residual):
+        count = rows // block
+        order = jnp.asarray([moved(row, count) for row in range(count)])
+        blocks = residual[:count * block].reshape(count, block, -1)[order].reshape(count * block, -1)
+        return prod.at[:count * block].add(blocks)
+
+    @added.def_pull_block_spec
+    def _(transforms):
+        (out,) = transforms
+        count = rows // out.block_shape[0]
+
+        def residual_index(*indices):
+            row, column = out.block_index_transform(*indices)
+            return moved(row, count), column
+
+        return out, out.replace(block_index_transform=residual_index)
+
+    @added.def_eval_rule
+    def _(ctx, prod, residual):
+        del ctx
+        return (prod + residual,)
+
+    return added
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(generation_name):
+    """A consumer whose residual is read at another row block than the product's, by a map that agrees with
+    the identity at one point (`_squared_rows`): the fused product keeps the unfused program's value on
+    every row, the consumer refused the epilogue (its map proved, `fused._followed`), where a map read at
+    (1, 2) alone was taken for the tile and the kernel read each block's own residual (row 3636)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, _, _, u, *_ = _draw(seed)
+        return x, w, u[:, :WIDTH].astype(jnp.float32)
+
+    def fusing(x, w, r):
+        prod = fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True)
+        return _squared_rows(ROWS, 64)(prod, r)
+
+    def unfused(x, w, r):
+        return _squared_rows(ROWS, 64).fun(template.gemm(x, w, sizes, out_dtype=jnp.float32), r)
+
+    def truth(x, w, r):
+        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+        product = jax.lax.ragged_dot(x, matrix, sizes, preferred_element_type=x.dtype)
+        return _squared_rows(ROWS, 64).fun(product, r.astype(x.dtype))
+
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "a residual off the tile",
+                        seeds=SEEDS, truth_fn=truth)
+
+
 def rms_norm(x, weight, epsilon=1e-6):
     """An RMS norm of the residual stream as a model writes it: statistics at least fp32 (float64 for the
     float64 truth), one rounding."""
