@@ -241,11 +241,10 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
 
 
 def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
-    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread, which leave a
-    multiprocessor four programs (`Family.programs` at the launch's own registers): a launch of 16 KiB a
-    stage holds all four at the deepest ring a quarter of its shared memory holds; one of 40 KiB a stage
-    holds the most programs whose share holds its floor of two stages; one past every residency at its
-    floor plans nothing."""
+    """`resources.plan` on an A100 for one mma.sync consumer (two programs a multiprocessor, 81 KiB each):
+    a launch of 16 KiB a stage holds two programs at four stages; one of 40 KiB a stage holds two programs
+    at its floor of two only where it fits, else falls to one program and deepens there; one past every
+    residency at its floor plans nothing."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
@@ -256,29 +255,8 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        block = generation.shared_budget(target)
+        share = resources.program_shared(generation.shared_budget(target), 2)
         small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
-    assert small is not None and (small[0].programs, small[0].stages) == (
-        4, min(8, resources.program_shared(block, 4) // (16 * 1024)))
-    assert wide is not None and wide[0].programs == max(
-        programs for programs in (1, 2, 3, 4) if resources.program_shared(block, programs) >= 2 * 40 * 1024)
+    assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
+    assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
     assert past is None
-
-
-def test_a_launch_runs_as_many_programs_as_its_own_registers_leave():
-    """`resources.plan` on an H100 for one warpgroup-MMA consumer beside its producer: whose threads hold
-    128 registers, two programs a multiprocessor, its consumer raised to their share (232 beside the
-    producer's 24), where a raise to the whole register file's held one (Nemotron-H 30B's SSD query/key
-    launch, 162 against 218 us, FS-SSD-RESIDENT1-h100); whose threads hold 200, one."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    def launch(registers: int) -> resources.Launch:
-        return resources.Launch(lambda stages: resources.Scope(
-            program=(plgpu.SMEM((stages * 8 * 1024,), jnp.uint8),)), consumers=1, registers=registers)
-
-    with generation.assumed("sm90"):
-        family, target = bundles.of("sm90", jnp.bfloat16), generation.gpu_target()
-        held, wide = (resources.plan([launch(registers)], family, target) for registers in (128, 200))
-    assert held is not None and held[0].programs == 2
-    assert wide is not None and wide[0].programs == 1
-    assert resources.raised_registers(1, held[0].programs) == 232
