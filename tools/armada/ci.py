@@ -1631,7 +1631,8 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     read (`depends`, None where that is not known): a map task's own, kept among its artifacts for its judge,
     which reads every one of its map tasks' among its inputs and keys on them with its own (`cache_key`), so
     the site's key covers what its draws ran, which the judge runs none of (an arm run as given, a branch of a
-    later seed); None where a map task's is not known or not found. Any other row's, as it is."""
+    later seed): its first stage's map tasks', and its later ones' where they ran; None where one of those is
+    not known or not found. Any other row's, as it is."""
     _, name, group = parsed_row(row_name)
     site = SITE.fullmatch(group)
     if site is None:
@@ -1647,8 +1648,13 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     found = {path.name: json.loads(path.read_text())
              for path in armada_dir("ARMADA_INPUTS", INPUTS).rglob("*.inputs.json")}
     mark = sites(name).get(test)
-    drawn = [found.get(f"{site_task(python, name, test, span)}.inputs.json")
-             for span in (draws_of(mark) if mark else [])]
+    named = {span: f"{site_task(python, name, test, span)}.inputs.json"
+             for span in (draws_of(mark) if mark else [])}
+    # A judge's later map tasks ran only where its first stage asked for them (`site_entries`), all of them:
+    # one that judged without them judged over its first stage's alone.
+    later = [span for span in named if mark and span[0] >= mark.timed]
+    supplied = [span for span in named if span not in later or any(named[each] in found for each in later)]
+    drawn = [found.get(named[span]) for span in supplied]
     if depends is None or not drawn or any(each is None for each in drawn):
         return None
     return sorted({*depends, *(path for each in drawn for path in each)})
