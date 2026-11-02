@@ -877,6 +877,27 @@ def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_
     assert abs(float(stepped[0, 0]) - exact) <= np.spacing(np.float32(exact))
 
 
+def test_a_variance_exploding_euler_step_from_a_zero_snr_sigma_rounds_as_ddim():
+    """An Euler step from a zero-SNR schedule's first sigma, 4096, down to 14.6 is DDIM's step,
+    x_0 + sigma_s (x - x_0) / sigma_t, to float32's rounding of its result: the source's x + derivative
+    dt cancels two terms of x's size there (x is 4e4) and keeps dt's rounding times the derivative, about
+    270 times farther (ledger 3475). The source's increment is the step between near sigmas alone, where
+    neither cancels (2 sigma_s >= sigma_t, the high-sigma walk of ledger 2541)."""
+    from dew.sampling.solvers.sigma import _euler_step
+
+    rng = np.random.default_rng(3475)
+    sigma_t, sigma_s = np.float32(4096.0), np.float32(14.6)
+    denoised = rng.standard_normal((4096, 1)).astype(np.float32)
+    x = (denoised + sigma_t * rng.standard_normal((4096, 1))).astype(np.float32)
+    one = jnp.float32(1)
+    stepped = np.asarray(_euler_step(jnp.asarray(x), jnp.asarray(denoised), (one, jnp.asarray(sigma_t)),
+                                     (one, jnp.asarray(sigma_s)))[0], np.float64)
+    wide = [np.asarray(value, np.float64) for value in (x, denoised, sigma_t, sigma_s)]
+    exact = wide[1] + wide[3] * (wide[0] - wide[1]) / wide[2]
+    # Four roundings of the form, each at most half an ulp of the result, where the source's sum keeps hundreds.
+    assert np.max(np.abs(stepped - exact) / np.spacing(np.abs(exact).astype(np.float32))) <= 4
+
+
 POSTERIOR_SEEDS = 8
 """The DDIM posterior site's declared draws (check 1), sized by `seeds_for` paired with Dew's step on
 armada: the most any process took."""
