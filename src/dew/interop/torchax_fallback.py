@@ -178,8 +178,9 @@ type Traceable = jax.typing.ArrayLike | jax.ShapeDtypeStruct
 initialization and an unprobed source's qualification (`qualified`) hold them."""
 
 QUALIFYING = 13
-"""The tokens a row `qualified` traces an unprobed source's forward over, fewer where its context holds
-fewer: a prime, so no other size of its program is taken for the sequence's."""
+"""The most tokens a row `qualified` traces an unprobed source's forward over, at the two largest primes
+up to it its context holds (11 and 13): two coprime lengths, its program the same at both
+(`sequence_causality.causality_refusal`), and no other size of it taken for the sequence's."""
 
 
 def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable) -> TorchAdmission:
@@ -190,8 +191,8 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     layer, each passing only keywords Dew computes with a mask its causal visibility reproduces
     (`_Probe`, read off the mask, `_masked`); an operation whose value the traced values decide (BLT's
     `item()`) fails that trace with JAX's own error, naming it; the trace on Dew's attention is causal by
-    its program alone (`sequence_causality.causality_refusal`: Dew's causal attention, causal
-    convolutions, forward scans and the like, each named where it is not); and its training forward
+    its program alone at two lengths, the same program at both (`sequence_causality.causality_refusal`:
+    each output position reading no later input through every operation); and its training forward
     draws nothing on the host. Each refusal names its cause."""
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -204,24 +205,28 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     source = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
     _registered()
     context = fields.get("max_position_embeddings")
-    length = max(prime for prime in (2, 3, 5, 7, 11, QUALIFYING)
-                 if context is None or prime <= _records.integer(context, "max_position_embeddings"))
+    stated = None if context is None else _records.integer(context, "max_position_embeddings")
+    lengths = [prime for prime in (2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated][-2:]
+    if len(lengths) < 2:
+        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its context "
+                         f"of {stated} positions holds no two lengths to trace it at")
     probe = _Probe(abstract=True)
     try:
         # Its masks evaluated as the trace runs, so the probe reads their values (`_masked`).
         with probe.recording(), jax.ensure_compile_time_eval():
-            _abstract(source, _PROBE, length, train=False)
-        closed, tokens, _ = _abstract(source, _ATTENTION, length, train=False)
-        _, _, trained = _abstract(source, _ATTENTION, length, train=True)
+            _abstract(source, _PROBE, lengths[-1], train=False)
+        why = probe.kept_from_dew(int(source.num_hidden_layers))
+        if why:
+            raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and tier 3 "
+                             "holds an unprobed source causal by Dew's attention, which it cannot run on: "
+                             f"{why}")
+        programs = {length: _abstract(source, _ATTENTION, length, train=False)[:2] for length in lengths}
+        trained = _abstract(source, _ATTENTION, lengths[-1], train=True)[2]
     except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
             jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError) as error:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"does not trace at its full config: {type(error).__name__}: {error}") from error
-    why = probe.kept_from_dew(int(source.num_hidden_layers))
-    if why:
-        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and tier 3 holds "
-                         f"an unprobed source causal by Dew's attention, which it cannot run on: {why}")
-    refusal = causality_refusal(closed, tokens, length)
+    refusal = causality_refusal(programs)
     if refusal is not None:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"is not causal by its program: {refusal}")
@@ -272,6 +277,13 @@ _PLUMBING = frozenset({"position_ids", "cache_position", "position_embeddings", 
 attention computes: positions are already in the rotated queries and keys, and a decoding call's cache is
 Dew's (`_Cached`), not transformers'."""
 
+def _asked(kwargs: Mapping[str, object]) -> set[str]:
+    """The keywords an attention call passes that ask its attention a computation Dew's does not make:
+    past `_PLUMBING` and `_COMPUTED`, those that hold a value (a BERT decoder's `encoder_hidden_states`
+    of None asks no cross-attention)."""
+    return {name for name, value in kwargs.items() if value is not None} - _PLUMBING - _COMPUTED
+
+
 _COMPUTED = frozenset({"sliding_window", "softcap", "s_aux"})
 """The keywords Dew's attention computes (`_dew_attention`): a window over the most recent keys, a
 tanh cap on the logits, and one value-free logit a head (sinks)."""
@@ -302,7 +314,7 @@ class _Probe:
 
     def called(self, module, query, key, attention_mask, scaling, kwargs) -> None:
         self.modules.add(id(module))
-        self.unknown |= set(kwargs) - _PLUMBING - _COMPUTED
+        self.unknown |= _asked(kwargs)
         # A probe traced over abstract weights (`qualified`) reads the keys each query sees off the mask
         # alone, whose values its trace holds; a mask it does not hold is no visibility it can verify.
         seen = (_masked(module, query, key, attention_mask, scaling, kwargs) if self.abstract
@@ -471,7 +483,7 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     call = _ATTENDING.get()
     if call is None:
         raise ValueError("Dew's attention runs inside a tier-3 model's traced call")
-    unknown = sorted(set(kwargs) - _PLUMBING - _COMPUTED)
+    unknown = sorted(_asked(kwargs))
     if unknown:
         # `admitted` runs a model on Dew's attention only where its probe passed no such keyword.
         raise ValueError(f"Dew's attention does not compute {unknown}, which this call passes")

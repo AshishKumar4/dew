@@ -1,15 +1,21 @@
 """Whether a traced forward is causal over its tokens, decided from its program alone, with no weights
-(ledger 1595, the 1493 design's H7): tier 3 admits a source whose shrunken probe cannot run by a trace of
-its full config over abstract weights, and reads that trace's causality here instead of from the
-probe's logits.
+(ledger 1595, the 1493 design's H7): tier 3 admits a source whose shrunken probe cannot run by traces of
+its full config over abstract weights, and reads their causality here instead of from the probe's
+logits.
 
-The walk follows every value the tokens reach through the program (`jax.make_jaxpr`'s), keeping the axis
-that holds their sequence position. An operation that combines values across that axis mixes positions,
-and is admitted only where it is causal by its structure: Dew's causal attention (`CAUSAL_ATTENTION`, the
-named call tier 3's attention runs in), a computation Dew states is token by token (`TOKENWISE`, its
-experts' dispatch), a convolution whose padding over the sequence is all on the left, a scan or a
-cumulative operation running forward over it, and a gather whose indices are each token's position or an
-earlier one. Anything else that mixes positions refuses the program, naming the operation."""
+The walk composes, through every operation of the program (`jax.make_jaxpr`'s), which input positions
+each entry of each value may read: a value the tokens reach holds an axis along which its entries read
+their own sets of positions (`Reads`), or reads one set everywhere. Slices, concatenations, pads,
+reversals, gathers by indices the program computes without the tokens, reshapes, broadcasts,
+cumulative operations, convolutions and scans (step by step, their carries and initial state included)
+each move those sets as they move the entries; a contraction, reduction, sort or selection across the
+positions' axis gives every entry the union, as any operation the walk holds no rule for does where it
+changes its operands' shape. Dew's causal attention (`CAUSAL_ATTENTION`) gives each query its own
+position's set and its keys' up to its own; a computation Dew states is token by token (`TOKENWISE`)
+gives each token its own. Every set is an over-approximation: the walk may refuse a causal program, never
+admit a later read. A program is causal where every output's entry at a position reads no later one, at
+each length it is traced at, and its program is the same at each (a branch taken on the sequence's length
+is no structure one length shows)."""
 
 from __future__ import annotations
 
@@ -17,497 +23,695 @@ import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
 
+import numpy as np
+from jax.core import ShapedArray
 from jax.extend import core
 
 CAUSAL_ATTENTION = "dew_causal_attention"
 """The name of the jitted call tier 3's attention runs in (`torchax_fallback._dew_attention`), causal over
-its keys by construction, which the walk admits whole."""
+its keys by construction, its queries, keys and values `[B, S, H, D]`."""
 
 TOKENWISE = "dew_tokenwise"
 """The name of a jitted call Dew computes token by token (tier 3's experts' dispatch,
 `torchax_fallback.functional_experts`), whose outputs at a token read that token's inputs alone."""
 
-
-class SequenceMixed(ValueError):
-    """A traced program whose outputs read later positions, or that the walk cannot show reads none,
-    naming the operation."""
-
-
-MIXED = -1
-"""A value that depends on the tokens but holds no position axis (a scan's last carry): its every entry
-may read every position."""
+CONCRETE = 1 << 20
+"""The most entries of an integer value the walk evaluates while it walks (a gather's indices, a
+slice's start), beyond which it reads none and keeps its rules' unions."""
 
 
 @dataclasses.dataclass(frozen=True)
-class Positions:
-    """A value the tokens do not reach that holds, along `axis`, an index no later than each position
-    plus `offset`: `iota` over the sequence, shifted or clamped, the indices a causal gather reads by;
-    `nonnegative` where none is below zero (a clamp from below at zero holds it), so a wrap of negative
-    indices (`jnp`'s indexing) leaves it as it is."""
+class Reads:
+    """Which input positions a value the tokens reach may read: along `axis`, its entry at index i
+    reads the positions `masks[i]` holds (bit j position j); where `axis` is None, every entry reads
+    `masks[0]`."""
 
-    axis: int
-    offset: int
-    nonnegative: bool = True
+    axis: int | None
+    masks: np.ndarray
+
+    @property
+    def union(self) -> int:
+        return int(np.bitwise_or.reduce(self.masks))
+
+    def flat(self) -> Reads:
+        return Reads(None, np.array([self.union], np.int64))
 
 
-type Held = int | Positions | None
-"""What the walk knows of a value: its sequence axis (`int`), `MIXED`, a position index (`Positions`),
-or None for a value the tokens do not reach."""
+type Held = Reads | None
+"""What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
 
-def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int) -> str | None:
-    """Why `closed` is not provably causal over the sequence of its input `tokens` (`[B, S]`, `length`
-    tokens a row, the sequence on axis 1), or None where each of its outputs at a position reads that
-    position and earlier ones alone."""
-    held: list[Held] = [1 if index == tokens else None for index in range(len(closed.jaxpr.invars))]
-    try:
-        outputs = _Walk(length).run(closed.jaxpr, held)
-    except SequenceMixed as mixed:
-        return str(mixed)
-    if any(output == MIXED for output in outputs):
-        return "an output reads every position (a scan's last state, or a value pooled over the sequence)"
+def causality_refusal(programs: Mapping[int, tuple[core.ClosedJaxpr, int]]) -> str | None:
+    """Why the forward `programs` traces (each length's closed program and the index of its tokens,
+    `[B, S]`, the sequence on axis 1, among its inputs) is not provably causal, or None where, at every
+    length, each output's entry at a position reads that position and earlier ones alone, and the
+    programs are one program at every length."""
+    shapes = {length: _structure(closed.jaxpr) for length, (closed, _) in programs.items()}
+    if len(set(shapes.values())) > 1:
+        return (f"its program differs between {sorted(programs)} tokens (a branch taken on the sequence's "
+                "length), so no one length's walk holds for every length")
+    for length, (closed, tokens) in programs.items():
+        held: list[Held] = [None] * len(closed.jaxpr.invars)
+        held[tokens] = Reads(1, np.array([1 << position for position in range(length)], np.int64))
+        walk = _Walk(length)
+        consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
+        outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+        for output in outputs:
+            if output is not None and _later(output, length):
+                where = f"; first at {walk.first}" if walk.first else ""
+                return f"an output's entry reads a later position at {length} tokens{where}"
     return None
+
+
+def _later(value: Reads, length: int) -> bool:
+    """Whether an entry of `value`, an output, reads a position later than its own: along a positions'
+    axis of `length`, entry i reads one past i; anywhere else, any read but none is later than some
+    entry's own."""
+    if value.axis is None or len(value.masks) != length:
+        return value.union != 0
+    allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], np.int64)
+    return bool(np.any(value.masks & ~allowed))
+
+
+def _structure(jaxpr: core.Jaxpr) -> tuple:
+    """`jaxpr`'s operations in order, each with its programs' own: its structure, apart from its
+    shapes."""
+    return tuple((eqn.primitive.name, *(_structure(inner) for inner in _programs(eqn))) for eqn in jaxpr.eqns)
+
+
+def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
+    """The programs `eqn` runs within it: a call's, a scan's or loop's body, a branch's."""
+    found = []
+    for value in eqn.params.values():
+        for program in value if isinstance(value, tuple | list) else (value,):
+            if isinstance(program, core.ClosedJaxpr):
+                found.append(program.jaxpr)
+            elif isinstance(program, core.Jaxpr):
+                found.append(program)
+    return found
+
+
+def _small_integer(value) -> bool:
+    """Whether a program's constant is an integer or boolean array of at most `CONCRETE` entries, which
+    the walk holds as its value."""
+    array = np.asarray(value)
+    return (np.issubdtype(array.dtype, np.integer) or array.dtype == np.bool_) and array.size <= CONCRETE
 
 
 class _Walk:
     def __init__(self, length: int):
         self.length = length
+        self.first = ""
+        """The first operation whose output's entry at a position reads a later position, for the
+        refusal's account."""
 
-    def run(self, jaxpr: core.Jaxpr, inputs: Sequence[Held]) -> list[Held]:
-        held: dict[core.Var, Held] = dict(zip(jaxpr.invars, inputs, strict=True))
-        for var in jaxpr.constvars:
-            held[var] = None
-        self.producers: dict[core.Var, core.JaxprEqn] = {}
+    def run(self, jaxpr: core.Jaxpr, inputs: Sequence[Held], values: Sequence[np.ndarray | None],
+            consts: Sequence[np.ndarray | None] = ()) -> tuple[list[Held], list[np.ndarray | None]]:
+        """`jaxpr`'s outputs' reads given its inputs', and their values where the walk evaluates them."""
+        held: dict = dict(zip(jaxpr.invars, inputs, strict=True))
+        known: dict = dict(zip(jaxpr.invars, values, strict=True))
+        held.update(dict.fromkeys(jaxpr.constvars))
+        known.update(zip(jaxpr.constvars, list(consts) or [None] * len(jaxpr.constvars), strict=True))
         for eqn in jaxpr.eqns:
             given = [None if isinstance(var, core.Literal) else held.get(var) for var in eqn.invars]
-            held.update(zip(eqn.outvars, self.equation(eqn, given), strict=True))
-            self.producers.update(dict.fromkeys(eqn.outvars, eqn))
-        return [None if isinstance(var, core.Literal) else held.get(var) for var in jaxpr.outvars]
+            operands = [np.asarray(var.val) if isinstance(var, core.Literal) else known.get(var)
+                        for var in eqn.invars]
+            outputs, evaluated = self.equation(eqn, given, operands)
+            held.update(zip(eqn.outvars, outputs, strict=True))
+            known.update(zip(eqn.outvars, evaluated, strict=True))
+            if not self.first and any(isinstance(value, Reads) and value.axis is not None
+                                      and len(value.masks) == self.length and _later(value, self.length)
+                                      for value in outputs):
+                self.first = eqn.primitive.name
+        return ([None if isinstance(var, core.Literal) else held.get(var) for var in jaxpr.outvars],
+                [np.asarray(var.val) if isinstance(var, core.Literal) else known.get(var)
+                 for var in jaxpr.outvars])
 
-    def equation(self, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
+    def equation(self, eqn: core.JaxprEqn, given: list[Held],
+                 operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
         name = eqn.primitive.name
-        reached = [value for value in given if isinstance(value, int)]
+        if name in _CALLS:
+            return _call(self, eqn, given, operands)
+        if not any(isinstance(value, Reads) for value in given):
+            return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
         rule = _RULES.get(name)
         if rule is not None:
-            return rule(self, eqn, given)
-        if not reached:
-            # The tokens reach none of its inputs: a position index survives elementwise steps alone.
-            return [_positions_through(self, eqn, given)] * len(eqn.outvars)
-        if name in _MIXING:
-            raise SequenceMixed(f"{name} combines the tokens' values across positions")
-        return self.elementwise(eqn, given)
-
-    def elementwise(self, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-        """An operation each output entry of which reads the inputs' entries at its own index: the
-        tokens' axis passes through, if every input the tokens reach holds it at one place."""
+            return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
-        axes = set()
-        for var, value in zip(eqn.invars, given, strict=True):
-            if not isinstance(value, int):
-                continue
-            if value == MIXED or _shape(var) != shape:
-                if any(isinstance(other, int) and other >= 0 for other in given):
-                    raise SequenceMixed(f"{eqn.primitive.name} combines a value read from every position "
-                                        "with each position's")
-                return [MIXED] * len(eqn.outvars)
-            axes.add(value)
-        if len(axes) > 1:
-            raise SequenceMixed(f"{eqn.primitive.name} pairs positions along two axes {sorted(axes)}")
-        return [axes.pop()] * len(eqn.outvars)
+        if name not in _MIXING and all(_shape(var) == shape for var in eqn.outvars) and all(
+                _shape(var) in ((), shape) for var, value in zip(eqn.invars, given, strict=True)
+                if isinstance(value, Reads)):
+            return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)
+        return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
+
+    def evaluated(self, eqn: core.JaxprEqn, operands: list[np.ndarray | None]) -> list[np.ndarray | None]:
+        """The outputs' values of an operation the tokens do not reach whose operands the walk holds,
+        where they are integers or booleans of at most `CONCRETE` entries: the indices a gather, a slice
+        or an update reads, and the tests that choose them."""
+        if (any(operand is None for operand in operands) or _programs(eqn)
+                or not all((np.issubdtype(_dtype(var), np.integer) or _dtype(var) == np.bool_)
+                           and math.prod(_shape(var)) <= CONCRETE for var in eqn.outvars)):
+            return [None] * len(eqn.outvars)
+        bound = eqn.primitive.bind(*operands, **eqn.params)
+        return [np.asarray(output) for output in (bound if eqn.primitive.multiple_results else [bound])]
 
 
 def _shape(var) -> tuple[int, ...]:
-    return tuple(getattr(var.aval, "shape", ()))
+    return tuple(var.aval.shape) if isinstance(var.aval, ShapedArray) else ()
 
 
-def _single(given: Sequence[Held]) -> int | None:
-    """The one input axis the tokens reach, None where they reach none; refused where they reach a
-    value without one."""
-    values = [value for value in given if isinstance(value, int)]
-    if any(value == MIXED for value in values):
-        return MIXED
-    return values[0] if values else None
+def _dtype(var) -> np.dtype:
+    return var.aval.dtype if isinstance(var.aval, ShapedArray) else np.dtype(np.float32)
 
 
-def _positions_through(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> Positions | None:
-    """A position index carried through an operation the tokens do not reach: `iota` over the sequence
-    makes one; a shift by a literal moves its offset; a cast keeps it; a clamp from below at zero or
-    more makes it nonnegative, and any clamp from above keeps it no later than it was; a wrap of
-    negative indices (`select_n` of `lt(index, 0)`, the index, and the index plus the sequence's
-    length) leaves a nonnegative one as it is; anything else loses it."""
-    name = eqn.primitive.name
-    if name == "iota":
-        dimension = int(eqn.params["dimension"])
-        return Positions(dimension, 0) if _shape(eqn.outvars[0])[dimension] == walk.length else None
-    indices = [value for value in given if isinstance(value, Positions)]
-    literals = [float(var.val) for var in eqn.invars if isinstance(var, core.Literal)]
-    if name == "select_n" and len(given) == 3 and isinstance(given[1], Positions):
-        return given[1] if _wrapped(walk, eqn, given) else None
-    if len(indices) != 1:
-        return None
-    index = indices[0]
-    if name in ("convert_element_type", "copy", "copy_p"):
-        return index
-    if name in ("add", "sub") and len(literals) == 1 and literals[0].is_integer():
-        if name == "sub" and isinstance(given[1], Positions):
-            return None  # a literal less the position
-        shift = int(literals[0]) * (1 if name == "add" else -1)
-        return Positions(index.axis, index.offset + shift, index.nonnegative and shift >= 0)
-    # A bound from below at zero or less keeps each index no later than its position (the positions
-    # count from zero), at zero making it nonnegative; one from above keeps it no later than it was.
-    if name == "max" and len(literals) == 1 and literals[0] <= 0:
-        return Positions(index.axis, max(index.offset, 0), index.nonnegative or literals[0] == 0)
-    if name == "min" and len(literals) == 1:
-        return Positions(index.axis, index.offset, index.nonnegative and literals[0] >= 0)
-    if name == "clamp" and isinstance(eqn.invars[0], core.Literal) and float(eqn.invars[0].val) <= 0:
-        return Positions(index.axis, max(index.offset, 0), index.nonnegative or float(eqn.invars[0].val) == 0)
-    return None
+def _flat(given: Sequence[Held]) -> Reads:
+    """Every entry reading what any of `given` reads."""
+    mask = 0
+    for value in given:
+        if isinstance(value, Reads):
+            mask |= value.union
+    return Reads(None, np.array([mask], np.int64))
 
 
-def _wrapped(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> bool:
-    """Whether `eqn`, a `select_n`, wraps negative indices of a nonnegative position index: its
-    predicate `lt` of its first case and zero, its second case the first plus the sequence's length."""
-    first, second = given[1], given[2]
-    if not (isinstance(first, Positions) and first.nonnegative and isinstance(second, Positions)
-            and second.axis == first.axis and second.offset == first.offset + walk.length):
-        return False
-    test, shifted = (None if isinstance(var, core.Literal) else walk.producers.get(var)
-                     for var in (eqn.invars[0], eqn.invars[2]))
-    if (test is None or test.primitive.name != "lt" or test.invars[0] is not eqn.invars[1]
-            or shifted is None or shifted.primitive.name != "add" or shifted.invars[0] is not eqn.invars[1]):
-        return False
-    zero, length = test.invars[1], shifted.invars[1]
-    return (isinstance(zero, core.Literal) and float(zero.val) == 0 and isinstance(length, core.Literal)
-            and float(length.val) == walk.length)
+def _combined(given: Sequence[Held], shape: tuple[int, ...]) -> Reads:
+    """An entrywise operation's reads over operands of `shape` (or scalars): the positions' axis the
+    operands share keeps each index's union; any other operand's reads join every entry."""
+    axes = [value for value in given if isinstance(value, Reads) and value.axis is not None
+            and len(value.masks) == shape[value.axis]]
+    base = axes[0] if axes else None
+    extra = 0
+    for value in given:
+        if isinstance(value, Reads) and (base is None or value is not base):
+            if base is not None and value.axis == base.axis and len(value.masks) == len(base.masks):
+                base = Reads(base.axis, base.masks | value.masks)
+            else:
+                extra |= value.union
+    if base is None:
+        return Reads(None, np.array([extra], np.int64))
+    return Reads(base.axis, base.masks | extra)
 
 
-def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    """A call of a jaxpr of its own: Dew's causal attention and its token-by-token computations admitted
-    whole, any other walked inside."""
+def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
+          operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
+    """A call of a program of its own: Dew's causal attention and its token-by-token computations by
+    their own rules, any other walked inside."""
     name = eqn.params.get("name")
-    if name in (CAUSAL_ATTENTION, TOKENWISE):
-        axis = _single(given)
-        if axis == MIXED:
-            raise SequenceMixed(f"{name} reads a value read from every position")
-        if axis is None:
-            return [None] * len(eqn.outvars)
-        size = _shape(eqn.invars[next(index for index, value in enumerate(given) if value == axis)])[axis]
-        return [axis if len(_shape(var)) > axis and _shape(var)[axis] == size else MIXED
-                for var in eqn.outvars]
-    inner = _inner(eqn)
-    return walk.run(inner.jaxpr if isinstance(inner, core.ClosedJaxpr) else inner, given)
+    if name == CAUSAL_ATTENTION and any(isinstance(value, Reads) for value in given):
+        return [_attended(eqn, given)] * len(eqn.outvars), [None] * len(eqn.outvars)
+    if name == TOKENWISE and any(isinstance(value, Reads) for value in given):
+        out = _shape(eqn.outvars[0])
+        aligned = [value for value in given if isinstance(value, Reads)]
+        if all(value.axis == 0 and len(value.masks) == out[0] for value in aligned):
+            masks = np.bitwise_or.reduce([value.masks for value in aligned])
+            return [Reads(0, masks)] * len(eqn.outvars), [None] * len(eqn.outvars)
+        return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
+    inner = next(iter(_programs(eqn)), None)
+    if inner is None:
+        return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)
+    closed = next((value for value in eqn.params.values() if isinstance(value, core.ClosedJaxpr)), None)
+    consts = [] if closed is None else [np.asarray(const) if _small_integer(const) else None
+                                        for const in closed.consts]
+    return walk.run(inner, given, operands, consts)
 
 
-def _inner(eqn: core.JaxprEqn):
-    for key in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
-        if key in eqn.params:
-            return eqn.params[key]
-    raise SequenceMixed(f"{eqn.primitive.name} calls a program the walk does not read")
-
-
-def _broadcast_in_dim(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    value, dims = given[0], eqn.params["broadcast_dimensions"]
-    if isinstance(value, Positions):
-        return [Positions(dims[value.axis], value.offset)]
-    if value is None or value == MIXED:
-        return [value]
-    return [dims[value]]
-
-
-def _reshape(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    value = given[0]
-    if value is None or value == MIXED:
-        return [value]
-    axis = value.axis if isinstance(value, Positions) else value
-    before, after = _shape(eqn.invars[0]), tuple(eqn.params["new_sizes"])
-    lead, size = math.prod(before[:axis]), before[axis]
-    for index, width in enumerate(after):
-        if width == size and math.prod(after[:index]) == lead:
-            return [Positions(index, value.offset) if isinstance(value, Positions) else index]
-    if isinstance(value, Positions):
-        return [None]
-    raise SequenceMixed(f"reshape {before} -> {after} folds the sequence axis into another")
-
-
-def _squeeze(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    value, dims = given[0], eqn.params["dimensions"]
-    if value is None or value == MIXED:
-        return [value]
-    axis = value.axis if isinstance(value, Positions) else value
-    moved = axis - sum(1 for dim in dims if dim < axis)
-    return [Positions(moved, value.offset) if isinstance(value, Positions) else moved]
-
-
-def _transpose(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    value, order = given[0], tuple(eqn.params["permutation"])
-    if value is None or value == MIXED:
-        return [value]
-    if isinstance(value, Positions):
-        return [Positions(order.index(value.axis), value.offset)]
-    return [order.index(value)]
-
-
-def _reduce(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    axis, axes = _single(given), tuple(eqn.params["axes"])
-    if axis is None or axis == MIXED:
-        return [axis] * len(eqn.outvars)
-    if axis in axes:
-        raise SequenceMixed(f"{eqn.primitive.name} reduces over the sequence axis")
-    return [axis - sum(1 for dim in axes if dim < axis)] * len(eqn.outvars)
-
-
-def _cumulative(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    axis = _single(given)
-    if axis is None or axis == MIXED:
-        return [axis]
-    if axis == eqn.params["axis"] and eqn.params.get("reverse", False):
-        raise SequenceMixed(f"{eqn.primitive.name} runs backward over the sequence axis")
-    return [axis]
-
-
-def _dot_general(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
-    lhs_rank, rhs_rank = len(_shape(eqn.invars[0])), len(_shape(eqn.invars[1]))
-    lhs_free = [dim for dim in range(lhs_rank) if dim not in lhs_contract and dim not in lhs_batch]
-    rhs_free = [dim for dim in range(rhs_rank) if dim not in rhs_contract and dim not in rhs_batch]
-    placed = set()
-    for value, contract, batch, free, start in ((given[0], lhs_contract, lhs_batch, lhs_free, len(lhs_batch)),
-                                                (given[1], rhs_contract, rhs_batch, rhs_free,
-                                                 len(lhs_batch) + len(lhs_free))):
-        if not isinstance(value, int):
+def _attended(eqn: core.JaxprEqn, given: list[Held]) -> Reads:
+    """Dew's causal attention's output `[B, S, H, D]`: each query position reads its own query's and its
+    documents' positions, and the keys' and values' positions up to its own."""
+    length = _shape(eqn.outvars[0])[1]
+    own, keyed, extra = np.zeros(length, np.int64), np.zeros(length, np.int64), 0
+    for index, value in enumerate(given):
+        if not isinstance(value, Reads):
             continue
-        if value == MIXED:
-            placed.add(MIXED)
-        elif value in contract:
-            raise SequenceMixed("dot_general contracts the sequence axis outside Dew's attention")
+        if value.axis == 1 and len(value.masks) == length:
+            if index == 0:
+                own |= value.masks
+            else:
+                keyed |= value.masks
         else:
-            placed.add(list(batch).index(value) if value in batch else start + free.index(value))
-    if MIXED in placed and len(placed) > 1:
-        raise SequenceMixed("dot_general combines a value read from every position with each position's")
-    if len(placed) > 1:
-        raise SequenceMixed("dot_general pairs the positions of two token-reached operands")
-    return [placed.pop() if placed else None]
+            extra |= value.union
+    return Reads(1, own | np.bitwise_or.accumulate(keyed) | extra)
 
 
-def _conv(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
+def _rows(value: Reads) -> np.ndarray:
+    return value.masks
+
+
+def _broadcast_in_dim(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value, dims, out = given[0], eqn.params["broadcast_dimensions"], _shape(eqn.outvars[0])
+    assert isinstance(value, Reads)
+    if value.axis is None:
+        return [value]
+    axis = dims[value.axis]
+    masks = value.masks if len(value.masks) == out[axis] else np.full(out[axis], value.union, np.int64)
+    return [Reads(axis, masks)]
+
+
+def _reshape(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis is None:
+        return [value]
+    before, after = _shape(eqn.invars[0]), tuple(eqn.params["new_sizes"])
+    return [_moved(value, before, after)]
+
+
+def _moved(value: Reads, before: tuple[int, ...], after: tuple[int, ...]) -> Reads:
+    """`value`'s reads once its entries, in row-major order, take the shape `after`: along each new axis,
+    each index reads the union of the rows its entries come from; the axis whose unions are the
+    tightest holds them (exactly where its index alone decides the row: the old axis kept, merged with
+    others, or split)."""
+    axis = value.axis
+    assert axis is not None
+    count, inner = len(value.masks), math.prod(before[axis + 1:])
+    span = _RangeOr(value.masks)
+    best: tuple[int, Reads] | None = None
+    for index, width in enumerate(after):
+        lead, tail = math.prod(after[:index]), math.prod(after[index + 1:])
+        if lead * width > CONCRETE:
+            continue
+        starts = (np.arange(lead)[:, None] * width + np.arange(width)[None, :]) * tail
+        rows = np.bitwise_or.reduce(span(starts // inner, (starts + tail - 1) // inner), axis=0)
+        if best is None or _tighter(rows, best[1].masks):
+            best = (index, Reads(index, rows.astype(np.int64)))
+    return value.flat() if best is None or count == 0 else best[1]
+
+
+def _tighter(rows: np.ndarray, held: np.ndarray) -> bool:
+    """Whether `rows` give their indices fewer positions each, on average, than `held` (the finer axis
+    where they tie): the axis a value's reads are kept along."""
+    def mean(masks: np.ndarray) -> float:
+        return sum(bin(int(mask)).count("1") for mask in masks) / len(masks)
+    return (mean(rows), -len(rows)) < (mean(held), -len(held))
+
+
+class _RangeOr:
+    """The union of `masks`' rows over each range of row indices, taken modulo their count (a sparse
+    table over them twice over), every row where a range covers them all."""
+
+    def __init__(self, masks: np.ndarray):
+        self.count = len(masks)
+        self.union = int(np.bitwise_or.reduce(masks)) if self.count else 0
+        table = [np.concatenate([masks, masks]).astype(np.int64)]
+        while (1 << len(table)) <= 2 * self.count:
+            last, step = table[-1], 1 << (len(table) - 1)
+            table.append(last[:-step] | last[step:])
+        self.table = table
+
+    def __call__(self, first: np.ndarray, last: np.ndarray) -> np.ndarray:
+        size = last - first + 1
+        whole = size >= self.count
+        start = first % self.count
+        clipped = np.where(whole, 1, size)
+        level = np.floor(np.log2(clipped)).astype(int)
+        out = np.zeros(first.shape, np.int64)
+        for height in np.unique(level):
+            at = level == height
+            row = self.table[height]
+            out[at] = row[start[at]] | row[start[at] + clipped[at] - (1 << height)]
+        return np.where(whole, self.union, out)
+
+
+def _squeeze(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis is None:
+        return [value]
+    dims = eqn.params["dimensions"]
+    if value.axis in dims:
+        return [value.flat()]
+    return [Reads(value.axis - sum(1 for dim in dims if dim < value.axis), value.masks)]
+
+
+def _transpose(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value, order = given[0], tuple(eqn.params["permutation"])
+    assert isinstance(value, Reads)
+    return [value if value.axis is None else Reads(order.index(value.axis), value.masks)]
+
+
+def _reduce(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value, axes = _combined(given, _shape(eqn.invars[0])), tuple(eqn.params["axes"])
+    if value.axis is None or value.axis in axes:
+        return [value.flat()] * len(eqn.outvars)
+    return [Reads(value.axis - sum(1 for dim in axes if dim < value.axis), value.masks)] * len(eqn.outvars)
+
+
+def _cumulative(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis != eqn.params["axis"]:
+        return [value]
+    if eqn.params.get("reverse", False):
+        return [Reads(value.axis, np.bitwise_or.accumulate(value.masks[::-1])[::-1])]
+    return [Reads(value.axis, np.bitwise_or.accumulate(value.masks))]
+
+
+def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
+    ranks = len(_shape(eqn.invars[0])), len(_shape(eqn.invars[1]))
+    free = [[dim for dim in range(rank) if dim not in contract and dim not in batch]
+            for rank, contract, batch in zip(ranks, (lhs_contract, rhs_contract), (lhs_batch, rhs_batch),
+                                              strict=True)]
+    placed, extra = [], 0
+    for side, value in enumerate(given[:2]):
+        if not isinstance(value, Reads):
+            continue
+        contract, batch = (lhs_contract, rhs_contract)[side], (lhs_batch, rhs_batch)[side]
+        if value.axis is None or value.axis in contract:
+            extra |= value.union
+        elif value.axis in batch:
+            placed.append(Reads(list(batch).index(value.axis), value.masks))
+        else:
+            start = len(lhs_batch) + (0 if side == 0 else len(free[0]))
+            placed.append(Reads(start + free[side].index(value.axis), value.masks))
+    if not placed:
+        return [Reads(None, np.array([extra], np.int64))]
+    base = placed[0]
+    for other in placed[1:]:
+        if other.axis == base.axis:
+            base = Reads(base.axis, base.masks | other.masks)
+        else:
+            extra |= other.union
+    return [Reads(base.axis, base.masks | extra)]
+
+
+def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
     lhs, rhs = given[0], given[1]
-    if isinstance(rhs, int):
-        raise SequenceMixed("a convolution's kernel is read from the tokens")
-    if not isinstance(lhs, int):
-        return [None]
-    if lhs == MIXED:
-        return [MIXED]
+    if isinstance(rhs, Reads) or not isinstance(lhs, Reads) or lhs.axis is None:
+        return [_flat(given)]
     numbers = eqn.params["dimension_numbers"]
     lhs_spec, rhs_spec, out_spec = numbers.lhs_spec, numbers.rhs_spec, numbers.out_spec
-    if lhs == lhs_spec[0]:
-        return [out_spec[0]]
-    if lhs == lhs_spec[1]:
-        raise SequenceMixed("a convolution takes the sequence axis for its features")
-    spatial = list(lhs_spec[2:]).index(lhs)
-    low, high = eqn.params["padding"][spatial]
+    if lhs.axis == lhs_spec[0]:
+        return [Reads(out_spec[0], lhs.masks)]
+    if lhs.axis == lhs_spec[1]:
+        return [lhs.flat()]
+    spatial = list(lhs_spec[2:]).index(lhs.axis)
+    low, _ = eqn.params["padding"][spatial]
     width = _shape(eqn.invars[1])[rhs_spec[2 + spatial]]
-    dilation = eqn.params["rhs_dilation"][spatial]
-    if (high != 0 or low != dilation * (width - 1) or eqn.params["window_strides"][spatial] != 1
-            or eqn.params["lhs_dilation"][spatial] != 1):
-        raise SequenceMixed(f"a convolution over the sequence pads it ({low}, {high}) for a window of "
-                            f"{width}: not all on the left, so a position reads later ones")
-    return [out_spec[2 + spatial]]
+    dilation, stride = eqn.params["rhs_dilation"][spatial], eqn.params["window_strides"][spatial]
+    if eqn.params["lhs_dilation"][spatial] != 1:
+        return [lhs.flat()]
+    size = _shape(eqn.outvars[0])[out_spec[2 + spatial]]
+    rows = []
+    for out in range(size):
+        mask = 0
+        for tap in range(width):
+            read = out * stride - low + tap * dilation
+            if 0 <= read < len(lhs.masks):
+                mask |= int(lhs.masks[read])
+        rows.append(mask)
+    return [Reads(out_spec[2 + spatial], np.array(rows, np.int64))]
 
 
-def _gather(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
+def _slice(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis is None:
+        return [value]
+    start, limit = eqn.params["start_indices"][value.axis], eqn.params["limit_indices"][value.axis]
+    strides = eqn.params.get("strides")
+    step = 1 if strides is None else strides[value.axis]
+    return [Reads(value.axis, value.masks[start:limit:step])]
+
+
+def _rev(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis is None or value.axis not in eqn.params["dimensions"]:
+        return [value]
+    return [Reads(value.axis, value.masks[::-1])]
+
+
+def _pad(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value, padding = given[0], given[1]
+    if isinstance(padding, Reads) or not isinstance(value, Reads) or value.axis is None:
+        return [_flat(given)]
+    low, high, interior = eqn.params["padding_config"][value.axis]
+    rows: list[int] = []
+    for index, mask in enumerate(value.masks):
+        rows.append(int(mask))
+        if index < len(value.masks) - 1:
+            rows.extend([0] * interior)
+    rows = [0] * max(low, 0) + rows[max(-low, 0):]
+    rows = rows[:len(rows) + high] if high < 0 else rows + [0] * high
+    return [Reads(value.axis, np.array(rows, np.int64))]
+
+
+def _concatenate(walk: _Walk, eqn, given, operands) -> list[Held]:
+    dimension = eqn.params["dimension"]
+    axes = {value.axis for value in given if isinstance(value, Reads)}
+    if axes != {dimension}:
+        flat = _flat(given)
+        along = [value for value in given if isinstance(value, Reads) and value.axis is not None]
+        if along and all(value.axis == along[0].axis for value in along) and dimension != along[0].axis:
+            return [_combined(given, _shape(eqn.outvars[0]))]
+        return [flat]
+    rows = [value.masks if isinstance(value, Reads) else np.zeros(_shape(var)[dimension], np.int64)
+            for var, value in zip(eqn.invars, given, strict=True)]
+    return [Reads(dimension, np.concatenate(rows))]
+
+
+def _dynamic_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    if not isinstance(value, Reads) or any(isinstance(start, Reads) for start in given[1:]):
+        return [_flat(given)]
+    if value.axis is None:
+        return [value]
+    start = operands[1 + value.axis]
+    size = eqn.params["slice_sizes"][value.axis]
+    if start is None:
+        return [Reads(value.axis, np.full(size, value.union, np.int64))]
+    first = int(np.clip(int(start), 0, len(value.masks) - size))
+    return [Reads(value.axis, value.masks[first:first + size])]
+
+
+def _dynamic_update_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
+    base, update = given[0], given[1]
+    if any(isinstance(start, Reads) for start in given[2:]):
+        return [_flat(given)]
+    axis = next((value.axis for value in (base, update) if isinstance(value, Reads)), None)
+    if axis is None or any(isinstance(value, Reads) and value.axis != axis for value in (base, update)):
+        return [_flat(given)]
+    length = _shape(eqn.outvars[0])[axis]
+    rows = base.masks.copy() if isinstance(base, Reads) else np.zeros(length, np.int64)
+    width = _shape(eqn.invars[1])[axis]
+    start = operands[2 + axis]
+    if start is None:
+        rows |= _flat([update]).masks[0] if isinstance(update, Reads) else 0
+        return [Reads(axis, rows)]
+    first = int(np.clip(int(start), 0, length - width))
+    rows[first:first + width] = update.masks if isinstance(update, Reads) else 0
+    return [Reads(axis, rows)]
+
+
+def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
+    """A gather: by indices the walk holds, each output entry reads the operand rows it takes, moved
+    to the output's axis that decides them; by indices the tokens reach (an embedding's lookup), each
+    output entry reads its index's positions; otherwise the union."""
     operand, indices = given[0], given[1]
     numbers = eqn.params["dimension_numbers"]
-    out_rank = len(_shape(eqn.outvars[0]))
-    offset_dims = tuple(numbers.offset_dims)
-    batch_out = [dim for dim in range(out_rank) if dim not in offset_dims]
-    rank = len(_shape(eqn.invars[0]))
-    collapsed, operand_batching = tuple(numbers.collapsed_slice_dims), tuple(numbers.operand_batching_dims)
-    kept = [dim for dim in range(rank) if dim not in collapsed and dim not in operand_batching]
-    placed = set()
-    if operand == MIXED or indices == MIXED:
-        return [MIXED]
-    if isinstance(operand, int):
-        if operand in operand_batching:
-            paired = numbers.start_indices_batching_dims[operand_batching.index(operand)]
-            placed.add(batch_out[paired])
-        elif operand in numbers.start_index_map:
-            if not (isinstance(indices, Positions) and indices.offset <= 0):
-                raise SequenceMixed("gather reads the sequence axis by indices no later than nothing proves "
-                                    "each token's position")
-            placed.add(batch_out[indices.axis])
-        elif eqn.params["slice_sizes"][operand] != _shape(eqn.invars[0])[operand]:
-            raise SequenceMixed("gather slices the sequence axis")
-        else:
-            placed.add(offset_dims[kept.index(operand)])
-    if isinstance(indices, int):
-        placed.add(batch_out[indices])
-    if len(placed) > 1:
-        raise SequenceMixed("gather pairs the positions of its operand and its indices")
-    return [placed.pop() if placed else None]
+    out = _shape(eqn.outvars[0])
+    batch_out = [dim for dim in range(len(out)) if dim not in tuple(numbers.offset_dims)]
+    if isinstance(indices, Reads):
+        if isinstance(operand, Reads) or indices.axis is None:
+            return [_flat(given)]
+        vector = len(_shape(eqn.invars[1])) - 1
+        if indices.axis == vector:
+            return [indices.flat()]
+        return [Reads(batch_out[indices.axis], indices.masks)]
+    assert isinstance(operand, Reads)
+    if operand.axis is None:
+        return [operand]
+    held = operands[1]
+    shape = _shape(eqn.invars[0])
+    if held is None or math.prod(shape) > CONCRETE or math.prod(out) > CONCRETE:
+        return [operand.flat()]
+    import jax
+
+    ids = np.broadcast_to(np.arange(shape[operand.axis]).reshape(
+        [-1 if dim == operand.axis else 1 for dim in range(len(shape))]), shape)
+    taken = np.asarray(jax.lax.gather(ids, held, numbers, eqn.params["slice_sizes"],
+                                      mode=eqn.params["mode"], fill_value=-1))
+    return [_decided(taken, operand.masks)]
 
 
-def _sort(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    axis = _single(given)
-    if isinstance(axis, int) and axis >= 0 and axis == eqn.params["dimension"]:
-        raise SequenceMixed("sort orders values across positions")
-    return [axis] * len(eqn.outvars)
+def _decided(ids: np.ndarray, masks: np.ndarray) -> Reads:
+    """Reads of a value whose entries hold the operand rows `ids` (-1 for none): along its axis whose
+    index decides the rows, each index's union; the axis giving the fewest positions where none does
+    alone."""
+    best: Reads | None = None
+    for axis in range(ids.ndim):
+        moved = np.moveaxis(ids, axis, 0).reshape(ids.shape[axis], -1)
+        rows = np.array([int(np.bitwise_or.reduce(np.append(masks[row[row >= 0]], 0))) for row in moved],
+                        np.int64)
+        if best is None or _tighter(rows, best.masks):
+            best = Reads(axis, rows)
+    if best is None:
+        return Reads(None, np.array([int(np.bitwise_or.reduce(np.append(masks[ids[ids >= 0]], 0)))],
+                                    np.int64))
+    return best
 
 
-def _top_k(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    axis = _single(given)
-    if isinstance(axis, int) and axis >= 0 and axis == len(_shape(eqn.invars[0])) - 1:
-        raise SequenceMixed("top_k selects across positions")
-    return [axis] * len(eqn.outvars)
+def _sort(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = _combined(given, _shape(eqn.invars[0]))
+    if value.axis == eqn.params["dimension"]:
+        return [value.flat()] * len(eqn.outvars)
+    return [value] * len(eqn.outvars)
 
 
-def _sliced(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    """A slice, pad, reversal or concatenation: admitted where the sequence axis passes whole."""
-    reached = {value for value in given if isinstance(value, int)}
-    if not reached or MIXED in reached:
-        return [MIXED if reached else None] * len(eqn.outvars)
-    if len(reached) > 1:
-        raise SequenceMixed(f"{eqn.primitive.name} pairs positions along two axes {sorted(reached)}")
-    axis = reached.pop()
-    size = _shape(eqn.outvars[0])[axis]
-    if any(isinstance(value, int) and _shape(var)[axis] != size for var, value in zip(eqn.invars, given,
-                                                                                         strict=True)) or (
-            eqn.primitive.name == "rev" and axis in eqn.params["dimensions"]) or (
-            eqn.primitive.name == "concatenate" and axis == eqn.params["dimension"]):
-        raise SequenceMixed(f"{eqn.primitive.name} moves values along the sequence axis")
-    return [axis] * len(eqn.outvars)
+def _top_k(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis == len(_shape(eqn.invars[0])) - 1:
+        return [value.flat()] * len(eqn.outvars)
+    return [value] * len(eqn.outvars)
 
 
-def _merged(held: Held, found: Held) -> Held:
-    """A carried value's axis across two passes of a loop's body: one it keeps, or one it takes on from
-    none; refused where it moves."""
-    if held == found or found is None:
-        return held
-    if held is None or found == MIXED:
-        return found
-    raise SequenceMixed("a loop's carried value moves its sequence axis from step to step")
+def _split(walk: _Walk, eqn, given, operands) -> list[Held]:
+    value = given[0]
+    assert isinstance(value, Reads)
+    if value.axis != eqn.params["axis"]:
+        return [value] * len(eqn.outvars)
+    pieces, start = [], 0
+    for size in eqn.params["sizes"]:
+        pieces.append(Reads(value.axis, value.masks[start:start + size]))
+        start += size
+    return pieces
 
 
-def _fixed(walk: _Walk, body: core.Jaxpr, consts: list[Held], carried: list[Held],
-           rest: list[Held]) -> list[Held]:
-    """`body`'s outputs once its carried values' axes stop changing between passes."""
-    for _ in range(len(carried) + 2):
-        out = walk.run(body, [*consts, *carried, *rest])
-        found = [_merged(held, value) for held, value in zip(carried, out[:len(carried)], strict=True)]
-        if found == carried:
-            return out
-        carried = found
-    raise SequenceMixed("a loop's carried values do not settle on their sequence axes")
-
-
-def _scan(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    """A scan: over the sequence (a scanned input the tokens reach on its axis 0), forward, each step's
-    output reads that step and the carry of the steps before it, and its last carry every step; over
-    another axis, its body walked with its carried values' axes held fixed."""
-    params = eqn.params
-    consts, carries = _scan_groups(eqn)
-    body = params["jaxpr"].jaxpr
-    xs = list(given[consts + carries:])
-    if any(value == 0 for value in xs if isinstance(value, int)):
-        if params["reverse"]:
-            raise SequenceMixed("a scan runs backward over the sequence")
-        if any(isinstance(value, int) for value in given[:consts]):
-            raise SequenceMixed("a scan over the sequence reads at each step a value the tokens reach whole")
-        if any(isinstance(value, int) and value > 0 for value in xs):
-            raise SequenceMixed("a scan over the sequence steps through a value holding it on another axis")
-        steps: list[Held] = [MIXED if isinstance(value, int) else None for value in xs]
-        out = _fixed(walk, body, list(given[:consts]), [MIXED if isinstance(value, int) else value
-                                                         for value in given[consts:consts + carries]],
-                     steps)
-        last = [MIXED if isinstance(value, int) else value for value in out[:carries]]
-        return [*last, *[0 if isinstance(value, int) else None for value in out[carries:]]]
-    steps = [value - 1 if isinstance(value, int) and value > 0 else value for value in xs]
-    out = _fixed(walk, body, list(given[:consts]), list(given[consts:consts + carries]), steps)
-    return [*out[:carries], *[value + 1 if isinstance(value, int) and value >= 0 else value
-                              for value in out[carries:]]]
+def _scatter(walk: _Walk, eqn, given, operands) -> list[Held]:
+    return [_flat(given)]
 
 
 def _scan_groups(eqn: core.JaxprEqn) -> tuple[int, int]:
     """A scan's constant and carried inputs' counts: its parameters', or, where it states its inputs'
-    and outputs' groups (`ft_in`, `ft_out`), theirs, its carries in matching its carries out."""
+    and outputs' groups (`ft_in`, `ft_out`), theirs."""
     params = eqn.params
     if "num_consts" in params:
         return params["num_consts"], params["num_carry"]
     consts, carried, _ = (len(group) for group in params["ft_in"].elts)
-    if len(params["ft_out"].elts[0]) != carried or len(params["jaxpr"].jaxpr.outvars) != len(eqn.outvars):
-        raise SequenceMixed("a scan forwards some of its carries past its body, which the walk does not "
-                            "align")
     return consts, carried
 
 
-def _while(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
+def _joined(held: Held, found: Held) -> Held:
+    """The reads of a loop's carried value over two passes: each entry the union of both."""
+    if held is None or found is None:
+        return found if held is None else held
+    if held.axis == found.axis and len(held.masks) == len(found.masks):
+        return Reads(held.axis, held.masks | found.masks)
+    return _flat([held, found])
+
+
+def _settled(walk: _Walk, body: core.Jaxpr, consts: list[Held], carried: list[Held], rest: list[Held],
+             values: Sequence[np.ndarray | None]) -> list[Held]:
+    """`body`'s outputs once its carried values' reads stop growing from pass to pass (they only grow,
+    over finitely many positions)."""
+    while True:
+        out, _ = walk.run(body, [*consts, *carried, *rest], values)
+        grown = [_joined(held, found) for held, found in zip(carried, out[:len(carried)], strict=True)]
+        if all(_same(held, found) for held, found in zip(grown, carried, strict=True)):
+            return out
+        carried = grown
+
+
+def _same(first: Held, second: Held) -> bool:
+    if first is None or second is None:
+        return first is second
+    return first.axis == second.axis and np.array_equal(first.masks, second.masks)
+
+
+def _scan(walk: _Walk, eqn, given, operands) -> list[Held]:
+    """A scan: over the positions (a scanned input the tokens reach on its axis 0), step by step in its
+    order, each step's output reading its carry, which holds its initial state's reads and every earlier
+    step's, and that step's inputs; over any other axis, its body walked until its carried reads settle."""
+    params = eqn.params
+    consts, carries = _scan_groups(eqn)
+    body = params["jaxpr"].jaxpr
+    fixed, carried = list(given[:consts]), list(given[consts:consts + carries])
+    xs = list(given[consts + carries:])
+    length = params["length"]
+    values = [None] * len(body.invars)
+    if any(isinstance(value, Reads) and value.axis == 0 for value in xs):
+        steps: list[list[Held]] = []
+        order = range(length - 1, -1, -1) if params["reverse"] else range(length)
+        for step in order:
+            sliced = [value if not isinstance(value, Reads) else
+                      Reads(None, value.masks[step:step + 1]) if value.axis == 0 else
+                      Reads(None if value.axis is None else value.axis - 1, value.masks) for value in xs]
+            out, _ = walk.run(body, [*fixed, *carried, *sliced], values)
+            carried = list(out[:carries])
+            steps.append(list(out[carries:]))
+        if params["reverse"]:
+            steps.reverse()
+        ys = []
+        for index in range(len(eqn.outvars) - carries):
+            per_step = [step[index] for step in steps]
+            if all(value is None for value in per_step):
+                ys.append(None)
+            elif all(value is None or value.axis is None for value in per_step):
+                ys.append(Reads(0, np.array([0 if value is None else value.union for value in per_step],
+                                            np.int64)))
+            else:
+                ys.append(_flat(per_step))
+        return [*carried, *ys]
+    sliced = [value if not isinstance(value, Reads) or value.axis is None
+              else Reads(value.axis - 1, value.masks) for value in xs]
+    out = _settled(walk, body, fixed, carried, sliced, values)
+    ys = [value if not isinstance(value, Reads) or value.axis is None
+          else Reads(value.axis + 1, value.masks) for value in out[carries:]]
+    return [*out[:carries], *ys]
+
+
+def _while(walk: _Walk, eqn, given, operands) -> list[Held]:
     params = eqn.params
     cond_consts, body_consts = params["cond_nconsts"], params["body_nconsts"]
-    out = _fixed(walk, params["body_jaxpr"].jaxpr, list(given[cond_consts:cond_consts + body_consts]),
-                 list(given[cond_consts + body_consts:]), [])
-    cond = walk.run(params["cond_jaxpr"].jaxpr, [*given[:cond_consts], *out])
-    if any(isinstance(value, int) for value in cond):
-        raise SequenceMixed("a loop's condition reads the tokens")
+    carried = list(given[cond_consts + body_consts:])
+    body = params["body_jaxpr"].jaxpr
+    out = _settled(walk, body, list(given[cond_consts:cond_consts + body_consts]), carried, [],
+                   [None] * len(body.invars))
+    cond, _ = walk.run(params["cond_jaxpr"].jaxpr, [*given[:cond_consts], *out],
+                       [None] * len(params["cond_jaxpr"].jaxpr.invars))
+    if any(isinstance(value, Reads) for value in cond):
+        # How many steps run is the tokens' to decide: every carried entry may read every one.
+        return [_flat([*given, *out])] * len(out)
     return out
 
 
-def _cond(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    if isinstance(given[0], int):
-        raise SequenceMixed("a branch is chosen by the tokens")
-    branches = [walk.run(branch.jaxpr, given[1:]) for branch in eqn.params["branches"]]
+def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
+    branches = eqn.params["branches"]
+    outs = [walk.run(branch.jaxpr, given[1:], operands[1:])[0] for branch in branches]
     merged = []
-    for values in zip(*branches, strict=True):
-        reached = {value for value in values if value is not None}
-        if len(reached) > 1:
-            raise SequenceMixed("a branch's outputs hold their positions on different axes")
-        merged.append(reached.pop() if reached else None)
+    for values in zip(*outs, strict=True):
+        held: Held = None
+        for value in values:
+            held = _joined(held, value)
+        merged.append(held)
+    if isinstance(given[0], Reads):
+        # The branch is the tokens' to choose: every entry may read what chose it.
+        return [_flat([value, given[0]]) for value in merged]
     return merged
 
 
-def _scatter(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    if any(isinstance(value, int) for value in given):
-        raise SequenceMixed(f"{eqn.primitive.name} writes values the tokens reach at indices the walk does "
-                            "not hold to their positions")
-    return [None]
-
-
-def _dynamic_slice(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    if any(isinstance(value, int) for value in given[1:]):
-        raise SequenceMixed(f"{eqn.primitive.name} places by indices the tokens reach")
-    return _sliced(walk, eqn, given[:1] + [None] * (len(given) - 1))
-
-
-def _split(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    axis = _single(given)
-    if isinstance(axis, int) and axis >= 0 and axis == eqn.params["axis"]:
-        raise SequenceMixed("split cuts the sequence axis")
-    return [axis] * len(eqn.outvars)
-
-
-def _each(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
-    """An operation passing each operand through as it is (`optimization_barrier`)."""
-    return list(given)
-
+_CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "custom_jvp_call", "custom_vjp_call",
+                    "custom_vjp_call_jaxpr", "remat", "checkpoint", "custom_lin"})
 
 _MIXING = frozenset({
     "reduce_window", "reduce_window_sum", "reduce_window_max", "reduce_window_min", "select_and_scatter_add",
     "select_and_gather_add", "fft", "triangular_solve", "cholesky", "lu", "qr", "eigh", "svd",
-    "all_gather", "all_to_all", "ppermute", "psum", "pmax", "pmin", "rng_bit_generator"})
-"""Operations with no rule of their own that read their inputs across an axis: refused where the tokens
-reach them."""
+    "all_gather", "all_to_all", "ppermute", "psum", "pmax", "pmin", "custom_linear_solve"})
+"""Operations that read their operands across an axis without changing their shape: their outputs take
+the union where the tokens reach them."""
 
-type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held]], list[Held]]
+type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held], list[np.ndarray | None]], list[Held]]
 
 _RULES: Mapping[str, _Rule] = {
-    **dict.fromkeys(("pjit", "jit", "closed_call", "core_call", "custom_jvp_call", "custom_vjp_call",
-                     "custom_vjp_call_jaxpr", "remat", "checkpoint", "custom_lin"), _call),
     "broadcast_in_dim": _broadcast_in_dim, "reshape": _reshape, "squeeze": _squeeze, "transpose": _transpose,
     **dict.fromkeys(("reduce_sum", "reduce_max", "reduce_min", "reduce_prod", "reduce_and", "reduce_or",
                      "reduce_xor", "argmax", "argmin"), _reduce),
     **dict.fromkeys(("cumsum", "cumprod", "cummax", "cummin", "cumlogsumexp"), _cumulative),
     "dot_general": _dot_general, "conv_general_dilated": _conv, "gather": _gather, "sort": _sort,
-    "top_k": _top_k, **dict.fromkeys(("slice", "pad", "rev", "concatenate"), _sliced),
-    **dict.fromkeys(("dynamic_slice", "dynamic_update_slice"), _dynamic_slice),
+    "top_k": _top_k, "slice": _slice, "rev": _rev, "pad": _pad, "concatenate": _concatenate,
+    "dynamic_slice": _dynamic_slice, "dynamic_update_slice": _dynamic_update_slice, "split": _split,
     **dict.fromkeys(("scatter", "scatter-add", "scatter_add", "scatter-mul", "scatter_mul", "scatter-min",
-                     "scatter_min", "scatter-max", "scatter_max"), _scatter),
-    "scan": _scan, "while": _while, "cond": _cond, "split": _split, "optimization_barrier": _each,
+                     "scatter_min", "scatter-max", "scatter_max", "scatter_apply"), _scatter),
+    "scan": _scan, "while": _while, "cond": _cond,
 }
