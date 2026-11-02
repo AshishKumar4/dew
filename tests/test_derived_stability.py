@@ -4,11 +4,11 @@ derived forms before, generated over the template suites' own families and the e
 
 - attention's: the template suite's every family (fp32 and bf16 as drawn, and in fp16, the dtype the derived
   forward walks), on the plain-JAX mainloop, forward and backward, its output and gradients finite wherever
-  the reference's are and a row that sees nothing zero (`test_attention_stability.assert_finite`,
-  `_held_empty`); and the edges as their own draws: a query a score hook empties beside a value product past
-  fp32's largest, a query no span reaches beside one, keys past a whole tile, a hook infinite or NaN at the
-  keys it masks, values at fp32's and fp16's largest and least, each in every dtype the derived forms walk,
-  finite wherever the reference is;
+  the float64 truth's rounded to their dtype are and a row that sees nothing zero
+  (`test_attention_stability.assert_finite`, `_held_empty`); and the edges as their own draws: a query a score
+  hook empties beside a value product past fp32's largest, a query no span reaches beside one, keys past a
+  whole tile, a hook infinite or NaN at the keys it masks, values at fp32's and fp16's largest and least, each
+  in every dtype the derived forms walk, finite wherever the reference is;
 - the recurrence's: the template suite's every site and regime (`test_recurrence_stability`), its output and
   final memory finite wherever float64's are and on par with the token-by-token recurrence's (check 1), and
   the decays' edges both ways (none, every token vanishing, a live decay then a vanishing one, the reverse),
@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 import test_attention_stability as attention_suite
 import test_recurrence_stability as recurrence_suite
-from reference_error import as_given, widened, with_gradients
+from reference_error import widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.algebra import forms as algebra_forms
@@ -51,20 +51,17 @@ ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIE
 
 @pytest.mark.parametrize(("name", "dtype"), ATTENTION_FAMILIES,
                          ids=[f"{name}-{dtype or 'as drawn'}" for name, dtype in ATTENTION_FAMILIES])
-def test_the_derived_attention_is_finite_where_the_reference_is_on_every_family(name, dtype):
-    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the reference is and
-    the float64 truth rounds finite (`assert_finite`) over the family's draws, a row that sees nothing
-    zero."""
+def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name, dtype):
+    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the float64 truth
+    rounded to their dtype is (`assert_finite`) over the family's draws, a row that sees nothing zero."""
     family = attention_suite.FAMILIES[name]
     family = family if dtype is None else dataclasses.replace(family, dtype=dtype)
     draw = attention_suite._cast(family, family.draw)
-    reference = as_given(jax.jit(with_gradients(attention_suite._reference(family, anchored=False))))
     truth = with_gradients(attention_suite._reference(family, anchored=True))
     label = f"portable derived {family.dtype} {name}"
     with derived():
         differentiated = jax.jit(with_gradients(attention_suite._mainloops(family, {})["portable"]))
-        attention_suite.assert_finite(differentiated, reference, truth, draw, label,
-                                      seeds=attention_suite.SEEDS[name])
+        attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name])
         attention_suite._held_empty(family, differentiated(*draw(0)), label)
 
 

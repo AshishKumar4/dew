@@ -1,6 +1,7 @@
 """The attention template's stability suite (bible §6): on inputs at fp32's edges, every attention form on
 every mainloop (the Triton one interpreted, the plain-JAX one, the decode kernel) gives a finite output
-and finite gradients wherever the reference does, and never ties values the reference keeps apart. Each
+and finite gradients wherever the float64 truth rounded to their dtype is, and never ties values the
+reference keeps apart. Each
 family fixes an adversarial structure (logits a ulp apart, near fp32's largest, a weight of exp(-87) on a
 value of 2^126, rows that see nothing) and draws its values by seed, against the reference written apart
 from Dew (`attention_oracle.exact_attention`), its float64 truth's derivative anchored
@@ -9,7 +10,7 @@ gradients zero. The accurate form (natural logits, `template.NATURAL`'s other fo
 accurate form, `template.ACCURATE`'s) holds check 1 (`reference_error.assert_as_exact`) on every family,
 as exact as the reference. The default, which folds log2(e) into the scale where the scale allows and
 takes FlashAttention's arithmetic for the backward's products and dQ (about the template's own anchored
-D, not FlashAttention's rowsum(dO * O)), is finite wherever the reference is and holds the exact-zero
+D, not FlashAttention's rowsum(dO * O)), is finite wherever the rounded truth is and holds the exact-zero
 claims (`assert_finite`, `_held_empty`; the owner's ruling, 2026-10-23) on every family but the fold's
 documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, §3, the exponent's
 forms), which the accurate form alone runs. Its error at these inputs is no claim, and it ties values the
@@ -858,27 +859,23 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
-    """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever
-    the reference's is, but where the float64 truth (`truth_fn` on the inputs widened) rounds past the
-    leaf's dtype: a reference computing in the call's 16-bit dtype is finite where its own rounding moved
-    a value back under the largest (fp16's written-out attention at `logits near 1e4`: a key gradient of
-    -45376 whose truth is -68612, FS-F16-DK1), and a value past the largest rounds to infinity."""
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+    """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
+    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
+    in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
+    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1)."""
+    truth_of = jax.jit(truth_fn)
     for seed in range(seeds):
         inputs = draw(seed)
+        with jax.enable_x64(new_val=True):
+            truth = jax.tree.leaves(truth_of(*widened(inputs)))
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        truth = None
-        for index, ((path, mine), theirs) in enumerate(zip(found, jax.tree.leaves(reference_fn(*inputs)),
-                                                           strict=True)):
-            lost = np.isfinite(np.asarray(theirs, np.float32)) & ~np.isfinite(np.asarray(mine, np.float32))
-            if lost.any():
-                if truth is None:
-                    with jax.enable_x64(new_val=True):
-                        truth = jax.tree.leaves(truth_fn(*widened(inputs)))
-                lost &= np.isfinite(np.asarray(truth[index], np.float64).astype(mine.dtype))
+        for (path, mine), wide in zip(found, truth, strict=True):
+            mine = np.asarray(mine)
+            rounded = np.asarray(wide, np.float64).astype(mine.dtype)
+            lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
-                                    "values not finite where the reference's are and the truth's round "
-                                    "finite")
+                                    "values not finite where the truth's rounded to their dtype are")
 
 
 GPU_ONLY = {
@@ -923,20 +920,20 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
 
 def default_is_finite(family_name: str, mainloop_name: str) -> None:
     """A template mainloop's output and query, key and value gradients in the default form, finite wherever
-    the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero. Its error
-    here is no claim, and its ties the documented divergence (the module's docstring)."""
+    the float64 truth's rounded to their dtype are (`assert_finite`) over the family's draws; a row that
+    sees nothing, zero. Its error here is no claim, and its ties the documented divergence (the module's
+    docstring)."""
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
-    reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, reference, truth, draw, label, seeds=seeds)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds)
     _held_empty(family, differentiated(*draw(0)), label)
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
-def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
+def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     """The plain-JAX mainloop, which walks under the default's guards (`algebra.walked`: its sums' headroom,
     the fold's reach), finite in the default form over every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
@@ -963,7 +960,7 @@ s, rows 1849, 2193; `GPU_ONLY`)."""
 @pytest.mark.parametrize("family", [
     family for family in TEMPLATE_FAMILIES
     if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES])
-def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
+def test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
     production route runs it on an sm80 or later GPU. It
@@ -976,7 +973,7 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
                                     if FAMILIES[family].overflows and family not in GPU_ONLY["frozen rows"]])
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
-    pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
+    pass fp32's largest, finite wherever the rounded truth is: a guarded forward's live rows carry normalized
     split sums, which only the split pass reads, so it takes that pass wherever the values can overflow
     (`attention_triton.backward`), in either form."""
     seeds, family_of = SEEDS[family], FAMILIES[family]
@@ -989,9 +986,8 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
         with tuning.pinned(PINS):
             return attention_triton.backward(*operands, interpret=INTERPRETED, split=False)
 
-    reference = as_given(jax.jit(with_gradients(_reference(family_of, anchored=False))))
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
-    assert_finite(unsplit, reference, with_gradients(_reference(family_of, anchored=True)),
+    assert_finite(unsplit, with_gradients(_reference(family_of, anchored=True)),
                   _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}", seeds=seeds)
 
 
@@ -1163,12 +1159,12 @@ largest."""
 @pytest.mark.parametrize("family", DECODED_OVERFLOWS)
 def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     """The decode kernel's default form, interpreted on a CPU and compiled on a GPU, finite wherever the
-    reference is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
+    rounded truth is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
     guards its sums' headroom in either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
-    assert_finite(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))),
-                  _reference(family, anchored=True), forward, f"decode default {family.dtype}", seeds=seeds)
+    assert_finite(jax.jit(decoded), _reference(family, anchored=True), forward,
+                  f"decode default {family.dtype}", seeds=seeds)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
