@@ -48,8 +48,10 @@ class CorpusCounts:
     example: a corpus none of whose counters counts its examples shows no `data/rows`. `delivered_rows`
     counts the rows it delivered, which the share of them cut short is of: `accepted`'s count where each
     row is one, not where a row stands for the examples it completes (`examples`) or for none. A
-    mixture's members count their source examples as they read them, before the mix: what a step after
-    the mix refuses of the rows made of them is counted under the mixture's own name."""
+    mixture's members count their records as the mix draws them; one a run bounds in examples counts each
+    member's where their rows are delivered, and what a step after the mix refuses of a member's rows
+    under that member (`MEMBER`, `MEMBERS`): a step of Grain's own after the mix, which no row's member
+    goes through, refuses under the mixture's name."""
 
     name: str
     label: str
