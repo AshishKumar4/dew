@@ -434,7 +434,8 @@ def _scan_groups(eqn: core.JaxprEqn) -> tuple[int, int]:
         return params["num_consts"], params["num_carry"]
     consts, carried, _ = (len(group) for group in params["ft_in"].elts)
     if len(params["ft_out"].elts[0]) != carried or len(params["jaxpr"].jaxpr.outvars) != len(eqn.outvars):
-        raise SequenceMixed("a scan forwards some of its carries past its body, which the walk does not align")
+        raise SequenceMixed("a scan forwards some of its carries past its body, which the walk does not "
+                            "align")
     return consts, carried
 
 
