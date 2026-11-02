@@ -522,6 +522,47 @@ class KVStore:
             scale = None if scale is None else self._gathered(scale)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
+    def attends_rows(self, query: jax.Array, softcap: float | None) -> bool:
+        """Whether `attend_rows` reads this cache for `query`: its rows' keys of the query's 16-bit dtype,
+        unquantized (the template's decode reads no codes yet, ledger 3624), a paged pool's pages each
+        whole tiles or tiles of whole pages (`TEMPLATE_PAGED_SUPPORTS`), on a GPU its Mosaic mainloop is
+        qualified on."""
+        from dew.nn.kernels.templates import attention_mosaic_program
+
+        if self.layout.quantized or backend() != "gpu" or query.dtype not in (jnp.bfloat16, jnp.float16):
+            return False
+        pool = self._get(self.payloads[0][0])
+        if pool.dtype != query.dtype:
+            return False
+        if self.layout.page_size is None:
+            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype)
+            return family is not None
+        case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
+                         value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
+                         pool=pool.dtype, page_size=self.layout.page_size, quantized=False,
+                         groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
+                         named='auto')
+        return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
+
+    def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None) -> jax.Array:
+        """`query` `[B, T, H, D]` through the attention template's decode over this cache's rows
+        (`attends_rows`):
+        batch row `b` over row `sources[b]`'s keys under `spans` (`attention.KeySpans`), read where they
+        lie: a dense cache's rows by `sources`, a paged pool's by those rows' tables. One call over a serving
+        step's work list (ledger 3623)."""
+        from dew.nn.kernels.templates import attention as template, attention_decode
+
+        hooks = template.Hooks(None if softcap is None else template.Capped(softcap))
+        interpret = generation.placed_platform() != "gpu"
+        if self.layout.page_size is None:
+            keys, values = self.read()
+            return attention_decode.attend(query, keys, values, spans, hooks, interpret=interpret,
+                                           sources=sources)
+        pools = [self._get(name) for name, _ in self.payloads]
+        table = self._absolute(self._get(TABLE))[sources]
+        return attention_decode.attend(query, pools[0], pools[-1], spans, hooks, interpret=interpret,
+                                       table=table)
+
     def _absolute(self, table: jax.Array) -> jax.Array:
         """A grouped pool's table `[rows, pages a row]` indexing the whole pool: each group's rows' pages
         past the start of the group's part (`grouped`), as a kernel over one pool reads them; an ungrouped
