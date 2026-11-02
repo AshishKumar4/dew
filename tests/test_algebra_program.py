@@ -175,6 +175,22 @@ def test_each_contraction_states_its_own_length():
     assert graph.check_bool(eq(algebra.rules.contracted_length(long)).to(i64(12)))
 
 
+def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
+    """A row scale lifted past a matrix product (`linear`'s lift, `(s x) @ y` as `s (x @ y)`): its broadcast
+    to the product's extent states that extent, so the region's price counts the lifted broadcast and its
+    multiply, where a broadcast of no stated shape was priced free (row 3581)."""
+    from egglog import Vec, eq, i64
+
+    closed = jax.make_jaxpr(lambda x, y, s: (x * s[:, None]) @ y)(*rows(1, (64, 32), (32, 16), (64,)))
+    region = terms.region(closed)
+    graph, _, _ = program.graphed(region)
+    program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
+    scale = terms.Term.leaf(i64(2))
+    lift = graph.extract(algebra.rules.lifted(Vec[i64](i64(64), i64(16)), i64(0)))
+    broadcast = scale.shaped("broadcast_in_dim", lift)
+    assert graph.check_bool(eq(algebra.rules.shape(broadcast)).to(Vec[i64](i64(64), i64(16))))
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
