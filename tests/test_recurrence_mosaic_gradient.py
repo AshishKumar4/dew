@@ -10,6 +10,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
@@ -41,8 +42,7 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
                         ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
-                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept'),
-                        ('a decay a key dimension', 'bf16', 'recomputed')}
+                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
 and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
 dimension (`key_backward`'s), and an fp32 call's gradient refused. Interpreted, the whole grid took 5.4 times
@@ -75,13 +75,12 @@ def restarted(fn, case: str):
 
 
 PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
-                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-recomputed': 402,
-                               'a decay a key dimension-bf16-kept': 483, 'a ragged length-fp32-kept': 653}}
+                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-kept': 483,
+                               'a ragged length-fp32-kept': 653}}
 """The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
-ledger 2127; the recomputed decay a key dimension's at a42fefc6b, kda-recompute; the kept one's and an fp32
-call's on train 479's at e82eab19a, the fast backward taking an fp32 call under the run's fast forms and
-fla_kda's form a decay a key dimension, each checked whole where they were refused), which the whole suite
-runs (`timed`)."""
+ledger 2127; a decay a key dimension's and an fp32 call's on train 479's at e82eab19a, the fast backward
+taking an fp32 call under the run's fast forms and fla_kda's form a decay a key dimension, each checked whole
+where they were refused), which the whole suite runs (`timed`)."""
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
@@ -142,6 +141,34 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the_template_is_as_exact_as_fla(rule, recorded_site(case, dtype),
                                     label=f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}',
                                     under=under)
+
+
+def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward_without_solving_again():
+    """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
+    recomputes the forward's memories (`recomputing(('delta_memory',))`), over one draw of its recorded site:
+    bitwise the gradient its kept memories give, whose check 1 against recorded fla holds both
+    (`test_the_mosaic_gradient_is_as_exact_as_its_reference`), and its recompute reading the inverse the
+    forward kept: the chunks' solve launched as often as under the kept memories (once, in the forward) while
+    the memories are launched again. The recompute had run the solve again, its kept residual unread (row
+    3591)."""
+    from fla_sites import LEAVES, ruled, sites
+
+    case = 'a decay a key dimension'
+    on = on_the_mainloop(case_hooks(case), case, jnp.bfloat16)
+    arrays = sites()[recorded_site(case, jnp.bfloat16)].arrays(0)
+
+    def under(names):
+        def run(given):
+            with recomputing(names):
+                return ruled(on, given, LEAVES)
+        return run
+
+    kept, recomputed = (str(jax.make_jaxpr(under(names))(arrays)) for names in ((), ('delta_memory',)))
+    assert recomputed.count('recurrence_intra_solve') == kept.count('recurrence_intra_solve')
+    assert recomputed.count('recurrence_states') > kept.count('recurrence_states')
+    found = (jax.tree.leaves(jax.jit(under(names))(arrays)) for names in ((), ('delta_memory',)))
+    for leaf, a, b in zip(LEAVES, *found, strict=True):
+        assert np.array_equal(np.asarray(a), np.asarray(b)), leaf
 
 
 WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]
