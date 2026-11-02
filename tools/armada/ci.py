@@ -1166,6 +1166,10 @@ def plan(target: float, timings: dict) -> list[dict]:
     # takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
     refused_sites(shards)
+    # Every file's shared setups, read so a mark the plan cannot read refuses its file now
+    # (`session.shared_setups`), not where a cut first reads it.
+    for name in every:
+        session.shared_setups(name)
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
