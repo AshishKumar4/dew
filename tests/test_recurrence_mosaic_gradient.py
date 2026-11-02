@@ -29,7 +29,6 @@ from test_recurrence_mosaic import (
     refuses_its_gradient,
     template_call,
 )
-from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
@@ -45,8 +44,8 @@ INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length',
                         ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
 and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
-dimension (`key_backward`'s), and an fp32 call's gradient refused. Interpreted, the whole grid took 5.4 times
-these (7828 against 1452 seconds)."""
+dimension (`key_backward`'s), and an fp32 call's under the run's fast forms. Interpreted, the whole grid took
+5.4 times these (7828 against 1452 seconds)."""
 
 REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
 """The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
@@ -74,17 +73,20 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
-                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-kept': 483,
-                               'a ragged length-fp32-kept': 653}}
-"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
-ledger 2127; a decay a key dimension's and an fp32 call's on train 479's at e82eab19a, the fast backward
-taking an fp32 call under the run's fast forms and fla_kda's form a decay a key dimension, each checked whole
-where they were refused), which the whole suite runs (`timed`)."""
+DRAWN_APART = {256: [('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
+                     ('one sequence', 'bf16', 'kept')],
+               128: [('a decay a key dimension', 'bf16', 'kept'), ('a ragged length', 'fp32', 'kept')]}
+"""The interpreted gradient's cases past two minutes in one process, by their recorded sites' declared seeds:
+whole, 122 to 225 seconds (train 270's CI on 66a222273, ledger 2127) and 483 to 653 (train 479's on
+e82eab19a, the fast backward taking an fp32 call under the run's fast forms and fla_kda's form a decay a key
+dimension), each seed 0.5 to 5 seconds of the interpreter's. Each runs as armada's map tasks of seeds and
+their judge (`check1_shards`), every seed drawn and judged as one process would."""
+
+LONG = {case for cases in DRAWN_APART.values() for case in cases}
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
-    GRADIENT_GRID, INTERPRETED_GRADIENT)))
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(
+    [case for case in GRADIENT_GRID if case not in LONG], INTERPRETED_GRADIENT - LONG))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
@@ -97,6 +99,27 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
     gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
+    _holds_check_1(case, dtype, remat)
+
+
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[256], set(DRAWN_APART[256])))
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_long_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 256 recorded seeds
+    (`DRAWN_APART`), their draws in map tasks of 64."""
+    _holds_check_1(case, dtype, remat)
+
+
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[128], set(DRAWN_APART[128])))
+@pytest.mark.check1_shards(seeds=128, per_task=12)
+def test_a_long_key_decay_or_fp32_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 128 recorded seeds, a
+    decay a key dimension's and an fp32 call's (`DRAWN_APART`), their draws in map tasks of 12."""
+    _holds_check_1(case, dtype, remat)
+
+
+def _holds_check_1(case, dtype, remat):
+    """The gradient case's check 1 (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     hooks = case_hooks(case)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
