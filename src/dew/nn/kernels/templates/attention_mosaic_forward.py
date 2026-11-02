@@ -135,7 +135,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(family, dtype, (rows, width, block, logits, False, True),
                               (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
-        live = resources.live_registers(family, carried, logits + sums, *fragments)
+        # Its keys' magnitudes read from the value tile beside the logits (`Family.key_magnitudes`).
+        magnitudes = [logits[0], (columns, block, jnp.float32)]
+        live = resources.live_registers(family, carried, logits + sums, magnitudes, *fragments)
         return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
@@ -218,9 +220,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
         # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
         # Each block reads its columns of the values where they lie (`_launch`'s `column_width`), no copy of
-        # them; their magnitudes a reduction XLA fuses with its slice.
+        # them, and their magnitudes from the tiles it walks (`Family.key_magnitudes`).
         for first, columns, held in _column_blocks(v, hooked, unit, whole=False):
-            guard = _Guard(live.astype(jnp.int32), jnp.swapaxes(algebra.magnitudes(columns), 1, 2))
+            guard = _Guard(live.astype(jnp.int32))
             blocks.append(_launch(q, k, v, guarded_spans, held._replace(output=()), guard, spec=form,
                                   hooks=_unhooked(hooks), tiles=guarded, family=family, training=False,
                                   interpret=interpret, columns=first, splits=splits, table=table,
@@ -512,7 +514,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     (`algebra.anchored_step`): the accumulator holds the split sums, every key's weighted values but the
     anchor's, which it stores with the rows' sums and status, no output (the output's anchor term joins in
     XLA, `_trained_forward`)."""
-    row, head, kv_head = place
+    row, head, _ = place
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, row)
     family.loaded(((q_view, q_smem, q_loaded),))
@@ -559,13 +561,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
-        k_first, coords, logits, products = scored(index, slots)
+        _, coords, logits, products = scored(index, slots)
         tile = values(slots)
         if guard is not None:
-            magnitudes = guard.largest
-
+            # Its keys' largest value magnitudes from the value tile it holds (`Family.key_magnitudes`).
             def largest():
-                return family.columns_of(magnitudes.at[row, kv_head, pl.ds(k_first, tiles.block_k)])
+                return family.key_magnitudes(slots["values"])
 
             keys = algebra.Keys(coords, logits, tile, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators

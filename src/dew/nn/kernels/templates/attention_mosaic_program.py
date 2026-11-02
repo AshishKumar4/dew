@@ -608,11 +608,10 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
 
 class _Guard(NamedTuple):
     """A guarded launch's arrays (`algebra.walked_launches`): the rows that shift, `live` `[B, H, Qp]` (int32,
-    nonzero where live), and each key's values' largest magnitude, `largest` `[B, Hk, Kp]`, which a step's
-    `algebra.room` reads (its values lie in a slot's shared memory)."""
+    nonzero where live); its keys' value magnitudes, which a step's `algebra.room` reads, come from the value
+    tiles it walks (`Family.key_magnitudes`)."""
 
     live: jax.Array
-    largest: jax.Array
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,

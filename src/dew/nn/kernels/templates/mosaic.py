@@ -1231,6 +1231,14 @@ class Issuer[Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def key_magnitudes(self, tile) -> jax.Array:
+        """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
+        memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
+        so the vector is in a column's layout (`column`, a logits tile's keys'), as `algebra.room` reads
+        it; no pass over the values outside the launch."""
+        values = plgpu.load(plgpu.transpose_ref(tile, (1, 0)), layout=self.layout, optimized=False)
+        return jnp.max(jnp.abs(values.astype(jnp.float32)), axis=0)
+
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
     holding a tile's rows takes one register's partial sums at a time."""

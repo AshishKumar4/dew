@@ -133,7 +133,9 @@ def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax
         held = initial.total > 0
         own = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
         out = jnp.concatenate([out, jnp.swapaxes(own, 1, 2)[:, None]], axis=1)
-        m = jnp.concatenate([m, jnp.swapaxes(initial.m, 1, 2)[:, None]], axis=1)
+        # The initial maximum natural, the slices' in `spec`'s units (raw products where it keeps them).
+        start = initial.m / spec.scale if spec.raw else initial.m
+        m = jnp.concatenate([m, jnp.swapaxes(start, 1, 2)[:, None]], axis=1)
         mass = jnp.concatenate([mass, jnp.swapaxes(initial.total, 1, 2)[:, None]], axis=1)
     seen = mass > 0
     units = spec.scale if spec.raw else 1.0
