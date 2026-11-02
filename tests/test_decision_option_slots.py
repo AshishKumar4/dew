@@ -129,7 +129,7 @@ confirming block, on armada over two streams of draws, 256 and 512 (run-tests ro
 as docs/design/testing.md's check 1 rules (6eafb57ba); both arms read the same head, states and cotangent,
 so their upstream rounding is shared. The head's scalar parameters, the prior's logit scale among them,
 take their gradient's error from one sum over every option, whose ratio to the reference's varies widely
-from draw to draw. Its draws run as CI's map tasks, 128 a task (`check1_shards`)."""
+from draw to draw. Its draws run as CI's map tasks, 256 a task (`check1_shards`)."""
 
 SCORER_MARGIN = 1e-4
 """The least gap a draw admits between the two sides of the scorer's `abs(repeated - options)` feature at
@@ -195,7 +195,7 @@ def scorer_gap(features, options, *drawn) -> float:
     return float(np.min(np.abs(difference[real])))
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=128)
+@pytest.mark.check1_shards(seeds=512, per_task=256)
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
     many questions deep as a window holds, which the packing compacts into the slots its bounds allow.

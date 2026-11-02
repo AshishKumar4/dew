@@ -194,7 +194,7 @@ def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, m
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=64)
+@pytest.mark.check1_shards(seeds=512, per_task=96)
 def test_training_differentiates_through_the_blocks_steps():
     """The outer loss's gradient flows through every chunk's steps of the blocks to their starts, the
     meta-gradient continued pre-training trains (section 7.3): the gradient of the summed losses, second
