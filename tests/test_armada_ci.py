@@ -2105,8 +2105,10 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_share_one_key_and_nam
         others = "".join(f"import test_{other}\n" for other in "abc" if other != name)
         return head + others + "from shared_case import test_shared\n"
 
-    # Each run also reads the three files whole, so each key covers the same files (`inputs`): one key.
+    # Each run also probes and reads the three files whole, as an import probes only the others, so each key
+    # covers the same inputs (`inputs`): one key.
     shared = ("from pathlib import Path\ndef test_shared(request):\n"
+              "    assert all(Path(f'tests/test_{n}.py').exists() for n in 'abc')\n"
               "    assert all(Path(f'tests/test_{n}.py').read_text() for n in 'abc')\n"
               "    with Path('runs-' + request.module.__name__[-1]).open('a') as runs: runs.write('x')\n")
     written(tmp_path, {"shared_case.py": shared, **{f"test_{name}.py": body(name) for name in "abc"}})
