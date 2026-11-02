@@ -870,7 +870,14 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
             # The values' tile at its block of the columns: a step's block index the column block's.
             ref, tile = views["values"]
             block = column_block[0] // column_block[1]
-            views["values"] = (ref, lambda j, tile=tile, block=block: (tile(j)[0], block))
+
+            def at_columns(j, tile=tile, block=block):
+                # A paged tile's pages each at the column block (`mosaic.Pieces`).
+                indices = tile(j)
+                if isinstance(indices, mosaic.Pieces):
+                    return mosaic.Pieces((piece[0], block) for piece in indices)
+                return indices[0], block
+            views["values"] = (ref, at_columns)
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
