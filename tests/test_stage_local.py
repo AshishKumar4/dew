@@ -301,9 +301,13 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     holds; the objective's pipeline generates from it; and it trains on when handed back to `fit`."""
     model, optimizer = decoder(), optax.adam(1e-2)
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
-    observe = Observe(STEPS, lambda state: state)
+    observe = Observe(STEPS, lambda state: (state.variables, state.opt_state, state.ema))
     trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
-    assert observe.values[-1][1] is trained and "stages" in trained.variables["params"]
+    assert "stages" in trained.variables["params"]
+    observed, returned = observe.values[-1][1], on_host((trained.variables, trained.opt_state, trained.ema))
+    assert jax.tree.structure(observed) == jax.tree.structure(returned)
+    for mine, theirs in zip(jax.tree.leaves(observed), jax.tree.leaves(returned), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
     stored = run.stored(trained)
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path)))
     held = on_host((stored.variables, stored.opt_state, stored.ema))

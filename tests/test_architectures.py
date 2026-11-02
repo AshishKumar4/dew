@@ -514,10 +514,10 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for (_, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
-        ours = stepped(*own)
+    for (run, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
+        ours, stored = stepped(*own), run.stored(fitted)
         for name, tree in ours.items():
-            held = jax.device_get(getattr(fitted, name))
+            held = jax.device_get(getattr(stored, name))
             assert jax.tree.structure(tree) == jax.tree.structure(held), name
             for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
                 mine, theirs = np.asarray(mine), np.asarray(theirs)
