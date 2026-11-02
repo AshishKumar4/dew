@@ -41,7 +41,10 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import os
 import pickle
+import platform
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -291,26 +294,43 @@ class AheadOfTime:
         return self.loaded()
 
 
+PHASE_FLAGS = ("--xla_dump", "--xla_gpu_dump", "--xla_gpu_load_autotune_results",
+               "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
+"""XLA_FLAGS of one phase's own (where a run dumps, what a build loads), which compute nothing a program
+does."""
+
+
+def computation_flags(flags: str | None = None) -> tuple[str, ...]:
+    """The XLA flags, `XLA_FLAGS` by default, that decide what a program computes (Dew's rounding and
+    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in one order."""
+    given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
+    return tuple(sorted(flag for flag in given.split() if not flag.startswith(PHASE_FLAGS)))
+
+
 @dataclasses.dataclass(frozen=True)
 class BuildTarget:
     """What programs compiled ahead (`compile_programs`) were built for and with, which a process loading them
     (`AheadPrograms.loaded`) must be: the GPU kind and how many, the generation whose facts their launches
-    derived for, and the JAX and jaxlib that compiled them. The CUDA plugin is not part of it: an H100 ran
-    sm90 programs a CUDA 12 plugin built, unchanged, under the CUDA 13 plugin of a node's own environment, bit
-    for bit as the jitted programs (2026-11-02, GS-compileahead-pilot-h100)."""
+    derived for, the JAX and jaxlib that compiled them, the XLA flags that decide what they compute
+    (`computation_flags`), and the host architecture their host code was built for (a Mosaic kernel carries
+    host code beside its cubin). The CUDA plugin is not part of it: an H100 ran sm90 programs a CUDA 12 plugin
+    built, unchanged, under the CUDA 13 plugin of a node's own environment, bit for bit as the jitted programs
+    (2026-11-02, GS-compileahead-pilot-h100)."""
 
     generation: str
     device_kind: str
     devices: int
     jax: str
     jaxlib: str
+    flags: tuple[str, ...]
+    host: str
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
-        """The target `devices` are, under this process's JAX."""
+        """The target `devices` are, under this process's JAX, XLA flags and host."""
         kind = devices[0].device_kind
         return BuildTarget(gpu_target(kind).generation, kind, len(devices), importlib.metadata.version("jax"),
-                           importlib.metadata.version("jaxlib"))
+                           importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's."""
@@ -323,8 +343,8 @@ class BuildTarget:
 class AheadPrograms:
     """Named programs compiled ahead for GPUs this process need not have (`compile_programs`): each program's
     executable (`AheadProgram`) and the target they were built for (`BuildTarget`). A process of that target
-    loads them (`loaded`) and runs them with no tracing, lowering or compile, which `executable_only` holds it
-    to: a GPU node then spends its time on its device's work alone (ledger 2716)."""
+    loads them (`loaded`) and runs them with no tracing, lowering or compile (`executable_only`): a GPU node
+    then spends its time on its device's work alone (ledger 2716)."""
 
     target: BuildTarget
     programs: dict[str, AheadProgram]
@@ -341,20 +361,20 @@ class AheadPrograms:
             raise ValueError(f"{path} holds no programs compiled ahead of time")
         return loaded
 
-    def loaded(self, devices: Sequence | None = None) -> dict[str, jax.stages.Compiled]:
-        """Each program, by its name, loaded onto `devices` (this process's own by default): each called with
-        the arguments it was compiled for runs it. Refused, naming what differs, where `devices` and this JAX
-        are not the target they were built for (`BuildTarget`); each is admitted as a compiled program is
-        (`dew.communicators.admit`)."""
-        found = list(devices if devices is not None else jax.devices())
-        if differences := self.target.differences(BuildTarget.of(found[:self.target.devices] or found)):
+    def loaded(self) -> dict[str, jax.stages.Compiled]:
+        """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
+        it was compiled for: each called with the arguments it was compiled for runs it. Refused, naming what
+        differs, where those devices, this JAX, its XLA flags or its host are not the target they were built
+        for; each is admitted as a compiled program is (`dew.communicators.admit`)."""
+        devices = jax.devices()[:self.target.devices]
+        if differences := self.target.differences(BuildTarget.of(devices)):
             raise ValueError(f"these programs were compiled for another target than this process's: "
                              f"{'; '.join(differences)}")
         programs = {}
         for name, program in self.programs.items():
             in_tree, out_tree = program.trees
-            programs[name] = serialize_executable.deserialize_and_load(program.executable, in_tree, out_tree,
-                                                                       backend=found[0].client)
+            programs[name] = serialize_executable.deserialize_and_load(
+                program.executable, in_tree, out_tree, backend=devices[0].client, execution_devices=devices)
             communicators.admit(programs[name])
         return programs
 
@@ -364,9 +384,10 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
     one GPU of the CUDA `generation` on any host holding the CUDA plugin (`compile_only_gpus`), its launches
     derived for that generation's facts (`assumed`), and serialized: a CPU host builds what a GPU node then
-    only loads and runs (`AheadPrograms.loaded`, ledger 2716). A function takes and returns arrays (a backward
-    is a program of its own over its residuals); one whose program holds constants it closed over is refused
-    by its serialization, named here."""
+    only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
+    GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
+    over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
+    serializes them."""
     devices = compile_only_gpus(generation)
     mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -375,15 +396,18 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
                        for argument in arguments)
         with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
-            lowered = jax.jit(function).trace(*shapes).lower()
+            lowered = jax.jit(function, out_shardings=placed).trace(*shapes).lower()
         with uncached():
             compiled = lowered.compile()
         try:
             built[name] = AheadProgram.of(program_of(lowered), compiled)
-        except ValueError as refused:
-            raise ValueError(f"program {name!r} cannot be compiled ahead: {refused}") from refused
-    return AheadPrograms(BuildTarget(generation, devices[0].device_kind, 1, importlib.metadata.version("jax"),
-                                     importlib.metadata.version("jaxlib")), built)
+        except (NotImplementedError, ValueError) as refused:
+            raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
+                             "constant of its program, which no executable serializes: pass it as an "
+                             f"argument): {refused}") from refused
+    target = BuildTarget(generation, devices[0].device_kind, 1, importlib.metadata.version("jax"),
+                         importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
+    return AheadPrograms(target, built)
 
 
 class ExecutableOnly(RuntimeError):
@@ -393,11 +417,11 @@ class ExecutableOnly(RuntimeError):
 COMPILE_EVENTS = ("/jax/core/compile/jaxpr_trace_duration", "/jax/core/compile/jaxpr_to_mlir_module_duration",
                   "/jax/core/compile/backend_compile_duration")
 """JAX's own events of a trace, a lowering and a backend compile (`jax.monitoring`)."""
-_held = [0]
+_held = threading.local()
 
 
 def _refused(event: str, duration: float, **_: object) -> None:
-    if _held[0] and event in COMPILE_EVENTS:
+    if getattr(_held, "depth", 0) and event in COMPILE_EVENTS:
         raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
                              "program compiled ahead was missing, or code traced around it")
 
@@ -409,15 +433,33 @@ def _listening() -> None:
 
 @contextlib.contextmanager
 def executable_only() -> Iterator[None]:
-    """Within the block, a trace, a lowering or a backend compile in this process raises `ExecutableOnly`
-    (JAX's own events of them, `COMPILE_EVENTS`), and a loaded program (`AheadPrograms.loaded`) runs: a GPU
-    node measuring programs compiled ahead fails, rather than compiles, where one is missing (ledger 2716)."""
+    """Within the block, on this thread, a trace, a lowering or a backend compile raises `ExecutableOnly` as
+    JAX records it (`COMPILE_EVENTS`), and a loaded program (`AheadPrograms.loaded`) runs: a GPU node
+    measuring programs compiled ahead stops where one is missing (ledger 2716). JAX records an event as its
+    step ends, so this stops a run, not the step itself; that no compile ran anywhere in a run, children
+    included, is its compilers' own dumps left empty (`dumps`, `compiled_in`)."""
     _listening()
-    _held[0] += 1
+    _held.depth = getattr(_held, "depth", 0) + 1
     try:
         yield
     finally:
-        _held[0] -= 1
+        _held.depth -= 1
+
+
+def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
+    """`environment` for a run whose every compile, in it or any process it starts, its compilers write under
+    `directory`: XLA's (`--xla_dump_to`) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin
+    compile writes nothing of XLA's). A run of programs compiled ahead leaves both empty (`compiled_in`)."""
+    for part in ("xla", "mosaic"):
+        (directory / part).mkdir(parents=True, exist_ok=True)
+    flags = environment.get("XLA_FLAGS", "")
+    return {**environment, "XLA_FLAGS": f"{flags} --xla_dump_to={directory / 'xla'}".strip(),
+            "MOSAIC_GPU_DUMP_TO": str(directory / "mosaic")}
+
+
+def compiled_in(directory: Path) -> list[Path]:
+    """What the compilers of a run given `dumps(directory, ...)` wrote: none where nothing compiled."""
+    return sorted(path for path in directory.rglob("*") if path.is_file())
 
 
 @contextlib.contextmanager
