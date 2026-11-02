@@ -781,6 +781,15 @@ class ThirdQuestionRefused:
         return Rejected("third question") if int(row["question"]) == 2 else row
 
 
+def _same(row):
+    return row
+
+
+def _kept_rows(rows):
+    """A Grain step of a mixture's own that keeps every row."""
+    return rows.map(_same)
+
+
 def _members_asked(read: str, *, native: bool = False) -> Dataset:
     """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike (a
     stream's mix shuffled), each record's `id % 3 + 1` questions refused at the third (`Questioned`,
@@ -790,7 +799,7 @@ def _members_asked(read: str, *, native: bool = False) -> Dataset:
                for name, start in (("left", 1), ("right", 101))]
     chain = mix(corpora)
     if native:
-        chain = chain.grain(lambda rows: rows.map(lambda row: row), identity="kept@1")
+        chain = chain.grain(_kept_rows, identity="kept@1")
     return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain).batch(2)
 
 
