@@ -90,7 +90,8 @@ class KPoolIndexer(IndexerFront, nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = self.declare_front()
+        # Its reference keeps no module in float32 (modeling_glm5_next.py:1358).
+        dense = self.declare_front(fp32_weights_at_half=False)
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')

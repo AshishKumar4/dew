@@ -181,13 +181,19 @@ class IndexerFront:
     dtype: Dtype | None
     precision: PrecisionLike
 
-    def declare_front(self) -> Callable[..., Dense]:
+    def declare_front(self, *, fp32_weights_at_half: bool = True) -> Callable[..., Dense]:
         """Declare `wq_b` and `weights_proj`, from the indexer's `setup`, and return the bias-free
-        projection at its `dtype` and `precision` they are, for the indexer's own keys."""
+        projection at its `dtype` and `precision` they are, for the indexer's own keys. Where
+        `fp32_weights_at_half`, a float16 indexer computes its head weights in float32, its input cast
+        to them, as V3.2's and V4's references keep `weights_proj` (`_keep_in_fp32_modules`, which
+        transformers honours in a float16 load alone, modeling_utils.py:3826-3830); GLM's k-pool keeps
+        it at the model's dtype."""
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        half = self.dtype is not None and jnp.dtype(self.dtype) == jnp.float16
+        self.weights_proj = dense(self.n_heads, name='weights_proj',
+                                  **({'dtype': jnp.float32} if half and fp32_weights_at_half else {}))
         return dense
 
     def queries(self, q_resid):

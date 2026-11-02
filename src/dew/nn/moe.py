@@ -248,8 +248,9 @@ class Router(nn.Module):
     chosen weights divide by `max(sum + weight_sum_epsilon, weight_sum_min)`, a softmax's too."""
     excluded_group_score: float | None = None
     """What an expert outside a token's best groups is chosen by (`expert_groups`): None for nothing, never
-    chosen, or the score its reference fills in, DeepSeek V3's and A.X-K2's 0.0 (`masked_fill(..., 0.0)`,
-    modeling_axk2.py:340), which a best group's experts biased below zero rank under."""
+    chosen (DeepSeek V3's -inf), or the score its reference fills in, A.X-K2's 0.0
+    (`masked_fill(..., 0.0)`, modeling_axk2.py:340), which a best group's experts biased below zero rank
+    under."""
     logit_softcap: float | None = None
     """Where set, the cap `c` of each gate logit, `tanh(logit / c) * c` before its scores, in float32 as
     the logits are (Laguna's `moe_router_logit_softcapping`, modeling_laguna.py:174-175); every reader of

@@ -623,14 +623,13 @@ def _read_lfm2_moe_router(view: PartView) -> Mapping[str, object]:
 
 def _read_grouped_router(view: PartView) -> Mapping[str, object]:
     """DeepSeek V3's router (GLM-4.7-Flash's): sigmoid scores in float32 plus its correction bias,
-    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best), an
-    expert outside them by 0.0 (`excluded_group_score`), weighted by score, renormalized where
+    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best, an
+    expert outside them never chosen, its score masked to -inf), weighted by score, renormalized where
     `norm_topk_prob`, times `routed_scaling_factor`."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
                      'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
                      'scaling': float(view.routed_scaling_factor), 'bias': True,
-                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group),
-                     'excluded_group_score': 0.0}}
+                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group)}}
 
 
 def _read_latent_attention(view: PartView) -> Mapping[str, object]:
@@ -680,9 +679,12 @@ def _read_norm_gate(view: PartView) -> Mapping[str, object]:
 
 def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
     """A.X-K2's router: DeepSeek V3's (`_read_grouped_router`), which chooses within groups only where its
-    config states `n_group`."""
+    config states `n_group`, an expert outside a token's best groups filled in at 0.0, not -inf
+    (`excluded_group_score`, modeling_axk2.py:340), so a best group's experts biased below zero rank under
+    it."""
     if view.num_group is not None:
-        return _read_grouped_router(view)
+        grouped = _records.record(_read_grouped_router(view)[_LAYER], _LAYER)
+        return {_LAYER: {**grouped, 'excluded_group_score': 0.0}}
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
                      'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
                      'scaling': float(view.routed_scaling_factor), 'bias': True}}
