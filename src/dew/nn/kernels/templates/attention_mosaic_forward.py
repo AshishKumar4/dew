@@ -59,6 +59,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _param,
     _products,
     _Program,
+    _query_bounds,
     _Spans,
     _spans_of,
     _streamed,
@@ -458,7 +459,8 @@ class _Residuals(NamedTuple):
 
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
-            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool) -> tuple:
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
+            held: tuple | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
@@ -476,7 +478,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
                                padded=spec.keys % tiles.block_k != 0)
     coords = _coords(family, spans, row, first, k_first, shape, read=read,
-                     draw=None if hooked.drop is None else hooked.drop.draw(row, head))
+                     draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
@@ -542,10 +544,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     start = (_initial(family, spec, hooked, state_rows, live) if hooked.initial is not None and not merged
              else _empty(family, (tiles.block_q, value_width), live))
     pl.when(consumer == 1)(turn)
+    # The queries' intervals and ids read once, before the walk (`_query_bounds`).
+    held = None if spans is None else _query_bounds(family, spans, row, first, tiles.block_q)
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks, drawn=hooked.drop is not None)
+                       hooks=hooks, drawn=hooked.drop is not None, held=held)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -678,11 +682,12 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     pl.when(consumer == 1)(turn)
+    held = None if spans is None else _query_bounds(family, spans, place[0], first, tiles.block_q)
 
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks, drawn=False)
+                                       turn, hooks=hooks, drawn=False, held=held)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
