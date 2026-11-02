@@ -195,7 +195,7 @@ def scorer_gap(features, options, *drawn) -> float:
     return float(np.min(np.abs(difference[real])))
 
 
-@pytest.mark.check1_shards(seeds=OPTION_SEEDS, per_task=OPTION_SEEDS // 2)
+@pytest.mark.check1_shards(seeds=512, per_task=256)
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
     many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
