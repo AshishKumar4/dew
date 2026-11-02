@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import without_flags
 from flax import linen as nn
 from flax.core import FrozenDict
 from one_draw import assert_as_exact_as_the_reference
@@ -521,11 +522,10 @@ def test_a_bf16_quantized_convolution_trains_as_qwix_does_in_float32(dtype):
     cuDNN refuses for the fp8 convolution on an H100
     (CUDNN_STATUS_NOT_SUPPORTED), and XLA reads its flags once a process."""
     pytest.importorskip("qwix")
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith("--xla_gpu_autotune_level")]
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
     root = Path(__file__).resolve().parents[1]
     run = subprocess.run([sys.executable, "-c", QUANTIZED_CONVOLUTION, dtype], capture_output=True, text=True,
-                         env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": str(root / "src")},
+                         env={**os.environ, "XLA_FLAGS": flags, "PYTHONPATH": str(root / "src")},
                          timeout=600)
     assert run.returncode == 0, run.stderr[-3000:]
 
@@ -1456,13 +1456,13 @@ def with_triton_gemms(flow) -> None:
     (openxla/xla#51016). XLA reads its flags once a process."""
     pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_deterministic_ops",
+                          "--xla_gpu_enable_triton_gemm")
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
     path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
-                         cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
+                         cwd=here, env={**os.environ, "XLA_FLAGS": flags,
                                         "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "PYTHONPATH": path})
     assert run.returncode == 0, run.stderr[-4000:]
 

@@ -45,6 +45,7 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
+    device_memory,
     deviceless_options,
     head_fused_of,
     head_tile_of,
@@ -54,6 +55,7 @@ from dew.training.memory import (
     remat_half,
     remat_more,
     rung_record,
+    stated,
     step_fits,
     temporaries_factor,
 )
@@ -666,6 +668,12 @@ class FitSearch[LossT, EffectsT]:
         where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
         assert self.derive is not None
         narrow, label = self.narrow, "refuses"
+        if not stated([device_memory(device, self.capacity) for device in local_devices(self.mesh)]):
+            # A device that states no memory leaves every rung unjudged (`admitted`), so no footprint is
+            # traced for it.
+            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
+                                 "label": "unknown", "terms": None})
+            return "unknown", narrow
         while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
@@ -753,6 +761,13 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(held)
         return False
 
+    def compiled_options(self, candidate: Candidate) -> jax.stages.CompilerOptions | None:
+        """The options the search compiles `candidate` under: `required` on the half rung of XLA's defaults,
+        else the step's own (`options`), each under the compile-only policy (`deviceless_options`), which
+        the search alone applies, so a step whose options are its towers' own is that rung's program
+        (`climb`)."""
+        return self.required if self.xla_defaults else deviceless_options(self.mesh, self.options(candidate))
+
     def measured(self, split: int, candidate: Candidate) -> tuple[
             jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
@@ -763,7 +778,7 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
-        options = self.required if self.xla_defaults else self.options(candidate)
+        options = self.compiled_options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
         if ahead is not None:
