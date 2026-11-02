@@ -173,3 +173,30 @@ def test_the_durations_fold_takes_main_s_times_only_for_files_as_main_ran_them(c
     assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
         f"{renamed}::test_new_a": 60.0, f"{renamed}::test_new_b": 140.0,
         f"{unchanged}::test_a": 10.0, f"{unchanged}::test_b": 20.0}
+
+
+def test_a_file_a_tasks_deadline_cut_off_takes_the_times_of_the_tests_it_finished(ci, tmp_path, monkeypatch):
+    """A file no record names and no green run times weighs nothing the plan reads, so it runs whole and its task's
+    deadline cuts it off every run (2026-11-02: base/kernels' test_algebra_laws, 46 of its ~70 tests in 1,684 s):
+    the fold takes the times its cut-off row observed of the tests it finished, as it records any test's, where
+    its record lacks them; the plan then cuts the file by them, a test it never reached weighing their mean. A
+    file red otherwise keeps its record."""
+    heavy, failed = "tests/test_heavy.py", "tests/test_failed.py"
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    (tmp_path / heavy).write_text("".join(f"def test_{index}():\n    pass\n" for index in range(6)))
+    (tmp_path / failed).write_text("def test_a():\n    pass\n")
+    (tmp_path / "tests/test_durations.json").write_text("{}\n")
+    main = commit(tmp_path, "main")
+    rows = [{"name": f"3.12:{heavy}", "exitCode": 1, "kind": "deadline", "seconds": 400.0,
+             "tests": {f"{heavy}::test_{index}": 100.0 for index in range(4)}},
+            {"name": f"3.12:{failed}", "exitCode": 1, "kind": "nodes", "seconds": 5.0,
+             "tests": {f"{failed}::test_a": 5.0}}]
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": main, "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
+        f"{heavy}::test_{index}": 100.0 for index in range(4)}
+    planned = sorted((entry["tests"], entry["split"]) for entry in ci.plan(240.0, {}) if entry["python"] == "3.12"
+                     and entry["tests"] == heavy)
+    assert planned == [(heavy, "1/2"), (heavy, "2/2")]
