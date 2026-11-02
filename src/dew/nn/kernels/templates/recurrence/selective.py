@@ -247,7 +247,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     layout = block_scan.blocked(positions)
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
-              db_ref, dc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
+              dbc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
+        db_ref, dc_ref = mosaic.stacked_views([dbc_ref], ((0, 1),))
         row, channel = lax.axis_index("rows"), lax.axis_index("channels")
 
         def load(ref):
@@ -321,19 +322,19 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                              scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
                                       plgpu.SMEM((2, states), jnp.float32)))
     def accumulated(refs):
-        """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero: state
-        the run discharges (`pl.run_state`), as a kernel's derivative inside a custom JVP
-        (`generation.linear_tangent`) can create no Ref of its own. A whole-array write of a launch's
-        output XLA folds to the output itself."""
-        db_ref, dc_ref, *outputs = refs
-        found = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, db_ref, dc_ref)
+        """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero, one ref
+        of both (a leading axis of them, `mosaic.stacked_views`: two refs of equal zeros are one value to
+        XLA, which a fusion wrapping the launch may pass once for both, row 3180): state the run discharges
+        (`pl.run_state`), as a kernel's derivative inside a custom JVP (`generation.linear_tangent`) can
+        create no Ref of its own. A whole-array write of a launch's output XLA folds to the output itself."""
+        dbc_ref, *outputs = refs
+        found = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, dbc_ref)
         for ref, value in zip(outputs, found, strict=True):
             ref[...] = value
 
-    zeros = (jnp.zeros((PARTIALS, *b.shape), jnp.float32),) * 2 + tuple(jnp.zeros(t.shape, t.dtype)
-                                                                      for t in out_type)
-    db, dc, dx, ddt, da, dd, dstate = pl.run_state(accumulated)(zeros)
-    return dx, ddt, db.sum(0), dc.sum(0), da, dd, dstate
+    zeros = (jnp.zeros((2, PARTIALS, *b.shape), jnp.float32), *(jnp.zeros(t.shape, t.dtype) for t in out_type))
+    dbc, dx, ddt, da, dd, dstate = pl.run_state(accumulated)(zeros)
+    return dx, ddt, dbc[0].sum(0), dbc[1].sum(0), da, dd, dstate
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
