@@ -227,8 +227,6 @@ class Router(nn.Module):
     rows a whole number of blocks long).
     """
     num_experts: int
-    kernel_axes: LogicalAxes | None = None
-    """Its kernel's logical axes, as its owner declares them where it makes it."""
     in_features: int
     top_k: int
     score_function: str = 'softmax'
@@ -251,6 +249,8 @@ class Router(nn.Module):
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
+    kernel_axes: LogicalAxes | None = None
+    """Its kernel's logical axes, as its owner declares them where it makes it."""
     def setup(self):
         if self.group_score not in ('top2', 'max'):
             raise ValueError(

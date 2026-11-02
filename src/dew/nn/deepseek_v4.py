@@ -343,9 +343,10 @@ class CompressedEntries(FakeQuantizing):
         projected = self.pool_dtype if self.gated and self.pool_dtype is not None else self.dtype
         dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision,
                                   dot_general=float32_dot_general)
-        self.kv_proj = dense(series * self.width, name='kv_proj')
+        # The entry width or twice it: nothing to shard on the output side.
+        self.kv_proj = dense(series * self.width, name='kv_proj', kernel_axes=('embed', None))
         if self.gated:
-            self.gate_proj = dense(series * self.width, name='gate_proj')
+            self.gate_proj = dense(series * self.width, name='gate_proj', kernel_axes=('embed', None))
             if self.position_bias:
                 self.bias = self.param(
                     'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
@@ -454,8 +455,9 @@ class IndexScorer(nn.Module):
 
     @nn.compact
     def __call__(self, query, keys, x):
-        weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype,
-                        precision=self.precision, name='weights_proj', dot_general=float32_dot_general)(x)
+        weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype, precision=self.precision,
+                        name='weights_proj', dot_general=float32_dot_general,
+                        kernel_axes=('embed', 'index'))(x)
         return index_scores(index_agreements(query, keys, self.precision), weights, query.shape[-1],
                             self.precision)
 
@@ -478,7 +480,7 @@ class LightningIndexer(CompressedEntries):
         super().setup()
         self.q_b_proj = Dense(self.n_heads * self.width, use_bias=False,
                               dtype=self.dtype, precision=self.precision, name='q_b_proj',
-                              dot_general=float32_dot_general)
+                              dot_general=float32_dot_general, kernel_axes=('qlora', 'index'))
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
@@ -563,9 +565,9 @@ class Csa2Indexer(IndexerFront, FakeQuantizing):
                 f"of width {self.head_dim}, so the heads have to be wider")
         dense = self.declare_front()
         if self.owns_keys:
-            self.wk = dense(self.head_dim, name='wk')
+            self.wk = dense(self.head_dim, name='wk', kernel_axes=('embed', 'index'))
             self.k_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
-                                  dtype=self.dtype, name='k_norm')
+                                  dtype=self.dtype, name='k_norm', scale_axes=('index',))
 
     def _fp4(self, x):
         return self.fp4(x, 32, e4m3_scale=False) if self.quantized else x
@@ -700,18 +702,20 @@ class DeepseekV4Attention(FakeQuantizing):
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype)
-        self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
-        self.q_a_norm = norm(name='q_a_norm')
-        self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj')
-        self.kv_proj = dense(self.head_dim, name='kv_proj')
+        self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj', kernel_axes=('embed', 'qlora'))
+        self.q_a_norm = norm(name='q_a_norm', scale_axes=('qlora',))
+        self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj',
+                              kernel_axes=('qlora', 'attention'))
+        # One shared key/value head: nothing to shard on the output side.
+        self.kv_proj = dense(self.head_dim, name='kv_proj', kernel_axes=('embed', None))
         self.kv_norm = norm(name='kv_norm')
         # Block-diagonal over the head groups: one `[g, in, o_lora_rank]` kernel, the group its
         # batch dim (`DeepseekV4GroupedLinear`, modeling_deepseek_v4.py:294-323, whose weight
         # `[g * o_lora_rank, in]` is this kernel with each group's block transposed).
         self.o_a_proj = DenseGeneral(self.o_lora_rank, batch_dims=(0,), use_bias=False, dtype=self.dtype,
                                      precision=self.precision, dot_general=float32_dot_general,
-                                     name='o_a_proj')
-        self.o_b_proj = dense(self.emb_features, name='o_b_proj')
+                                     name='o_a_proj', kernel_axes=(None, 'attention', None))
+        self.o_b_proj = dense(self.emb_features, name='o_b_proj', kernel_axes=(None, 'embed'))
         self.sinks = self.param('sinks', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         if self.compressor == 'csa2':
             rate, index = self._csa2_geometry()
