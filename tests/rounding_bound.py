@@ -24,7 +24,9 @@ EXACT = frozenset({
     "is_finite", "stop_gradient", "optimization_barrier", "cummax", "cummin", "sort",
     "shift_left", "shift_right_logical", "shift_right_arithmetic", "population_count", "rem",
     "name", "pjit_name", "nextafter", "random_bits", "random_seed", "random_wrap", "random_unwrap",
-    "threefry2x32", "split", "scatter"})
+    "threefry2x32", "split", "scatter", "stack", "unstack", "bitcast_convert_type", "device_put",
+    "sharding_constraint", "mesh_cast", "pvary", "reshard", "tie_in", "reduce_and", "reduce_or",
+    "select_and_gather_add_exact"})
 """Operations whose float results are their operands' values moved or selected, or exact: no rounding.
 An integer result rounds nothing either."""
 
