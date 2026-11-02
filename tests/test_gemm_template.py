@@ -860,6 +860,40 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name):
+    """A bias of each group's own, `[G, N]` on the axes `('groups', 'columns')` (an expert's,
+    kernel-templates.md §3, Appendix C row 10): the template's output and its gradient through the bias, a
+    sum over each group's rows, on par with the program that adds each row its group's bias over the draws
+    (check 1), truth in float64, where the side operand's groups axis was refused (row 3642)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, *_ = _draw(seed)
+        rng = np.random.default_rng(seed + 3000)
+        return x, w, jnp.asarray(rng.normal(size=(len(SIZES), WIDTH)), jnp.float32)
+
+    def dew(x, w, b):
+        def loss(b):
+            out = template.gemm(x, w, sizes, epilogue=biased, epilogue_operands=((b, ("groups", "columns")),),
+                                out_dtype=jnp.float32, interpret_on_cpu=True)
+            return jnp.sum(out[:ROUTED] ** 2), out
+        (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
+        return out[:ROUTED], grad
+
+    def plain(x, w, b, wide=jnp.float32):
+        def loss(b):
+            product = jax.lax.ragged_dot(x.astype(wide), w.astype(wide), sizes, preferred_element_type=wide)
+            out = product + jnp.repeat(b.astype(wide), sizes, axis=0, total_repeat_length=ROWS)
+            return jnp.sum(out[:ROUTED] ** 2), out
+        (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
+        return out[:ROUTED], grad
+
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a per-group bias", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_epilogue_applies_to_every_row(generation_name):
     """A row past the routed ones sums nothing: its output is the epilogue of zero, the bias."""
     x, w, _, _, b, *_ = _draw(1)
