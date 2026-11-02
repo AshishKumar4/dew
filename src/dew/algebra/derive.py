@@ -49,6 +49,7 @@ from egglog import (
     ruleset,
     seq,
     set_,
+    union,
     var,
     vars_,
 )
@@ -186,6 +187,22 @@ def least(anchor: Term) -> i64: ...
 """The literal of an anchor's dtype's least finite value (`Region.literals`), each anchor its own dtype's: a
 correction's shift `max(k_now, least)` keeps `exp(k_carried - k_now)` zero, not `exp(-inf + inf)`, where
 nothing is seen yet."""
+
+
+@function(merge=lambda old, new: old)
+def rescaled_by(step: Term) -> Term: ...
+"""The row factor a sum's step rescales its carried state by (`state * lift(factor) + weights @ values`), as
+the rule that wrote the step states it: a mainloop takes such a step into its own accumulator."""
+
+
+@function(merge=lambda old, new: old)
+def weighed(step: Term) -> Term: ...
+"""The weights of the tile's product a sum's step adds (`rescaled_by`'s)."""
+
+
+@function(merge=lambda old, new: old)
+def weighted(step: Term) -> Term: ...
+"""The values of the tile's product a sum's step adds (`rescaled_by`'s)."""
 
 
 @function(merge=lambda old, new: old)
@@ -386,22 +403,32 @@ def _decoupled():
     # A sum along the walked axis of values that scale with an anchor `k`: its carried value rescaled by
     # exp(k carried - k now), lifted to its shape, beside the tile's sum at the anchor now; the anchor now
     # at least the least finite value, so a state that has seen nothing (both -inf) rescales by 0.
-    def rescaled(carried_side, now):
+    def correction(carried_side, now):
         shifted = now.binary(String("max"), Term.literal(floor), largest)
-        correction = k.held(carried_side).binary(String("sub"), shifted, s).unary(name, e).convert(typed)
-        lifted = correction.shaped(String("broadcast_in_dim"), lift)
+        return k.held(carried_side).binary(String("sub"), shifted, s).unary(name, e).convert(typed)
+
+    def rescaled(carried_side, now):
+        lifted = correction(carried_side, now).shaped(String("broadcast_in_dim"), lift)
         return Term.state(i, carried_side).binary(String("mul"), lifted, multiplied)
 
     lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(along).to(anchored(t)),
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
               eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
+    stepped = var("stepped", Term)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
         conditions = (eq(t).to(summed_term), summed(t), scales(x, k, name, e, s, at), *lifted)
+        # A product's step states its parts as it writes them: the factor, the tile's weights and values a
+        # mainloop's own accumulator takes (`rescaled_by`), whatever form extraction then picks of the step.
+        product = get_callable_args(tile, Term.dot)
+        parts = () if product is None else (set_(rescaled_by(stepped)).to(correction(0, k.stepped())),
+                                            set_(weighed(stepped)).to(product[0]),
+                                            set_(weighted(stepped)).to(product[1]))
         derived += [
-            rewrite(t.stepped()).to(rescaled(0, k.stepped()).binary(String("add"), tile, added), *conditions),
+            rule(eq(stepped).to(t.stepped()), *conditions).then(
+                union(stepped).with_(rescaled(0, k.stepped()).binary(String("add"), tile, added)), *parts),
             rewrite(t.merged()).to(rescaled(0, k.merged()).binary(String("add"), rescaled(1, k.merged()),
                                                                   added), *conditions),
             rewrite(t.finished()).to(Term.state(i, 0), *conditions),
@@ -467,6 +494,9 @@ class _Forms:
     walked_leaves: frozenset[int]
     consts: tuple
     report: program.AlgebraReport
+    accumulated: tuple[tuple[Term, Term, Term] | None, ...] = ()
+    """Each reduction's step as a mainloop's accumulator takes it (`rescaled_by`): its row factor, the tile
+    product's weights and values, extracted with the forms; None for a step of no such rule."""
 
 
 def derive(declaration: Reduction, *, accurate: bool, saturation: program.Saturation) -> Derived:
@@ -513,7 +543,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                           carried(made, state), product=product)
         stepped = []
         for index, form in enumerate(made.steps):
-            if accumulate is not None and (parts := _accumulated(form, index)) is not None:
+            if accumulate is not None and (parts := made.accumulated[index]) is not None:
                 factor, weights, values = parts
                 stepped.append(accumulate(state[index], value(factor), value(weights), value(values)))
             else:
@@ -556,39 +586,23 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
 
     def slots(shapes) -> tuple[tuple[str, tuple[int, ...]], ...]:
         made = forms(shapes)
-        return tuple((_monoid(reduction), made.region.shape(reduction)) for reduction in made.reductions)
+        return tuple((_role(reduction), made.region.shape(reduction)) for reduction in made.reductions)
 
     return Derived(init, step, merge, finish, mapped,
                    {"rounding": "reorders", "walked": declaration.walked, "exponent": declaration.exponent,
                     "rules": ("walking", "decoupled")}, slots=slots)
 
 
-def _monoid(reduction: Term) -> str:
-    """A walked reduction's monoid: a maximum's `max`; a sum's, or a product's contracting the walked axis,
-    `sum`."""
-    args = get_callable_args(reduction, Term.reduce)
-    return "max" if args is not None and terms.text(args[1]) == "max" else "sum"
-
-
-def _accumulated(form: Term, index: int) -> tuple[Term, Term, Term] | None:
-    """A sum's step a mainloop takes into its own accumulator (`Derived.step`'s `accumulate`): `form`, the
-    `index`th state's, as `state * lift(factor) + weights @ values`, its row factor, weights and values; None
-    for a step of another form."""
-    args = get_callable_args(form, Term.binary)
-    if args is None or terms.text(args[1]) != "add":
-        return None
-    for scaled, added in ((args[0], args[2]), (args[2], args[0])):
-        product = get_callable_args(added, Term.dot)
-        times = get_callable_args(scaled, Term.binary)
-        if product is None or times is None or terms.text(times[1]) != "mul":
-            continue
-        for state, lifted in ((times[0], times[2]), (times[2], times[0])):
-            at = get_callable_args(state, Term.state)
-            lift = get_callable_args(lifted, Term.shaped)
-            slot = None if at is None else (terms.integer(at[0]), terms.integer(at[1]))
-            if slot == (index, 0) and lift is not None and terms.text(lift[1]) == "broadcast_in_dim":
-                return lift[0], product[0], product[1]
-    return None
+def _role(reduction: Term) -> str:
+    """A walked reduction's role in the carried state, as the declaration's reduction is made: a maximum's
+    `max`, a sum's `sum`, a product's contracting the walked axis `contraction` (each the constructor that
+    made it, `terms.reduce_of`)."""
+    if get_callable_args(reduction, Term.dot) is not None:
+        return "contraction"
+    found = terms.reduce_of(reduction)
+    if found is None or found[0] not in ("max", "sum"):
+        raise Refused(f"{reduction} is no walked maximum, sum or contraction")
+    return found[0]
 
 
 def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int],
@@ -641,7 +655,19 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     _decoupled_through(graph, region, facts)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
                                  saturation, facts)
+    # Each step a rule wrote as a mainloop's accumulator takes it, its parts extracted with the forms.
+    accumulating = [index for index, reduction in enumerate(reductions)
+                    if graph.lookup_function_value(rescaled_by(reduction.stepped())) is not None]
+    parts = [part(reductions[index].stepped()) for index in accumulating
+             for part in (rescaled_by, weighed, weighted)]
+    if parts:
+        bundle = Term.bundle(Vec[Term](*roots, *parts))
+        graph.register(bundle)
     chosen, after = program.extracted(graph, bundle, _priced(region, schedule))
+    held = iter(chosen[len(roots):])
+    accumulated = tuple((next(held), next(held), next(held)) if index in accumulating else None
+                        for index in range(len(reductions)))
+    chosen = chosen[:len(roots)]
     if not math.isfinite(after.value):
         unwritten = next(root for root, form in zip(roots, chosen, strict=True) if not _written(form))
         raise Refused(f"no rule writes {unwritten} in the language: a walked reduction read other than by a "
@@ -662,7 +688,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         if _reads_leaves(form) & walked_leaves:
             raise Refused("a merge reads a walked operand: no tile is there to read")
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
-                  walked_leaves, tuple(closed.consts), report)
+                  walked_leaves, tuple(closed.consts), report, accumulated)
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule) -> None:
@@ -859,7 +885,7 @@ def _holds(graph: EGraph, fact) -> bool:
 def _identity(reduction: Term, dtype) -> float:
     """A walked reduction's empty value, its monoid's identity: a sum's zero; a maximum's -inf (its dtype's
     least value where it has no infinity). A correction never reads it unshifted (`least`)."""
-    if _monoid(reduction) != "max":
+    if _role(reduction) != "max":
         return 0.0
     return -math.inf if jnp.issubdtype(dtype, jnp.floating) else float(jnp.iinfo(dtype).min)
 

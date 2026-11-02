@@ -34,10 +34,11 @@ class Derived(NamedTuple):
     d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
     the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
     backward is a declaration of its own, None here). A reduction's `slots(shapes)` names each carried state's
-    monoid (`max`, `sum`) and shape in the state's order, so a template holds each where its mainloop holds
-    that value; its `step(state, tiles, product=, accumulate=, outputs=)` takes a mainloop's own matrix
-    product (`evaluator`) and its own accumulator for a sum stepped as `state * factor + weights @ values`
-    (`accumulate(state, factor, weights, values)`, the factor a row's), and with `outputs` (places) returns
+    role (`max`, `sum`, `contraction`: the reduction that made it) and shape in the state's order, so a
+    template holds each where its mainloop holds that value; its `step(state, tiles, product=, accumulate=,
+    outputs=)` takes a mainloop's own matrix product (`evaluator`) and its own accumulator for a sum a rule
+    stepped as `state * factor + weights @ values` (`accumulate(state, factor, weights, values)`, the factor a
+    row's, the parts the rule states, `derive.rescaled_by`), and with `outputs` (places) returns
     those of the tile's outputs along the walked axis beside the state, by the same evaluation; its `merge(a,
     b, operands=None, shapes=)` and `finish(state, operands=None, shapes=)` read the state (and the unwalked
     operands given) by the forms of the walk whose tiles were of `shapes` (`init`'s), named, as a state's
