@@ -31,7 +31,6 @@ from reference_error import (
 )
 from sharded import assert_sharded
 from token_support import token_rows
-from whole_suite import timed
 
 from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
@@ -285,13 +284,7 @@ class ScanCase:
         return arm("scanned"), arm("plain"), truth
 
 
-PAST_TARGET = {"scan": {"gemma3n": 151}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2137):
-Gemma 3n's scanned stack; every train scans the other shapes, the sparse gate's fault among them."""
-
-
-@pytest.mark.parametrize("shape", timed(PAST_TARGET, "scan", sorted(SHAPES)))
-def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
+def scans_as_the_loop(shape: str) -> None:
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
@@ -302,6 +295,21 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scanned, plain, truth = case.arms()
     assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
                     truth_fn=truth)
+
+
+@pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
+def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
+    """`scans_as_the_loop` over each shape but Gemma 3n's, which CI's map tasks draw
+    (`test_gemma3ns_runs_of_like_layers_scan_as_its_loop`)."""
+    scans_as_the_loop(shape)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=24)
+def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
+    """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
+    (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
+    each seed's rows redrawn until their selections clear the margin."""
+    scans_as_the_loop("gemma3n")
 
 
 def test_a_scanned_gate_at_another_sparsity_fails_check_1():
@@ -434,9 +442,13 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
     def draw(seed):
         return (np.random.default_rng([0x9E, seed]).integers(0, VOCAB, (2, 10)).astype(np.int32),)
 
+    # The loop's float64 twin over its variables widened once, a program the gate compiles for every draw: a
+    # truth that fetched its steps to the host ran eagerly, decoding each draw's ten steps op by op.
+    with jax.enable_x64(new_val=True):
+        twin, wide = hybrid(6, dtype=jnp.float64), jax.tree.map(jnp.asarray, widened(variables))
+
     def truth(ids):
-        with jax.enable_x64(new_val=True):
-            return np.asarray(decoded(hybrid(6, dtype=jnp.float64), widened(variables), ids)[0])
+        return decoded(twin, wide, ids)[0]
 
     def steps(model):
         return lambda ids: decoded(model, variables, ids)[0]
@@ -473,9 +485,11 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
 
     draw = interop_support.token_draw(0x642, config["vocab_size"], (2, 10))
 
+    with jax.enable_x64(new_val=True):
+        twin, wide = plain.model.clone(dtype=jnp.float64), jax.tree.map(jnp.asarray, widened(plain.variables))
+
     def truth(ids):
-        with jax.enable_x64(new_val=True):
-            return np.asarray(decoded(plain.model.clone(dtype=jnp.float64), widened(plain.variables), ids)[0])
+        return decoded(twin, wide, ids)[0]
 
     def steps(source):
         return lambda ids: decoded(source.model, source.variables, ids)[0]
