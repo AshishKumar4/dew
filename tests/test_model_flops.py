@@ -650,15 +650,19 @@ def test_gated_norms_count_each_run_at_its_width(fields):
     two maps each time a call runs it, at its width: the embedding's at the lookup's where it norms the
     lookup before `project_in`, the final one's after the stack and before or between a loop's passes
     (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm), and a
-    layer's before its sublayers; equal to every product the forward traces."""
-    gate = NormSpec(gate_rank=2)
-    model = decoder(causal=False, attention_impl="reference", norms=dict.fromkeys(GATED_NORM_SITES, gate),
-                    **fields)
+    layer's before its sublayers: as many products as the forward traces beside the ungated decoder's."""
     lengths = np.array([4, 4], np.int64)
     operands = (jnp.ones((2, 4), jnp.int32),)
-    variables = model.init(jax.random.key(201), *operands)
-    count = model.model_flops(lengths) + model.logits_flops(lengths)
-    assert count == forward_products(model.apply, variables, *operands)
+
+    def counted_and_traced(model):
+        variables = model.init(jax.random.key(201), *operands)
+        return (model.model_flops(lengths) + model.logits_flops(lengths),
+                forward_products(model.apply, variables, *operands))
+
+    base = {"causal": False, "attention_impl": "reference", **fields}
+    plain = counted_and_traced(decoder(**base))
+    gated = counted_and_traced(decoder(**base, norms=dict.fromkeys(GATED_NORM_SITES, NormSpec(gate_rank=2))))
+    assert gated[0] - plain[0] == gated[1] - plain[1] > 0
 
 
 def test_a_norm_gated_on_the_routed_layers_counts_there_alone():
