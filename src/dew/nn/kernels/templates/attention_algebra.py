@@ -2398,12 +2398,11 @@ def states_derived(spec: Forward, *states: Partial) -> bool:
 
 def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
     """The `Partial` field each of the derived forms' (`derived_forms(*key)`) carried states is
-    (`Derived.slots`) at a walk of tiles of `shapes`: its maximum `m`, its sum of one value a query `total`,
-    its sum of a row a query `acc`."""
+    (`Derived.slots`) at a walk of tiles of `shapes`, by its role: its maximum `m`, its sum `total`, its
+    contraction (the weights' product with the values) `acc`."""
     slots = derived_forms(*key).slots
     assert slots is not None, "a reduction's derived forms name their slots"
-    fields = tuple("m" if monoid == "max" else "total" if len(shape) == 1 else "acc"
-                   for monoid, shape in slots(shapes))
+    fields = tuple({"max": "m", "sum": "total", "contraction": "acc"}[role] for role, _ in slots(shapes))
     if sorted(fields) != ["acc", "m", "total"]:
         raise derive.Refused(f"the derived forms carry {fields}, not a softmax's maximum, total and sums")
     return fields
