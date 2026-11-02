@@ -70,7 +70,6 @@ from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.norms import gated_rms_normalized
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
 from dew.nn.sharding import logical_axes, sequence_shards
 
@@ -142,9 +141,8 @@ class MambaRMSNormGated(nn.Module):
     norm over the whole width after, both in fp32 (`at_least_fp32`), the weight applied to the
     cast-back values. `gate_after` norms first and gates the weighted norm, and `scale_wide` applies the
     weight in at least fp32 before the one cast, Falcon-H1's `FalconH1RMSNormGated` in either order
-    (`norm_before_gate`, modeling_falcon_h1.py:256-282). Every order is the RMS norm's one arithmetic
-    (`rms_statistics`, `rms_weighted`) over each group; the norm-first one over the whole width, weighted
-    wide, is Qwen3-Next's gated norm, whose fused kernel it takes (`gated_rms_normalized`)."""
+    (`norm_before_gate`, modeling_falcon_h1.py:256-282). The norm is the RMS norm's one arithmetic
+    (`rms_statistics`, `rms_weighted`) over each group, the gate broadcast over the norm's output."""
 
     epsilon: float = 1e-5
     groups: int = 1
@@ -160,8 +158,6 @@ class MambaRMSNormGated(nn.Module):
         if self.groups < 1 or x.shape[-1] % self.groups:
             raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
         scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
-        if self.gate_after and self.scale_wide and self.groups == 1:
-            return gated_rms_normalized(x, gate, scale, self.epsilon, dtype, 'silu')
 
         def grouped(value):
             return value.reshape(*value.shape[:-1], self.groups, -1)
@@ -173,8 +169,10 @@ class MambaRMSNormGated(nn.Module):
         weight, rounded = ((scale.astype(wide), None) if self.scale_wide
                            else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
         y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
-                         gate=grouped(gate.astype(wide)) if self.gate_after else None, rounded=rounded)
-        return y.reshape(x.shape).astype(dtype)
+                         rounded=rounded).reshape(x.shape)
+        if self.gate_after:
+            y = y.astype(wide) * nn.silu(gate.astype(wide))
+        return y.astype(dtype)
 
 
 @logical_axes({

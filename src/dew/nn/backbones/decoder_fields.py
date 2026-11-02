@@ -61,8 +61,9 @@ def _dropout(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]) -> Non
             raise ValueError(f"{field} must be within [0, 1), got {rate}")
     if model.attention_dropout_rate:
         for kind in kinds.values():
-            if not isinstance(kind.mixer or model.mixer or AttentionMixer(), AttentionMixer):
-                raise ValueError("attention_dropout_rate requires ordinary attention mixers")
+            if not (kind.mixer or model.mixer or AttentionMixer()).drops_attention:
+                raise ValueError("attention_dropout_rate requires mixers that drop attention probabilities "
+                                 "(`MixerBase.drops_attention`): ordinary attention, or layers of it")
 
 def _classic(model: CausalTransformer):
     """Raise `ValueError` for norm, position and feed-forward combinations that no supported

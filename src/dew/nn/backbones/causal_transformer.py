@@ -945,8 +945,7 @@ class CausalTransformer(LinearProducts):
 
         def provides(index: int, layer_type: str) -> bool:
             mixer = kinds[layer_type].mixer or mixer_spec
-            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
-                                          and mixer.publishes(index in sharing))
+            return index in providers or (mixer is not None and mixer.publishes(index in sharing))
 
         return tuple(
             LayerSpec(

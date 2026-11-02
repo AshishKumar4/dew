@@ -173,6 +173,13 @@ class ParallelMixer(MixerBase):
         return all(branch.mixer.draws_init_std for branch in self.branches)
 
     @property
+    def drops_attention(self) -> bool:
+        return all(branch.mixer.drops_attention for branch in self.branches)
+
+    def publishes(self, kv_shared: bool) -> bool:
+        return any(branch.mixer.publishes(kv_shared) for branch in self.branches)
+
+    @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
         return tuple(indexed for branch in self.branches for indexed in branch.mixer.indexed_mixers)
 

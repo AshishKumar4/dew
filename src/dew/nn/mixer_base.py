@@ -250,8 +250,17 @@ class MixerBase:
 
     draws_init_std = False
     """Whether the mixer this kind builds draws its projections at the context's `init_std` and
-    `output_init_std` (lm-engine's `initializer_range`), as attention and Mamba-2 do; another keeps its
-    own initializers, and a model setting the range refuses it (`decoder_fields`)."""
+    `output_init_std` (lm-engine's `initializer_range`), as attention, Mamba-2 and a dense feed-forward
+    do; another keeps its own initializers, and a model setting the range refuses it (`decoder_fields`)."""
+    drops_attention = False
+    """Whether the mixer this kind builds drops its attention probabilities at the context's
+    `attention_dropout_rate`, as attention does; a model setting the rate refuses another
+    (`decoder_fields`)."""
+
+    def publishes(self, kv_shared: bool) -> bool:
+        """Whether a layer of this kind leaves in the run's store what later layers read (DeepSeek V4's
+        CSA2 layers, `DeepseekV4Mixer.publishes`), which the stack then threads to it; none by default."""
+        return False
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
