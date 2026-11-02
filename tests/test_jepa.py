@@ -470,6 +470,30 @@ def test_target_encoder_tracks_the_context_encoder(mask):
     assert any(not np.array_equal(a, b) for a, b in zip(ema, live, strict=True)), "EMA is not lagging"
 
 
+def test_a_run_bounded_in_examples_averages_its_target_by_the_momentum_at_its_progress(mask):
+    """A run bounded to 16 examples, two updates of 8, its target encoder's momentum ramped over the run's
+    progress (`momentum_steps=None`) from 1 to 0: its first update, at progress 0, keeps the target where
+    it starts; its second, at progress 8/16 (the examples consumed before it over the bound), averages it
+    half and half with the context encoder after that update, exactly, as `ema_update` computes (row 2438:
+    `Transaction.commit`'s progress branch in a fit)."""
+    from dew.data import Memory
+
+    trainer = make_jepa_trainer(mask, momentum=(1.0, 0.0), momentum_steps=None)
+    start = jax.tree.map(np.asarray, trainer.initial_state().ema["params"]["context_encoder"])
+    pictures = np.asarray(images(batch=16), np.uint8)
+    rows = Memory([{"image": picture, "label": np.int32(index % 4)}
+                   for index, picture in enumerate(pictures)])
+    # Streamed, so no plan counts its steps ahead and the run reads its progress off its examples clock.
+    state = trainer.fit(rows.read("streamed").batch(8), examples=16, log_every=1, checkpoint_final=False)
+    assert int(state.updates) == 2
+    live = jax.tree.leaves(state.variables["params"]["context_encoder"])
+    target = jax.tree.leaves(state.ema["params"]["context_encoder"])
+    # Halves are exact in float32, so the average rounds once however it is computed.
+    half = np.float32(0.5)
+    for averaged, began, now in zip(target, jax.tree.leaves(start), live, strict=True):
+        np.testing.assert_array_equal(np.asarray(averaged), half * began + half * np.asarray(now))
+
+
 @pytest.mark.mesh(devices=2)
 def test_jepa_trains_under_fsdp(mask):
     """Where the two halves of the trainer meet: an objective that owns a

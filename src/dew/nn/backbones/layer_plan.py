@@ -57,6 +57,9 @@ class LayerKind:
     tokens (`dew.nn.inputs.counted_places`). This is MaxText's
     `chunk_attn_window_size` and Llama 4's `attention_chunk_size`. None
     attends to all keys. A kind sets a window or a chunk, not both."""
+    num_heads: int | None = None
+    """This kind's query head count; None takes the model's. Laguna's sliding
+    layers have 64 where its full ones have 48 (num_attention_heads_per_layer)."""
     num_kv_heads: int | None = None
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers have fewer than its sliding ones (num_global_key_value_heads)."""
@@ -102,7 +105,7 @@ class ResolvedKind:
 
     `LayerKind` is what a config states, so a field the config leaves to the
     model is None there. `ResolvedKind` is what the model resolved it to, so
-    `num_kv_heads`, `rope_theta` and `head_dim` are numbers. The window, the
+    `num_heads`, `num_kv_heads`, `rope_theta` and `head_dim` are numbers. The window, the
     chunk and the rotary ramps stay optional, since a kind may have none.
     `mixer` is passed through unchanged, and the model's default applies when
     it is unset.
@@ -111,6 +114,7 @@ class ResolvedKind:
     window: int | None
     bidirectional_window: bool
     chunk: int | None
+    num_heads: int
     num_kv_heads: int
     rope_theta: float
     rope_scaling: Scaling | None
@@ -224,32 +228,6 @@ def run_period(specs: Sequence[Hashable], first: int, count: int) -> int:
     run = specs[first:first + count]
     return next(period for period in range(1, count + 1)
                 if not count % period and all(spec == run[index % period] for index, spec in enumerate(run)))
-
-
-def group_name(first: int, count: int) -> str:
-    """The module name of a scanned run: `layers_3_7` runs layers 3 through 7."""
-    return f'layers_{first}_{first + count - 1}'
-
-
-def group_layers(name: str) -> range | None:
-    """The layers a stack module name runs: `layers_3_7` as range(3, 8),
-    `layers_3` as range(3, 4), anything else as None. The inverse of
-    `group_name`, for a reader keyed by single layers that meets the run."""
-    if not name.startswith("layers_"):
-        return None
-    parts = name[len("layers_"):].split("_")
-    if not all(part.isdigit() for part in parts) or len(parts) > 2:
-        return None
-    first, last = int(parts[0]), int(parts[-1])
-    return range(first, last + 1)
-
-
-
-def layer_index(name: str) -> int | None:
-    """Return the layer index a single layer's `layers_N` module name holds (`group_layers`), or
-    None, a run's `layers_3_7` (or one-layer run's `layers_3_3`) among the rest."""
-    layers = group_layers(name)
-    return layers.start if layers is not None and name == f"layers_{layers.start}" else None
 
 
 __all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]

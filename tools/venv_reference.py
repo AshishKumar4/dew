@@ -30,9 +30,17 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                   "license": "MIT"},
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
                    "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
-                   "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")}}
-"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`), worker and reference, and the
-distribution and version its environment must hold, where the reference is one."""
+                   "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+         "kimi-k3": {"test": "test_kimi_k3", "worker": "kimi_worker.py", "device": "cuda",
+                     "reference": "moonshotai/Kimi-K3 f831ab66814297da540d832a5235f8e904f29d06",
+                     "license": "other (kimi-k3)", "distribution": ("fla-core", "0.5.2")},
+         "kimi-linear": {"test": "test_kimi_linear", "worker": "kimi_worker.py", "device": "cuda",
+                         "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
+                                      "e1df551a447157d4658b573f9a695d57658590e9",
+                         "license": "MIT", "distribution": ("fla-core", "0.4.0")}}
+"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`), worker and reference, the
+distribution and version its environment must hold, where the reference is one, and the device its
+worker's float32 run takes, the CPU unless named."""
 
 
 def main() -> None:
@@ -71,7 +79,7 @@ def main() -> None:
     worker.stdin.close()
     worker.wait()
     written = save(test.FIXTURE, {**arrays, "provenance": provenance(
-        known["reference"], "", "cpu",
+        known["reference"], "", known.get("device", "cpu"),
         f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if len(sys.argv) > 3 else ''}")},
         reference=known["reference"], license=known["license"])
     print(f"{written}: {sorted(arrays)}")

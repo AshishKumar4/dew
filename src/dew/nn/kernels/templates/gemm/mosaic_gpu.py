@@ -539,7 +539,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         def schedule(index):
             """A tile's whether it multiplies any row, its steps, its streams' views and its group, row
             block and column tile: its pair's but for this multiprocessor's row block."""
-            mi, ni = plgpu.planar_snake(index[0], grid, 1, tiles.grid_block_n)
+            mi, ni = tail_of.planar_snake(index[0], grid, 1, tiles.grid_block_n)
             group = (GroupInfo.dense(block_m * pair, mi, m) if dense
                      else GroupInfo.create(table_gmem, block_m * pair, mi))
             # This multiprocessor's row tile of its pair, from its group's first: a multiple of the rows a
@@ -844,7 +844,7 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
     lhs_gmem, rhs_gmem, side_gmems = operands
     index = tail_of.ordered(tail, index, programs, interpreted)
     g_i, snaked, start, count, gathered = _segmented(tail, index, programs, grid[0] * grid[1])
-    m_i, n_i = plgpu.planar_snake(snaked, grid, 1, tiles.grid_block_n)
+    m_i, n_i = tail_of.planar_snake(snaked, grid, 1, tiles.grid_block_n)
     depth, columns = pl.ds(m_i * tiles.block_m, tiles.block_m), pl.ds(n_i * tiles.block_n, tiles.block_n)
     first = pl.multiple_of(block_starts_gmem[g_i], tiles.block_k) // tiles.block_k + start
     steps = jnp.where(sizes_gmem[g_i] > 0, blocks_gmem[g_i], 0)

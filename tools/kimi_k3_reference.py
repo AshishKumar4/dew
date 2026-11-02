@@ -193,41 +193,6 @@ def record_released_padding() -> None:
                    json.loads((DESTINATION / "config.json").read_text()), DESTINATION, ("text_config",))
 
 
-STEPPED_PREFILL = 40
-"""The prefill of tests/test_kimi_k3.py's cached decode, whose steps `record_stepped` records the reference
-at the shapes of."""
-
-
-def record_stepped() -> None:
-    """reference.npz's `stepped_logits` [1, tokens, vocab] for the committed fixture: the released model on
-    the CUDA device as `main` runs it (`released_modules`), holding the fixture's weights (`load_weights`),
-    over its batch's first row at the shapes tests/test_kimi_k3.py's cached decode computes them (ledger
-    1543): the first `STEPPED_PREFILL` positions from one forward over them, each later one from a forward
-    over the row up to it. Every other array of the file is kept as it is."""
-    from safetensors.torch import load_file
-
-    configuration, modeling, _ = released_modules()
-    config = json.loads((DESTINATION / "config.json").read_text())
-    model = modeling.KimiK3ForConditionalGeneration(
-        configuration.KimiK3Config(**copy.deepcopy(config))).float()
-    model.language_model.config._attn_implementation = "eager"
-    load_weights(model, load_file(str(DESTINATION / "model.safetensors")))
-    model = model.cuda().eval()
-    with np.load(DESTINATION / "reference.npz") as stored:
-        arrays = {name: stored[name] for name in stored.files}
-    row = torch.tensor(arrays["input_ids"][:1], device="cuda")
-    with torch.no_grad():
-        def forward(length: int) -> np.ndarray:
-            return model(input_ids=row[:, :length], use_cache=False).logits.cpu().numpy()
-
-        stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[:, -1:]
-                                                               for length in range(STEPPED_PREFILL + 1,
-                                                                                   row.shape[1] + 1))], 1)
-    arrays["stepped_logits"] = stepped
-    np.savez(DESTINATION / "reference.npz", **arrays)
-    print("wrote", DESTINATION / "reference.npz", "stepped_logits", stepped.shape)
-
-
 def remote_modules():
     """The pinned configuration, modeling and linear modules as the release writes them, the routed experts
     in the backward pass (the second of the changes above)."""
@@ -331,14 +296,27 @@ def main() -> None:
                              config["text_config"]["activation_situ_linear_beta"])
     gate, up = torch.meshgrid(grid[::40], grid[::40], indexing="ij")
     situ_out = situ(torch.cat([gate.reshape(-1, 1), up.reshape(-1, 1)], dim=-1))
+    # The forward's logits are recorded over drawn batches (tools/kimi_worker.py), not here.
     np.savez(DESTINATION / "reference.npz", input_ids=ids, attention_mask=mask,
-             logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
+             loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
              situ=situ_out.reshape(-1).numpy(), precision=matmul_precision())
     record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
+
+
+def released_model(configuration, modeling, config: dict, tensors: dict[str, torch.Tensor],
+                   dtype: torch.dtype) -> torch.nn.Module:
+    """The release (`configuration`, `modeling`: `remote_modules`' or `released_modules`') at `dtype`, its
+    attention eager as the release's own decode runs it, holding the fixture's `tensors`
+    (`load_weights`): the model `truth` and tools/kimi_worker.py build."""
+    model = modeling.KimiK3ForConditionalGeneration(configuration.KimiK3Config(**copy.deepcopy(config)))
+    model = model.to(dtype)
+    model.language_model.config._attn_implementation = "eager"
+    load_weights(model, tensors)
+    return model
 
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
@@ -356,10 +334,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
     # most 252, a power of two up to 2^125, since every E2M1 code times one is a bfloat16.
     assert max(int(value.max()) for name, value in tensors.items() if name.endswith(".weight_scale")) <= 252
     with installed(linear), float64():
-        model = modeling.KimiK3ForConditionalGeneration(
-            configuration.KimiK3Config(**copy.deepcopy(config))).double()
-        model.language_model.config._attn_implementation = "eager"
-        load_weights(model, tensors)
+        model = released_model(configuration, modeling, config, tensors, torch.float64)
         return float64_truth(model.eval(), directory, lambda name: name.startswith("language_model."))
 
 
@@ -367,11 +342,10 @@ def float64_truth(model: torch.nn.Module, directory: Path,
                   trainable: Callable[[str], bool]) -> dict[str, np.ndarray]:
     """numerics.npz's arrays for the fixture at `directory`, `model` its released model at float64 holding the
     fixture's weights, inside `torch_precision.float64`: `step_logits_f64` [rows, steps, vocab], the logits
-    teacher-forced over `generated` at the positions its greedy decode scored; then `logits_f64` [rows,
-    tokens, vocab] over `input_ids`, NaN at the padded positions, `loss_f64`, the mean next-token cross
-    entropy over the targets whose input and target are both valid, and `updated_logits_f64`, the logits
-    after one SGD step at the fixture's stored learning rate (`sgd_step`), its gradient over every
-    `trainable` weight."""
+    teacher-forced over `generated` at the positions its greedy decode scored; then over `input_ids`
+    `loss_f64`, the mean next-token cross entropy over the targets whose input and target are both valid,
+    and `updated_logits_f64` [rows, tokens, vocab], the logits after one SGD step at the fixture's stored
+    learning rate (`sgd_step`), its gradient over every `trainable` weight, NaN at the padded positions."""
     with np.load(directory / "reference.npz") as stored:
         fixture = {name: stored[name] for name in stored.files}
     valid = fixture["attention_mask"].astype(bool)
@@ -389,8 +363,8 @@ def float64_truth(model: torch.nn.Module, directory: Path,
     def grid(values: torch.Tensor) -> np.ndarray:
         return np.where(valid[..., None], values.detach().numpy(), np.nan)
 
-    return {"logits_f64": grid(logits), "loss_f64": np.float64(loss.detach()),
-            "updated_logits_f64": grid(updated), "step_logits_f64": step_logits}
+    return {"loss_f64": np.float64(loss.detach()), "updated_logits_f64": grid(updated),
+            "step_logits_f64": step_logits}
 
 
 def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]]) -> None:
@@ -518,8 +492,6 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
-    elif sys.argv[1:] == ["stepped"]:
-        record_stepped()
     elif sys.argv[1:2] == ["truth"]:
         write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:

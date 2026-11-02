@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
@@ -117,6 +118,7 @@ __all__ = [
     "RequiresText",
     "Selective",
     "Serving",
+    "StagedStacks",
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
@@ -287,14 +289,19 @@ class SteppedInContext(Protocol):
     variables, None without a level; the tree with others in their place; and the two halves of the
     head the steps run between, the level on final states (`continuum_states`) and the head past it
     (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
-    `in_context` says whether the model holds a level, and `affine_head`, read from the bound model,
-    whether `head_logits` is affine in its states, which a damped step's curvature bound needs
-    (`ChunkAdaptation.damped`)."""
+    `in_context` says whether the model holds a level, and what a damped step's rate reads
+    (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model, bounds on the curvature and slope
+    of a slot's loss in the states `head_logits` reads; `level_terms`, for the parts that step, the
+    level's |x|^2 and |f|^2 at final states as its maps multiply them, its output map's norm and its
+    activation's derivative bounds."""
 
     @property
     def in_context(self) -> bool: ...
 
-    def affine_head(self) -> bool: ...
+    def head_bounds(self) -> tuple[jax.Array, jax.Array]: ...
+
+    def level_terms(self, states: jax.Array, parts: tuple[str, ...]
+                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
@@ -607,6 +614,16 @@ class CacheCapacity(Protocol):
 
 
 @runtime_checkable
+class StagedStacks(Protocol):
+    """A model whose stacks of like layers a pipeline over the stage axis runs: where in `store`, the
+    variables a stage-local state is made from, each stack's run lies and how the pipeline over
+    `stages` stages stacks it (`DecoderBank`), so a trainer keeps that run stacked by stage on the
+    stage's own devices (`dew.training.stages`). A stack that runs whole on every stage has none."""
+
+    def stage_sites(self, store: VariableDict, stages: int) -> tuple[DecoderBank, ...]: ...
+
+
+@runtime_checkable
 class Looping(Protocol):
     """A model whose layer stack can run a block of it several times over its own output,
     and the same model at `steps` passes of its block (None keeps its count), or of the block
@@ -799,6 +816,16 @@ class RoutesExperts(Protocol):
     def routes_experts(self) -> bool: ...
 
     def __call__(self, x: jax.Array, *, routes: Routes | None = None) -> jax.Array: ...
+
+
+@runtime_checkable
+class RoutesBySite(Protocol):
+    """A token mixer composed of routed sites (a parallel layer's branches, `dew.nn.mixers.parallel`):
+    `routed_sites` are their paths below it, `/`-joined branch names, and its call takes `routes` as each
+    site's own record by its path (`dew.nn.inputs.LayerInputs.experts`) beside the coverage."""
+
+    @property
+    def routed_sites(self) -> frozenset[str]: ...
 
 
 @runtime_checkable

@@ -621,8 +621,10 @@ def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_an
 def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_path):
     """A wrapper's compressed-tensors groups and ignore list, by name and by a pattern over the wrapper's
     own modules (`re:`), read `text_only` under its text checkpoint's names: a pattern resolved into the
-    language model's modules it matches, the tower's matches dropped, a class target kept as it is."""
-    from dew.interop.hf_decoders import language_model_quantization, translate_wrapper_config
+    language model's modules it matches, the tower's matches dropped, a class target kept as it is; the
+    decoder a tool builds reads them so (`decoder_config`, ledger 3138), and DiffusionGemma's decoder,
+    its whole model, is no text-only decoder."""
+    from dew.interop.hf_decoders import decoder_config, language_model_quantization, translate_wrapper_config
     from dew.interop.safetensors_io import read_file
 
     source = FIXTURES / "qwen35-native-tiny"
@@ -630,13 +632,18 @@ def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_p
     names, _ = read_file(source / "model.safetensors")
     quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
                     "config_groups": {"fp8": {
-                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"]}},
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": False}}},
                     "ignore": ["lm_head", "re:.*visual\\.blocks\\.0\\..*", "model.language_model.layers.1"]}
     projected = language_model_quantization({**config, "quantization_config": quantization},
                                             translate_wrapper_config(config), lambda: names.keys())
     assert projected["config_groups"]["fp8"]["targets"] == [
         "Linear", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.up_proj"]
     assert projected["ignore"] == ["lm_head", "model.layers.1"]
+    built = decoder_config({**config, "quantization_config": quantization}, lambda: names.keys())
+    assert built["quantization_config"] == projected
+    with pytest.raises(ValueError):
+        decoder_config({"model_type": "diffusion_gemma", "text_config": {}})
 
 
 def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():
@@ -654,3 +661,76 @@ def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():
         stem = weight.removesuffix(".weight")
         for suffix in SIDECARS:
             assert wrapper_route(module + suffix, record) == (component, stem + suffix)
+
+
+VLM_TEXT = {
+    "qwen2_5_vl": {"text_config": {"model_type": "qwen2_5_vl_text", "hidden_size": 64,
+                                   "intermediate_size": 128, "num_hidden_layers": 2, "num_attention_heads": 4,
+                                   "num_key_value_heads": 2,
+                                   "vocab_size": 256, "max_position_embeddings": 64,
+                                   "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3]}},
+                   "vision_config": {"depth": 1, "hidden_size": 32, "out_hidden_size": 64, "num_heads": 2,
+                                     "intermediate_size": 64, "fullatt_block_indexes": [0]}},
+    "qwen3_vl_moe": {"text_config": {"model_type": "qwen3_vl_moe_text", "hidden_size": 64,
+                                     "intermediate_size": 128, "moe_intermediate_size": 32,
+                                     "num_hidden_layers": 2, "num_attention_heads": 4,
+                                     "num_key_value_heads": 2, "head_dim": 16, "num_experts": 4,
+                                     "num_experts_per_tok": 2,
+                                     "vocab_size": 256, "max_position_embeddings": 64,
+                                     "rope_scaling": {"rope_type": "default", "mrope_section": [2, 3, 3],
+                                                      "mrope_interleaved": True}},
+                     "vision_config": {"depth": 1, "hidden_size": 32, "out_hidden_size": 64, "num_heads": 2,
+                                       "intermediate_size": 64, "deepstack_visual_indexes": [0]}},
+}
+"""Two VLMs whose text decoders transformers builds no causal LM for (ledger 3069), each tiny."""
+VLM_TEXT_SEEDS = 8
+"""Their text logits' declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("model_type", sorted(VLM_TEXT))
+def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type):
+    """Qwen2.5-VL's and Qwen3-VL-MoE's text decoders, which transformers builds no causal LM for, load
+    text-only as the Qwen2 and Qwen3-MoE decoders they are, their M-RoPE the plain rotary a text-only row
+    turns (ledger 3069): their logits over drawn text hold check 1 against the VLM's own forward over
+    text alone, from its float64 twin; the config read as its class reads it, with no root head policy
+    (an untied head, the class's default) and, for Qwen2.5-VL, flat at the root as its published
+    releases state it, loads the same decoder bit for bit."""
+    import torch
+    from interop_support import token_draw, torch_logits
+    from reference_error import as_given, assert_as_exact
+    from transformers import AutoConfig, AutoModelForImageTextToText
+
+    from dew.interop import Pretrained
+    from dew.interop.verify import scatter_weights
+    from tools.torch_precision import float64, float64_twin
+
+    config = AutoConfig.for_model(model_type, image_token_id=255, video_token_id=254,
+                                  vision_start_token_id=253, vision_end_token_id=252, **VLM_TEXT[model_type])
+
+    def built(dtype):
+        # Its experts looped as written, which the float64 twin's matmuls run (grouped_mm takes no double).
+        return AutoModelForImageTextToText.from_config(config, dtype=dtype,
+                                                       experts_implementation="eager").eval()
+
+    torch.manual_seed(0)
+    model = built(torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path / "saved")
+    loaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference", text_only=True)
+    forward = jax.jit(loaded.model.apply)
+    wide = float64_twin(model, lambda: built(torch.float64)).eval()
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_logits(model), token_draw(0x3069, 250, (2, 12)), f"{model_type}'s text logits",
+                    seeds=VLM_TEXT_SEEDS, truth_fn=torch_logits(wide, float64))
+    import shutil
+
+    saved = json.loads((tmp_path / "saved" / "config.json").read_text())
+    restated = {key: value for key, value in saved.items() if key != "tie_word_embeddings"}
+    if model_type == "qwen2_5_vl":
+        restated = {**{key: value for key, value in restated.pop("text_config").items()
+                       if key not in ("model_type", "tie_word_embeddings")}, **restated}
+    shutil.copytree(tmp_path / "saved", tmp_path / "restated")
+    (tmp_path / "restated" / "config.json").write_text(json.dumps(restated))
+    again = Pretrained.load(tmp_path / "restated", dtype="float32", attention_impl="reference",
+                            text_only=True)
+    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)

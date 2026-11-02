@@ -120,7 +120,7 @@ def causal(scores: np.ndarray) -> np.ndarray:
     return np.tril(np.ones((queries, keys), bool), keys - queries)
 
 
-def margin(config, captured, label: str) -> float:
+def margin(config, captured, label: str, *, stable: bool = True) -> float:
     """The smallest margin of the selections `captured` (`capture`'s output) of a decoder built from
     `config`, relative to their scale: the lightning indexer's top-k (the gap between the k-th and the
     next visible key's score, over the query's largest), Gemma 3n's gaussian top-k (`gate_margin`) and
@@ -130,7 +130,9 @@ def margin(config, captured, label: str) -> float:
     query that sees no more keys than its budget decides nothing. Where its budget ends in a tie of
     keys every head disagrees with, scored zero and ordered by index, the tie holds only while each
     such key's heads stay below zero: its margin is the least distance of those keys' best agreement
-    from zero, over the query's largest agreement (`indexer_margins`)."""
+    from zero, over the query's largest agreement (`indexer_margins`), where every selection compared
+    breaks ties by index (`stable`); where one is torch's `topk`, which promises no tie order, a tie has
+    none."""
     fields = config.get("mixer", {}).get("fields", {})
     sparsities = config.get("activation_sparsity_pattern", ())
     smallest, seen = np.inf, 0
@@ -162,7 +164,7 @@ def margin(config, captured, label: str) -> float:
     for operands in indexers.values():
         scores = operands["scores"]
         smallest = min(smallest, float(np.min(indexer_margins(scores, operands["agreements"], causal(scores),
-                                                              fields["index_topk"]))))
+                                                              fields["index_topk"], stable=stable))))
     # A model that selects shows its selections here, or the draw would pass unfiltered.
     for operands in routers.values():
         # A Router chooses its best groups by their scores, then its experts among the groups kept.
@@ -170,7 +172,9 @@ def margin(config, captured, label: str) -> float:
         if "group_scores" in operands:
             groups = np.asarray(operands["group_scores"], np.float64)
             smallest = min(smallest, float(np.min(top_margin(groups, mixture.get("groups_per_token", 1)))))
-            selection = np.where(operands["group_mask"], selection, -np.inf)
+            # An expert outside the best groups is chosen by the score its router fills in.
+            fill = mixture.get("excluded_group_score")
+            selection = np.where(operands["group_mask"], selection, -np.inf if fill is None else fill)
         smallest = min(smallest, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
     assert seen, f"{label}: no selection was captured"
     return smallest

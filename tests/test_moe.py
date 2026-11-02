@@ -219,6 +219,39 @@ def test_router_reproduces_the_deepseek_choice(name, router):
     assert_routes_as_recorded(tensors, weights, indices)
 
 
+@pytest.mark.parametrize("fill", [0.0, None], ids=["axk2-zero", "deepseek-inf"])
+def test_a_router_chooses_an_expert_outside_its_best_groups_by_the_score_its_reference_fills_in(fill):
+    """A grouped router whose best group's experts all choose below zero: A.X-K2's fills every expert
+    outside that group at 0.0 (modeling_axk2.py:340), so those outrank the group's own, and DeepSeek V3's
+    at -inf, so they never do (`Router.excluded_group_score`). Of eight experts in four groups, two
+    groups are a token's best and the four experts outside them are its choice, or never are."""
+    import torch
+    from transformers import AutoConfig
+    from transformers.models.axk2.modeling_axk2 import AXK2TopkRouter
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3TopkRouter
+
+    fields = {"hidden_size": 16, "n_routed_experts": 8, "num_experts_per_tok": 4, "n_group": 4,
+              "topk_group": 2, "routed_scaling_factor": 1.0, "norm_topk_prob": True}
+    reference = (AXK2TopkRouter(AutoConfig.for_model("axk2", **fields)) if fill is not None
+                 else DeepseekV3TopkRouter(AutoConfig.for_model("deepseek_v3", **fields)))
+    generator = np.random.default_rng(0x3080)
+    weight = generator.standard_normal((8, 16)).astype(np.float32)
+    # Every expert's score for choice falls below zero, the excluded experts' fill above it or not.
+    bias = np.full((8,), -5.0, np.float32)
+    hidden = generator.standard_normal((6, 16)).astype(np.float32)
+    reference.weight.data = torch.from_numpy(weight)
+    reference.e_score_correction_bias.data = torch.from_numpy(bias)
+    with torch.no_grad():
+        _, _, theirs = reference(torch.from_numpy(hidden))
+    router = Router(num_experts=8, in_features=16, top_k=4, score_function='sigmoid',
+                    normalize_weights=True, expert_groups=4, groups_per_token=2, expert_bias=True,
+                    excluded_group_score=fill)
+    variables = {"params": {"kernel": jnp.asarray(weight.T)},
+                 "moe": {"e_score_correction_bias": jnp.asarray(bias)}}
+    _, indices = router.apply(variables, jnp.asarray(hidden))
+    np.testing.assert_array_equal(np.sort(np.asarray(indices), -1), np.sort(theirs.numpy(), -1))
+
+
 def v4_experts(swiglu_limit) -> ExpertMLP:
     config = CONFIG["deepseek_v4"]
     return ExpertMLP(num_experts=config["num_local_experts"],

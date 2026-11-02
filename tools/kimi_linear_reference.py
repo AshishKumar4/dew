@@ -219,8 +219,9 @@ def main() -> None:
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
         generated, step_logits = greedy(model, input_ids, attention_mask)
+    # The forward's logits are recorded over drawn batches (tools/kimi_worker.py), not here.
     np.savez(DESTINATION / "reference.npz", input_ids=ids, attention_mask=mask,
-             logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
+             loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
     record_picks(DESTINATION)
@@ -232,6 +233,18 @@ def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> No
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             parameter.copy_(tensors[name].to(parameter))
+
+
+def released_model(configuration, modeling, config: dict, tensors: dict[str, torch.Tensor],
+                   dtype: torch.dtype) -> torch.nn.Module:
+    """The release (`configuration`, `modeling`: `patched`'s or `released_modules`') at `dtype`, its
+    attention eager, holding the fixture's `tensors` (`load_weights`): the model `truth` and
+    tools/kimi_worker.py build."""
+    model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config)))
+    model = model.to(dtype)
+    model.config._attn_implementation = "eager"
+    load_weights(model, tensors)
+    return model
 
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
@@ -247,10 +260,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
     with installed(modeling), float64():
-        model = modeling.KimiLinearForCausalLM(
-            configuration.KimiLinearConfig(**copy.deepcopy(config))).double()
-        model.config._attn_implementation = "eager"
-        load_weights(model, tensors)
+        model = released_model(configuration, modeling, config, tensors, torch.float64)
         return float64_truth(model.eval(), directory, lambda name: True)
 
 

@@ -24,10 +24,13 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same ref makes the older run's verdict moot.
+# A newer push to the same ref makes the older run's verdict moot, but on base/kernels, whose lanes push more
+# often than a run takes (about 47 minutes), a running run finishes: GitHub keeps the newest push pending behind it,
+# cancelling an older pending one, so each run that finishes grades the newest tip it could and its reds page
+# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' }}
 
 env:
   # The armada runner every armada job uses.

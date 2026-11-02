@@ -181,13 +181,19 @@ class IndexerFront:
     dtype: Dtype | None
     precision: PrecisionLike
 
-    def declare_front(self) -> Callable[..., Dense]:
+    def declare_front(self, *, fp32_weights_at_half: bool = True) -> Callable[..., Dense]:
         """Declare `wq_b` and `weights_proj`, from the indexer's `setup`, and return the bias-free
-        projection at its `dtype` and `precision` they are, for the indexer's own keys."""
+        projection at its `dtype` and `precision` they are, for the indexer's own keys. Where
+        `fp32_weights_at_half`, a float16 indexer computes its head weights in float32, its input cast
+        to them, as V3.2's and V4's references keep `weights_proj` (`_keep_in_fp32_modules`, which
+        transformers honours in a float16 load alone, modeling_utils.py:3826-3830); GLM's k-pool keeps
+        it at the model's dtype."""
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        half = self.dtype is not None and jnp.dtype(self.dtype) == jnp.float16
+        self.weights_proj = dense(self.n_heads, name='weights_proj',
+                                  dtype=jnp.float32 if half and fp32_weights_at_half else self.dtype)
         return dense
 
     def queries(self, q_resid):
@@ -291,6 +297,7 @@ class SparseIndexer(IndexerFront, nn.Module):
 @logical_axes({
     ("q_a_proj",): ("embed", "qlora"),
     ("q_b_proj",): ("qlora", "attention"),
+    ("q_gate_proj",): ("qlora", "attention"),
     # The output concatenates the latent and the decoupled rope head, which
     # ride into the cache together; the name picks the sharded side.
     ("kv_a_proj_with_mqa",): ("embed", "kvlora"),
@@ -383,6 +390,11 @@ class MultiHeadLatentAttention(nn.Module):
     output_gate: bool = False
     """Kimi K3's `mla_use_output_gate`: the heads' output times
     `sigmoid(g_proj(x))` before `o_proj` (modeling_kimi_linear.py:398-401, 470-472)."""
+    query_gate: bool = False
+    """A.X-K2's fused query and gate (`attn_gate_fused`, modeling_axk2.py:540-606, 670): one projection,
+    `q_gate_proj`, of the normed query latent beside the raw one (`[q_resid, q_compressed]`, twice the
+    rank wide) to each head's query and a gate of its value's width; the heads' output times the gate's
+    sigmoid in at least float32, rounded once, before `o_proj`. It takes the place of `q_b_proj`."""
     force_fp32_for_softmax: bool = True
 
     def setup(self):
@@ -419,6 +431,9 @@ class MultiHeadLatentAttention(nn.Module):
             RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+        if self.query_gate and (self.q_lora_rank is None or self.output_gate):
+            raise ValueError("query_gate projects a query latent, which q_lora_rank sets, to the queries and "
+                             "their gate, which output_gate's g_proj would gate again")
         if self.q_lora_rank is None:
             # The reference's plain q_proj takes no bias, whatever
             # attention_bias says; only the low-rank projections do.
@@ -428,9 +443,14 @@ class MultiHeadLatentAttention(nn.Module):
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
-            self.q_b_proj = Dense(
-                self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
+            if self.query_gate:
+                self.q_gate_proj = Dense(
+                    self.num_heads * (qk_head_dim + self.v_head_dim), use_bias=False, dtype=self.dtype,
+                    precision=self.precision, name='q_gate_proj', dot_general=float32_dot_general)
+            else:
+                self.q_b_proj = Dense(
+                    self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
+                    precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
@@ -511,20 +531,29 @@ class MultiHeadLatentAttention(nn.Module):
         return yarn_query_scale(self.rope_scaling)
 
     def _queries(self, x, place: LogicalAxes):
-        """`[B, S, H, nope+rope]` queries and the residual the indexer reads,
-        the query latent computed where `place` puts it."""
+        """`[B, S, H, nope+rope]` queries, the residual the indexer reads, the query latent computed
+        where `place` puts it, and under `query_gate` the output gate's logits `[B, S, H * v]`, else
+        None."""
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
         # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
+        gate = None
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
+        elif self.query_gate:
+            compressed = constrain(self.q_a_proj(constrain(x, place)), place)
+            q_resid = constrain(self.q_a_layernorm(compressed), place)
+            fused = self.q_gate_proj(constrain(jnp.concatenate([q_resid, compressed], axis=-1), RESIDUAL))
+            per_head = fused.reshape(batch, length, self.num_heads, qk_head_dim + self.v_head_dim)
+            queries, gate = jnp.split(per_head, [qk_head_dim], axis=-1)
+            gate = gate.reshape(batch, length, self.num_heads * self.v_head_dim)
         else:
             q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
             queries = self.q_b_proj(constrain(q_resid, RESIDUAL))
         queries = checkpoint_name(queries, 'q_proj')
-        return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid
+        return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid, gate
 
     def _latents(self, x, place: LogicalAxes):
         """The normed KV latent and the raw decoupled rope head.
@@ -582,11 +611,11 @@ class MultiHeadLatentAttention(nn.Module):
     def context_query(self, x):
         """Its query heads over `x` `[B, S, E]` as it reads another sequence (`attend_context`): through
         its query latent as its own call projects them, YaRN's scale on them, their rope parts
-        unrotated, a context having no positions to rotate by. With the output gate, `x`, which the
-        gate reads (`_output`), else None."""
-        queries, _ = self._queries(x, RESIDUAL)
+        unrotated, a context having no positions to rotate by. What its output gate reads (`_output`):
+        with `output_gate`, `x`; with `query_gate`, the gate's logits; else None."""
+        queries, _, gate = self._queries(x, RESIDUAL)
         q_pass, q_rot = jnp.split(queries, [self.qk_nope_head_dim], axis=-1)
-        return self._scaled_query(q_pass, q_rot), x if self.output_gate else None
+        return self._scaled_query(q_pass, q_rot), x if self.output_gate else gate
 
     def context_keys(self, context):
         """Its key and value heads over a context `[B, C, E]`: the context's normed latent expanded by
@@ -624,9 +653,11 @@ class MultiHeadLatentAttention(nn.Module):
         expansion's over the context's `context_lengths`; its own call's over its sequence alike
         (`model_flops`)."""
         query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        if self.query_gate:
+            query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim)
         rows = (projection_flops(lengths, self.emb_features, query) if self.q_lora_rank is None else
                 projection_flops(lengths, self.emb_features, self.q_lora_rank)
-                + projection_flops(lengths, self.q_lora_rank, query))
+                + projection_flops(lengths, (2 if self.query_gate else 1) * self.q_lora_rank, query))
         rows += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
         if self.output_gate:
             rows += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
@@ -640,7 +671,9 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         self._check_call(call, batch, length)
         place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
-        queries, q_resid = self._queries(x, place)
+        queries, q_resid, gate = self._queries(x, place)
+        # What the output gate reads (`_output`): the gate's logits beside the queries, else the input.
+        gating = x if gate is None else gate
         latent, rot = self._latents(x, place)
         decode, attention_metadata = call.decode, call.metadata
         causal, mask, objective = self.causal, None, None
@@ -709,7 +742,7 @@ class MultiHeadLatentAttention(nn.Module):
                 if self.sparse:
                     if self._attends_sparsely(selection, length):
                         return self._output(self._sparse_attention(
-                            q_pass, q_rot, latent, rot, selection, index_scores), x)
+                            q_pass, q_rot, latent, rot, selection, index_scores), gating)
                     keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
                     unselected = self._empty_selection(keep, row_valid)
@@ -741,7 +774,7 @@ class MultiHeadLatentAttention(nn.Module):
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax)
-        return self._attend(query, key, value, x, mask, implementation, causal=causal, bias=bias,
+        return self._attend(query, key, value, gating, mask, implementation, causal=causal, bias=bias,
                             unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
 
     def _dense_visibility(self, metadata, positions, places, segment_ids, valid, causal: bool, batch: int,
@@ -879,7 +912,7 @@ class MultiHeadLatentAttention(nn.Module):
         return seen & chunk_mask(slots, jnp.broadcast_to(jnp.arange(total), (slots.shape[0], total)),
                                  self.attention_chunk)
 
-    def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False, bias=None,
+    def _attend(self, query, key, value, gating, mask, implementation, *, causal: bool = False, bias=None,
                 unselected=None, force_fp32_for_softmax: bool = True):
         """The attention over `key` and `value` and its output projection, sowing the per-head
         maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
@@ -904,7 +937,7 @@ class MultiHeadLatentAttention(nn.Module):
             wide = value.astype(at_least_fp32(value.dtype))
             uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
             attention = jnp.where(unselected, uniform, attention)
-        return self._output(attention, x)
+        return self._output(attention, gating)
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")
@@ -972,14 +1005,19 @@ class MultiHeadLatentAttention(nn.Module):
             latent, rot, key_weight, value_weight, selection,
             scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.precision)
 
-    def _output(self, attention, x):
-        """o_proj over the heads' context, gated by `x` under `output_gate`."""
+    def _output(self, attention, gating):
+        """o_proj over the heads' context, gated where it has a gate: by `sigmoid(g_proj(gating))`, the
+        layer's input's, under `output_gate`; by `gating`'s own sigmoid, the gate's logits, under
+        `query_gate`, in at least float32 and rounded once (modeling_axk2.py:670)."""
         batch, length = attention.shape[:2]
         context = checkpoint_name(attention, "context").reshape(
             batch, length, self.num_heads * self.v_head_dim
         )
-        if self.output_gate:
-            context = context * nn.sigmoid(self.g_proj(x))
+        if self.query_gate:
+            wide = at_least_fp32(context.dtype)
+            context = (context.astype(wide) * nn.sigmoid(gating.astype(wide))).astype(context.dtype)
+        elif self.output_gate:
+            context = context * nn.sigmoid(self.g_proj(gating))
         return checkpoint_name(self.o_proj(context), 'o_proj')
 
 
@@ -1012,6 +1050,7 @@ class MLAMixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
+    reads_phase = True
 
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512
@@ -1025,10 +1064,17 @@ class MLAMixer(MixerBase):
     index_rope_interleave: bool = False
     mla_use_nope: bool = False
     mla_use_output_gate: bool = False
+    attn_gate_fused: bool = False
+    """A.X-K2's fused query and output gate (`MultiHeadLatentAttention.query_gate`), by its config's name."""
     bidirectional_blocks: bool = False
     """A causal dense layer reads each block of a call's `block_groups` whole (the standard kind's flag)."""
     bidirectional_images: bool = False
     """A causal dense layer reads each image of a call's `image_groups` whole."""
+    latent_scale_offset: bool | None = None
+    latent_scale_after_cast: bool | None = None
+    """The latent norms' rounding where it is not the layer's own (`MixerContext.scale_offset`,
+    `scale_after_cast`): DeepSeek V3's latents normed by Llama's RMSNorm beside a block of another's
+    (OLMo 2's scale-first norms); None follows the layer's."""
 
     @property
     def indexed(self) -> bool:
@@ -1068,8 +1114,9 @@ class MLAMixer(MixerBase):
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
             rope_scaling=ctx.rope_scaling,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
+            scale_offset=ctx.scale_offset if self.latent_scale_offset is None else self.latent_scale_offset,
+            scale_after_cast=(ctx.scale_after_cast if self.latent_scale_after_cast is None
+                              else self.latent_scale_after_cast),
             attention_bias=ctx.attention_bias,
             index_topk=None if ctx.kv_shared else self.index_topk,
             index_n_heads=None if ctx.kv_shared else self.index_n_heads,
@@ -1087,4 +1134,5 @@ class MLAMixer(MixerBase):
             attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
             output_gate=self.mla_use_output_gate,
+            query_gate=self.attn_gate_fused,
             kv_cache=ctx.kv_cache)

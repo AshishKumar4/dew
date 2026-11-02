@@ -240,6 +240,12 @@ class RMSNorm(nn.Module):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
         return self.seam(x, axes=axes)[1]
 
+    def largest_gain(self) -> jax.Array:
+        """The largest gain the weight puts on the normalized input, over the features: |w|, or
+        |1 + w| stored as its offset (`scale_offset`); one without a weight. Read from the bound
+        norm, as a curvature bound through it reads it (`CausalTransformer.head_bounds`)."""
+        return _gain_of(self, offset=self.scale_offset)
+
     @nn.compact
     def seam(self, x, branch=None, *, axes=None):
         """A pre-norm block's residual seam: `(stream, normed)` for the stream
@@ -272,11 +278,60 @@ class RMSNorm(nn.Module):
         return stream, normed.reshape(stream.shape)
 
 
+class NormGate(nn.Module):
+    """A norm's low-rank gate: `fc2(silu(fc1(y)))` of the normed `y`, unbiased, `rank` wide between
+    (A.X-K2's AXK2GateMLP, modeling_axk2.py:72-84)."""
+
+    rank: int
+    dtype: Dtype | None = None
+
+    @nn.compact
+    def __call__(self, y):
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype)
+        return dense(y.shape[-1], name='fc2')(nn.silu(dense(self.rank, name='fc1')(y)))
+
+
+class GatedRMSNorm(nn.Module):
+    """An RMS norm whose output its own low-rank gate scales: `y = norm(x)`, then `y * sigmoid(gate(y))`
+    in at least fp32, rounded once to `y`'s dtype (A.X-K2's AXK2GatedRMSNorm, modeling_axk2.py:87-101,
+    Megatron's GatedNormWrapper). `norm` is the `RMSNorm` it gates, built under the name `norm`; the gate
+    is `NormGate` under `mlp`, as the checkpoint names them."""
+
+    rank: int
+    norm: Callable[..., RMSNorm]
+    dtype: Dtype | None = None
+
+    def __call__(self, x, *, axes=None):
+        return self.seam(x, axes=axes)[1]
+
+    @nn.compact
+    def seam(self, x, branch=None, *, axes=None):
+        """The residual seam of its norm (`RMSNorm.seam`), its normed output gated."""
+        stream, normed = self.norm(name='norm').seam(x, branch, axes=axes)
+        gate = NormGate(self.rank, dtype=self.dtype, name='mlp')(normed)
+        wide = at_least_fp32(normed.dtype)
+        return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
+
+
 class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
     (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
     and the module's name are flax's, so checkpoints and scopes move both ways."""
+
+    def largest_gain(self) -> jax.Array:
+        """The largest gain the weight puts on the normalized input, |w| over the features, one
+        without a weight (`RMSNorm.largest_gain`)."""
+        return _gain_of(self, offset=False)
+
+
+def _gain_of(norm: nn.Module, *, offset: bool) -> jax.Array:
+    """The largest of `norm`'s weight's gains, |w| or |1 + w| where it stores its offset, one without a
+    weight (`RMSNorm.largest_gain`)."""
+    scale = norm.variables.get("params", {}).get("scale")
+    if scale is None:
+        return jnp.ones((), jnp.float32)
+    return jnp.max(jnp.abs(jnp.asarray(scale, jnp.float32) + (1 if offset else 0)))
 
 
 class OffsetLayerNorm(nn.Module):
@@ -297,6 +352,11 @@ class OffsetLayerNorm(nn.Module):
         if self.use_bias:
             y = y + self.param("bias", nn.initializers.zeros, (x.shape[-1],), jnp.float32).astype(y.dtype)
         return y
+
+    def largest_gain(self) -> jax.Array:
+        """The largest gain the weight puts on the normalized input, |1 + w| over the features
+        (`RMSNorm.largest_gain`)."""
+        return _gain_of(self, offset=True)
 
 
 class GroupNorm(nn.Module):

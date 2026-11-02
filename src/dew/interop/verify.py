@@ -96,6 +96,11 @@ _WINDOW = 4
 # turn too little to show, so a ramp the reference applies and the convention
 # does not (or the reverse) shows only past it.
 _CONTEXT = 8
+# The groups a type splits its heads into, which its heads stay a multiple of at the probe's size:
+# CodeGen's fused qkv in four (transformers' `mp_num`).
+_HEAD_GROUPS = {'codegen': 4}
+# A rope record's per-frequency factors, one per rotated pair (Phi-3's and PhiMoE's LongRoPE).
+_FREQUENCY_FACTORS = frozenset({'long_factor', 'short_factor'})
 # Probe fields Dew never reads that would change what the reference builds or
 # runs, not what it computes: `auto_map` asks transformers to run the
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
@@ -159,11 +164,14 @@ class ModelSource:
         return self._remote_class('AutoConfig')
 
     def configured(self, fields: Mapping[str, object]) -> PretrainedConfig:
+        """The source's config of `fields`, a config's JSON, its records of infinite floats read back as
+        its own load reads them (`_records.decoded_floats`)."""
         from transformers import AutoConfig
 
+        stated = _records.decoded_floats(fields)
         if 'AutoConfig' not in self.references:
-            return AutoConfig.for_model(self.model_type, **fields)
-        return self.config_class().from_dict(dict(fields))
+            return AutoConfig.for_model(self.model_type, **stated)
+        return self.config_class().from_dict(dict(stated))
 
     def causal_lm(self, config: PretrainedConfig) -> PreTrainedModel:
         """The source's causal LM of `config`, float32, on torch's current device."""
@@ -332,7 +340,8 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     heads, hidden = sizes.stated('num_attention_heads'), sizes.stated('hidden_size')
     kv_heads = sizes.given('num_key_value_heads') or heads
     head_dim = sizes.given('head_dim') or hidden // heads
-    small_kv = min(kv_heads, 2)
+    # Two key heads, or as many as a type splits its heads into (`_HEAD_GROUPS`).
+    small_kv = max(min(kv_heads, 2), _HEAD_GROUPS.get(str(hf_config.get('model_type')), 1))
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
     # Each spelled size is written once, under the config's own key: a standard name its class
@@ -362,6 +371,10 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
+    if isinstance(per_layer := hf_config.get('num_attention_heads_per_layer'), list):
+        # Each layer's own query heads (Laguna's) keep their share of the key heads.
+        counts = _records.integers(per_layer, 'num_attention_heads_per_layer')
+        fields['num_attention_heads_per_layer'] = [count // kv_heads * small_kv for count in counts]
     if key('head_dim') in hf_config:
         # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
         # two equal.
@@ -373,9 +386,26 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
             fields[positional] = _WINDOW
+    small_head_dim = _HEAD_DIM if key('head_dim') in hf_config else small_hidden // small_heads
+    partial = _records.number(hf_config.get('partial_rotary_factor', 1.0), 'partial_rotary_factor')
+    if isinstance(rotary := hf_config.get('rotary_dim'), int):
+        # A stated rotary width (CodeGen's, GPT-J's) keeps its share of the head (`_HEAD_DIM`'s).
+        fields['rotary_dim'] = max(2, rotary * small_head_dim // head_dim // 2 * 2)
     for record in ('rope_parameters', 'rope_scaling'):
         if isinstance(rope := hf_config.get(record), Mapping):
-            fields[record] = _within_probe(rope)
+            fields[record] = _within_probe(rope, small_head_dim, partial)
+    if 'mamba_n_heads' in hf_config:
+        # A Mamba mixer's heads tile its expanded width, which GraniteMoeHybrid's config validates: two
+        # heads, one group, a small state.
+        # A stated inner width (Falcon-H1's mamba_d_ssm) is the expanded hidden's, shrunk with it.
+        width = _records.integer(hf_config.get('mamba_expand', 2), 'mamba_expand') * small_hidden
+        fields['mamba_n_heads'] = 2
+        if isinstance(hf_config.get('mamba_d_head'), int):
+            fields['mamba_d_head'] = width // 2
+        if isinstance(hf_config.get('mamba_d_ssm'), int):
+            fields['mamba_d_ssm'] = width
+        fields.update({name: value for name, value in (('mamba_n_groups', 1), ('mamba_d_state', _HEAD_DIM))
+                       if name in hf_config})
     if isinstance(hf_config.get('original_max_position_embeddings'), int):
         fields['original_max_position_embeddings'] = _CONTEXT
     for key in ('pad_token_id', 'bos_token_id', 'eos_token_id'):
@@ -387,12 +417,19 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     return fields
 
 
-def _within_probe(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A rope record with the original context it states at `_CONTEXT`: a record's own, or each layer
-    type's of a record nested by layer type."""
-    if 'original_max_position_embeddings' in record:
-        return {**record, 'original_max_position_embeddings': _CONTEXT}
-    return {key: _within_probe(value) if isinstance(value, Mapping) else value
+def _within_probe(record: Mapping[str, object], head_dim: int, partial: float) -> Mapping[str, object]:
+    """A rope record with the original context it states at `_CONTEXT`, and its per-frequency factors
+    (LongRoPE's `long_factor` and `short_factor`, one per rotated pair) cut to the pairs the probe's
+    `head_dim` rotates, the record's partial rotary share where it states one, else the config's
+    `partial`: a record's own, or each layer type's of a record nested by layer type."""
+    if 'original_max_position_embeddings' in record or _FREQUENCY_FACTORS & set(record):
+        share = _records.number(record.get('partial_rotary_factor', partial), 'partial_rotary_factor')
+        half = int(head_dim * share) // 2
+        cut = {name: factors[:half] for name in _FREQUENCY_FACTORS
+               if isinstance(factors := record.get(name), list)}
+        stated = 'original_max_position_embeddings' in record
+        return {**record, **({'original_max_position_embeddings': _CONTEXT} if stated else {}), **cut}
+    return {key: _within_probe(value, head_dim, partial) if isinstance(value, Mapping) else value
             for key, value in record.items()}
 
 
@@ -490,12 +527,14 @@ class VerifiedMapping:
     source: ModelSource | None = None
     """Where the type's classes came from, where not transformers' own (remote code, opted into)."""
 
-    def entry(self, hf_config: Mapping[str, object]) -> decoder_parts.DecoderFamily:
+    def entry(self, hf_config: Mapping[str, object],
+              inventory: Collection[str] | None = None) -> decoder_parts.DecoderFamily:
         """The family the real config loads through: the convention's, or, for a type verified from parts,
-        the one its real-sized skeleton assembles (`parts.family`)."""
+        the one its real-sized skeleton assembles (`parts.family`), its stored names read over the
+        checkpoint's `inventory` (`parts.assemble`)."""
         if self.family == PARTS:
             source = self.source or ModelSource(self.model_type)
-            return parts.family(self.model_type, _assembled(source, hf_config))
+            return parts.family(self.model_type, _assembled(source, hf_config, inventory))
         return dict(CONVENTIONS)[self.family]
 
     def record(self, hf_config: Mapping[str, object],
@@ -518,7 +557,7 @@ class VerifiedMapping:
         and its tensors may carry names the shrunk reference did not build.
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
-        entry = self.entry(hf_config) if entry is None else entry
+        entry = self.entry(hf_config, tensor_names) if entry is None else entry
         record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
@@ -535,9 +574,22 @@ class VerifiedMapping:
         return record
 
 
-def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.Assembly:
+def _saved_names(directory: Path) -> frozenset[str]:
+    """The tensor names a source's `save_pretrained` wrote to `directory`, read from its safetensors'
+    headers."""
+    from safetensors import safe_open
+
+    names: set[str] = set()
+    for shard in sorted(directory.glob("*.safetensors")):
+        with safe_open(shard, "np") as stored:
+            names.update(stored.keys())
+    return frozenset(names)
+
+
+def _assembled(source: ModelSource, hf_config: Mapping[str, object],
+               inventory: Collection[str] | None = None) -> parts.Assembly:
     """The source's causal LM at `hf_config`'s own sizes, built on torch's meta device (so no layer
-    allocates), assembled from parts (`parts.assemble`)."""
+    allocates), assembled from parts over the checkpoint's `inventory` (`parts.assemble`)."""
     import torch
 
     fields = {key: value for key, value in hf_config.items()
@@ -545,7 +597,7 @@ def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.As
     with torch.device('meta'):
         skeleton = source.causal_lm(source.configured(fields))
     try:
-        return parts.assemble(skeleton)
+        return parts.assemble(skeleton, inventory)
     except parts.Ambiguous as error:
         raise _refuse(source.model_type, f"its real-sized model does not assemble as its probe did "
                       f"({error})") from error
@@ -756,16 +808,20 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
                      train: bool) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """The source's logits over `ids` and every parameter's gradient of their sum against `cotangent`,
-    by the parameter's stored name, in training or eval mode, eager attention."""
+    """The source's logits over `ids` and every trained parameter's gradient of their sum against
+    `cotangent`, by the parameter's stored name, in training or eval mode, eager attention. A trained
+    parameter the backward reaches no path to (one read under `torch.no_grad`, as DeepSeek V3.2's
+    lightning indexer is, whose top-k selection carries no gradient) has a gradient of zeros, which torch
+    leaves unset."""
     import torch
 
     model.train(train)
     model.zero_grad()
     logits = model(input_ids=torch.from_numpy(ids.astype(np.int64)), use_cache=False).logits
     (logits * torch.from_numpy(cotangent)).sum().backward()
-    gradients = {name: parameter.grad.detach().numpy().copy() for name, parameter in model.named_parameters()
-                 if parameter.grad is not None}
+    gradients = {name: (np.zeros(tuple(parameter.shape), np.float32) if parameter.grad is None
+                        else parameter.grad.detach().numpy().copy())
+                 for name, parameter in model.named_parameters() if parameter.requires_grad}
     model.eval()
     return logits.detach().numpy(), gradients
 
@@ -1000,30 +1056,32 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "
                                f"({type(error).__name__}: {error})") from error
-        assembly = None
-        try:
-            assembly = parts.assemble(reference)
-        except parts.Ambiguous as ambiguous:
-            reasons[PARTS] = str(ambiguous)
-        else:
-            record = assembly.fields
-            try:
-                model = models.build("causal_transformer",
-                                     {**record, "dtype": "float32", "attention_impl": "reference"})
-            except ValueError as refused:
-                # Parts each read alike may still combine into a decoder Dew refuses to build.
-                reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
-            else:
-                sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
         # The row the source's table pads, nn.Embedding's notion (Gemma's scaled table is one); a lookup
         # of another kind has no padding_idx to pad by. The reference ran, so torch is installed.
         import torch
 
         lookup = reference.get_input_embeddings()
         pad = lookup.padding_idx if isinstance(lookup, torch.nn.Embedding) else None
-        if sized:
-            with tempfile.TemporaryDirectory() as scratch:
-                reference.save_pretrained(scratch)
+        with tempfile.TemporaryDirectory() as scratch:
+            # Saved first: the parts read the checkpoint's names as its load does, over its whole
+            # inventory where its conversion renames a key by another's presence (`parts.assemble`).
+            reference.save_pretrained(scratch)
+            assembly = None
+            try:
+                assembly = parts.assemble(reference, _saved_names(Path(scratch)))
+            except parts.Ambiguous as ambiguous:
+                reasons[PARTS] = str(ambiguous)
+            else:
+                record = assembly.fields
+                try:
+                    model = models.build("causal_transformer",
+                                         {**record, "dtype": "float32", "attention_impl": "reference"})
+                except ValueError as refused:
+                    # Parts each read alike may still combine into a decoder Dew refuses to build.
+                    reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
+                else:
+                    sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
+            if sized:
                 for convention, family, model, record, inert in sized:
                     try:
                         error, bound = _agreement(convention, family, model, record, inert, name, expected,

@@ -777,3 +777,108 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     first, *_ = listed(plan["probes"], "probes", read=record, what="probes")
     assert int(state.step) == 1 and int(state.updates) == 1
     assert plan["split"] == 2 and first["ahead"] is True
+
+
+def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
+    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`), one of them reading
+    no argument, are the programs loaded after saving, each an executable this host's CPU is no target of:
+    loading them here is refused, naming the GPU kind it is not (ledger 2716: an H100 node loads what a CPU
+    host built, and runs it alone)."""
+    from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
+
+    square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    built = compile_programs({"dot": (lambda x, y: x @ y, [square, square]),
+                              "iota": (lambda: jnp.arange(8.0), [])}, "sm90")
+    assert set(built.programs) == {"dot", "iota"}
+    assert (built.target.generation, built.target.devices) == ("sm90", 1)
+    built.save(tmp_path / "programs.dew-aot")
+    loaded = AheadPrograms.load(tmp_path / "programs.dew-aot")
+    assert loaded == built
+    with pytest.raises(ValueError):
+        loaded.loaded()
+    here = BuildTarget.of(jax.devices()[:1])
+    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "multiprocessors"]
+    # A kind of the generation with its multiprocessors is its target, whatever its memory or its name: the
+    # build's target is sm90's facts, 132 multiprocessors.
+    assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
+
+
+def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
+    """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
+    compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
+    the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
+    missing)."""
+    import threading
+
+    from dew.training.ahead import ExecutableOnly, executable_only
+
+    x = jnp.arange(8.0)
+    compiled = jax.jit(lambda value: value * 3).lower(x).compile()
+    traced = jax.jit(lambda value: value * 5).trace(x)
+    lowered = jax.jit(lambda value: value * 7).lower(x)
+    elsewhere = []
+    with executable_only():
+        assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
+        for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
+            with pytest.raises(ExecutableOnly):
+                step()
+        thread = threading.Thread(target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
+        thread.start()
+        thread.join()
+    assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
+    assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+
+
+def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
+                                                                                           monkeypatch):
+    """A run given `dumps` writes its compiles under that directory, a child process's too from another
+    working directory, whatever the environment said of XLA's dumping (elsewhere, or filtered to no
+    module), and nothing where it compiled nothing (`compiled_in`); a directory dumps did not make is
+    refused, never read as empty: the gate of a run of programs compiled ahead (ledger 2716)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from dew.training.ahead import compiled_in, dumps
+
+    child = "import jax; jax.jit(lambda x: x + 1)(1.0)"
+    elsewhere = f"[sys.executable, '-c', {child!r}], cwd='/', check=True"
+    compiling = f"import subprocess, sys; subprocess.run({elsewhere})"
+    monkeypatch.chdir(tmp_path)
+    given = (("elsewhere", f"--xla_dump_to={tmp_path / 'other'}"),
+             ("filtered", "--xla_dump_hlo_module_re=^never$"))
+    for name, flags in given:
+        environment = {**os.environ, "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
+        subprocess.run([sys.executable, "-c", compiling], env=dumps(Path(name), environment), check=True)
+        assert compiled_in(tmp_path / name), name
+    computing = dumps(Path("computes"), {**os.environ, "JAX_PLATFORMS": "cpu"})
+    subprocess.run([sys.executable, "-c", "import numpy; numpy.arange(8.0).sum()"], env=computing, check=True)
+    assert compiled_in(tmp_path / "computes") == []
+    with pytest.raises(FileNotFoundError):
+        compiled_in(tmp_path / "never-made")
+    # A dump directory that is a link elsewhere is refused at both ends, and one that takes no file at the
+    # start.
+    (tmp_path / "linked").mkdir()
+    (tmp_path / "link-target").mkdir()
+    (tmp_path / "linked" / "xla").symlink_to(tmp_path / "link-target")
+    with pytest.raises(ValueError):
+        dumps(tmp_path / "linked", {})
+    (tmp_path / "linked" / "mosaic").mkdir()
+    with pytest.raises(ValueError):
+        compiled_in(tmp_path / "linked")
+    (tmp_path / "locked" / "xla").mkdir(parents=True)
+    (tmp_path / "locked" / "xla").chmod(0o500)
+    with pytest.raises(PermissionError):
+        dumps(tmp_path / "locked", {})
+
+
+def test_a_flag_given_twice_is_read_by_its_order():
+    """XLA reads a flag given twice by its last value, so the two orders of one pair are two targets
+    (`computation_flags`, review)."""
+    from dew.training.ahead import computation_flags
+
+    first = "--xla_allow_excess_precision=false --xla_allow_excess_precision=true --xla_dump_to=/tmp/x"
+    second = "--xla_allow_excess_precision=true --xla_allow_excess_precision=false"
+    assert computation_flags(first) != computation_flags(second)
+    excess = "--xla_allow_excess_precision"
+    assert computation_flags(first) == (f"{excess}=false", f"{excess}=true")

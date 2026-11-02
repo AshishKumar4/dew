@@ -125,6 +125,33 @@ def number(value: object, key: str) -> float:
     return finite(value, key)
 
 
+_SPECIAL_FLOATS = {"Infinity": math.inf, "-Infinity": -math.inf, "NaN": math.nan}
+
+
+def decoded_floats(config: Mapping[str, object]) -> Mapping[str, JSON]:
+    """`config`, a config's JSON, with transformers' records of the floats JSON cannot spell
+    (`{"__float__": "Infinity"}`, `"-Infinity"`, `"NaN"`, `number`) read back as those floats, at any
+    depth, as its own config load reads them before its class sees them
+    (`PreTrainedConfig._dict_from_json_file`, 5.17): what a config class built from a mapping takes."""
+    return {key: _decoded(value, key) for key, value in config.items()}
+
+
+def _decoded(value: object, key: str) -> JSON:
+    """One config value as its file holds it, transformers' float records read back (`decoded_floats`):
+    a mapping's integer keys (a label map's, as a config object's `to_dict` gives them) as the strings
+    its file spells them with, which the config class reads back alike."""
+    if isinstance(value, Mapping):
+        if set(value) == {"__float__"} and value["__float__"] in _SPECIAL_FLOATS:
+            return _SPECIAL_FLOATS[str(value["__float__"])]
+        return {(str(name) if isinstance(name, int) else text(name, f"{key} record key")):
+                _decoded(entry, key) for name, entry in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_decoded(entry, key) for entry in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise ValueError(f"{key}={value!r}: this field is not a value a JSON config carries")
+
+
 def boolean(value: object, key: str) -> bool:
     """One flag field, as JSON's true and false."""
     if not isinstance(value, bool):
@@ -181,6 +208,11 @@ def json_value(value: object, key: str) -> JSON:
                 for name, entry in value.items()}
     raise ValueError(f"{key}={value!r}: this field is not a value a JSON config carries")
 
+
+UNREAD = "unread"
+"""The field of an inference record naming the parts of the run's tree its model does not read
+(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
+teacher and projections beside the student it saves (`dew.objectives.distillation`)."""
 
 ADDED = "added"
 """The metadata key of a configuration field added after runs were saved with it: declared

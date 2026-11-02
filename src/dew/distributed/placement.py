@@ -42,11 +42,11 @@ from dew.nn.sharding import Suffix, boxed, boxed_axes, current_boxes, declaratio
 from dew.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: diloco holds DiLoCo's replica
-# groups, each with its own copy, data holds a batch's replicas, and stage the
-# pipeline's stages of the layer stack, which the decoder places itself.
-# `Layout` refuses a parameter placed there. Every other axis a mesh has,
-# Dew's own (expert, fsdp, tensor, sequence) or a native mesh's, holds a
-# parameter where the rules put one.
+# groups, each with its own copy, data holds a batch's replicas, and stage a
+# pipeline's stages, whose runs the trainer stacks by stage onto it itself
+# (`dew.training.stages`). `Layout` refuses a rule placing a parameter there.
+# Every other axis a mesh has, Dew's own (expert, fsdp, tensor, sequence) or a
+# native mesh's, holds a parameter where the rules put one.
 UNSPLIT_AXES = (DILOCO_AXIS, DATA_AXIS, STAGE_AXIS)
 
 
@@ -413,8 +413,9 @@ class Layout:
     devices compute their own positions with the same weights (`STATE_AXES`).
     `shardings` refuses rules that place a parameter on the data or stage
     axis. The data axis holds the batch's replicas, each with the whole
-    state. The stage axis holds the layer stack's pipeline stages, and the
-    decoder places those itself from the stored tree.
+    state. The stage axis holds a pipeline's stages: the trainer keeps each
+    run a pipeline repeats stacked by stage on it, each row placed as these
+    rules place its layer (`dew.training.stages.StageLocal.placement`).
 
     Below `min_shard` elements a parameter costs more in collectives than it
     saves in memory, so it stays replicated. `tolerance` is the fraction of
@@ -456,6 +457,11 @@ class Layout:
     host: tuple[str, ...] = ()
     host_parameters: tuple[str, ...] = ()
     frozen_whole: bool = False
+    stage_local: bool = True
+    """Whether a pipelined run's layers, with their optimizer state and EMA, are kept stacked by stage on
+    their own stage's devices (`dew.training.stages`), about 1/S of the run on each; False keeps every
+    layer whole on every stage, which an optax transformation that may read a stacked leaf whole needs.
+    Either trains the same arithmetic, bit for bit."""
     data_axes: tuple[str, ...] = ()
     """The axes a batch's rows split over, ahead of the rules' own
     `activation_batch` entries: a native mesh's names for its data-parallel
@@ -784,7 +790,8 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
     axis of two H100s reduce-scatters, tests/test_layout_validation.py). An axis that splits a
     variable and no batch, tensor, sums the
     partial products of the width it splits (all-reduce). The stage axis hands each microbatch's
-    activations on (collective-permute). How the experts on the expert axis meet their tokens, an
+    activations on (collective-permute); the runs it splits are each stage's own, whose gradients no
+    other stage sums. How the experts on the expert axis meet their tokens, an
     all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
     over the sequence axis, an all-to-all or a gather by its heads and lengths
     (`dew.nn.attention_parallel.sequence_parallel_attention`), are the model's choice, not the
@@ -794,7 +801,7 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
         if size == 1:
             continue
         shares = axis in rows or axis == SEQUENCE_AXIS
-        ops = ["all-reduce"] if shares or axis in split else []
+        ops = ["all-reduce"] if shares or (axis in split and axis != STAGE_AXIS) else []
         if shares and axis in split and axis != EXPERT_AXIS:
             ops += ["all-gather", "reduce-scatter"]
         if axis == STAGE_AXIS:
