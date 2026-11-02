@@ -791,6 +791,37 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
     assert compiles.count == 3
 
 
+def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
+    """A `Compiles` block that closes while another thread's event is being told to it closes once that event
+    is held: what it counts when it closes is what it counts from then on, never a program late."""
+    import threading
+
+    told, release = threading.Event(), threading.Event()
+
+    class Slow(Compiles):
+        """An open block that takes its time over each event it is told."""
+
+        def heard(self, kind, duration_secs, metadata):
+            told.set()
+            release.wait(60)
+            super().heard(kind, duration_secs, metadata)
+
+    compiles = Slow(None).__enter__()
+    x = jnp.arange(8.0)
+    compiler = threading.Thread(target=lambda: jax.jit(lambda value: value * 11).trace(x))
+    compiler.start()
+    assert told.wait(60)
+    closed = []
+    closer = threading.Thread(target=lambda: (compiles.__exit__(None, None, None),
+                                              closed.append(len(compiles.programs))))
+    closer.start()
+    closer.join(0.5)
+    release.set()
+    closer.join()
+    compiler.join()
+    assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
+
+
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
                                                                                            monkeypatch):
     """A run given `dumps` writes its compiles under that directory, a child process's too from another
