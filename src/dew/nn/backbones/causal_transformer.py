@@ -1280,7 +1280,7 @@ class CausalTransformer(LinearProducts):
             squared = (jnp.square(logits * growth["project_out"]) * _squared_norm(table.rows())
                        * _squared_norm(projection.kernel))
         if self.head_transform is None:
-            return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
+            return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros_like(states[..., 0]))
         if not isinstance(self.head_norm, BoundedNorm):
             raise ValueError(f"a damped step bounds a head transform's curvature through its norm's "
                              f"derivatives, which {type(self.head_norm).__name__} bounds none of")

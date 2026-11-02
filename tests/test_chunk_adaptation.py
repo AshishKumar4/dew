@@ -599,17 +599,18 @@ def test_a_chain_of_one_level_steps_as_the_level_alone(adaptation):
     np.testing.assert_array_equal(np.asarray(scored[0]), np.asarray(scored[1]))
 
 
-def test_a_float64_level_steps_damped():
-    """A float64 model's damped step carries its window's terms in float64, as its states hold them: its
-    losses are finite."""
+def test_a_damped_step_carries_its_terms_in_its_states_precision():
+    """A damped step carries its window's terms as its states hold them: a float64 model's in float64,
+    and a float32 model's in float32 though x64 is on, its losses finite in each."""
     fields = {name: jnp.asarray(value) for name, value in fields_of("packed").items()}
+    adaptation = ChunkAdaptation(window=3, rate=5.0, damped=True)
     with jax.enable_x64(new_val=True):
-        wide = MODEL.clone(dtype=jnp.float64)
-        variables, hidden, targets, weights = widened(draw(0, scale=0.5))
-        losses = adapted_scores(wide, variables, hidden, targets, weights, fields,
-                                ChunkAdaptation(window=3, rate=5.0, damped=True), predict=False,
-                                logits=False).losses
-        assert losses.dtype == jnp.float64 and np.all(np.isfinite(np.asarray(losses)))
+        for model, dtype in ((MODEL.clone(dtype=jnp.float64), jnp.float64), (MODEL, jnp.float32)):
+            drawn = draw(0, scale=0.5)
+            variables, hidden, targets, weights = widened(drawn) if dtype == jnp.float64 else drawn
+            losses = adapted_scores(model, variables, hidden, targets, weights, fields, adaptation,
+                                    predict=False, logits=False).losses
+            assert losses.dtype == dtype and np.all(np.isfinite(np.asarray(losses))), dtype
 
 
 def test_a_damped_step_through_a_relu_head_transform_is_refused():
