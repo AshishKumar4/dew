@@ -124,34 +124,39 @@ def runs(root: Path) -> list[int]:
 def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_waits_on_them(
         ci, tmp_path, monkeypatch, site, per_unit):
     """A test marked check1_shards(seeds=4, per_task=8) plans map tasks of at most 8 of the 20 seeds check
-    1's two stages draw (seeds 0 to (1 + REDRAW) times 4), and one marked shards(units=20, per_task=8) of at
-    most 8 of its 20 units, each its test's own group, `<test>.draws-<start>-<stop>`, and one judge waiting
-    on them by their names, whose row is the site's, `<file>#<test>`; the file's own row sets the site aside,
-    weighed and cut without its seconds. A map task weighs what armada measured it at, else its units at the
-    site's recorded seconds over the units a whole run takes (a check-1 site's declared seeds, a `shards`
-    test's units); the judge, its row's pooling as armada measured it, else the target; a cold plan adds
-    what a cold task pays to each."""
+    1's two stages draw (seeds 0 to (1 + REDRAW) times 4), its first stage's 4 apart and its second's
+    later, run only where its judge's first judgement asks for them (armada's `later`), and one marked
+    shards(units=20, per_task=8) of at most 8 of its 20 units, none later, each its test's own group,
+    `<test>.draws-<start>-<stop>`, and one judge waiting on them by their names, whose row is the site's,
+    `<file>#<test>`; the file's own row sets the site aside, weighed and cut without its seconds. A map
+    task weighs what armada measured it at, else its units at the site's recorded seconds over the units a
+    whole run takes (a check-1 site's declared seeds, a `shards` test's units); the judge, its row's
+    pooling as armada measured it, else the target; a cold plan adds what a cold task pays to each."""
     site_checkout(tmp_path, site)
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"]
-    spans = [(0, 8), (8, 16), (16, 20)]
+    check1 = site is SITE
+    spans = [(0, 4), (4, 12), (12, 20)] if check1 else [(0, 8), (8, 16), (16, 20)]
     names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
     assert [(entry["name"], entry["tests"], entry["split"], entry.get("rows"), entry.get("after"),
-             entry["weight"]) for entry in entries] == [
-        ("3.12-1", "tests/test_site.py", "", ["3.12:tests/test_site.py"], None, 1.0),
+             entry["weight"], entry.get("later", False)) for entry in entries] == [
+        ("3.12-1", "tests/test_site.py", "", ["3.12:tests/test_site.py"], None, 1.0, False),
         *((name, "tests/test_site.py", f"test_site.draws-{start}-{stop}",
-           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, per_unit * (stop - start))
+           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, per_unit * (stop - start),
+           check1 and start >= 4)
           for name, (start, stop) in zip(names, spans, strict=True)),
         (ci.site_task("3.12", "tests/test_site.py", "test_site"), "tests/test_site.py", "test_site", None,
-         names, 30.0)]
+         names, 30.0, False)]
     assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", entry["name"]) for entry in entries)
     # Weighed by what armada measured: a map task under its task's name, the judge under its row's.
     measured = {names[0]: 7.0, "3.12:tests/test_site.py#test_site": 3.0}
     weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": measured})}
-    assert [weighed[name] for name in names] == [7.0, 8 * per_unit, 4 * per_unit]
+    assert [weighed[name] for name in names] == [7.0, *(per_unit * (stop - start)
+                                                          for start, stop in spans[1:])]
     assert weighed[ci.site_task("3.12", "tests/test_site.py", "test_site")] == 3.0
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
     cold = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"}
-    assert [cold[name] for name in names] == [count * per_unit + ci.COLD_SECONDS for count in (8, 8, 4)]
+    assert [cold[name] for name in names] == [(stop - start) * per_unit + ci.COLD_SECONDS
+                                              for start, stop in spans]
 
 
 def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp_path):
@@ -289,6 +294,71 @@ def test_site():
     [row] = json.loads(out.read_text())["rows"]
     assert (row["name"], row["exitCode"]) == ("3.12:tests/test_site.py#test_site", 1)
     assert row["first_failure"].partition(":")[0].rpartition(".")[2] == "PoolRefused"
+
+
+def test_a_judge_asks_for_its_later_draws_only_where_its_first_stage_finds_something(ci, tmp_path,
+                                                                                     monkeypatch):
+    """Check 1 as armada runs a site with later map tasks: the first stage's map task draws the declared
+    seeds, and the judge over them alone passes where the first stage passes, its row green and asking
+    nothing, and where it finds something writes its ask (LATER, `ask_later`) and its row is red and asks
+    for more (armada's `more`); once the later map tasks have drawn, the judge over them all judges as one
+    that drew every seed (Main, 2026-11-02: the second stage drawn every run, read only where the first
+    found something)."""
+    out = site_checkout(tmp_path, f"""import sys
+
+sys.path.insert(0, {str(ROOT / "tests")!r})
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import assert_as_exact
+
+
+def draw(seed):
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def halved(x, w):
+    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_on_par():
+    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_halved():
+    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
+""")
+    entries = planned(ci)
+
+    def judged(test: str, drawn: list[dict]) -> dict:
+        inputs = tmp_path / f".verdict/inputs-{test}-{len(drawn)}"
+        for index, entry in enumerate(drawn):
+            assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        assert entry_task(ci, monkeypatch, judge, out, artifacts=tmp_path / f".verdict/judge-{test}",
+                          inputs=inputs) == 0
+        [row] = json.loads(out.read_text())["rows"]
+        return row
+
+    for test in ("test_on_par", "test_halved"):
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        maps = [entries[name] for name in judge["after"]]
+        assert [entry.get("later", False) for entry in maps] == [False, True, True]
+        first = judged(test, maps[:1])
+        if test == "test_on_par":
+            assert (first["exitCode"], first.get("more")) == (0, None)
+            continue
+        assert (first["exitCode"], first.get("more")) == (1, True)
+        assert first["first_failure"].partition(":")[0].rpartition(".")[2] == "LaterUnits"
+        asked = json.loads((tmp_path / ".verdict/judge-test_halved/check1-later.json").read_text())
+        assert (asked["from"], asked["to"]) == (16, 80)
+        whole = judged(test, maps)
+        assert (whole["exitCode"], whole.get("more")) == (1, None)
+        assert whole["first_failure"].partition(":")[0].rpartition(".")[2] == "GateFailure"
 
 
 @KINDS
