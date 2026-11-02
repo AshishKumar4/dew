@@ -45,6 +45,7 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
+    device_memory,
     deviceless_options,
     head_fused_of,
     head_tile_of,
@@ -54,6 +55,7 @@ from dew.training.memory import (
     remat_half,
     remat_more,
     rung_record,
+    stated,
     step_fits,
     temporaries_factor,
 )
@@ -666,6 +668,12 @@ class FitSearch[LossT, EffectsT]:
         where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
         assert self.derive is not None
         narrow, label = self.narrow, "refuses"
+        if not stated([device_memory(device, self.capacity) for device in local_devices(self.mesh)]):
+            # A device that states no memory leaves every rung unjudged (`admitted`), so no footprint is
+            # traced for it.
+            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
+                                 "label": "unknown", "terms": None})
+            return "unknown", narrow
         while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
