@@ -1111,7 +1111,8 @@ def mode_pipeline(args) -> dict:
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
-    dump_params(args.out.with_suffix(".npz"), state.variables)
+    # A stage-local state holds each stage's layers stacked on its own devices; the dump reads every layer.
+    dump_params(args.out.with_suffix(".npz"), trainer.stored(state).variables)
     return {
         "process_index": jax.process_index(),
         "losses": losses,
@@ -1279,7 +1280,7 @@ def mode_evaluation_contract(args) -> dict:
             result = Evaluation.run(objective, state.variables, data.val, metrics=scoring, key=state.key,
                               step=state.step, schedule_step=state.microstep,
                               preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-            trainer._report_evaluation(result)
+            result.report(trainer._display, trainer.tracker)
             results[failure] = {"scores": result.scalars, "events": list(events)}
         except (ValueError, RuntimeError, OSError) as error:
             results[failure] = {"error": str(error), "events": list(events)}

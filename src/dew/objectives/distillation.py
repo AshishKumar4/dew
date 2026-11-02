@@ -39,6 +39,7 @@ import optax
 from flax import linen as nn
 from typing_extensions import TypeVar
 
+from dew._records import UNREAD
 from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
@@ -48,7 +49,6 @@ from dew.nn.protocols import Bounded
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
-    UNREAD,
     Aux,
     EMASpec,
     Objective,
@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import Processor
+    from dew.nn.backbones.decoder_stack import DecoderBank
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""
@@ -273,6 +274,12 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         if projections:
             tree["params"] = {**tree["params"], PROJECTIONS: projections}
         return tree
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """The student's runs a pipeline over `stages` stacks (`Objective.stage_sites`), which its tree,
+        the run's without the teacher and the projections, holds where the run's does: the teacher reads
+        no update, whose layers stay whole."""
+        return self.student.stage_sites(self.student_variables(store), stages)
 
     def student_variables(self, params: Variables) -> Variables:
         """Return the student's own tree, without the teacher or the feature projections.

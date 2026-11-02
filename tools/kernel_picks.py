@@ -26,9 +26,9 @@ import jax
 import jax.numpy as jnp
 import optax
 import tokamax
-from huggingface_hub import hf_hub_download
 
 from dew import cache
+from dew.interop import sources
 from dew.interop.hf_decoders import decoder_config, translate_config
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
@@ -39,20 +39,29 @@ from dew.training._lowering import Lowered
 
 def model_of(arguments) -> CausalTransformer:
     """The decoder a checkpoint's config.json translates to, in `--dtype`: a
-    local directory's, or a Hub repo's, of which nothing else is read."""
-    local = Path(arguments.config) / "config.json"
-    path = local if local.is_file() else hf_hub_download(arguments.config, "config.json",
-                                                         revision=arguments.revision)
-    config = json.loads(Path(path).read_text())
-    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides (ledger 3006).
-    fields = dict(translate_config(decoder_config(config)))
+    local directory's, or a Hub repo's, of which nothing else is read but its
+    tensors' names, from their headers, where a quantized wrapper's selection
+    needs them."""
+    # One snapshot, the config's and the headers' commit alike (`snapshot(weights=False)`).
+    source = sources.SourceReference(arguments.config, arguments.revision)
+    root = source.metadata()
+    config = json.loads((root / "config.json").read_text())
+
+    def inventory():
+        stored = sources.stored_tensors(source, root)
+        return None if stored is None else stored.keys()
+
+    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides, its quantized
+    # selection renamed with its tensors (ledgers 3006, 3138).
+    fields = dict(translate_config(decoder_config(config, inventory)))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Measure this GPU's kernel picks for a decoder's step.")
     parser.add_argument("--config", required=True,
-                        help="a decoder checkpoint's directory or Hub repo; only its config.json is read")
+                        help="a decoder checkpoint's directory or Hub repo; its config.json and, for a "
+                             "quantized wrapper, its tensors' headers are read")
     parser.add_argument("--revision", help="the Hub repo's commit")
     parser.add_argument("--batch", type=int, required=True, help="sequences a device holds")
     parser.add_argument("--seq", type=int, required=True)

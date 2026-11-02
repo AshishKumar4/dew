@@ -55,6 +55,7 @@ from dew.nn.kv_cache import (
     with_rounding_keys_of,
     write_cache,
 )
+from dew.nn.precision import ROUNDING_STREAM
 from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     BlockDenoiser,
@@ -72,7 +73,6 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
-from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -939,10 +939,13 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 
     # dew.inference imports this module, so its packing is imported here.
     from dew.inference.projections import packed_in_call
+    from dew.nn.backbones.layer_names import stored_layers
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
-        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
-        return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
+        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`), a
+        # stage-local run's store cut onto its layers first (`pending`).
+        layered = stored_layers(model, params) if packing else params
+        return _generate(model, packed_in_call(layered, packing), inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy, progress)
 
     return checkify.checkify(run, errors=checkify.user_checks)(

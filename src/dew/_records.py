@@ -182,6 +182,11 @@ def json_value(value: object, key: str) -> JSON:
     raise ValueError(f"{key}={value!r}: this field is not a value a JSON config carries")
 
 
+UNREAD = "unread"
+"""The field of an inference record naming the parts of the run's tree its model does not read
+(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
+teacher and projections beside the student it saves (`dew.objectives.distillation`)."""
+
 ADDED = "added"
 """The metadata key of a configuration field added after runs were saved with it: declared
 `dataclasses.field(default=..., repr=False, metadata={ADDED: True})`, so a run that leaves it at its

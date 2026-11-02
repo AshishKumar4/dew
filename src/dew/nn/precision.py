@@ -51,6 +51,7 @@ __all__ = [
     "L2NORM_EPS",
     "MATMUL_PRECISIONS",
     "NUMERICS_PRESETS",
+    "ROUNDING_STREAM",
     "WIDE_CPU_ARITHMETIC",
     "Dtypes",
     "Numerics",
@@ -116,7 +117,7 @@ def stochastic_bf16(x, noise):
     exactly with that probability. It does not saturate: a value past bf16's largest finite rounds to
     infinity with its dropped bits' probability, as rounding to nearest would. NaN stays NaN. The noise is
     its caller's policy: a hash of the state's own bits and the token (`recurrence.round_to_bf16`), of the
-    step's seed and the element's index (`optim.stochastic_round_bf16`)."""
+    step's seed and the element's index (`dew._moments.stochastic_round_bf16`)."""
     bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
     rounded = jax.lax.bitcast_convert_type((bits + (noise & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000),
                                            jnp.float32)
@@ -546,6 +547,11 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
 
 L2NORM_EPS = 1e-6
 """The epsilon `l2norm` adds under its square root: FLA's, and Dory's `justnorm`'s."""
+
+ROUNDING_STREAM = 0x726F756E
+"""The stream stochastic rounding draws from: what a training step folds its key with
+(`dew.objectives.base.training_rngs`), and what a served row's rounding key starts from
+(`dew.sampling.text.rounding_keys`), apart from dropout's and sampling's."""
 
 
 def span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
