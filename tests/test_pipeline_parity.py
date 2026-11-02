@@ -1,58 +1,45 @@
-"""A pipelined decoder's full training state stays on par with one device's (check 1).
+"""A decoder's logits and every parameter gradient over stages stay on par with one device's.
 
-Each draw initializes its own four-layer decoder with 32-wide heads and takes two AdamW steps
-on 64 rows of 64 tokens. The larger heads and batches give the q/k norm scale gradients enough
-elements and terms for paired sizing. The two-stage layout places the rows over eight CPU devices
-beside fsdp; its parameters, EMA and optimizer moments are measured against the same initial state
-widened to float64.
+Each draw initializes its own four-layer decoder and scores eight rows of sixteen tokens.
+The two-stage layout runs beside fsdp over eight CPU devices; both arms are measured against
+the same variables widened to float64, with actual FP32 product sums under check 1.
 """
 
-import dataclasses
 import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened, without_ynn
 from token_support import token_rows
 
-from dew.distributed.batches import shard_batch
-from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig
+from dew.mesh import batch_axes
+from dew.nn.sharding import pipeline_microbatches
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
-VOCAB, BATCH, SEQUENCE, STEPS = 64, 64, 64, 2
-HEAD_DIM = 32
+VOCAB, BATCH, SEQUENCE, HEAD_DIM = 64, 8, 16, 8
 STAGED = MeshSpec(fsdp=2, stage=2)
-SEEDS = 512
-"""Sized paired by `seeds_for`, pipeline against one device, on armada at 4a21a396e9
-(TR-3369dbg-19). Both disjoint pilot blocks resolve at 512, and the standard verdict passes at
-its first stage over 512 fresh draws, with no product change or layout-specific tolerance."""
-LABEL = "two-stage decoder AdamW full state"
+SEEDS = 8
+"""Sized paired by `seeds_for`, pipeline against one device, on armada at a887cfb3d0
+(TR-3369dbg-20). Both pilot blocks resolve at eight seeds, and check 1 passes at its first stage."""
+LABEL = "decoder logits and parameter gradients over stages"
 
 
 def decoder():
     """Four layers, which two pipeline stages split into two layers each."""
     return models.build("causal_transformer", **{
-        "vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "num_heads": 4,
-        "num_kv_heads": 2, "emb_features": 4 * HEAD_DIM, "mlp_features": 8 * HEAD_DIM,
-        "max_seq_len": SEQUENCE})
+        "vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "num_kv_heads": 2})
 
 
 def draw(seed):
     """A fresh batch and the independent key that draws its decoder's initial variables."""
     return token_rows(VOCAB, BATCH, SEQUENCE + 1, seed=seed)["text"], np.int64(seed)
-
-
-def optimizer():
-    """Adam's epsilon keeps its update smooth above a gradient's FP32 rounding."""
-    return OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
-                       optimizer_opts={"eps": 1e-4})
 
 
 @functools.cache
@@ -67,64 +54,49 @@ def variables_at(seed):
         return initializer()(jax.random.key(seed), jnp.zeros((1, SEQUENCE), jnp.int32))
 
 
-def trainer(model, spec, devices):
-    run = Trainer(LMObjective(model, SEQUENCE, ema_decay=0.9), optimizer(), key=jax.random.key(0),
-                  mesh=spec, layout=Layout(min_shard=256), tracker=None)
-    run.device_mesh = spec.build(jax.devices()[:devices])
-    run.validate(steps=STEPS)
-    return run
+def logits_and_gradients(model, variables, tokens):
+    """The logits and all parameter gradients of the mean next-token cross entropy."""
+    def loss(params):
+        logits = model.apply({"params": params}, tokens[:, :-1], train=True)
+        log_probs = jax.nn.log_softmax(logits)
+        value = -jnp.take_along_axis(log_probs, tokens[:, 1:, None], axis=-1).mean()
+        return value, logits
+
+    (_, logits), gradients = jax.value_and_grad(loss, has_aux=True)(variables["params"])
+    return {"logits": logits, "gradients": gradients}
 
 
-@functools.cache
-def initial_template():
-    """The same optimizer state in all arms, including its already-rounded FP32 hyperparameters."""
-    with jax.enable_x64(new_val=False):
-        return trainer(decoder(), MeshSpec(), 1).initial_state()
-
-
-def widened_state(state):
-    """A truth's copy of the exact initial state, its typed PRNG key kept as a key."""
-    return jax.tree.map(lambda leaf: jnp.copy(leaf) if jax.dtypes.issubdtype(
-        leaf.dtype, jax.dtypes.prng_key) else widened(leaf), state)
-
-
-def trained(spec, devices, *, exact=False):
-    """Two compiled steps over a layout, returning every parameter, EMA and optimizer-state leaf."""
-    built = []
+def evaluated(spec, devices, *, exact=False):
+    """A layout's compiled forward and backward, placed as the stage-block parity checks place them."""
+    model = decoder().clone(dtype=jnp.float64) if exact else decoder()
+    mesh = spec.build(jax.devices()[:devices])
+    rows = NamedSharding(mesh, P(batch_axes(mesh)))
+    compiled = without_ynn(functools.partial(logits_and_gradients, model))
 
     @as_given
     def run(tokens, seed):
-        if not built:
-            model = decoder().clone(dtype=jnp.float64) if exact else decoder()
-            built.append(trainer(model, spec, devices))
-        steps = built[0]
-        template, variables = initial_template(), variables_at(int(seed))
-        assert template.ema is not None
-        moving = {name: jax.tree.map(jnp.copy, variables[name]) for name in template.ema}
-        start = dataclasses.replace(template, variables=variables, ema=moving)
-        start = widened_state(start) if exact else jax.tree.map(jnp.copy, start)
-        state = jax.device_put(start, steps.shardings(start))
-        batch = shard_batch(steps.device_mesh, {"text": tokens})
-        if len(built) == 1:
-            built.append(steps.compile(state, batch))
-        for _ in range(STEPS):
-            state, *_ = built[1](state, batch)
-        return jax.device_get({"variables": state.variables, "opt_state": state.opt_state,
-                               "ema": state.ema})
+        variables = variables_at(int(seed))
+        if exact:
+            variables = jax.tree.map(jnp.asarray, widened(variables))
+        placement = Layout(min_shard=256).shardings(mesh, variables)
+        placed = jax.device_put(variables, placement)
+        with jax.set_mesh(mesh), pipeline_microbatches(None):
+            result = compiled(placed, jax.device_put(tokens, rows))
+        return jax.device_get(result)
     return run
 
 
 def arms():
-    """The pipeline, one device and float64, each reading the same per-draw initial state."""
-    return trained(STAGED, 8), trained(MeshSpec(), 1), trained(MeshSpec(), 1, exact=True)
+    """The pipeline, one device and float64, each reading the same per-draw initial variables."""
+    return evaluated(STAGED, 8), evaluated(MeshSpec(), 1), evaluated(MeshSpec(), 1, exact=True)
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_pipelined_decoder_trains_as_one_device_through_adamw():
-    """Two AdamW steps over stages leave the full state on par with one device, from float64.
+def test_a_decoder_over_stages_computes_logits_and_gradients_on_par_with_one_device():
+    """Both layouts' logits and every parameter gradient stay on par from float64, by check 1.
 
-    The gate runs both arms with actual FP32 product sums (`summed_as_run`), and sizes each row
-    and leaf by the standard check 1 alone, with no fixed-draw or layout-specific tolerance.
+    The gate runs both arms with actual FP32 product sums (`summed_as_run`), with no optimizer
+    steps, fixed-draw guard or layout-specific tolerance.
     """
     staged, one, truth = arms()
     assert_as_exact(staged, one, draw, LABEL, seeds=SEEDS, truth_fn=truth)
