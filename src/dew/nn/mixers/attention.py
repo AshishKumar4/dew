@@ -1521,6 +1521,7 @@ class AttentionMixer(MixerBase):
     """
 
     residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
+    draws_init_std = True
 
     bidirectional_images: bool = False
     """Whether a causal layer reads an image whole (`CausalSelfAttention.bidirectional_images`)."""

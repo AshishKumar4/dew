@@ -31,6 +31,7 @@ from dew.nn.value_experts import ValueExperts
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import Mixture
+    from dew.nn.mla import MLAMixer
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
@@ -246,6 +247,18 @@ class MixerBase:
     """Whether the kind shares its sparse selection across a prediction depth's iterations under that
     phase (`CausalTransformer.index_share_for_mtp_iteration`): the k-pool's, or a composed kind's through
     one of its own."""
+
+    draws_init_std = False
+    """Whether the mixer this kind builds draws its projections at the context's `init_std` and
+    `output_init_std` (lm-engine's `initializer_range`), as attention and Mamba-2 do; another keeps its
+    own initializers, and a model setting the range refuses it (`decoder_fields`)."""
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+        """The kinds within this one that carry an indexer an objective trains (latent attention's,
+        `MLAMixer.indexed`): none by default, this kind itself where it carries one, a composed kind's
+        branches' own."""
+        return ()
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's

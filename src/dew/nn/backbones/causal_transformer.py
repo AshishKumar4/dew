@@ -928,7 +928,7 @@ class CausalTransformer(LinearProducts):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='head_norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
@@ -2160,7 +2160,7 @@ class CausalTransformer(LinearProducts):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
@@ -2180,7 +2180,7 @@ class CausalTransformer(LinearProducts):
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_kv_cache(self, layout: KVCache) -> Self:
@@ -2468,7 +2468,7 @@ class CausalTransformer(LinearProducts):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
-        return tuple(mixer for mixer in self.declared_mixers if isinstance(mixer, MLAMixer) and mixer.indexed)
+        return tuple(indexed for mixer in self.declared_mixers for indexed in mixer.indexed_mixers)
 
     @property
     def keeps_triton_gemm(self) -> bool:
