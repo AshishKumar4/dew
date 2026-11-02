@@ -142,12 +142,15 @@ def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: 
 
 def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The decoder config a wrapper's language model is: its text_config, typed as the wrapper declares
-    it (`_typed`), with the wrapper's own head policy."""
+    it (`_typed`), a VLM text decoder's as the family it follows (`TEXT_FAMILIES`), with the wrapper's own
+    head policy."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     text = dict(_typed(hf_config, text, "text"))
+    if (family_type := TEXT_FAMILIES.get(_records.text(text["model_type"], "model_type"))) is not None:
+        text = {**plain_text_rope(text), "model_type": family_type}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -406,7 +409,7 @@ def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
     fields = _wrapper_fields(model_type, used, text, None, None, image, None,
                              video=_records.integer(hf_config["video_token_id"], "video_token_id")
                              if hf_config.get("video_token_id") is not None else None)
-    fields["text_model_type"] = TEXT_FAMILIES[_text_config(hf_config)["model_type"]]
+    fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
     fields["unported"] = {"visual.": f"{model_type}'s vision tower has no Dew port"}
     fields["text_unprefixed"] = ("embed_tokens.", "layers.", "norm.")
     return fields
@@ -599,8 +602,6 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
     before the text config's (`generation_config`)."""
     text = dict(_text_config(hf_config))
-    if (family_type := TEXT_FAMILIES.get(str(text.get("model_type")))) is not None:
-        text = {**plain_text_rope(text), "model_type": family_type}
     for field in ("torch_dtype", "dtype"):
         if field in hf_config and field not in text:
             text[field] = hf_config[field]
