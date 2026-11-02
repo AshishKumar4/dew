@@ -941,23 +941,25 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
 @pytest.mark.parametrize("act", sorted(SLOPES, key=lambda function: function.__name__),
                          ids=lambda function: function.__name__)
 def test_each_activations_slopes_bound_its_derivatives(act):
-    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: their float64 maxima over
-    [-40, 40] at a step of 1e-4, past which every one is flat, rounded up at the seventh decimal; a
-    ReLU's act'' is a point mass, no number (None)."""
+    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: each is its float64 maximum
+    over [-40, 40] on a grid of step 2e-5, past which every one is flat, plus half the step times the
+    next derivative's maximum there (every real lies within half a step of the grid), rounded up at the
+    seventh decimal; a ReLU's act'' is a point mass, no number (None)."""
+    step = 2e-5
     with jax.enable_x64(new_val=True):
-        grid = jnp.linspace(-40.0, 40.0, 800_001, dtype=jnp.float64)
-        first = jax.vmap(jax.grad(act))(grid)
-        second = jax.vmap(jax.grad(jax.grad(act)))(grid)
+        grid = jnp.linspace(-40.0, 40.0, round(80 / step) + 1, dtype=jnp.float64)
+        first, second, third = (float(jnp.abs(jax.vmap(derivative)(grid)).max()) for derivative in (
+            jax.grad(act), jax.grad(jax.grad(act)), jax.grad(jax.grad(jax.grad(act)))))
 
-    def rounded_up(values) -> float:
-        return math.ceil(float(jnp.abs(values).max()) * 10 ** 7) / 10 ** 7
+    def bound(peak: float, next_peak: float) -> float:
+        return math.ceil((peak + step / 2 * next_peak) * 10 ** 7) / 10 ** 7
 
     p1, p2 = SLOPES[act]
-    assert p1 == rounded_up(first)
+    assert p1 == bound(first, second)
     if p2 is None:
         assert act is jax.nn.relu
     else:
-        assert p2 == rounded_up(second)
+        assert p2 == bound(second, third)
 
 
 def test_what_the_adaptation_cannot_serve_is_refused():
