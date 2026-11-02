@@ -173,5 +173,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=True, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, pages=pages)[:3]
+    if work.slices == 1:
+        # One slice's launch gives its rows without a slices axis (`_plain_forward`).
+        out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
     merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
     return unpacked(merged_rows, heads).astype(query.dtype)
