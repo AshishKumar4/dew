@@ -3,6 +3,7 @@
 digest, or read at the commit its URL pins; never as other bytes."""
 
 import contextlib
+import dataclasses
 import hashlib
 import http.server
 import importlib
@@ -211,39 +212,37 @@ def test_a_token_exports_index_first_read_by_many_threads_at_once_reads_its_own_
 
 
 def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
-    """An index whose first read waits on its lease (a declared file a slow mirror is fetching) keeps no
-    other index from mapping its own values meanwhile: each index takes its lease under a lock of its own
-    (row 3199)."""
-    import numpy as np
-
-    from dew.data.sources.index import ArrayIndex
-
-    np.save(tmp_path / "quick.npy", np.arange(8))
-    started, release = threading.Event(), threading.Event()
-
-    class Fetching:
-        """A declared file whose check waits until the test releases it."""
-
-        def leased(self):
-            started.set()
-            release.wait(60)
-            return str(tmp_path / "quick.npy"), None
-
-    slow, quick = ArrayIndex("slow", None, Fetching()), ArrayIndex(str(tmp_path / "quick.npy"))
-    waiting = threading.Thread(target=lambda: slow.values)
-    waiting.start()
-    started.wait(60)
-    read = []
-    reader = threading.Thread(target=lambda: read.append(quick.values.tolist()))
-    reader.start()
-    try:
-        reader.join(10)
-        # Read while the other index's lease still waits.
-        assert read == [list(range(8))]
-    finally:
-        release.set()
-        waiting.join(60)
-        reader.join(60)
+    """A source whose offset index is still on its way (a remote index its server has not answered yet)
+    keeps no other source from reading its rows meanwhile: each index takes its lease under a lock of its
+    own (rows 3199, 3219)."""
+    served, local = tmp_path / "served", tmp_path / "local"
+    for directory, first in ((served, 0), (local, 10)):
+        directory.mkdir()
+        path = directory / "rows.jsonl"
+        path.write_bytes(b"".join(json.dumps({"id": first + row}).encode() + b"\n" for row in range(2)))
+        Files(str(path)).provision()
+    objects = {f"/{path.name}": path.read_bytes() for path in served.iterdir()}
+    gate = Gate("/rows.index.npy")
+    with etagged_server(objects, gate=gate) as url:
+        facts = {url + "/rows.jsonl": {"bytes": len(objects["/rows.jsonl"]),
+                                       "sha256": hashlib.sha256(objects["/rows.jsonl"]).hexdigest()}}
+        options = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        remote = Files(url + "/rows.jsonl", format="jsonl", file_info=facts, storage_options=options)
+        waited = []
+        waiting = threading.Thread(target=lambda: waited.append(remote.records("indexed")[0]))
+        waiting.start()
+        try:
+            assert gate.asked.wait(60), "the remote source never asked for its index"
+            quick = Files(str(local / "rows.jsonl")).records("indexed")
+            # Read while the other source's index is still unanswered.
+            assert [quick[position]["id"] for position in range(len(quick))] == [10, 11]
+            assert not waited
+        finally:
+            gate.released.set()
+            waiting.join(60)
+    # Released by the test, not timed out: a local read the remote lease held back would have waited for
+    # the gate's wait to run out, and passed late.
+    assert waited == [{"id": 0}] and gate.answered and all(gate.answered)
 
 
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():
@@ -365,16 +364,31 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
         list(manifest.reader(manifest.shards[0]))
 
 
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    """A path a server answers only once `released`, whether a read has `asked` for it, and whether each
+    answer waited for its release (`answered`) rather than for the wait to run out."""
+
+    path: str
+    asked: threading.Event = dataclasses.field(default_factory=threading.Event)
+    released: threading.Event = dataclasses.field(default_factory=threading.Event)
+    answered: list[bool] = dataclasses.field(default_factory=list)
+
+
 @contextlib.contextmanager
-def etagged_server(objects: dict[str, bytes], token: str | None = None):
+def etagged_server(objects: dict[str, bytes], token: str | None = None, gate: Gate | None = None):
     """An HTTP server of `objects`, by path, each named by its content's digest as its ETag and served
     whole or a range of it (`Range`), a read conditioned on another ETag refused (`If-Match`: 412, RFC
-    9110 13.1.1), and with `token` a read without it as its bearer refused (401); its URL."""
+    9110 13.1.1), with `token` a read without it as its bearer refused (401), and the `gate`'s path
+    answered once the gate is released; its URL."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_GET(self):
+            if gate is not None and self.path == gate.path:
+                gate.asked.set()
+                gate.answered.append(gate.released.wait(60))
             if token is not None and self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_response(401)
                 self.end_headers()

@@ -7,6 +7,7 @@ import itertools
 
 import numpy as np
 import pytest
+from data_support import Keeps, Twice, jittered
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
@@ -237,3 +238,285 @@ def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_read
     loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
     assert loader.records == 8
     assert sorted(_ids(loader.train(DataPartition()))) == [*range(100, 104), *range(200, 204)]
+
+
+def _pulled(expansion=None):
+    """An objective pulling a weight toward its batches' real rows of `id`, over the rows its data step
+    `expansion` makes of each record, where it names one."""
+    import jax.numpy as jnp
+
+    from dew.data.pipeline import ObjectiveData
+    from dew.objectives import Aux, Objective
+
+    class Pulled(Objective):
+        def fresh_variables(self, key, held):
+            return {"params": {"w": jnp.zeros(())}}
+
+        def loss(self, variables, batch, step):
+            x = jnp.asarray(batch["id"], jnp.float32)
+            return self.row_mean(jnp.square(variables["params"]["w"] - x), batch), Aux({})
+
+        def data(self):
+            return ObjectiveData(train=() if expansion is None else (expansion,))
+
+    return Pulled()
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_over_its_examples(read):
+    """A run of two epochs over 12 records whose objective makes 1 to 3 rows of each (`Questioned`), so
+    its read has no record count: an epoch is a pass over its 12 source examples (`Loader.pass_examples`),
+    so the run trains on the examples clock to 24 of them; a config's epoch cadence is a pass's 12 examples
+    (row 1902)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.config import TrainerConfig
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+    from dew.training.budget import recorded
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.records, loader.examples) == (None, 24)
+    evaluated = TrainerConfig(epochs=2, eval_every="epoch").eval_interval(loader)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 24
+    assert recorded(evaluated) == {"examples": 12}
+
+
+def test_epochs_of_a_read_it_packs_as_its_rows_arrive_are_passes_over_its_documents():
+    """A run of three epochs over 10 documents a pack lays out as they arrive, read per share, so its
+    read has no record count: an epoch is a pass over its 10 documents, so the run trains on the examples
+    clock to 30 of them (row 1902)."""
+    import optax
+
+    from dew.training import Trainer
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).shuffle(seed=1).read("indexed").pack(8, fields=("id",)).batch(8)
+    state = Trainer(_pulled(), optax.sgd(0.01), key=0).fit(chain, epochs=3, log_every=1)
+    assert int(state.consumed) == 30
+
+
+def test_epochs_of_a_read_holding_missing_records_are_passes_over_those_it_holds():
+    """Twelve records of which two are missing, read in memory through an objective that makes rows of
+    each, so its read has no record count: an epoch is a pass over the 10 it holds, so two epochs bound
+    the read to 20 of them, none of the next pass's (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+
+    records = [None if index in (4, 9) else {"id": np.int32(index + 1)} for index in range(12)]
+    chain = Pipeline(Memory(records)).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 20, 10)
+
+
+def test_a_loader_compiled_for_epochs_runs_them_and_refuses_another_count():
+    """Data compiled for a run of two epochs over a read with no record count (`fitted(epochs=2)`) runs
+    them, on the examples clock to its 24 examples, and a run of three over it is refused before a step:
+    its bound holds two passes (row 1902's review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(loader, epochs=2, log_every=1)
+    assert int(state.consumed) == 24
+    with pytest.raises(ValueError):
+        Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(loader, epochs=3, log_every=1)
+
+
+def test_epochs_of_a_memory_read_whose_filter_drops_records_are_passes_over_those_it_holds():
+    """Twelve records a filter keeps 9 of (`id % 4 != 0`) before an objective makes rows of each, read in
+    memory, which runs the filter as it holds them, so no count is stated ahead: an epoch is a pass over the
+    9 it holds, counted once it holds them, so two epochs bound the read to 18, the run on the examples
+    clock to them (row 1902's review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).filter(_kept).shuffle(seed=3).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 18, 9)
+    state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 18
+
+
+def _kept(row):
+    return int(row["id"]) % 4 != 0
+
+
+def _fourth_refused(metadata):
+    """A step configured for the source that refuses every fourth record."""
+    return Keeps(4)
+
+
+@pytest.mark.parametrize("prefix", ["configured filter", "take"])
+def test_epochs_count_the_examples_a_pass_reaches_its_rows_with(prefix):
+    """Twelve records through a step configured for the source that refuses every fourth, bound as the
+    read is built, or taken to their first 5, before a shuffle and an objective that makes rows of each:
+    an epoch is a pass over the 9 the step keeps, or the 5 taken, so two epochs bound the read to twice
+    those, no record of a third pass read (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import Configured
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids}))
+    chain = (chain.map(Configured(_fourth_refused, needs=())) if prefix == "configured filter"
+             else chain.take(5))
+    loader, _ = fitted(chain.shuffle(seed=3).read("memory").batch(8), None,
+                       objective=_pulled(Questioned()).data(), epochs=2)
+    each = 9 if prefix == "configured filter" else 5
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 2 * each, each)
+
+
+def test_epochs_of_a_memory_read_it_packs_as_it_holds_them_count_its_windows():
+    """Documents a memory read packs as it holds them, before its shuffle, read in one counted order: an
+    epoch is its windows, as before, with no bound in examples (row 1902's review)."""
+    from dew.data.compile import fitted
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    loader, _ = fitted(chain, None, objective=_pulled().data(), epochs=2)
+    assert loader.records is not None and (loader.epochs, loader.examples) == (None, None)
+
+
+def test_epochs_of_a_mixture_whose_objective_makes_rows_are_passes_its_parts_come_round_in():
+    """Two corpora of 6 and 4 records mixed equally, an objective making rows of each after the mix, so its
+    read has no record count: an epoch is the records in which both parts come round once
+    (`Proportions.covering`), two epochs twice that (row 1902's review)."""
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.data.mixing import Proportions
+
+    first = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)})).named("first")
+    second = Pipeline(Memory({"id": np.arange(11, 15, dtype=np.int32)})).named("second")
+    chain = mix([first, second], weights=(1, 1)).batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    each = Proportions.of((1, 1)).covering([6, 4])
+    assert (loader.epochs, loader.examples, loader.pass_examples) == (2, 2 * each, each)
+
+
+def test_epochs_count_no_pass_where_a_step_after_a_repeat_drops_records():
+    """Twelve records repeated and then filtered, keeping 9 a pass, before an objective that makes rows of
+    each: the pass the bound would count reaches its rows through the filter, so no pass is stated ahead
+    and a run of epochs over it is refused, where counting the 12 would read past two passes (row 1902's
+    review)."""
+    import optax
+    from data_support import Questioned
+
+    from dew.data.compile import fitted
+    from dew.training import Trainer
+
+    ids = np.arange(1, 13, dtype=np.int32)
+    chain = Pipeline(Memory({"id": ids})).repeat().filter(_kept).shuffle(seed=3, window=12).batch(8)
+    loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
+    assert (loader.epochs, loader.pass_examples) == (None, None)
+    with pytest.raises(ValueError):
+        Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+
+
+def test_epochs_of_a_memory_read_that_packs_its_examples_as_it_holds_them_are_passes_over_its_documents():
+    """Documents a memory read packs as it holds them, before a shuffle, then an objective makes two rows of
+    each window, so its read has no record count: an epoch is a pass over its 10 documents, which the read
+    holds twice for two epochs, its bound held with its pack (`Limit.passes`), so the run trains on the
+    examples clock to 20 of them (row 1902)."""
+    import optax
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+    from dew.training import Trainer
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.records, loader.epochs, loader.pass_examples, loader.examples) == (None, 2, 10, 20)
+    state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 20
+
+
+@pytest.mark.parametrize("layout", ["pack", "windows"])
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_epochs_of_a_concatenating_pack_a_shuffle_draws_count_each_example_once_its_windows_are_drawn(read,
+                                                                                                    layout):
+    """Ten documents a concatenating pack, or windows 2 tokens apart, cut across windows, shuffled after
+    (all of them by a memory read, four at a time in a stream) and read through an objective's two rows of
+    each window: an epoch is a pass over the 10 documents, so two epochs bound the run to 20, and its clock
+    counts each once every window holding a piece of it is drawn, at 20 when the run ends (row 1902)."""
+    import optax
+
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+    from dew.training import Trainer
+
+    documents = [{"id": np.full(index % 5 + 3, index + 1, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents, shard_rows=5))
+    chain = (chain.pack(8, fields=("id",), policy="concat") if layout == "pack"
+             else chain.windows(4, stride=2, fields=("id",)))
+    chain = chain.shuffle(seed=1, window=None if read == "memory" else 4).read(read).batch(8)
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
+    state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 20
+
+
+class _KeptWhole:
+    """A step that keeps each record as it is."""
+
+    identity = "kept-whole@1"
+
+    def __call__(self, row):
+        return row
+
+
+class _KeptWholeBy:
+    """A step configured for its source that binds to `_KeptWhole`."""
+
+    identity = "kept-whole-by@1"
+
+    def __call__(self, metadata):
+        return _KeptWhole()
+
+
+@pytest.mark.parametrize("before", ["configured draw", "cache", "configured map and cache",
+                                    "run-configured map and cache"])
+def test_epochs_of_a_memory_read_that_packs_after_a_draw_or_a_cache_are_passes_over_its_documents(before):
+    """Documents a memory read packs before its shuffle and an objective's rows, behind a draw configured for
+    the run (which binds to a random map the read holds no rows past, so it streams the bound before the
+    pack), behind a cache the read fills (after which it holds the pack), or behind a map configured for its
+    source or for the run and a cache that map's bound step keys: an epoch is a pass over its 10 documents
+    each way, so two epochs bound the run to 20 of them, its clock at 20 (row 1902's review)."""
+    import optax
+
+    from dew.data.cache import Cache
+    from dew.data.compile import fitted
+    from dew.data.pipeline import Configured, ObjectiveData
+    from dew.training import Trainer
+
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents))
+    if before == "configured draw":
+        chain = chain.map(Configured(jittered, needs=(), scope="run", random=True, one_to_one=True))
+    else:
+        if before != "cache":
+            scope = "run" if before.startswith("run") else "source"
+            chain = chain.map(Configured(_KeptWholeBy(), needs=(), scope=scope, one_to_one=True))
+        chain = chain.cache(Cache(f"memory://epochs-{id(chain)}"))
+    chain = chain.pack(8, fields=("id",)).shuffle(seed=1, window=4).read("memory").batch(8)
+    loader, _ = fitted(chain, None, objective=ObjectiveData(train=(Twice(),)), epochs=2)
+    assert (loader.epochs, loader.pass_examples, loader.examples) == (2, 10, 20)
+    state = Trainer(_pulled(Twice()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
+    assert int(state.consumed) == 20

@@ -18,9 +18,9 @@ from typing import ClassVar
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, record
+from dew._records import integer, integers, record
 from dew.batch import Batch
-from dew.data.dataset import Records
+from dew.data.dataset import Records, restore_parent
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
@@ -448,3 +448,81 @@ class PackedSource(View[Source]):
 
     def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.plan.location, 1024)
+
+
+class _Concatenated(pygrain.IterDataset):
+    """Grain's concatenating packer, restored from a position read back from JSON, as every saved
+    position is. Its saved state marks a window's remainder by its slices and none by the tuple
+    (-1, -1), which JSON reads back as a list the packer does not take for that tuple, so a restore
+    reads the next document as a remainder cut to nothing and drops it (grain 0.2.18 to its main of
+    2026-10-18, `packing_concat_then_split._CtsState.has_remainder`). The slices go back as the
+    tuples the packer wrote."""
+
+    def __init__(self, parent: pygrain.IterDataset):
+        super().__init__(parent)
+        self._packed = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _ConcatenatedIterator(self._packed.__iter__())
+
+
+class _ConcatenatedIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._packed = parent
+
+    def __next__(self) -> Batch:
+        return next(self._packed)
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._packed.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        slices = record(state["remainder_slices"], "packed remainder")
+        self._packed.set_state({**state, "remainder_slices": {
+            name: integers(bounds, name) for name, bounds in slices.items()}})
+
+
+class _OverlappedCuts(pygrain.IterDataset):
+    """Documents as a concatenating pack (`Pack.overlap`) reads them: the tokens before each cut
+    through a document written again after it, so the window the cut ends and the next both hold
+    them. Grain's concatenating packer cuts the documents it joins every `seq_len` tokens, so how
+    full this stream leaves its window places the next cut."""
+
+    def __init__(self, parent: pygrain.IterDataset, stage: Pack):
+        super().__init__(parent)
+        self._documents, self._stage = parent, stage
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _OverlappedCutsIterator(self._documents.__iter__(), self._stage)
+
+
+class _OverlappedCutsIterator(pygrain.DatasetIterator):
+    """Each document with its cuts overlapped, and where the last one left its window: the room
+    left in it, saved with the parent's position."""
+
+    def __init__(self, parent: pygrain.DatasetIterator, stage: Pack):
+        super().__init__(parent)
+        self._documents, self._stage = parent, stage
+        self._room = stage.seq_len
+
+    def __next__(self) -> Batch:
+        document = next(self._documents)
+        count = len(document[self._stage.fields[0]])
+        pieces, start, room = [], 0, self._room
+        while count - start > room:
+            pieces.append(slice(start, start + room))
+            start, room = max(start + room - self._stage.overlap, 0), self._stage.seq_len
+        pieces.append(slice(start, count))
+        self._room = room - (count - start) or self._stage.seq_len
+        if len(pieces) == 1:
+            return document
+        return {name: np.concatenate([value[piece] for piece in pieces]) if name in self._stage.fields
+                else value for name, value in document.items()}
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"documents": self._documents.get_state(), "room": self._room}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        restore_parent(self._documents, state, "documents", "packed documents")
+        self._room = integer(state["room"], "packed window room")

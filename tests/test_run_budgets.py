@@ -3,6 +3,7 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import itertools
 import json
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from data_support import Fanned, Questioned
+from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
@@ -182,6 +183,302 @@ def bound_read(
             if isinstance(stream, Closeable):
                 stream.close()
     return read, consumed
+
+
+@pytest.mark.parametrize("expands", [False, True])
+@pytest.mark.parametrize("examples", [7, 10, 23])
+def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(examples, expands):
+    """Ten documents a memory read packs as it holds them, before a global shuffle of its windows, read
+    alone or through an objective that makes two rows of each window after: bounded to 7, 10 or 23
+    examples, it holds that many documents, cycling them past a pass, and packs those, each window
+    consuming the documents it ends (`EXAMPLES_CONSUMED`), so a read of it consumes the bound whole, each
+    document's tokens held as many times as the bound reads it (row 1902)."""
+    documents = [{"id": np.full(index % 3 + 2, index, np.int32)} for index in range(10)]
+    chain = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read="memory", examples=examples, objective=objective)
+    stream = loader.train(DataPartition())
+    consumed, tokens = 0, collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+            for row in np.asarray(batch["id"])[real][::2 if expands else 1]:
+                tokens.update(int(token) for token in row if token)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert consumed == examples
+    reads = [examples // 10 + (index < examples % 10) for index in range(10)]
+    assert tokens == collections.Counter({index: reads[index] * (index % 3 + 2)
+                                          for index in range(1, 10) if reads[index]})
+
+
+def _consumed_of(loader) -> int:
+    """The examples a read of `loader`'s training stream consumes, read to its end."""
+    stream = loader.train(DataPartition())
+    consumed = 0
+    try:
+        for batch in stream:
+            consumed += int(np.sum(batch[EXAMPLES_CONSUMED]))
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return consumed
+
+
+def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_around_them():
+    """Bounds in examples over memory reads that pack: a configured random step before the pack, which no
+    memory read holds, so the bound streams before it (row 1902's review); a first-fit plan that leaves a
+    window out (two documents of one and two tokens, a window of a single segment, so the singleton's
+    window holds no target), which passes its document's count to the next window it keeps; a first-fit
+    pack whose windows a shuffle draws in any order, each document whole in one window; and a
+    concatenating pack's windows, which cut documents, each count released once a shuffle has drawn every
+    window holding a piece of its document (`dew.data.completion`)."""
+    from dew.data.pipeline import Configured
+
+    documents = [{"id": np.full(index % 3 + 2, index + 1, np.int32)} for index in range(10)]
+    configured = Configured(jittered, needs=(), scope="run", random=True, one_to_one=True)
+    chain = (Pipeline(Memory(documents)).map(configured).pack(8, fields=("id",)).shuffle(seed=1, window=4)
+             .read("memory").batch(2))
+    assert _consumed_of(compile(chain, read="memory", examples=7,
+                                objective=ObjectiveData(train=(Twice(),)))) == 7
+    lone = [{"id": np.asarray([5], np.int32)}, {"id": np.asarray([6, 7], np.int32)}]
+    single = (Pipeline(Memory(lone)).pack(2, fields=("id",), segments=1).shuffle(seed=1).read("memory")
+              .batch(1))
+    assert _consumed_of(compile(single, read="memory", examples=2)) == 2
+    # Through an objective's rows, the singleton, whose window holds no target, is consumed and refused.
+    counted = compile(single, read="memory", examples=2, objective=ObjectiveData(train=(Twice(),)))
+    assert _consumed_of(counted) == 2
+    stated = counted.statistics()
+    assert [value for name, value in stated.items() if name.startswith("data/rows/")] == [1]
+    assert [value for name, value in stated.items() if name.endswith("/zero_targets")] == [1]
+    whole = Pipeline(Memory(documents)).pack(8, fields=("id",)).shuffle(seed=1).read("memory").batch(2)
+    twice = ObjectiveData(train=(Twice(),))
+    assert _consumed_of(compile(whole, read="memory", examples=10, objective=twice)) == 10
+    cut = (Pipeline(Memory(documents)).pack(8, fields=("id",), policy="concat").shuffle(seed=1).read("memory")
+           .batch(2))
+    assert _consumed_of(compile(cut, read="memory", examples=10, objective=twice)) == 10
+
+
+_LENGTHS = (3, 11, 5, 17, 2, 9, 4, 13, 6, 8, 3, 21)
+"""Documents' lengths, several longer than a window, so a layout cuts them across two, three or more."""
+
+
+def _pieces():
+    """Documents of `_LENGTHS` tokens, each token unique: document `index`'s are `1000 * (index + 1)` on."""
+    return [{"id": np.arange(length, dtype=np.int32) + 1000 * (index + 1)}
+            for index, length in enumerate(_LENGTHS)]
+
+
+_SPLIT = {
+    "concat": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4),
+               "streamed"),
+    "overlap": (lambda chain: chain.pack(8, fields=("id",), policy="concat", overlap=2)
+                .shuffle(seed=2, window=3), "streamed"),
+    "windows": (lambda chain: chain.windows(4, fields=("id",)).shuffle(seed=3, window=5), "streamed"),
+    "strided": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=8, window=5),
+                "streamed"),
+    "twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=1, window=4)
+              .shuffle(seed=5, window=3), "streamed"),
+    "held": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4), "memory"),
+    "held windows": (lambda chain: chain.windows(4, stride=2, fields=("id",)).shuffle(seed=7), "memory"),
+    "held twice": (lambda chain: chain.pack(8, fields=("id",), policy="concat").shuffle(seed=4)
+                   .shuffle(seed=6, window=5), "memory"),
+}
+"""Layouts that cut documents across windows, each with a shuffle after it, or two: read as a stream, its
+window shuffled, or by a memory read, which shuffles them all; windows `stride` apart overlap."""
+
+
+def _drawn(loader, share, shares):
+    """Each batch's tokens, each as often as the batch holds it, and the examples it consumes, as share
+    `share` of `shares` reads them."""
+    stream = loader.train(DataPartition(index=share, count=shares))
+    read = []
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            tokens = collections.Counter(int(token) for token in held if token)
+            read.append((tokens, int(np.sum(batch[EXAMPLES_CONSUMED]))))
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return read
+
+
+@pytest.mark.parametrize("expands", [False, True])
+@pytest.mark.parametrize("shares", [1, 2])
+@pytest.mark.parametrize("layout", sorted(_SPLIT))
+def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_window_is_drawn(layout, shares,
+                                                                                            expands):
+    """Twelve documents of unique tokens, a run bounded to all twelve, laid across windows that cut them (a
+    concatenating pack, one that starts each cut 2 tokens back, or windows over the stream, overlapping
+    where they stand 2 tokens apart) and shuffled after, once or twice, read as a stream or by a memory
+    read, by one share or two, alone or through an objective that makes two rows of each window: no step's
+    batches take a document's count before the shares have drawn every window that holds a token of it,
+    each token as often as the whole read draws it, and the read takes every count it draws whole, none
+    twice. Each share lays its own documents, so each document's windows are one share's, and two shares
+    each lay some (row 1902)."""
+    laid, read = _SPLIT[layout]
+    chain = laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2 * shares)
+    objective = ObjectiveData(train=(Twice(),)) if expands else None
+    loader = compile(chain, read=read, examples=len(_LENGTHS), objective=objective)
+    drawn = [_drawn(loader, share, shares) for share in range(shares)]
+    total = sum((tokens for batches in drawn for tokens, _ in batches), collections.Counter())
+    seen, consumed, whole = collections.Counter(), 0, 0
+    for step in itertools.zip_longest(*drawn, fillvalue=(collections.Counter(), 0)):
+        for tokens, examples in step:
+            seen += tokens
+            consumed += examples
+        whole = sum(all(seen[token] and seen[token] == total[token]
+                        for token in range(1000 * (index + 1), 1000 * (index + 1) + length))
+                    for index, length in enumerate(_LENGTHS))
+        assert consumed <= whole
+    assert consumed == whole
+    if not layout.endswith(("windows", "strided")):
+        # Every token of a pack's documents is laid in a window; windows leave the stream's last tokens
+        # past every window out.
+        assert consumed == len(_LENGTHS)
+    assert loader.order_records is None
+    owners = collections.defaultdict(set)
+    for share, batches in enumerate(drawn):
+        for tokens, _ in batches:
+            for token in tokens:
+                owners[token // 1000].add(share)
+    assert all(len(held) == 1 for held in owners.values())
+    if shares > 1:
+        assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
+
+
+def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_each_token_to_its_first():
+    """A streamed read of twelve documents in windows of 4 tokens 2 apart, bounded to all twelve, its
+    position saved by main 91527d9fe, which credited each token to the first window holding it, where it
+    had credited a document's last token the next window holds too (tests/fixtures/
+    overlapping_windows_position.json): restored where each token goes to the last window holding it, it
+    credits none twice, the read consuming the 11 examples whose last tokens a window holds, as the saving
+    read did (review of row 1902)."""
+    fixture = Path(__file__).with_name("fixtures") / "overlapping_windows_position.json"
+    recorded = json.loads(fixture.read_text())
+    chain = Pipeline(Memory(_pieces(), shard_rows=3)).windows(4, stride=2, fields=("id",))
+    chain = chain.read("streamed").batch(1)
+    stream = compile(chain, read="streamed", examples=len(_LENGTHS)).train(DataPartition())
+    try:
+        stream.set_state(recorded["state"].encode())
+        after = [int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in stream]
+    finally:
+        stream.close()
+    assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
+
+
+_MAPPED = {
+    "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
+                      .shuffle(seed=1, window=4), "streamed"),
+    "held mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept).shuffle(seed=4),
+                    "memory"),
+}
+"""Concatenating packs with a step that keeps each window between the pack and the shuffle."""
+
+
+def _kept(row):
+    return row
+
+
+@pytest.mark.parametrize("layout", ["concat", "overlap", "windows", "strided", "held", "concat mapped",
+                                    "held mapped"])
+def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutting_them_are_drawn(layout):
+    """Two named corpora of the twelve documents (`_pieces`, the right's tokens offset by 100,000), mixed
+    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`, a step that
+    keeps each window between them or not): by each batch, each member's rows (data/rows) are its documents
+    every token of which the batches delivered, which a window can hold pieces of two members' documents
+    (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = {**_SPLIT, **_MAPPED}[layout]
+    corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+               .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+    loader = compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+    # Every draw of each token the whole read makes, which a document's every window holds once drawn.
+    total = sum((tokens for tokens, _ in _drawn(loader, 0, 1)), collections.Counter())
+
+    def whole(seen, offset):
+        return sum(all(seen[token] and seen[token] == total[token]
+                       for token in range(offset + 1000 * (index + 1), offset + 1000 * (index + 1) + length))
+                   for index, length in enumerate(_LENGTHS))
+
+    stream = loader.train(DataPartition())
+    seen = collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            seen += collections.Counter(int(token) for token in held if token)
+            statistics = loader.statistics()
+            for name, offset in (("left", 0), ("right", 100_000)):
+                assert statistics.get(f"data/rows/{name}", 0) <= whole(seen, offset), name
+    finally:
+        stream.close()
+    for name, offset in (("left", 0), ("right", 100_000)):
+        assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
+
+
+@pytest.mark.parametrize("layout", ["strided", "concat"])
+def test_a_bounded_mixtures_member_counts_resume_while_a_layout_holds_a_document(layout):
+    """The mixed read of the test above, its windows 2 tokens apart or packed, its position saved after two
+    batches while its layout holds pieces of a document: restored, it delivers the batches and counts each
+    member as the uninterrupted read does (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = _SPLIT[layout]
+
+    def loader():
+        corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+                   .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+        return compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+
+    def rest(stream):
+        held = [np.asarray(batch["id"]).tolist() for batch in stream]
+        stream.close()
+        return held
+
+    whole = loader()
+    stream = whole.train(DataPartition())
+    for _ in range(2):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    resumed = loader()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert {name: value for name, value in resumed.statistics().items() if name.startswith("data/rows/")} == {
+        name: value for name, value in whole.statistics().items() if name.startswith("data/rows/")}
+
+
+@pytest.mark.parametrize("layout", ["concat", "held"])
+def test_a_shuffle_of_windows_cutting_documents_resumes_its_counts_where_it_saved_them(layout):
+    """A bounded read of a concatenating pack shuffled after, read as a stream or held by a memory read, its
+    position saved after three batches: restored, it reads the batches and counts the uninterrupted read
+    reads after them, the counts held for windows not yet drawn among them (row 1902)."""
+    laid, read = _SPLIT[layout]
+    loader = compile(laid(Pipeline(Memory(_pieces(), shard_rows=3))).read(read).batch(2), read=read,
+                     examples=len(_LENGTHS))
+
+    def rest(stream):
+        held = [(np.asarray(batch["id"]).tolist(), np.asarray(batch[EXAMPLES_CONSUMED]).tolist())
+                for batch in stream]
+        stream.close()
+        return held
+
+    stream = loader.train(DataPartition())
+    for _ in range(3):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    restored = loader.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert sum(sum(consumed) for _, consumed in after) > 0
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])

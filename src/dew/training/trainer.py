@@ -131,6 +131,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
+from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import (
     DiLoCo,
@@ -164,6 +165,7 @@ from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
+    deviceless_options,
     first_run,
     head_tile_of,
     local_devices,
@@ -1078,8 +1080,8 @@ class Trainer(Generic[Loss, Effects]):
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
         search = FitSearch(
-            lower, lambda candidate: step_options(self.objective, candidate.micro,
-                                                  candidate.prepared.variables, mesh),
+            lower, lambda candidate: deviceless_options(mesh, step_options(
+                self.objective, candidate.micro, candidate.prepared.variables, mesh)),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
@@ -1292,9 +1294,9 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
-        log_every: int | str = 100,
-        eval_every: int | str | None = None,
-        checkpoint_every: int | str | datetime.timedelta | None = None,
+        log_every: int | str | Counted = 100,
+        eval_every: int | str | Counted | None = None,
+        checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
@@ -1357,7 +1359,7 @@ class Trainer(Generic[Loss, Effects]):
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
         self._startup = Startup()
-        loader, held, tokens, steps = run_data(
+        loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
@@ -1393,7 +1395,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
-              written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
+              written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
               checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
               scored_to: str | os.PathLike[str] | None,
               best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None,
@@ -2075,11 +2077,8 @@ class Trainer(Generic[Loss, Effects]):
         # already: only the others are scored now, joined to the scores that step reported.
         joined = run.evaluation if run.evaluation is not None and run.evaluation.step == current else None
         scored = run.scored if joined is not None else frozenset()
-        if (
-            (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
-            and run.preempted is None
-            and run.paused is None
-        ):
+        if ((plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
+                and run.preempted is None and run.paused is None):
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,

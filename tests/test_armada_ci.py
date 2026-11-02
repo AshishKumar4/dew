@@ -3,6 +3,7 @@
 import functools
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,56 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
     return loaded(tmp_path, monkeypatch)
+
+
+SITED = """
+import json
+import os
+
+import pytest
+
+
+def noted(name):
+    with open(os.environ["SEEN"], "a") as out:
+        out.write(json.dumps([name, {key: os.environ.get(key) for key in
+                                     ("DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL")}]) + "\\n")
+
+
+def test_ordinary():
+    noted("ordinary")
+
+
+@pytest.mark.check1_shards(seeds=4, per_task=4)
+def test_check1():
+    noted("check1")
+
+
+@pytest.mark.shards(units=4, per_task=4)
+def test_witness():
+    noted("witness")
+"""
+
+
+@pytest.mark.parametrize("split", ["", "1/1", "test_check1.draws-0-4", "test_check1"])
+def test_a_targeted_group_runs_what_cis_task_runs_and_a_site_runs_in_its_own_tasks_alone(ci, tmp_path,
+                                                                                        monkeypatch, split):
+    """A targeted run of a file's group (tmp/run_tests.py, the gangs) selects as CI's task does: a file's
+    group sets aside its sites, which run in their own tasks alone, a map task drawing its seeds into its
+    artifacts and the judge pooling them from its inputs (2026-11-02: a lane's targeted
+    chunk_adaptation#1/5 ran a site's every seed itself, 2233 s against CI's 8, and #2/5 timed out)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setenv("SEEN", str(tmp_path / "seen.jsonl"))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("ARMADA_INPUTS", str(tmp_path / "inputs"))
+    written(tmp_path, {"test_sites.py": SITED})
+    assert ci.targeted("3.12", [], tmp_path / "report.xml", ["tests/test_sites.py"], split) == 0
+    seen = [json.loads(line) for line in (tmp_path / "seen.jsonl").read_text().splitlines()]
+    unset = {"DEW_CHECK1_DRAWS": None, "DEW_CHECK1_RECORDS": None, "DEW_CHECK1_POOL": None}
+    expected = {"": [["ordinary", unset]], "1/1": [["ordinary", unset]],
+                "test_check1.draws-0-4": [["check1", {**unset, "DEW_CHECK1_DRAWS": "0:4",
+                                                      "DEW_CHECK1_RECORDS": str(tmp_path / "artifacts")}]],
+                "test_check1": [["check1", {**unset, "DEW_CHECK1_POOL": str(tmp_path / "inputs")}]]}
+    assert seen == expected[split]
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
@@ -93,6 +144,26 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
             "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
             "tests/test_new.py"}
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
+
+
+def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
+        ci, tmp_path, monkeypatch):
+    """Each collect task holds at most the target's seconds of files at the slowest per-file rate armada
+    recorded for a collection, and weighs that, so armada's heaviest-first order starts it beside the run's
+    other full tasks. Train 459's four collect tasks of 140 files, each weighed at the target, started last
+    and ran 485-910 s on Genoa hosts against 145 s on Turin ones; the run ended with the last of them."""
+    names = [f"tests/test_f{index:03}.py" for index in range(200)]
+    for name in names:
+        (tmp_path / name).write_text("")
+    monkeypatch.setattr(ci, "NEWEST_FILES", ())
+    # A collect task's rows split its seconds evenly: these files last ran on a fast host and a slow one.
+    rates = {ci.row("3.14", name, ci.COLLECT): 5.3 if index % 2 else 1.0 for index, name in enumerate(names)}
+    collecting = [entry for entry in ci.plan(120.0, {"rows": rates}) if entry["split"] == ci.COLLECT]
+    assert sorted(name for entry in collecting for name in entry["tests"].split()) == names
+    # 22 files fit the target at 5.3 s each.
+    assert len(collecting) == math.ceil(len(names) / 22), [entry["weight"] for entry in collecting]
+    assert all(entry["weight"] == len(entry["tests"].split()) * 5.3 <= 120.0 for entry in collecting), [
+        (len(entry["tests"].split()), entry["weight"]) for entry in collecting]
 
 
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):

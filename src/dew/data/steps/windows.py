@@ -13,9 +13,9 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew._records import integer, integers, record
+from dew._records import integer, integers, json_value, record
 from dew.batch import Batch
-from dew.data.pipeline import ACCOUNTS, CONSUMED, Windows
+from dew.data.pipeline import ACCOUNTS, CONSUMED, DOCUMENT, Documents, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import aligned
@@ -107,24 +107,34 @@ class WindowSource(View[TokenFiles]):
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):
-    def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows):
+    def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows, documents: Documents | None):
         super().__init__(parent)
-        self._read, self._windows = parent, windows
+        self._read, self._windows, self._documents = parent, windows, documents
         self._held: Batch = {name: np.zeros(0, np.int32) for name in windows.fields}
         self._skip = 0
         # The leading held tokens whose counts of examples a window already took (`ACCOUNTS`).
         self._credited = 0
 
     def __next__(self) -> Batch:
+        stride = self._windows.stride or self._windows.seq_len
+        # Windows that overlap credit each token to the last of them that holds it, so a counted read
+        # reads on until it knows whether another window follows this one.
+        overlapping = CONSUMED in self._held and stride < self._windows.seq_len + 1
+        ahead = 2 if overlapping else 1
         while True:
             windows = IndexedWindows(
                 {name: value[self._skip :] for name, value in self._held.items()},
                 self._windows.seq_len,
-                self._windows.stride or self._windows.seq_len,
+                stride,
             )
-            if len(windows):
+            if len(windows) >= ahead:
                 break
-            row = aligned(next(self._read), self._windows.fields)
+            try:
+                row = aligned(next(self._read), self._windows.fields)
+            except StopIteration:
+                if not len(windows):
+                    raise
+                break
             self._held = {
                 name: np.concatenate([self._held[name], row[name]])
                 for name in self._windows.fields
@@ -133,16 +143,30 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         # The window holds its view's first `length + 1` tokens, its inputs and their targets.
         end, kept = self._skip + windows.length + 1, self._skip + windows.stride
         if CONSUMED in self._held:
-            # Each token's counts go to the first window that holds it, the tokens a stride skips going
-            # to the window after them; a token past every window the stream makes is consumed by none.
-            emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : end]))
+            # Each token's counts go to the last window that holds it, where windows overlap (a stride
+            # short of a window), so its example counts once every window holding a piece of it is read;
+            # else to the window that holds it, the tokens a stride skips going to the window after them.
+            # A token past every window the stream makes is consumed by none.
+            # Nothing before the tokens already credited is credited again, a position saved where each
+            # token went to the first window holding it among them.
+            upto = max(self._credited, kept if overlapping and len(windows) > 1 else end)
+            emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : upto]))
                                      for name in ACCOUNTS if name in self._held}}
-            self._credited = max(0, end - kept)
+            if DOCUMENT in self._held:
+                # A mixture's documents (`DOCUMENT`): those the window holds, and those whose last tokens
+                # it is credited, as it is their counts, which end in it.
+                ids = self._held[DOCUMENT]
+                credited = ids[self._credited : upto]
+                emitted[DOCUMENT] = np.concatenate([np.abs(emitted[DOCUMENT]), credited[credited < 0]])
+            self._credited = max(0, upto - kept)
         self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)
         return emitted
 
     def get_state(self) -> Mapping[str, object]:
+        # A mixture's documents its held tokens are of, which no read before it holds again.
+        documents = {} if self._documents is None else {"documents": self._documents.saved(
+            np.abs(self._held.get(DOCUMENT, np.zeros(0, np.int64))).tolist())}
         return {
             "parent": self._read.get_state(),
             "skip": self._skip,
@@ -151,6 +175,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
                 name: {"dtype": value.dtype.str, "tokens": value.tolist()}
                 for name, value in self._held.items()
             },
+            **documents,
         }
 
     def set_state(self, state: Mapping[str, object]) -> None:
@@ -162,21 +187,26 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             for name, tokens in held.items()
         }
+        if self._documents is not None:
+            self._documents.restore(json_value(state["documents"], "held documents"))
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
         self._skip = skip
-        # A position saved before windows took counts credits none of its carry.
-        self._credited = integer(state.get("credited", 0), "saved causal window credit")
+        self._credited = integer(state["credited"], "saved causal window credit")
 
     def close(self) -> None:
         self._read.close()
 
 
 class CausalWindows(grain.IterDataset[Batch]):
-    def __init__(self, parent: grain.IterDataset[Batch], windows: Windows):
+    """Windows over a stream of documents; a mixture's (`documents`) say, by id, which documents each holds
+    and which end in it (`DOCUMENT`)."""
+
+    def __init__(self, parent: grain.IterDataset[Batch], windows: Windows,
+                 documents: Documents | None = None):
         super().__init__(parent)
-        self._records, self._windows = parent, windows
+        self._records, self._windows, self._documents = parent, windows, documents
 
     def __iter__(self) -> grain.DatasetIterator[Batch]:
-        return _WindowIterator(iter(self._records), self._windows)
+        return _WindowIterator(iter(self._records), self._windows, self._documents)

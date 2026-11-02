@@ -31,6 +31,7 @@ from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
+    _ConsumedAt,
     _counts_rows,
     _fill,
     _Locality,
@@ -41,18 +42,24 @@ from dew.data.lowering import (
 )
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
+    ACCOUNTS,
+    CONSUMED,
     Artifact,
     FlatMap,
+    Limit,
     Map,
     Mixture,
+    Owed,
     Pack,
     Phases,
     Pipeline,
     Record,
     Rejected,
+    Repeat,
     Stage,
     TokenSplit,
     Windows,
+    accounts,
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
@@ -226,10 +233,16 @@ def _memory_stages(
                                for stage in pipeline.stages[:consumed])
     # The layout facts are numbered by the stages the chain wrote, a cache the compiler placed none.
     placed = consumed - len(written(pipeline.stages[:consumed]))
+    # The rows a bound's repeat reads on over, which its limit cycles (`analysis._held_bound`).
+    cycled: list[tuple[tuple[int, ...], Record]] | None = None
     for stage in pipeline.stages[consumed:eager]:
         counting = counting or isinstance(stage, (Windows, Pack)) or (
             isinstance(stage, Map) and isinstance(stage.step, CountTargets))
-        if isinstance(stage, TokenSplit):
+        if isinstance(stage, Repeat):
+            cycled = rows
+        elif isinstance(stage, Limit):
+            rows, pipeline = _limited(pipeline, consumed, rows, cycled)
+        elif isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
@@ -247,38 +260,7 @@ def _memory_stages(
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
                                       stage.fields[0], rule)
         elif isinstance(stage, Pack):
-            from dew.data.packing import _Held, _PackedRows, refuse_overlong
-
-            derived[f"accepted_before_pack_{consumed - placed}"] = fingerprint(
-                [list(identifier) for identifier, _ in rows]
-            )
-            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
-            documents = tuple(stage.document(record(value, "packing document")) for _, value in rows)
-            sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
-            refuse_overlong(sizes, stage, source.describe())
-            if stage.policy == "first-fit" and not stage.along:
-                # The plan and windows reader of an indexed read of documents that state
-                # their lengths (`PackedSource.planned`): it reads the windows that hold a
-                # target, and the plan counts the rest as zero_targets.
-                plan = _Held(_Memory(source, documents, sizes, {}), stage)
-                planned = plan.arrays
-                derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
-                packed = _PackedRows(documents, plan)
-                counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
-                # The plan counts every target a window holds; windows of documents counted by a
-                # rule are counted by it (`_targeted`), as an indexed or streamed read's are.
-                rows, targets = _targeted([((plan.at("accepted", index),), packed[index])
-                                           for index in range(len(packed))], counter, stage.fields[0], rule)
-            else:
-                # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
-                # the corpus as an indexed read streams it (`_packed`).
-                packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
-                derived["packing"] = fingerprint(sizes)
-                rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
-                                          stage.fields[0], rule)
-            ids = f"{stage.fields[0]}_segment_ids"
-            documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
-                             for _, value in rows), default=0)
+            rows, targets, documents = _memory_pack(stage, rows, source, counter, derived, consumed - placed)
         else:
             if isinstance(stage, FlatMap) and stage.examples and examples is None:
                 # The corpus counts its source examples, so its counts are taken here, before an
@@ -315,22 +297,144 @@ def _memory_stages(
                          counted=counted)
 
 
+def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source: Source,
+                 counter: CorpusCounts, derived: dict[str, str], at: int,
+                 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int] | None, int]:
+    """A memory read's windows of `rows` as `stage`, the `at`-th stage the chain wrote, packs them, their
+    targets' counts, and the most documents a window holds; the plan's facts go into `derived`."""
+    from dew.data.packing import _Held, _PackedRows, refuse_overlong
+
+    derived[f"accepted_before_pack_{at}"] = fingerprint([list(identifier) for identifier, _ in rows])
+    rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
+    marked = any(isinstance(value, Mapping) and CONSUMED in value for _, value in rows)
+    stage, documents = _documents(stage, rows, marked=marked)
+    sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
+    refuse_overlong(sizes, stage, source.describe())
+    if stage.policy == "first-fit" and not stage.along:
+        # The plan and windows reader of an indexed read of documents that state
+        # their lengths (`PackedSource.planned`): it reads the windows that hold a
+        # target, and the plan counts the rest as zero_targets.
+        plan = _Held(_Memory(source, documents, sizes, {}), stage)
+        planned = plan.arrays
+        derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
+        packed = _PackedRows(documents, plan)
+        counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
+        # The plan counts every target a window holds; windows of documents counted by a
+        # rule are counted by it (`_targeted`), as an indexed or streamed read's are. A window the
+        # plan leaves out passes the examples its documents end to the next it keeps (`_owed`).
+        owed = _owed(planned, documents) if marked else None
+        rows, targets = _targeted([((plan.at("accepted", index),), packed[index] if owed is None
+                                    else _credited(packed[index], owed[index]))
+                                   for index in range(len(packed))], counter, stage.fields[0], rule)
+    else:
+        # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
+        # the corpus as an indexed read streams it (`_packed`).
+        packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
+        derived["packing"] = fingerprint(sizes)
+        rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
+                                  stage.fields[0], rule)
+    ids = f"{stage.fields[0]}_segment_ids"
+    most = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0)) for _, value in rows),
+               default=0)
+    return rows, targets, most
+
+
+def _limited(pipeline: Pipeline, at: int, rows: list[tuple[tuple[int, ...], Record]],
+             cycled: list[tuple[tuple[int, ...], Record]] | None,
+             ) -> tuple[list[tuple[tuple[int, ...], Record]], Pipeline]:
+    """The rows a bound's limit at `at` keeps, as a memory read holds them (`analysis._held_bound`): its
+    count of the rows, or of the rows a repeat before it reads on over (`cycled`), pass after pass, each
+    pass's rows numbered by it; a run of epochs's limit its passes over them (`Limit.passes`), which the
+    stages the read ran state as the count it resolves to."""
+    stage = pipeline.stages[at]
+    assert isinstance(stage, Limit)
+    held = rows if cycled is None else cycled
+    count = stage.count if stage.passes is None else stage.passes * len(held)
+    if stage.passes is not None:
+        pipeline = dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Limit(count),
+                                                         *pipeline.stages[at + 1:]))
+    if cycled is None:
+        return rows[:count], pipeline
+    turns = -(-count // len(held)) if held else 0
+    passes = [((*identifier, turn), value) for turn in range(turns) for identifier, value in held]
+    return passes[:count], pipeline
+
+
+def _owed(planned: Mapping[str, np.ndarray], documents: Sequence[Batch]) -> list[int]:
+    """For each window a first-fit plan keeps (`accepted`), the examples ended by the documents of the
+    windows it leaves out before it (`order`, `starts`), the last kept also owed those of the windows it
+    leaves out after every kept one, so the kept windows consume every example, each owed one refused
+    (`Owed`). A window holds pieces (`order`), each a slice of one document (`documents`, `offsets`,
+    `sizes`), whose counts stand at its document's last token (`_ConsumedAt`)."""
+    kept = [int(window) for window in planned["accepted"]]
+    starts, order = planned["starts"], planned["order"]
+    pieces, offsets, sizes = planned["documents"], planned["offsets"], planned["sizes"]
+    owed, pending, at = [], 0, 0
+    for window in range(len(starts) - 1):
+        if at < len(kept) and window == kept[at]:
+            owed.append(pending)
+            pending, at = 0, at + 1
+            continue
+        for piece in order[int(starts[window]):int(starts[window + 1])]:
+            document, offset = documents[int(pieces[piece])], int(offsets[piece])
+            pending += int(np.sum(np.asarray(document[CONSUMED])[offset:offset + int(sizes[piece])]))
+    if owed:
+        owed[-1] += pending
+    return owed
+
+
+def _credited(window: Batch, owed: int) -> Batch:
+    """`window` owed `owed` more examples, each refused (`_owed`, `Owed`), at its last token, which its
+    sums take (`_targeted`)."""
+    if not owed:
+        return window
+    credited = dict(window)
+    for name in ACCOUNTS:
+        held = np.array(window[name], copy=True)
+        held[-1] += owed
+        credited[name] = held
+    return credited
+
+
+def _documents(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], *, marked: bool,
+               ) -> tuple[Pack, tuple[Batch, ...]]:
+    """The documents a held pack lays out, and the pack that lays them: where a bound marked the rows
+    (`analysis._held_bound`), each document's marks ride its last token (`_ConsumedAt`), packed beside
+    its fields, which the window that holds it sums."""
+    if not marked:
+        return stage, tuple(stage.document(record(value, "packing document")) for _, value in rows)
+    laid = _ConsumedAt(stage.fields[0])
+    carried = dataclasses.replace(stage, fields=(*stage.fields, *ACCOUNTS))
+    return carried, tuple(carried.document(record(laid(record(value, "packing document")), "marked document"))
+                          for _, value in rows)
+
+
 def _targeted(
     rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target of
     their token `field`, each counted by the rule their documents were (`counted_window`),
-    and their total, as an indexed or streamed read accepts them."""
+    and their total, as an indexed or streamed read accepts them. Windows of documents a bound in
+    examples marked (`ACCOUNTS`, at each document's last token) hold their sums, one count a window, and
+    a window left out owes the examples it ends to the next kept, each refused as a row a step drops
+    owes them (`Owed`), the last kept taking what none after holds, so the kept windows consume every
+    example the bound read."""
 
-    kept, total = [], 0
+    kept, total, owed = [], 0, Owed()
     for identifier, value in rows:
         window = counted_window(record(value, "packed window"), rule, field)
+        if CONSUMED in window:
+            window = {**window, **{name: int(np.sum(window[name])) for name in ACCOUNTS}}
         count = ValidTargets(field)(window)
         if count:
-            kept.append((identifier, window))
+            kept.append((identifier, owed.paid(window) if CONSUMED in window else window))
             total += count
         else:
             counter.rejected["zero_targets"] += 1
+            owed.owe(accounts(window)[0])
+    if owed.examples and kept:
+        identifier, last = kept[-1]
+        kept[-1] = (identifier, owed.paid(last))
     return kept, {"valid_targets": total}
 
 

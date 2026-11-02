@@ -20,10 +20,20 @@ export const generatedRoot = path.join(siteRoot, 'src/generated');
 const assetRoot = path.join(siteRoot, 'src/assets/repo');
 export const publicRepoRoot = path.join(siteRoot, 'public/repo');
 
+/** The posts' Markdown files, docs/posts/*.md, by name; none before the first. */
+export function postFiles() {
+	const directory = path.join(repoRoot, 'docs/posts');
+	return existsSync(directory) ? readdirSync(directory).filter((file) => file.endsWith('.md')).sort() : [];
+}
+
 const slugBySource = new Map(pages.filter((page) => page.source).map((page) => [page.source, page.slug]));
 // Every notebook in tutorials/ has a page, so a link to the .ipynb file resolves to it.
 for (const name of readdirSync(path.join(repoRoot, 'tutorials')).filter((file) => file.endsWith('.ipynb'))) {
 	slugBySource.set(`tutorials/${name}`, `tutorials/${name.replace(/\.ipynb$/, '')}`);
+}
+// And every post in docs/posts/ (scripts/render-posts.mjs).
+for (const name of postFiles()) {
+	slugBySource.set(`docs/posts/${name}`, `posts/${name.replace(/\.md$/, '')}`);
 }
 
 export function blobUrl(repoPath, line) {
@@ -35,14 +45,41 @@ export function editUrl(repoPath) {
 	return `${repository.url}/edit/${repository.branch}/${repoPath}`;
 }
 
-/** The commit date of the last change to a repository file, or undefined outside git. */
-export function lastUpdated(repoPath) {
+/** The commit date of a change to a repository file, the first that added it at its path where `first`, else
+ * its last; undefined for a file git does not hold yet, or outside git. */
+function committed(repoPath, first) {
+	// The add a rename carries the file's history past (`--follow`), so a renamed page keeps its date (review).
+	const flags = first ? ['--follow', '--diff-filter=A'] : ['-1'];
 	try {
-		const date = execFileSync('git', ['log', '-1', '--format=%cI', '--', repoPath], { cwd: repoRoot, encoding: 'utf8' }).trim();
-		return date ? new Date(date) : undefined;
+		const dates = execFileSync('git', ['log', ...flags, '--format=%cI', '--', repoPath], { cwd: repoRoot, encoding: 'utf8' }).trim();
+		return dates ? new Date(dates.split('\n').at(-1)) : undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+/** The commit date of the last change to a repository file, or undefined outside git. */
+export const lastUpdated = (repoPath) => committed(repoPath, false);
+
+let whole;
+
+/** Overview page `slug` (sync-docs wrote its prose) with `items`, HTML, appended inside `open` and its closing
+ * tag, replacing what an earlier render appended; none appended where `items` is empty. */
+export async function listed(slug, open, items) {
+	const page = pageFile(slug);
+	const prose = (await readFile(page, 'utf8')).split(`\n\n${open}`)[0].trimEnd();
+	const close = `</${open.match(/^<(\w+)/)[1]}>`;
+	await writeFile(page, items.length ? `${prose}\n\n${open}${items.join('')}${close}\n` : `${prose}\n`);
+}
+
+/** When a tutorial or post was published: the commit date of the change that added its file at its path, or
+ * undefined for one git does not hold yet. A listing of the newest reads it, so no date is written by hand. A
+ * shallow clone's oldest commit holds every file as added, so the dates need the whole history, and a build
+ * without it says how to fetch it rather than date old pages by that commit (review). */
+export function published(repoPath) {
+	whole ??= execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: repoRoot, encoding: 'utf8' }).trim() === 'false';
+	if (!whole) throw new Error(`${repoPath}: publication dates need the repository's whole history: git fetch --unshallow`);
+	return committed(repoPath, true);
 }
 
 const IMAGE = /\.(png|jpe?g|gif|svg|webp|avif)$/i;

@@ -31,7 +31,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#a8b23968a77c9c43d5868f027e43d2a1d245734c
+  ARMADA: github:AshishKumar4/armada#d0e6021d7412a1cdf0373984d3bab34f6b07ac74
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -95,6 +95,7 @@ jobs:
       run: |
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
+        node site/scripts/render-posts.mjs --check
 
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement

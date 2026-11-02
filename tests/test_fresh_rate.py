@@ -154,10 +154,11 @@ def test_a_decision_run_records_its_default_fresh_group_over_its_block_and_head(
 @pytest.mark.mesh(devices=8)
 def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
     """A run that names its groups keeps its own, its fresh group claiming the block and the head;
-    resumed from a recipe naming none, it trains on in the groups its record names (row 2391)."""
+    resumed from a recipe naming none, it trains on in the groups its record names (row 2391). Its run
+    scores no split, whose passes the groups don't read (the next test reads them with a held chain)."""
     from run_kinds import trained
 
-    run = context_run(tmp_path)
+    run = dataclasses.replace(context_run(tmp_path), validation=None)
     claiming = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, BASE)))
     named, _ = trained(claiming, tmp_path, "named", trainer=SAVING)
     assert groups(tmp_path, "named")[1] == BASE
