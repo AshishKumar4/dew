@@ -362,14 +362,10 @@ def test_halved():
         assert whole["first_failure"].partition(":")[0].rpartition(".")[2] == "GateFailure"
 
 
-@KINDS
-def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
-        ci, tmp_path, monkeypatch, cache_worker, site):
-    """A site's judge green on exactly these inputs is kept whole, a check-1 site's and a `shards` test's
-    alike: the plan runs none of its map tasks and not its judge, whose row a kept task reads. Its key is the
-    site's, its map tasks' inputs (each among its artifacts) with its own, so a module only its draws ran
-    (src/draws.py), changed, plans that site's map tasks and judge again and nothing else: the file's own
-    row, which never ran it, stays kept."""
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
+    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
+    those, and the file's own row."""
     out = site_checkout(tmp_path, site)
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
@@ -381,29 +377,59 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     entries = list(planned(ci).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
-    for index, name in enumerate(judge["after"]):
-        [drawn] = [entry for entry in entries if entry["name"] == name]
-        assert entry_task(ci, monkeypatch, drawn, out, artifacts=inputs / "job" / str(index)) == 0
+    drawn = [entry for name in judge["after"] for entry in entries
+             if entry["name"] == name and (later or not entry.get("later", False))]
+    for index, entry in enumerate(drawn):
+        assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
     for entry in entries:
         if not entry["split"] or entry is judge:
             assert entry_task(ci, monkeypatch, entry, out, inputs=inputs) == 0
+
+
+def planned_now(ci) -> tuple[set[tuple[str, str]], list[dict]]:
+    """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
+    entries = list(planned(ci).values())
+    kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
+    return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
+
+
+@KINDS
+def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
+        ci, tmp_path, monkeypatch, cache_worker, site):
+    """A site's judge green on exactly these inputs is kept whole, a check-1 site's and a `shards` test's
+    alike: the plan runs none of its map tasks and not its judge, whose row a kept task reads. Its key is the
+    site's, its map tasks' inputs (each among its artifacts) with its own, so a module only its draws ran
+    (src/draws.py), changed, plans that site's map tasks and judge again and nothing else: the file's own
+    row, which never ran it, stays kept."""
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, site, later=True)
     assert runs(tmp_path) == [1, 3, 1]
-
-    def planned_now() -> tuple[set[tuple[str, str]], list[dict]]:
-        """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
-        entries = list(planned(ci).values())
-        kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
-        return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
-
-    kept, ran = planned_now()
+    kept, ran = planned_now(ci)
     assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
     (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
-    kept, ran = planned_now()
+    kept, ran = planned_now(ci)
     assert kept == {("tests/test_site.py", "")}
     [again] = [entry for entry in ran if "after" in entry]
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
+
+
+def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_never_ran(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A check-1 site whose judge's first stage finds nothing, as armada runs it: its later map tasks never
+    run, and its judge, green over its first stage's draws alone, keys on those map tasks' inputs with its
+    own, so it is kept whole on them: the plan runs none of its map tasks and not its judge. A module its
+    draws ran (src/draws.py), changed, plans them again."""
+    run_cached(ci, tmp_path, monkeypatch, cache_worker,
+               SITE.replace("held[-1][1] == 20", "held[-1][1] == 4"), later=False)
+    assert runs(tmp_path) == [1, 1, 1]
+    kept, ran = planned_now(ci)
+    assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
+    (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
+    kept, ran = planned_now(ci)
+    assert kept == {("tests/test_site.py", "")}
+    [again] = [entry for entry in ran if "after" in entry]
+    assert len(again["after"]) == 3 and len(ran) == 4
 
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):
