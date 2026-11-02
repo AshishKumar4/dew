@@ -230,7 +230,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                 family=family, training=False, interpret=interpret,
                                 counted=form.natural == spec.natural and not again, kept=again,
                                 finishes=rows, columns=first, splits=splits, table=table,
-                                out_dtype=jnp.float32 if split else out_dtype)
+                                out_dtype=jnp.float32 if split else out_dtype, masked=walked_call is not call)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
@@ -257,7 +257,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
                 tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
                 splits=splits, table=table, out_dtype=jnp.float32 if hooked_blocks else out_dtype,
-                finishes=finishes, column_width=columns.shape[-1] if first is not None else None)
+                finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
+                masked=masked)
             blocks.append(block)
             # Every block's rows alike: its logits are the row's whole.
             finished = finished or tuple(block_rows)
@@ -765,7 +766,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             interpret: bool, columns: int | None = None, peaks: bool = False,
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
             kept: bool = False, finishes: bool = False, splits: int = 1,
-            table: tuple[jax.Array, int] | None = None, column_width: int | None = None):
+            table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
+            masked: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -784,7 +786,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     `table` (a paged call's page table and its keys a page, `attention.Pages`), `key` and `value` are its
     pools flattened, `[KV, P·size, D]`, and a step's key tile is read where the table maps it. With
     `column_width`, it walks `value`'s columns `columns` to `columns + column_width` where they lie, its
-    output that block's.
+    output that block's. A `masked` launch (`algebra.walked_launches`') walks only the rows its spans leave
+    keys: a program whose query blocks have none loads and writes nothing, its outputs there unread.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
@@ -800,16 +803,16 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      counted=counted, finishes=finishes, target=generation.gpu_target(),
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_block=None if column_width is None else (columns, column_width))
+                     column_block=None if column_width is None else (columns, column_width), masked=masked)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_block"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_block", "masked"))
 def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_block: tuple[int, int] | None = None):
+              column_block: tuple[int, int] | None = None, masked: bool = False):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -886,12 +889,19 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
                 out_view = outputs[0].at[rows]
             finished = None if training or not finishes else tuple(outputs[1].at[place, *state_rows]
                                                                         for place in range(2))
-            _consumer(program, spec, index, q_ref.at[row, pl.ds(first, block_q), head], out_view, status,
-                      q_smem.at[index],
-                      q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, views, turn,
-                      streamed, first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)),
-                      hooks=hooks, residuals=residuals, anchors=anchors_of, interpret=interpret,
-                      finished=finished)
+            walk = functools.partial(
+                _consumer, program, spec, index, q_ref.at[row, pl.ds(first, block_q), head], out_view, status,
+                q_smem.at[index], q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, views,
+                turn, streamed, first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)),
+                hooks=hooks, residuals=residuals, anchors=anchors_of, interpret=interpret, finished=finished)
+            if not masked:
+                walk()
+                return
+            # A masked launch's program walks where a block of its consumers' has a live row, every key
+            # range of theirs non-empty (a slice's may be empty): the program's blocks' unsliced ranges.
+            blocks = [lax.div(pair_first + other * block_q, block_q) for other in range(consumers)]
+            pl.when(functools.reduce(jnp.logical_or, [spans_of.lo[row, block] < spans_of.hi[row, block]
+                                                      for block in blocks]))(walk)
 
         def producer():
             family.stream(streams, views, *streamed)
