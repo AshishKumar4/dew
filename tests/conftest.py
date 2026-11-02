@@ -6,18 +6,27 @@ import os
 import sys
 import threading
 import urllib.parse
+from datetime import timedelta
 from pathlib import Path
 
 import lane_environment
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
+import hypothesis
 import jax
 import pytest
 import remote_cache
 from tool_support import load
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+
+# The suite's Hypothesis profile (docs/design/testing.md): the same examples on every run, so a red
+# reproduces anywhere, no example database, and at most 50 examples of at most 2 s each, within a test's
+# 120 s. A test whose examples compile declares its own deadline and count within that.
+hypothesis.settings.register_profile("dew", derandomize=True, database=None, deadline=timedelta(seconds=2),
+                                     max_examples=50, print_blob=True)
+hypothesis.settings.load_profile("dew")
 
 # The suite compiles the same kernels every run, on both lanes, in every xdist
 # worker. XLA's persistent cache is keyed by the executable, so a second run
