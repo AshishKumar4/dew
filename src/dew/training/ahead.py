@@ -684,8 +684,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
+        # The GPU the caller stated (`target`), as its devices were built: the generation's own where none.
         devices = compile_only_gpus(generation, len(devices), capacity,
-                                    None if stated is None else stated.multiprocessors)
+                                    None if target is None else target.multiprocessors)
         trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
             np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()

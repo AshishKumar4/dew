@@ -388,14 +388,16 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
 
     def compiled(*stated: str) -> AheadOfTime:
-        path = tmp_path / f"step{len(stated)}.dew-aot"
-        run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        root = tmp_path / f"run{len(stated)}"
+        root.mkdir()
+        path = root / "step.dew-aot"
+        run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
                                "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
                                "--trainer.compile-ahead.frontier", *stated],
-                              default=lm(tmp_path, drawn=False))
+                              default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
             run.run()
         return AheadOfTime.load(path)
