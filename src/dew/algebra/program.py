@@ -19,7 +19,8 @@ from collections.abc import Callable, Hashable, Iterator, Mapping
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import EGraph, Schedule, String, Vec, get_callable_args, get_literal_value, i64, set_
+from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
+from egglog.egraph import ComparableAdd
 from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
@@ -174,7 +175,9 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
         return {}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     for out, root in zip(yielded, done.region.outputs, strict=True):
-        form = None if root is None else done.picked.get(terms.key(root))
+        if root is None:
+            continue
+        form = done.picked.get(terms.key(root))
         made_at = id(made_by[out])
         if form is None or terms.key(form) == terms.key(root) or made_at in taken or made_at in spliced:
             continue
@@ -348,7 +351,7 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         if bound is not None:
             facts += rules.made(term, i64(bound))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
-            _, params = region.params[int(get_literal_value(args[3]))]
+            _, params = region.params[terms.integer(args[3])]
             extent = region.shape(args[0])
             length = math.prod(extent[axis] for axis in params["axes"])
             facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
@@ -377,7 +380,7 @@ def _products(region: terms.Region) -> list:
             facts.append(rules.matrix(term))
         if (args := get_callable_args(term, terms.Term.dot)) is None:
             continue
-        index = int(get_literal_value(args[2]))
+        index = terms.integer(args[2])
         _, params = region.params[index]
         # Its contracted length's power, the elements each output sums (`rules.contracted_length`).
         (contracting, _), _ = params["dimension_numbers"]
@@ -444,7 +447,8 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
     return Saturated(fired, (nodes, steps), iterations, limited)
 
 
-def extracted(graph: EGraph, bundle: terms.Term, model):
+def extracted[Price: ComparableAdd](graph: EGraph, bundle: terms.Term,
+                                    model: DagCostModel[Price]) -> tuple[list[terms.Term], Price]:
     """The roots' forms `model` prices cheapest together, each shared value once, and their price (the
     model's cost: `cost.Seconds` for the program's)."""
     chosen, price = graph.extract(bundle, include_cost=True, cost_model=model, extractor="greedy-dag")

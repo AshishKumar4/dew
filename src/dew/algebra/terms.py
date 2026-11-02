@@ -17,7 +17,20 @@ from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
+from egglog import (
+    Expr,
+    String,
+    StringLike,
+    Vec,
+    f64,
+    get_callable_args,
+    get_literal_value,
+    i64,
+    i64Like,
+    method,
+)
+from egglog.declarations import Declarations, HasDeclarations
+from egglog.runtime import RuntimeExpr
 from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
@@ -162,7 +175,17 @@ def key(term: Expr) -> Hashable:
     """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
     are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
     step's pass)."""
+    if not isinstance(term, RuntimeExpr):
+        raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
+
+
+def declarations(language: object) -> Declarations:
+    """A language's declarations (egglog's `HasDeclarations`), which reading at import frees its defining
+    frame (`linear_scan._DECLARATIONS`)."""
+    if not isinstance(language, HasDeclarations):
+        raise TypeError(f"{language!r} declares no egglog language")
+    return language.__egg_decls__
 
 
 def protected(equation: jcore.JaxprEqn) -> bool:
@@ -531,8 +554,26 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     return None
 
 
-def _index(argument) -> int:
-    return int(get_literal_value(argument))
+def integer(argument: object) -> int:
+    """An `i64` literal's value: a term's argument as `get_callable_args` gives it, which egglog types by its
+    constructor's parameter (`i64Like`), each an `i64` literal in a term."""
+    if isinstance(argument, i64) and (value := get_literal_value(argument)) is not None:
+        return value
+    raise TypeError(f"{argument!r} is no i64 literal")
+
+
+def text(argument: object) -> str:
+    """A `String` literal's value, as `integer` reads an `i64`'s (a term's operation names)."""
+    if isinstance(argument, String) and (value := get_literal_value(argument)) is not None:
+        return value
+    raise TypeError(f"{argument!r} is no String literal")
+
+
+def real(argument: object) -> float:
+    """An `f64` literal's value, as `integer` reads an `i64`'s (a term's float constants)."""
+    if isinstance(argument, f64) and (value := get_literal_value(argument)) is not None:
+        return value
+    raise TypeError(f"{argument!r} is no f64 literal")
 
 
 def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: Sequence) -> jax.Array:
@@ -540,22 +581,27 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     as the lax function it came from aligns them (`jax_core.auto_insert_reshard`): a literal or a constant
     beside a value a checked `shard_map`'s manual axes vary varies as it does."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
-        return leaves[_index(args[0])]
+        return leaves[integer(args[0])]
     if (args := get_callable_args(term, Term.literal)) is not None:
-        return region_.literals[_index(args[0])]
-    for constructor in (Term.binary, Term.compare, Term.dot):
+        return region_.literals[integer(args[0])]
+
+    def bound(left: Term, right: Term, index: object) -> jax.Array:
+        primitive, given = region_.params[integer(index)]
+        return primitive.bind(*jax_core.auto_insert_reshard(value(left), value(right)), **given)
+
+    if (args := get_callable_args(term, Term.dot)) is not None:
+        return bound(args[0], args[1], args[2])
+    for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(term, constructor)) is not None:
-            # A product's operands lead its arguments; an operation's name stands between a binary's two.
-            left, right, index = args if constructor is Term.dot else (args[0], args[2], args[3])
-            primitive, given = region_.params[_index(index)]
-            return primitive.bind(*jax_core.auto_insert_reshard(value(left), value(right)), **given)
+            # An operation's name stands between its two operands.
+            return bound(args[0], args[2], args[3])
     if (args := get_callable_args(term, Term.select)) is not None:
         operands = jax_core.auto_insert_reshard(*(value(operand) for operand in args))
         return jax.lax.select_n_p.bind(*operands)
     # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
-            primitive, given = region_.params[_index(args[-1])]
+            primitive, given = region_.params[integer(args[-1])]
             return primitive.bind(value(args[0]), **given)
     raise ValueError(f"a term of no known constructor: {term}")
 

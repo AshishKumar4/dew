@@ -46,7 +46,7 @@ import dataclasses
 import functools
 import math
 import operator
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -62,7 +62,6 @@ from egglog import (
     f64Like,
     function,
     get_callable_args,
-    get_literal_value,
     i64,
     i64Like,
     method,
@@ -76,7 +75,7 @@ from egglog import (
 )
 from jax.extend import core as jcore
 
-from dew.algebra import cost
+from dew.algebra import cost, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Program, Refused, aval
 
@@ -248,8 +247,8 @@ def parts(update: Program, readout: Program) -> Parts:
         raise Refused("the readout is not the state contracted with a vector over its keys plus a part free "
                       "of it")
     base2, per_key, exponent, left, right, *correction = args
-    return Parts(update, readout, tuple(atoms), bool(get_literal_value(base2)),
-                 bool(get_literal_value(per_key)), exponent, left, right,
+    return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
+                 bool(terms.integer(per_key)), exponent, left, right,
                  correction[0] if correction else None, *readout_args)
 
 
@@ -370,9 +369,9 @@ def _read(vector, matrix, keys: int) -> jax.Array:
 def value_of(term: Token, read: Callable[[int], jax.Array], keys: int) -> jax.Array:
     """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s)."""
     if (args := get_callable_args(term, Token.value)) is not None:
-        return read(int(get_literal_value(args[0])))
+        return read(terms.integer(args[0]))
     if (args := get_callable_args(term, Token.literal)) is not None:
-        return jnp.asarray(get_literal_value(args[0]), jnp.float32)
+        return jnp.asarray(terms.real(args[0]), jnp.float32)
     if get_callable_args(term, Token.zero) is not None:
         return jnp.zeros((), jnp.float32)
     if (args := get_callable_args(term, Token.read)) is not None:
@@ -582,8 +581,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule) -> Form
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:
     """A value's shape from the e-graph's facts (`rows_of`, `columns_of`)."""
     rows, columns = (graph.lookup_function_value(fact(value)) for fact in (rows_of, columns_of))
-    return (int(get_literal_value(rows)) if rows is not None else 0,
-            int(get_literal_value(columns)) if columns is not None else 0)
+    return (terms.integer(rows) if rows is not None else 0,
+            terms.integer(columns) if columns is not None else 0)
 
 
 def _priced(roots: tuple[Chunk, ...], extents: Extents, shape_of) -> Work:
@@ -593,13 +592,9 @@ def _priced(roots: tuple[Chunk, ...], extents: Extents, shape_of) -> Work:
     for node in _nodes(roots):
         own = _work(node, extents, shape_of)
         work = work + dataclasses.replace(own, span=0.0)
-        spans[key(node)] = own.span + max((spans[key(child)] for child in _children(node)), default=0.0)
-    return dataclasses.replace(work, span=max(spans[key(root)] for root in roots))
-
-
-def key(node: Chunk) -> Hashable:
-    """A node as a dictionary's key: its declaration (`terms.key`'s reading)."""
-    return node.__egg_typed_expr__
+        spans[terms.key(node)] = own.span + max((spans[terms.key(child)] for child in _children(node)),
+                                                default=0.0)
+    return dataclasses.replace(work, span=max(spans[terms.key(root)] for root in roots))
 
 
 def _nodes(roots: tuple[Chunk, ...]) -> Iterator[Chunk]:
@@ -607,9 +602,9 @@ def _nodes(roots: tuple[Chunk, ...]) -> Iterator[Chunk]:
     seen: set = set()
 
     def visit(node: Chunk) -> Iterator[Chunk]:
-        if key(node) in seen:
+        if terms.key(node) in seen:
             return
-        seen.add(key(node))
+        seen.add(terms.key(node))
         for child in _children(node):
             yield from visit(child)
         yield node
@@ -646,7 +641,7 @@ def _work(node: Chunk, extents: Extents, shape_of) -> Work:
         return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c)
     if (args := get_callable_args(node, Chunk.decay)) is not None:
         # The compensated prefix (`scan._decays`), its pairs' exponentials.
-        part = get_literal_value(args[0])
+        part = terms.text(args[0])
         elements = {"entering": c * d, "to_last": c * d, "whole": d, "between": c * c * d}[part]
         return Work(operations=12.0 * c * d + elements, exponentials=elements)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
@@ -697,4 +692,4 @@ def inverse(node: Chunk) -> bool:
 # first read (`dew/__init__` imports egglog on its own frame for its builtins'): read here, at import, they
 # hold none of the locals of a call that compiles a process's first program through the algebra pass, which
 # imports this module and never derives a scan.
-_DECLARATIONS = tuple(language.__egg_decls__ for language in (Token, Affine, Chunk))
+_DECLARATIONS = tuple(map(terms.declarations, (Token, Affine, Chunk)))

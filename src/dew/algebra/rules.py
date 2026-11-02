@@ -24,7 +24,6 @@ from egglog import (
     eq,
     function,
     get_callable_args,
-    get_literal_value,
     i64,
     i64Like,
     rewrite,
@@ -419,7 +418,7 @@ def reorderable(region: terms.Region) -> bool:
     scaled: set = set()
     for term, _ in region.shapes:
         args = get_callable_args(term, Term.binary)
-        if args is None or get_literal_value(args[1]) != "mul":
+        if args is None or terms.text(args[1]) != "mul":
             continue
         for operand, other in ((args[0], args[2]), (args[2], args[0])):
             if terms.key(other) in literals:

@@ -11,7 +11,7 @@ import dataclasses
 from collections.abc import Callable, Hashable, Sequence
 
 import jax
-from egglog import Vec
+from egglog import DagCostModel, Vec
 
 from dew.algebra import cost, forms, program, rules, terms
 
@@ -62,7 +62,7 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     return Choice(min(admitted, key=lambda candidate: candidate.seconds), tuple(candidates))
 
 
-def _priced(region: terms.Region, chosen: list[terms.Term], model) -> float:
+def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[cost.Seconds]) -> float:
     """The price of `chosen` together under `model`, each shared value once: extracted from an unsaturated
     graph of `region`'s facts holding them, where no rule has made another form of theirs."""
     graph, _, _ = program.graphed(region)

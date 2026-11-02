@@ -11,7 +11,7 @@ from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
-from egglog import get_callable_args, get_literal_value
+from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -243,10 +243,10 @@ def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[Hashable, j
         if key in values:
             return values[key]
         if (args := get_callable_args(term, terms.Term.leaf)) is not None:
-            made = leaf(int(get_literal_value(args[0])))
+            made = leaf(terms.integer(args[0]))
         elif (args := get_callable_args(term, terms.Term.dot)) is not None:
             left, right, index = args
-            _, params = region.params[int(get_literal_value(index))]
+            _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
             if product is not None and numbers == PLAIN_PRODUCT:
                 made = product(value(left), value(right))

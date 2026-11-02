@@ -169,7 +169,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
                            if bound is not None and linear_scan.inverse(node)})
             splits[key] = carry.split(functools.partial(_chunk, form, tuple(held)), h, avals, (1,),
                                       saturation=saturation, ranges=ranges,
-                                      state_range=declaration.ranges.get("state"))
+                                      state_range=_magnitude(declaration.ranges.get("state")))
         return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
     def step(state, prepared):
@@ -243,6 +243,11 @@ def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precisi
     return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target))
 
 
+def _magnitude(bound: float | tuple[float, float] | None) -> float | None:
+    """A declared range's magnitude (`Scan.ranges`): a magnitude itself, an interval its endpoints' larger."""
+    return None if bound is None else max(map(abs, bound)) if isinstance(bound, tuple) else bound
+
+
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
             chunk_size: int) -> dict:
     """The chunk function's operands' ranges (`_chunk`'s, `carry.split`'s): its decays at most 1, each token
@@ -275,8 +280,7 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
     # count (two tokens of 16 keys each element at most 1 overlap by 16).
     places = TOKENS
     tokens_at = {name: DECAYS + place for place, name in enumerate(places)}
-    overlap = declaration.ranges.get("overlap")
-    entry = None if overlap is None else max(map(abs, overlap)) if isinstance(overlap, tuple) else overlap
+    entry = _magnitude(declaration.ranges.get("overlap"))
     if entry is None and all(tokens_at[name] in bounded for name in ("B", "s", "C")):
         B = region.outputs[places.index("B")]
         keys = math.prod(np.shape(region.literal_outputs[0]) if B is None else region.shape(B))
@@ -295,7 +299,7 @@ def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, bet
     splits."""
     decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
     tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
-    known = {linear_scan.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
+    known = {terms.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
     return (_evaluated(form.outputs, tokens, decays, h, known),
             _evaluated(form.state, tokens, decays, h, known))
 
@@ -311,10 +315,10 @@ def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays) -> dict:
 def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
     `h`, each node once (`known`, by node)."""
-    from egglog import get_callable_args, get_literal_value
+    from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
-    named = linear_scan.key(node)
+    named = terms.key(node)
     if named in known:
         return known[named]
 
@@ -322,11 +326,11 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
         return _evaluated(child, tokens, decays, h, known)
 
     if (args := get_callable_args(node, Chunk.token)) is not None:
-        value = tokens[get_literal_value(args[0])]
+        value = tokens[terms.text(args[0])]
     elif get_callable_args(node, Chunk.entering) is not None:
         value = h
     elif (args := get_callable_args(node, Chunk.decay)) is not None:
-        value = getattr(decays, get_literal_value(args[0]))
+        value = getattr(decays, terms.text(args[0]))
     elif (args := get_callable_args(node, Chunk.loop)) is not None:
         value = _looped(tokens, decays, h, of(args[0]), corrected=True)
     elif (args := get_callable_args(node, Chunk.plain)) is not None:
@@ -338,7 +342,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     elif (args := get_callable_args(node, Chunk.state)) is not None:
         value = of(args[0])[1]
     elif (args := get_callable_args(node, Chunk.gram)) is not None:
-        strict = get_literal_value(args[2])
+        strict = terms.integer(args[2])
         between = decays.between
         if strict:
             below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]

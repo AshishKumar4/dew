@@ -422,7 +422,7 @@ def _held_key(value, leaves: list, path: frozenset = frozenset()) -> Hashable:
     if id(value) in path:
         raise TypeError("a hook's parts reach the hook again")
     inner = path | {id(value)}
-    if isinstance(value, FieldHook):
+    if isinstance(value, FieldHook) and dataclasses.is_dataclass(value):
         held: list = []
         try:
             fields = tuple((field.name, _held_key(getattr(value, field.name), held, inner))

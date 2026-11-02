@@ -43,7 +43,6 @@ from egglog import (
     eq,
     function,
     get_callable_args,
-    get_literal_value,
     i64,
     rewrite,
     rule,
@@ -434,7 +433,7 @@ PLAIN = _plain()
 _READINGS = (Term.stepped, Term.merged, Term.finished, Term.held)
 
 
-def _priced(region: terms.Region, schedule) -> DagCostModel:
+def _priced(region: terms.Region, schedule) -> DagCostModel[cost.Seconds]:
     """The template's tile walk's price of each node (`cost.model` under `cost.walk`: a form the template's
     algebra takes runs between its mainloop's products, not as XLA fuses it), each of the derivation's
     readings infinite in every schedule (`cost.Seconds.extra`: a form that keeps one is no form, whatever
@@ -516,10 +515,12 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
             return tuple(stepped)
         # The tile's outputs along the walked axis `outputs` names (by place), by the same evaluation: a
         # term both read, once.
+        along = []
         for index in outputs:
-            if not made.mapped[index] or made.outputs[index] is None:
+            if not made.mapped[index] or (output := made.outputs[index]) is None:
                 raise Refused(f"output {index} is no output along the walked axis")
-        return tuple(stepped), tuple(value(made.outputs[index]) for index in outputs)
+            along.append(value(output))
+        return tuple(stepped), tuple(along)
 
     def merge(a, b, operands=None, *, shapes: Mapping):
         made = forms(shapes)
@@ -559,7 +560,7 @@ def _monoid(reduction: Term) -> str:
     """A walked reduction's monoid: a maximum's `max`; a sum's, or a product's contracting the walked axis,
     `sum`."""
     args = get_callable_args(reduction, Term.reduce)
-    return "max" if args is not None and get_literal_value(args[1]) == "max" else "sum"
+    return "max" if args is not None and terms.text(args[1]) == "max" else "sum"
 
 
 def _accumulated(form: Term, index: int) -> tuple[Term, Term, Term] | None:
@@ -567,18 +568,18 @@ def _accumulated(form: Term, index: int) -> tuple[Term, Term, Term] | None:
     `index`th state's, as `state * lift(factor) + weights @ values`, its row factor, weights and values; None
     for a step of another form."""
     args = get_callable_args(form, Term.binary)
-    if args is None or get_literal_value(args[1]) != "add":
+    if args is None or terms.text(args[1]) != "add":
         return None
     for scaled, added in ((args[0], args[2]), (args[2], args[0])):
         product = get_callable_args(added, Term.dot)
         times = get_callable_args(scaled, Term.binary)
-        if product is None or times is None or get_literal_value(times[1]) != "mul":
+        if product is None or times is None or terms.text(times[1]) != "mul":
             continue
         for state, lifted in ((times[0], times[2]), (times[2], times[0])):
             at = get_callable_args(state, Term.state)
             lift = get_callable_args(lifted, Term.shaped)
-            slot = None if at is None else (int(get_literal_value(at[0])), int(get_literal_value(at[1])))
-            if slot == (index, 0) and lift is not None and get_literal_value(lift[1]) == "broadcast_in_dim":
+            slot = None if at is None else (terms.integer(at[0]), terms.integer(at[1]))
+            if slot == (index, 0) and lift is not None and terms.text(lift[1]) == "broadcast_in_dim":
                 return lift[0], product[0], product[1]
     return None
 
@@ -617,7 +618,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     outputs = list(region.outputs)
     along = [term is not None and _walked(graph, term) for term in outputs]
     for term, is_along in zip(outputs, along, strict=True):
-        if is_along and not _holds(graph, local(term)):
+        if is_along and term is not None and not _holds(graph, local(term)):
             raise Refused("an output along the walked axis reads a walked reduction: no tile holds it")
     roots = ([reduction.stepped() for reduction in reductions]
              + [reduction.merged() for reduction in reductions]
@@ -767,7 +768,7 @@ def _operand_and_result_shapes(region: terms.Region, index: int):
     """The shapes of the operand and the result of a single-operand term of parameters `index`."""
     for term, extent in region.shapes:
         args = get_callable_args(term, Term.shaped) or get_callable_args(term, Term.reduce)
-        if args is not None and int(get_literal_value(args[-1])) == index:
+        if args is not None and terms.integer(args[-1]) == index:
             return region.extents.get(terms.key(args[0])), extent
     return None, None
 
@@ -780,7 +781,7 @@ def _rank_before(region: terms.Region, index: int, reduced: set[int]) -> int:
 def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     for term, _ in region.shapes:
         args = get_callable_args(term, Term.dot)
-        if args is not None and int(get_literal_value(args[-1])) == index:
+        if args is not None and terms.integer(args[-1]) == index:
             return len(region.shape(args[0])), len(region.shape(args[1]))
     return 0, 0
 
@@ -856,7 +857,7 @@ def _identity(reduction: Term, dtype) -> float:
 
 def _reads_leaves(form: Term) -> set[int]:
     """The region's leaves `form` reads."""
-    return {int(get_literal_value(args[0])) for term in terms.subterms(form)
+    return {terms.integer(args[0]) for term in terms.subterms(form)
             if (args := get_callable_args(term, Term.leaf)) is not None}
 
 

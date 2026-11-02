@@ -16,10 +16,10 @@ from typing import Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import DagCostModel, EGraph, get_callable_args, get_literal_value
+from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew.algebra.rules import shape
-from dew.algebra.terms import Region, Term, key
+from dew.algebra.terms import Region, Term, integer, key, text
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
@@ -51,7 +51,7 @@ def shape_of(graph: EGraph, term, held: dict | None = None) -> tuple[int, ...] |
     if held is not None and named in held:
         return held[named]
     known = graph.lookup_function_value(shape(term))
-    found = None if known is None else tuple(int(get_literal_value(size)) for size in known.value)
+    found = None if known is None else tuple(integer(size) for size in known.value)
     if held is not None:
         held[named] = found
     return found
@@ -85,7 +85,7 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
         if left is None or right is None:
             return Work()
-        index = int(get_literal_value(args[2]))
+        index = integer(args[2])
         _, params = region.params[index]
         (contracted, right_contracted), (batch, right_batch) = params["dimension_numbers"]
         length = math.prod(left[axis] for axis in contracted)
@@ -101,7 +101,7 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
         return Work(conversions=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.unary)) is not None:
         elements = made(graph, args[:1], held)
-        special = get_literal_value(args[1]) in EXPONENTIALS
+        special = text(args[1]) in EXPONENTIALS
         return Work(exponentials=elements) if special else Work(operations=elements)
     for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2))):
         if (args := get_callable_args(node, constructor)) is not None:
@@ -150,7 +150,6 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
     return Work(**{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
 
 
-@functools.total_ordering
 @dataclasses.dataclass(frozen=True, eq=False)
 class Seconds:
     """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
@@ -180,6 +179,15 @@ class Seconds:
 
     def __lt__(self, other: Seconds) -> bool:
         return self.key < other.key
+
+    def __le__(self, other: Seconds) -> bool:
+        return self.key <= other.key
+
+    def __gt__(self, other: Seconds) -> bool:
+        return self.key > other.key
+
+    def __ge__(self, other: Seconds) -> bool:
+        return self.key >= other.key
 
     def __hash__(self) -> int:
         return hash(self.key)
@@ -258,7 +266,7 @@ def walk(facts: generation.GpuTarget) -> Walk:
     return Walk(facts)
 
 
-def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel:
+def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel[Seconds]:
     """Each node's work (`work`) under `schedule`; extraction adds them, once a shared node. A node is priced
     from its operands' shapes, the e-classes the extractor hands its callback, and its parameters
     (`region`'s)."""
@@ -276,7 +284,7 @@ is rounded into what follows it, a difference that may cancel its operands' digi
 dev time measures every candidate's error (`dew.algebra.error.choose`)."""
 
 
-def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel:
+def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel[Seconds]:
     """The program's model (`model`) with each node of a rounding risk priced up (`RISK`), so its cheapest
     forms are the ones the stable rules wrote: the candidate dev time proposes for its accuracy."""
     held: dict = {}
@@ -286,8 +294,7 @@ def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> Da
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
                 # Each operation's name follows its first operand.
-                name = get_literal_value(args[1])
-                risk = RISK.get(name if isinstance(name, str) else "", 0.0)
+                risk = RISK.get(text(args[1]), 0.0)
                 return Seconds(done, schedule, risk)
         return Seconds(done, schedule)
 

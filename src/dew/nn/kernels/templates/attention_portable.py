@@ -579,18 +579,24 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                              for kind in score_kinds if kind in DKV_GRADS)
 
     dk, dv, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    return _dkv_laid_out(dk, dv, written, [kind for kind in score_kinds if kind in DKV_GRADS],
+                         batch=batch, heads=heads, queries=queries, keys=keys, block_k=block_k)
+
+
+def _dkv_laid_out(dk, dv, written, kinds, *, batch: int, heads: int, queries: int, keys: int, block_k: int):
+    """`_dkv_launch`'s programs' results laid out: dK, dV and the key parameters' gradients (`kinds`, each of
+    `written`'s) from `[blocks * batch * heads, bk, ...]` to `[B, Kp, H, ...]`, the tile parameters' from
+    `[blocks * batch * heads, Qp, bk]` to `[B, H, Qp, Kp]`."""
+    blocks = keys // block_k
 
     def keyed(x):
-        # [blocks * batch * heads, bk, ...] to [B, Kp, H, ...].
         return jnp.moveaxis(x.reshape(blocks, batch, heads, *x.shape[1:]), 0, 2).reshape(
             batch, heads, keys, *x.shape[2:]).swapaxes(1, 2)
 
     def tiles(x):
-        # [blocks * batch * heads, Qp, bk] to [B, H, Qp, Kp].
         return jnp.moveaxis(x.reshape(blocks, batch, heads, queries, block_k), 0, 3).reshape(
             batch, heads, queries, keys)
 
-    kinds = [kind for kind in score_kinds if kind in DKV_GRADS]
     return keyed(dk), keyed(dv), tuple(keyed(grad[..., None])[..., 0].swapaxes(1, 2) if kind == Kind.KEY
                                        else tiles(grad) for grad, kind in zip(written, kinds, strict=True))
 

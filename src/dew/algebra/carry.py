@@ -30,7 +30,6 @@ from egglog import (
     eq,
     function,
     get_callable_args,
-    get_literal_value,
     i64,
     rule,
     ruleset,
@@ -154,7 +153,7 @@ class Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
 
 
-def _carry_priced(region: terms.Region, schedule) -> DagCostModel:
+def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
     """`Priced` per node: its work (`cost.work`) sequential where an operand reads the state (the e-classes
     the extractor hands the callback, which alone it may look up), parallel otherwise."""
     none = cost.Seconds(Work(), schedule)
@@ -245,7 +244,7 @@ def _products(graph: EGraph, region: terms.Region) -> None:
     for term, _ in region.shapes:
         if (args := get_callable_args(term, Term.dot)) is None:
             continue
-        index = int(get_literal_value(args[2]))
+        index = terms.integer(args[2])
         primitive, params = region.params[index]
         if jax.tree.map(int, params["dimension_numbers"]) != transposed:
             continue
@@ -270,7 +269,7 @@ def _parameters(region: terms.Region, primitive, params) -> int:
 
 def _reads(term: Term, reading: set[int]) -> bool:
     """Whether `term` reads one of the `reading` leaves."""
-    return any((args := get_callable_args(sub, Term.leaf)) is not None and int(get_literal_value(args[0]))
+    return any((args := get_callable_args(sub, Term.leaf)) is not None and terms.integer(args[0])
                in reading for sub in terms.subterms(term))
 
 
@@ -286,7 +285,7 @@ def _free(form: Term, reading: set[int]) -> list[Term]:
         named = terms.key(term)
         if ready:
             leaf = get_callable_args(term, Term.leaf)
-            reads[named] = (leaf is not None and int(get_literal_value(leaf[0])) in reading) or any(
+            reads[named] = (leaf is not None and terms.integer(leaf[0]) in reading) or any(
                 reads[terms.key(operand)] for operand in operands[named])
             continue
         if named in operands:

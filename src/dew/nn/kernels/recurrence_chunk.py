@@ -762,6 +762,10 @@ portable math, whose forms are those derived from the token update behind the sw
 `dew.algebra.forms.derived`)."""
 
 
+RESET = "first"
+"""The derived rule's reset operand (`scan.Scan.reset`): a packed document's first tokens."""
+
+
 def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
                  chunk_size: int, dtype, bound: float | None = None):
     """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
@@ -795,7 +799,7 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
 
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
-    reset = None if starts is None else "first"
+    reset = None if starts is None else RESET
     declared = axes if reset is None else {**axes, reset: ("time",)}
     # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
@@ -814,9 +818,9 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
 
     operands = {name: laid(x.astype(dtype))
                 for name, x in zip(axes, (query, key, value, g, beta), strict=True)}
-    if reset is not None:
+    if starts is not None:
         # Each head's tokens reset where their row's document starts; a padded token starts none.
-        operands[reset] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+        operands[RESET] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
