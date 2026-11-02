@@ -178,6 +178,19 @@ def scored(simulator, objective, variables, key: jax.Array) -> dict:
             "steps": float(rows["steps"].mean())}
 
 
+def chunk_end(done: int, taken: int, steps: int, every: int, phase: Phase, *, pending: bool) -> int | None:
+    """The update a run at `done` updates and `taken` environment steps trains its next chunk to: a chunk
+    checkpointed and stopped before its score (`pending`) is restored where it stands and scored first;
+    short of `steps`, the update that takes the steps to the next judgement (`every` steps apart) at the
+    phase's pace; None once the run has taken `steps`, so a finished run run again trains nothing."""
+    if pending:
+        return done
+    if taken >= steps:
+        return None
+    judgement = min(steps, (taken // every + 1) * every)
+    return done + max(1, math.ceil((judgement - taken) / (WINDOWS * phase.length / TRAIN_RATIO)))
+
+
 def judged_races(setting: Setting, assets: Path) -> dict[str, dict[str, SkyDreamerRace]]:
     """The races a run of `setting` is judged on, each track's (or the race's) Table III evaluation (every
     start before the first gate, the gates' size 1 m) and held-out training episodes, sharing one renderer
@@ -264,12 +277,11 @@ def trained(out: Path, assets: Path, steps: int, every: int, setting: Setting = 
     written()
     began, state = time.perf_counter(), None
     scored_at = {point["updates"] for point in points}
-    while state is None or taken < steps:
-        # A chunk checkpointed and stopped before its score is restored there and scored before the next.
-        pending = state is None and done > 0 and done not in scored_at
-        judgement = min(steps, (taken // every + 1) * every)
-        paced = WINDOWS * phase.length / TRAIN_RATIO
-        reached = done if pending else done + max(1, math.ceil((judgement - taken) / paced))
+    while True:
+        reached = chunk_end(done, taken, steps, every, phase,
+                            pending=state is None and done > 0 and done not in scored_at)
+        if reached is None:
+            break
         prepared = dataclasses.replace(prepared, run=prepared.run.override({"trainer.steps": reached}))
         state = prepared.train("base")
         done, taken = int(state.step), rollout.environment_steps

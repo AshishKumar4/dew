@@ -1049,19 +1049,16 @@ class DreamerRollout:
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
-        if self._paced is None:
-            updates = int(state.updates)
-            if not self._restored:
-                # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
-                # steps of the updates after that step alone: those before it were taken by the run it
-                # resumes.
-                self._taken = self._paced_steps(updates)
-            # The updates and the steps owed for them where this rollout goes on, from which it owes at its
-            # own pace (`_owed`).
-            self._paced = (updates, self._taken - self._prefilled)
+        updates = int(state.updates)
+        if self._paced is None and not self._restored:
+            # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
+            # steps of the updates after that step alone: those before it were taken by the run it resumes.
+            self._taken = self._paced_steps(updates)
         live = self._started(variables, act_key) if self._live is None else self._live
         envs = live.returns.shape[0]
-        due = max(self._owed(int(state.updates) + 1, envs) - (self._taken - self._prefilled), 0)
+        if self._paced is None:
+            self._paced = (updates, self._anchored(updates, envs))
+        due = max(self._owed(updates + 1, envs) - (self._taken - self._prefilled), 0)
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
         self._live = live
@@ -1069,15 +1066,28 @@ class DreamerRollout:
         # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
         return self._drawn(sample_key)
 
+    def _anchored(self, updates: int, envs: int) -> int:
+        """The steps owed for the `updates` committed where the rollout goes on from, of those it has taken:
+        between those taken and those less one update's (taken for an update not yet committed, in an
+        accumulation window or one the trainer rejected), its own pace's (`_whole`), as the run that took
+        them owes them at that pace; outside them, the nearest, as a run going on at another pace (a later
+        phase's longer windows) owes from there."""
+        taken = self._taken - self._prefilled
+        owed = self._whole(updates, envs)
+        return min(max(owed, taken - (self._whole(updates + 1, envs) - owed)), taken)
+
     def _owed(self, updates: int, envs: int) -> int:
         """The environment steps owed for `updates` updates over `envs` environments stepped together: those
-        owed where the rollout went on from, and from there the steps its updates train on at its pace
-        (`_paced_steps`) in whole steps of every environment, as a run at that pace from the start takes
-        them, so a resumed run takes the steps the uninterrupted run took."""
+        owed where the rollout went on from (`_anchored`), and from there the steps of its updates at its
+        pace (`_whole`)."""
         assert self._paced is not None
         since, owed = self._paced
-        now, then = self._paced_steps(updates), self._paced_steps(since)
-        return owed + envs * (-(-now // envs) + -then // envs)
+        return owed + self._whole(updates, envs) - self._whole(since, envs)
+
+    def _whole(self, updates: int, envs: int) -> int:
+        """The steps `updates` updates train on at the rollout's pace (`_paced_steps`), in whole steps of
+        every one of `envs` environments, as a run at that pace from the start takes them."""
+        return envs * -(-self._paced_steps(updates) // envs)
 
     def _paced_steps(self, updates: int) -> int:
         """The environment steps `updates` updates train on at the rollout's batch, length and train ratio,
