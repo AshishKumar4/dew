@@ -671,7 +671,7 @@ def differentiated(fn):
 
 
 DAMPED_GRADIENT_SEEDS = {("documents", "up"): 32, ("packed", "up"): 128, ("padded", "up"): 64,
-                         ("documents", "both"): 0, ("packed", "both"): 0, ("padded", "both"): 0}
+                         ("documents", "both"): 32, ("packed", "both"): 64, ("padded", "both"): 64}
 """Check 1's declared seeds for the outer gradient through damped steps at the corner, of `up` or of both
 parts, one draw a seed, sized paired by `seeds_for` on armada."""
 
