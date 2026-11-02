@@ -991,9 +991,10 @@ INPUTS = "/armada/inputs"
 """Where a judge's task finds its map tasks' artifacts (armada's `{inputs}`), each task's under
 `<job>/<index>`, where armada names none (`armada_dir`)."""
 MAX_INPUTS = 1000
-"""The most tasks' artifacts one armada job takes as its inputs (armada's MAX_INPUT_RUNS, src/protocol.ts): a
-judges' job takes every map task its judges wait on, the judges of one environment and size together, so the
-plan's map tasks, every marked site's on every Python, stay within it (`refused_sites`)."""
+"""The most tasks' artifacts one armada job takes as its inputs (armada's MAX_INPUT_RUNS,
+src/protocol.ts): armada cuts the judges of one environment and size into as many judges' jobs as keep
+each within it (its `judgeChunks`), so a site's own map tasks, which one judge reads in one job, stay
+within it (`refused_sites`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1092,20 +1093,18 @@ def draws_of(mark: Mark) -> list[tuple[int, int]]:
 
 
 def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
-    """Refuse the marks of `marked` (each test file's sites, `sites`) where their map tasks on every Python
-    pass what one judges' job takes (`MAX_INPUTS`): armada would run every map task, then refuse to start the
-    judges' job, and the run would go ungraded. Counted on every Python whatever a run plans or keeps, as a
-    cold run plans every site on each and armada may hold all their judges in one job, so a mark is refused
-    on the run that adds it, naming each mark's line."""
-    counts = {(name, test): len(draws_of(mark))
-              for name, held in marked.items() for test, mark in held.items()}
-    total = sum(counts.values()) * len(PYTHONS)
-    if total > MAX_INPUTS:
-        each = "; ".join(f"{name}, line {marked[name][test].line}: {test}, {count} a Python"
-                         for (name, test), count in sorted(counts.items()))
-        raise SystemExit(f"the sites marked check1_shards or shards plan {total} map tasks over "
-                         f"{len(PYTHONS)} Pythons, past the {MAX_INPUTS} tasks' artifacts one armada judges' "
-                         f"job takes; give a map task more units (per_task): {each}")
+    """Refuse the marks of `marked` (each test file's sites, `sites`) whose own map tasks pass what one
+    judges' job takes (`MAX_INPUTS`): its judge reads them all in one job, which armada would refuse after
+    every map task ran, and the run would go ungraded; marks within it pass it together, armada cutting
+    their judges into jobs. A mark is refused on the run that adds it, naming its line."""
+    over = {(name, test): count for name, held in marked.items() for test, mark in held.items()
+            if (count := len(draws_of(mark))) > MAX_INPUTS}
+    if over:
+        each = "; ".join(f"{name}, line {marked[name][test].line}: {test}, {count} map tasks"
+                         for (name, test), count in sorted(over.items()))
+        raise SystemExit(f"a site marked check1_shards or shards plans more map tasks than the {MAX_INPUTS} "
+                         "tasks' artifacts its judges' job takes; give a map task more units (per_task): "
+                         f"{each}")
 
 
 def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = None) -> str:
@@ -1167,8 +1166,8 @@ def plan(target: float, timings: dict) -> list[dict]:
     # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
     cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    # Every file's check-1 sites its marks shard, refused where their map tasks outnumber what a judges' job
-    # takes (`refused_sites`).
+    # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
+    # judges' job takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
     refused_sites(shards)
     recorded = recorded_tests()
