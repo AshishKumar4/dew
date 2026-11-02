@@ -31,7 +31,8 @@ test('the landing page lists the four newest tutorials and posts, each with its 
 	const tutorials = JSON.parse(read('src/generated/tutorial-cards.json'));
 	const posts = JSON.parse(read('src/generated/posts.json'));
 	// Every tutorial and post git holds is dated by the commit that added it; one written since has no date yet.
-	const held = new Set(execFileSync('git', ['ls-files', 'tutorials', 'docs/posts'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' }).split('\n'));
+	// What a commit holds, not the index, where a file staged before its first commit already stands.
+	const held = new Set(execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', 'tutorials', 'docs/posts'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' }).split('\n'));
 	for (const entry of [...tutorials, ...posts]) assert.equal(Boolean(entry.published), held.has(entry.source), entry.source);
 	const page = read('dist/index.html');
 	const listed = [...page.matchAll(/<a class="latest-link" href="\/([^"]+)\/">(.*?)<\/a>/gs)].map(([, slug, inner]) => ({
