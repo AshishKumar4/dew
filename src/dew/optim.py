@@ -52,7 +52,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes
+from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes, unboxed_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -140,7 +140,7 @@ def muon_partition(params) -> dict[str, str]:
     AltUp matrices are), takes Linen's kernel convention, contracting axis 0
     into axis 1.
     """
-    return {jax.tree_util.keystr(path): reason
+    return {jax.tree_util.keystr(unboxed_path(path)): reason
             for path, (_, reason) in _placements(params).items()}
 
 

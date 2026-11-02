@@ -531,6 +531,14 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
     return decorate
 
 
+def unboxed_path(path) -> tuple:
+    """A leaf's key path with a boxed parameter's `.value` (`nn.LogicallyPartitioned`'s) dropped: the
+    path of the parameter the box holds."""
+    path = tuple(path)
+    boxed = path and isinstance(path[-1], jax.tree_util.GetAttrKey) and path[-1].name == "value"
+    return path[:-1] if boxed else path
+
+
 def parameter_path(path) -> Suffix:
     """The parameter's own path: the trailing run of dict keys under a leaf, a boxed parameter's value
     (`.value` under its `nn.LogicallyPartitioned`) read as the parameter it holds.
@@ -538,11 +546,8 @@ def parameter_path(path) -> Suffix:
     An optimizer state nests a copy of the parameter tree inside its own
     structure, so what identifies a parameter is where its path ends.
     """
-    path = tuple(path)
-    if path and isinstance(path[-1], jax.tree_util.GetAttrKey) and path[-1].name == "value":
-        path = path[:-1]
     names = []
-    for entry in reversed(path):
+    for entry in reversed(unboxed_path(path)):
         if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
             break
         names.append(entry.key)
