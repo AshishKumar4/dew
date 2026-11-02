@@ -12,6 +12,7 @@ its logits are the model's without it. The objective that steps it in context is
 """
 
 import dataclasses
+import math
 from collections.abc import Callable
 
 import flax.linen as nn
@@ -19,15 +20,15 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.activations import activation
+from dew.nn.activations import SLOPES, activation
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
-from dew.quantization import quantized_products
+from dew.quantization import InputQuantizer, quantized_products
 
-Rounding = Callable[[jax.Array], jax.Array]
-"""A map's input as its product reads it: a checkpoint's quantizer's round trip (`InputQuantizer.qdq`)."""
+Quantizers = Callable[[nn.Module], InputQuantizer | None]
+"""A model's checkpoint quantizer of a layer's input (`CausalTransformer._quantizer`), None for none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,19 +95,27 @@ class Continuum(nn.Module):
         forward)."""
         return quantized_products(self, name).inputs
 
-    def step_terms(self, x: jax.Array, parts: tuple[str, ...], down_input: Rounding | None = None,
-                   up_input: Rounding | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
+                   ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
         (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
-        `down` and `up` multiply them (`down_input`, `up_input`: a checkpoint's quantizer of the map's
-        input, none where None), and the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`,
-        an adapter's update on it included), at least its spectral norm; in at least fp32.
+        `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
+        for none), the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`, an adapter's
+        update on it included), at least its spectral norm, in at least fp32; and the activation's bounds
+        p1, p2 on |act'| and |act''| (`SLOPES`).
 
         A map whose product rounds its kernel (Qwix's quantized weights) makes the loss piecewise constant
         in that kernel, and an `up` that computes other than the linear map of its input by its kernel
         (`nonlinear_input`, or its kernel rounded) makes the level's output piecewise constant in `down`,
         through its rounding of f: the gradient jumps at every rounding boundary, and no curvature bounds
-        a step there, refused. A quantizer of `down`'s input rounds the states, which no step moves."""
+        a step there, refused, as is a step of `down` through an activation whose act'' no number bounds
+        (ReLU's, a point mass at zero). A quantizer of `down`'s input rounds the states, which no step
+        moves."""
+        p1, p2 = SLOPES[activation(self.level.activation)]
+        if "down" in parts and p2 is None:
+            raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
+                             "activation's second derivative, which a ReLU has none of (a point mass at "
+                             "zero), so no rate bounds it there: select=('up',), or a smooth activation")
         for name in parts:
             if quantized_products(self, name).weights:
                 raise ValueError(f"a damped step of the level's `{name}` bounds the loss's curvature in its "
@@ -118,10 +127,39 @@ class Continuum(nn.Module):
                              "map `up` applies to f = act(D x), and this call's `up` rounds its input or its "
                              "kernel, making the level's output piecewise constant in `down`, which no "
                              "curvature bounds: select=('up',), or step it undamped")
-        wide = at_least_fp32(x.dtype)
-        read = x if down_input is None else down_input(x)
-        hidden = activation(self.level.activation)(self.down(x))
-        fed = hidden if up_input is None else up_input(hidden)
-        kernel = self.applied_kernel("up").astype(wide)
-        return (jnp.sum(jnp.square(read.astype(wide)), axis=-1),
-                jnp.sum(jnp.square(fed.astype(wide)), axis=-1), jnp.sqrt(jnp.sum(jnp.square(kernel))))
+
+        def read(value: jax.Array, layer: nn.Module) -> jax.Array:
+            rounding = quantizer(layer)
+            return (value if rounding is None else rounding.qdq(value)).astype(at_least_fp32(x.dtype))
+
+        fed = read(activation(self.level.activation)(self.down(x)), self.up)
+        kernel = self.applied_kernel("up").astype(at_least_fp32(x.dtype))
+        return (jnp.sum(jnp.square(read(x, self.down)), axis=-1), jnp.sum(jnp.square(fed), axis=-1),
+                jnp.sqrt(jnp.sum(jnp.square(kernel))), p1, p2 or 0.0)
+
+
+def head_loss_bounds(table: jax.Array, softcap: float | None = None, transform: tuple | None = None
+                     ) -> tuple[jax.Array, jax.Array]:
+    """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states a
+    head reads, `table` the squared Frobenius norm |A|^2 of its rows A, at least the spectral: an affine
+    head's are |A|^2 / 2 and sqrt 2 |A| (the cross entropy's Hessian in the logits is at most 1/2, its
+    gradient p - y at most sqrt 2); a logit `softcap` c tanh(u / c), of slope at most 1, adds
+    |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign; a `transform` N(phi(D s)) before A, given as
+    ((p1, p2), |D|^2, g, e) with N a norm of largest gain g and epsilon e and p1, p2 phi's `SLOPES`, has a
+    Jacobian of at most |g| p1 |D| / sqrt e and a second derivative of at most
+    |g| (6 p1^2 / e + p2 / sqrt e) |D|^2 (a norm's are |g| / sqrt e and 6 |g| / e). Constants of the step,
+    not differentiated (`dew.objectives.lm.adaptation.damping`)."""
+    curvature, slope = table / 2, jnp.sqrt(2 * table)
+    if softcap is not None:
+        curvature = table * (0.5 + 4 / (3 * math.sqrt(3) * softcap))
+    if transform is not None:
+        (p1, p2), spread, gain, epsilon = transform
+        jacobian = jnp.sqrt(gain ** 2 * p1 ** 2 * spread / epsilon)
+        bent = gain * (6 * p1 ** 2 / epsilon + (p2 or 0) / math.sqrt(epsilon)) * spread
+        curvature, slope = jacobian ** 2 * curvature + slope * bent, jacobian * slope
+    return jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope)
+
+
+def squared_norm(value: jax.Array) -> jax.Array:
+    """The sum of `value`'s squares, in at least fp32: a matrix's squared Frobenius norm."""
+    return jnp.sum(jnp.square(value.astype(at_least_fp32(value.dtype))))

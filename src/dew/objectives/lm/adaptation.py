@@ -61,7 +61,7 @@ class ChunkAdaptation:
     of the window's loss in them along the step (`damping`): rate times L stays below 1, so a step never
     overshoots, whatever the rate. The level reads s = x + U f, f = act(D x); with Ls and Gs the head's
     bounds on a slot loss's curvature and slope in s (`SteppedInContext.head_bounds`), and p1, p2 the
-    activation's on |act'| and |act''| (`level_slopes`), a slot's curvature is at most
+    activation's on |act'| and |act''| (`level_terms`), a slot's curvature is at most
     Ls (|U|^2 p1^2 |x|^2 [D steps] + |f|^2 [U steps]) + Gs (|U| p2 |x|^2 [D steps] + p1 |x| [both step]),
     |U| and |f| taken at their largest along the window's step (`stepped`), summed over the window by its
     weights, x and f as `down` and `up` multiply them (a checkpoint's quantizer of their inputs applied),
@@ -204,25 +204,20 @@ TERMS = 4
 
 def damping(model: nn.Module, variables, start, hidden, weights, adaptation: ChunkAdaptation):
     """A damped step's bounds (`ChunkAdaptation.damped`): the head's on a slot loss's curvature and slope
-    in the states (`SteppedInContext.head_bounds`), the norm of the level's start's output map, and each
-    slot's weighted terms `[B, S, TERMS]` at the level's start (`level_terms`, of the parts that step),
-    whose window sums set its rate (`step_rate`); zeros for an undamped step. A step of `down` under an
-    activation whose act'' no number bounds is refused (ReLU's, a point mass at zero)."""
+    in the states (`SteppedInContext.head_bounds`), the norm of the level's start's output map and its
+    activation's p1, p2, and each slot's weighted terms `[B, S, TERMS]` at the level's start
+    (`level_terms`, of the parts that step, which refuses what no curvature bounds), whose window sums
+    set its rate (`step_rate`); zeros for an undamped step."""
     if not adaptation.damped:
         zero = jnp.zeros((), jnp.float32)
-        return zero, zero, zero, jnp.zeros((*weights.shape, TERMS), jnp.float32)
+        return zero, zero, zero, zero, zero, jnp.zeros((*weights.shape, TERMS), jnp.float32)
     parts = damped_parts(start, adaptation)
-    if "down" in parts and model.level_slopes()[1] is None:
-        raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
-                         "activation's second derivative, which a ReLU has none of (a point mass at zero), "
-                         "so no rate bounds it there: select=('up',), or a smooth activation")
     curvature, slope = _arrays(model.apply(variables, method="head_bounds"))
     held = model.with_in_context_level(variables, start)
-    squares, inputs, norm = _arrays(model.apply(held, hidden, parts, method="level_terms"))
+    squares, inputs, norm, p1, p2 = _arrays(model.apply(held, hidden, parts, method="level_terms"))
     lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
     terms = jnp.stack([squares, inputs, fed * lengths, lengths], axis=-1)
-    return (jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope), jax.lax.stop_gradient(norm),
-            jax.lax.stop_gradient(weights[..., None] * terms))
+    return jax.lax.stop_gradient((curvature, slope, norm, p1, p2, weights[..., None] * terms))
 
 
 def _arrays(applied) -> tuple[jax.Array, ...]:
@@ -230,19 +225,17 @@ def _arrays(applied) -> tuple[jax.Array, ...]:
     return tuple(jnp.asarray(value) for value in applied)
 
 
-def step_rate(model: nn.Module, adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums,
-              moved, gradient):
+def step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums, moved, gradient):
     """A damped window's rate per row, rate / (1 + rate L), L its loss's curvature bound along the step
     (`ChunkAdaptation.damped`): the window's `sums` `[B, TERMS]` of its slots' terms, `bounds` the head's
-    curvature and slope and the start's output-map norm (`damping`), `moved` per row the Frobenius norms
-    `down` and `up` have moved from the start before the window, and `gradient` the window's. A part's
-    largest norm along the step is its start's plus what it moved and what this step moves it at most,
-    the rate times its gradient's norm. The rate is a constant of the step, as its bound is: the outer
-    gradient flows through the step's gradient, not through the bound it reads (whose distances are
-    zero at a run's start, where their root has no derivative)."""
-    curvature, slope, norm = bounds
+    curvature and slope, the start's output-map norm and its activation's p1, p2 (`damping`), `moved` per
+    row the Frobenius norms `down` and `up` have moved from the start before the window, and `gradient`
+    the window's. A part's largest norm along the step is its start's plus what it moved and what this
+    step moves it at most, the rate times its gradient's norm. The rate is a constant of the step, as its
+    bound is: the outer gradient flows through the step's gradient, not through the bound it reads (whose
+    distances are zero at a run's start, where their root has no derivative)."""
+    curvature, slope, norm, p1, p2 = bounds
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(TERMS))
-    p1, p2 = model.level_slopes()
     rate = adaptation.rate
 
     def reach(part: str) -> jax.Array:
@@ -258,7 +251,7 @@ def step_rate(model: nn.Module, adaptation: ChunkAdaptation, parts: tuple[str, .
     stretch = jnp.zeros_like(squares)
     if "down" in parts:
         stretch = stretch + output ** 2 * p1 ** 2 * squares
-        bend = bend + output * (p2 or 0.0) * squares
+        bend = bend + output * p2 * squares
     if "up" in parts:
         stretch = stretch + inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares
         if "down" in parts:
@@ -312,7 +305,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
         rate = None
         if adaptation.damped:
             moved = {part: _distance(level[part]["kernel"], started[part]["kernel"]) for part in parts}
-            rate = step_rate(model, adaptation, parts, bounds, energy, moved, gradient)
+            rate = step_rate(adaptation, parts, bounds, energy, moved, gradient)
 
         def step(leaf, grad, moves):
             if not moves:

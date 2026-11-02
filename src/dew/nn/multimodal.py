@@ -553,11 +553,6 @@ class MultimodalTransformer(DecoderWrapper):
         (`SteppedInContext`)."""
         return self.language_model.level_terms(hidden, parts)
 
-    @nn.nowrap
-    def level_slopes(self) -> tuple[float, float | None]:
-        """The decoder's level's activation's derivative bounds (`SteppedInContext`)."""
-        return self.language_model.level_slopes()
-
     def head_logits(self, states):
         """The decoder's head over states its continuum level already read (`SteppedInContext`)."""
         return self.language_model.head_logits(states)

@@ -606,7 +606,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     gradient = jax.grad(loss)(kernels, variables, states, weighed)
     *bounds, terms = damping(model, variables, level, states, weighed, adaptation)
     moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
-    damped = float(step_rate(model, adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
+    damped = float(step_rate(adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
