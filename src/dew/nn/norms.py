@@ -272,6 +272,41 @@ class RMSNorm(nn.Module):
         return stream, normed.reshape(stream.shape)
 
 
+class NormGate(nn.Module):
+    """A norm's low-rank gate: `fc2(silu(fc1(y)))` of the normed `y`, unbiased, `rank` wide between
+    (A.X-K2's AXK2GateMLP, modeling_axk2.py:72-84)."""
+
+    rank: int
+    dtype: Dtype | None = None
+
+    @nn.compact
+    def __call__(self, y):
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype)
+        return dense(y.shape[-1], name='fc2')(nn.silu(dense(self.rank, name='fc1')(y)))
+
+
+class GatedRMSNorm(nn.Module):
+    """An RMS norm whose output its own low-rank gate scales: `y = norm(x)`, then `y * sigmoid(gate(y))`
+    in at least fp32, rounded once to `y`'s dtype (A.X-K2's AXK2GatedRMSNorm, modeling_axk2.py:87-101,
+    Megatron's GatedNormWrapper). `norm` is the `RMSNorm` it gates, built under the name `norm`; the gate
+    is `NormGate` under `mlp`, as the checkpoint names them."""
+
+    rank: int
+    norm: Callable[..., RMSNorm]
+    dtype: Dtype | None = None
+
+    def __call__(self, x, *, axes=None):
+        return self.seam(x, axes=axes)[1]
+
+    @nn.compact
+    def seam(self, x, branch=None, *, axes=None):
+        """The residual seam of its norm (`RMSNorm.seam`), its normed output gated."""
+        stream, normed = self.norm(name='norm').seam(x, branch, axes=axes)
+        gate = NormGate(self.rank, dtype=self.dtype, name='mlp')(normed)
+        wide = at_least_fp32(normed.dtype)
+        return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
+
+
 class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps

@@ -33,7 +33,7 @@ from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
 from dew.interop.unread import Stored, held
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import Mixture, NormSpec
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mla import MultiHeadLatentAttention
 
@@ -637,6 +637,67 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
     normed at their own epsilon, which the mixer holds at `MultiHeadLatentAttention.norm_eps`, and its
     scale takes the yarn ramp's mscale off its config's rope record, the rotary's (`_rope`), as the
     mixer's does off the layer's."""
+    return _latent_attention(view, interleave=bool(view.config.rope_interleave))
+
+
+def _read_gated_latent_attention(view: PartView) -> Mapping[str, object]:
+    """A.X-K2's latent attention: DeepSeek V3's (`_latent_attention`) through its query latent, its rope
+    heads always rotated in interleaved pairs, the latent's normed and raw values projected together to
+    each head's query and a gate (`q_gate_proj`), the heads' output times that gate's sigmoid in float32
+    before `o_proj` (`attn_gate_fused`), beside DeepSeek V3.2's lightning indexer (its own class, compared
+    by its code), which selects `index_topk` keys a query, its rotary turning halves."""
+    if view.q_lora_rank is None:
+        raise Ambiguous("the fused query and gate project a query latent, which this attention lacks")
+    fields = dict(_latent_attention(view, interleave=True))
+    mixer = dict(_records.record(fields['mixer'], 'mixer'))
+    indexer = view.indexer
+    mixer['fields'] = {**_records.record(mixer['fields'], 'fields'), 'attn_gate_fused': True,
+                       'index_topk': int(indexer.index_topk), 'index_n_heads': int(indexer.n_heads),
+                       'index_head_dim': int(indexer.head_dim), 'index_rope_interleave': False}
+    return {**fields, 'mixer': mixer}
+
+
+def _read_indexer_norm(view: PartView) -> Mapping[str, object]:
+    """The lightning indexer's key norm: torch's LayerNorm with its weight and bias at 1e-6, which Dew's
+    indexer holds (`dew.nn.mla.SparseIndexer`)."""
+    if not view.elementwise_affine or view.bias is None or float(view.eps) != 1e-6:
+        raise Ambiguous("the indexer's key norm is not an affine LayerNorm at 1e-6")
+    return {}
+
+
+def _read_gated_norm_layer(view: PartView) -> Mapping[str, object]:
+    """A.X-K2's layer: Llama's, its norms each an RMS norm or one gated by a low-rank map of its own output
+    (AXK2GatedRMSNorm, its gate `mlp`): before its attention on every layer, before its feed-forward on its
+    routed layers alone; a per-layer fact of each gated norm's rank (`_with_norm_gates`)."""
+    gates = {}
+    for site in ('input_layernorm', 'post_attention_layernorm'):
+        children = dict(getattr(view, site).named_children())
+        if 'mlp' in children:
+            gates[site] = int(children['mlp'].fc1.out_features)
+    return {_LAYER: {'norm_gates': gates}} if gates else {}
+
+
+def _read_norm_gate(view: PartView) -> Mapping[str, object]:
+    """A gated norm's gate (AXK2GateMLP): `fc2(silu(fc1(y)))`, unbiased (`dew.nn.norms.NormGate`)."""
+    import torch
+
+    if not isinstance(view.activation_fn, torch.nn.SiLU) or _biased(view.fc1, view.fc2):
+        raise Ambiguous("the norm's gate is not an unbiased silu map")
+    return {}
+
+
+def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
+    """A.X-K2's router: DeepSeek V3's (`_read_grouped_router`), which chooses within groups only where its
+    config states `n_group`."""
+    fields = dict(_records.record(_read_grouped_router(view)[_LAYER], _LAYER))
+    if view.num_group is None:
+        fields.update(groups=1, groups_per_token=1)
+    return {_LAYER: fields}
+
+
+def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, object]:
+    """A DeepSeek V3 latent attention's fields (`_read_latent_attention`), its rope heads rotated in
+    interleaved pairs or halves."""
     if not view.is_causal:
         raise Ambiguous("the attention is not causal")
     nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
@@ -653,7 +714,7 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': bool(view.config.rope_interleave),
+                'rope_interleave': interleave,
                 # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
                 'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
@@ -801,6 +862,7 @@ _APERTUS = 'transformers.models.apertus.modeling_apertus'
 _LAGUNA = 'transformers.models.laguna.modeling_laguna'
 _JAMBA = 'transformers.models.jamba.modeling_jamba'
 _FALCON_H1 = 'transformers.models.falcon_h1.modeling_falcon_h1'
+_AXK2 = 'transformers.models.axk2.modeling_axk2'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -916,6 +978,27 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('moe', f'{_LAGUNA}:LagunaSparseMoeBlock', _SHARED_MOE_CHILDREN, _read_scaled_shared_moe),
     KnownPart('router', f'{_LAGUNA}:LagunaTopKRouter', {}, _read_laguna_router,
               ('weight', 'e_score_correction_bias')),
+    KnownPart('model', f'{_AXK2}:AXK2Model', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('layer', f'{_AXK2}:AXK2DecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
+               **dict.fromkeys(('input_layernorm', 'post_attention_layernorm'),
+                               ('norm', 'gated_block_norm'))},
+              _read_gated_norm_layer),
+    KnownPart('attention', f'{_AXK2}:AXK2Attention',
+              {**dict.fromkeys(('q_a_proj', 'q_gate_proj', 'kv_a_proj_with_mqa', 'kv_b_proj', 'o_proj'),
+                               ('linear',)),
+               **dict.fromkeys(('q_a_layernorm', 'kv_a_layernorm'), ('latent_norm',)),
+               'indexer': ('indexer',)},
+              _read_gated_latent_attention),
+    KnownPart('indexer', f'{_AXK2}:AXK2Indexer',
+              {**dict.fromkeys(('wq_b', 'wk', 'weights_proj'), ('linear',)), 'k_norm': ('indexer_norm',)},
+              _read_nothing),
+    KnownPart('indexer_norm', 'torch.nn:LayerNorm', {}, _read_indexer_norm, ('weight', 'bias')),
+    KnownPart('gated_block_norm', f'{_AXK2}:AXK2GatedRMSNorm', {'norm': ('norm',), 'mlp': ('norm_gate',)},
+              _read_nothing),
+    KnownPart('norm_gate', f'{_AXK2}:AXK2GateMLP', {'fc1': ('linear',), 'fc2': ('linear',)}, _read_norm_gate),
+    KnownPart('router', f'{_AXK2}:AXK2TopkRouter', {}, _read_optionally_grouped_router,
+              ('weight',), state={'e_score_correction_bias': 'e_score_correction_bias'}),
     KnownPart('causal_lm', f'{_FALCON_H1}:FalconH1ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
               _read_multiplied_causal_lm),
     KnownPart('model', f'{_FALCON_H1}:FalconH1Model',
@@ -1287,7 +1370,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads', 'parallel')))
+                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads', 'parallel',
+                                              'norm_gates')))
                   for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
@@ -1306,6 +1390,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
         fields.setdefault('mlp_features', width)
     heads = {layer: facts['heads'] for layer, facts in assembler.layers.items() if 'heads' in facts}
     fields.update(_with_head_counts(fields, heads))
+    gates = {layer: facts['norm_gates'] for layer, facts in assembler.layers.items() if 'norm_gates' in facts}
+    fields.update(_with_norm_gates(fields, gates, routed))
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
@@ -1362,6 +1448,32 @@ def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, ob
                          'fields': {**_records.record(mixer.get('fields', {}), 'fields'), **(held[0] or {})}}
         kinds[name] = kind
     return {'layer_types': tuple(types), 'kinds': kinds}
+
+
+def _with_norm_gates(fields: Mapping[str, object], gates: Mapping[int, object], routed: list[int]
+                     ) -> Mapping[str, object]:
+    """The norms whose outputs a low-rank gate scales (`gates`, by layer, each gated norm's rank by its site,
+    A.X-K2's): each site's `NormSpec` gated at its one rank on every layer, or on the `routed` layers
+    alone; a site gated on other layers, or at several ranks, is `Ambiguous`."""
+    if not gates:
+        return {}
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    held = {layer: _records.record(sites, 'norm_gates') for layer, sites in gates.items()}
+    specs = dict(_records.record(fields.get('norms') or {}, 'norms'))
+    for site in sorted({site for sites in held.values() for site in sites}):
+        ranks = {_records.integer(sites[site], site) for sites in held.values() if site in sites}
+        layers = {layer for layer, sites in held.items() if site in sites}
+        if len(ranks) != 1:
+            raise Ambiguous(f"the {site} norms' gates are {sorted(ranks)} wide")
+        if layers == set(range(count)):
+            which = 'every'
+        elif layers == set(routed):
+            which = 'routed'
+        else:
+            raise Ambiguous(f"the {site} norms are gated on layers {sorted(layers)}: neither every layer nor "
+                            "the routed ones")
+        specs[site] = {**native_fields(NormSpec)(), 'gate_rank': ranks.pop(), 'gated_layers': which}
+    return {'norms': specs}
 
 
 def _with_head_counts(fields: Mapping[str, object], heads: Mapping[int, object]) -> Mapping[str, object]:
@@ -1497,7 +1609,7 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
         leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
-                  **decoder_parts.MAMBA_LEAVES}
+                  **decoder_parts.MAMBA_LEAVES, **decoder_parts.GATED_NORM_LEAVES}
         path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
         parts = canonical.split('.', 4)
         if path is not None and len(parts) == 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():

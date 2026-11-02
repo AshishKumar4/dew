@@ -164,11 +164,14 @@ class ModelSource:
         return self._remote_class('AutoConfig')
 
     def configured(self, fields: Mapping[str, object]) -> PretrainedConfig:
+        """The source's config of `fields`, a config's JSON, its records of infinite floats read back as
+        its own load reads them (`_records.decoded_floats`)."""
         from transformers import AutoConfig
 
+        stated = _records.record(_records.decoded_floats(_records.json_value(fields, 'config')), 'config')
         if 'AutoConfig' not in self.references:
-            return AutoConfig.for_model(self.model_type, **fields)
-        return self.config_class().from_dict(dict(fields))
+            return AutoConfig.for_model(self.model_type, **stated)
+        return self.config_class().from_dict(dict(stated))
 
     def causal_lm(self, config: PretrainedConfig) -> PreTrainedModel:
         """The source's causal LM of `config`, float32, on torch's current device."""

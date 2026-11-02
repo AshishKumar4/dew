@@ -47,6 +47,7 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
+from dew import _records
 from dew.batch import COORDINATES_FIELD, Coordinates, Variables, real_slots, token_coordinates
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
@@ -130,7 +131,8 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
         raise ValueError(f"model_type {model_type!r} is no registered family, no registered family's "
                          f"convention computes it ({detail}), and transformers builds no causal LM for it, "
                          "which tier 3 runs")
-    fields = {key: value for key, value in unmapped.fields.items() if key != "model_type"}
+    fields = {key: _records.decoded_floats(_records.json_value(value, key))
+              for key, value in unmapped.fields.items() if key != "model_type"}
     config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
     _registered()
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
@@ -1508,7 +1510,8 @@ def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
 
     model_type = str(config["model_type"])
     probed = verify.shallow(verify.ModelSource(model_type), verify.shrink(config))
-    fields = {key: value for key, value in probed.items() if key != "model_type"}
+    fields = {key: _records.decoded_floats(_records.json_value(value, key)) for key, value in probed.items()
+              if key != "model_type"}
     stated = AutoConfig.for_model(model_type, **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())

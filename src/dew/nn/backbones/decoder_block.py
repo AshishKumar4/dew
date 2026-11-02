@@ -43,7 +43,7 @@ from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
+from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -63,6 +63,11 @@ class NormSpec:
     scale: bool = True
     offset: bool | None = None
     groups: int = 1
+    gate_rank: int | None = None
+    """Where set, an RMS norm's output scaled by its own low-rank sigmoid gate this wide
+    (`dew.nn.norms.GatedRMSNorm`, A.X-K2's), on the layers `gated_layers` names: 'every' layer, or the
+    'routed' ones alone (A.X-K2 gates its feed-forward's norm where it routes)."""
+    gated_layers: Literal['every', 'routed'] = 'every'
 
 
 NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
@@ -73,21 +78,29 @@ NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_n
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None,
-                 specs: Mapping[str, NormSpec] | None = None) -> Callable[..., nn.Module]:
+                 specs: Mapping[str, NormSpec] | None = None,
+                 routed: bool = False) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
-    `specs` changes it there. 'layer' keeps torch's exact variance, the
-    reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
-    which the vision towers run."""
+    `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated on
+    the layers it names, the `routed` layer's among them or not. 'layer'
+    keeps torch's exact variance, the reference decoders' formula;
+    'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose
+    mean and square reduce in one pass, which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
         eps = epsilon if spec.eps is None else spec.eps
+        gated = spec.gate_rank is not None and (spec.gated_layers == 'every' or routed)
         if kind == 'rms':
-            return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
-                           scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
-                           dtype=dtype, name=name)
+            norm = functools.partial(
+                RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
+                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
+            if gated and spec.gate_rank is not None:
+                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, name=name)
+            return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
+        if spec.gate_rank is not None:
+            raise ValueError(f"{name}, a {kind} norm, takes no gate; a gated norm is an RMS norm's")
         if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
             raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis and a "
                              f"weight offset from one only as a scaled 'layer' norm, not {spec}")
@@ -693,6 +706,12 @@ class DecoderBlock(nn.Module):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+        # A gated norm's gate maps the width down to its rank and back (`dew.nn.norms.NormGate`).
+        for site, spec in (self.norms or {}).items():
+            built = site == 'input_layernorm' or (site == 'post_attention_layernorm'
+                                                  and self.feedforward is not None)
+            if built and spec.gate_rank is not None and (spec.gated_layers == 'every' or self.routed):
+                count += 2 * projection_flops(lengths, self.emb_features, spec.gate_rank)
         if self.laurel_rank is not None:
             count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
         if self.altup is not None:
@@ -732,7 +751,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)
+            dtype=self.dtype, specs=self.norms, routed=self.routed)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None

@@ -125,6 +125,23 @@ def number(value: object, key: str) -> float:
     return finite(value, key)
 
 
+_SPECIAL_FLOATS = {"Infinity": math.inf, "-Infinity": -math.inf, "NaN": math.nan}
+
+
+def decoded_floats(value: JSON) -> JSON:
+    """`value`, a config's JSON, with transformers' records of the floats JSON cannot spell
+    (`{"__float__": "Infinity"}`, `"-Infinity"`, `"NaN"`, `number`) read back as those floats, at any
+    depth, as its own config load reads them before its class sees them
+    (`PreTrainedConfig._dict_from_json_file`, 5.17): what a config class built from a mapping takes."""
+    if isinstance(value, dict):
+        if set(value) == {"__float__"} and value["__float__"] in _SPECIAL_FLOATS:
+            return _SPECIAL_FLOATS[str(value["__float__"])]
+        return {key: decoded_floats(entry) for key, entry in value.items()}
+    if isinstance(value, list):
+        return [decoded_floats(entry) for entry in value]
+    return value
+
+
 def boolean(value: object, key: str) -> bool:
     """One flag field, as JSON's true and false."""
     if not isinstance(value, bool):

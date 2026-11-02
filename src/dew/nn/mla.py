@@ -1057,6 +1057,8 @@ class MLAMixer(MixerBase):
     index_rope_interleave: bool = False
     mla_use_nope: bool = False
     mla_use_output_gate: bool = False
+    attn_gate_fused: bool = False
+    """A.X-K2's fused query and output gate (`MultiHeadLatentAttention.query_gate`), by its config's name."""
     bidirectional_blocks: bool = False
     """A causal dense layer reads each block of a call's `block_groups` whole (the standard kind's flag)."""
     bidirectional_images: bool = False
@@ -1125,4 +1127,5 @@ class MLAMixer(MixerBase):
             attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
             output_gate=self.mla_use_output_gate,
+            query_gate=self.attn_gate_fused,
             kv_cache=ctx.kv_cache)

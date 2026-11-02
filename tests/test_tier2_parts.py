@@ -531,6 +531,19 @@ BUILT_IN = {
     "falcon_h1-no-norm": {"model_type": "falcon_h1", "mamba_d_ssm": 128, "mamba_expand": 2,
                           "mamba_n_heads": 8, "mamba_d_head": 16, "mamba_n_groups": 2, "mamba_d_state": 8,
                           "mamba_chunk_size": 8, "mamba_rms_norm": False, "key_multiplier": 0.25},
+    "axk2": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8, "num_experts_per_tok": 2,
+             "n_shared_experts": 1, "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
+             "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "n_group": 2, "topk_group": 1,
+             "routed_scaling_factor": 1.8, "index_n_heads": 4, "index_head_dim": 16, "index_topk": 6,
+             "gated_norm_rank": 4,
+             "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0, "beta_fast": 32.0,
+                                 "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                                 "original_max_position_embeddings": 16}},
+    "axk2-ungrouped": {"model_type": "axk2", "head_dim": None, "num_key_value_heads": 4,
+                       "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 1, "moe_intermediate_size": 32,
+                       "q_lora_rank": 24, "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
+                       "v_head_dim": 16, "index_n_heads": 4, "index_head_dim": 16, "index_topk": 6,
+                       "gated_norm_rank": 4},
     "laguna-per-channel": {"model_type": "laguna", "gating": "per-element",
                            "layer_types": ["sliding_attention", "full_attention"] * 2,
                            "num_attention_heads_per_layer": [8, 4, 8, 4], "sliding_window": 6,
@@ -563,13 +576,17 @@ between attention layers without positions, every second layer routed by a softm
 whose chosen scores stay unrenormalized (ledger 3080); and Falcon-H1's Mamba-2 beside its attention in
 every layer, under its muP multipliers (its embedding's, its head's, each branch's input and output, its
 keys', its MLP's and its in projection's sections), its Mamba-2 output normed before or after its gate
-(`falcon_h1-norm-first`, with its out projection biased apart) or gated alone (`falcon_h1-no-norm`)
-(ledger 3080)."""
+(`falcon_h1-norm-first`, with its out projection biased apart) or gated alone (`falcon_h1-no-norm`); and
+A.X-K2's latent attention, its query latent's normed and raw values projected together to its queries and
+an output gate, beside DeepSeek V3.2's indexer selecting six keys a query, its norms before its attention
+and before its routed feed-forwards gated by a low-rank map of their own output, its experts chosen within
+groups or (`axk2-ungrouped`) not (ledger 3080)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
                   "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8, "laguna": 8, "laguna-per-channel": 8,
-                  "jamba": 8, "falcon_h1": 8, "falcon_h1-norm-first": 8, "falcon_h1-no-norm": 8}
+                  "jamba": 8, "falcon_h1": 8, "falcon_h1-norm-first": 8, "falcon_h1-no-norm": 8,
+                  "axk2": 8, "axk2-ungrouped": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -761,26 +778,47 @@ FALCON_H1_3B = {
     "vocab_size": 65537}
 """tiiuae/Falcon-H1-3B-Instruct's released config."""
 
+AXK2_RELEASE = {
+    "architectures": ["AXK2ForCausalLM"], "model_type": "axk2", "attention_bias": False,
+    "attention_dropout": 0.0, "attention_output_gate": True, "attn_gate_fused": True, "bos_token_id": 163691, "dtype": "bfloat16",
+    "eos_token_id": 163704, "first_k_dense_replace": 1, "gated_norm": True, "gated_norm_rank": 16,
+    "hidden_act": "silu", "hidden_size": 7168, "index_head_dim": 128, "index_n_heads": 64, "index_topk": 2048,
+    "initializer_range": 0.02, "intermediate_size": 18432, "kv_lora_rank": 512,
+    "max_position_embeddings": 262144, "moe_intermediate_size": 2048, "moe_layer_freq": 1, "n_group": 8, "n_routed_experts": 256,
+    "n_shared_experts": 1, "norm_topk_prob": True, "num_attention_heads": 64, "num_experts_per_tok": 8,
+    "num_hidden_layers": 61, "num_key_value_heads": 64, "num_nextn_predict_layers": 0, "pad_token_id": 163692,
+    "q_lora_rank": 1536, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64,
+    "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                            "weight_block_size": [128, 128],
+                            "modules_to_not_convert": ["lm_head", "W_up", "W_down", "weights_proj"]},
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000, "factor": 2.0, "beta_fast": 32.0,
+                        "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
+                        "original_max_position_embeddings": 131072},
+    "routed_scaling_factor": 2.5, "scoring_func": "sigmoid", "tie_word_embeddings": False, "topk_group": 4,
+    "topk_method": "noaux_tc", "use_cache": True, "v_head_dim": 128, "vocab_size": 163840}
+"""skt/A.X-K2's released config."""
 
-@pytest.mark.parametrize("released", [LAGUNA_XS, JAMBA_REASONING, FALCON_H1_3B],
-                         ids=["laguna", "jamba", "falcon_h1"])
+
+@pytest.mark.parametrize("released", [LAGUNA_XS, JAMBA_REASONING, FALCON_H1_3B, AXK2_RELEASE],
+                         ids=["laguna", "jamba", "falcon_h1", "axk2"])
 def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
     """A release's config verifies from parts at the probe's sizes: Laguna-XS.2's 40 layers cut to the
     five that hold each kind (`verify.shallow`), each layer's query heads shrunk with its key heads, so
     its full and sliding layers keep their own counts; Jamba-Reasoning-3B's 28 cut to the eight that hold
-    its Mamba layers and its first attention layer; Falcon-H1-3B's, every layer Mamba-2 beside attention
-    (ledgers 3070, 3080)."""
+    its Mamba layers and its first attention layer; Falcon-H1-3B's, every layer Mamba-2 beside attention;
+    A.X-K2's 61 cut to its dense first and a routed one, its fp8 codec aside (ledgers 3070, 3080)."""
     verdict = verify_mapping(released)
     assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
 
 
-@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first"])
+@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba", "falcon_h1-norm-first", "axk2"])
 def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
     """Apertus's xIELU parameters and the buffers Dew holds as constants, GLM-4's fused gate and up
     Linear, which a load reads as two projections, Laguna's gate projection, router bias and shared
-    expert, which its load renames, and Jamba's Mamba mixers and routers and Falcon-H1's mixers side by
-    side, save back under their stored names bit for bit, the buffers in their stored dtype (ledgers 3076,
-    3077, 3070, 3080)."""
+    expert, which its load renames, Jamba's Mamba mixers and routers, Falcon-H1's mixers side by side and
+    A.X-K2's fused query and gate and gated norms, which its load renames, save back under their stored
+    names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
     from interop_support import tiny_config
     from safetensors.numpy import load_file
     from transformers import AutoModelForCausalLM
