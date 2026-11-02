@@ -801,6 +801,20 @@ def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compi
     assert compiled_in(tmp_path / "computes") == []
     with pytest.raises(FileNotFoundError):
         compiled_in(tmp_path / "never-made")
+    # A dump directory that is a link elsewhere is refused at both ends, and one that takes no file at the
+    # start.
+    (tmp_path / "linked").mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "linked" / "xla").symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(ValueError, match="link"):
+        dumps(tmp_path / "linked", {})
+    (tmp_path / "linked" / "mosaic").mkdir()
+    with pytest.raises(ValueError, match="link"):
+        compiled_in(tmp_path / "linked")
+    (tmp_path / "locked" / "xla").mkdir(parents=True)
+    (tmp_path / "locked" / "xla").chmod(0o500)
+    with pytest.raises(PermissionError):
+        dumps(tmp_path / "locked", {})
 
 
 def test_a_flag_given_twice_is_read_by_its_order():
