@@ -704,9 +704,9 @@ def test_the_settings_a_pytest_a_test_runs_in_its_process_reads_are_the_tests_in
 
 def test_the_registrations_a_conftests_configure_reads_are_every_files_input(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A conftest's own pytest_configure reading the marker registrations (`config.getini("markers")`) makes them
-    an input of the files it configures (review: a conftest's hook ran before the recorder's, and its read went
-    unseen), so a registration it needs reruns them when it changes."""
+    """A conftest's own pytest_configure reading the marker registrations (`config.getini("markers")`) makes
+    them an input of the files it configures (review: a conftest's hook ran before the recorder's, and its read
+    went unseen), so a registration it needs reruns them when it changes."""
     project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
     (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
