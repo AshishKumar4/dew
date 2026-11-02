@@ -768,12 +768,15 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
         5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
-        temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); otherwise (the accurate form, a hooked
-        or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds,
-        a call over key spans, windows, documents or runs, whose one launch is on par but the slower: row
-        3171's packed windowed call, 1 x 1024, 8 query heads over 2, its step 0.082 ms against the two
-        launches' 0.062 at width 64 and 0.106 against 0.073 at 128, ET-SPAN-h100, its dK and dV wrong there
-        before row 3180's fix) two launches, the dQ launch then the keys-first dK/dV one, in a fixed order."""
+        temporaries against 258 at llama-d128 2 x 4096, its dQ fp32), a call over key spans, windows,
+        documents or runs as a plain one (ET-CROSS-h100 and ET-SPAN4-h100, the attention launches a training
+        step: Qwen3-8B's heads over four documents 0.67 to 0.72 times the two launches' from 1 x 1024 to
+        8192, under a causal window of 4096 at 8192 0.65; width 64's 8 heads over 2 0.56 to 0.88, 16 over
+        16 under the window 0.54; check 1 over documents and a window at 1 x 2048; of every call measured,
+        row 3171's toy one alone the slower, 1 x 1024 over three short documents and a window of 256,
+        1.38 times: 20 us a step); otherwise (the accurate form, a hooked or dropping call, deterministic
+        mode, `deterministic_ops_requested`, a width no fused launch holds) two launches, the dQ launch then
+        the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -786,7 +789,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
         dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
-        if not deterministic_ops_requested() and self.form != "spans":
+        if not deterministic_ops_requested():
             # Legal where the form, the hooks, the widths and the registers allow (`legal`): of the one
             # launch keys first and queries first, the larger query tile (`_derived`'s order).
             found = []
