@@ -699,6 +699,19 @@ splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and value
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py).
 
+A derived algebra's laws are proven before its forms ship (`laws.py`): identity, associativity, consistency
+(a tile folded into a state is a walk of it merged), and the declared function (a walk of two tiles finishes
+as the function of them joined, an output along the walk each tile's own joined). Together they make a
+walk's result independent of its chunking and its merge tree. The proof is over the reals: the forms traced
+and evaluated over SymPy symbols, a float's largest read as a finite value below every other (the empty
+state's anchor), each comparison decided both ways and each maximum by each order of its arguments, and
+the two sides' difference zero as a rational function of exponentials. A declaration that carries no state
+(a tile's) is certified tile by tile. Extraction is priced, so a declaration's forms can take another
+structure at another tile. The suite enumerates every tile the mainloops' derivations emit for an A100, an
+H100 and an RTX PRO 6000 and certifies each distinct structure at a small tile of it, each axis's extent
+past one and the kernel tile's equal extents equal (tests/test_algebra_laws.py). No proof runs at trace
+time.
+
 Behind the one switch (`dew.algebra.forms.derived`, in JAX's trace context), the templates take their derived
 forms where the declarations state the walk:
 
