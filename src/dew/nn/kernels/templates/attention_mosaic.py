@@ -533,10 +533,12 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s) by lifetime (`Family.lifetimes`),
-    with its `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    with the algebra's reductions' scratch and its `reducing_warpgroups`' scratch (`resources.Scope`):
+    every attention launch reduces its scores, weights or cotangents."""
     scoped, streams = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *held), walks=walks, reducing_warpgroups=reducing_warpgroups)
+    return resources.Scope(program=(scoped, *held), walks=walks, reduces=True,
+                           reducing_warpgroups=reducing_warpgroups)
 
 
 DQ_ROWS = 7
