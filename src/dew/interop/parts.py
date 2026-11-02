@@ -472,7 +472,9 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': bool(view.config.rope_interleave)}}}
+                'rope_interleave': bool(view.config.rope_interleave),
+                # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
+                'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
 
 def _read_shared_moe(view: PartView) -> Mapping[str, object]:
@@ -500,10 +502,11 @@ def _read_rms_norm(view: PartView) -> Mapping[str, object]:
 
 
 def _read_latent_norm(view: PartView) -> Mapping[str, object]:
-    """A latent attention's norm (Llama's RMSNorm): the latent mixer norms at the block norms' rounding
-    (`MLAMixer.build` passes the layer's), so it states that rounding, which the block norms' must agree
-    with; its epsilon the attention's reader holds to the mixer's own."""
-    return {'scale_after_cast': True, 'scale_offset': False}
+    """A latent attention's norm (Llama's RMSNorm, the one class the `latent_norm` role admits): its
+    rounding the latent mixer's own (`_read_latent_attention` states `latent_scale_after_cast` and
+    `latent_scale_offset` as this class computes), whatever the block norms' is (ledger 3114); its
+    epsilon the attention's reader holds to the mixer's own."""
+    return {}
 
 
 def _read_offset_norm(view: PartView) -> Mapping[str, object]:

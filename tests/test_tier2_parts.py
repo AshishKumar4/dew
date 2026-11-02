@@ -83,6 +83,55 @@ class MixedConfig(LlamaConfig):
     router_jitter_noise: float = 0.0
 '''
 
+LATENT = '''
+from torch import nn
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
+from transformers.models.olmo2.modeling_olmo2 import Olmo2DecoderLayer, Olmo2ForCausalLM, Olmo2Model
+
+from .configuration_latent import LatentConfig
+
+
+class LatentDecoderLayer(Olmo2DecoderLayer):
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        self.self_attn = DeepseekV3Attention(config, layer_idx)
+
+
+class LatentModel(Olmo2Model):
+    config_class = LatentConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.layers = nn.ModuleList(LatentDecoderLayer(config, index)
+                                    for index in range(config.num_hidden_layers))
+        self.post_init()
+
+
+class LatentForCausalLM(Olmo2ForCausalLM):
+    config_class = LatentConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LatentModel(config)
+        self.post_init()
+'''
+"""A decoder of DeepSeek V3's latent attention, its latents normed by Llama's RMSNorm, inside OLMo 2's
+output-normed layers of scale-first norms (ledger 3114), as remote code."""
+
+LATENT_CONFIG = '''
+from transformers.models.olmo2.configuration_olmo2 import Olmo2Config
+
+
+class LatentConfig(Olmo2Config):
+    model_type = "latent_olmo"
+    q_lora_rank: int | None = 24
+    kv_lora_rank: int = 16
+    qk_nope_head_dim: int = 16
+    qk_rope_head_dim: int = 8
+    v_head_dim: int = 16
+    rope_interleave: bool = True
+'''
+
 RENAMED_CONFIG = '''
 from transformers.models.llama.configuration_llama import LlamaConfig
 
@@ -140,14 +189,17 @@ SOURCES = {
     "mixed": ("mixed_parts", "mixed", lambda: MIXED, MIXED_CONFIG, "MixedConfig", "MixedForCausalLM"),
     "renamed-moe": ("renamed_moe", "renamedmoe", _renamed_mixtral, RENAMED_MOE_CONFIG, "RenamedMoeConfig",
                     "RenamedmoeForCausalLM"),
+    "latent": ("latent_olmo", "latent", lambda: LATENT, LATENT_CONFIG, "LatentConfig", "LatentForCausalLM"),
 }
 """Each source: its model_type, its modules' stem (`modeling_<stem>.py` and `configuration_<stem>.py`), its
 modeling code, its configuration code, and its config and causal LM classes."""
 
-FIELDS = {"renamed-moe": {"tie_word_embeddings": True}}
+FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
+          # The rotary turns DeepSeek's rotated slice of each head (`qk_rope_head_dim`).
+          "latent": {"head_dim": 8, "num_key_value_heads": 4}}
 """Each source's config fields beside `TINY`."""
 
-SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8}
+SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8}
 """Each source's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
