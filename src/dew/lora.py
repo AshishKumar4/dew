@@ -49,6 +49,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
@@ -86,7 +87,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, unboxed
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -211,7 +212,7 @@ class LoRA:
 
         _refuse_unadaptable(model)
         # A draw boxes the parameters its modules declare the axes of; the adapter reads their values.
-        variables = unboxed(variables)
+        variables = nn.unbox(variables)
         if fp8_base is not None:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -683,7 +684,7 @@ class _Branch:
             if target is None:
                 return kernel
             child = getattr(module, name)
-            a, b = (unboxed(child.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
+            a, b = (meta.unbox(child.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
             return _updated(kernel, a, b, _scale(target, self.rslora))
         target = (_target_at(self.targets, root + module.path)
                   if context.method_name in ("__call__", "_linear") else None)
@@ -698,15 +699,14 @@ class _Branch:
             raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
-            a, b = (unboxed(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
+            a, b = (meta.unbox(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
         else:
-            # Each factor declares its kernel's axes on its side of the rank, where its kernel declares them.
+            # Each factor declares its kernel's axes on its side of the rank, as its kernel's box names
+            # them (`nn.get_partition_spec`, empty for a kernel that names none).
             kernel = module.get_variable("params", "kernel")
-            names = kernel.names if isinstance(kernel, nn.LogicallyPartitioned) else None
-            shape = unboxed(kernel).shape
+            names, shape = tuple(nn.get_partition_spec(kernel)), meta.unbox(kernel).shape
             sides = {"lora_A": (*shape[:len(axes)], target.rank), "lora_B": (target.rank, *shape[len(axes):])}
-            a, b = (module.param(factor, declared(init, None if names is None
-                                                  else factor_axes(names, factor, len(sides[factor]))),
+            a, b = (module.param(factor, declared(init, factor_axes(names, factor, len(sides[factor]))),
                                  sides[factor], FACTOR_DTYPE)
                     for factor, init in zip(LOW_RANK_FACTORS, (INIT_A, INIT_B), strict=True))
         # The branch drops out its input when the forward carries the
@@ -1072,7 +1072,7 @@ def bound_layouts(model: nn.Module, variables: Variables,
         return layouts
     # A draw boxes the kernels its modules declare the axes of; their shapes are their values'.
     derived = {".".join(module): _kernel_layout(module, kernel)
-               for module, kernel in _kernels(unboxed(variables).get("params", {}), ())
+               for module, kernel in _kernels(nn.unbox(variables).get("params", {}), ())
                if kernel.ndim == 2}
     if not derived:
         raise ValueError(

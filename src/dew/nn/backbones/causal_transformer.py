@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
@@ -104,7 +105,7 @@ from ..precision import (
 from ..progress import Progress
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages, unboxed
+from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
@@ -2112,7 +2113,7 @@ class CausalTransformer(nn.Module):
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
         # `get_variable` hands back the box the kernel was drawn in (`nn.with_logical_partitioning`).
-        return unboxed(getattr(self, name).get_variable("params", "kernel"))
+        return meta.unbox(getattr(self, name).get_variable("params", "kernel"))
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

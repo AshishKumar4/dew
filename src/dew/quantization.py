@@ -68,6 +68,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import core, linen as nn
+from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.batch import Coordinates
@@ -76,7 +77,6 @@ from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
-from dew.nn.sharding import unboxed
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -517,7 +517,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
-        product = product + unboxed(module.get_variable("params", "bias")).astype(jnp.float32)
+        product = product + meta.unbox(module.get_variable("params", "bias")).astype(jnp.float32)
     dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
     return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
 
@@ -1635,7 +1635,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     JAX parameters keep their placement through Qwix's operations.
     """
     # A draw boxes the parameters its modules declare the axes of; Qwix quantizes their values.
-    variables = unboxed(variables)
+    variables = nn.unbox(variables)
     rules = _rules(spec, training=False)
     served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):

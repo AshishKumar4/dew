@@ -631,14 +631,15 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     split keeps every leaf or none, since then there is nothing to split.
     """
     training = (frozenset() if FROZEN not in variables else frozenset(
-        ("params", *keys_of(path)) for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+        ("params", *(entry.key for entry in path))
+        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
     variables = thaw(variables)
 
     def trains(path: Path) -> bool:
         return path in training or trainable(path)
 
     leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trains(("params", *keys_of(path))) for path, _ in leaves)
+    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
     if kept in (0, len(leaves)):
         raise ValueError(
             f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
@@ -716,15 +717,10 @@ def probed(variables: Variables, name: str | None) -> Variables:
     return {**rest, PROBES: variables[PROBES].get(name, variables[PROBES])}
 
 
-def keys_of(path) -> tuple[str, ...]:
-    """The dict keys along a variables tree's leaf `path`: a parameter its module boxed with its axes
-    (`nn.LogicallyPartitioned`, as a draw returns it) is the value under the box, whose `.value` is no key."""
-    return tuple(entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey))
-
-
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
-    """Every leaf of a variables subtree, by its dict-key path (`keys_of`)."""
-    return {keys_of(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+    """Every leaf of a variables subtree, by its dict-key path."""
+    return {tuple(entry.key for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
 
 def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:

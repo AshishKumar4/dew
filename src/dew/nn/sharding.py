@@ -46,7 +46,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import meta
 from flax.typing import Initializer
 
 from dew.batch import FROZEN
@@ -531,23 +530,14 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
     return decorate
 
 
-def unboxed_path(path) -> tuple:
-    """A leaf's key path with a boxed parameter's `.value` (`nn.LogicallyPartitioned`'s) dropped: the
-    path of the parameter the box holds."""
-    path = tuple(path)
-    boxed = path and isinstance(path[-1], jax.tree_util.GetAttrKey) and path[-1].name == "value"
-    return path[:-1] if boxed else path
-
-
 def parameter_path(path) -> Suffix:
-    """The parameter's own path: the trailing run of dict keys under a leaf, a boxed parameter's value
-    (`.value` under its `nn.LogicallyPartitioned`) read as the parameter it holds.
+    """The parameter's own path: the trailing run of dict keys under a leaf.
 
     An optimizer state nests a copy of the parameter tree inside its own
     structure, so what identifies a parameter is where its path ends.
     """
     names = []
-    for entry in reversed(unboxed_path(path)):
+    for entry in reversed(path):
         if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
             break
         names.append(entry.key)
@@ -575,45 +565,12 @@ def declared(init: Initializer, axes: LogicalAxes | None) -> Initializer:
     return init if axes is None else nn.with_logical_partitioning(init, axes)
 
 
-def is_boxed(leaf) -> bool:
-    """Whether `leaf` is a box of axis metadata (`nn.LogicallyPartitioned`), which a tree walk stops at."""
-    return isinstance(leaf, meta.AxisMetadata)
-
-
-def unboxed(tree):
-    """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
-    holds, as it holds it: no constraint its names would apply inside a trace (`LogicallyPartitioned.unbox`)
-    is applied, so a view that restacks or slices the values (`StackView`) computes with them as stored."""
-    def value(leaf):
-        if isinstance(leaf, meta.Partitioned):
-            return leaf.unbox(apply_constraint=False)
-        return leaf.unbox() if isinstance(leaf, meta.AxisMetadata) else leaf
-    return jax.tree.map(value, tree, is_leaf=is_boxed)
-
-
-def rows_boxed(boxed, value):
-    """`value`, cut from `boxed`'s value along its leading axes (a stacked run's row), in `boxed`'s box
-    with the names of the axes it keeps: a box a scan stacked (`metadata_params`) handed back a row a
-    layer."""
-    if not isinstance(boxed, meta.Partitioned):
-        return value
-    kept = boxed.names[len(boxed.names) - np.ndim(value):]
-    return boxed.replace(value=value, names=kept)
-
-
 def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
-    """The axes each parameter a module boxed itself carries
-    (`nn.with_logical_partitioning`), by the parameter's full path,
-    collection first; `nn.unbox` drops them."""
-    table: dict[Suffix, LogicalAxes] = {}
-
-    def visit(path, leaf):
-        if isinstance(leaf, nn.LogicallyPartitioned):
-            table[parameter_path(path)] = tuple(leaf.names)
-
-    jax.tree_util.tree_map_with_path(visit, tree,
-                                     is_leaf=lambda leaf: isinstance(leaf, nn.LogicallyPartitioned))
-    return table
+    """The axes each parameter carries in the box its module drew it in (`nn.with_logical_partitioning`),
+    by its full path, collection first: where a run's table is read off its objective's draw
+    (`Objective.parameter_axes`) and a tree given to `Layout` names its own; `nn.unbox` drops them."""
+    boxes = jax.tree_util.tree_leaves_with_path(tree, is_leaf=lambda leaf: isinstance(leaf, nn.Partitioned))
+    return {parameter_path(path): tuple(box.names) for path, box in boxes if isinstance(box, nn.Partitioned)}
 
 
 def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) -> dict[Suffix, LogicalAxes]:
@@ -673,13 +630,16 @@ def declarations(tree) -> dict[Suffix, LogicalAxes]:
     return table
 
 
-def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
+def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes | None:
     """The axes of a layer's low-rank `factor` (`LOW_RANK_FACTORS`) of `ndim` dimensions, under a
     kernel declared `kernel`: `lora_A`'s are the kernel's leading `ndim - 1` axes, its inputs, then
-    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs.
-    Read off the factor alone, so a tree holding one factor without the other (an optimizer's
-    masked partition, a parameter group) declares it as the whole adapter does."""
+    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs; none
+    under a kernel its module names no axes of (`kernel` empty). Read off the factor alone, so a tree
+    holding one factor without the other (an optimizer's masked partition, a parameter group) declares
+    it as the whole adapter does."""
     sides = ndim - 1
+    if not kernel:
+        return None
     if not 0 < sides < len(kernel):
         raise ValueError(f"a {factor} of {ndim} dimensions does not split a kernel declared {kernel}")
     if factor == "lora_A":

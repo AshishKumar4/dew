@@ -32,15 +32,7 @@ from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
-from ..sharding import (
-    is_boxed,
-    microbatched,
-    microbatches,
-    pipeline_stage,
-    pipeline_stages,
-    rows_boxed,
-    unboxed,
-)
+from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name, run_period
 
@@ -824,13 +816,13 @@ class StackView:
                             # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
                             row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
                             tree[layer] = _rows(lambda path, leaf, row=row: row(leaf),
-                                                view[f'{prefix}{offset}'])
+                                                view[f'{prefix}{offset}'], 1)
                     continue
                 for stage, names in enumerate(self._outside_names(first, count, prefix)):
                     for offset, layer in enumerate(names):
                         cut = functools.partial(self._leaf, stage, offset if count > 1 else None,
                                                 collection in self.broadcast)
-                        tree[layer] = _rows(cut, view)
+                        tree[layer] = _rows(cut, view, 1 + (self.stages > 1 and count > 1))
             if self.stages > 1 and stages:
                 tree['stages'] = stages
             outside[collection] = tree
@@ -877,12 +869,14 @@ class DecoderBank:
     (`dew.training.execution.resident`)."""
 
 
-def _rows(cut, tree):
-    """`cut(path, leaf)` of each of `tree`'s leaves, a layer's row of a stacked run's: a box a scan
-    stacked (`metadata_params`, as initialization draws a run) keeps the names of the axes the row keeps
-    (`rows_boxed`)."""
-    return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: rows_boxed(leaf, cut(path, unboxed(leaf))), tree, is_leaf=is_boxed)
+def _rows(cut, tree, removed: int):
+    """`cut(path, leaf)` of each of `tree`'s leaves, a layer's row of a stacked run's, which takes off its
+    `removed` leading axes: a box a scan or a stack made (`stack_layers`, `metadata_params`) keeps the
+    names of the axes the row keeps (`meta.remove_axis`), the stacked ones named none."""
+    rows = jax.tree_util.tree_map_with_path(cut, tree)
+    for _ in range(removed):
+        rows = meta.remove_axis(rows, 0, {nn.PARTITION_NAME: None})
+    return rows
 
 
 def _on_stage_axis(leaf):

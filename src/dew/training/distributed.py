@@ -28,7 +28,7 @@ from dew.distributed.placement import Layout, Placement, link_topology
 from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Placements, owned_program
-from dew.nn.sharding import microbatched, unboxed_path
+from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
@@ -312,8 +312,7 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     def variable(path, leaf) -> NamedSharding | None:
         # An initializer binds the checkpoint as `variables`
         # (`Objective.initializer`), so a leaf's path below that keyword
-        # is its variable's, a boxed one's the parameter its box holds.
-        path = unboxed_path(path)
+        # is its variable's.
         keys = [key.key if isinstance(key, jax.tree_util.DictKey) else None for key in path]
         sharding, shape = kept.get(path[keys.index('variables') + 1:] if 'variables' in keys else (),
                                    (None, None))

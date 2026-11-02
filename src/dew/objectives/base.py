@@ -54,7 +54,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken, unboxed
+from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1005,8 +1005,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
-                      for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}
-            for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(held))):
+                      for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(dict(drawn)))}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(dict(held))):
                 name = jax.tree_util.keystr(path)
                 if name in shapes and shapes[name] != np.shape(leaf):
                     raise ValueError(f"the held {name} is {np.shape(leaf)}, where the objective's modules "

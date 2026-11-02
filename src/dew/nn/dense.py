@@ -26,7 +26,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import meta
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
@@ -99,17 +98,12 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
 
 
 def _reshaped(init, flat_shape):
-    """`init` drawn at `flat_shape` and reshaped to the shape asked of it, a boxed draw (a
-    partitioned initializer's) reshaped inside its box, as flax's DenseGeneral draws: its value read as
-    drawn, whose rank its names, the reshaped kernel's, do not have, so no constraint of theirs applies
-    to it (`LogicallyPartitioned.unbox` would)."""
+    """`init` drawn at `flat_shape` and reshaped to the shape asked of it, a boxed draw (a partitioned
+    initializer's) reshaped inside its box, whose names are the reshaped kernel's: the reshape maps over
+    the draw's values, so no constraint the names would apply meets the flat draw."""
     def drawn(rng, shape, dtype=jnp.float32):
-        value = init(rng, tuple(int(size) for size in flat_shape(shape)), dtype)
-        if isinstance(value, meta.Partitioned):
-            return value.replace_boxed(jnp.reshape(value.value, shape))
-        if isinstance(value, meta.AxisMetadata):
-            return meta.replace_boxed(value, jnp.reshape(value.unbox(), shape))
-        return jnp.reshape(value, shape)
+        flat = init(rng, tuple(int(size) for size in flat_shape(shape)), dtype)
+        return jax.tree.map(lambda value: jnp.reshape(value, shape), flat)
     return drawn
 
 

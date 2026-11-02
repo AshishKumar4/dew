@@ -52,7 +52,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes, parameter_path, unboxed_path
+from dew.nn.sharding import boxed, declarations, declared_axes, parameter_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -140,7 +140,7 @@ def muon_partition(params) -> dict[str, str]:
     AltUp matrices are), takes Linen's kernel convention, contracting axis 0
     into axis 1.
     """
-    return {jax.tree_util.keystr(unboxed_path(path)): reason
+    return {jax.tree_util.keystr(path): reason
             for path, (_, reason) in _placements(params).items()}
 
 
@@ -181,8 +181,7 @@ def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonD
     path. A matrix's declared sides are read first, so a projection of one head, `[embed, 1, head_dim]`,
     is the matrix its declaration names; only a parameter no declaration makes a matrix is read as a
     per-channel filter by its shape."""
-    # Boxes the parameters carry are theirs, read ahead of any table (`boxed_axes`).
-    declared = {**declarations(params), **boxed_axes(params)}
+    declared = declarations(params)
     leaves = jax.tree_util.tree_leaves_with_path(params)
     decaying = jax.tree_util.tree_leaves(weight_decay_mask(params))
     placed = {}
