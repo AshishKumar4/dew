@@ -539,9 +539,9 @@ def _log2(value: float) -> int:
 
 def _magnitude(value) -> Magnitude | None:
     """A constant's magnitude, its elements' largest (a complex one's modulus); None for one of no number (a
-    key's)."""
+    key's). A number of any dtype, ml_dtypes' (bfloat16, float8) among them, which numpy's type tree omits."""
     array = np.asarray(value)
-    if not (np.issubdtype(array.dtype, np.number) or array.dtype == bool):
+    if not (jnp.issubdtype(array.dtype, jnp.number) or array.dtype == bool):
         return None
     # In complex128, which holds every integer's absolute value (int32's least's too) and a complex modulus.
     largest = float(np.max(np.abs(array.astype(np.complex128)))) if array.size else 0.0

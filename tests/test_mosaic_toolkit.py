@@ -449,6 +449,20 @@ def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
     assert family.registers(1) == 248
 
 
+def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
+    """One warpgroup-MMA consumer beside its producer on an H100, at one to four programs a multiprocessor:
+    the compile gate holds it at each residency to the registers its launch raises it to there
+    (`RegisterModel.cap`, `raised_registers`: 248, 232, 136 and 104), where its cap at three programs was the
+    multiprocessor's share less the producer's, 144, past the launch's raise, so a kernel of 137 to 144
+    registers passed the gate and spilled."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+        model = resources.register_model(family, 1, None)
+    assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
+
+
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
