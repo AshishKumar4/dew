@@ -71,13 +71,12 @@ from flax import core, linen as nn
 from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.batch import Coordinates
+from dew.batch import Coordinates, unboxed
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
-from dew.nn.sharding import unboxed
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -775,6 +774,7 @@ class InputQuantization:
     def packed(self, frozen: Variables) -> Variables:
         """The `QUANTIZATION` leaves of `frozen_fp8`, packed from the kernels
         the `frozen` tree holds at their scopes (`frozen_fp8_leaves`)."""
+        frozen = unboxed(frozen)
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
@@ -899,6 +899,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     """
     from dew import _coordination, cache
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
+
+    variables = unboxed(variables)
 
     def planned() -> dict:
         return {"tokens": tokens,

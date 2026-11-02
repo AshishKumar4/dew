@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-from flax.core import FrozenDict
+from flax.core import FrozenDict, meta
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -630,6 +630,7 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     attached over another keeps both training. Raises `ValueError` when the
     split keeps every leaf or none, since then there is nothing to split.
     """
+    variables = unboxed(variables)
     training = (frozenset() if FROZEN not in variables else frozenset(
         ("params", *(entry.key for entry in path))
         for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
@@ -660,6 +661,16 @@ def thaw(variables: Variables) -> Variables:
         return variables
     rest = {name: value for name, value in variables.items() if name not in (FROZEN, PACKED_FROZEN)}
     return {**rest, "params": merge(variables.get(FROZEN, {}), variables.get("params", {}))}
+
+
+def unboxed(tree):
+    """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
+    holds, as stored: how a tree enters Dew. No constraint its names would apply is applied, which
+    `LogicallyPartitioned.unbox` (and `nn.unbox`) applies under an active mesh and bound Flax rules: Dew
+    places the arrays from its run's own table (`Objective.parameter_axes`), in one place."""
+    def stored(leaf):
+        return leaf.unbox(apply_constraint=False) if isinstance(leaf, meta.Partitioned) else leaf
+    return jax.tree.map(stored, tree, is_leaf=lambda leaf: isinstance(leaf, meta.Partitioned))
 
 
 def dicts[Tree](tree: Tree) -> Tree:
@@ -720,7 +731,7 @@ def probed(variables: Variables, name: str | None) -> Variables:
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
     """Every leaf of a variables subtree, by its dict-key path."""
     return {tuple(entry.key for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(tree))}
 
 
 def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:

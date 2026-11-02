@@ -8,12 +8,13 @@ import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, with_gradients
 
+from dew.batch import unboxed
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.activations import gated_product
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP, geglu_feed_forward
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import boxed, boxed_axes, declared_axes, parameter_path, unboxed
+from dew.nn.sharding import boxed, boxed_axes, declared_axes, parameter_path
 
 GEGLU_SEEDS = {"tanh float32": 128, "tanh bfloat16": 128, "erf float32": 128, "erf bfloat16": 128}
 """Check 1's declared seeds for each form, sized by `seeds_for` on armada."""

@@ -21,10 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import unboxed
 from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, write_file
-from dew.nn.sharding import unboxed
 
 if TYPE_CHECKING:
     from dew.decision.sources import PretrainedDecision

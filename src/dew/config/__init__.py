@@ -282,7 +282,7 @@ def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str])
     is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
     if not modules:
         return ()
-    from dew.nn.sharding import unboxed
+    from dew.batch import unboxed
     from dew.optim import parameter_name
 
     trained = unboxed(jax.eval_shape(lambda: objective.init(jax.random.key(0))))["params"]

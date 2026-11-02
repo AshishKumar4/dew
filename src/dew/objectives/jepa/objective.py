@@ -33,11 +33,11 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
-from dew.batch import Variables, dicts, part, thaw, under
+from dew.batch import Variables, dicts, part, thaw, unboxed, under
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import accumulated, at_least_fp32
-from dew.nn.sharding import explicit_spec, unboxed, whole_spec
+from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
     EMASpec,

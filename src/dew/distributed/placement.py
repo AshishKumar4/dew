@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.batch import FROZEN, Variables
+from dew.batch import FROZEN, Variables, unboxed
 from dew.mesh import (
     DATA_AXIS,
     DEFAULT_RULES,
@@ -38,7 +38,7 @@ from dew.mesh import (
     logical_spec,
     mesh_axes,
 )
-from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, ruled_boxes, unboxed
+from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, ruled_boxes
 from dew.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: diloco holds DiLoCo's replica

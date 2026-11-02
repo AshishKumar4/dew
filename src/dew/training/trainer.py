@@ -34,7 +34,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select
+from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import Handed
@@ -79,7 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, unboxed
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
     Aux,
     Initializer,

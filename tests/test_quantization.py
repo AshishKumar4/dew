@@ -26,6 +26,7 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
 
+from dew.batch import unboxed
 from dew.config import ObjectiveConfig
 from dew.distributed.batches import shard_batch
 from dew.distributed.placement import Layout, MeshSpec
@@ -35,7 +36,7 @@ from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
 from dew.nn.precision import FP32_SUMS
 from dew.nn.quantizers import nearest_codewords
-from dew.nn.sharding import pipeline_microbatches, unboxed
+from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

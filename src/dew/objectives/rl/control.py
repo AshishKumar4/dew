@@ -27,9 +27,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.batch import Batch, Variables
+from dew.batch import Batch, Variables, unboxed
 from dew.nn.kernels.options import OuterProgram
-from dew.nn.sharding import unboxed
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes, first_episode_rows

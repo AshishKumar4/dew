@@ -24,9 +24,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import Batch, Variables
+from dew.batch import Batch, Variables, unboxed
 from dew.nn.attention import reference_attention
-from dew.nn.sharding import unboxed
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
 

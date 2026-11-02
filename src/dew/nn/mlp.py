@@ -132,7 +132,9 @@ class GatedMLP(nn.Module):
     output_init_std: float | None = None  # down normal std; None follows init_std
     packed: bool = False
     packed_order: tuple[str, str] = ('gate_proj', 'up_proj')
-    linear: Callable[..., nn.Module] = functools.partial(Dense, dot_general=float32_dot_general)
+    linear: Callable[..., Dense] = functools.partial(Dense, dot_general=float32_dot_general)
+    """How each projection is built: a factory of `dew.nn.dense.Dense`'s signature, which declares each
+    projection's axes where it draws it (`kernel_axes`)."""
     dropout_rate: float = 0.0
     ngpt: NGPT | None = None
     """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the gate and the up projection each

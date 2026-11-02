@@ -22,6 +22,7 @@ from flax.traverse_util import flatten_dict
 
 from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
+from dew.batch import unboxed
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
@@ -1487,6 +1488,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     built from their parts. Gemma 4's layer scalars are read from the
     collection `model.layer_scalar` names.
     """
+    variables = unboxed(variables)
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')

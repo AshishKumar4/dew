@@ -30,7 +30,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, parameter_path, unboxed
+from dew.batch import unboxed
+from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, parameter_path
 
 # mHC's small mappings stay replicated; a production 'embed' declaration
 # would change their placement. Their columns concatenate residual streams.

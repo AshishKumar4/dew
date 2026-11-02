@@ -13,7 +13,7 @@ from flax import linen as nn
 
 from dew._records import integer, record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw
+from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -43,7 +43,6 @@ from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
-from dew.nn.sharding import unboxed
 from dew.objectives.base import (
     OMITTED,
     Aux,

@@ -46,7 +46,18 @@ from typing_extensions import TypeIs, TypeVar
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.batch import (
+    EXAMPLE_ROWS,
+    FROZEN,
+    VALID_ROWS,
+    Batch,
+    PathFilter,
+    Variables,
+    dicts,
+    everything,
+    part,
+    unboxed,
+)
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
 from dew.nn.inspection import INSPECTED, Watched, watching
@@ -54,7 +65,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken, unboxed
+from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance

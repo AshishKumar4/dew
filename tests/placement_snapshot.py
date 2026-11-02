@@ -19,10 +19,11 @@ from flax import linen as nn
 from test_mixers import KIND_FIELDS, tiny
 from tiny_models import DECODERS, build_model, tiny_inputs
 
+from dew.batch import unboxed
 from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.sharding import boxed, boxed_axes, declared_axes, ruled_boxes, unboxed
+from dew.nn.sharding import boxed, boxed_axes, declared_axes, ruled_boxes
 from dew.objectives.lm import LMObjective
 from dew.registry import mixers, models
 from dew.training import Trainer

@@ -24,6 +24,7 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 from token_support import repeated_token_batch, write_token_corpus
 
+from dew.batch import unboxed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
@@ -31,7 +32,7 @@ from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import Link, boxed, declared_axes, unboxed
+from dew.nn.sharding import Link, boxed, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective

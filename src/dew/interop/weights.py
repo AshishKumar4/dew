@@ -11,8 +11,8 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
+from dew.batch import unboxed
 from dew.interop.unread import Stored, equal, held, valued
-from dew.nn.sharding import unboxed
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:

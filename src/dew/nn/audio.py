@@ -22,6 +22,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
+from dew.batch import unboxed
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
@@ -33,7 +34,6 @@ from dew.registry import from_record
 from .activations import activation
 from .conv import Conv
 from .norms import LayerNorm, RMSNorm
-from .sharding import unboxed
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
 

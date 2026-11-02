@@ -29,7 +29,7 @@ from flax import linen as nn
 
 from dew._coordination import agreed, collective_host
 from dew.artifacts import ImageGrid, VideoGrid
-from dew.batch import FROZEN, Batch, Variables, dicts, merge, thaw, under
+from dew.batch import FROZEN, Batch, Variables, dicts, merge, thaw, unboxed, under
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
@@ -55,7 +55,6 @@ from dew.nn.protocols import (
     CountedVideo,
     RequiresText,
 )
-from dew.nn.sharding import unboxed
 from dew.objectives.base import (
     OMITTED,
     TEACHER,

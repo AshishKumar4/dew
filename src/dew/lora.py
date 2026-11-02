@@ -55,7 +55,7 @@ from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
 from dew._records import finite
-from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw, unboxed
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
@@ -87,7 +87,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, unboxed
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
