@@ -823,6 +823,7 @@ def _on_device(placement: Placement) -> Placement:
     """A bank's placement in device memory, where its rows are written into it (`_written`)."""
     def device(target):
         sharding = target.sharding if isinstance(target, Format) else target
+        assert isinstance(sharding, NamedSharding)
         return sharding.with_memory_kind("device")
 
     return jax.tree.map(device, placement)
