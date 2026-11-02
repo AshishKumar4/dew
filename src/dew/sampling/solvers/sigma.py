@@ -35,9 +35,12 @@ def _euler_step(x, denoised, source, target):
     # secant coefficient is in the thousands; this form has neither, and a step to sigma 0 lands on
     # the clean prediction itself. A step of no length leaves x exactly as it is.
     stepped = alpha_s * denoised + divided(x - alpha_t * denoised, sigma_t) * sigma_s
-    # A constant signal makes the source's Euler sum well-conditioned even at large sigmas, where
-    # summing the clean and noise components would cancel two large terms in an early small step.
-    stepped = jnp.where((alpha_t == alpha_s) & (sigma_s != 0), x + derivative * dt, stepped)
+    # Between near sigmas of a constant signal (2 sigma_s >= sigma_t, a variance-exploding walk's high
+    # steps), the source's x + derivative dt cancels nothing, where the form above sums its clean and
+    # noise parts, each of x's size, back to x's small step (ledger 2541); a long step from a zero-SNR
+    # sigma keeps the form above (ledger 3475).
+    near = (alpha_t == alpha_s) & (2 * sigma_s >= sigma_t) & (sigma_s != 0)
+    stepped = jnp.where(near, x + derivative * dt, stepped)
     return jnp.where(dt == 0, x, stepped), derivative, x_0_coeff, dt
 
 
