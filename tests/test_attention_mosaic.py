@@ -1085,7 +1085,7 @@ def test_an_fp16_backward_is_on_par_interpreted(call, accurate):
     """fp16's backward in two launches under the interpreter (row 3497): its weights' and score cotangents'
     parts scaled (`product.Scaled`), each product its own accumulator restored into the carried dK, dV or
     dQ (`operands.Issuer.summed`), on par with the reference (check 1)."""
-    _check_backward(call, SHAPES["interpreted"], form="accurate" if accurate else "default", interpret=True,
+    _check_backward(call, SHAPES["interpreted"], form="accurate" if accurate else None, interpret=True,
                     dtype=jnp.float16)
 
 

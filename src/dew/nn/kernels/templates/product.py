@@ -137,13 +137,23 @@ class Exact:
         return self.value.shape
 
 
+@jax.tree_util.register_pytree_node_class
 class Scaled:
-    """A register operand stored scaled, its product taken back by `2**exponent` (a traced scalar: an fp16
-    part held at its tile's largest magnitude's scale): a mainloop issues its product into an accumulator of
-    its own, which no unscaled product shares, and restores it."""
+    """A register operand stored scaled, its product taken back by `2**exponent` (traced: an fp16 part held
+    at its tile's, or each row's, largest magnitude's scale): a mainloop issues its product into an
+    accumulator of its own, which no unscaled product shares, and restores it. A pytree of both, so a
+    branch's parts leave it (`lax.cond`)."""
 
     def __init__(self, value: jax.Array, exponent: jax.Array):
         self.value, self.exponent = value, exponent
+
+    def tree_flatten(self):
+        return (self.value, self.exponent), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del aux
+        return cls(*children)
 
     @property
     def shape(self) -> tuple:
