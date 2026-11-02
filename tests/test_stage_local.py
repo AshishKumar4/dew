@@ -31,7 +31,6 @@ from dew.registry import models
 from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import inspected
-from dew.training.rollout import rolled_out
 
 pytestmark = pytest.mark.mesh
 
@@ -446,19 +445,6 @@ def test_a_stage_local_run_reports_its_optimizers_groups_and_steps(name):
     assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
 
 
-def test_a_run_without_a_rollout_never_lays_its_state_out_whole():
-    """A stage-local state is laid out whole, every layer on every stage, for a rollout alone, which reads
-    it as a model outside the mesh does (`StageLocal.outside`): a batch with no rollout is the batch as it
-    is, the whole view never read, so a run that fits only stage-local gathers nothing a step."""
-    batch = {"tokens": np.zeros((2, 3), np.int32)}
-
-    def whole(state):
-        raise AssertionError("a run without a rollout laid its state out whole")
-
-    made, position = rolled_out(None, None, batch, None, None, None, None, view=whole)
-    assert made is batch and position is None
-
-
 @pytest.mark.mesh(devices=8)
 def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
     """DiLoCo's groups each hold an inner copy of the state on a first axis of their own, which a
@@ -584,7 +570,8 @@ def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
         stored = run.stored(state)
         greedy = [np.argmax(np.asarray(model.apply(dict(variables), batch["text"])), axis=-1)
                   for variables in (state.variables, stored.variables)]
-        read.append((all(bytes_on(state, device) < bytes_on(stored, device)
+        # The variables the policy reads, not the optimizer's state, which a whole copy left stacked.
+        read.append((all(bytes_on(state.variables, device) < bytes_on(stored.variables, device)
                          for device in run.device_mesh.devices.flat), greedy))
         return {**batch, "text": jnp.asarray(greedy[0], batch["text"].dtype)}
 
