@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from data_support import Fanned, Questioned
+from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
@@ -185,15 +185,6 @@ def bound_read(
     return read, consumed
 
 
-class Twice:
-    """An objective's step that makes two rows of each packed window (`FlatMap.examples`)."""
-
-    identity = "twice@1"
-
-    def flat_map(self, element):
-        return (element, element)
-
-
 @pytest.mark.parametrize("expands", [False, True])
 @pytest.mark.parametrize("examples", [7, 10, 23])
 def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(examples, expands):
@@ -223,15 +214,6 @@ def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(e
                                           for index in range(1, 10) if reads[index]})
 
 
-def _jittered(metadata):
-    """A random step configured for the run, which binds to a random map (`RandomMap`)."""
-    class Jittered(grain.RandomMapTransform):
-        def random_map(self, element, rng):
-            return element
-
-    return Jittered()
-
-
 def _consumed_of(loader) -> int:
     """The examples a read of `loader`'s training stream consumes, read to its end."""
     stream = loader.train(DataPartition())
@@ -256,7 +238,7 @@ def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_a
     from dew.data.pipeline import Configured
 
     documents = [{"id": np.full(index % 3 + 2, index + 1, np.int32)} for index in range(10)]
-    configured = Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True)
+    configured = Configured(jittered, needs=(), scope="run", random=True, one_to_one=True)
     chain = (Pipeline(Memory(documents)).map(configured).pack(8, fields=("id",)).shuffle(seed=1, window=4)
              .read("memory").batch(2))
     assert _consumed_of(compile(chain, read="memory", examples=7,

@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
-from data_support import Questioned
+from data_support import Keeps, Questioned
 from multiprocess_worker import BATCH, dump_params
 from process_support import serve_mode, worker_parser
 
@@ -19,18 +19,6 @@ RECORDS = 10
 FEATURES = 3
 SHARD_ROWS = 3
 """The rows of each physical shard a streamed read deals its shares, the last one short."""
-
-
-class FifthRefused:
-    """A step that refuses every fifth record's rows (`--refusing`)."""
-
-    identity = "fifth-refused@1"
-    rejects = True
-
-    def __call__(self, row):
-        from dew.data.pipeline import Rejected
-
-        return Rejected("fifth") if int(row["id"]) % 5 == 0 else row
 
 
 class DrawingFurther:
@@ -91,7 +79,7 @@ def examples_clock(args) -> dict:
                               for record in range(1, RECORDS + 1)})
 
         def data(self):
-            refused = (FifthRefused(),) if args.refusing else ()
+            refused = (Keeps(5),) if args.refusing else ()
             return ObjectiveData(train=(Questioned(), *refused)) if expands else ObjectiveData()
 
     class Logged:
