@@ -514,6 +514,10 @@ BUILT_IN = {
                                       "partial_rotary_factor": 0.5},
                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0,
                                          "partial_rotary_factor": 1.0}}},
+    "jamba": {"head_dim": None, "num_hidden_layers": 6, "attn_layer_period": 3, "attn_layer_offset": 1,
+              "expert_layer_period": 2, "expert_layer_offset": 1, "num_experts": 8, "num_experts_per_tok": 2,
+              "mamba_d_state": 8, "mamba_dt_rank": 8, "mamba_expand": 2, "mamba_d_conv": 4,
+              "use_mamba_kernels": False},
     "laguna-per-channel": {"model_type": "laguna", "gating": "per-element",
                            "layer_types": ["sliding_attention", "full_attention"] * 2,
                            "num_attention_heads_per_layer": [8, 4, 8, 4], "sliding_window": 6,
@@ -541,11 +545,14 @@ beside Qwen3's per-head query and key norms (ledger 3076); and Laguna's layers o
 query heads, window and rotary (a YaRN ramp over half of each full layer's head, its sliding layers' whole
 heads at their own base), its attention gated per head (or, `laguna-per-channel`, per channel) by a
 softplus, its routed layers past its first chosen by capped sigmoid scores and a correction bias beside a
-shared expert, their sum scaled (ledger 3070)."""
+shared expert, their sum scaled (ledger 3070); and Jamba's Mamba layers, their raw step, B and C normed,
+between attention layers without positions, every second layer routed by a softmax over every expert
+whose chosen scores stay unrenormalized (ledger 3080)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8, "laguna": 8, "laguna-per-channel": 8}
+                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8, "laguna": 8, "laguna-per-channel": 8,
+                  "jamba": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -707,20 +714,35 @@ LAGUNA_XS = {
 """poolside/Laguna-XS.2's released config, its own-code `auto_map` aside (transformers builds the type)."""
 
 
-def test_a_released_laguna_config_verifies_from_parts():
-    """Laguna-XS.2's released config verifies from parts at the probe's sizes: its 40 layers cut to the
+JAMBA_REASONING = {
+    "architectures": ["JambaForCausalLM"], "model_type": "jamba", "attention_dropout": 0.0,
+    "attn_layer_offset": 7, "attn_layer_period": 14, "bos_token_id": 1, "eos_token_id": [2, 519], "expert_layer_offset": 1,
+    "expert_layer_period": 2, "hidden_act": "silu", "hidden_size": 2560, "intermediate_size": 8192,
+    "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_state": 16, "mamba_dt_rank": 160, "mamba_expand": 2,
+    "mamba_proj_bias": False, "max_position_embeddings": 262144, "num_attention_heads": 20, "num_experts": 1,
+    "num_experts_per_tok": 1, "num_hidden_layers": 28, "num_key_value_heads": 1, "num_logits_to_keep": 1,
+    "output_router_logits": False, "pad_token_id": 0, "rms_norm_eps": 1e-06, "router_aux_loss_coef": 0.001,
+    "sliding_window": None, "tie_word_embeddings": True, "use_cache": True, "use_mamba_kernels": True,
+    "vocab_size": 65536}
+"""ai21labs/AI21-Jamba-Reasoning-3B's released config."""
+
+
+@pytest.mark.parametrize("released", [LAGUNA_XS, JAMBA_REASONING], ids=["laguna", "jamba"])
+def test_a_released_config_of_a_new_hybrid_verifies_from_parts(released):
+    """A release's config verifies from parts at the probe's sizes: Laguna-XS.2's 40 layers cut to the
     five that hold each kind (`verify.shallow`), each layer's query heads shrunk with its key heads, so
-    its full and sliding layers keep their own counts (ledger 3070)."""
-    verdict = verify_mapping(LAGUNA_XS)
+    its full and sliding layers keep their own counts; Jamba-Reasoning-3B's 28 cut to the eight that hold
+    its Mamba layers and its first attention layer (ledgers 3070, 3080)."""
+    verdict = verify_mapping(released)
     assert isinstance(verdict, VerifiedMapping) and verdict.family == "parts"
 
 
-@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna"])
+@pytest.mark.parametrize("case", ["apertus", "glm4", "laguna", "jamba"])
 def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
     """Apertus's xIELU parameters and the buffers Dew holds as constants, GLM-4's fused gate and up
-    Linear, which a load reads as two projections, and Laguna's gate projection, router bias and shared
-    expert, which its load renames, save back under their stored names bit for bit, the buffers in their
-    stored dtype (ledgers 3076, 3077, 3070)."""
+    Linear, which a load reads as two projections, Laguna's gate projection, router bias and shared
+    expert, which its load renames, and Jamba's Mamba mixers and routers, save back under their stored
+    names bit for bit, the buffers in their stored dtype (ledgers 3076, 3077, 3070, 3080)."""
     from interop_support import tiny_config
     from safetensors.numpy import load_file
     from transformers import AutoModelForCausalLM

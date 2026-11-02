@@ -274,6 +274,12 @@ def _read_nope_attention(view: PartView) -> Mapping[str, object]:
     return {**_read_attention(view), _LAYER: {'nope': not bool(view.use_rope)}}
 
 
+def _read_unrotated_attention(view: PartView) -> Mapping[str, object]:
+    """Jamba's attention: Llama's with no rotary at all, its queries and keys placed by nothing (each of
+    its layers a kind without positions, `_without_positions`)."""
+    return {**_read_attention(view), _LAYER: {'nope': True}}
+
+
 def _read_projection_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     """OLMo 2's attention: Llama's with an RMSNorm over the whole query and key projections, before the
     heads split (`qk_norm_scope='projection'`, OLMo 3's)."""
@@ -365,7 +371,7 @@ def _read_lfm2_mlp(view: PartView) -> Mapping[str, object]:
 def _read_short_conv(view: PartView) -> Mapping[str, object]:
     """LFM2's gated short convolution (`dew.nn.mixers.short_conv.GatedShortConv`): `in_proj` to B, C and x,
     the depthwise causal convolution of B * x over `conv_kernel_size` taps, gated by C, and `out_proj`
-    back; a per-layer fact (`_with_convolutions`). Its `bias` biases all three together, padded slots
+    back; a per-layer fact (`_with_mixers`). Its `bias` biases all three together, padded slots
     holding their bias product as the source's zeroed inputs do (`GatedShortConv`); one biasing some
     of them alone is `Ambiguous`."""
     conv, width = view.conv, view.in_proj.in_features
@@ -373,7 +379,28 @@ def _read_short_conv(view: PartView) -> Mapping[str, object]:
     if (conv.groups != width or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)
             or view.in_proj.out_features != 3 * width):
         raise Ambiguous("the convolution is not one causal depthwise filter per channel over its taps")
-    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': _biased(view.in_proj, view.out_proj, conv)}}}
+    return {_LAYER: {'mixer': {'kind': 'conv', 'class': 'short_conv', 'fields': {
+        'conv_L_cache': taps, 'conv_bias': _biased(view.in_proj, view.out_proj, conv)}}}}
+
+
+def _read_step_normed_mamba(view: PartView) -> Mapping[str, object]:
+    """Jamba's Mamba mixer (`dew.nn.mixers.mamba.Mamba`): `in_proj` to the inner channels and their gate,
+    a causal depthwise convolution activated by silu, `x_proj` to the raw step, B and C, each RMS-normed
+    (`dt_layernorm`, `b_layernorm`, `c_layernorm`, read as the block's norms are, `step_norms`), the step
+    through `dt_proj` and its bias, the selective scan, its silu gate and `out_proj`; a per-layer fact
+    (`_with_mixers`)."""
+    conv, inner = view.conv1d, int(view.intermediate_size)
+    taps = int(view.conv_kernel_size)
+    if (view.activation != 'silu' or conv.groups != inner or conv.in_channels != inner
+            or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)):
+        raise Ambiguous("the convolution is not one causal depthwise filter per channel activated by silu")
+    if view.x_proj.bias is not None or view.dt_proj.bias is None:
+        raise Ambiguous("the selective projection is biased or the step's projection is not")
+    return {_LAYER: {'mixer': {'kind': 'mamba', 'class': 'mamba', 'fields': {
+        'intermediate_size': inner, 'state_size': int(view.ssm_state_size),
+        'time_step_rank': int(view.time_step_rank), 'conv_kernel': taps,
+        'use_bias': _biased(view.in_proj, view.out_proj), 'use_conv_bias': conv.bias is not None,
+        'step_norms': True}}}}
 
 
 def _read_mlp(view: PartView) -> Mapping[str, object]:
@@ -408,6 +435,16 @@ def _read_laguna_router(view: PartView) -> Mapping[str, object]:
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
                      'score_function': 'sigmoid', 'bias': True, 'weight_sum_epsilon': 0.0,
                      **({'router_softcap': cap} if cap > 0 else {})}}
+
+
+def _read_unnormalized_moe(view: PartView) -> Mapping[str, object]:
+    """Jamba's MoE: an unbiased Linear router (`router`, Dew's `gate`), the softmax of its logits over every
+    expert in float32, the `num_experts_per_tok` best weighted by their scores as they are, not
+    renormalized."""
+    if view.router.bias is not None:
+        raise Ambiguous("the router's Linear is biased, which Dew's router is not")
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': False,
+                     'score_function': 'softmax'}}
 
 
 def _read_scaled_shared_moe(view: PartView) -> Mapping[str, object]:
@@ -682,6 +719,7 @@ _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 _GLM4 = 'transformers.models.glm4.modeling_glm4'
 _APERTUS = 'transformers.models.apertus.modeling_apertus'
 _LAGUNA = 'transformers.models.laguna.modeling_laguna'
+_JAMBA = 'transformers.models.jamba.modeling_jamba'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -797,6 +835,27 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('moe', f'{_LAGUNA}:LagunaSparseMoeBlock', _SHARED_MOE_CHILDREN, _read_scaled_shared_moe),
     KnownPart('router', f'{_LAGUNA}:LagunaTopKRouter', {}, _read_laguna_router,
               ('weight', 'e_score_correction_bias')),
+    KnownPart('causal_lm', f'{_JAMBA}:JambaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_JAMBA}:JambaModel',
+              {'embed_tokens': ('embedding',), 'layers': ('layers',), 'final_layernorm': ('norm',)},
+              _read_llama_model, canonical={'final_layernorm': 'norm'}),
+    KnownPart('layer', f'{_JAMBA}:JambaAttentionDecoderLayer',
+              {'self_attn': ('attention',), 'feed_forward': ('mlp', 'moe'), 'input_layernorm': ('norm',),
+               'pre_ff_layernorm': ('norm',)}, _read_nothing,
+              canonical={'feed_forward': 'mlp', 'pre_ff_layernorm': 'post_attention_layernorm'}),
+    KnownPart('layer', f'{_JAMBA}:JambaMambaDecoderLayer',
+              {'mamba': ('mamba',), 'feed_forward': ('mlp', 'moe'), 'input_layernorm': ('norm',),
+               'pre_ff_layernorm': ('norm',)}, _read_nothing,
+              canonical={'feed_forward': 'mlp', 'pre_ff_layernorm': 'post_attention_layernorm'}),
+    KnownPart('attention', f'{_JAMBA}:JambaAttention', _ATTENTION_CHILDREN, _read_unrotated_attention),
+    KnownPart('mamba', f'{_JAMBA}:JambaMambaMixer',
+              {**dict.fromkeys(('in_proj', 'x_proj', 'dt_proj', 'out_proj'), ('linear',)),
+               'conv1d': ('conv1d',),
+               **dict.fromkeys(('dt_layernorm', 'b_layernorm', 'c_layernorm'), ('norm',))},
+              _read_step_normed_mamba, ('A_log', 'D')),
+    KnownPart('moe', f'{_JAMBA}:JambaSparseMoeBlock', {'router': ('linear',), 'experts': ('experts',)},
+              _read_unnormalized_moe, canonical={'router': 'gate'}),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -1093,7 +1152,7 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'conv', 'attention', 'heads')))
+                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads')))
                   for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
@@ -1112,14 +1171,18 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
         fields.setdefault('mlp_features', width)
     heads = {layer: facts['heads'] for layer, facts in assembler.layers.items() if 'heads' in facts}
     fields.update(_with_head_counts(fields, heads))
-    for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps',
-                     'rope_theta'):
+    for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
+    # A base for the rotary wherever a layer's attention rotates: one neither unrotated nor another mixer.
+    rotating = [layer for layer in range(_records.integer(fields['num_layers'], 'num_layers'))
+                if not {'nope', 'mixer'} & set(assembler.layers.get(layer, {}))]
+    if rotating and 'rope_theta' not in fields:
+        raise Ambiguous("no part states rope_theta")
     unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
     fields.update(_without_positions(fields, unrotated))
-    convolutions = {layer: facts['conv'] for layer, facts in assembler.layers.items() if 'conv' in facts}
-    fields.update(_with_convolutions(fields, convolutions))
+    fields.update(_with_mixers(fields, {layer: facts['mixer'] for layer, facts in assembler.layers.items()
+                                        if 'mixer' in facts}))
     fields.update(_with_attention_fields(fields, {layer: facts['attention'] for layer, facts
                                                   in assembler.layers.items() if 'attention' in facts}))
     capacity, context = decoder_parts.context_lengths(
@@ -1188,26 +1251,29 @@ def _with_head_counts(fields: Mapping[str, object], heads: Mapping[int, object])
     return {'num_heads': model, 'kinds': kinds, 'layer_types': tuple(types)}
 
 
-def _with_convolutions(fields: Mapping[str, object], convolutions: Mapping[int, object]
-                       ) -> Mapping[str, object]:
-    """The layer types and kinds that make each layer of `convolutions` (LFM2's, each its short_conv mixer's
-    fields) a gated short convolution (`short_conv`) beside the attention layers, which keep their layer
-    type."""
-    if not convolutions:
+def _with_mixers(fields: Mapping[str, object], mixers: Mapping[int, object]) -> Mapping[str, object]:
+    """The layer types and kinds that make each layer of `mixers` (by layer, the kind its mixer's part names,
+    the mixer's class and its fields: LFM2's gated short convolutions, `conv`; Jamba's Mamba mixers,
+    `mamba`) a layer of that kind, its mixer that class, beside the attention layers, which keep their
+    layer type; every layer of a kind must mix alike."""
+    if not mixers:
         return {}
-    mixers = [dict(_records.record(mixer, 'conv')) for mixer in convolutions.values()]
-    if any(mixer != mixers[0] for mixer in mixers):
-        raise Ambiguous("the convolution layers convolve differently")
     count = _records.integer(fields['num_layers'], 'num_layers')
     stated_types = fields.get('layer_types')
     types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
              else ['full_attention'] * count)
     kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
-    kind = dict(native_fields(LayerKind)())
-    kind['mixer'] = {'class': 'short_conv', 'fields': mixers[0]}
-    kinds['conv'] = kind
-    for layer in convolutions:
-        types[layer] = 'conv'
+    stated: dict[str, dict[str, object]] = {}
+    for layer, fact in mixers.items():
+        record = dict(_records.record(fact, 'mixer'))
+        name = _records.text(record.pop('kind'), 'kind')
+        if stated.setdefault(name, record) != record:
+            raise Ambiguous(f"the {name} layers mix differently")
+        types[layer] = name
+    for name, record in stated.items():
+        kind = dict(native_fields(LayerKind)())
+        kind['mixer'] = record
+        kinds[name] = kind
     return {'layer_types': tuple(types), 'kinds': kinds}
 
 
@@ -1292,7 +1358,8 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
-        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES}
+        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
+                  **decoder_parts.MAMBA_LEAVES}
         path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
         if canonical in assembly.constants and path is not None:
             # A buffer no step trains, held where Dew keeps constants (`KnownPart.constants`).

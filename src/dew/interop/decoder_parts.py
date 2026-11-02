@@ -1086,6 +1086,19 @@ SHORT_CONV_LEAVES: Leaves = {
 under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projections and its `[D, 1, K]`
 taps."""
 
+MAMBA_LEAVES: Leaves = {
+    **{f'mamba.{leaf}': ('self_attn', leaf) for leaf in ('A_log', 'D')},
+    **{f'mamba.{linear}.{leaf}': ('self_attn', linear, 'kernel' if leaf == 'weight' else 'bias')
+       for linear in ('in_proj', 'x_proj', 'dt_proj', 'out_proj') for leaf in ('weight', 'bias')},
+    **{f'mamba.conv1d.{leaf}': ('self_attn', 'conv1d', leaf) for leaf in ('weight', 'bias')},
+    **{f'mamba.{norm}.weight': ('self_attn', norm, 'scale')
+       for norm in ('dt_layernorm', 'b_layernorm', 'c_layernorm')},
+}
+"""A Mamba layer's tensors (Jamba's), by their names past `model.layers.N.`, under the mixer's slot
+(`dew.nn.mixers.mamba.Mamba`): its projections, its `[D, 1, K]` taps, its `A_log` and `D`, and the norms
+of its raw step, B and C (`Mamba.step_norm_eps`)."""
+
+
 XIELU_LEAVES: Leaves = {f'mlp.act_fn.{name}': ('mlp', 'act_fn', name)
                         for name in ('alpha_p', 'alpha_n', 'beta', 'eps')}
 """An ungated feed-forward's xIELU (Apertus's), by its tensors' names past `model.layers.N.`: its two
