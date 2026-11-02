@@ -77,14 +77,14 @@ _held = _Held()
 
 def _heard(event: str, duration_secs: float, **metadata: str | int) -> None:
     """`EVENTS`' one listener: an event is told to every open `Compiles`, as JAX records it once the work is
-    done, and then raises `ExecutableOnly` on a thread within `executable_only`."""
+    done, and then raises `ExecutableOnly` on a thread within `executable_only`. It is told under the lock a
+    block closes under, so a block closes once the events told to it are held."""
     kind = EVENTS.get(event)
     if kind is None:
         return
     with _open_lock:
-        listening = list(_open)
-    for compiles in listening:
-        compiles.heard(kind, duration_secs, metadata)
+        for compiles in _open:
+            compiles.heard(kind, duration_secs, metadata)
     if _held.depth:
         raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
                              "program compiled ahead was missing, or code traced around it")
