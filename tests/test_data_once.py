@@ -10,7 +10,7 @@ def test_threads_that_first_read_a_value_at_once_read_the_one_its_instance_compu
     every one reads that value; another instance computes its own meanwhile, waiting on none of it; a value
     taken from its instance is computed afresh at its next read."""
     started, release = threading.Event(), threading.Event()
-    computed = []
+    computed, released = [], []
 
     class Held:
         def __init__(self, slow: bool):
@@ -21,7 +21,9 @@ def test_threads_that_first_read_a_value_at_once_read_the_one_its_instance_compu
             computed.append(self.slow)
             if self.slow:
                 started.set()
-                release.wait(60)
+                # Released by the test, not timed out: a lock another instance held would keep the test
+                # waiting here until the wait ran out, and pass late.
+                released.append(release.wait(60))
             return [self.slow]
 
     slow, quick = Held(slow=True), Held(slow=False)
@@ -29,7 +31,7 @@ def test_threads_that_first_read_a_value_at_once_read_the_one_its_instance_compu
     threads = [threading.Thread(target=lambda: read.append(slow.value)) for _ in range(6)]
     for thread in threads:
         thread.start()
-    started.wait(60)
+    assert started.wait(60)
     try:
         assert quick.value == [False]
     finally:
@@ -40,3 +42,4 @@ def test_threads_that_first_read_a_value_at_once_read_the_one_its_instance_compu
     assert computed == [True, False]
     assert Held.value.taken(slow) is read[0]
     assert slow.value is not read[0] and computed == [True, False, True]
+    assert released == [True, True]
