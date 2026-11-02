@@ -103,9 +103,11 @@ RELEASES = {
     # The same release with its convolutions' bias (`conv_bias`), which its padding masks around.
     "lfm3-biased-tiny": (*_PINNED["LFM3"][:2], ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
                          "AutoModelForCausalLM"),
-    # LFM3-VL's wrapper, its LFM3 decoder's code its own copy beside its vision code.
+    # LFM3-VL's wrapper, its LFM3 decoder's code its own copy beside its vision code, and its processor's.
     "lfm3-vl-tiny": (*_PINNED["LFM3_VL"][:2], ("configuration_lfm3_vl.py", "modeling_lfm3_vl.py",
-                                               "configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
+                                               "configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py",
+                                               "processing_lfm3_vl.py", "image_processing_lfm3_vl.py",
+                                               "video_processing_lfm3_vl.py"),
                      "AutoModelForImageTextToText"),
 }
 LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
@@ -180,6 +182,8 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         config = json.loads((FIXTURES / name / "config.json").read_text())
         ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
+        if "vision_config" in config:
+            media_tokenizer(config, FIXTURES / name)
     state = model.state_dict()
     missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
                                                 strict=False)
@@ -189,6 +193,31 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
     return model.eval()
+
+
+MEDIA_TOKENS = {"image_token_id": "<|image|>", "video_token_id": "<|video|>",
+                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
+"""A wrapper fixture's media tokens by the config field placing each, as its release's processor spells them
+(Lfm3VlProcessor's defaults, processing_lfm3_vl.py)."""
+
+
+def media_tokenizer(config: dict, directory: Path) -> None:
+    """A tokenizer over a wrapper fixture's vocabulary written beside it: each id a word of its own
+    (`w<id>`, split on whitespace), the media tokens at the ids its config places them (`MEDIA_TOKENS`),
+    matched whole wherever they sit, as its release's processor writes them unspaced, and its pad, start
+    and end tokens."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    named = {config[field]: token for field, token in MEDIA_TOKENS.items()}
+    ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
+            "eos_token": config["eos_token_id"]}
+    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(config))}
+    tokenizer = Tokenizer(models.WordLevel(words, unk_token=f"w{config['pad_token_id']}"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, additional_special_tokens=list(named.values()),
+                                   **{role: f"w{index}" for role, index in ends.items()})
+    fast.save_pretrained(str(directory))
 
 
 def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

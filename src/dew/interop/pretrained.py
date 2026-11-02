@@ -1263,8 +1263,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference
-                      ) -> Processor | None:
+                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference,
+                      remote_code: bool = False) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
     Only a media source, a wrapper whose config names towers beside its
@@ -1278,7 +1278,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     the loader resolved, the identity a run records to reload the processor
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
-    files from its directory and keeps the wrapper's translated `record`.
+    files from its directory and keeps the wrapper's translated `record`, and runs
+    the source's own processor code where the load ran its code (`remote_code`).
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -1293,7 +1294,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
         return Processor(tokenizer, config, record if media else {}, model.vocab_size,
                          source=source if media or gguf_path is None else None,
-                         directory=directory if media else None)
+                         directory=directory if media else None, remote_code=media and remote_code)
     return None
 
 
@@ -2260,7 +2261,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     if component is None and commit is not None:
         resolved_commit = root.name
     source = replace(source, revision=resolved_commit)
-    processor = source_processor(directory, config, record, model, gguf_path, source=source)
+    processor = source_processor(directory, config, record, model, gguf_path, source=source,
+                                 remote_code=remote is not None)
     generation_config = read_generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in

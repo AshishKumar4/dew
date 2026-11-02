@@ -303,3 +303,51 @@ def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     released = {file: Path(hf_hub_download(str(code.source), file, revision=code.revision))
                 for file in ('configuration_lfm3.py', 'modeling_lfm3.py', 'lfm3_conv.py')}
     assert written == {file: path.read_bytes() for file, path in released.items()}
+
+
+@pytest.mark.release_env("transformers==5.18.0")
+def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_path):
+    """LFM3-VL's processor is its release's own code (Lfm3VlProcessor and its image and video processors
+    at f83d2b0), which a load that trusts the source's code runs (`trust_remote_code`, `Processor`): over a
+    prompt with an image, and one with a video sampled at its own rate, Dew's processor gives the release
+    processor's tokens, and each image's or video frame's patch vectors and grid where its placeholders
+    read them, the placeholders in text order reading their media's merge blocks in order."""
+    import shutil
+
+    from tool_support import run_from
+    from transformers import AutoProcessor
+
+    source = tmp_path / 'source'
+    shutil.copytree(VL, source)
+    with run_from('remote_code_reference', 'tools') as reference:
+        for file in reference.RELEASES['lfm3-vl-tiny'][2]:
+            shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference', trust_remote_code=True)
+    release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
+    config = json.loads((VL / 'config.json').read_text())
+    rng = np.random.default_rng(0x2067)
+    image = rng.integers(0, 256, (24, 40, 3), dtype=np.uint8)
+    video = rng.integers(0, 256, (4, 24, 24, 3), dtype=np.uint8)
+    metadata = [{'fps': 2.0, 'total_num_frames': 4, 'frames_indices': [0, 1, 2, 3]}]
+    for text, media, token in (('w5 w6 <|image|> w7', {'images': [image]}, config['image_token_id']),
+                               ('w5 <|video|> w9', {'videos': [video], 'video_metadata': metadata},
+                                config['video_token_id'])):
+        theirs = release(text=[text], return_tensors='np', **media)
+        ours = loaded.processor(text, **media)
+        np.testing.assert_array_equal(np.asarray(ours.tokens), theirs['input_ids'])
+        kind = 'image' if 'images' in media else 'video'
+        pixels = theirs['pixel_values' if kind == 'image' else 'pixel_values_videos']
+        frames, height, width = (int(side) for side in theirs[f'{kind}_grid_thw'][0])
+        # An image is one frame of its own; a video's frames each one, as its placeholders' runs are.
+        chunks = 1 if kind == 'image' else frames
+        patches = frames * height * width // chunks
+        placed = np.asarray(ours.conditioning['pixel_values'])[0]
+        grids = np.asarray(ours.conditioning['image_grid_thw'])[0]
+        for chunk in range(chunks):
+            np.testing.assert_array_equal(placed[chunk, :patches],
+                                          pixels[chunk * patches:(chunk + 1) * patches])
+            assert tuple(grids[chunk]) == (frames // chunks, height, width)
+        indices = np.asarray(ours.token_fields['image_indices'])[0]
+        held = theirs['input_ids'][0] == token
+        assert held.sum() == frames * height * width // 4 and np.all(indices[~held] == -1)
+        assert np.all(np.diff(indices[held]) > 0)

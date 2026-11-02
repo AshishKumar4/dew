@@ -219,7 +219,10 @@ class Processor:
     `source` records the directory or repository, revision and subfolder its files came from.
     That identity reloads the processor (`load_processor`), and a media
     processor's geometry from the source config, independently of a task's
-    text tokenizer. Only a media processor reads files from `directory`.
+    text tokenizer. Only a media processor reads files from `directory`, and
+    runs the source's own processor code there (its config's `auto_map`,
+    LFM3-VL's) where its load ran the source's own code (`remote_code`,
+    `Pretrained.load(trust_remote_code=True)`).
     """
 
     reference: HostProcessor
@@ -229,6 +232,8 @@ class Processor:
     source: SourceReference | None = None
     directory: Path | None = None
     """Where this process reads the files. Only `source` records their identity."""
+    remote_code: bool = False
+    """Whether the load ran the source's own code, which its media processor may be (`trust_remote_code`)."""
 
     @cached_property
     def _media_reference(self) -> HostProcessor:
@@ -237,7 +242,8 @@ class Processor:
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
-        return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
+        return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True,
+                                             trust_remote_code=self.remote_code, **options)
 
     def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
         """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew

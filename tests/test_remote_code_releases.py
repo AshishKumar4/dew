@@ -41,13 +41,14 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
 
 
 OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
-          "mimo-v2-tiny": "transformers==5.1.0"}
+          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0"}
 """Each fixture whose export opens through its release's code, by the transformers that code runs under,
 which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
-native export carries it (`DecoderFamily.release_code`); MiMo-V2's, which transformers holds no class
-for, is a released source Dew loads and saves, which keeps the code its config names (`Pretrained.code`)."""
+native export carries it (`DecoderFamily.release_code`); MiMo-V2's and LFM3-VL's, which transformers
+holds no class for, are released sources Dew loads and saves, which keep the code their configs name
+(`Pretrained.code`)."""
 
-SAVED = ("mimo-v2-tiny",)
+SAVED = ("mimo-v2-tiny", "lfm3-vl-tiny")
 """The fixtures exported as a released source's save: their release's code and `auto_map` beside them."""
 
 
