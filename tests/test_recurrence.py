@@ -19,9 +19,9 @@ from dew.nn.kernels import recurrence, tuning
 from dew.nn.precision import FP32_SUMS
 
 ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 64, 4
-"""The draws' shape: values one of the step launch's column blocks wide (`recurrence.COLUMNS`); a head's later
-blocks' programs check 1 reaches at 80 columns, five blocks a head
-(`test_a_head_wider_than_its_column_blocks_steps_every_column`)."""
+"""The draws' shape: values two of the step launch's column blocks wide (`recurrence.COLUMNS`), so check 1
+reaches a head's later blocks' programs, as a gated delta net's 128-wide values take four (template numerics
+review 2026-10-26, P3-6)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
@@ -215,6 +215,11 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
     reference = reference_fn(given)
 
     configs = each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given)
+    # A column-split launch runs more than one block a head, its later programs' columns among them; a decay
+    # a key dimension's blocks are as wide as the draws' heads (`recurrence.KEYED_COLUMNS`), its later
+    # blocks checked at 80 columns (`test_a_head_wider_than_its_column_blocks_steps_every_column`).
+    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1
+               or config.block == recurrence.KEYED_COLUMNS for config in configs), configs
     for config in configs:
         with tuning.pinned({recurrence.StepLaunch: config}):
             step = jax.jit(functools.partial(recurrence.step, hooks))
