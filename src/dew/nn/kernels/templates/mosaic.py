@@ -17,6 +17,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 """
 
 import abc
+import contextvars
 import dataclasses
 import functools
 import math
@@ -37,16 +38,18 @@ Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 
 
-def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0) -> plgpu.CompilerParams:
+def compiler_params(*, approx_math: bool = False, reduction_scratch: int = 0,
+                    resident: int = 1) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
     exp2 and FlashAttention's are). A block's warpgroups reduce at once, so each takes its own scratch: a
     consumer's planned reductions its share of the kernel's allocations (`Family.column_sums`), the
     implicit ones its arithmetic forms (a unit row a hook slices) an equal share of `reduction_scratch`
     bytes, which Mosaic GPU splits between the block's warpgroups; with none, such a reduction fails to
-    lower rather than share one."""
+    lower rather than share one. Its compile fits a thread's registers to `resident` programs a
+    multiprocessor (`min_blocks_per_sm`), its plan's residency (`resources.LaunchPlan.programs`)."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
-                                reduction_scratch_bytes=reduction_scratch)
+                                reduction_scratch_bytes=reduction_scratch, min_blocks_per_sm=resident)
 
 
 CLUSTER = "cluster"
@@ -118,27 +121,38 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           reduction_scratch: int = 0) -> Callable:
+           reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
-    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
+    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), `resident`
+    programs a multiprocessor (`compiler_params`), its roles raised to their share (`roles`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
                          compiler_params=compiler_params(approx_math=approx_math,
-                                                         reduction_scratch=reduction_scratch),
+                                                         reduction_scratch=reduction_scratch,
+                                                         resident=resident),
                          interpret=interpreted(interpret),
                          kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
-    return checked(built, name or family)
+    return checked(built, name or family, resident)
 
 
-def checked(built: Callable, kernel: str) -> Callable:
-    """The launch `built`, each call checked against the mesh it runs in (`per_shard`): a launch built once
-    for every call of its facts checks each call's own."""
+_RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
+"""The programs a multiprocessor holds at once of the launch being traced (`kernel`'s `resident`): its roles
+raise their registers to that residency's share (`roles`)."""
+
+
+def checked(built: Callable, kernel: str, resident: int = 1) -> Callable:
+    """The launch `built`, each call checked against the mesh it runs in (`per_shard`) and traced at its
+    residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own."""
     def launch(*operands):
         per_shard(kernel)
-        return built(*operands)
+        token = _RESIDENT.set(resident)
+        try:
+            return built(*operands)
+        finally:
+            _RESIDENT.reset(token)
 
     return launch
 
@@ -506,12 +520,12 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
 
 def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to their share (`resources.raised_registers`), the last runs `producer()`
-    with its lowered to `resources.PRODUCER_REGISTERS`, where the GPU's compile honors them
-    (`resources.RAISES_HONORED`)."""
+    register budget raised to their share at the launch's residency (`resources.raised_registers`,
+    `_RESIDENT`), the last runs `producer()` with its lowered to `resources.PRODUCER_REGISTERS`, where the
+    GPU's compile honors them (`resources.RAISES_HONORED`)."""
     @pl.when(wg < consumers)
     def _():
-        plgpu.set_max_registers(resources.raised_registers(consumers), action="increase")
+        plgpu.set_max_registers(resources.raised_registers(consumers, _RESIDENT.get()), action="increase")
         consumer(wg)
 
     @pl.when(wg == consumers)
@@ -690,16 +704,18 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
-    def programs(self, consumers: int) -> int:
+    def programs(self, consumers: int, registers: int | None = None) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
-        consumer roles: one where the family's roles split the register file between them (warpgroup
-        MMA's consumers beside its producer, `resources.consumer_registers`). Each stages its share of the
-        multiprocessor's shared memory (`resources.program_shared`), which may hold no tile at that many."""
-        return resources.register_programs(self, consumers)
+        consumer roles holding `registers` (None: the family's budget, `registers`): at warpgroup MMA's
+        budget, one, its consumers raised to the register file's share beside its producer
+        (`resources.consumer_registers`). Each stages its share of the multiprocessor's shared memory
+        (`resources.program_shared`), which may hold no tile at that many."""
+        return resources.register_programs(self, consumers, registers)
 
     @abc.abstractmethod
-    def registers(self, consumers: int) -> int:
-        """The registers a thread of each of `consumers` consumer roles may hold."""
+    def registers(self, consumers: int, programs: int = 1) -> int:
+        """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
+        multiprocessor at once."""
 
     @abc.abstractmethod
     def column_unit(self, dtype) -> int:
@@ -779,8 +795,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0) -> Callable:
-        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
+               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
+        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
+        `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
+        compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
         `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
         programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
@@ -1087,8 +1105,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     stores_through_registers = False
     copy_extent = 256
 
-    def registers(self, consumers: int) -> int:
-        return resources.consumer_registers(consumers)
+    def registers(self, consumers: int, programs: int = 1) -> int:
+        return resources.consumer_registers(consumers, programs)
 
     def column_unit(self, dtype) -> int:
         return swizzle_columns(dtype, SWIZZLE_BYTES)
@@ -1102,12 +1120,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
-                      name=name, approx_math=approx_math, cluster=cluster, cost=cost,
+                      name=name, approx_math=approx_math, cluster=cluster, cost=cost, resident=resident,
                       reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups)
 
     def scoped(self, body, *allocations, streams):
@@ -1409,8 +1427,8 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     loader = 0
     """The consumer that issues the loads."""
 
-    def registers(self, consumers: int) -> int:
-        return resources.entry_registers(consumers)
+    def registers(self, consumers: int, programs: int = 1) -> int:
+        return resources.entry_registers(consumers, programs)
 
 
     def warpgroups(self, consumers: int) -> int:

@@ -719,8 +719,11 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def launched(*arrays):
         laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
                 else {"grid": grid, "grid_names": grid_names})
+        # At its plan's residency (`resources.LaunchPlan.programs`), which its registers fit and its roles
+        # raise to the share of (two query/key programs where one held, FS-WHY3-h100).
         return family.kernel(entry, out_type=out_type, **laid, consumers=consumers, interpret=call.interpret,
-                             name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
+                             name=name, cost=_stated(work, tiles, arrays, out_type),
+                             resident=found.programs if found else 1)(*arrays)
 
     return launched
 

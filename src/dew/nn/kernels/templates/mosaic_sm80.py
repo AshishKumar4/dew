@@ -170,11 +170,11 @@ class Mma(mosaic.Family):
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
-    def registers(self, consumers: int) -> int:
-        # Each role at a thread's whole budget: two warpgroups' 256 threads hold 255 each of a
-        # multiprocessor's 64K registers.
+    def registers(self, consumers: int, programs: int = 1) -> int:
+        # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
+        # hold 255 each.
         _one(consumers)
-        return 255
+        return resources.entry_registers(1, programs)
 
 
     def column_registers(self, columns: int, dtype) -> int:
@@ -232,16 +232,17 @@ class Mma(mosaic.Family):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
         _one(consumers, clustered=cluster > 1)
         built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
+                             compiler_params=plgpu.CompilerParams(approx_math=approx_math,
+                                                                  min_blocks_per_sm=resident),
                              interpret=mosaic.interpreted(interpret),
                              kernel_name=report.named(name), cost_estimate=cost)
-        return mosaic.checked(built, name or self.name)
+        return mosaic.checked(built, name or self.name, resident)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
