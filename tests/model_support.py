@@ -160,7 +160,7 @@ def decoder(kind: str = "attention") -> CausalTransformer:
 def initialized_decoder(kind: str = "attention", length: int = 2) -> tuple[CausalTransformer, dict]:
     """`decoder(kind)` and its parameters, initialized from key 0 over `length` tokens."""
     module = decoder(kind)
-    return module, module.init(jax.random.key(0), jnp.ones((1, length), jnp.int32))
+    return module, nn.unbox(module.init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
 
 
 class Digits:
@@ -176,7 +176,7 @@ _DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=12)
 
 def serving_task(sampling: Sampling = _DEFAULT_TASK_SAMPLING, capacity: int = 128) -> TextGeneration:
     model = decoder().clone(max_seq_len=capacity)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     return TextGeneration(model, params, RunProcessor(Digits()), sampling=sampling)
 
 
@@ -344,7 +344,7 @@ def stepped_decode(model, variables, ids):
                                     mutable=["cache"])
         return state["cache"], logits[:, 0]
 
-    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
     cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
     return jnp.moveaxis(steps, 0, 1), cache
 

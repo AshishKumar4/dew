@@ -64,7 +64,7 @@ def token_batch():
 
 def quantized_forward(spec, **overrides):
     model = tiny(**overrides)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     qmodel = spec.apply(model)
     ids = jnp.asarray(token_batch()["text"][:, :SEQ_LEN])
     return model, qmodel, variables, ids
@@ -113,7 +113,7 @@ def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
     layer = Dense(8)
     with jax.default_device(jax.devices("cpu")[0]):
         x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
-        variables = layer.init(jax.random.key(0), x)
+        variables = nn.unbox(layer.init(jax.random.key(0), x))
         quantized = qwix.quantize_model(layer, qwix.QtProvider(
             [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
         loss = jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2))
@@ -137,7 +137,7 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
 
     model = Product()
     quantized = Quantization().apply(model)
-    variables = model.init(jax.random.key(0), jnp.ones((1, 16)))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 16))))
     kernel = variables["params"]["kernel"]
 
     def plain(x):
@@ -159,7 +159,7 @@ def test_a_dense_quantized_after_its_plain_call_quantizes():
 
     layer = Dense(8)
     x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
-    variables = layer.init(jax.random.key(0), x)
+    variables = nn.unbox(layer.init(jax.random.key(0), x))
     plain = np.asarray(jax.jit(layer.apply)(variables, x))
     quantized = qwix.quantize_model(layer, qwix.QtProvider(
         [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
@@ -337,7 +337,7 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, 16)).astype(jnp.bfloat16)
     settings = {"features": 16, "kernel_size": (3, 3), "padding": "SAME", "feature_group_count": groups,
                 "use_bias": False, "dtype": jnp.bfloat16}
-    variables = Native().init(jax.random.key(1), x)
+    variables = nn.unbox(Native().init(jax.random.key(1), x))
 
     def quantized(module):
         return Quantization().apply(module).apply(variables, x)
@@ -358,7 +358,8 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
 
     def draw(seed):
         x = jax.random.normal(jax.random.key(2 * seed), (2, 8, 8, 16)).astype(jnp.bfloat16)
-        return x, wide.init(jax.random.key(2 * seed + 1), x)["params"]["kernel"].astype(jnp.bfloat16)
+        drawn = nn.unbox(wide.init(jax.random.key(2 * seed + 1), x))
+        return x, drawn["params"]["kernel"].astype(jnp.bfloat16)
 
     def plain(x, kernel):
         return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", feature_group_count=groups,
@@ -411,7 +412,7 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
     grouped = Conv(**settings, feature_group_count=groups)
     grouped_reference, peaks_of = ungrouped_reference(qwix, settings, group_width)
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * jnp.logspace(-3, 0, features)
-    kernel = grouped.init(jax.random.key(1), x)["params"]["kernel"]
+    kernel = nn.unbox(grouped.init(jax.random.key(1), x))["params"]["kernel"]
     cotangent = jax.random.normal(jax.random.key(2), x.shape)
     # The peaks are the input's own, held fixed as the derivative is taken, as Dew holds them.
     peaks = peaks_of(x)
@@ -544,7 +545,8 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
     conv = Conv(features=128, kernel_size=(2, 2), strides=(2, 2), padding="VALID", use_bias=False,
                 dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
-    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
+    drawn = nn.unbox(conv.init(jax.random.key(1), x))
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), drawn)
     cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
     reference = quantize_with(conv, qwix.QtProvider([qwix.QtRule(
         module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
@@ -582,7 +584,7 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
 
     block = Block()
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, 64))
-    variables = block.init(jax.random.key(1), x)
+    variables = nn.unbox(block.init(jax.random.key(1), x))
     if kernels == "trained":
         variables = jax.tree.map(
             lambda leaf: 0.1 * jax.random.normal(jax.random.key(2), leaf.shape), variables
@@ -657,7 +659,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     qwix = pytest.importorskip("qwix")
     model = tiny()
     prompt = jnp.asarray(token_batch()["text"][:, :4])
-    variables = model.init(jax.random.key(0), prompt)
+    variables = nn.unbox(model.init(jax.random.key(0), prompt))
     task = TextGeneration(model, variables, sampling=Sampling(temperature=0), max_new_tokens=4)
     spec = Quantization(dtype=dtype, weight_only=weight_only, patterns=(".*_proj",))
     served = task.quantized(spec)
@@ -667,8 +669,8 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
                                   act_qtype=None if weight_only else qtype, **fields)]
     reference = quantize_with(model, qwix.PtqProvider(rules),
                                     methods=entry_methods(model))
-    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
-                                               jnp.zeros((1, 1), jnp.int32)))
+    abstract = nn.unbox(jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
+                                               jnp.zeros((1, 1), jnp.int32))))
     expected_variables = {
         **variables,
         "params": qwix.quantize_params(variables["params"], abstract["params"]),
@@ -711,8 +713,8 @@ def flux_source(root: Path):
     task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
     model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
     example = task.prepare("", key=0, steps=1)
-    params = model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
-                        **example.conditions)["params"]
+    params = nn.unbox(model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
+                        **example.conditions))["params"]
     return dataclasses.replace(task, model=model, variables={**task.variables, "params": params})
 
 
@@ -744,8 +746,8 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
                                     methods=entry_methods(task.model))
     example = task.prepare("", key=0, steps=1)
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
-    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
-                                                jnp.zeros(example.noise.shape[:1]), **example.conditions))
+    abstract = nn.unbox(jax.eval_shape(functools.partial(reference.init, jax.random.key(0), example.noise,
+                                                jnp.zeros(example.noise.shape[:1]), **example.conditions)))
     # The task's tree boxes the axes its modules declare; Qwix quantizes their values.
     expected = {**own, "params": qwix.quantize_params(jax.tree.map(jnp.asarray, unboxed(own["params"])),
                                                       abstract["params"])}
@@ -781,7 +783,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     qwix = pytest.importorskip("qwix")
     model = tiny()
     prompt = jnp.asarray(token_batch()["text"][:, :4])
-    resident = model.init(jax.random.key(0), prompt)
+    resident = nn.unbox(model.init(jax.random.key(0), prompt))
     host = jax.device_get(resident)
     spec = Quantization(weight_only=True, patterns=(".*_proj",))
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
@@ -793,8 +795,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
         methods=entry_methods(model))
-    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
-                                               jnp.zeros((1, 1), jnp.int32)))
+    abstract = nn.unbox(jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
+                                               jnp.zeros((1, 1), jnp.int32))))
     reference_variables = {**host, "params": qwix.quantize_params(resident["params"], abstract["params"])}
     expected = TextGeneration(reference, jax.device_get(reference_variables), sampling=task.sampling)
     np.testing.assert_array_equal(jax.jit(served.model.apply)(served.variables, prompt),
@@ -1053,7 +1055,7 @@ def test_a_bf16_int8_matmul_scales_its_int32_products_in_float32():
 
     dense = nn.Dense(64, use_bias=False, dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (8, 256), jnp.bfloat16)
-    variables = dense.init(jax.random.key(1), x)
+    variables = nn.unbox(dense.init(jax.random.key(1), x))
     served, served_variables = quantize_for_serving(dense, variables, Quantization(), x)
     kernel = served_variables["params"]["kernel"].array.astype(jnp.bfloat16)
     activations = qarray.quantize(x, qarray.HowToQuantize(qtype=jnp.int8, channelwise_axes=(0,)))
@@ -1085,7 +1087,7 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
 
     model = Rotated()
     x = jax.random.normal(jax.random.key(0), (4, 16))
-    variables = model.init(jax.random.key(1), x)
+    variables = nn.unbox(model.init(jax.random.key(1), x))
     reference = quantize_with(model, qwix.QtProvider(
         [qwix.QtRule(module_path="proj", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
@@ -1123,11 +1125,11 @@ def test_serving_leaves_complex_matmuls_in_float():
 
     model = Rotated()
     x = jax.random.normal(jax.random.key(0), (4, 16))
-    variables = model.init(jax.random.key(1), x)
+    variables = nn.unbox(model.init(jax.random.key(1), x))
     served, served_variables = quantize_for_serving(model, variables, Quantization(), x)
     reference = quantize_with(model, qwix.PtqProvider([qwix.QuantizationRule(
         module_path="Dense_0", weight_qtype=jnp.int8, act_qtype=jnp.int8)]), methods=entry_methods(model))
-    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(1), x))
+    abstract = nn.unbox(jax.eval_shape(functools.partial(reference.init, jax.random.key(1), x)))
     expected = {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
     found = served.apply(served_variables, x)
     np.testing.assert_array_equal(found, reference.apply(expected, x))
@@ -1198,7 +1200,7 @@ def test_stochastic_rounding_draws_from_its_own_stream():
 
     model = nn.Dense(16)
     values = jax.random.normal(jax.random.key(3), (32, 8))
-    variables = model.init(jax.random.key(2), values)
+    variables = nn.unbox(model.init(jax.random.key(2), values))
     quantized = Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform").apply(model)
 
     def loss(variables, key):
@@ -1331,7 +1333,7 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
     objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
     quantize_trunk(objective, Quantization())
     tokens = jnp.arange(32, dtype=jnp.int32)[None]
-    variables = student.init(jax.random.key(0), tokens)
+    variables = nn.unbox(student.init(jax.random.key(0), tokens))
     trained, frozen = (entry.module for entry in objective.program_key())
     assert float(jnp.max(jnp.abs(jax.jit(trained.apply)(variables, tokens)
                                  - jax.jit(student.apply)(variables, tokens)))) > 0.0
@@ -1347,7 +1349,7 @@ def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
     model's do."""
     x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
     model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
-    variables = model.init(jax.random.key(0), x)
+    variables = nn.unbox(model.init(jax.random.key(0), x))
     quantized = np.asarray(Quantization().apply(model).apply(variables, x), np.float32)
     assert not np.array_equal(quantized, np.asarray(model.apply(variables, x), np.float32))
 
@@ -1481,7 +1483,7 @@ def served_text_flow():
     from dew.sampling import Sampling
 
     prompt = token_batch()["text"][:, :4]
-    held = jax.device_get(tiny().init(jax.random.key(0), jnp.asarray(prompt)))
+    held = jax.device_get(nn.unbox(tiny().init(jax.random.key(0), jnp.asarray(prompt))))
 
     def run(dtype):
         task = TextGeneration(tiny(dtype=dtype), placed(held, dtype), sampling=Sampling(temperature=0),
@@ -1589,7 +1591,7 @@ def decision_flow():
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                                  max_seq_len=128, attention_impl="xla")
     base = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    held = jax.device_get(base.init(jax.random.key(0)))
+    held = jax.device_get(nn.unbox(base.init(jax.random.key(0))))
     spec = Quantization(patterns=(".*_proj",))
 
     def run(dtype):
@@ -1642,7 +1644,7 @@ def assert_step_moves_by_the_hosts_gradient():
     # Eight rows, one on each of the host's eight test devices.
     spec, length = Quantization(patterns=(".*_proj",)), 4
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
-    held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
+    held = jax.device_get(nn.unbox(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32))))
     objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
     rows = Memory([{"text": row} for row in batch["text"]]).read("memory")
     data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))

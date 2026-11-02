@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from steady_state import steady_state
@@ -262,7 +263,7 @@ def test_composite_replay_does_not_apply_effects_twice():
             self.reference = Tiny(composite=True)
 
         def init(self, key, variables=None):
-            return self.reference.init(key, variables)
+            return nn.unbox(self.reference.init(key, variables))
 
         def loss(self, variables, batch, step):
             stats, aux = self.reference.loss(variables, batch, step)
@@ -509,7 +510,7 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
         return "layers_1" not in path and path[-2:] != ("gate_proj", "kernel")
 
     model = decoder()
-    start = freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable)
+    start = freeze(nn.unbox(LMObjective(model, 8).init(jax.random.key(0))), trainable)
 
     def objective():
         # A host placement leaves its banks in the held tree's rows, so each
@@ -560,7 +561,7 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
 
     base = decoder()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
-        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+        base, nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))), key=1)
     objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
                             variables=jax.tree.map(np.asarray, adapter.variables))
     checkpoints = Checkpoints(str(tmp_path / "run"))
@@ -638,9 +639,9 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     """
     model = multimodal()
     batch, other = media_batch(), media_batch(scale=.25)
-    held = model.init(jax.random.key(0), batch["text"].tokens,
+    held = nn.unbox(model.init(jax.random.key(0), batch["text"].tokens,
                       image_indices=batch["text"].token_fields["image_indices"],
-                      conditioning=batch["text"].conditioning)
+                      conditioning=batch["text"].conditioning))
 
     def trainable(path):
         return path[1] == "language_model" and "layers_1" not in path
@@ -728,7 +729,8 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     the state and the objective share one array per leaf and no numpy copy
     stays beside it."""
     model = decoder()
-    held = freeze(jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))),
+    drawn = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    held = freeze(jax.tree.map(np.asarray, drawn),
                   lambda path: path[-2:] == ("q_proj", "kernel"))
     objective = LMObjective(model, 8, head_chunks=1, variables=held)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
@@ -744,7 +746,7 @@ def test_place_streams_the_held_tree_and_releases_each_source():
         state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
         is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     )
-    fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    fresh = jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))))
 
     def queries(path):
         return path[-2:] == ("q_proj", "kernel")
@@ -770,7 +772,7 @@ def test_a_tree_of_frozen_dicts_is_placed_as_a_tree_of_dicts_is():
     as a dict tree's do."""
     model = decoder()
     given = frozen_dict(freeze(
-        jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))),
+        jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))),
         lambda path: path[-2:] == ("q_proj", "kernel")))
     objective = LMObjective(model, 8, head_chunks=1, variables=given)
     state, _, _ = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST).place()

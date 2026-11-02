@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from model_support import decoder, float64_twin
 from reference_error import as_given, assert_as_exact, widened
 from rl_support import clipped_surrogate, prompt_inputs
@@ -232,7 +233,7 @@ def assert_generation_scores_as_full_forwards(model, label: str, *, params=None,
     `params`, a fresh initialization where none are given, at the `seeds` declared for each label, the
     generation and the forwards at the run's `progress`."""
     if params is None:
-        params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     sampling = Sampling(temperature=0.7, top_k=5)
     for leaf, margin in (("raw", False), ("behavior", True)):
         name = f"{label} {'raw' if leaf == 'raw' else 'policy'}"
@@ -250,7 +251,7 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     generation's raw likelihoods, and the top-k policy's differ from the raw model's."""
     model = decoder(kind)
     assert_generation_scores_as_full_forwards(model, f"{kind} cached scores")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     batch = prompts()
     sampling = Sampling(temperature=0.7, top_k=5)
     result = generate(model, params, prompt_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
@@ -282,7 +283,7 @@ def test_a_generation_draws_at_the_runs_progress_its_full_forwards_score_there()
     from dew.nn.dex import DifferentialExtension
 
     model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
-    params = moved_draw(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), 8)(0)[0]
+    params = moved_draw(nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))), 8)(0)[0]
     halfway = Progress(jnp.asarray(5, jnp.int32))
     assert_generation_scores_as_full_forwards(model, "dex mid-anneal scores", params=params, progress=halfway)
     inputs = prompt_inputs(prompts())
@@ -309,7 +310,7 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
     its raw likelihoods are on par with that forward's from its float64 evaluation over drawn tokens
     and positions (check 1)."""
     model = decoder(kind)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     greedy, steps = Sampling(temperature=0), 3
 
     def placed(seed, attempt):
@@ -371,7 +372,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
     and likelihoods on par with the unpadded copy's from the full forward's float64 evaluation over
     drawn prompts and keys (check 1); the same call twice is the same generation."""
     model = decoder()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     steps = 3
 
     def unpadded(prompt, key):
@@ -422,7 +423,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
 def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     model = decoder()
     objective = GRPOObjective(model, seq_len=7)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = prompts()
     plain = generate(model, params, prompt_inputs(batch), 4, key=jax.random.key(1),
                      sampling=Sampling(temperature=0))
@@ -466,7 +467,7 @@ def test_a_synchronous_collection_draws_from_the_policy_at_the_runs_updates():
 
     model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     objective = GRPOObjective(model, seq_len=7)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     rollout = RolloutScheduler.sampled(objective, lambda text, record: 1.0, groups=2, max_new_tokens=3,
                                        sampling=Sampling(temperature=0))
     held = {updates: rollout(SimpleNamespace(variables=params, step=0, updates=updates), prompts(),
@@ -481,7 +482,7 @@ def test_a_task_at_a_runs_progress_keeps_it_rebound():
 
     model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     objective = GRPOObjective(model, seq_len=7)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     halfway = Progress(jnp.asarray(5, jnp.int32))
     task = objective.policy(params, Sampling(temperature=0), halfway)
     assert task.bind(params).progress is halfway
@@ -495,7 +496,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
     (check 1)."""
     model = decoder(kind)
     objective = GRPOObjective(model, seq_len=7)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     step = Step(jnp.array(0), jax.random.key(1), None)
     scores = objective.evaluate(params, prompts(), step)
     np.testing.assert_array_equal(scores.weights, [[0, 0, 1], [1, 1, 1]])
@@ -546,7 +547,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     moves the parameters. The run's own first step, its rollout drawn inside `fit`, is the compiled
     step's over the drawn rollout, bit for bit."""
     model = decoder()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     objective = GRPOObjective(model, seq_len=7, variables=params)
     rollout = RolloutScheduler.sampled(
         objective, lambda text, record: float(sum(map(int, text.split()))),
@@ -627,7 +628,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
     draws, bit for bit, and raw likelihoods on par with the unpadded copy's from a full forward's
     float64 evaluation over drawn prompts (check 1)."""
     model = decoder(kind).clone(max_seq_len=5)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     greedy, steps = Sampling(temperature=0), 3
     mask = jnp.asarray(np.arange(8)[None, :] >= 6)
 
@@ -667,7 +668,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
 
 def test_any_declared_eos_id_stops_the_generation():
     model = decoder()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     prompt = jnp.array([[1, 2]])
     baseline = generate(model, params, prompt, 3, key=jax.random.key(1),
                         sampling=Sampling(temperature=0))
@@ -703,7 +704,7 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
     episodes give the same rows from both, where the legacy key was once refused for its shape."""
     model = decoder()
     objective = GRPOObjective(model, seq_len=7)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
     sampled = RolloutScheduler.sampled(objective, lambda text, record: float(len(text) % 3),
                                        groups=2, max_new_tokens=4, sampling=sampling)

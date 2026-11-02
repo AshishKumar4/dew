@@ -30,6 +30,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
+from flax import linen as nn
 from process_support import run_pool
 
 from dew.data.dataset import Loader
@@ -152,7 +153,7 @@ def pair(**overrides):
     scanned = models.build("causal_transformer", **fields, scan_layers=True)
     tokens = jnp.asarray(
         np.random.default_rng(0).integers(1, VOCAB, size=(2, PROMPT)), jnp.int32)
-    return plain, scanned, plain.init(jax.random.key(0), tokens), tokens
+    return plain, scanned, nn.unbox(plain.init(jax.random.key(0), tokens)), tokens
 
 
 def stores(scanned, variables, **kwargs):

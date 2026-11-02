@@ -90,25 +90,32 @@ def _residual_axes(path, leaf, width: int) -> tuple[int, ...]:
     return (axes.index("embed"),)
 
 
-def _axes_of(variables):
+def _axes_of(variables, axes):
     """The context in which `declared_axes` reads `variables`' axes: the boxes a draw carries, beside the
-    run's table a caller holds a plain tree's in (`boxed`)."""
-    return boxed({**current_boxes(), **boxed_axes(variables)})
+    table of a run's plain tree (`axes`, `Objective.parameter_axes`) or the one a caller holds (`boxed`)."""
+    return boxed({**current_boxes(), **(axes or {}), **boxed_axes(variables)})
 
 
-def residual_width(variables) -> int:
+def model_axes(model, *inputs):
+    """The axes `model` draws each parameter in (`boxed_axes` of its init traced for shapes alone): the
+    table of a plain tree of it, a loaded or unboxed one, for `residual_width` and `permuted`."""
+    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), *inputs))
+
+
+def residual_width(variables, axes=None) -> int:
     """The residual stream's width: the 'embed' side of the token embedding
     table. A wrapper's vision tower declares its own, which is not this one
     unless the widths happen to agree; a text-only run never reads it."""
-    with _axes_of(variables):
+    with _axes_of(variables, axes):
         (width,) = {leaf.shape[1] for path, leaf in jax.tree_util.tree_flatten_with_path(
             unboxed(variables)["params"])[0] if declared_axes(path, leaf.ndim) == ("vocab", "embed")}
     return width
 
 
-def permuted(variables, order: np.ndarray):
+def permuted(variables, order: np.ndarray, axes=None):
     """`variables` with the residual stream's units in `order`, each leaf where it is: a device
-    array reordered on its device, a host array on the host."""
+    array reordered on its device, a host array on the host. A plain tree's axes are the run's `axes`
+    (`Objective.parameter_axes`) or the table a caller holds."""
     width = len(order)
 
     def reorder(path, leaf):
@@ -120,7 +127,7 @@ def permuted(variables, order: np.ndarray):
                 leaf = np.take(np.asarray(leaf), grouped, axis=axis)
         return leaf
 
-    with _axes_of(variables):
+    with _axes_of(variables, axes):
         plain = unboxed(variables)
         return {**plain, "params": jax.tree_util.tree_map_with_path(reorder, plain["params"])}
 

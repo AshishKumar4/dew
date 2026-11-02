@@ -11,6 +11,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, VALID_ROWS
@@ -120,7 +121,7 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
     data = decision_rows(soft, 8, soft, objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
     logits = np.asarray(objective.model.logits(variables, laid_out(batch, objective.bounds.segments)))
     logits = logits[np.asarray(batch["questions"])][:, :3]
@@ -170,7 +171,7 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout,
                                   shuffle_options=False)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     data = decision_rows(HELD, 4, HELD, objective=objective.data())
     expected = {}
@@ -233,13 +234,13 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     was, and the saved run loads as a Decide task with identical
     probabilities."""
     model = tiny_backbone()
-    base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    base = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = DecisionObjective(adapter, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   loss=LogLoss() + 0.5 * Brier())
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
-    start = objective.init(jax.random.key(2))
+    start = nn.unbox(objective.init(jax.random.key(2)))
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
         data, steps=3, log_every=100, checkpoint_every=3, eval_every=3, metrics=[Accuracy(), ECE()])
     checkpoints.wait()
@@ -278,7 +279,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
 
     model = tiny_backbone().clone(head_transform="gelu" if head == "transformed" else None,
                                   tie_embeddings=head == "transformed", max_seq_len=1536)
-    variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
     if head == "transformed":
         given, backbone, held = model, model, variables
         expected = variables["params"]["embed_tokens"]["embedding"]
@@ -323,7 +324,7 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
 
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     data = decision_rows(EXAMPLES, 8, EXAMPLES[:1], objective=objective.data())
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     result = Evaluation.run(objective, variables, data.val, key=0, metrics=(Accuracy(),), loss=True)
     alone = decision_rows(EXAMPLES, 1, EXAMPLES[:1], objective=objective.data())
     (row,) = list(alone.val(DataPartition()))
@@ -364,7 +365,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     tokenizer = HFTokenizer(str(tokenizer_directory), local_files_only=True)
     layout = JointLayout(max_len=1024)
     base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
-    task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
+    task = Decide(base.model, nn.unbox(base.init(jax.random.key(0))), layout, tokenizer, base.specials,
                   processor=source.processor)
     objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
@@ -408,7 +409,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     source = Pretrained.load(tokenized_qwen3(tmp_path / "source"), dtype="float32", attention_impl="xla",
                              max_seq_len=128)
     base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
+    task = Decide(base.model, nn.unbox(base.init(jax.random.key(0))), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
     objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
 
@@ -635,7 +636,7 @@ def test_a_head_reads_none_of_its_rows_padding(joint):
     inputs = DecisionInputs.collate(rows, SPECIALS.pad)
     padding = ~np.asarray(inputs.valid)
     assert padding.any() and not padding.all(axis=1).any()
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     model = objective.model
     states = np.asarray(model.states(variables, inputs))
     diverged = np.where(padding[..., None], np.nan, states).astype(states.dtype)
@@ -658,8 +659,8 @@ def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint)
                            feedforward=64) if joint else None
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
                                   head=head)
-    backbone = {"params": {"backbone": objective.model.backbone.init(
-        jax.random.key(1), np.zeros((1, layout.max_len), np.int32))["params"]}}
+    backbone = {"params": {"backbone": nn.unbox(objective.model.backbone.init(
+        jax.random.key(1), np.zeros((1, layout.max_len), np.int32)))["params"]}}
     drawn = objective.complete_variables(jax.random.key(0), backbone)
     again = jax.eval_shape(objective.complete_variables, jax.random.key(0), backbone)
     assert jax.tree.map(np.shape, again) == jax.tree.map(np.shape, drawn)

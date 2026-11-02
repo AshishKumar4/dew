@@ -112,6 +112,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
 from one_draw import assert_as_exact_as_the_reference
@@ -975,7 +976,7 @@ def biased_qwen3(rng):
     built = {**config, 'dtype': 'float32', 'attention_impl': 'reference'}
     model = models.build('causal_transformer', **built)
     leaves, structure = jax.tree_util.tree_flatten_with_path(
-        model.init(rng, jnp.zeros((1, 4), jnp.int32)))
+        nn.unbox(model.init(rng, jnp.zeros((1, 4), jnp.int32))))
     return model, jax.tree_util.tree_unflatten(structure, [
         jax.random.normal(jax.random.fold_in(rng, index), leaf.shape, leaf.dtype) * 0.2
         if path[-1].key == 'bias' else leaf
@@ -1767,7 +1768,7 @@ def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
     model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=4,
                          max_seq_len=16, dtype="float32")
     assert model.mlp_features is None
-    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
     PretrainedDecoder.from_model(model, variables).save(tmp_path)
     back = Pretrained.load(tmp_path, dtype="float32")
     ids = jnp.arange(8, dtype=jnp.int32)[None]

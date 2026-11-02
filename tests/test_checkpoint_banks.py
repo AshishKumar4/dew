@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import linen as nn
 from steady_state import steady_state
 
 from dew.batch import FROZEN
@@ -46,7 +47,8 @@ def test_a_trees_banks_spread_back_into_its_rows():
     reads the tree back row for row: the one pair a host layout's frozen collection, its placement and
     a checkpoint's template take."""
     model = decoder(bank_layers=2)
-    variables = jax.device_get(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))["params"]
+    drawn = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+    variables = jax.device_get(drawn)["params"]
     tree = {name: dict(value) if name.startswith("layers_") else value for name, value in variables.items()}
     # A leaf one row holds alone, as a frozen collection under a partial freeze does.
     tree["layers_1"] = {**tree["layers_1"], "extra": np.ones(3, np.float32)}
@@ -88,7 +90,7 @@ def test_a_cpu_owned_run_reads_its_frozen_banks_into_rows_again_on_the_programs_
     read cuts them with the program the first compiled."""
     base = decoder()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
-        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+        base, nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))), key=1)
     objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
                             variables=jax.tree.map(np.asarray, adapter.variables))
     state = trained(tmp_path / "run", objective, HOST)

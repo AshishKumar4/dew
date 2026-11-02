@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import raw_leaf
-from flax import struct
+from flax import linen as nn, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import assert_as_exact, dew_programs
 
@@ -261,7 +261,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
                               max_seq_len=8, causal=False, qk_norm=False)
     silent, mask = 14, 15
-    variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
     table = variables["params"]["embed_tokens"]["embedding"]
     variables = {**variables, "params": {**variables["params"], "embed_tokens": {
         "embedding": table.at[jnp.asarray([silent, mask])].set(0.0)}}}

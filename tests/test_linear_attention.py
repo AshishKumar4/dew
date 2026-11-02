@@ -446,7 +446,8 @@ def test_the_layer_matches_qwen3_5_gated_delta_net(reference, geometry):
     the projections and the norm."""
     module = layer(geometry)
     variables = layer_params(reference)
-    template = jax.eval_shape(module.init, jax.random.key(0), jnp.zeros((1, 4, geometry["hidden_size"])))
+    sample = jnp.zeros((1, 4, geometry["hidden_size"]))
+    template = nn.unbox(jax.eval_shape(module.init, jax.random.key(0), sample))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
 
     out = module.apply(variables, jnp.asarray(reference["layer.hidden"]))
@@ -856,7 +857,7 @@ def fused_case(heads, width, rows, dtype, held, seed: int = 0):
     layer = GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
                           head_v_dim=width, dtype=dtype)
     hidden = jax.random.normal(jax.random.key(7 + 2 * seed), (rows, 6, 64), jnp.float32).astype(dtype)
-    variables = layer.init(jax.random.key(8 + 2 * seed), hidden[:, :1])
+    variables = nn.unbox(layer.init(jax.random.key(8 + 2 * seed), hidden[:, :1]))
     variables = {**variables, "params": {**variables["params"], "A_log": jnp.linspace(-1.0, 1.0, heads),
                                          "dt_bias": jnp.linspace(0.5, 1.5, heads)}}
     step = MixerCall(decode=True)
@@ -966,9 +967,9 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
-    unfused = jax.eval_shape(lambda: module.init(jax.random.key(0), x, MixerCall(decode=True)))
+    unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
     with assumed("sm80"), chosen(delta_decode="fused"):
-        fused = jax.eval_shape(lambda: module.init(jax.random.key(0), x, MixerCall(decode=True)))
+        fused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
     def described(tree):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), tree)
 

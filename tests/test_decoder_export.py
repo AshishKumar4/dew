@@ -92,6 +92,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
@@ -1045,7 +1046,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
     ids = np.load(FIXTURES / fixture / "input_ids.npy")
     if dense:
         model = model.clone(per_layer_input_dim=None, per_layer_input_vocab=None)
-        variables = unfreeze(model.init(jax.random.key(11), jnp.asarray(ids)))
+        variables = unfreeze(nn.unbox(model.init(jax.random.key(11), jnp.asarray(ids))))
     else:
         variables = unfreeze(loaded.variables)
     for index in range(model.num_layers):

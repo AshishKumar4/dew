@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 
 import dew
 from dew.checkpoints import Checkpoints
@@ -34,7 +35,7 @@ def test_live_model_record_rebuilds_exact_constructor_fields():
     rebuilt = ModelConfig.from_model(original).build()
     assert rebuilt == original.clone(dtype=jnp.float32)
     tokens = jnp.arange(1, 9)[None, :]
-    variables = original.init(jax.random.key(0), tokens)
+    variables = nn.unbox(original.init(jax.random.key(0), tokens))
     np.testing.assert_array_equal(original.apply(variables, tokens), rebuilt.apply(variables, tokens))
 
 
@@ -91,7 +92,7 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
 
     base = model()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
-        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+        base, nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))), key=1)
     objective = LMObjective(adapter.model, seq_len=8, ema_decay=None, variables=adapter.variables)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(8)]
     data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(8), read="indexed",
@@ -133,7 +134,7 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
 
     base = model()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
-        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+        base, nn.unbox(base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))), key=1)
     count = max(2, jax.device_count())
     if kind == "dpo":
         objective = DPOObjective(adapter.model, seq_len=2, variables=adapter.variables)
@@ -205,7 +206,7 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     base = TinyDenoiser()
     sample = jnp.zeros((1, 4, 4, 3))
     adapter = LoRA(rank=2, modules=("hidden", "out")).apply(
-        base, base.init(jax.random.key(0), sample, jnp.zeros((1,))), key=1)
+        base, nn.unbox(base.init(jax.random.key(0), sample, jnp.zeros((1,)))), key=1)
     objective = DiffusionObjective(adapter.model, Flow(), InputSpec(Field("image", (4, 4, 3))),
                                    guidance=None, steps=2, ema_decay=None,
                                    variables={**adapter.variables, "encoders": {}})
@@ -247,7 +248,7 @@ def test_a_hub_run_loads_as_its_task_at_the_requested_snapshot(tmp_path, monkeyp
         block = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
         objective = BlockDiffusionObjective(block, prompt_length=4)
         task_type = BlockGeneration
-    original = objective.init(jax.random.key(0))
+    original = nn.unbox(objective.init(jax.random.key(0)))
     selected = jax.tree.map(lambda leaf: leaf + 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
                            original)
     zero = jnp.asarray(0, jnp.int32)
@@ -293,7 +294,7 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
     image = jnp.ones((1, 8, 8, 3))
     module = AutoencoderKL(channels=(4,), latent_channels=2, blocks_per_level=1, norm_groups=1,
                            dtype=jnp.float32)
-    variables = module.init(jax.random.key(0), image)
+    variables = nn.unbox(module.init(jax.random.key(0), image))
     original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
     rebuilt = AutoEncoder.bound(to_record(original, AutoEncoder), params=original.params)
     np.testing.assert_array_equal(original.encode(original.params, image),

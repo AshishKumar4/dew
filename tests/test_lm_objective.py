@@ -21,6 +21,7 @@ import optax
 import pytest
 import selection_margins
 from affine_run import dataset
+from flax import linen as nn
 from lm_support import token_batch_of
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, over_windows, summed_as_run, widened, windows
@@ -230,7 +231,7 @@ def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_
     where an infinite loss times its zero weight would make every one NaN (row 1481)."""
     pad_id = 0
     objective = make_objective(pad_id=pad_id, model=tiny_decoder(head_bias=True))
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch(seed=3)
     assert (np.asarray(batch[TEXT_KEY])[:, 1:] == pad_id).any(), "this batch has no padding to skip"
 
@@ -250,7 +251,7 @@ def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_
 
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch()
 
     loss, aux = objective.scalar_loss(params, batch, step_at())
@@ -270,7 +271,7 @@ def test_dropout_runs_on_the_step_key():
     """The loss passes the step key as the dropout rng, so a model with
     dropout is stochastic across keys and reproducible under one."""
     objective = make_objective(model=tiny_decoder(dropout_rate=0.5))
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch()
 
     first, _ = objective.scalar_loss(params, batch, step_at(key=1))
@@ -284,7 +285,7 @@ def test_dropout_runs_on_the_step_key():
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
     objective = make_objective(pad_id=0)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch(seed=3)
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
     assert (targets == 0).any(), "this batch has no padding to skip"
@@ -302,10 +303,10 @@ def test_pretrained_weights_are_what_init_returns():
     """Continued pretraining: the trainer's whole initial state is the
     checkpoint, not a fresh init that happens to have the same shapes."""
     objective = make_objective()
-    trained = objective.init(jax.random.key(0))
+    trained = nn.unbox(objective.init(jax.random.key(0)))
     loaded = jax.tree.map(lambda leaf: leaf + 1.0, trained)
 
-    resumed = make_objective(variables=loaded).init(jax.random.key(1))
+    resumed = nn.unbox(make_objective(variables=loaded).init(jax.random.key(1)))
 
     for restored, expected in zip(jax.tree.leaves(resumed), jax.tree.leaves(loaded), strict=True):
         assert jnp.array_equal(restored, expected)
@@ -355,7 +356,7 @@ def test_evaluation_correctness_is_the_same_full_forward_argmax():
                               mlp_features=32, max_seq_len=8, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None, token_accuracy=False)
     tokens = jnp.asarray([[1, 2, 3, 4, 1], [4, 3, 2, 1, 4]], jnp.int32)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     scores = objective.evaluate(params, {"text": tokens}, Step(jnp.asarray(0), jax.random.key(1), None))
     logits = model.apply(params, tokens[:, :-1], train=False)
     expected = jnp.argmax(logits, axis=-1) == tokens[:, 1:]
@@ -372,7 +373,7 @@ def test_evaluation_scores_every_target_of_the_batch():
     """Evaluation scores each target at weight one, and over drawn decoders and tokens the targets'
     mean loss on par with their written cross entropy (check 1)."""
     objective = make_objective()
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     scores = objective.evaluate(params, token_batch(), step_at())
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     np.testing.assert_array_equal(scores.weights, 1.0)
@@ -434,7 +435,7 @@ def test_preview_generates_reproducible_text_from_ema():
         seq_len=SEQ,
         samples=Samples(prompt=[1, 2, 3], max_new_tokens=4, sampling=Sampling(temperature=0.0)),
     )
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     ema = jax.tree.map(lambda leaf: leaf + 0.1, params)
     averaged = objective.preview(params, token_batch(), step_at(key=5, ema=ema))
     direct = objective.preview(ema, token_batch(), step_at(key=5))
@@ -458,7 +459,7 @@ def test_a_preview_over_prompts_of_different_lengths_draws_what_each_draws_alone
             prompt=prompt, max_new_tokens=4, sampling=Sampling(temperature=0.0), decode=lambda ids: str(ids)))
 
     together = objective_for(prompts)
-    params = together.init(jax.random.key(0))
+    params = nn.unbox(together.init(jax.random.key(0)))
     drawn = together.preview(params, token_batch(), step_at(key=5))
     # One prompt as a flat array previews as one row, as a list does.
     flat = objective_for(jnp.asarray(prompts[0])).preview(params, token_batch(), step_at(key=5))
@@ -666,7 +667,7 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     into the padding, and over drawn decoders and documents its loss is on par with the cross entropy
     written from the model's logits of the packed row (check 1)."""
     objective = packed_objective()
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     tokens, segment_ids, positions, (doc_a, _) = documents()
 
     laid = coordinates(segments=segment_ids, positions=positions)
@@ -699,7 +700,7 @@ def test_a_packed_batch_scores_like_its_documents_alone():
     written loss is the test before's), and the boundary target is dropped on
     both sides."""
     objective = packed_objective()
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
     for document in (doc_a, doc_b):
         alone_tokens, alone_segments, alone_positions = only_document(document)
@@ -766,7 +767,7 @@ def test_a_packed_batch_refuses_the_old_packing_columns(stale):
     the evaluation, where the same documents under `text_coordinates` are
     read (`test_a_packed_batch_reaches_the_objective_through_the_batch_dict`)."""
     objective = packed_objective()
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     tokens, segments, positions, _ = documents()
     columns = {"text_segment_ids": segments, "text_positions": positions}
     batch = {TEXT_KEY: tokens, **{name: columns[name] for name in stale}}
@@ -842,7 +843,7 @@ def test_a_roles_column_is_ignored_without_loss_role():
 
 def test_evaluation_weights_follow_loss_role():
     objective = make_objective(loss_role=Role.ASSISTANT)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = assistant_batch()
 
     scores = objective.evaluate(params, batch, step_at())
@@ -873,7 +874,7 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     pad_id, coefficient = 0, 1e-2
     plain = make_objective(pad_id=pad_id)
     with_z = make_objective(pad_id=pad_id, z_loss=coefficient)
-    params = plain.init(jax.random.key(0))
+    params = nn.unbox(plain.init(jax.random.key(0)))
 
     def draw(seed):
         return (np.asarray(token_batch(seed=seed)[TEXT_KEY]),)
@@ -928,7 +929,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
     objective = make_objective(z_loss=coefficient)
     model = objective.model
 
-    initialized = jax.jit(lambda key: objective.init(key)["params"])
+    initialized = jax.jit(lambda key: nn.unbox(objective.init(key))["params"])
 
     def draw(seed):
         # 32 rows: at the 4 of `token_batch`'s default the reference's own rounding of the embedding

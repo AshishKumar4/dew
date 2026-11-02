@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying, dataset
+from flax import linen as nn
 from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
@@ -105,7 +106,7 @@ def site(dew, reference, drawn, rate: float, scale: float, window: int, label: s
 def variable_shapes(model: CausalTransformer):
     """`model`'s variables' shapes, traced once a model: a site's every draw reads them
     (`drawn_variables`)."""
-    return jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+    return jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))))
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
@@ -608,7 +609,7 @@ def test_a_level_at_its_start_is_the_identity():
     the level standing before it."""
     plain = decoder(None)
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH)), jnp.int32)
-    variables = MODEL.init(jax.random.key(3), tokens)
+    variables = nn.unbox(MODEL.init(jax.random.key(3), tokens))
     without = {**variables, "params": {name: part for name, part in variables["params"].items()
                                        if name != "continuum"}}
     np.testing.assert_array_equal(np.asarray(MODEL.apply(variables, tokens)),
@@ -696,7 +697,7 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
     resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1,
                                                checkpoint_every=2)
-    start = objective.init(jax.random.key(0))["params"]["continuum"]
+    start = nn.unbox(objective.init(jax.random.key(0)))["params"]["continuum"]
     assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),
                               np.asarray(start["up"]["kernel"]))
     for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
@@ -717,7 +718,7 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(),
                     samples=Samples(prompt=[1, 2], max_new_tokens=2))
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(select=("sideways",)))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     with pytest.raises(ValueError):
         objective.token_scores(variables, jnp.zeros((1, LENGTH + 1), jnp.int32))
     adapted = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation())
@@ -732,7 +733,7 @@ def test_what_the_adaptation_cannot_serve_is_refused():
     damped = ChunkAdaptation(select=("up",), damped=True)
     capped = LMObjective(decoder(final_logit_softcap=30.0), LENGTH, adaptation=damped)
     with pytest.raises(ValueError):
-        capped.token_scores(capped.init(jax.random.key(0)), jnp.zeros((1, LENGTH + 1), jnp.int32))
+        capped.token_scores(nn.unbox(capped.init(jax.random.key(0))), jnp.zeros((1, LENGTH + 1), jnp.int32))
     # A checkpoint's quantizer of the head's own input makes the head no longer affine in its states,
     # and refuses; one of a trunk module alone leaves it affine, and the step runs.
     from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
@@ -741,7 +742,7 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         quantized = InputQuantization(format="modelopt", sites=((site, "fp8"),)).apply(
             decoder(tie_embeddings=False))
         objective = LMObjective(quantized, LENGTH, adaptation=damped)
-        variables = objective.init(jax.random.key(0))
+        variables = nn.unbox(objective.init(jax.random.key(0)))
         scales = variables[QUANTIZATION]
         for path in site.split("/")[:-1]:
             scales = scales[path]

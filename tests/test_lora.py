@@ -153,7 +153,7 @@ def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, referen
     adapter = _rebound(loaded, decoder.model, dropout=0.0)
     tokens = jnp.asarray(reference["input_ids"])
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     assert sorted(params) == [FROZEN, "params"]
     assert all(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(params["params"]))
 
@@ -604,7 +604,7 @@ def clipped_adapter_case():
     from dew.nn.vision.gemma4 import Gemma4ClippableLinear
 
     model = _BranchHost(Gemma4ClippableLinear(12, use_clipped_linears=True))
-    variables = model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32))
+    variables = nn.unbox(model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32)))
     limits = variables["constants"]["proj"]
     limits.update(input_min=jnp.float32(-0.7), input_max=jnp.float32(0.7),
                   output_min=jnp.float32(-1), output_max=jnp.float32(1))
@@ -683,7 +683,7 @@ def test_field_only_linear_subclasses_train_their_adapter():
     inputs = jnp.asarray(np.random.default_rng(9).standard_normal((4, 6)), jnp.float32)
     for projection in (FieldDense(5), FieldFlaxDense(5)):
         model = _BranchHost(projection)
-        variables = model.init(jax.random.key(3), inputs)
+        variables = nn.unbox(model.init(jax.random.key(3), inputs))
         adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
         gradient = jax.grad(lambda params, bound=adapter: jnp.sum(jnp.square(bound.model.apply(
             {**bound.variables, "params": params}, inputs))))(adapter.variables["params"])
@@ -705,7 +705,7 @@ def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors
 
     model = _BranchHost(OpaqueArithmetic(5) if arithmetic else OpaqueCall(5))
     inputs = jnp.ones((4, 6), jnp.float32)
-    variables = model.init(jax.random.key(3), inputs)
+    variables = nn.unbox(model.init(jax.random.key(3), inputs))
     adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
     with pytest.raises(TypeError):
         adapter.model.apply(adapter.variables, inputs)
@@ -747,7 +747,7 @@ def test_the_branch_reads_a_keyword_input():
     branch has to read `inputs` from kwargs where the call passes it there."""
     model = _BranchHost(nn.Dense(4), keyword=True)
     x = jnp.asarray(np.random.RandomState(0).randn(2, 3), jnp.float32)
-    adapter, adapted, adapted_tree, merged = _adapted(model, model.init(jax.random.key(0), x))
+    adapter, adapted, adapted_tree, merged = _adapted(model, nn.unbox(model.init(jax.random.key(0), x)))
     node = adapted_tree["params"]["proj"]
     expected = (jnp.einsum("bi,ij->bj", x, node["kernel"]) + node["bias"]
                 + adapter.scale(adapter.targets[("params", "proj")])
@@ -768,9 +768,9 @@ def test_a_multi_axis_target_contracts_the_sorted_axes(features):
     model = _BranchHost(nn.DenseGeneral(4, axis=(-1, -2)))
     x = jnp.asarray(np.random.RandomState(1).randn(2, 3, features), jnp.float32)
     adapter, adapted, adapted_tree, merged = _adapted(
-        model, model.init(jax.random.key(0), x), contracted=2)
+        model, nn.unbox(model.init(jax.random.key(0), x)), contracted=2)
     node = adapted_tree["params"]["proj"]
-    created = adapted.init(jax.random.key(9), x)["params"]["proj"]
+    created = nn.unbox(adapted.init(jax.random.key(9), x))["params"]["proj"]
     assert created["lora_A"].shape == (3, features, 2)
     assert created["lora_B"].shape == (2, 4)
     expected = jnp.einsum("bij,ijk->bk", x, node["kernel"]) + node["bias"] + (
@@ -929,7 +929,7 @@ def _registry_decoder():
     config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
                                               "dtype": "float32", "attention_impl": "reference"})
     model = config.build()
-    return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    return config, model, nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
 
 
 REGISTRY_SEEDS = 16
@@ -1001,7 +1001,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     rows = 2 * jax.device_count()
     inputs = np.asarray(jax.random.normal(jax.random.key(1), (rows, 6)))
     adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(
-        model, model.init(jax.random.key(0), inputs), key=0)
+        model, nn.unbox(model.init(jax.random.key(0), inputs)), key=0)
     rebuilt = ModelConfig.from_model(adapter.model).build()
 
     class Squared(Objective):
@@ -1015,7 +1015,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
         def init(self, key, variables=None):
             if variables is not None:
                 return variables
-            return self.model.init(key, inputs) if self.variables is None else self.variables
+            return nn.unbox(self.model.init(key, inputs)) if self.variables is None else self.variables
 
         def loss(self, variables, batch, step):
             return squared_output(self.model, variables, batch["x"])
@@ -1040,7 +1040,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     first.checkpoints.wait()
 
     resumed = trainer(Squared(rebuilt), tmp_path / "split")
-    template = factors(Squared(rebuilt).init(jax.random.key(3)))
+    template = factors(nn.unbox(Squared(rebuilt).init(jax.random.key(3))))
     assert {leaf.dtype for leaf in template.values()} == {jnp.dtype(jnp.float32)}
     restored, _, _ = resumed.place()
     assert int(restored.step) == 2
@@ -1478,7 +1478,7 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
     plain = dataclasses.replace(config, lora=None).build()
     key = jax.random.key(config.trainer.key)
-    drawn = plain.model_variables(plain.init(key))
+    drawn = plain.model_variables(nn.unbox(plain.init(key)))
     for before, after in zip(jax.tree.leaves(drawn["params"]), jax.tree.leaves(state.variables[FROZEN]),
                              strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))

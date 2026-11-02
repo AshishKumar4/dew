@@ -88,7 +88,7 @@ def test_a_named_mixer_places_its_own_tokens_beside_the_models_default(rng, posi
     implicit = tiny(position_embedding=position_embedding, layer_types=("full_attention", "rotated"))
     named = implicit.clone(kinds={"rotated": {"mixer": default}})
     ids = tokens(rng)
-    params = implicit.init(rng, ids)
+    params = nn.unbox(implicit.init(rng, ids))
     logits = np.asarray(implicit.apply(params, ids))
     np.testing.assert_array_equal(np.asarray(named.apply(params, ids)), logits)
     rotated = implicit.clone(kinds={"rotated": {"mixer": AttentionMixer()}})
@@ -109,12 +109,12 @@ def test_a_named_mixer_places_its_own_tokens_beside_the_models_default(rng, posi
 def test_layer_kinds_refuse_invalid_rotary_mask_and_grouped_head_geometry(fields, causal, message):
     with pytest.raises(ValueError):
         model = tiny(num_layers=1, layer_types=("special",), kinds={"special": fields}, causal=causal)
-        model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
 @pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate", "dropout_rate"])
 def test_decoder_dropout_is_training_only(rng, field):
     base = tiny(dropout_rate=0, attention_impl="reference")
     ids = tokens(rng, length=4)
-    params = base.init(rng, ids)
+    params = nn.unbox(base.init(rng, ids))
     active = tiny(attention_impl="reference", **{"dropout_rate": 0, field: .5})
     first = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(10)})
     second = active.apply(params, ids, train=True, rngs={"dropout": jax.random.key(11)})
@@ -147,7 +147,7 @@ def test_decoder_dropout_is_training_only(rng, field):
 def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     model = tiny(attention_dropout_rate=.5, attention_impl="reference", **geometry)
     ids = tokens(rng, length=4)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     one = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(1)})
     two = model.apply(params, ids, train=True, rngs={"dropout": jax.random.key(2)})
     assert not jnp.array_equal(one, two)
@@ -277,15 +277,15 @@ def test_attention_dropout_preserves_visibility_masks(rng):
 
 def test_attention_dropout_refuses_a_mixer_without_probabilities(rng):
     with pytest.raises(ValueError):
-        tiny(attention_dropout_rate=.5, mixer={"class": "mamba2", "fields": {}}).init(
-            rng, tokens(rng, length=4))
+        nn.unbox(tiny(attention_dropout_rate=.5, mixer={"class": "mamba2", "fields": {}}).init(
+            rng, tokens(rng, length=4)))
 
 
 @pytest.mark.parametrize("field", ["embedding_dropout_rate", "attention_dropout_rate"])
 @pytest.mark.parametrize("rate", [-.1, 1.1])
 def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
     with pytest.raises(ValueError):
-        tiny(**{field: rate}).init(rng, tokens(rng, length=4))
+        nn.unbox(tiny(**{field: rate}).init(rng, tokens(rng, length=4)))
 
 
 def decode_logits(model, params, prompt, rest):
@@ -325,7 +325,7 @@ def test_logits_ignore_every_later_token(rng):
     tail of a sequence cannot move the logits before it."""
     model = tiny()
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids)
 
     cut = 5
@@ -344,7 +344,7 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     argument, not a causal flag)."""
     model = tiny(attention_impl=attention_impl)
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     assert decode_logits(model, params, ids[:, :4], ids[:, 4:]).shape == (ids.shape[0], SEQ - 3, VOCAB)
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
@@ -481,7 +481,7 @@ def test_sliding_attention_forgets_past_the_window(rng):
     model = tiny(layer_types=('sliding_attention',) * 2,
                  kinds={'sliding_attention': {'window': 3}})
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids)
 
     flipped = 3
@@ -498,7 +498,7 @@ def bidirectional_reach(rng, implementation, path, kind):
     model = tiny(layer_types=('sliding_attention',) * 2, causal=False, attention_impl=implementation,
                  kinds={'sliding_attention': kind})
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     inputs = {"plain": {}, "valid": {"attention_mask": jnp.ones(ids.shape, bool)},
               "packed": {"segment_ids": jnp.ones(ids.shape, jnp.int32),
                          "positions": jnp.broadcast_to(jnp.arange(SEQ), ids.shape)}}[path]
@@ -581,7 +581,7 @@ def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
     layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
     its first call."""
     with pytest.raises(ValueError):
-        tiny(partial_rotary_factor=0.5, rope_scaling=YarnScaling()).init(rng, tokens(rng))
+        nn.unbox(tiny(partial_rotary_factor=0.5, rope_scaling=YarnScaling()).init(rng, tokens(rng)))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
@@ -594,7 +594,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     dropped) moves the logits by 3.8e+00."""
     model = hybrid()
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     full = model.apply(params, ids)
 
     cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
@@ -619,8 +619,8 @@ def test_gemma_zero_qk_norm_weights_are_identity(rng):
     ids = tokens(rng)
     qwen = tiny(num_layers=1, scale_offset=False)
     gemma = tiny(num_layers=1, scale_offset=True)
-    qwen_params = qwen.init(rng, ids)
-    gemma_params = gemma.init(rng, ids)
+    qwen_params = nn.unbox(qwen.init(rng, ids))
+    gemma_params = nn.unbox(gemma.init(rng, ids))
 
     for name in ("q_norm", "k_norm"):
         qwen_scale = qwen_params["params"]["layers_0"]["self_attn"][name]["scale"]
@@ -638,7 +638,7 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     ids = tokens(rng)
     pattern = ('full_attention', 'sliding_attention')
     model = tiny(layer_types=pattern, kinds={'sliding_attention': {'window': 4}})
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     same_theta = tiny(layer_types=pattern,
                       kinds={'sliding_attention': {'window': 4, 'rope_theta': 10000.0}})
     assert jnp.array_equal(model.apply(params, ids), same_theta.apply(params, ids))
@@ -649,7 +649,7 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     pattern = ("sliding_attention", "sliding_attention")
     both = tiny(rope_theta=111.0, layer_types=pattern,
                 kinds={"sliding_attention": {"window": 4, "rope_theta": 1e6}})
-    precedence_params = both.init(rng, ids)
+    precedence_params = nn.unbox(both.init(rng, ids))
     kind_only = tiny(layer_types=pattern, kinds={"sliding_attention": {"window": 4, "rope_theta": 1e6}})
     model_only = tiny(rope_theta=1e6, layer_types=pattern, kinds={"sliding_attention": {"window": 4}})
     assert jnp.array_equal(both.apply(precedence_params, ids), kind_only.apply(precedence_params, ids))
@@ -665,7 +665,7 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     them."""
     ids = tokens(rng)
     model = tiny(sandwich_norms=True, norm_eps=0.0)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     amplified = ('o_proj', 'down_proj')
 
     def louder(params):
@@ -695,7 +695,7 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     feedforward = functools.partial(GatedMLP, hidden_features=64, out_features=features)
     block = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
                          wiring=BlockWiring(pre_norms=False, output_norms=True))
-    params = block.init(rng, x)
+    params = nn.unbox(block.init(rng, x))
     assert set(params['params']) == {'self_attn', 'mlp', 'attention_output_norm', 'mlp_output_norm'}
 
     def norm(name, value):
@@ -709,7 +709,7 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
 
     pre = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
                        wiring=BlockWiring(output_norms=True))
-    with_input_norms = pre.init(rng, x)
+    with_input_norms = nn.unbox(pre.init(rng, x))
     with_input_norms['params'].update(params['params'])
     assert not jnp.array_equal(pre.apply(with_input_norms, x), expected)
 
@@ -734,7 +734,7 @@ def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
     shared = {"emb_features": features, "num_heads": 8, "num_layers": 1,
                   "tie_embeddings": False, "dtype": jnp.bfloat16}
     scaled = tiny(embedding_scale=True, **shared)
-    params = scaled.init(rng, ids)
+    params = nn.unbox(scaled.init(rng, ids))
     assert params['params']['embed_tokens']['embedding'].dtype == jnp.float32
 
     def fold(factor):
@@ -756,7 +756,7 @@ def test_attention_scale_defaults_to_the_head_dim_scale(rng):
     query_pre_attn_scalar must move the logits."""
     ids = tokens(rng)
     model = tiny(head_dim=16)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
 
     explicit = tiny(head_dim=16, attention_scale=16 ** -0.5)
     assert jnp.array_equal(model.apply(params, ids), explicit.apply(params, ids))
@@ -778,7 +778,7 @@ def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
     ids = tokens(rng)
     shared = {"head_dim": 128, "num_layers": 1, "dtype": jnp.bfloat16}
     exact = tiny(attention_scale=168 ** -0.5, **shared)
-    params = exact.init(rng, ids)
+    params = nn.unbox(exact.init(rng, ids))
     rounded = tiny(attention_scale=float(jnp.bfloat16(168 ** -0.5 * math.sqrt(128)))
                    / math.sqrt(128), **shared)
 
@@ -791,7 +791,7 @@ def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
 def test_a_prompt_longer_than_the_cache_is_refused(rng):
     model = tiny(max_seq_len=8)
     ids = tokens(rng, length=12)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     cache = model.apply(params, 2, method=CausalTransformer.init_cache,
                         mutable=['cache'])[1]['cache']
     with pytest.raises(ValueError):
@@ -811,7 +811,7 @@ def test_a_prompt_longer_than_the_cache_is_refused(rng):
 ])
 def test_rejected_configs(rng, config, message):
     with pytest.raises(ValueError):
-        tiny(**config).init(rng, tokens(rng))
+        nn.unbox(tiny(**config).init(rng, tokens(rng)))
 
 
 # --- packed batches -------------------------------------------------------
@@ -830,7 +830,7 @@ def test_positions_default_to_the_row_index(rng):
     same whether the caller spells them out or not."""
     model = tiny()
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
 
     row_index = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
     assert jnp.array_equal(model.apply(params, ids),
@@ -841,7 +841,7 @@ def test_packed_attention_stays_causal_inside_a_document(rng):
     """The segment mask must sit on top of causality, not replace it."""
     model = tiny()
     ids, segment_ids, positions = packed_pair(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
 
     cut = 4
@@ -874,7 +874,7 @@ def test_a_packed_row_refuses_a_decode_cache(rng):
     its segments."""
     model = tiny()
     ids, segment_ids, positions = packed_pair(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     model.apply(params, ids, decode=True, positions=positions, mutable=["cache"])
     with pytest.raises(ValueError):
         model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
@@ -886,7 +886,7 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     ids = tokens(rng, length=8)
     segment_ids = jnp.asarray([[1] * 5 + [0] * 3] * ids.shape[0])
     positions = jnp.asarray([list(range(5)) + [0] * 3] * ids.shape[0])
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
 
     # Rewriting the padded tail cannot move a real token's logits, and the
@@ -919,7 +919,7 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
-    params = tiny().init(rng, ids)
+    params = nn.unbox(tiny().init(rng, ids))
 
     with pytest.raises(KernelRefused) as plain:
         model.apply(params, ids)
@@ -941,7 +941,7 @@ def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(
     time, so an all-true one still builds the mask and still rides xla."""
     model = tiny(attention_impl='cudnn')
     ids = tokens(rng)
-    params = tiny().init(rng, ids)
+    params = nn.unbox(tiny().init(rng, ids))
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
     with pytest.raises(ValueError):
@@ -961,7 +961,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     bitwise."""
     model = tiny(attention_impl='xla')
     ids = tokens(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
     def scored(model, **metadata):
@@ -992,7 +992,7 @@ def test_a_padded_slot_reaches_no_query(rng):
     valid = jnp.asarray([padded] * ids.shape[0])
     slots = jnp.asarray([index for index, real in enumerate(padded) if not real])
     real = jnp.asarray([index for index, real in enumerate(padded) if real])
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids, attention_mask=valid)
 
     changed = model.apply(params, ids.at[:, slots].set((ids[:, slots] + 11) % VOCAB),
@@ -1025,7 +1025,7 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
     model = tiny(layer_types=('sliding_attention',) * 2,
                  kinds={'sliding_attention': {'window': 3}})
     ids, segment_ids, positions = packed_pair(rng)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     baseline = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
 
     flipped = 1
@@ -1051,7 +1051,7 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     with jax.default_matmul_precision(None):
         model = tiny(dtype=jnp.bfloat16)
         ids = tokens(rng)
-        params = model.init(rng, ids)
+        params = nn.unbox(model.init(rng, ids))
         logits = model.apply(params, ids)
         np.testing.assert_array_equal(
             np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
@@ -1376,7 +1376,7 @@ def test_a_nope_layer_reads_no_positions_and_keeps_its_logit_scale():
     attention_scale still scales the logits as it does with rope."""
     tokens = jax.random.randint(jax.random.key(1), (2, 12), 0, 32)
     model = nope_model()
-    variables = model.init(jax.random.key(0), tokens)
+    variables = nn.unbox(model.init(jax.random.key(0), tokens))
     plain = model.apply(variables, tokens)
     shifted = model.apply(variables, tokens, positions=jnp.arange(12) + 100)
     np.testing.assert_array_equal(plain, shifted)
@@ -1406,7 +1406,7 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
     ids = tokens(jax.random.key(0), length=8)
     record = {"class": "attention", "fields": {"nope": True, "exclusive_self_attention": True}}
     kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})
-    params = kinded.init(jax.random.key(1), ids)
+    params = nn.unbox(kinded.init(jax.random.key(1), ids))
     plain = tiny(qk_norm=False).apply(params, ids)
     assert not np.array_equal(kinded.apply(params, ids), plain)
 
@@ -1423,7 +1423,7 @@ def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
     of two, which round nothing."""
     ids = tokens(jax.random.key(0), length=8)
     plain = tiny(tie_embeddings=False, **extra)
-    variables = plain.init(jax.random.key(1), ids)
+    variables = nn.unbox(plain.init(jax.random.key(1), ids))
     table = ("params", "embed_tokens", "embedding")
     multiplied = jax.tree_util.tree_map_with_path(
         lambda path, leaf: leaf * 2 if tuple(key.key for key in path) == table else leaf, variables)
@@ -1527,7 +1527,7 @@ def test_a_per_axis_rotary_without_its_axes_is_refused():
     layer = CausalSelfAttention(MixerContext(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4,
                                              max_seq_len=4, causal=False), rotary_per_axis=True)
     with pytest.raises(ValueError):
-        layer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
+        nn.unbox(layer.init(jax.random.key(0), jnp.zeros((1, 4, 8))))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])

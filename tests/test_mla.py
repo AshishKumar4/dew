@@ -35,6 +35,7 @@ import numpy as np
 import optax
 import pytest
 import torch
+from flax import linen as nn
 from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
 from model_support import as_stepped, decode_through
@@ -568,7 +569,7 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     tensors = fixture(name)
     model = mla_model(settings)
     tokens = jnp.zeros((2, 7), jnp.int32)
-    variables = model.init(jax.random.key(0), tokens)
+    variables = nn.unbox(model.init(jax.random.key(0), tokens))
     translated = block_variables(tensors)["params"]
     layer = variables["params"]["layers_0"]
     assert jax.tree_util.tree_structure(layer["self_attn"]) == (
@@ -599,7 +600,7 @@ def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     settings = CONFIG["v3"]
     tensors = fixture("mla_v3")
     model = mla_model(settings, rope_scaling=scaling)
-    variables = model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
     layer = variables["params"]["layers_0"]
     variables = {**variables, "params": {
         **variables["params"], "layers_0": {**layer, "self_attn": block_variables(tensors)["params"]}}}
@@ -702,8 +703,8 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     assert attention["kv_b_proj"]["kernel"].sharding.spec == P("fsdp")
     assert attention["indexer"]["wq_b"]["kernel"].sharding.spec == P("fsdp")
     assert experts["gate_proj"]["kernel"].sharding.spec == P("expert" if expert > 1 else None, "fsdp")
-    abstract = jax.eval_shape(
-        model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32))
+    abstract = nn.unbox(jax.eval_shape(
+        model.init, jax.random.key(0), jnp.ones((1, 16), jnp.int32)))
     shardings = trainer.layout.shardings(trainer.device_mesh, abstract)
     trainer.layout.check(abstract["params"], shardings["params"], trainer.device_mesh)
 
@@ -844,7 +845,7 @@ def test_the_mla_kind_takes_its_layers_window_and_chunk(kind):
     """A decoder's mla layer of a windowed or chunked kind computes what the block with that window or
     chunk computes on the same weights, bit for bit: the kind hands its layer's window and chunk on."""
     model = mla_model(CONFIG["v3"], layer_types=("local",), kinds={"local": kind})
-    variables = model.init(jax.random.key(0), jnp.zeros((2, VIS_LENGTH), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((2, VIS_LENGTH), jnp.int32)))
     variables = {**variables, "params": {**variables["params"], "layers_0": {
         **variables["params"]["layers_0"], "self_attn": visibility_variables()["params"]}}}
     hidden = visibility_draw(visibility_variables())(0)[1]
@@ -991,7 +992,7 @@ def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
     model = mla_model(CONFIG["v3"])
     length = 9
     ids = jax.random.randint(jax.random.key(2), (2, length), 0, 37)
-    params = model.init(jax.random.key(3), ids)
+    params = nn.unbox(model.init(jax.random.key(3), ids))
     slots = np.arange(length)
     lo, hi = np.clip(slots - 1, 0, None), np.clip(slots + 1, None, length)
     runs = np.broadcast_to(np.stack([lo, hi], -1)[:, None], (2, length, 1, 2)).astype(np.int32)

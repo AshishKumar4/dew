@@ -102,9 +102,9 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
     ids = jnp.asarray(np.load(directory / "input_ids.npy")[:1, :8], jnp.int32)
     whole = jnp.asarray(scanned.apply(variables, ids))
 
-    state = scanned.init(jax.random.key(0), ids[:, :1], decode=True)
-    assert paths(state["cache"]) == paths(model.init(jax.random.key(0), ids[:, :1],
-                                                     decode=True)["cache"])
+    state = nn.unbox(scanned.init(jax.random.key(0), ids[:, :1], decode=True))
+    assert paths(state["cache"]) == paths(nn.unbox(model.init(jax.random.key(0), ids[:, :1],
+                                                     decode=True))["cache"])
     steps = []
     for position in range(ids.shape[1]):
         step, state = scanned.apply(
@@ -215,7 +215,7 @@ def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
 def scanned_pair(build):
     plain, scanned = build(), build(scan_layers=True)
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = plain.init(jax.random.key(0), ids)
+    variables = nn.unbox(plain.init(jax.random.key(0), ids))
     return plain, scanned, variables, ids
 
 
@@ -354,7 +354,8 @@ def test_a_scanned_init_is_the_plain_init(shape):
     build = SHAPES[shape]
     plain, scanned = build(), build(scan_layers=True)
     ids = jnp.ones((1, 4), jnp.int32)
-    first, second = plain.init(jax.random.key(0), ids), scanned.init(jax.random.key(0), ids)
+    first = nn.unbox(plain.init(jax.random.key(0), ids))
+    second = nn.unbox(scanned.init(jax.random.key(0), ids))
 
     assert paths(first) == paths(second)
     assert all(jax.tree.leaves(jax.tree.map(
@@ -466,7 +467,7 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
 
     def program(model, variables):
         """The step's one scan: its length and its body's operations."""
-        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
         graph = jax.make_jaxpr(lambda variables, cache: model.apply(
             {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
         (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == "scan")
@@ -474,11 +475,11 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
         return scan.params["length"], body
 
     short, deep = hybrid(2, scan_layers=True), hybrid(6, scan_layers=True)
-    (two, shallow), (six, body) = (program(model, model.init(jax.random.key(0), ids))
+    (two, shallow), (six, body) = (program(model, nn.unbox(model.init(jax.random.key(0), ids)))
                                    for model in (short, deep))
     assert (two, six) == (2, 6) and shallow == body
     plain = hybrid(6)
-    variables = plain.init(jax.random.key(0), ids)
+    variables = nn.unbox(plain.init(jax.random.key(0), ids))
     assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
 
     def draw(seed):
@@ -515,7 +516,7 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     plain, scanned = (Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", scan_layers=scan)
                       for scan in (False, True))
     ids = np.zeros((2, 1), np.int32)
-    cache = scanned.model.init(jax.random.key(0), ids, decode=True)["cache"]
+    cache = nn.unbox(scanned.model.init(jax.random.key(0), ids, decode=True))["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.model.apply(
         {**variables, "cache": cache}, ids, decode=True, mutable=["cache"]))(scanned.variables, cache)
     assert [equation.params["length"] for equation in graph.jaxpr.eqns
@@ -549,7 +550,7 @@ def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     plain, scanned = bf16(), bf16(scan_layers=True)
     exact = tiny(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
-    variables = plain.init(jax.random.key(0), ids)
+    variables = nn.unbox(plain.init(jax.random.key(0), ids))
     logits, scanned_logits = plain.apply(variables, ids), scanned.apply(variables, ids)
     reference = exact.apply(variables, ids)
 
@@ -617,7 +618,7 @@ def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, bala
     0.2."""
     model = build()
     objective = LMObjective(model, SEQ_LEN, **balance)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch(PIPELINED_ROWS)
 
     loss, metrics, grads = loss_and_grads(objective, MeshSpec(fsdp=4), variables, batch)
@@ -679,7 +680,7 @@ def pipelined_layer_states():
     """The pipelined (dew) and fsdp (reference) layer-state functions of one model's weights and its
     float64 truth: two stages over four microbatches, microbatch m holding rows m, m + 4, ..."""
     model = tiny()
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     return (layer_states_on(MeshSpec(fsdp=2, stage=2), model, variables, microbatches=4),
             layer_states_on(MeshSpec(fsdp=4), model, variables), float64_layer_states(model, variables))
 
@@ -703,7 +704,7 @@ def test_a_pipeline_trains_an_exchange_dispatch():
     dispatch inside their own manual axes."""
     model = tiny(mixture={"experts": 4, "top_k": 2, "dispatch": "exchange"})
     objective = LMObjective(model, SEQ_LEN)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch(PIPELINED_ROWS)
 
     loss, _, grads = loss_and_grads(objective, MeshSpec(expert=2, fsdp=2), variables, batch)
@@ -720,7 +721,7 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     """Stages of two like layers scan inside the pipeline; the loss and the
     gradients hold to the plain loop's. Largest observed differences on
     CPU: loss 0.0, gradients 1.6e-07 on leaves of order 0.2."""
-    variables = tiny().init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(tiny().init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch()
 
     loss, _, grads = loss_and_grads(LMObjective(tiny(), SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
@@ -740,7 +741,7 @@ def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     the plain loop's and every gradient finite. Observed loss difference on
     CPU: 3.4e-04 on a loss of order 5."""
     model = bf16()
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     batch = token_batch(PIPELINED_ROWS)
 
     loss, _, _ = loss_and_grads(LMObjective(model, SEQ_LEN), MeshSpec(fsdp=4), variables, batch)
@@ -767,7 +768,7 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
     it). Largest observed differences on CPU: loss 0.0, gradients 1.4e-07
     on leaves of order 0.1."""
     model = tiny(max_seq_len=16)
-    variables = model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 16), jnp.int32)))
     rng = np.random.default_rng(0)
     batch = {"text": rng.integers(0, VOCAB, size=(BATCH, 17)).astype(np.int32)}
     objective, four = LMObjective(model, 16), jax.devices()[:4]
@@ -789,7 +790,7 @@ def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(1, 9))}
     model = tiny(num_layers=9, scan_layers=True, mixture=routed)
     ids = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, SEQ_LEN)), jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     _, plain = model.apply(variables, ids, mutable=["qk"])
     mesh = MeshSpec(stage=4).build(jax.devices()[:4])
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
@@ -803,7 +804,7 @@ def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_
 def test_scanned_dropout_uses_the_supplied_rng():
     model = tiny(num_layers=3, dropout_rate=0.2, scan_layers=True)
     ids = jnp.asarray(token_batch()["text"][:2, :5])
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
 
     @jax.jit
     def loss_and_grad(params, key):
@@ -847,7 +848,7 @@ def fetched_layer_states():
     """The host-fetched (dew) and resident (reference) layer-state functions of one scanned model's
     weights and its float64 truth, each arm compiled once (`without_ynn`)."""
     model = tiny(scan_layers=True, attention_impl="reference")
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     layers = {name: jax.device_put(tree, host) for name, tree in variables["params"].items()
@@ -875,7 +876,7 @@ def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     same places, and no layer output nobody asked for. A layer norm runs its own call, where the
     default RMS norm runs fused into its seam."""
     model = tiny(scan_layers=True, attention_impl="reference", norm_type="layer")
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
         name: jax.device_put(tree, host) if name.startswith("layers_") else tree
@@ -901,7 +902,7 @@ def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
     keeps it even when the first layer's shape probe captured nothing."""
     model = tiny(scan_layers=False, attention_impl="reference")
     ids = jnp.ones((1, SEQ_LEN), jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
         name: jax.device_put(tree, host) if name.startswith("layers_") else tree
@@ -923,7 +924,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
     the providers' writes carried out of the lifted scope that fetches them."""
     model = SHAPES["gemma4"](scan_layers=True)
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
-    variables = model.init(jax.random.key(0), tokens)
+    variables = nn.unbox(model.init(jax.random.key(0), tokens))
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
@@ -965,7 +966,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                               attention_impl="reference", scan_layers=True,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
-    variables = model.init(jax.random.key(0), tokens)
+    variables = nn.unbox(model.init(jax.random.key(0), tokens))
     variables = {**variables, "moe": jax.tree.map(lambda bias: bias + 4.0 * (jnp.arange(bias.shape[-1]) % 3),
                                                   variables["moe"])}
     assert any(count > 1 for _, count in model.bind(variables).groups)

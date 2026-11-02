@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
@@ -76,7 +77,7 @@ def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
     mla = MultiHeadLatentAttention(emb_features=32, num_heads=2, max_seq_len=8, q_lora_rank=24,
                                    kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=4, v_head_dim=8,
                                    attention_impl="reference")
-    params = mla.init(jax.random.key(0), jnp.ones((1, 8, 32), jnp.float32))
+    params = nn.unbox(mla.init(jax.random.key(0), jnp.ones((1, 8, 32), jnp.float32)))
     query, value = ('params', 'q_b_proj', 'kernel'), ('params', 'kv_b_proj', 'kernel')
     widths = {query: 12, value: 16}
 
@@ -227,7 +228,7 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
 
     for flat in (True, False):
         model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat, attention_impl="xla")
-        params = model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32))["params"]
+        params = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32)))["params"]
         split = muon_partition(params)
         assert {path: reason for path, reason in split.items() if path.endswith("['kernel']")} == {
             f"['{name}']['kernel']": "muon" for name in ("to_q", "to_k", "to_v", "to_out_0")}

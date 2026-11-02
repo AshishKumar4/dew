@@ -181,7 +181,7 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
     lora = LoRA(rank=2, modules=modules, dropout=0.5)
     draw = factor_draw(model, lora)
     ids = jnp.asarray(draw(0)[1])
-    base = model.init(jax.random.key(0), ids)
+    base = nn.unbox(model.init(jax.random.key(0), ids))
     adapter = lora.apply(model, base, key=0)
     adapted = adapter.model
     np.testing.assert_array_equal(np.asarray(adapted.apply(adapter.variables, ids)),
@@ -219,7 +219,7 @@ def test_a_cached_linear_memory_keeps_one_cache_across_dropout_routes():
     model = decoder(layer("gated_linear_attention"))
     lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
     variables, ids = factor_draw(model, lora)(0)
-    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+    adapted = lora.apply(model, nn.unbox(model.init(jax.random.key(0), jnp.asarray(ids))), key=0).model
 
     @jax.jit
     def cached(allocating, continuing):
@@ -309,10 +309,10 @@ def test_a_quantized_memory_decoder_reloads_from_its_record():
 
     plain = decoder()
     ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
-    first = inner_sites(plain.init(jax.random.key(0), ids)["params"], heads=(0,))
+    first = inner_sites(nn.unbox(plain.init(jax.random.key(0), ids))["params"], heads=(0,))
     sites = tuple((site, "fp8") for site in first if site.endswith("layers_0"))
     quantized = InputQuantization(sites=sites).apply(plain)
-    variables = quantized.init(jax.random.key(0), ids)
+    variables = nn.unbox(quantized.init(jax.random.key(0), ids))
     scales = jax.tree.map(lambda scale: np.float32(SCALE), variables[QUANTIZATION])
     variables = {**variables, QUANTIZATION: scales}
     logits = np.asarray(quantized.apply(variables, ids))
@@ -434,7 +434,7 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
     model = Quantization(patterns=(INNER,), bwd_qtype="int8", bwd_stochastic_rounding="uniform").apply(
         decoder())
     ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
-    params = model.init(jax.random.key(0), ids)["params"]
+    params = nn.unbox(model.init(jax.random.key(0), ids))["params"]
 
     @jax.jit
     def trained(params, key):
@@ -547,7 +547,7 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     from dew.sampling import Sampling
 
     model = decoder(None if memory is None else layer(memory)).clone(max_seq_len=64)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=12))
     bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
@@ -583,7 +583,7 @@ def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward
     from dew.sampling import Sampling
 
     model = decoder().clone(max_seq_len=64)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     spec = Quantization(patterns=(INNER,))
     task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     bound = task.quantized(spec)
@@ -654,7 +654,7 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
         network=GeneralMemory(), heads=2, head_features=8, chunk=4, normalize=True,
         learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
     model = decoder(memory).clone(max_seq_len=64)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=12))
     if weight_only is not None:
@@ -702,7 +702,7 @@ def test_a_memory_composes_under_a_field_named_network():
 
     module = layer("titans")
     x = drawn(module)(0)[0]
-    variables = Holder(module).init(jax.random.key(0), x)
+    variables = nn.unbox(Holder(module).init(jax.random.key(0), x))
     np.testing.assert_array_equal(np.asarray(Holder(module).apply(variables, x)),
                                   np.asarray(module.apply({"params": variables["params"]["network"]}, x)))
 
@@ -711,9 +711,9 @@ def test_a_memory_refuses_a_bidirectional_decoder():
     """A memory reads each token's prefix alone, so a decoder that asks its layers for the whole row
     (`causal=False`, a masked diffusion model's) refuses to build one; the same decoder causal builds."""
     ids = jnp.zeros((2, LENGTH), jnp.int32)
-    decoder().init(jax.random.key(0), ids)
+    nn.unbox(decoder().init(jax.random.key(0), ids))
     with pytest.raises(ValueError):
-        decoder(causal=False).init(jax.random.key(0), ids)
+        nn.unbox(decoder(causal=False).init(jax.random.key(0), ids))
 
 
 def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
@@ -740,7 +740,7 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
     def kept(memory: InContextMemory, *, quantized: bool = False) -> tuple[set[str], list]:
         kind = InContextMemoryMixer(memory)
         model = CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "dtype": jnp.float32, "mixer": kind})
-        variables = model.init(jax.random.key(4), ids)
+        variables = nn.unbox(model.init(jax.random.key(4), ids))
         if quantized:
             sites = tuple((site, "fp8") for site in inner_sites(variables["params"], heads=(0,)))
             record = InputQuantization(sites=sites)
@@ -781,7 +781,7 @@ def test_muon_steps_each_memory_heads_matrices_on_their_own():
     from dew.optim import OptimConfig, muon_weight_dimension_numbers
 
     model = decoder()
-    params = model.init(jax.random.key(0), jnp.zeros((2, LENGTH), jnp.int32))["params"]
+    params = nn.unbox(model.init(jax.random.key(0), jnp.zeros((2, LENGTH), jnp.int32)))["params"]
     numbers = muon_weight_dimension_numbers(params)["layers_0"]["self_attn"]
     layers = {f"layers_{index}": {"kernel": optax.contrib.MuonDimensionNumbers(), "bias": None}
               for index in (0, 1)}
@@ -824,7 +824,7 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     rebuilt = ModelConfig.from_dict(record).build()
     assert rebuilt == model
     ids = jax.random.randint(jax.random.key(1), (2, LENGTH), 0, 37)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     np.testing.assert_array_equal(np.asarray(rebuilt.apply(variables, ids)),
                                   np.asarray(model.apply(variables, ids)))
 
@@ -840,7 +840,7 @@ def test_a_memory_draws_its_tokens_keys_from_a_typed_rbg_stream():
     model = decoder(layer("gated_linear_attention"))
     lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
     variables, ids = factor_draw(model, lora)(0)
-    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+    adapted = lora.apply(model, nn.unbox(model.init(jax.random.key(0), jnp.asarray(ids))), key=0).model
 
     @jax.jit
     def cached(rngs):

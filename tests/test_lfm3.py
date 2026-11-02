@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import respelled
 from safetensors.numpy import load_file
 
@@ -69,7 +70,7 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     model, variables = loaded.model, loaded.variables
     if not sandwich:
         model = model.clone(sandwich_norms=False)
-        variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+        variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     ids = jnp.asarray(fixture('input_ids'), jnp.int32)
     expected = np.asarray(model.apply(variables, ids))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'saved')
@@ -102,7 +103,7 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
 
     # The tiny release at the vocabulary of a tokenizer a decision layout reads its specials from.
     model = Pretrained.load(TINY, dtype='float32', attention_impl='reference').model.clone(vocab_size=289)
-    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'release')
     for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
         shutil.copy(QWEN / name, tmp_path / 'release' / name)

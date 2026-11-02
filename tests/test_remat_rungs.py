@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, VOCAB, Case
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, reads
+from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin, stepped_outputs
 from reference_error import assert_as_exact, widened
@@ -258,7 +259,7 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
                               continuum=ContinuumLevel(hidden=4))
     scanned = _rungs(plain.clone(scan_layers=True))[-1]
     tokens = jnp.zeros((ROWS, LENGTH), jnp.int32)
-    shapes = jax.eval_shape(lambda: plain.init(jax.random.key(0), tokens))
+    shapes = jax.eval_shape(lambda: nn.unbox(plain.init(jax.random.key(0), tokens)))
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -330,7 +331,7 @@ def test_an_architectures_remat_rungs_step_as_it_does(case):
     ladder, decoders and DiT stacks, at its size there."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(case.name, model, model.init(jax.random.key(0), *inputs), inputs)
+    _climbs_and_restores(case.name, model, nn.unbox(model.init(jax.random.key(0), *inputs)), inputs)
 
 
 def test_the_gradient_covering_names_tested_models():

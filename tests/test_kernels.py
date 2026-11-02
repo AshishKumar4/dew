@@ -901,7 +901,7 @@ def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
 
     def draw(seed):
         tokens = jnp.asarray(np.random.default_rng(seed).integers(1, 64, (2, 300)), jnp.int32)
-        return model('auto').init(jax.random.key(seed), tokens), tokens
+        return nn.unbox(model('auto').init(jax.random.key(seed), tokens)), tokens
 
     def applied(implementation, dtype=jnp.float32):
         def apply(params, tokens):
@@ -1007,7 +1007,7 @@ def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_doe
     rng = np.random.default_rng(1)
     queries = jnp.asarray(rng.normal(size=(3, 5, 16)), jnp.float32)
     context = jnp.asarray(rng.normal(size=(3, 7, 16)), jnp.float32)
-    params = module.init(jax.random.key(0), queries, context)
+    params = nn.unbox(module.init(jax.random.key(0), queries, context))
     lengths = jnp.asarray([7, 4, 1])
     prefix = (jnp.arange(7)[None, :] < lengths[:, None])[:, None, None, :]
     np.testing.assert_array_equal(module.apply(params, queries, context, key_value_seq_lengths=lengths),
@@ -1027,7 +1027,7 @@ def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
     context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
     moved = context.at[:, 3].add(10.0)
-    params = module.init(jax.random.key(0), queries, context)
+    params = nn.unbox(module.init(jax.random.key(0), queries, context))
     kept = jnp.ones((2, 1, 5, 7), bool)
     dropped = kept.at[..., 3].set(False)
     np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),

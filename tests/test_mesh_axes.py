@@ -206,7 +206,7 @@ def test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_t
     one device trains."""
     shardings, _, (loss, trained) = stepped(mesh, devices)
     model = tiny(max_seq_len=LENGTH, tie_embeddings=False)
-    params = LMObjective(model, LENGTH).init(jax.random.key(0))["params"]
+    params = nn.unbox(LMObjective(model, LENGTH).init(jax.random.key(0)))["params"]
     fsdp = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
     grouped = Layout(min_shard=TINY_SHARD).shardings(fsdp, params)
 
@@ -227,7 +227,7 @@ def test_the_sequence_axis_shares_the_state_beside_every_split_the_rules_give_it
     a vocabulary of 516 that tensor 4 divides and tensor 4 times sequence 2 does not keeps its
     table split over tensor, and no leaf's tensor split moves when sequence joins the mesh."""
     model = tiny(vocab_size=516, emb_features=256, mlp_features=512)
-    params = LMObjective(model, SEQ_LEN).init(jax.random.key(0))["params"]
+    params = nn.unbox(LMObjective(model, SEQ_LEN).init(jax.random.key(0)))["params"]
 
     def others(placement):
         """Each leaf's axes past the state axes, by dimension."""
@@ -356,7 +356,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
     query = jax.random.normal(jax.random.key(21), (2, 8, 64))
     context = jax.random.normal(jax.random.key(22), (2, length, 96))
-    params = model.init(jax.random.key(23), query, context)["params"]
+    params = nn.unbox(model.init(jax.random.key(23), query, context))["params"]
 
     def compiled(sequence, tensor, link):
         mesh = MeshSpec(sequence=sequence, tensor=tensor).build(jax.devices()[:sequence * tensor])
@@ -407,7 +407,7 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
 
     model = tiny()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
-        model, model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)), key=1)
+        model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))), key=1)
     batch = next(token_batches())
 
     def stepped(frozen_whole: bool):
@@ -565,7 +565,7 @@ def one_step(spec):
     """
     mesh = spec.build()
     objective = LMObjective(tiny(), SEQ_LEN)
-    initial = objective.init(jax.random.key(0))
+    initial = nn.unbox(objective.init(jax.random.key(0)))
     placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
     assert_sharded(placed["params"], mesh)
     batch = shard_batch(mesh, next(token_batches()))
@@ -612,7 +612,7 @@ def test_a_dit_steps_under_a_tensor_axis():
     times = jnp.full((BATCH,), 0.5, jnp.float32)
     layout = Layout(min_shard=TINY_SHARD)
     shardings = layout.shardings(
-        mesh, jax.eval_shape(model.init, jax.random.key(0), images, times))
+        mesh, nn.unbox(jax.eval_shape(model.init, jax.random.key(0), images, times)))
 
     with jax.set_mesh(mesh):
         # The draw boxes the parameters its modules declare the axes of; the checks read their values.
@@ -643,7 +643,7 @@ def test_a_vocabulary_split_head_leaves_the_excluded_column_out_on_every_shard()
         "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1, num_heads=4,
         num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, causal=False)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=4095)(), SEQ_LEN)
-    initial = objective.init(jax.random.key(0))
+    initial = nn.unbox(objective.init(jax.random.key(0)))
     text = jax.random.randint(jax.random.key(2), (BATCH, SEQ_LEN), 0, 4095)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None)
 
@@ -723,7 +723,7 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     block, spec, rows, outputs = CONV_LAYOUTS[name]
     rng = np.random.default_rng(0)
     x = rng.normal(size=(4, 8, 8, 8)).astype(np.float32)
-    params = block.init(jax.random.key(0), x)["params"]
+    params = nn.unbox(block.init(jax.random.key(0), x))["params"]
     shape = jax.eval_shape(block.apply, {"params": params}, x).shape
     cotangent = rng.normal(size=shape).astype(np.float32)
 
@@ -761,7 +761,7 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
     rng = np.random.default_rng(0)
     x = rng.normal(size=(4, 8, 8, 64)).astype(np.float32)
     conv = Conv(64, (3, 3))
-    params = conv.init(jax.random.key(0), x[:1])["params"]
+    params = nn.unbox(conv.init(jax.random.key(0), x[:1]))["params"]
     alone = conv.apply({"params": params}, x)
     mesh = MeshSpec(fsdp=2, tensor=2).build(jax.devices()[:4])
     with jax.set_mesh(mesh):
@@ -841,7 +841,7 @@ def test_a_models_own_parameter_takes_no_axes_from_another_models_names():
             gate = self.param("gate", nn.initializers.normal(), (2, x.shape[-1], 4))
             return jnp.einsum("bd,edf->bef", x, gate)
 
-    variables = Experts().init(jax.random.key(0), jnp.ones((1, 8)))
+    variables = nn.unbox(Experts().init(jax.random.key(0), jnp.ones((1, 8))))
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     placed = Layout(min_shard=1).shardings(mesh, variables)
     assert placed["params"]["gate"].spec == P(None, "fsdp")

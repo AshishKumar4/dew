@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 import torch
+from flax import linen as nn
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
@@ -85,8 +86,8 @@ SEEDS = {"block float32": 512, "block bfloat16": 512, "base": 16, "decode": 16, 
 @functools.cache
 def block_shapes():
     """The block's parameters' shapes, traced once for every draw."""
-    return jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
-                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+    return nn.unbox(jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
+                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32))))["params"]
 
 
 def block_draw(seed, dtype=np.float32):
@@ -373,7 +374,7 @@ def test_a_decoder_refuses_what_its_blocks_cannot_read():
         with pytest.raises(ValueError):
             CrossAttention(**{"layer_ids": (0,), "context_length": 4, **fields})
     with pytest.raises(ValueError):
-        MODEL.clone(cross_attention=CrossAttention((3,), 4)).init(jax.random.key(0), ids)
+        nn.unbox(MODEL.clone(cross_attention=CrossAttention((3,), 4)).init(jax.random.key(0), ids))
 
 
 def test_cross_flops_count_the_blocks_over_the_context():
@@ -492,7 +493,7 @@ def served_task() -> TextGeneration:
     """model_support's one-layer decoder with a block before its layer, its gates drawn away from
     zero, as a greedy task."""
     model = decoder().clone(max_seq_len=128, cross_attention=SERVED)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     params = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.full_like(leaf, 0.8) if path[-1].key.startswith("alpha_") else leaf, params)
     return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0,
@@ -554,7 +555,7 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
             server.submit(dataclasses.replace(wide, conditioning={
                 CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
-    plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+    plain = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
         Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
@@ -748,7 +749,7 @@ def test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pas
     variables = jax.tree_util.tree_map_with_path(
         lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)
                             if path[-1].key.startswith("alpha_") else leaf),
-        model.init(jax.random.key(0), ids))
+        nn.unbox(model.init(jax.random.key(0), ids)))
     table = jnp.asarray(variables["params"]["embed_tokens"]["embedding"])
     encoded = encode_context(model, variables, tokens, lengths, encoder="table")
     assert encoded[CONTEXT].dtype == jnp.bfloat16 and model.context_dtype == jnp.float32

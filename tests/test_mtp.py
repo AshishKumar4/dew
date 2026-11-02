@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from lm_support import token_batch_of
 from model_support import TINY_DECODER, prediction_logits
 from reference_error import assert_as_exact
@@ -47,7 +48,7 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
                  hyper_connections={'hc_mult': 4, 'hc_eps': 1e-6,
                                     'hc_sinkhorn_iters': 20, 'head': 'mean'})
     ids = token_batch(batch=2)[TEXT_KEY]
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     hidden = jnp.asarray(model.apply(variables, ids, method=CausalTransformer.hidden_states))
     state, _ = model.apply(variables, ids, method=CausalTransformer.states_and_logits)
     state = jnp.asarray(state)
@@ -100,7 +101,7 @@ def test_a_depth_reads_the_token_after_its_position():
     position S - 2 alone too; it changes here, and nothing earlier does."""
     model = tiny(num_nextn_predict_layers=1)
     ids = jnp.asarray(np.random.RandomState(0).randint(0, VOCAB, (1, SEQ)), jnp.int32)
-    params = model.init(jax.random.key(0), ids)
+    params = nn.unbox(model.init(jax.random.key(0), ids))
     changed = ids.at[0, -1].set((ids[0, -1] + 1) % VOCAB)
 
     def depth_logits(tokens):
@@ -117,7 +118,7 @@ def test_the_depths_score_through_the_main_head():
     would not."""
     model = tiny(num_nextn_predict_layers=2, tie_embeddings=False)
     ids = jnp.ones((2, 8), jnp.int32)
-    params = model.init(jax.random.key(0), ids)
+    params = nn.unbox(model.init(jax.random.key(0), ids))
     doubled = {"params": {**params["params"],
                           "lm_head": {"kernel": params["params"]["lm_head"]["kernel"] * 2.0}}}
 
@@ -178,7 +179,7 @@ def test_the_term_is_off_by_default():
     depths receive no gradient."""
     model = tiny(num_nextn_predict_layers=1)
     objective = LMObjective(model, SEQ)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch()
 
     (loss, aux), grads = jax.value_and_grad(
@@ -204,7 +205,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
     receive gradient."""
     model = tiny(num_nextn_predict_layers=2, hyper_connections=hyper_connections)
     objective = LMObjective(model, SEQ, mtp_weight=0.3)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     batch = token_batch()
     tokens = np.asarray(batch[TEXT_KEY])
 
@@ -257,7 +258,7 @@ def test_the_depths_read_a_packed_rows_layout_as_its_coordinates_alone():
     bit as the coordinates built from them, and flat fields handed to the depths are refused."""
     model = tiny(num_nextn_predict_layers=2)
     ids, segments, positions = packed_row()
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     hidden = jax.random.normal(jax.random.key(1), (*ids.shape, model.emb_features))
     laid = coordinates(segments=segments, positions=positions)
     flat = ModelInputs(jnp.asarray(ids), {"segment_ids": jnp.asarray(segments),
@@ -276,7 +277,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     """Coordinates may ride the `ModelInputs` instead of beside the batch's
     token ids, and the losses are the same number either way."""
     objective = LMObjective(tiny(num_nextn_predict_layers=depths), SEQ, mtp_weight=0.3)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     ids, segments, positions = packed_row()
     laid = coordinates(segments=segments, positions=positions, max_segments=ids.shape[1],
                        right_padded=True, xp=np)
@@ -306,7 +307,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
                  mixture={"experts": 4, "top_k": 2, "score_function": "sigmoid", "bias": True})
     batch = token_batch()
     still = LMObjective(model, SEQ, balance=ExpertBalance(balance_rate=0.1))
-    params = still.init(jax.random.key(0))
+    params = nn.unbox(still.init(jax.random.key(0)))
     _, aux = still.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
     moved = still.apply_effects(params, aux.effects)["moe"]

@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import as_stepped, decode_through
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
@@ -196,7 +197,8 @@ def test_the_layer_matches_mamba2_mixer(reference, geometry):
     D skip, the gated norm and the output projection."""
     module = layer(geometry)
     variables = layer_params(reference)
-    template = jax.eval_shape(module.init, jax.random.key(0), jnp.zeros((1, 4, geometry["hidden_size"])))
+    sample = jnp.zeros((1, 4, geometry["hidden_size"]))
+    template = nn.unbox(jax.eval_shape(module.init, jax.random.key(0), sample))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
 
     out = module.apply(variables, jnp.asarray(reference["layer.hidden"]))
@@ -386,7 +388,7 @@ def test_padded_packed_rows_reset_at_each_document():
     outside the rule."""
     model = tiny_lm()
     (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(16)
-    params = model.init(jax.random.key(0), ids)
+    params = nn.unbox(model.init(jax.random.key(0), ids))
 
     def hidden(tokens, model=model, params=params, **fields):
         # The flat fields laid out once (`field_coordinates`), the layout the trunk reads.
@@ -432,7 +434,7 @@ def test_the_model_decodes_as_it_scores_in_parallel():
     model = tiny_lm()
     rng = jax.random.key(0)
     ids = jax.random.randint(rng, (2, 12), 0, 32)
-    params = model.init(rng, ids)
+    params = nn.unbox(model.init(rng, ids))
     full = as_stepped(jax.jit(lambda held: model.apply(params, held)), ids, 4)
 
     cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
@@ -494,7 +496,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
         assert_rows_as_exact_over_orders,
         chain_roundings,
     )
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
 
     from dew.nn.kernels import generation
     from dew.nn.kernels.ssd import ssd_kernel_runs
@@ -502,14 +504,15 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     assert ssd_kernel_runs(64, 64, 64, "tpu", dtype=jnp.float32)
     model, devices = ssd_lm(), jax.devices()
     ids = np.asarray(jax.random.randint(jax.random.key(0), (2 * len(devices), 129), 0, 64))
-    variables = jax.device_get(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1])))
-    units = residual_width(variables)
+    variables = jax.device_get(nn.unbox(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1]))))
+    axes = model_axes(model, jnp.asarray(ids[:, :-1]))
+    units = residual_width(variables, axes)
 
     def ordered(result, order):
         """The step's gradients with the residual's units in `order`, and its logits, which no order
         moves."""
         gradients, logits = result
-        return permuted({"params": gradients}, order)["params"], logits
+        return permuted({"params": gradients}, order, axes)["params"], logits
 
     # The float64 oracle runs on the host: a TPU emulates float64.
     with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
