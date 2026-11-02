@@ -25,7 +25,7 @@ def test_drawn(value):
 def test_slow(value):
     with open({slow!r}, "a") as out:
         out.write("ran\\n")
-    time.sleep(2.2)
+    time.sleep(2.6)
 """
 
 
@@ -53,7 +53,8 @@ def test_a_property_test_runs_the_profiles_examples_alike_every_run_and_keeps_no
         assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
         runs.append(drawn.read_text().split())
     assert runs[0] == runs[1] and len(runs[0]) == 50, (len(runs[0]), len(runs[1]))
-    # Its one example past the 2 s deadline fails the test (which passes with none), run again only to confirm it.
+    # Its one example past the 2 s deadline, and the quarter more Hypothesis allows while it generates, fails the
+    # test (which passes with no deadline), run again only to confirm it.
     slow = ran("test_slow")
     assert slow.returncode == 1 and 0 < len(slowed.read_text().split()) <= 3, slow.stdout[-2000:]
     assert not (tmp_path / ".hypothesis").exists()
