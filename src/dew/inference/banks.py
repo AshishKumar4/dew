@@ -40,7 +40,7 @@ from jax.typing import DTypeLike
 
 from dew.batch import Variables, merge, without
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
-from dew.nn.backbones.layer_plan import group_layers, layer_index
+from dew.nn.backbones.layer_names import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
 from dew.nn.kernels.options import program
 

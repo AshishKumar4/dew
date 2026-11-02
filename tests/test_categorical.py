@@ -1,7 +1,7 @@
 """The categorical distribution's one owner (`dew.nn.categorical`): every log-likelihood Dew takes
 computes in at least float32 and keeps float64 logits in float64, masks the classes a row does not
 hold, a class of no probability adding no term in value or gradient, and each form agrees with the
-others; a label's log probability through the token owner (`dew.objectives.base.token_log_probs`) is
+others; a label's log probability through the token owner (`dew.nn.categorical.token_log_probs`) is
 float64's own for a float64 model, and a ragged row's segments normalize as each segment alone."""
 
 import jax
@@ -13,7 +13,7 @@ from confident_support import confident, label_derivative, log_softmax
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn import categorical
-from dew.objectives.base import token_log_probs
+from dew.nn.categorical import token_log_probs
 
 MASKED_SEEDS = 8
 """Check 1's declared seeds for a masked row against the row of its held classes alone."""

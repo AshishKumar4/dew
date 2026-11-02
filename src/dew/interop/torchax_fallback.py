@@ -113,11 +113,11 @@ class TorchAdmission:
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     """Tier 3's decision on an unregistered model_type no registered convention computes, on the
     probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
-    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward is
-    causal, so changing a row's last token leaves every earlier position's logits bit for bit (a
-    decoder configured bidirectionally, BERT's with is_decoder False, is not); and its inference and
+    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its inference and
     training forwards trace as tier 3 traces them (`TorchGraph.traced`), the training one drawing
-    nothing on the host. An operation whose output's shape or value the traced values decide (a
+    nothing on the host; and the forward tier 3 runs is causal, so changing a row's last token leaves
+    every earlier position's logits bit for bit (a decoder configured bidirectionally, BERT's with
+    is_decoder False, is not). An operation whose output's shape or value the traced values decide (a
     `nonzero`, an `item()`) fails that trace with JAX's own error, naming it. Each refusal names its
     cause."""
     import torch
@@ -139,14 +139,7 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
     probe = _Probe()
     with torch.no_grad(), probe.recording():
-        logits = model(input_ids=ids, use_cache=False).logits
-    changed = ids.clone()
-    changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
-    with torch.no_grad():
-        moved = model(input_ids=changed, use_cache=False).logits
-    if not torch.equal(logits[:, :-1], moved[:, :-1]):
-        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
-                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
+        model(input_ids=ids, use_cache=False)
     # Its inference and training forwards traced as tier 3 traces them; the training one's dropout and
     # any layer drop run only there, and a draw on the host would be fixed for every step.
     from torchax.interop import JittableModule, extract_all_buffers
@@ -156,7 +149,17 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     graph = TorchGraph(jittable, ())
-    graph.traced(params, buffers, ids.numpy().astype(np.int32), None, train=False)
+    # Causal as tier 3 runs it, its experts at static shapes (`functional_parts`): transformers' own
+    # forward runs Longcat Flash's experts over the tokens each routes, so one token's route rounds
+    # another's products, which is no attention to later tokens (ledger 3125).
+    placed = {name: jnp.asarray(leaf) for name, leaf in params.items()}
+    held = {name: jnp.asarray(leaf) for name, leaf in buffers.items()}
+    tokens = jnp.asarray(ids.numpy(), jnp.int32)
+    changed = tokens.at[:, -1].set((tokens[:, -1] + 1) % int(config.vocab_size))
+    logits, moved = (np.asarray(graph(placed, held, row, train=False)[0]) for row in (tokens, changed))
+    if not np.array_equal(logits[:, :-1], moved[:, :-1]):
+        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
+                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
     _, _, draws = graph.traced(params, buffers, ids.numpy().astype(np.int32), jax.random.key(0), train=True)
     if draws.host:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
@@ -979,7 +982,7 @@ def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
 
 def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
     """`closed` evaluated on `arguments` with each broadcast of a floating value
-    narrower than fp32 summing its gradient in fp32 (`_accumulated`): an explicit
+    narrower than fp32 summing its gradient in fp32 (`dew.nn.precision.broadcast_summed`): an explicit
     `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
     broadcasts implicitly (`_BROADCASTING`), each made explicit first; a jit's body
     is inlined so its broadcasts are found too. jax transposes a broadcast into a
@@ -1007,14 +1010,14 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
                 inner = equation.params["jaxpr"]
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
-                outputs = [_accumulated(inputs[0], tuple(equation.params["shape"]),
-                                        tuple(equation.params["broadcast_dimensions"]))]
+                outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),
+                                            tuple(equation.params["broadcast_dimensions"]))]
             else:
                 if equation.primitive in _BROADCASTING:
                     shape = equation.outvars[0].aval.shape
                     rank = len(shape)
                     # An operand broadcasts on its trailing dimensions: a scalar on none.
-                    inputs = [_accumulated(value, shape, tuple(range(rank - jnp.ndim(value), rank)))
+                    inputs = [broadcast_summed(value, shape, tuple(range(rank - jnp.ndim(value), rank)))
                               if _narrow_float(value) and jnp.shape(value) != shape else value
                               for value in inputs]
                 # As `jax.core.eval_jaxpr` binds an equation.
@@ -1039,12 +1042,6 @@ def _narrow_float(value) -> bool:
     """Whether `value` is a floating array narrower than fp32."""
     dtype = jnp.result_type(value)
     return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
-
-
-def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
-    order, as a Dew bias's does (`dew.nn.precision.broadcast_summed`, ledgers 2653 and 3038)."""
-    return broadcast_summed(value, shape, dimensions)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
@@ -1580,10 +1577,10 @@ def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) ->
     under, as stored, which the load casts to their storage leaf by leaf where it places them
     (`_in_storage`): each key named as transformers' load names it (`sources.load_names`), a key the model
     holds nothing under left out, and a tied parameter (an output table that is its input table) under
-    each of its names from the one the checkpoint stores it under. None where a key takes one of the
-    mapping's tensor conversions (a fused expert's merge), or the mapping renames a key by whether
-    another is stored, which transformers' own load applies."""
-    names = sources.load_names(model)
+    each of its names from the one the checkpoint stores it under, a key renamed by whether another is
+    stored read over the shards' names. None where a key takes one of the mapping's tensor conversions
+    (a fused expert's merge), which transformers' own load applies."""
+    names = sources.load_names(model, shards.keys())
     if names is None:
         return None
     held = model.state_dict()

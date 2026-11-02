@@ -1,4 +1,4 @@
-"""8-bit optimizer state (`dew.optim.int8_moments`, `OptimConfig(state_dtype='int8')`): Adam's moments
+"""8-bit optimizer state (`dew._moments.int8_moments`, `OptimConfig(state_dtype='int8')`): Adam's moments
 stored blockwise in 8 bits, against fp32 Adam."""
 
 import jax
@@ -8,15 +8,8 @@ import optax
 import pytest
 from learning_gate import assert_learns
 
-from dew.optim import (
-    OPTIMIZER_MAP,
-    QUANTIZED_SIZE,
-    OptimConfig,
-    QuantizedMoments,
-    dequantized,
-    dynamic_map,
-    quantized,
-)
+from dew._moments import QUANTIZED_SIZE, QuantizedMoments, dequantized, dynamic_map, quantized
+from dew.optim import OPTIMIZER_MAP, OptimConfig
 
 LR = 1e-2
 BLOCK = 256

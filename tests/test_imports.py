@@ -165,13 +165,20 @@ FOREIGN = {
 """Each run configuration's module and the modules outside its domain it must not import: an LM's no image
 diffusion, vision tower, autoencoder or media data; a diffusion model's no decoder language model or chat
 data, its text encoders' decoder blocks its own; a decision task's no image generation or autoencoder,
-the vision towers its multimodal reader reads its own (row 2042)."""
+the vision towers its multimodal reader reads its own (row 2042); and the shared modules an objective, a
+sampler or a model imports (row 2043): a LoRA reads a stack's layer names, not its plan's mixers; a
+sampler's tokens and rounding stream and a saved run's record are the categorical's, the precision's and
+the records' own, not an objective's."""
+FOREIGN |= {"dew.lora": ("dew.nn.backbones.layer_plan", "dew.nn.mixer_base", "dew.objectives"),
+            "dew.sampling.text": ("dew.objectives",),
+            "dew.sampling.strategies": ("dew.objectives",),
+            "dew.inference.tasks": ("dew.objectives",)}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
-def test_a_run_configuration_imports_its_own_domain_alone(module):
-    """A run configuration's module imports, in a fresh interpreter, none of the modules outside its
-    domain (`FOREIGN`): a change there re-runs none of its tests."""
+def test_a_module_imports_its_own_domain_alone(module):
+    """A run configuration's or a shared module's module imports, in a fresh interpreter, none of the
+    modules outside its domain (`FOREIGN`): a change there re-runs none of its tests."""
     script = f"""
 import json, sys
 import {module}

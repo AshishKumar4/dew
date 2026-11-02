@@ -50,6 +50,7 @@ from dew.interop.families.qwen import (
     QWEN3_5_TEXT,
     QWEN3_MOE,
     QWEN3_NEXT,
+    QWEN3_VL_MOE_TEXT,
 )
 from dew.interop.families.qwen4_exp import QWEN4_EXP_TEXT
 from dew.interop.families.starcoder2 import STARCODER2
@@ -114,6 +115,7 @@ ENTRIES = (
     GEMMA2,
     GEMMA,
     QWEN3_MOE,
+    QWEN3_VL_MOE_TEXT,
     QWEN3,
     QWEN2_MOE,
     QWEN2,

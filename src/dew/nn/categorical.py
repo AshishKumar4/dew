@@ -32,7 +32,8 @@ from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
            "label_entry", "log_probs", "partition", "probabilities", "ranked_probability", "rescaled",
-           "segment_log_partition", "smoothed", "soft_cross_entropy", "spherical", "target_loss"]
+           "segment_log_partition", "smoothed", "soft_cross_entropy", "spherical", "target_loss",
+           "token_log_probs"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -83,6 +84,14 @@ def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None 
     over the other classes passes the dtype's precision (eq. 4; 16.6 in float32), while the others'
     probabilities stay until they underflow."""
     return _label_loss(widened(logits, where), labels)
+
+
+def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`cross_entropy`'s negation).
+
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
+    """
+    return -cross_entropy(logits, tokens)
 
 
 def partition(logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
