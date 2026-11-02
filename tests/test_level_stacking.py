@@ -12,7 +12,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.batch import Coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_stack import StackView, stack_layers
+from dew.nn.backbones.decoder_stack import stack_layers
 from dew.nn.continuum import feedforward_levels
 from dew.nn.mixers import AttentionMixer
 from dew.objectives.lm import LMObjective
@@ -27,6 +27,7 @@ STACKED = CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=
 norm's gradient, one sum over every token the draw holds, has 16 elements a draw for check 1 to pool."""
 
 TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
+"""The decoder in float64 on the reference kernel: the loops' truth."""
 SCANNED = STACKED.clone(scan_layers=True)
 """`STACKED` scanning its run of layers, which stores them as its own layers, one subtree a layer."""
 BLOCKED = STACKED.clone(layer_types=("full_attention",) * 2,
@@ -35,7 +36,6 @@ BLOCKED = STACKED.clone(layer_types=("full_attention",) * 2,
 run's decoder does, and its float64 truth and scanned form."""
 BLOCKED_TRUTH = BLOCKED.clone(dtype=jnp.float64, attention_impl="reference")
 BLOCKED_SCANNED = BLOCKED.clone(scan_layers=True)
-"""The decoder in float64 on the reference kernel: the loops' truth."""
 
 STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 512,
                   "blocks": 8}
@@ -174,22 +174,21 @@ def test_a_decoders_own_blocks_at_rate_zero_score_as_its_forward():
                     truth_fn=plain(TRUTH, truth=True))
 
 
-@pytest.mark.parametrize(("model", "store"), [(STACKED, None), (SCANNED, None), (SCANNED, banked)],
-                         ids=["layers", "scanned", "banked"])
+@pytest.mark.parametrize("model", [STACKED, SCANNED], ids=["layers", "scanned"])
 @pytest.mark.parametrize(("layers", "windows"), [((1,), (3,)), ((0, 1), (3, 6)), ((1, 0), (6, 3))],
                          ids=["one-layer", "faster-first", "slower-first"])
-def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, model, store):
+def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, model):
     """A decoder's feed-forward blocks step in context at their own windows and rates, each target's loss
     on par with the literal chunk loop's (`chunk_loop`, check 1): one layer's block, and two at windows of
-    three and six in either order; a stack of its own layers, one that scans them alike, and one whose
-    store banks them as one run, each block read and written at its row of the bank."""
+    three and six in either order; a stack of its own layers and one that scans them alike (a store that
+    banks them: test_stacked_training.py)."""
     adaptation = ChunkAdaptation(window=windows, rate=(0.1, 0.05)[:len(layers)], layers=layers)
 
     def literal(reference, *, truth):
         return jax.jit(lambda variables, tokens: chunk_loop(reference, variables, tokens, adaptation,
                                                             truth=truth))
 
-    assert_as_exact(jax.jit(stacked(adaptation, model, store)), literal(STACKED, truth=False), draw,
+    assert_as_exact(jax.jit(stacked(adaptation, model)), literal(STACKED, truth=False), draw,
                     f"stacked blocks of layers {layers} at windows {windows}",
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 
@@ -219,50 +218,6 @@ def test_training_differentiates_through_the_blocks_steps():
     assert_as_exact(jax.jit(dew), literal(STACKED, truth=False), gradient_draw,
                     "the gradient through stacked blocks' steps", seeds=STACKING_SEEDS["gradient"],
                     truth_fn=literal(TRUTH, truth=True))
-
-
-def test_a_run_continues_pretraining_through_its_blocks_steps():
-    """An objective that steps a decoder's own blocks in context trains, its loss finite and its blocks'
-    starts moved by the outer step (`LMObjective(adaptation=ChunkAdaptation(layers=...))`)."""
-    import optax
-
-    adaptation = ChunkAdaptation(window=(3, 6), rate=0.05, layers=(0, 1))
-    objective = LMObjective(STACKED, LENGTH, adaptation=adaptation)
-    variables = objective.init(jax.random.key(0))
-    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)), jnp.int32)
-
-    def loss(params):
-        return jnp.mean(objective.token_scores(params, tokens).losses)
-
-    value, gradient = jax.value_and_grad(loss)(variables)
-    assert np.isfinite(float(value))
-    blocks = gradient["params"]["layers_0"]["mlp"]
-    assert any(float(jnp.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(blocks))
-    updates, _ = optax.sgd(0.1).update(gradient, optax.sgd(0.1).init(variables))
-    assert np.isfinite(float(loss(optax.apply_updates(variables, updates))))
-
-
-def test_a_training_step_continues_pretraining_through_the_blocks_steps():
-    """A training step's loss (`LMObjective.loss`, its summed head and z-loss) of a decoder stepping its
-    own blocks in context is finite and moves the blocks' starts, as continued pre-training trains them."""
-    from dew.objectives.base import Step
-
-    objective = LMObjective(STACKED, LENGTH, adaptation=ChunkAdaptation(window=(3, 6), rate=0.05,
-                                                                        layers=(0, 1)), z_loss=1e-4)
-    variables = objective.init(jax.random.key(0))
-    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)), jnp.int32)
-
-    def loss(params):
-        step = Step(jnp.asarray(0), jax.random.key(0), None)
-        statistics, _ = objective.loss(params, {"text": tokens}, step)
-        return statistics.mean()[0]
-
-    value, gradient = jax.value_and_grad(loss)(variables)
-    assert np.isfinite(float(value))
-    blocks = gradient["params"]["layers_0"]["mlp"]
-    assert any(float(jnp.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(blocks))
-
-
 def padded_draw(seed: int):
     """A draw (`draw`) and each row's validity, its last few slots padding."""
     variables, tokens = draw(seed)
@@ -303,96 +258,3 @@ def test_a_stacked_row_refuses_several_packed_documents():
     with pytest.raises(ValueError):
         stacked_scores(STACKED, variables, inputs, targets, jnp.ones(targets.shape),
                        {"segment_ids": documents}, adaptation, predict=False, logits=False)
-
-
-def test_a_rows_blocks_at_rate_zero_score_as_its_forward_reads_them():
-    """At rate zero a stacked pass over rows whose attention reads blocks whole (a prefix, and a later run,
-    within one chunk or across bounds) scores each target as the decoder's own forward over the whole row
-    and its blocks does (check 1): every block is read whole, by the chunk it starts in."""
-    adaptation = ChunkAdaptation(window=3, rate=0.0, layers=(0, 1))
-
-    def plain(model, *, truth):
-        return jax.jit(lambda variables, tokens, blocks: token_losses(
-            model.apply(variables, tokens[:, :-1], block_groups=blocks), tokens[:, 1:], truth=truth))
-
-    assert_as_exact(jax.jit(stacked(adaptation, BLOCKED)), plain(BLOCKED, truth=False), blocked_draw,
-                    "the stacked pass over blocks at rate zero", seeds=STACKING_SEEDS["zero"],
-                    truth_fn=plain(BLOCKED_TRUTH, truth=True))
-
-
-@pytest.mark.parametrize(("model", "store"), [(BLOCKED, None), (BLOCKED_SCANNED, banked)],
-                         ids=["layers", "banked"])
-def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(model, store):
-    """A decoder's blocks step in context over rows whose attention reads blocks whole, each target's loss on
-    par with the literal chunk loop's (`chunk_loop`, check 1), whose chunk holds a block's every token from
-    the chunk its first token is in: a block's chunk reads it whole before the cache holds it, at that
-    chunk's levels, and a chunk a block covers whole steps no level by any token of its own."""
-    adaptation = ChunkAdaptation(window=(3, 6), rate=(0.1, 0.05), layers=(0, 1))
-
-    def literal(reference, *, truth):
-        return jax.jit(lambda variables, tokens, blocks: chunk_loop(reference, variables, tokens, adaptation,
-                                                                    truth=truth, blocks=blocks))
-
-    assert_as_exact(jax.jit(stacked(adaptation, model, store)), literal(BLOCKED, truth=False), blocked_draw,
-                    "stacked blocks over a row's blocks", seeds=STACKING_SEEDS["blocks"],
-                    truth_fn=literal(BLOCKED_TRUTH, truth=True))
-
-
-def test_a_prefix_run_steps_its_blocks_in_context():
-    """A prefix run (`LMObjective(prefix=...)`) whose decoder steps its own blocks in context scores at rate
-    zero as the prefix run without them (check 1), its prefix read whole across the chunks it spans, and
-    trains through their steps: its loss finite and its blocks' starts moved."""
-    from dew.objectives.base import Step
-
-    stepping = ChunkAdaptation(window=3, rate=0.0, layers=(0, 1))
-    objective = LMObjective(BLOCKED, LENGTH, prefix=5, adaptation=stepping)
-    plain = LMObjective(BLOCKED, LENGTH, prefix=5)
-
-    def scored(scorer):
-        def losses(variables, tokens):
-            step = Step(jnp.asarray(0), jax.random.key(0), None)
-            _, _, prediction = scorer.predict(variables, {"text": tokens}, step, train=False, logits=False)
-            return prediction.losses * prediction.weights
-        return jax.jit(losses)
-
-    def truth(variables, tokens):
-        blocks = jnp.where(jnp.arange(LENGTH) < 5, 1, -1)[None].repeat(ROWS, axis=0)
-        logits = BLOCKED_TRUTH.apply(variables, tokens[:, :-1], block_groups=blocks)
-        return token_losses(logits, tokens[:, 1:], truth=True) * (jnp.arange(1, LENGTH + 1) >= 5)
-
-    assert_as_exact(scored(objective), scored(plain), lambda seed: draw(seed, model=BLOCKED),
-                    "a prefix run's stacked pass at rate zero",
-                    seeds=STACKING_SEEDS["zero"], truth_fn=jax.jit(truth))
-    trained = LMObjective(BLOCKED, LENGTH, prefix=5, adaptation=ChunkAdaptation(window=(3, 6), rate=0.05,
-                                                                               layers=(0, 1)))
-    variables = trained.init(jax.random.key(0))
-    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)), jnp.int32)
-
-    def loss(params):
-        statistics, _ = trained.loss(params, {"text": tokens}, Step(jnp.asarray(0), jax.random.key(0), None))
-        return statistics.mean()[0]
-
-    value, gradient = jax.value_and_grad(loss)(variables)
-    assert np.isfinite(float(value))
-    blocks = gradient["params"]["layers_0"]["mlp"]
-    assert any(float(jnp.abs(leaf).max()) > 0 for leaf in jax.tree.leaves(blocks))
-
-
-def test_a_periodic_runs_layer_is_read_and_written_at_its_position():
-    """A store a periodic run's positions stack (`StackView.stack` over a period of two) reads each layer's
-    block at its position's repeat (`StackView.stored_layer`), and a block written there
-    (`with_stored_layer`) is that layer's alone once the run is unstacked, every other layer as stored."""
-    view = StackView(((0, 4),), periods=(2,))
-    layers = {f"layers_{index}": {"mlp": {"kernel": jnp.full((2, 3), index, jnp.float32)},
-                                  "norm": {"scale": jnp.full(3, -index, jnp.float32)}} for index in range(4)}
-    stored = view.stack({"params": layers})["params"]
-    for index in range(4):
-        np.testing.assert_array_equal(view.stored_layer(stored, index, "mlp")["kernel"],
-                                      layers[f"layers_{index}"]["mlp"]["kernel"])
-    written = view.with_stored_layer(stored, 3, "mlp", {"kernel": jnp.full((2, 3), 9.0)})
-    unstacked = view.unstack({"params": written})["params"]
-    for index in range(4):
-        kernel = 9.0 if index == 3 else index
-        np.testing.assert_array_equal(unstacked[f"layers_{index}"]["mlp"]["kernel"], jnp.full((2, 3), kernel))
-        np.testing.assert_array_equal(unstacked[f"layers_{index}"]["norm"]["scale"],
-                                      layers[f"layers_{index}"]["norm"]["scale"])
