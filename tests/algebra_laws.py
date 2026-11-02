@@ -449,8 +449,8 @@ def _scaled_out(expression):
     """`expression` with each maximum and minimum whose arguments share a positive rational factor (their
     contents' greatest common one, a float's least, `LEAST`, apart) taken as that factor times the extremum of
     the arguments over it: a positive scale keeps every order, so a scaled logit's maxima are ordered as its
-    raw products' are, not as twice as many values (a positive factor's forward proved in minutes, not
-    seconds, every order of both counted)."""
+    raw products' are, not as twice as many values (a positive factor's forward certificate ran past
+    900 seconds with every order of both counted: FS-EACH-LAWS1)."""
     def factored(atom):
         scaled = [argument for argument in atom.args if argument != LEAST]
         if not scaled:
