@@ -444,10 +444,10 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
     # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
-    # to 16384. The runs score no split, which nothing here reads.
+    # to 16384. Each step reads four rows, and the runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
-    data = decision_rows(examples, 8, objective=objective.data())
+    data = decision_rows(examples, 4, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
     for index, steps in enumerate((2, 1)):
