@@ -23,7 +23,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "mask": ("causal", "full", "documents"),
         "hook": ("plain", "key-bias", "tile-bias", "softcap"),
         "launch": ("one", "two", "shared-keys"),
-        "dtype": ("bfloat16", "float16"),
+        "dtype": ("bfloat16", "float16", "float32"),
         "form": ("fast", "accurate"),
     },
 }
@@ -32,6 +32,14 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
 one shape added to the logits (two in-place gradients of one shape, row 3180's), or a softcap; the backward
 in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or the accurate
 form."""
+
+SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
+    "attention": (
+        (3522, ("sm90", "256", "gqa-8-4", "causal", "plain", "two", "float32", "fast")),
+    ),
+}
+"""Each family's cases a ledger row names, by the row, its axis values in `AXES`' order: its cells take them
+whatever the covering takes besides (`covering`), so the row's own case proves it closed."""
 
 CELLS: dict[str, tuple[str, str]] = {
     "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
@@ -79,13 +87,18 @@ def covered(family: str) -> list[tuple[str, dict[str, str]]]:
 
 def covering(family: str) -> list[tuple[str, ...]]:
     """Combinations the route serves in which every supported pair occurs (`supported_pairs`), each as its
-    values in `AXES`' order: the combination holding the most pairs not yet covered first, a tie to the first
-    in `combinations`' order. A family's cell module takes these as its cases, regenerated where its axes or
-    its route's support change (tests/test_kernel_matrix.py fails until they are)."""
+    values in `AXES`' order: the family's seeded cases (`SEEDED`) first, then the combination holding the most
+    pairs not yet covered, a tie to the first in `combinations`' order. A family's cell module takes these as
+    its cases, regenerated where its axes or its route's support change (tests/test_kernel_matrix.py fails
+    until they are)."""
     left = supported_pairs(family)
     served = [combination for combination in combinations(family)
               if supported(family, tuple(combination.items()))]
     chosen = []
+    for _, case in SEEDED.get(family, ()):
+        combination = dict(zip(AXES[family], case, strict=True))
+        chosen.append(case)
+        left -= set(itertools.combinations(combination.items(), 2))
     while left:
         best = max(served, key=lambda combination: len(
             left & set(itertools.combinations(combination.items(), 2))))
