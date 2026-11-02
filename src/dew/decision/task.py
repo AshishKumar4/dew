@@ -1252,7 +1252,7 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
 
     @property
     def model(self) -> DecisionModel:
-        """The decision's model, whose weights every pass reads (`Scoring.model`)."""
+        """The decision's model, whose weights every pass reads (`ModelScoring.model`)."""
         return self.decide.model
 
     def metrics(self) -> dict[str, float]:
