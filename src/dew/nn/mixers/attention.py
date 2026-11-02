@@ -65,7 +65,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
-from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared, logical_axes
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
@@ -257,6 +257,18 @@ GATE_ACTIVATIONS = {
 }
 """The output gate's activations (`MixerContext.output_gate_activation`)."""
 
+ATTENTION_AXES: dict[str, LogicalAxes] = {
+    "q_proj": ("embed", "heads"),
+    "k_proj": ("embed", "kv"),
+    "v_proj": ("embed", "kv"),
+    # The output gate's own projection (`gate_projection='own'`) is per head like the query's.
+    "gate_proj": ("embed", "heads"),
+    "o_proj": ("attention", "embed"),
+}
+"""The logical axes of an attention layer's projections, by name, as `CausalSelfAttention` declares them
+where it makes them; a packed projection (`qkv_proj`) declares none."""
+
+
 @logical_axes({
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
@@ -388,12 +400,12 @@ class CausalSelfAttention(nn.Module):
                                  "KV-sharing or keys-are-values layer does not project")
             self.qkv_proj = dense(sum(group.widths), name=group.packed)
         else:
-            self.q_proj = dense(projections['q_proj'][1], name='q_proj')
+            self.q_proj = dense(projections['q_proj'][1], name='q_proj', kernel_axes=ATTENTION_AXES['q_proj'])
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.ctx.kv_shared and not self._packed():
-            self.k_proj = dense(projections['k_proj'][1], name='k_proj')
+            self.k_proj = dense(projections['k_proj'][1], name='k_proj', kernel_axes=ATTENTION_AXES['k_proj'])
             if self.ctx.value_experts is not None:
                 # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`), run
                 # under the layer's routed MLP, without which a decoder's fields refuse them.
@@ -404,10 +416,13 @@ class CausalSelfAttention(nn.Module):
                     mixture=mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
                     precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
-                self.v_proj = dense(projections['v_proj'][1], name='v_proj')
+                self.v_proj = dense(projections['v_proj'][1], name='v_proj',
+                                    kernel_axes=ATTENTION_AXES['v_proj'])
         if 'gate_proj' in projections:
-            self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False)
-        self.o_proj = dense(projections['o_proj'][1], name='o_proj', use_bias=(
+            self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False,
+                                   kernel_axes=ATTENTION_AXES['gate_proj'])
+        self.o_proj = dense(projections['o_proj'][1], name='o_proj', kernel_axes=ATTENTION_AXES['o_proj'],
+                            use_bias=(
             self.ctx.attention_bias if self.ctx.o_proj_bias is None else self.ctx.o_proj_bias),
             **normal_kernel(self.ctx.init_std if self.ctx.output_init_std is None
                             else self.ctx.output_init_std))
@@ -522,17 +537,22 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"DEX names heads {start.heads} of a layer of {self.ctx.num_heads}")
 
         def held(name: str, value: tuple[int, ...] | float, dtype) -> jax.Array:
-            def drawn() -> jax.Array:
+            def drawn() -> nn.LogicallyPartitioned:
                 if start is None:
                     raise ValueError("a DEX layer's chosen heads and lambda_init are its variables, which "
                                      "a layer built without them reads from the variables it is given")
-                return jnp.asarray(value, dtype)
+                # Whole on every device: no head split divides the chosen heads.
+                held = jnp.asarray(value, dtype)
+                return nn.LogicallyPartitioned(held, (None,) * held.ndim)
             return self.variable(DEX_COLLECTION, name, drawn).value
 
+        # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
+        # every device (`dew.nn.dex`).
         self.dex_projection = self.param(
-            'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+            'dex_projection', declared(nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                                       (None, None, None)),
             (dex.count, self.value_dim, self.value_dim), jnp.float32)
-        self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
+        self.dex_lambda = self.param('dex_lambda', declared(nn.initializers.zeros, ()), (), jnp.float32)
         self.dex_heads = held('dex_heads', () if start is None else start.heads, jnp.int32)
         self.dex_lambda_init = held('dex_lambda_init', 0.0 if start is None else start.lambda_init,
                                     jnp.float32)

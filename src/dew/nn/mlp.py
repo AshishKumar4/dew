@@ -77,14 +77,19 @@ def gaussian_cutoff(x, sparsity: float):
     return mean + std * multiplier
 
 
-@logical_axes({
-    ("gate_proj",): ("embed", "mlp"),
-    ("up_proj",): ("embed", "mlp"),
+MLP_AXES: dict[str, LogicalAxes] = {
+    "gate_proj": ("embed", "mlp"),
+    "up_proj": ("embed", "mlp"),
     # The packed kernel's columns are both halves' hidden widths: a tensor axis splits them flat,
     # which the product's [..., 2, H] (`PACKED_HIDDEN`) redistributes.
-    ("gate_up_proj",): ("embed", "mlp"),
-    ("down_proj",): ("mlp", "embed"),
-})
+    "gate_up_proj": ("embed", "mlp"),
+    "down_proj": ("mlp", "embed"),
+}
+"""The logical axes of a feed-forward's projections, by name, as `GatedMLP` declares them where it makes
+them; a projection of another name (an ungated MLP's own `names`) declares none."""
+
+
+@logical_axes({(name,): axes for name, axes in MLP_AXES.items()})
 class GatedMLP(nn.Module):
     """Computes the gated feed-forward down_proj(act(gate_proj(x)) * up_proj(x)).
 
@@ -168,9 +173,11 @@ class GatedMLP(nn.Module):
         if self._gated():
             if self._packed():
                 group = self._group()
-                self.gate_up_proj = dense(sum(group.widths), name=group.packed)
+                self.gate_up_proj = dense(sum(group.widths), name=group.packed,
+                                          kernel_axes=MLP_AXES.get(group.packed))
             else:
-                self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj')
+                self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj',
+                                       kernel_axes=MLP_AXES['gate_proj'])
         elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
             raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
         if self._gated() and (self.in_features is not None or self.activation_after
@@ -178,9 +185,10 @@ class GatedMLP(nn.Module):
             raise ValueError('in_features, activation_after and names shape an ungated MLP')
         up, down = ('up_proj', 'down_proj') if self._gated() else self.names
         if not self._packed():
-            self.up_proj = dense(projections[up][1], name=up)
-        self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+            self.up_proj = dense(projections[up][1], name=up, kernel_axes=MLP_AXES.get(up))
+        self.down_proj = dense(projections[down][1], name=down, kernel_axes=MLP_AXES.get(down),
+                               **normal_kernel(self.init_std if self.output_init_std is None
+                                               else self.output_init_std))
         if self.dropout_rate:
             # Only where it drops: two MLPs sharing one owner's scope (`joint.embedding`) hold one name.
             self.dropout = Dropout(rate=self.dropout_rate)

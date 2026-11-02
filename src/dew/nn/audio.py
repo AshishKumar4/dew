@@ -154,7 +154,8 @@ class AudioLinear(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        return clipped_linear(self, self.dense(self.features, name="linear"), x, self.use_clipped_linears)
+        return clipped_linear(self, self.dense(self.features, name="linear", kernel_axes=("embed", "mlp")), x,
+                              self.use_clipped_linears)
 
 
 def _clippable(config: Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
