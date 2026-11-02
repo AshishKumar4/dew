@@ -437,7 +437,7 @@ def test_a_banked_decoder_keeps_axes_when_its_layers_are_stacked_and_restored(pe
     for names in axes.values():
         assert names[0] is None
     assert boxed_axes(view.unstack(bank)) == boxed_axes(variables)
-    assert StackView(((0, 4),), banked=("params",)).stack(bank)["params"] == bank["params"]
+    assert boxed_axes(StackView(((0, 4),), banked=("params",)).stack(bank)) == axes
 
 
 PERIODIC_SEEDS = 8
