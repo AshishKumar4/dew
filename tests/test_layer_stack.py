@@ -431,11 +431,10 @@ def test_a_banked_decoder_keeps_axes_when_its_layers_are_stacked_and_restored(pe
     variables = model.init(jax.random.key(0), ids)
     view = StackView(((0, 4),), periods=(period,))
     bank = view.stack(variables)
-    expected = decoder_axes(4)
+    expected = {("params", "layers_0_3", *(path[1:2] if period > 1 else ()), *path[2:]): (None, *names)
+                for path, names in decoder_axes(period).items()}
     axes = boxed_axes(bank)
-    assert len(axes) >= len(expected) // (4 // period)
-    for names in axes.values():
-        assert names[0] is None
+    assert {path: axes[path] for path in expected if path in axes} == expected
     assert boxed_axes(view.unstack(bank)) == boxed_axes(variables)
     assert boxed_axes(StackView(((0, 4),), banked=("params",)).stack(bank)) == axes
 
