@@ -523,7 +523,7 @@ def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
         communicators.hold(held)
 
 
-ADMITTED = """\
+COMPILED_ON_GPU = """\
 import jax
 import jax.numpy as jnp
 
@@ -557,7 +557,7 @@ def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_commun
     kept = cache / "dew" / "communicators" / "programs" / package_digest()
     held = []
     for _ in range(2):
-        subprocess.run([sys.executable, "-c", ADMITTED], check=True, env=environment)
+        subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment)
         held.append(sorted(path.name for path in kept.iterdir()))
         assert any(compiled.iterdir()), "the process cached no executable"
     assert len(held[0]) == 1 and held[1] == held[0]
