@@ -1280,7 +1280,7 @@ def mode_evaluation_contract(args) -> dict:
             result = Evaluation.run(objective, state.variables, data.val, metrics=scoring, key=state.key,
                               step=state.step, schedule_step=state.microstep,
                               preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-            result.report(trainer._display, trainer.tracker)
+            result._report(trainer._display, trainer.tracker)
             results[failure] = {"scores": result.scalars, "events": list(events)}
         except (ValueError, RuntimeError, OSError) as error:
             results[failure] = {"error": str(error), "events": list(events)}

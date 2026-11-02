@@ -117,6 +117,10 @@ class MixerContext:
     value_scale: float | None = None
     """Multiplies the values as projected, before the cache and the kernel
     read them (MiMo-V2-Flash's `attention_value_scale`)."""
+    key_multiplier: float | None = None
+    """Multiplies the keys as projected, before their norm, rotation and cache
+    (Falcon-H1's `key_multiplier`), so a narrow key keeps the range its source's
+    does through its rotation."""
     attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     attn_logit_softcap: float | None = None
@@ -148,8 +152,9 @@ class MixerContext:
     kind (qwen4_exp's output_gate_type), which is the only gate a reference
     varies."""
     output_gate_activation: str = 'sigmoid'
-    """What the output gate passes its logits through: 'sigmoid' (Qwen3.5's), 'silu', or 'softplus2',
-    softplus at beta log 2, log2(1 + 2^x) (K2 Horizon's `attention_gate_func`)."""
+    """What the output gate passes its logits through: 'sigmoid' (Qwen3.5's), 'silu', 'softplus2',
+    softplus at beta log 2, log2(1 + 2^x) (K2 Horizon's `attention_gate_func`), or 'softplus' in at
+    least float32 (Laguna's)."""
     value_experts: ValueExperts | None = None
     """The layer's routed value experts in place of its value projection (`dew.nn.value_experts`, K2
     Horizon's MoVA), or None."""
@@ -178,6 +183,7 @@ class MixerContext:
             "attn_logit_softcap": self.attn_logit_softcap is not None,
             "attention_sinks": self.attention_sinks,
             "value_scale": self.value_scale is not None,
+            "key_multiplier": self.key_multiplier is not None,
             "o_proj_bias": bool(self.o_proj_bias),
             "attention_dropout_rate": bool(self.attention_dropout_rate),
             "narrow_rotary_tables": self.narrow_rotary_tables,
@@ -229,9 +235,17 @@ class MixerBase:
     decoder skips a remat rung that keeps nothing more of its layers' names
     than the next (`CausalTransformer.recompute_more`). The class's default,
     which every reader takes through `marks`."""
-    reads_depth: ClassVar[bool] = False
+    reads_depth = False
     """Whether the mixer computes by its layer's index in the stack (`MixerCall.depth`), which the
     model then hands every layer as data (`LayerInputs.depth`), so like layers still scan as one."""
+    reads_phase = False
+    """Whether the module this kind builds takes a prediction depth's phase (`prediction_phase`, 'extend'
+    or 'draft', `DecoderBlock._mix`): a k-pool's index shared across a depth's iterations
+    (`CausalTransformer.index_share_for_mtp_iteration`) or a latent attention's."""
+    shares_prediction_index = False
+    """Whether the kind shares its sparse selection across a prediction depth's iterations under that
+    phase (`CausalTransformer.index_share_for_mtp_iteration`): the k-pool's, or a composed kind's through
+    one of its own."""
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's

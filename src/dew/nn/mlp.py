@@ -31,7 +31,7 @@ from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
 from .ngpt import NGPT, normed_hidden
-from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
+from .precision import at_least_fp32, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain, logical_axes
 
@@ -141,6 +141,11 @@ class GatedMLP(nn.Module):
     in_features: int | None = None
     activation_after: bool = False
     names: tuple[str, str] = ('up_proj', 'down_proj')
+    gate_multiplier: float = 1.0
+    """A gated MLP's gate projection's output times this before the activation, and `down_multiplier`
+    its down projection's output: Falcon-H1's `mlp_multipliers`, each a product rounded once to its
+    operand's dtype (`dew.nn.precision.scaled`), as torch's product of a tensor and a Python float."""
+    down_multiplier: float = 1.0
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -178,6 +183,10 @@ class GatedMLP(nn.Module):
         if self._gated() and (self.in_features is not None or self.activation_after
                               or self.names != ('up_proj', 'down_proj')):
             raise ValueError('in_features, activation_after and names shape an ungated MLP')
+        if (self.gate_multiplier != 1.0 or self.down_multiplier != 1.0) and (
+                not self._gated() or self.ngpt is not None):
+            raise ValueError("gate_multiplier and down_multiplier scale a plain gated MLP's gate and output; "
+                             "an ungated or nGPT feed-forward takes neither")
         up, down = ('up_proj', 'down_proj') if self._gated() else self.names
         if not self._packed():
             self.up_proj = dense(projections[up][1], name=up)
@@ -213,7 +222,7 @@ class GatedMLP(nn.Module):
             return activation(out) if self.activation_after else out
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
-                and self.ngpt is None):
+                and self.ngpt is None and self.gate_multiplier == 1.0):
             gate_up = self._gate_up(x)
             if gate_up is not None:
                 # Both names on the one output: a remat policy that keeps either keeps it whole.
@@ -231,7 +240,7 @@ class GatedMLP(nn.Module):
         up = checkpoint_name(self._placed(up), 'up_proj')
         if self.ngpt is not None:
             return self._down(self._ngpt_hidden(self.ngpt, gate, up, activation), train)
-        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
+        gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         return self._down(gated_product(activation, axes=axes)(gate, up), train)
@@ -259,7 +268,7 @@ class GatedMLP(nn.Module):
     def _down(self, hidden, train: bool):
         if self.dropout_rate:
             hidden = self.dropout(hidden, deterministic=not train)
-        return checkpoint_name(self.down_proj(hidden), 'down_proj')
+        return scaled(checkpoint_name(self.down_proj(hidden), 'down_proj'), self.down_multiplier)
 
     def _gate_up(self, x):
         """The gate and up projections as one `[..., 2, H]` output: the packed
