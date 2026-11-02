@@ -1,24 +1,26 @@
 """The laws of every form a shipped declaration's derivation emits at a GPU's kernel tiles, certified
-(`dew.algebra.laws`, docs/design/algebra.md §6.9). The mainloops' tile search spaces for an A100, an H100 and
+(`algebra_laws`, docs/design/algebra.md §6.9). The mainloops' tile search spaces for an A100, an H100 and
 an RTX PRO 6000 (sm80, sm90, sm120) lie in `ROWS`, `KEYS` and `WIDTHS`. Over them each declaration's forms
 take a few distinct structures (`laws.skeletons`: extraction is priced, so a tile's extents can choose
 another form), and each is certified at a small tile of the same structure (`witness`), proven over the
 reals. A witness keeps every axis past one and its extents equal and unequal as the kernel tile's are, so a
 form that confuses two axes of one extent shows it in its values (the keys-first forward's broadcast did, at
 square tiles alone). The proofs are reduced-tile proofs, shared by the kernel tiles of their structure
-(`dew.algebra.laws`)."""
+(`algebra_laws`)."""
 
 import functools
 import itertools
 
+import algebra_laws as laws
 import jax.numpy as jnp
 import pytest
 
-from dew.algebra import SATURATION, derive, laws
+from dew.algebra import SATURATION, derive
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra,
+    attention_backward_algebra,
     attention_mosaic_program,
     attention_triton,
     bundles,
@@ -59,8 +61,8 @@ def _forward(base2: bool, keys_first: bool, dtype):
 
 
 def _backward(walked: str, hooked: bool, dropped: bool, dtype, width: int):
-    declared = attention_algebra.backward_declaration(scale=width ** -0.5, walked=walked, hooked=hooked,
-                                                      dropped=dropped)
+    declared = attention_backward_algebra.backward_declaration(scale=width ** -0.5, walked=walked,
+                                                               hooked=hooked, dropped=dropped)
 
     def shapes(rows, keys, columns):
         tile = ((rows, keys), jnp.float32)
@@ -77,7 +79,7 @@ def _cotangents(keys_first: bool, dropped: bool, masked: bool):
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
     axes = {"logits": tile, "products": tile, "peak": ("rows",), "total": ("rows",), "anchor": ("rows",),
             "delta": ("rows",), **({"keep": tile} if dropped else {}), **({"seen": tile} if masked else {})}
-    declared = functools.partial(attention_algebra.softmax_cotangents, keys_first=keys_first)
+    declared = functools.partial(attention_backward_algebra.softmax_cotangents, keys_first=keys_first)
     declaration = derive.Reduction(declared, axes, walked="keys", exponent="e")
 
     def shapes(rows, keys, width):
@@ -149,8 +151,8 @@ def test_every_structure_of_the_forward_is_certified(base2, keys_first, dtype):
                          list(itertools.product(("keys", "rows"), (False, True), (False, True))),
                          ids=lambda value: str(value))
 def test_every_structure_of_the_backward_is_certified(walked, hooked, dropped, dtype, width):
-    """The backward (`attention_algebra.backward_declaration`) at the scale of each head width, walked over
-    keys or queries, hooked and dropping or not."""
+    """The backward (`attention_backward_algebra.backward_declaration`) at the scale of each head width,
+    walked over keys or queries, hooked and dropping or not."""
     declaration, shapes = _backward(walked, hooked, dropped, dtype, width)
     tiles = tuple((rows, keys, width) for rows, keys in itertools.product(ROWS, KEYS))
     _certify_every_structure(declaration, shapes, tiles)
@@ -159,7 +161,7 @@ def test_every_structure_of_the_backward_is_certified(walked, hooked, dropped, d
 @pytest.mark.parametrize(("keys_first", "dropped", "masked"),
                          list(itertools.product((False, True), repeat=3)), ids=lambda value: str(value))
 def test_every_structure_of_the_backward_tile_is_certified(keys_first, dropped, masked):
-    """The backward tile's softmax algebra (`attention_algebra.softmax_cotangents`)."""
+    """The backward tile's softmax algebra (`attention_backward_algebra.softmax_cotangents`)."""
     declaration, shapes = _cotangents(keys_first, dropped, masked)
     _certify_every_structure(declaration, shapes, tuple((rows, keys, 0) for rows, keys in
                                                         itertools.product(ROWS, KEYS)))
@@ -184,9 +186,10 @@ def test_a_form_that_breaks_a_law_is_refused():
         del b, operands, shapes
         return a
 
-    with pytest.raises(laws.Unlawful, match="identity"):
+    with pytest.raises(laws.Unlawful) as raised:
         laws.certify(init=forms.init, step=forms.step, merge=kept, finish=forms.finish,
                      declared=declaration.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0})
+    assert raised.value.law == "identity"
 
 
 def _biased(start: int):
@@ -218,10 +221,11 @@ def test_forms_sliced_off_by_one_are_refused():
     where they should: the declared function's law breaks."""
     (declared, shapes), (shifted, _) = _biased(0), _biased(1)
     forms = derive.derive(shifted, accurate=False, saturation=SATURATION)
-    with pytest.raises(laws.Unlawful, match="declared"):
+    with pytest.raises(laws.Unlawful) as raised:
         laws.certify(init=forms.init, step=forms.step, merge=forms.merge, finish=forms.finish,
                      declared=declared.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0},
                      mapped=forms.mapped)
+    assert raised.value.law == "declared"
 
 
 def test_forms_whose_output_is_laid_out_otherwise_are_refused():
@@ -234,7 +238,9 @@ def test_forms_whose_output_is_laid_out_otherwise_are_refused():
         output = forms.finish(*args, **kwargs)
         return jnp.reshape(output, output.shape[::-1])
 
-    with pytest.raises(laws.Unlawful, match="shapes differ"):
+    with pytest.raises(laws.Unlawful) as raised:
         laws.certify(init=forms.init, step=forms.step, merge=forms.merge, finish=reshaped,
                      declared=declaration.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0},
                      mapped=forms.mapped)
+
+    assert raised.value.law == "declared"

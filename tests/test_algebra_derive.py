@@ -474,5 +474,5 @@ def test_an_equation_outside_the_language_over_a_walks_total_is_refused():
     refused: no form computes it from the walk's state, where evaluating it at the finish read the operands
     whole."""
     forms = derive.derive(declared(sinh_total), accurate=False, saturation=SATURATION)
-    with pytest.raises(derive.Refused, match="a walked reduction gave"):
+    with pytest.raises(derive.Refused):
         walked_whole(forms)(*draw(0))

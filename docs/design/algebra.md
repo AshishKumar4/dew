@@ -699,7 +699,7 @@ splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and value
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
 sound over the reals from their declarations (tests/test_linear_scan.py).
 
-A derived algebra's laws are proven before its forms ship (`laws.py`): identity, associativity, consistency
+A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py): identity, associativity, consistency
 (a tile folded into a state is a walk of it merged), and the declared function (a walk of two tiles finishes
 as the function of them joined, an output along the walk each tile's own joined). Together they make a
 walk's result independent of its chunking and its merge tree. The proof is over the reals: the forms traced

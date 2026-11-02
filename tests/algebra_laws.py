@@ -37,9 +37,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import sympy
+from egglog import declarations
 from jax.extend import core as jcore
 
-from dew.algebra import forms
+from dew.algebra import SATURATION, derive, forms
 
 LAWS = ("identity", "associative", "consistent", "declared")
 """The laws a certificate proves, in the order it proves them."""
@@ -150,8 +151,6 @@ def skeletons(declaration, shapes: Mapping) -> tuple[str, ...]:
     """The structure of `declaration`'s forms at a tile of `shapes` (`dew.algebra.derive.Reduction`'s, each
     operand's shape and dtype): each step's, merge's, finish's and output's along the walked axis
     (`skeleton`), one for two tiles exactly where their forms compute alike up to the extents they hold."""
-    from dew.algebra import SATURATION, derive
-
     names = tuple(declaration.operands)
     walked = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
               if declaration.walked in axes}
@@ -163,13 +162,11 @@ def skeletons(declaration, shapes: Mapping) -> tuple[str, ...]:
 def certified(declaration, shapes: Mapping) -> Certificate:
     """`declaration`'s derived forms (the fast class's, `dew.algebra.derive.derive`) certified at a tile of
     `shapes` (`certify`)."""
-    from dew.algebra import SATURATION, derive
-
-    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+    made = derive.derive(declaration, accurate=False, saturation=SATURATION)
     walked = {name: axes.index(declaration.walked) for name, axes in declaration.operands.items()
               if declaration.walked in axes}
-    return certify(init=forms.init, step=forms.step, merge=forms.merge, finish=forms.finish,
-                   declared=declaration.function, shapes=shapes, walked=walked, mapped=forms.mapped)
+    return certify(init=made.init, step=made.step, merge=made.merge, finish=made.finish,
+                   declared=declaration.function, shapes=shapes, walked=walked, mapped=made.mapped)
 
 
 SHAPES = frozenset({"shape", "new_sizes", "sizes"})
@@ -183,8 +180,6 @@ def skeleton(term, region) -> str:
     """A term's structure in `region` (`terms.Region`): its constructors, operation names, literals and each
     parameter but the shapes it holds (`SHAPES`), so the forms of two tiles of one declaration whose extents
     are equal and unequal alike have one skeleton exactly where they compute alike up to their extents."""
-    from egglog import declarations
-
     def parameter(index: int) -> str:
         primitive, params = region.params[index]
         kept = {name: value for name, value in sorted(params.items()) if name not in SHAPES}
@@ -229,8 +224,6 @@ def skeleton(term, region) -> str:
 
 def _inner_literal(expr):
     """A term argument's literal value, None where it is no literal."""
-    from egglog import declarations
-
     inner = expr.expr if isinstance(expr, declarations.TypedExprDecl) else expr
     return inner.value if isinstance(inner, declarations.LitDecl) else None
 
