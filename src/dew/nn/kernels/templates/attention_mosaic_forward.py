@@ -513,23 +513,28 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         turn(arrive=False)
         return slot
 
+    def values(slots) -> algebra.Operand:
+        # The value tile's type beside its slot's acquisition, which the step defers to the form reading it.
+        return algebra.Operand((tiles.block_k, value_width), views["values"][0].dtype,
+                               functools.partial(value_of, slots))
+
     def dot(lhs, rhs):
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
         k_first, coords, logits, products = scored(index, slots)
-        load = functools.partial(value_of, slots)
+        tile = values(slots)
         if guard is not None:
             magnitudes = guard.largest
 
             def largest():
                 return family.columns_of(magnitudes.at[row, kv_head, pl.ds(k_first, tiles.block_k)])
 
-            keys = algebra.Keys(coords, logits, load, dot, products=products, largest=largest)
+            keys = algebra.Keys(coords, logits, tile, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).
         state = algebra.Partial(accumulators[0], *carry)
-        keys = algebra.Keys(coords, logits, load, dot, _accumulated(family, interpret), products)
+        keys = algebra.Keys(coords, logits, tile, dot, _accumulated(family, interpret), products)
         state = algebra.plain_step(spec, state, keys)
         return (state.m, state.total), (state.acc,)
 
@@ -538,7 +543,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             assert anchors is not None
             known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
                                    family.rows_of(anchors[1].at[state_rows]))
-            return _trained(spec, family, start, known, scored, value_of, (lo, hi), streams, counted,
+            return _trained(spec, family, start, known, scored, values, (lo, hi), streams, counted,
                             interpret=interpret)
         if guard is not None:
             return family.walk(streams, ((step, lo, hi),), start, (), interpret, first=counted)[0], None
@@ -588,13 +593,15 @@ def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
 
 
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
-             scored, value_of, reach, streams, first, *, interpret: bool) -> tuple[algebra.Partial, tuple]:
+             scored, values, reach, streams, first, *, interpret: bool
+             ) -> tuple[algebra.Partial, tuple]:
     """A training forward consumer's walk of its key tiles `reach` (`[lo, hi)`, the streams' steps from
     `first`) from `start` at the anchors and keys' largest logits `known` (`algebra.anchored`): each tile
     `algebra.anchored_step`, its split sums the family's accumulator, which takes each tile's product in place
     and no factor. `scored(index, slots)` gives a tile's place, coordinates, logits and products, and
-    `value_of(slots)` its value slot. Returns the state with the split sums as its sums, and what the walk
-    leaves beside them: the anchor's own weight, the other keys' weights' sum and the anchor keys."""
+    `values(slots)` its value slot as an operand (`algebra.Operand`). Returns the state with the split sums
+    as its sums, and what the walk leaves beside them: the anchor's own weight, the other keys' weights' sum
+    and the anchor keys."""
     state, arg, own, others_total = algebra.anchored(spec, start, known)
 
     def dot(lhs, rhs):
@@ -603,8 +610,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
     def step(index, slots, carry, accumulators):
         total, own, others_total = carry
         _, coords, logits, products = scored(index, slots)
-        keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot,
-                            _accumulated(family, interpret), products)
+        keys = algebra.Keys(coords, logits, values(slots), dot, _accumulated(family, interpret), products)
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).
         walked = algebra.Partial(accumulators[0], state.m, total)
         walked, _, own, others_total = algebra.anchored_step(spec, (walked, arg, own, others_total), keys)
@@ -703,6 +709,8 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, tiles.consumers
     block_q, block_k = tiles.block_q, tiles.block_k
+    approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
+    spec = dataclasses.replace(spec, approximate=approx_math)
     pair = consumers * block_q
     steps = keys_count // block_k
     # No more stages than key tiles: a slot past them would load past the keys.
@@ -781,7 +789,6 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), out_dtype))
         if finishes:
             out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
-    approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
     # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
     # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
     # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.

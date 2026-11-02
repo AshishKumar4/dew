@@ -203,6 +203,17 @@ PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
 
 
+class Operand(NamedTuple):
+    """A leaf's value given by its type and the call that acquires it (`load`), which an evaluation calls
+    where a form first reads the leaf (`evaluator`): a mainloop's operand whose acquisition waits on its
+    pipeline (a Mosaic step's value slot, its partner's turn) is acquired after what the form computes
+    before it (a step's weights)."""
+
+    shape: tuple[int, ...]
+    dtype: object
+    load: Callable[[], jax.Array]
+
+
 def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
               product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None) -> Callable[[terms.Term], jax.Array]:
@@ -223,6 +234,8 @@ def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[Hashable, j
             inputs = [literal if term is None else value(picked.get(terms.key(term), term))
                       for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
             given.update(zip(opaque.outputs, bound(opaque.equation, inputs), strict=True))
+        if isinstance(given[index], Operand):
+            given[index] = given[index].load()
         return given[index]
 
     def value(term: terms.Term) -> jax.Array:

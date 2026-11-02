@@ -156,7 +156,8 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         key, value = read(step)
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
         logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
-        return algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
+        return algebra.Keys(coords, logits, algebra.Operand(value.shape, value.dtype, lambda: value),
+                            functools.partial(kernel_dot, interpret=interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.

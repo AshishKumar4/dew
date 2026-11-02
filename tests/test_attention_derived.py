@@ -90,7 +90,8 @@ def oracle_walk(base2: bool, mask: str, split: bool):
             masked = jnp.where(jax.lax.dynamic_slice_in_dim(seen, tile * TILE, TILE, axis=1),
                                jax.lax.dynamic_slice_in_dim(logits, tile * TILE, TILE, axis=1), -jnp.inf)
             tile_values = jax.lax.dynamic_slice_in_dim(value, tile * TILE, TILE)
-            return algebra.Keys(coords, masked, lambda: tile_values, dot)
+            return algebra.Keys(coords, masked, algebra.Operand(tile_values.shape, tile_values.dtype,
+                                                                lambda: tile_values), dot)
 
         def walk(lo, hi):
             return algebra.plain_walk(spec, lo, hi, keys_at, algebra.started(spec, None, ROWS, WIDTH, None))

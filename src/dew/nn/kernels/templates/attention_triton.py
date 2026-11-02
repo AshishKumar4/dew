@@ -185,8 +185,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
         logits = algebra.modify(spec, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
-        return algebra.Keys(coords, logits, lambda: value_ref[tile, :],
-                            functools.partial(kernel_dot, interpret=interpret))
+        values = algebra.Operand((block_k, value_ref.shape[-1]), value_ref.dtype, lambda: value_ref[tile, :])
+        return algebra.Keys(coords, logits, values, functools.partial(kernel_dot, interpret=interpret))
 
     def rows(keys):
         # Each row's value row at its key (the anchor's).

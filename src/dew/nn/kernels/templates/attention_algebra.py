@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import derive
-from dew.algebra.forms import derived_on
+from dew.algebra.forms import Operand, derived_on
 from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
@@ -81,9 +81,11 @@ class Forward:
     tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does),
     whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), the
     power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
-    is the call's scale over, and the keys a launch's walk reaches where past the call's though they are
+    is the call's scale over, the keys a launch's walk reaches where past the call's though they are
     whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
-    it; None where none does)."""
+    it; None where none does), and whether the launch lowers its exponentials to the hardware's
+    approximations (`approximate`, `attention_mosaic_program.approximate`; false where a hook's tanh makes it
+    lower every transcendental exactly)."""
 
     form: str
     keys: int
@@ -98,6 +100,7 @@ class Forward:
     compensated: bool = False
     prescale: float = 1.0
     walked_keys: int | None = None
+    approximate: bool = True
 
     @property
     def raw(self) -> bool:
@@ -148,9 +151,14 @@ class Forward:
         difference or of the scaled logits', as exact as the reference's `jnp.exp` on every backend, whose
         state (a resumed partial, a sink) may be any size: a Mosaic launch of approximate math lowers
         `jnp.exp` to the hardware's base-2 exponential of `x * log2(e)` rounded, about `|x|` ulps off for a
-        state carried far, where `natural_exp` keeps that product's residual."""
+        state carried far, where `natural_exp` keeps that product's residual. A launch that lowers its
+        exponentials exactly (`approximate` false) takes the fast form's `jnp.exp` as it is: its
+        range reduction would repeat the lowering's own (the softcap's forward, 68 of its conversions to
+        integers and back a tile)."""
         if self.base2:
             return jnp.exp2(x)
+        if not self.natural and not self.approximate:
+            return jnp.exp(x)
         return natural_exp(x, self.scale) if self.raw else natural_exp(x)
 
     def naturalized(self, m: jax.Array) -> jax.Array:
@@ -1001,8 +1009,9 @@ operand with the power of two its product takes back (None: none)."""
 
 
 class Keys(NamedTuple):
-    """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
-    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and on
+    """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`, its
+    values `[bk, Dv]` as an operand of their type (`Operand`), which a step loads after the softmax (where
+    jax's mha loads them; a derived step's evaluation where its form first reads them), and on
     the guarded walk their largest magnitude a key (`magnitudes`, or `largest()` where the mainloop holds the
     values where it cannot read them, a Mosaic slot's shared memory), the
     mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
@@ -1014,7 +1023,7 @@ class Keys(NamedTuple):
 
     coords: Coords
     logits: jax.Array
-    load: Callable[[], jax.Array]
+    values: Operand
     dot: Callable[[jax.Array, jax.Array], jax.Array]
     accumulate: Callable[[Any, Callable | None, Parts, jax.Array], Any] | None = None
     products: jax.Array | None = None
@@ -1083,7 +1092,7 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
     m, alpha = peak(spec, state.m, keys.logits, keys.products, axis=keys.coords.key_axis)
     p = weights(spec, keys.logits, m, keys.coords)
-    value = keys.load()
+    value = keys.values.load()
     largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
     bound = 1.0 if keys.coords.drop is None else keys.coords.drop.bound
     p, factor, held = tile(state, alpha, p, largest, bound)
@@ -1204,7 +1213,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None)."""
     state, arg, own, others_total = carry
     p = weights(spec, keys.logits, state.m)
-    value = keys.load()
+    value = keys.values.load()
     parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
@@ -1271,7 +1280,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
 
     def walk(index, sums):
         keys = keys_at(index)
-        value = keys.load()
+        value = keys.values.load()
         rest, own_tile, small = normalized_terms(difference(keys.logits), total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  jnp.exp2 if spec.base2 else jnp.exp)
@@ -2346,7 +2355,7 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
     key = (spec.base2, bool(keys.coords.keys_first))
     forms = derived_forms(*key)
-    tiles = {"logits": keys.logits, "values": keys.load()}
+    tiles = {"logits": keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
     held_by = keys.accumulate
 

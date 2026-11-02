@@ -124,7 +124,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             return algebra.Keys(coords, algebra.modify(form, interpreted_dot(q, k_tile.T), coords, params),
-                                lambda: v_tile, interpreted_dot)
+                                algebra.Operand(v_tile.shape, v_tile.dtype, lambda: v_tile), interpreted_dot)
 
         def anchor_rows(keys):
             # Each row's value row at its key (the anchor's).
