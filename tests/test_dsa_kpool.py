@@ -588,6 +588,56 @@ def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
                     truth_fn=drafting(jnp.float64, gathered=False))
 
 
+def test_a_parallel_prediction_mixer_hands_its_kpool_branch_the_chains_phases():
+    """A parallel prediction mixer (`dew.nn.mixers.parallel`, a k-pool beside Mamba-2, each scaled in and
+    out) through a prediction chain, allocated and extended over five tokens, then drafted at the sixth and
+    the seventh: its k-pool branch takes each call's phase, sharing its seeded selection through the drafts,
+    and its Mamba-2 branch its ordinary decode steps; each draft's output is the two branches' run apart
+    through the same calls, scaled and summed, bit for bit (ledger 3575)."""
+    from dew.nn.mixers.mamba2 import Mamba2Mixer
+    from dew.nn.mixers.parallel import ParallelMixers
+    from dew.nn.precision import scaled
+
+    kpool = partial(KPoolSparseAttention, emb_features=E, num_heads=H, max_seq_len=16, qk_rope_head_dim=0,
+                    norm_eps=1e-5, scale_after_cast=True, **SETTINGS)
+    mamba = Mamba2Mixer(num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=4).build(
+        MixerContext(E, H, H, 8, 16))
+    parallel = ParallelMixers(branches=(("kpool", kpool, 1.0, 0.5, True),
+                                        ("mamba", mamba, 0.75, 1.25, False)))
+    hidden, valid = inputs()
+    x, active = jnp.asarray(hidden), jnp.asarray(valid)
+    mamba_params = parallel.init(jax.random.key(3), x[:, :4])["params"]["mamba"]
+    variables = {"params": {"kpool": translated(reference_block())["params"], "mamba": mamba_params}}
+    calls = [(slice(0, 5), "extend"), (slice(5, 6), "draft"), (slice(6, 7), "draft")]
+
+    def chain(module, variables, phased: bool, into: float = 1.0):
+        """The module's outputs at each call of the chain over `x` times `into`, its cache allocated
+        first as `drafts` does."""
+        read = scaled(x, into)
+
+        def step(cache, span, phase):
+            options = {"prediction_phase": phase} if phased else {}
+            call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=active[:, span])), decode=True)
+            return module.apply({**variables, "cache": cache}, read[:, span], call, mutable=["cache"],
+                                **options)
+
+        _, allocated = module.apply(variables, read[:, :1], MixerCall(decode=True), mutable=["cache"],
+                                    **({"prediction_phase": "extend"} if phased else {}))
+        cache, outputs = allocated["cache"], []
+        for span, phase in calls:
+            out, held = step(cache, span, phase)
+            cache = held["cache"]
+            outputs.append(np.asarray(out))
+        return outputs
+
+    together = chain(parallel, variables, phased=True)
+    selected = chain(kpool(), {"params": variables["params"]["kpool"]}, phased=True)
+    recurred = chain(mamba(), {"params": variables["params"]["mamba"]}, phased=False, into=0.75)
+    for joined, attended, scanned in zip(together, selected, recurred, strict=True):
+        apart = scaled(jnp.asarray(attended), 0.5) + scaled(jnp.asarray(scanned), 1.25)
+        np.testing.assert_array_equal(joined, np.asarray(apart))
+
+
 def test_prediction_selection_rewind_recomputes_only_invalidated_row():
     block = module()
     variables = translated(reference_block())

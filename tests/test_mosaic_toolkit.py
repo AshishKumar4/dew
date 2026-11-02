@@ -265,23 +265,28 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
     """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
     dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
-    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each read back."""
-    launched = mosaic.checked(lambda *operands: None, "probe")
-    shapes = [(2, 3), (2, 3), (4,)]
+    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each member its own
+    place: a launch writing a value of its own into each view (`stacked_views`) reads each back apart
+    (`stacked_read`), in its shapes' order."""
+    shapes = [(2, 3), (4,), (2, 3)]
+
+    def written(*refs):
+        for index, view in enumerate(mosaic.stacked_views(refs, groups)):
+            view[...] = jnp.full(view.shape, index + 1.0)
+
+    launched = mosaic.checked(written, "probe")
 
     def apart():
         launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
 
+    groups = mosaic.stacked_groups(shapes)
     with pytest.raises(ValueError):
         jax.jit(apart).trace()
-
-    groups = mosaic.stacked_groups(shapes)
 
     def stacked():
         refs = mosaic.stacked_zeros(shapes, groups)
         launched(*refs)
         return mosaic.stacked_read(refs, groups)
 
-    read = jax.jit(stacked)()
-    assert groups == ((0, 1), (2,))
-    assert [array.shape for array in read] == shapes
+    for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
+        np.testing.assert_array_equal(array, np.full(shape, index + 1.0))

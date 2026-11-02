@@ -61,7 +61,6 @@ from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
-from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
@@ -1065,9 +1064,9 @@ class CausalTransformer(nn.Module):
         # experts) and is dense otherwise.
         mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        if (self.index_share_for_mtp_iteration
-                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
-            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
+        if self.index_share_for_mtp_iteration and not prediction_mixer.shares_prediction_index:
+            raise ValueError("index_share_for_mtp_iteration requires a prediction mixer that shares its "
+                             "index (`MixerBase.shares_prediction_index`): a k-pool, or a kind composing one")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths
@@ -1596,7 +1595,8 @@ class CausalTransformer(nn.Module):
           query's key intervals, whose union it reads, R of them, static, its
           key positions windowed within each run alone (the template's spans,
           `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
-        - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
+        - `routed_experts` `[B, S, layers, top_k]` (or one such a routed site, keyed by
+          it, `LayerInputs.experts`, where a layer routes at several) replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
           `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
           it covers (`dew.nn.protocols.Routes`).
@@ -2026,14 +2026,19 @@ class CausalTransformer(nn.Module):
                 raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
             return None if embeddings is None and depth is None else LayerInputs(embeddings=embeddings,
                                                                                  depth=depth)
-        routed_experts = jnp.asarray(routed_experts)
-        if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
-            raise ValueError(
-                f"routed_experts is [batch, tokens, layers, top_k], {(*tokens.shape, self.num_layers)} "
-                f"leading for this model; got {routed_experts.shape}")
+        # One record for each layer's one routed site, or one a site, keyed by it (`LayerInputs.experts`).
+        keyed = isinstance(routed_experts, Mapping)
+        records = {name: jnp.asarray(record) for name, record in
+                   (routed_experts.items() if keyed else (('routed_experts', routed_experts),))}
+        for name, record in records.items():
+            if record.ndim != 4 or record.shape[:3] != (*tokens.shape, self.num_layers):
+                raise ValueError(
+                    f"{f'routed_experts[{name!r}]' if keyed else name} is [batch, tokens, layers, top_k], "
+                    f"{(*tokens.shape, self.num_layers)} leading for this model; got {record.shape}")
         coverage = None if routed is None else jnp.broadcast_to(
-            jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
-        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage, depth=depth)
+            jnp.asarray(routed, bool)[:, :, None], (*tokens.shape, self.num_layers))
+        return LayerInputs(embeddings=embeddings, experts=records if keyed else records['routed_experts'],
+                           routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).

@@ -1050,6 +1050,7 @@ class MLAMixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
+    reads_phase = True
 
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512

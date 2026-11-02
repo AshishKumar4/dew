@@ -10,8 +10,9 @@ both outputs, so dK and dV both held dK + dV (an H100's gradients 1.2 and 0.8 ti
 ET-3180-PLAIN-h100). A backward alone in its own program is not wrapped, so the Mosaic backward's own cells
 (called with the residuals as arguments) never saw it. The dK/dV launch's hook gradients
 (`attention_mosaic_dkv._dkv_launched`) are such refs too: two key parameters, or two tile parameters, of one
-shape were one buffer alike. The route's training steps through the one launch and under two hook
-parameters of one kind on an H100, on par with the reference path's (check 1), hold it.
+shape were one buffer alike, which the kernel matrix's bias cells hold (tests/attention_matrix.py: two key
+or two tile parameters, the route's training step). The route's training steps through the one launch on an
+H100, on par with the reference path's (check 1), hold the rest.
 """
 
 import jax
@@ -19,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_matrix import operands, terms_of
-from attention_oracle import attention_terms, kept
+from attention_oracle import kept
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
@@ -39,11 +40,6 @@ or 4 key heads, each pinned so the check holds wherever the derived default goes
 LENGTH = 1024
 HEADS = 8
 SEEDS = 8
-HOOKED = {"two-keys": template.Kind.KEY, "two-tiles": template.Kind.TILE}
-"""A score hook of two parameters of one kind, so of one shape: their gradients (the dK/dV launch's, each
-added into a zeroed ref) are two aliased operands of the launch."""
-
-
 def _route(causal: bool, implementation: AttentionImpl = "template"):
     """The route's training step: the gradients of `sum(attention * dout)` through `implementation`."""
     def step(query, key, value, dout):
@@ -57,34 +53,11 @@ def _route(causal: bool, implementation: AttentionImpl = "template"):
     return step
 
 
-def _hooked_route(kind, *, reference: bool = False):
-    """The route's training step (`attention_route.attend`, or the template's reference path) under a score
-    hook of two parameters of `kind`, `s + a + 2 b`: the gradients of `sum(attention * dout)` of the query,
-    key, value and both parameters."""
-    spans = template.spans(LENGTH, LENGTH, 1, causal=True)
-
-    def score_mod(s, q_pos, k_pos, a, b):
-        return s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype)
-
-    def step(query, key, value, dout, a, b):
-        def loss(query, key, value, a, b):
-            hooks = template.Hooks(score_mod, (template.Param(a, kind), template.Param(b, kind)))
-            if reference:
-                out = template.reference(query, key, value, spans, hooks)
-            else:
-                out = attention_route.attend(query, key, value, spans, hooks)
-            return (jnp.asarray(out, jnp.float32) * dout.astype(jnp.float32)).sum()
-
-        return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(query, key, value, a, b)
-
-    return step
-
-
-def _terms(causal: bool, kind=None):
-    """The gradients' float64 terms (`terms_of`, without the output's): a causal query that keeps few keys
-    has a dQ that cancels toward zero in float64, held to its terms' rounding, not to its own size; under a
-    hook of `kind`, its two parameters' terms beside them."""
-    terms = terms_of(kept(LENGTH, LENGTH, causal=causal), HEADS, kind=kind)
+def _terms(keep, heads: int = HEADS):
+    """The gradients' float64 terms (`terms_of`, without the output's) over the keys each query keeps: a
+    causal query that keeps few keys has a dQ that cancels toward zero in float64, held to its terms'
+    rounding, not to its own size."""
+    terms = terms_of(keep, heads)
 
     def gradients(*drawn):
         return terms(*drawn)[1:]
@@ -107,18 +80,8 @@ def a_routes_one_launch_backward_is_on_par_on_an_h100(name: str, causal: bool) -
 
     assert_as_exact(jax.jit(ours), jax.jit(_route(causal, "reference")),
                     operands(width, heads, kv_heads, jnp.bfloat16),
-                    f"one launch {name} {'causal' if causal else 'full'}", seeds=SEEDS, terms=_terms(causal))
-
-
-@ON_HOPPER
-@pytest.mark.parametrize("name", HOOKED)
-def a_routes_hooked_backward_is_on_par_on_an_h100(name: str) -> None:
-    """The route's training step under a score hook of two parameters of one kind on an H100, on par with the
-    reference path's (check 1), the dK/dV launch's two hook gradients two buffers (row 3180)."""
-    kind = HOOKED[name]
-    assert_as_exact(jax.jit(_hooked_route(kind)), jax.jit(_hooked_route(kind, reference=True)),
-                    operands(64, HEADS, 2, jnp.bfloat16, kind), f"hooked {name}", seeds=SEEDS,
-                    terms=_terms(causal=True, kind=kind))
+                    f"one launch {name} {'causal' if causal else 'full'}", seeds=SEEDS,
+                    terms=_terms(kept(LENGTH, LENGTH, causal=causal)))
 
 
 WINDOW = 256
@@ -165,9 +128,6 @@ def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
         with tuning.pinned({attention_mosaic.MosaicBackward: config}):
             return step(*operands)
 
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[:4])
-
     assert_as_exact(jax.jit(ours), jax.jit(_spanned(width, "reference")[0]),
                     operands(width, HEADS, 2, jnp.bfloat16),
-                    f"span call one launch {name}", seeds=SEEDS, terms=terms)
+                    f"span call one launch {name}", seeds=SEEDS, terms=terms_of(keep, HEADS))
