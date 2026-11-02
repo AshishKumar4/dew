@@ -43,7 +43,8 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
-"""The launch axes each hook's side operands may follow."""
+"""The launch axes each hook's side operands may follow; `groups` too (`_by_row`), each group's value at each
+of its rows."""
 
 
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
@@ -78,9 +79,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     dense = group_sizes is None and layer is None
     prologue = _prologued(prologue, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
+    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue', group_sizes, lhs.shape[0])
+    epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue', group_sizes, lhs.shape[0])
     rhs, group_sizes = _grouped(lhs, rhs, group_sizes, layer)
-    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
-    epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue')
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     several = out_dtypes is not None
     plain = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu, 'precision': precision,
@@ -148,8 +149,8 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     every row one group, a dense product's (`[1, depth, width]`). A value, as `gemm`'s reverse mode
     takes it."""
     dense = group_sizes is None
+    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue', group_sizes, lhs.shape[0])
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
-    prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
@@ -508,12 +509,15 @@ def _grouped(lhs, rhs, group_sizes, layer=None):
     return stack.reshape(layers * groups, *stack.shape[2:]), stacked.reshape(layers * groups)
 
 
-def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:
+def _split(operands: tuple, hook: str, group_sizes: jax.Array | None, rows: int) -> tuple[tuple, tuple]:
     """The side operands' arrays and their axes, each checked: one axis per dimension, each a launch
-    axis the hook's operands follow or None for a dimension of one, at least one a launch axis."""
+    axis the hook's operands follow or None for a dimension of one, at least one a launch axis; a `groups`
+    axis read at each row as its group's (`_by_row`)."""
     arrays, axes_of = [], []
     for array, axes in operands:
         axes = tuple(axes)
+        if 'groups' in axes:
+            array, axes = _by_row(array, axes, group_sizes, rows)
         named = [axis for axis in axes if axis is not None]
         if (len(axes) != array.ndim or not named or any(axis not in LAUNCH_AXES[hook] for axis in named)
                 or any(extent != 1 for axis, extent in zip(axes, array.shape, strict=True) if axis is None)):
@@ -522,6 +526,23 @@ def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:
         arrays.append(array)
         axes_of.append(axes)
     return tuple(arrays), tuple(axes_of)
+
+
+def _by_row(array: jax.Array, axes: tuple, group_sizes: jax.Array | None,
+            rows: int) -> tuple[jax.Array, tuple]:
+    """A side operand of one value a group (its `groups` axis, `[G, ...]`, G the call's groups, one where it
+    has none) as the `rows` operand every launch and the portable program take: each group's value at each
+    of its rows, a row past the groups' the last's (its output unrouted, `_routed`). Its derivative, the
+    repetition's transpose, sums each group's rows' cotangents: the group-aware reduction its gradient is."""
+    position = axes.index('groups')
+    if 'rows' in axes or axes.count('groups') != 1:
+        raise ValueError(f"a side operand's axes {axes} name groups once, beside no rows")
+    sizes = jnp.full((1,), rows, jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
+    if array.shape[position] != sizes.shape[0]:
+        raise ValueError(f"a side operand of shape {array.shape} has {array.shape[position]} groups, "
+                         f"the call {sizes.shape[0]}")
+    by_row = jnp.repeat(array, sizes, axis=position, total_repeat_length=rows)
+    return by_row, tuple('rows' if axis == 'groups' else axis for axis in axes)
 
 
 def _launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:

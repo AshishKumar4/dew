@@ -135,10 +135,12 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(family, dtype, (rows, width, block, logits, False, True),
                               (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
-        # Its keys' magnitudes read from the value tile beside the logits (`Family.key_magnitudes`), in the
-        # values' dtype.
-        magnitudes = [logits[0], (columns, block, dtype)]
-        live = resources.live_registers(family, carried, logits + sums, magnitudes, *fragments)
+        # Its keys' magnitudes read from the value tile (`Family.key_magnitudes`) while the step's logits and
+        # sums are live (`algebra.room` reads them beside both), counted at fp32's registers: an accumulator
+        # layout's load holds a 16-bit entry a register on mma.sync (gate80: counted as a phase of its own,
+        # beside the logits alone, the A100's guarded launch at width 64 spilled 40 bytes).
+        magnitudes = (columns, block, jnp.float32)
+        live = resources.live_registers(family, carried, [*logits, *sums, magnitudes], *fragments)
         return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]

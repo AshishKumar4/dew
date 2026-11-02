@@ -194,7 +194,8 @@ SIGNS = [(target, source, bound) for target in DTYPES for source in DTYPES
                               for target, source, bound in SIGNS])
 def test_every_kept_sign_holds_every_value_its_operand_reaches(target, source, bound):
     """A value declared at most 0 (in `(-2**bound, 0)`) converted to `target`, and exponentiated, is at most
-    1 wherever the region states it is (the conversion keeps its sign, `terms._keeps_sign`), over every
+    1 in the reals (2 as computed) wherever the region states it is (the conversion keeps its sign,
+    `terms._keeps_sign`), over every
     nonpositive value of `source` the module reads: a narrowing integer's wrap, an unsigned or boolean
     target's, a float's to an integer, each where it claims nothing."""
     wide = jnp.dtype(source).itemsize == 8 or jnp.dtype(target).itemsize == 8
@@ -209,7 +210,7 @@ def test_every_kept_sign_holds_every_value_its_operand_reaches(target, source, b
         operand = jnp.asarray(np.repeat(values[values <= 0], 4), source)
         closed = jax.make_jaxpr(exponentiated)(operand)
         region = terms.region(closed, {0: (-(2.0 ** bound), 0.0)})
-        if region.magnitudes.get(terms.key(region.outputs[0])) != terms.UNIT:
+        if region.magnitudes.get(terms.key(region.outputs[0])) != terms.UNIT + 1:
             return
         converted = np.asarray(operand.astype(target)).astype(np.float64)
     positive = converted[converted > 0]
