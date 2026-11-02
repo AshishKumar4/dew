@@ -232,8 +232,14 @@ def _owned(equation, inputs, outputs, made: list, owns: dict) -> None:
     name = equation.primitive.name
     floats = [jnp.issubdtype(var.aval.dtype, jnp.floating) for var in equation.outvars]
     if made:
-        owns.update(zip((var for var, is_float in zip(equation.outvars, floats, strict=True) if is_float),
-                        made, strict=True))
+        # Each floating output's last rounding: one bound an output, in order, or an output's last of
+        # several (a reduction's or a scan's) where the equation makes one; a scan's stacked taps,
+        # shaped apart from its outputs, floor none.
+        rounded = [var for var, is_float in zip(equation.outvars, floats, strict=True) if is_float]
+        if len(made) != len(rounded):
+            made = made[-1:] if len(rounded) == 1 else []
+        owns.update((var, bound) for var, bound in zip(rounded, made)
+                    if jnp.shape(bound) == tuple(var.aval.shape))
         return
     known = [not isinstance(var, Literal) and var in owns for var in equation.invars]
     if not any(known):
