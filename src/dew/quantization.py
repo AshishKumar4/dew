@@ -348,13 +348,13 @@ class LinearProducts(nn.Module):
         frozen FP8 site's is its codes decoded."""
         return getattr(self, name).get_variable("params", "kernel")
 
-    def nonlinear_input(self, name: str) -> bool:
+    def nonlinear_input(self, name: str, qwix: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
         map of its input: as the Qwix quantization the call runs under quantizes its activations or
-        gradients (`quantized_products`; a weight-only rule leaves it linear, by its quantized matrix), and
-        as a method interceptor answers for itself (a checkpoint's input quantization and frozen FP8
-        products, `dew.lora`'s dropout on a training forward)."""
-        return quantized_products(self, name).inputs
+        gradients (`quantized_products`; a weight-only rule leaves it linear, by its quantized matrix),
+        read where `qwix`, and as a method interceptor answers for itself (a checkpoint's input
+        quantization and frozen FP8 products, `dew.lora`'s dropout on a training forward)."""
+        return qwix and quantized_products(self, name).inputs
 
     def linear_product(self, name: str) -> bool:
         """Whether this call computes the submodule `name` as the linear map of its input by the kernel it
@@ -407,12 +407,11 @@ def rounding_growth(module: nn.Module, name: str | None, contraction: int) -> tu
     return (1.0 if policy.weight_only else growth(1.0)), growth(clip)
 
 
-def intercepted_nonlinear(module: nn.Module, name: str) -> bool:
+def intercepted_nonlinear(module: LinearProducts, name: str) -> bool:
     """Whether a method interceptor computes the bound `module`'s submodule `name` other than as a linear
     map of its input (`nonlinear_input`, read apart from Qwix's quantization, which `rounding_growth`
     bounds): a checkpoint's input quantization, a frozen FP8 product, an adapter's dropout."""
-    with QUANTIZED_TRACE(None):
-        return module.nonlinear_input(name)
+    return module.nonlinear_input(name, qwix=False)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:

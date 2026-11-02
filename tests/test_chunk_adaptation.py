@@ -996,6 +996,30 @@ def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
         assert not np.any(np.asarray(rounded)), site
 
 
+def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
+    """A run's record states a damped adaptation of a decoder with a continuum level (`LMRunConfig`, its
+    model's `continuum` and its objective's `adaptation`): `run.json` reads back as the config that wrote
+    it, and the objective it builds steps the level damped, its losses finite (1925)."""
+    import json
+
+    from dew.config import ModelConfig, ObjectiveConfig, RunConfig
+    from dew.config.lm import LMRunConfig
+
+    adaptation = ChunkAdaptation(window=3, rate=0.5, damped=True)
+    config = LMRunConfig(
+        model=ModelConfig("causal_transformer", {
+            "vocab_size": VOCAB, "emb_features": FEATURES, "num_layers": 1, "num_heads": 2, "head_dim": 4,
+            "mlp_features": 16, "max_seq_len": 32, "attention_impl": "xla", "continuum": LEVEL}),
+        objective=ObjectiveConfig("lm", {"adaptation": adaptation}))
+    read = RunConfig.read(json.loads(json.dumps(config.record())))
+    assert read == config
+    objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)
+    assert objective.adaptation == adaptation
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
+                                                                tokens).losses)))
+
+
 def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
     """A continuum level is no field of any transformers config, so a decoder with one exports no
     config that reads back as it (ValueError), where the same decoder without it exports."""

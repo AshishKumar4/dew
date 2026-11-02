@@ -52,24 +52,30 @@ class ChunkAdaptation:
     others held at their trained values.
 
     `damped` steps the selected parts' kernels alone (`up`'s, `down`'s, or both, every part where
-    `select` is empty; an adapter's factors on them hold) at rate / (1 + rate L), L a bound on the curvature
-    of the window's loss in them along the step (`_damping`): rate times L stays below 1, so a step never
-    overshoots, whatever the rate. The level reads s = x + U f, f = act(D x); with Ls and Gs the head's
-    bounds on a slot loss's curvature and slope in s (`SteppedInContext.head_bounds`), and p1, p2 the
-    activation's on |act'| and |act''| (`level_terms`), a slot's curvature is at most
+    `select` is empty; an adapter's factors on them hold) at a rate d with d <= rate / (1 + rate L(d)),
+    L(d) a bound on the curvature of the window's loss in them along a step of rate d (`_step_rate`, which
+    settles d toward the largest such): d L(d) stays below 1, so a step never overshoots, whatever the
+    rate. The level reads s = x + U f, f = act(D x); with Ls and Gs the head's bounds on a slot loss's
+    curvature and slope in s (`SteppedInContext.head_bounds`, a head transform's read over the states
+    the step can reach from the window's), and p1, p2 the activation's on |act'| and |act''|
+    (`level_terms`), a slot's curvature is at most
     Ls (|U|^2 p1^2 |x|^2 [D steps] + |f|^2 [U steps]) + Gs (|U| p2 |x|^2 [D steps] + p1 |x| [both step]),
-    |U| and |f| taken at their largest along the window's step (`stepped`), summed over the window by its
-    weights, x and f as `down` and `up` multiply them (a checkpoint's quantizer of their inputs applied),
-    L a constant of the step, not differentiated. Under an affine head the loss is convex in `up`, and a
-    step below 1 / L of a convex loss is non-expansive, so stepping `up` alone moves two nearby levels no
-    further apart, whatever the rate: their rounding grows at most by what each window adds. A softcap,
-    a head transform or a step of `down` leaves the loss non-convex, where a step below 1 / L expands two
-    levels' distance by at most 1 + rate L, under 2, a window, not by the rate times curvature past 2 of
-    an undamped step, whose rounding grows by 10^4 over three windows of 0.5 N(0, 1) weights at a rate
-    of a half (ledger 1714).
-    An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused,
-    as are a step of a kernel its product rounds and a step of `down` through an `up` that rounds its
-    input or kernel (`Continuum.step_terms`), the loss piecewise constant in what steps.
+    |U| and |f| taken at their largest along the window's step, summed over the window by its weights, x,
+    f and every kernel as the products multiply them (a checkpoint's quantizer of their inputs applied,
+    Qwix's rounding bounded, `dew.quantization.rounding_growth`), L a constant of the step, not
+    differentiated. Where Qwix quantizes a product, a step follows its straight-through gradient: the
+    bound holds for the surrogate's smooth part, and a step that crosses a rounding cell adds the
+    quantization's own jump. Under an affine head the loss is convex in `up`, and a step below 1 / L of a
+    convex loss is non-expansive, so stepping `up` alone moves two nearby levels no further apart,
+    whatever the rate: their rounding grows at most by what each window adds. A softcap, a head
+    transform or a step of `down` leaves the loss non-convex, where a step below 1 / L expands two levels'
+    distance by at most 1 + rate L, under 2, a window, not by the rate times curvature past 2 of an
+    undamped step, whose rounding grows by 10^4 over three windows of 0.5 N(0, 1) weights at a rate of a
+    half (ledger 1714). An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step
+    of `down`, a head map or an `up` a method interceptor computes other than as a linear map (a
+    checkpoint's quantizer of a head map's input, a frozen FP8 product, an adapter's dropout) leaves the
+    loss piecewise constant in what steps, and a head transform's norm that bounds no derivatives
+    (`BoundedNorm`) and a Qwix weight calibration whose clip no bound reads bound nothing: each refused.
     """
 
     window: int = 16
