@@ -1046,29 +1046,18 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         return {}
     found: dict[str, Mark] = {}
     read: set[int] = set()
-
-    def walked(body: list[ast.stmt], prefix: str) -> None:
-        for node in body:
-            if isinstance(node, ast.ClassDef):
-                walked(node.body, f"{prefix}{node.name}.")
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name[:4] != "test":
-                continue
-            for mark in node.decorator_list:
-                called = ast.unparse(mark.func) if isinstance(mark, ast.Call) else ""
-                kind = called.removeprefix("pytest.mark.")
-                if kind not in SHARDS or not isinstance(mark, ast.Call):
-                    continue
-                counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
-                          if isinstance(keyword.value, ast.Constant)}
-                if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
-                        and all(type(count) is int and count > 0 for count in counts.values())
-                        and prefix + node.name not in found):
-                    declared = counts[SHARDS[kind]]
-                    units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-                    found[prefix + node.name] = Mark(units, counts["per_task"], mark.lineno, declared)
-                    read.add(id(mark.func))
-
-    walked(tree.body, "")
+    for test, mark in session.decorated_tests(tree.body):
+        kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
+        if kind not in SHARDS:
+            continue
+        counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
+                  if isinstance(keyword.value, ast.Constant)}
+        if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
+                and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
+            declared = counts[SHARDS[kind]]
+            units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
+            found[test] = Mark(units, counts["per_task"], mark.lineno, declared)
+            read.add(id(mark.func))
     unread = sorted(node.lineno for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute) and node.attr in SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)

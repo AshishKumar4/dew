@@ -9,7 +9,7 @@ installed."""
 import ast
 import functools
 import os
-from collections.abc import Container, Mapping
+from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
@@ -93,6 +93,19 @@ def shared_setups(name: str) -> dict[str, str]:
     return marked_setups(name, text) if SHARED_SETUP in text else {}
 
 
+def decorated_tests(body: list[ast.stmt], prefix: str = "") -> Iterator[tuple[str, ast.Call]]:
+    """Each test function of a test file's `body` (`ast.parse`'s), by its name in the file (`test_name`'s
+    form), with each call its own decorators make (`@pytest.mark.<mark>(...)`): what the plan reads a test's
+    marks from, as it imports no test (`shared_setups`, ci.py's `sites`)."""
+    for node in body:
+        if isinstance(node, ast.ClassDef):
+            yield from decorated_tests(node.body, f"{prefix}{node.name}.")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name[:4] == "test":
+            for mark in node.decorator_list:
+                if isinstance(mark, ast.Call):
+                    yield prefix + node.name, mark
+
+
 @functools.cache
 def marked_setups(name: str, text: str) -> dict[str, str]:
     """`shared_setups` of test file `name`, whose source is `text`, read once a text."""
@@ -103,23 +116,12 @@ def marked_setups(name: str, text: str) -> dict[str, str]:
         return {}
     found: dict[str, str] = {}
     read: set[int] = set()
-
-    def walked(body: list[ast.stmt], prefix: str) -> None:
-        for node in body:
-            if isinstance(node, ast.ClassDef):
-                walked(node.body, f"{prefix}{node.name}.")
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name[:4] != "test":
-                continue
-            for mark in node.decorator_list:
-                if not (isinstance(mark, ast.Call)
-                        and ast.unparse(mark.func) == f"pytest.mark.{SHARED_SETUP}"):
-                    continue
-                if (len(mark.args) == 1 and not mark.keywords and isinstance(mark.args[0], ast.Constant)
-                        and isinstance(mark.args[0].value, str) and prefix + node.name not in found):
-                    found[prefix + node.name] = mark.args[0].value
-                    read.add(id(mark.func))
-
-    walked(tree.body, "")
+    for test, mark in decorated_tests(tree.body):
+        if (ast.unparse(mark.func) == f"pytest.mark.{SHARED_SETUP}" and len(mark.args) == 1
+                and not mark.keywords and isinstance(mark.args[0], ast.Constant)
+                and isinstance(mark.args[0].value, str) and test not in found):
+            found[test] = mark.args[0].value
+            read.add(id(mark.func))
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr == SHARED_SETUP and id(node) not in read:
             raise SystemExit(f"{name}, line {node.lineno}: {SHARED_SETUP} is read on a test's own "

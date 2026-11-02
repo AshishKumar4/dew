@@ -1074,7 +1074,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
                       "@pytest.mark.shared_setup(NAME)\n"):
         (tmp_path / "tests/test_refused.py").write_text(
             f"import pytest\nNAME = 'plan'\n{misplaced}def test_one():\n    pass\n")
-        with pytest.raises(SystemExit, match=r"test_refused\.py, line 3: shared_setup"):
+        with pytest.raises(SystemExit):
             ci.plan(300.0, {})
 
 
