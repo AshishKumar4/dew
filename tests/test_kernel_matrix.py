@@ -38,11 +38,12 @@ def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_no
 
 
 def test_every_matrix_flow_is_a_test_the_gpu_tier_selects():
-    """Each of `FLOWS`, the tier's node ids, is a test pytest collects under the GPU tier's selection (`-m gpu`), so
-    the tier runs what the matrix declares (review: a helper's name, or an unmarked test, would run nothing)."""
+    """Each of `FLOWS`, the tier's node ids, is a test pytest collects under the GPU tier's selection (`-m
+    gpu`), so the tier runs what the matrix declares (review: a helper's name, or an unmarked test, would run
+    nothing)."""
     command = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", "gpu"]
-    collected = subprocess.run([*command, *kernel_matrix.FLOWS], cwd=TESTS.parent, capture_output=True, text=True,
-                               check=False)
+    collected = subprocess.run([*command, *kernel_matrix.FLOWS], cwd=TESTS.parent, capture_output=True,
+                               text=True, check=False)
     found = {line.strip() for line in collected.stdout.splitlines()}
     missing = sorted(set(kernel_matrix.FLOWS) - found)
     assert not missing, (missing, collected.stdout[-2000:], collected.stderr[-2000:])
