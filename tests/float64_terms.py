@@ -76,14 +76,16 @@ def float64_terms(fn, *args):
     A program whose every step its shapes decide (no branch or loop its
     values pick, `_static`) is evaluated by the same rules traced once into
     one compiled float64 program (`_compiled`), which each later call of `fn`
-    on arguments of the same shapes runs: the operations and their order are
-    the walk's, compiled where the walk dispatched each alone."""
+    on arguments of the same shapes runs; in any other, each run of such
+    steps between its branches and loops is one (`_compiled_run`), the
+    branches and loops walked as their values pick. The operations and their
+    order are the walk's, compiled where the walk dispatched each alone."""
     closed = jax.make_jaxpr(fn)(*args)
     leaves = jax.tree.leaves(args)
     if _static(closed.jaxpr):
         values, energies = _compiled(closed)(closed.consts, leaves)
     else:
-        values, energies = _evaluated(closed.jaxpr, closed.consts, leaves)
+        values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
     return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
                                                    for energy, value in zip(energies, values, strict=True)])
@@ -119,10 +121,12 @@ def _compiled(closed):
     return COMPILED[key]
 
 
-def _evaluated(jaxpr, consts, args, given=None):
+def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
     """`jaxpr`'s outputs and their terms' energies, the sums of their squares
     (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs). A value no sum made has none."""
+    a computation's own inputs). A value no sum made has none. `compiling`
+    evaluates each run of static steps between a branch and a loop
+    (`_runs`) as one compiled program (`_compiled_run`)."""
     from jax.extend.core import Literal
 
     wanted = _carrying(jaxpr)
@@ -144,18 +148,102 @@ def _evaluated(jaxpr, consts, args, given=None):
     for var in jaxpr.outvars:
         if not isinstance(var, Literal):
             last.pop(var, None)
-    for index, equation in enumerate(jaxpr.eqns):
-        inputs = [read(var) for var in equation.invars]
-        with equation.ctx.manager:
-            outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
-                                     any(var in wanted for var in equation.outvars))
-        for var in equation.invars:
-            if not isinstance(var, Literal) and last.get(var) == index:
+    spans = _runs(jaxpr) if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
+    for start, stop in spans:
+        run = jaxpr.eqns[start:stop]
+        if stop - start > 1:
+            # A static run of the walk's steps, compiled once (`_compiled_run`), the values it reads in.
+            reads = _run_reads(run)
+            kept = [var for var in _run_writes(run) if last.get(var, len(jaxpr.eqns)) >= stop]
+            outputs, made = _compiled_run(run, reads, kept, wanted)(
+                [read(var) for var in reads], [energy(var) for var in reads])
+            written = kept
+        else:
+            (equation,) = run
+            inputs = [read(var) for var in equation.invars]
+            with equation.ctx.manager:
+                outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
+                                         any(var in wanted for var in equation.outvars), compiling)
+            written = equation.outvars
+        for var in {var for equation in run for var in equation.invars if not isinstance(var, Literal)}:
+            if start <= last.get(var, -1) < stop:
                 values.pop(var, None)
                 energies.pop(var, None)
-        for var, value, made_energy in zip(equation.outvars, outputs, made, strict=True):
+        for var, value, made_energy in zip(written, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
     return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
+
+
+def _static_equation(equation) -> bool:
+    """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`)."""
+    if equation.primitive.name in ("cond", "while"):
+        return False
+    for value in equation.params.values():
+        for body in value if isinstance(value, tuple | list) else (value,):
+            inner = getattr(body, "jaxpr", body)
+            if hasattr(inner, "eqns") and not _static(inner):
+                return False
+    return True
+
+
+def _runs(jaxpr) -> list[tuple[int, int]]:
+    """`jaxpr`'s steps as spans: each maximal run of static ones (`_static_equation`) one span, each
+    branch or loop a span of its own."""
+    spans, start = [], 0
+    for index, equation in enumerate(jaxpr.eqns):
+        if not _static_equation(equation):
+            if start < index:
+                spans.append((start, index))
+            spans.append((index, index + 1))
+            start = index + 1
+    if start < len(jaxpr.eqns):
+        spans.append((start, len(jaxpr.eqns)))
+    return spans
+
+
+def _run_writes(run) -> list:
+    """The variables a run of steps defines, in order."""
+    return [var for equation in run for var in equation.outvars]
+
+
+def _run_reads(run) -> list:
+    """The variables a run of steps reads from before it, in order of first read."""
+    from jax.extend.core import Literal
+
+    written, reads = set(), []
+    for equation in run:
+        for var in equation.invars:
+            if not isinstance(var, Literal) and var not in written and var not in reads:
+                reads.append(var)
+        written.update(equation.outvars)
+    return reads
+
+
+RUNS: dict = {}
+"""Each static run's compiled evaluation (`_compiled_run`), by its steps' text and what it reads and keeps."""
+
+
+def _compiled_run(run, reads, kept, wanted):
+    """The run of static steps `run` evaluated as the walk evaluates them (`_applied`), compiled once a
+    run's text, reading `reads`' values and energies and returning `kept`'s."""
+    from jax.extend.core import Literal
+
+    marks = tuple(any(var in wanted for var in equation.outvars) for equation in run)
+    key = ("\n".join(map(str, run)), tuple(map(str, reads)), tuple(map(str, kept)), marks)
+    if key not in RUNS:
+        def evaluate(read_values, read_energies):
+            values, energies = dict(zip(reads, read_values, strict=True)), dict(
+                zip(reads, read_energies, strict=True))
+            for equation, mark in zip(run, marks, strict=True):
+                inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
+                given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
+                with equation.ctx.manager:
+                    outputs, made = _applied(equation, inputs, given, mark)
+                values.update(zip(equation.outvars, outputs, strict=True))
+                energies.update(zip(equation.outvars, made, strict=True))
+            return [values[var] for var in kept], [energies[var] for var in kept]
+        RUNS[key] = jax.jit(evaluate)
+    return RUNS[key]
 
 
 def _carrying(jaxpr) -> set:
@@ -206,21 +294,22 @@ def _squared(value):
     return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
 
 
-def _applied(equation, inputs, given, wanted: bool):
-    """`equation`'s outputs from `inputs`, and their energies where `wanted`."""
+def _applied(equation, inputs, given, wanted: bool, compiling: bool = False):
+    """`equation`'s outputs from `inputs`, and their energies where `wanted`, a body's runs of static
+    steps compiled where `compiling` (`_evaluated`)."""
     name, params = equation.primitive.name, equation.params
     body = _body(equation)
     if wanted and body is not None:
-        return _evaluated(*body, inputs, given)
+        return _evaluated(*body, inputs, given, compiling)
     if wanted and name == "scan":
-        return _scanned(params, inputs, given)
+        return _scanned(params, inputs, given, compiling)
     if wanted and name == "while":
-        return _looped(params, inputs, given)
+        return _looped(params, inputs, given, compiling)
     if wanted and name == "shard_map":
         return _mapped(params, inputs, given)
     if wanted and name == "cond":
         branch = params["branches"][int(inputs[0])]
-        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:])
+        return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:], compiling)
     outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
     outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
     if not wanted:
@@ -287,28 +376,29 @@ def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
                       for column in zip(*ys, strict=True))]
 
 
-def _scanned(params, inputs, given):
+def _scanned(params, inputs, given, compiling: bool = False):
     """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time."""
     body = params["jaxpr"]
 
     def step(_, pairs):
         outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
-                                   [energy for _, energy in pairs])
+                                   [energy for _, energy in pairs], compiling)
         return list(zip(outputs, made, strict=True))
 
     walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
     return [value for value, _ in walked], [energy for _, energy in walked]
 
 
-def _looped(params, inputs, given):
+def _looped(params, inputs, given, compiling: bool = False):
     """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time."""
     condition, body = params["cond_jaxpr"], params["body_jaxpr"]
     tested, run = params["cond_nconsts"], params["body_nconsts"]
     condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
     body_terms, carry_terms = given[tested:tested + run], given[tested + run:]
-    while bool(_evaluated(condition.jaxpr, condition.consts, [*condition_consts, *carry])[0][0]):
+    while bool(_evaluated(condition.jaxpr, condition.consts, [*condition_consts, *carry],
+                          compiling=compiling)[0][0]):
         carry, carry_terms = _evaluated(body.jaxpr, body.consts, [*body_consts, *carry],
-                                        [*body_terms, *carry_terms])
+                                        [*body_terms, *carry_terms], compiling)
     return carry, carry_terms
 
 
