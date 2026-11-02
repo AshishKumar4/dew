@@ -23,6 +23,7 @@ from egglog import (
     StringLike,
     Vec,
     f64,
+    f64Like,
     get_callable_args,
     get_literal_value,
     i64,
@@ -554,26 +555,27 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
     return None
 
 
-def integer(argument: object) -> int:
-    """An `i64` literal's value: a term's argument as `get_callable_args` gives it, which egglog types by its
-    constructor's parameter (`i64Like`), each an `i64` literal in a term."""
-    if isinstance(argument, i64) and (value := get_literal_value(argument)) is not None:
+def _literal(argument: object, kind: type[i64] | type[String] | type[f64]) -> int | str | float:
+    """A literal argument's value: a term's argument as `get_callable_args` gives it, which egglog types by
+    its constructor's parameter (`i64Like`, `StringLike`), each a literal of `kind` in a term."""
+    if isinstance(argument, kind) and (value := get_literal_value(argument)) is not None:
         return value
-    raise TypeError(f"{argument!r} is no i64 literal")
+    raise TypeError(f"{argument!r} is no {kind.__name__} literal")
 
 
-def text(argument: object) -> str:
-    """A `String` literal's value, as `integer` reads an `i64`'s (a term's operation names)."""
-    if isinstance(argument, String) and (value := get_literal_value(argument)) is not None:
-        return value
-    raise TypeError(f"{argument!r} is no String literal")
+def integer(argument: i64Like) -> int:
+    """An `i64` literal's value (`_literal`): a term's indices."""
+    return int(_literal(argument, i64))
 
 
-def real(argument: object) -> float:
-    """An `f64` literal's value, as `integer` reads an `i64`'s (a term's float constants)."""
-    if isinstance(argument, f64) and (value := get_literal_value(argument)) is not None:
-        return value
-    raise TypeError(f"{argument!r} is no f64 literal")
+def text(argument: StringLike) -> str:
+    """A `String` literal's value (`_literal`): a term's operation names."""
+    return str(_literal(argument, String))
+
+
+def real(argument: f64Like) -> float:
+    """An `f64` literal's value (`_literal`): a term's float constants."""
+    return float(_literal(argument, f64))
 
 
 def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: Sequence) -> jax.Array:
@@ -585,7 +587,7 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     if (args := get_callable_args(term, Term.literal)) is not None:
         return region_.literals[integer(args[0])]
 
-    def bound(left: Term, right: Term, index: object) -> jax.Array:
+    def bound(left: Term, right: Term, index: i64Like) -> jax.Array:
         primitive, given = region_.params[integer(index)]
         return primitive.bind(*jax_core.auto_insert_reshard(value(left), value(right)), **given)
 
