@@ -476,7 +476,9 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
-    task = Decide.averaged(runs, calibrate_on=examples * 4)
+    # Its held-out answers are the examples' own, each as often as four copies weigh it: a mean of the
+    # same answers, so the same temperatures.
+    task = Decide.averaged(runs, calibrate_on=examples)
     assert task.calibration != Calibration()
     averaged = str(tmp_path / "averaged")
     task.save(averaged)
