@@ -42,7 +42,8 @@ above:
   /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
 
 LFM3's code (lfm3-tiny, lfm3-biased-tiny) runs under transformers 5.18.0 on
-(tests/fixtures/hf/lfm3-tiny/source.json).
+(tests/fixtures/hf/lfm3-tiny/source.json), and LFM3-VL's (lfm3-vl-tiny), the same LFM3 decoder beside
+its vision trunk and projector, under the same (tests/fixtures/hf/lfm3-vl-tiny/source.json).
 
 `--record` records each release over seeds at its sites (tests/remote_code_draws.py's `SITES`,
 `record_case(..., summary=True)`), as `released.npz` beside the fixture, which
@@ -79,7 +80,7 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
-from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions
+from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions, vocabulary
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -93,8 +94,9 @@ RELEASES = {
     "dream-tiny": ("Dream-org/Dream-v0-Base-7B", "6572adb5535263e4d1a337b56942ba48b6dee2a9",
                    ("configuration_dream.py", "modeling_dream.py", "generation_utils.py"),
                    "AutoModel"),
-    "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
-                     ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM"),
+    # The family's own pin (dew.interop.release_pins), as LFM3's.
+    "mimo-v2-tiny": (*_PINNED["MIMO_V2"][:2], ("configuration_mimo_v2.py", "modeling_mimo_v2.py"),
+                     "AutoModelForCausalLM"),
     # The family's own pin (dew.interop.release_pins). modeling_lfm3.py imports its
     # Triton conv from lfm3_conv.py, which its CPU run passes by.
     "lfm3-tiny": (*_PINNED["LFM3"][:2],
@@ -102,8 +104,15 @@ RELEASES = {
     # The same release with its convolutions' bias (`conv_bias`), which its padding masks around.
     "lfm3-biased-tiny": (*_PINNED["LFM3"][:2], ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
                          "AutoModelForCausalLM"),
+    # LFM3-VL's wrapper, its LFM3 decoder's code its own copy beside its vision code, and its processor's.
+    "lfm3-vl-tiny": (*_PINNED["LFM3_VL"][:2], ("configuration_lfm3_vl.py", "modeling_lfm3_vl.py",
+                                               "configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py",
+                                               "processing_lfm3_vl.py", "image_processing_lfm3_vl.py",
+                                               "video_processing_lfm3_vl.py"),
+                     "AutoModelForImageTextToText"),
 }
-LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "mimo-v2-tiny": "mit",
+LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
+            "mimo-v2-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
@@ -171,9 +180,11 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
         save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
-        vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
-        ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
+        config = json.loads((FIXTURES / name / "config.json").read_text())
+        ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
+        if "vision_config" in config:
+            media_tokenizer(config, FIXTURES / name)
     state = model.state_dict()
     missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
                                                 strict=False)
@@ -183,6 +194,31 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
         raise ValueError(f"{name}: the file's tensors differ from the model's: missing {missing}, "
                          f"unexpected {unexpected}")
     return model.eval()
+
+
+MEDIA_TOKENS = {"image_token_id": "<|image|>", "video_token_id": "<|video|>",
+                "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
+"""A wrapper fixture's media tokens by the config field placing each, as its release's processor spells them
+(Lfm3VlProcessor's defaults, processing_lfm3_vl.py)."""
+
+
+def media_tokenizer(config: dict, directory: Path) -> None:
+    """A tokenizer over a wrapper fixture's vocabulary written beside it: each id a word of its own
+    (`w<id>`, split on whitespace), the media tokens at the ids its config places them (`MEDIA_TOKENS`),
+    matched whole wherever they sit, as its release's processor writes them unspaced, and its pad, start
+    and end tokens."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    named = {config[field]: token for field, token in MEDIA_TOKENS.items()}
+    ends = {"pad_token": config["pad_token_id"], "bos_token": config["bos_token_id"],
+            "eos_token": config["eos_token_id"]}
+    words = {named.get(index, f"w{index}"): index for index in range(vocabulary(config))}
+    tokenizer = Tokenizer(models.WordLevel(words, unk_token=f"w{config['pad_token_id']}"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, additional_special_tokens=list(named.values()),
+                                   **{role: f"w{index}" for role, index in ends.items()})
+    fast.save_pretrained(str(directory))
 
 
 def _stored_once(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -304,6 +340,12 @@ def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
         if site == "biased":
             logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
             return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
+        if site in ("image", "video"):
+            # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
+            dtype = next(model.parameters()).dtype
+            media = {name: torch.from_numpy(value).to(dtype if name.startswith("pixel") else torch.int64)
+                     for name, value in inputs.items() if name != "ids"}
+            return {"logits": model(input_ids=ids, **media).logits.numpy()}
         return {"logits": model(input_ids=ids).logits.numpy()}
 
 
@@ -337,7 +379,7 @@ def record(name: str, release_python: str) -> None:
     from dew.interop import Pretrained
 
     source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
-    vocabulary = int(json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"])
+    config = json.loads((FIXTURES / name / "config.json").read_text())
     layouts = {layout.name: layout for layout in source.weight_layouts}
     shapes = {path: leaf.shape for path, leaf in flat_tree(source.variables).items()}
     worker = subprocess.Popen([release_python, __file__, name, "--serve"], stdin=subprocess.PIPE,
@@ -357,7 +399,7 @@ def record(name: str, release_python: str) -> None:
                     for arm in arms)
 
             arrays.update(record_case(
-                f"{name} {site}", lambda seed, site=site: draw(site, seed, vocabulary), evaluate,
+                f"{name} {site}", lambda seed, site=site: draw(site, seed, config), evaluate,
                 remote_code_site(source, site), truth_proxy=remote_code_site(source, site, wide=True),
                 store_inputs=False, summary=True))
     finally:

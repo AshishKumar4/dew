@@ -1,0 +1,15 @@
+{
+ "released": {
+  "repo": "LiquidAI/LFM3-VL-2B",
+  "revision": "f83d2b0a2296aaa277f394990a9b8b949ddf9691",
+  "code": ["configuration_lfm3_vl.py", "modeling_lfm3_vl.py", "configuration_lfm3.py", "modeling_lfm3.py",
+           "lfm3_conv.py"]
+ },
+ "transformers": {
+  "version": "5.18.0",
+  "why": "the release's LFM3 decoder runs from 5.18.0 on (lfm3-tiny/source.json), and its vision code under it"
+ },
+ "torch": "2.14.1",
+ "command": "tools/remote_code_reference.py lfm3-vl-tiny --draw; tools/remote_code_reference.py lfm3-vl-tiny --record",
+ "processor": "processor_config.json is the release's at its commit, its patches 4 pixels square and its sizes bounded to match; the tokenizer is qwen38-dense-tiny's, which the recorded sites read no text through"
+}
