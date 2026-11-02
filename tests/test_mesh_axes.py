@@ -9,6 +9,8 @@ sharding moves values, never changes them.
 """
 
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -29,7 +31,7 @@ from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import Link, declarations, declared_axes, unboxed
+from dew.nn.sharding import Link, boxed, declared_axes, unboxed
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -169,10 +171,11 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
                       for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
-    declared = declarations(shardings)
-    specs = {jax.tree_util.keystr(path): sharding.spec
-             for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **delta_layers(fused=fused))
+    with boxed(LMObjective(model, LENGTH).parameter_axes):
+        specs = {jax.tree_util.keystr(path): sharding.spec
+                 for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
+                 if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
     if fused:
@@ -821,3 +824,23 @@ def test_an_async_collective_counts_its_results_not_its_operands():
     assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
                                          ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
     assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_models_own_parameter_takes_no_axes_from_another_models_names():
+    """A parameter takes the axes its own module draws it in, and none from another model's names: with
+    Dew's mixture of experts imported, a user model's three-dimensional `gate` is placed by the shape
+    heuristic as any undeclared parameter is, where a process-wide table of trailing module names gave it
+    the MoE router's two axes and refused it (ledger 1153, 3453)."""
+    importlib.import_module("dew.nn.moe")
+
+    class Experts(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            gate = self.param("gate", nn.initializers.normal(), (2, x.shape[-1], 4))
+            return jnp.einsum("bd,edf->bef", x, gate)
+
+    variables = Experts().init(jax.random.key(0), jnp.ones((1, 8)))
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    placed = Layout(min_shard=1).shardings(mesh, variables)
+    assert placed["params"]["gate"].spec == P(None, "fsdp")
