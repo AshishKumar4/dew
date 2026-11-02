@@ -46,19 +46,27 @@ from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel
 from .linear import DepthwiseConv1d, RMSNormGated, held_scan, over_sequence, split_delta_rule
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
-from .sharding import logical_axes, sequence_shards
+from .sharding import LogicalAxes, logical_axes, sequence_shards
+
+KDA_AXES: dict[str, LogicalAxes] = {
+    # The attention mixer's projections under its names (`ATTENTION_AXES`).
+    "q_proj": ("embed", "heads"),
+    "k_proj": ("embed", "kv"),
+    "v_proj": ("embed", "kv"),
+    "o_proj": ("attention", "embed"),
+    # The gates' low-rank pairs and the beta projection are KDA's own.
+    "b_proj": ("embed", "kv"),
+    "f_a_proj": ("embed", None),
+    "f_b_proj": (None, "heads"),
+    "g_a_proj": ("embed", None),
+    "g_b_proj": (None, "heads"),
+    "g_proj": ("embed", "heads"),
+}
+"""The logical axes of KDA's projections, by name, as it declares them where it makes them."""
 
 
-# q/k/v_proj and o_proj carry the attention mixer's declarations under the
-# same names; the gates' low-rank pairs and the beta projection are KDA's own.
-@logical_axes({
-    ("b_proj",): ("embed", "kv"),
-    ("f_a_proj",): ("embed", None),
-    ("f_b_proj",): (None, "heads"),
-    ("g_a_proj",): ("embed", None),
-    ("g_b_proj",): (None, "heads"),
-    ("g_proj",): ("embed", "heads"),
-})
+@logical_axes({(name,): axes for name, axes in KDA_AXES.items() if name not in ("q_proj", "k_proj", "v_proj",
+                                                                                  "o_proj")})
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
 
@@ -111,8 +119,10 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-                                  dot_general=float32_dot_general)
+        def dense(features: int, *, name: str) -> Dense:
+            return Dense(features, use_bias=False, dtype=self.dtype, precision=self.precision,
+                         dot_general=float32_dot_general, name=name, kernel_axes=KDA_AXES[name])
+
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')

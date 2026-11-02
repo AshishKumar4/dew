@@ -66,6 +66,7 @@ from .sharding import (
     HEADS,
     MLP_HIDDEN,
     RESIDUAL,
+    LogicalAxes,
     automatic_axes,
     constrain,
     grouped_heads,
@@ -628,16 +629,20 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
 # The projected width of the keys, values and the gate is the delta net's own
 # ("linear"); the output projection is the width every mixer projects back
 # into the model, which the table already calls "attention".
-@logical_axes({
-    ("in_proj_qkv",): ("embed", "linear"),
-    ("in_proj_z",): ("embed", "linear"),
-    ("in_proj_b",): ("embed", "kv"),
-    ("in_proj_a",): ("embed", "kv"),
+GATED_DELTA_AXES: dict[str, LogicalAxes] = {
+    "in_proj_qkv": ("embed", "linear"),
+    "in_proj_z": ("embed", "linear"),
+    "in_proj_b": ("embed", "kv"),
+    "in_proj_a": ("embed", "kv"),
     # Qwen3-Next's checkpoint fuses the same projections (`fused_in_proj`).
-    ("in_proj_qkvz",): ("embed", "linear"),
-    ("in_proj_ba",): ("embed", "kv"),
-    ("out_proj",): ("attention", "embed"),
-})
+    "in_proj_qkvz": ("embed", "linear"),
+    "in_proj_ba": ("embed", "kv"),
+    "out_proj": ("attention", "embed"),
+}
+"""The logical axes of Gated DeltaNet's projections, by name, as it declares them where it makes them."""
+
+
+@logical_axes({(name,): axes for name, axes in GATED_DELTA_AXES.items()})
 class GatedDeltaNet(nn.Module):
     """The token mixer of a linear_attention layer.
 
@@ -739,7 +744,7 @@ class GatedDeltaNet(nn.Module):
             Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
             dot_general=float32_dot_general)
         for name, (_, outputs) in self.projections().items():
-            setattr(self, name, dense(outputs, name=name))
+            setattr(self, name, dense(outputs, name=name, kernel_axes=GATED_DELTA_AXES[name]))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
                                        kernel=self.conv_kernel, name='conv1d')
         self.A_log = self.param('A_log', nn.initializers.constant(0.0),
