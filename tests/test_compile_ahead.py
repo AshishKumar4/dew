@@ -81,13 +81,14 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
     takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. The
-    run sets Triton's GEMM fusions itself, so its step's options are its towers' own and no probe compiles
-    the half rung under XLA's defaults, which would be the same program: the search applies the
-    compile-only policy (`deviceless_options`) to both alike (row 3506)."""
+    run sets Triton's GEMM fusions itself and leaves autotuning to Dew, so its step's options are its towers'
+    own and no probe compiles the half rung under XLA's defaults, which would be the same program: the
+    search applies the compile-only policy (`deviceless_options`) to both alike (row 3506)."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    monkeypatch.setenv("XLA_FLAGS", f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_enable_triton_gemm=false")
+    monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level")
+                       + " --xla_gpu_enable_triton_gemm=false")
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=700_000, frontier=True)
     plan = record(ahead.plan, "plan")
