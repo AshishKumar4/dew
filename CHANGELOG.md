@@ -16,6 +16,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   non-expansive where the loss is convex (an affine head, `up` alone). A step of `down` under ReLU and a
   quantized head input stay refused, as no curvature bounds them (both were refused before, with every
   head but an affine one).
+- A mixture a run bounds in examples counts each member's source examples where their rows are delivered,
+  and what a step after the mix refuses of a member's rows under that member, through objective steps,
+  batched steps, packs, windows and the shuffles after them (they were counted as the mix drew them, and
+  refused under the mixture). A data position now records its counters' format. A position saved before
+  counts its mixture's members afresh from the resume. The examples a counter, a causal window or a
+  completion held in flight count in its total and on its clock as before, and complete no member's.
 - A step compiled ahead for GPUs with none attached compiles with XLA's autotuning off, unless `XLA_FLAGS` sets it: its programs
   and their memory are the same, and its fit search compiles each rung about a third faster.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
