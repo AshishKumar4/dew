@@ -21,10 +21,10 @@ from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
-`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's and Muse
-Glimmer's, whose towers attend within a frame."""
+`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
+Glimmer's and LFM3-VL's, whose towers attend and convolve within a frame."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,

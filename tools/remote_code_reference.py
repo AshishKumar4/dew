@@ -42,7 +42,8 @@ above:
   /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
 
 LFM3's code (lfm3-tiny, lfm3-biased-tiny) runs under transformers 5.18.0 on
-(tests/fixtures/hf/lfm3-tiny/source.json).
+(tests/fixtures/hf/lfm3-tiny/source.json), and LFM3-VL's (lfm3-vl-tiny), the same LFM3 decoder beside
+its vision trunk and projector, under the same (tests/fixtures/hf/lfm3-vl-tiny/source.json).
 
 `--record` records each release over seeds at its sites (tests/remote_code_draws.py's `SITES`,
 `record_case(..., summary=True)`), as `released.npz` beside the fixture, which
@@ -79,7 +80,7 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
-from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions
+from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions, vocabulary
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -102,8 +103,13 @@ RELEASES = {
     # The same release with its convolutions' bias (`conv_bias`), which its padding masks around.
     "lfm3-biased-tiny": (*_PINNED["LFM3"][:2], ("configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
                          "AutoModelForCausalLM"),
+    # LFM3-VL's wrapper, its LFM3 decoder's code its own copy beside its vision code.
+    "lfm3-vl-tiny": (*_PINNED["LFM3_VL"][:2], ("configuration_lfm3_vl.py", "modeling_lfm3_vl.py",
+                                               "configuration_lfm3.py", "modeling_lfm3.py", "lfm3_conv.py"),
+                     "AutoModelForImageTextToText"),
 }
-LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "mimo-v2-tiny": "mit",
+LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny": "lfm1.0",
+            "mimo-v2-tiny": "mit",
             "dream-tiny": "apache-2.0", "llada-tiny": "mit"}
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
@@ -171,8 +177,8 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
             for parameter in model.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.1)
         save_file(_stored_once(model.state_dict()), str(FIXTURES / name / "model.safetensors"))
-        vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
-        ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
+        config = json.loads((FIXTURES / name / "config.json").read_text())
+        ids = torch.randint(0, vocabulary(config), (2, 16)).numpy().astype(np.int32)
         np.save(FIXTURES / name / "input_ids.npy", ids)
     state = model.state_dict()
     missing, unexpected = model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")),
@@ -304,6 +310,12 @@ def released_outputs(model, site: str, inputs: dict) -> dict[str, np.ndarray]:
         if site == "biased":
             logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
             return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
+        if site in ("image", "video"):
+            # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
+            dtype = next(model.parameters()).dtype
+            media = {name: torch.from_numpy(value).to(dtype if name.startswith("pixel") else torch.int64)
+                     for name, value in inputs.items() if name != "ids"}
+            return {"logits": model(input_ids=ids, **media).logits.numpy()}
         return {"logits": model(input_ids=ids).logits.numpy()}
 
 
@@ -337,7 +349,7 @@ def record(name: str, release_python: str) -> None:
     from dew.interop import Pretrained
 
     source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
-    vocabulary = int(json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"])
+    config = json.loads((FIXTURES / name / "config.json").read_text())
     layouts = {layout.name: layout for layout in source.weight_layouts}
     shapes = {path: leaf.shape for path, leaf in flat_tree(source.variables).items()}
     worker = subprocess.Popen([release_python, __file__, name, "--serve"], stdin=subprocess.PIPE,
@@ -357,7 +369,7 @@ def record(name: str, release_python: str) -> None:
                     for arm in arms)
 
             arrays.update(record_case(
-                f"{name} {site}", lambda seed, site=site: draw(site, seed, vocabulary), evaluate,
+                f"{name} {site}", lambda seed, site=site: draw(site, seed, config), evaluate,
                 remote_code_site(source, site), truth_proxy=remote_code_site(source, site, wide=True),
                 store_inputs=False, summary=True))
     finally:

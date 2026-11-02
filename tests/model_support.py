@@ -286,7 +286,9 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
     positions from 0; `decode` through the decode cache in `CHUNKS`; `gradients`, the parameters'
     gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
     logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
-    rows, each row's real slots alone (`row0`, `row1`)."""
+    rows, each row's real slots alone (`row0`, `row1`); `image` and `video` over a row whose placeholders
+    its drawn media fill, read as the source's processor reads its own processor's fields
+    (`Processor.from_hf`)."""
     import optax
     from reference_error import widened
     from remote_code_draws import CHUNKS, DOCUMENTS, PADDED, RATE, positions
@@ -335,6 +337,14 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
             logits = model.apply(variables, inputs["ids"], attention_mask=mask)
             return {"row0": logits[0], "row1": logits[1, PADDED:]}
         return jax.jit(biased)
+    if site in ("image", "video"):
+        forward = jax.jit(model.apply)
+
+        def media(inputs):
+            fields = {name: np.asarray(value) for name, value in inputs.items() if name != "ids"}
+            batch = source.processor.from_hf({"input_ids": np.asarray(inputs["ids"]), **fields})
+            return {"logits": forward(variables, batch.tokens, **batch.kwargs())}
+        return media
     return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
 
 

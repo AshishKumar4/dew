@@ -7,3 +7,7 @@ alone and imports nothing."""
 LFM3 = ("LiquidAI/LFM3-1.7B", "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
         {"AutoConfig": "configuration_lfm3.Lfm3Config", "AutoModel": "modeling_lfm3.Lfm3Model",
          "AutoModelForCausalLM": "modeling_lfm3.Lfm3ForCausalLM"})
+
+LFM3_VL = ("LiquidAI/LFM3-VL-2B", "f83d2b0a2296aaa277f394990a9b8b949ddf9691",
+           {"AutoConfig": "configuration_lfm3_vl.Lfm3VlConfig", "AutoModel": "modeling_lfm3_vl.Lfm3VlModel",
+            "AutoModelForImageTextToText": "modeling_lfm3_vl.Lfm3VlForConditionalGeneration"})

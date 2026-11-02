@@ -31,9 +31,9 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
     path, label = FIXTURES / name / 'released.npz', f'{name} {site}'
     seeds = declared_seeds(path)[label]
-    vocabulary = json.loads((FIXTURES / name / 'config.json').read_text())['vocab_size']
+    config = json.loads((FIXTURES / name / 'config.json').read_text())
     drawn, reference, truth = indexed_recording(
-        recording(path), label, seeds, inputs_of=lambda seed: draw(site, seed, vocabulary),
+        recording(path), label, seeds, inputs_of=lambda seed: draw(site, seed, config),
         truth_fn=remote_code_site(source, site, wide=True))
     forward = remote_code_site(source, site)
     assert_as_exact(lambda index, inputs: forward(inputs), reference, drawn, label, seeds=seeds,

@@ -107,7 +107,7 @@ class Llama4Vision(TowerBase):
             order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
             positions=LearnedPositions(self.image_size // self.patch_size, "fixed", initializer=initialize),
             special_tokens=SpecialTokens("last", initializer=initialize), image_size=self.image_size,
-            rotary="adjacent", pre_norm=True, post_norm="layer", outer_norm_eps=self.layer_norm_eps,
+            rotary="adjacent", pre_norm="layer", post_norm="layer", outer_norm_eps=self.layer_norm_eps,
             output="patches", rope_theta=self.rope_theta, rotary_columns_first=True, rotary_origin=1,
             merge_blocks=False)
 
