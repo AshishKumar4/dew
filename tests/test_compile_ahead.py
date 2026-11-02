@@ -804,8 +804,8 @@ def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compi
     # A dump directory that is a link elsewhere is refused at both ends, and one that takes no file at the
     # start.
     (tmp_path / "linked").mkdir()
-    (tmp_path / "elsewhere").mkdir()
-    (tmp_path / "linked" / "xla").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "link-target").mkdir()
+    (tmp_path / "linked" / "xla").symlink_to(tmp_path / "link-target")
     with pytest.raises(ValueError, match="link"):
         dumps(tmp_path / "linked", {})
     (tmp_path / "linked" / "mosaic").mkdir()
