@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
@@ -1116,6 +1117,20 @@ def test_both_fused_stages_chosen_through_xla_are_as_exact_as_the_unfused_progra
     with generation.assumed("sm80"), generation.chosen(gemm_epilogue="xla", gemm_prologue="xla"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "both stages in XLA",
                         seeds=SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("index_map", [lambda row, column: (row * row, column),
+                                       lambda row, column: (column, row),
+                                       lambda row, column: (row, 0)],
+                         ids=["a square of the row", "the axes swapped", "a fixed column"])
+def test_a_block_spec_is_the_tile_only_where_its_map_is_the_identity(index_map):
+    """A block of the probe tile at a place its index map computes otherwise than the tile's own (a square of
+    the row, the axes swapped, a fixed column) is not the tile, however the map reads at one coordinate:
+    (row, column) -> (row * row, column) gives (1, 2) at (1, 2), which one probe there took for the identity
+    (row 3636)."""
+    probe = (8, 16)
+    assert fused._is_tile(pl.BlockSpec(probe, lambda row, column: (row, column)), probe)
+    assert not fused._is_tile(pl.BlockSpec(probe, index_map), probe)
 
 
 @runs("sm80")

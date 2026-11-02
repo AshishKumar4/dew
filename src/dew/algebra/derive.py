@@ -182,9 +182,10 @@ narrow value) before it scales the carried sum."""
 
 
 @function(merge=lambda old, new: old)
-def least() -> i64: ...
-"""The literal of the walked maxima's dtype's least finite value (`Region.literals`): a correction's shift
-`max(k_now, least)` keeps `exp(k_carried - k_now)` zero, not `exp(-inf + inf)`, where nothing is seen yet."""
+def least(anchor: Term) -> i64: ...
+"""The literal of an anchor's dtype's least finite value (`Region.literals`), each anchor its own dtype's: a
+correction's shift `max(k_now, least)` keeps `exp(k_carried - k_now)` zero, not `exp(-inf + inf)`, where
+nothing is seen yet."""
 
 
 @function(merge=lambda old, new: old)
@@ -394,7 +395,7 @@ def _decoupled():
     lifted = (eq(given).to(shape(k)), eq(to).to(shape(t)), eq(along).to(anchored(t)),
               eq(lift).to(lifts(given, to, along)),
               eq(added).to(stock("add")), eq(multiplied).to(stock("mul")), eq(largest).to(stock("max")),
-              eq(floor).to(least()), eq(typed).to(retype(i)), slotted)
+              eq(floor).to(least(k)), eq(typed).to(retype(i)), slotted)
     for summed_term, tile in ((x.reduce(String("sum"), axes, p), x.stepped().reduce(String("sum"), axes, p)),
                               (x.dot(y, p), x.stepped().dot(y.stepped(), p)),
                               (y.dot(x, p), y.stepped().dot(x.stepped(), p))):
@@ -680,7 +681,7 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
     the derivation's own), and each input's walked axis."""
     program.stated(graph, region)
     elementwise = terms.BINARY | terms.COMPARISONS | terms.UNARY | {"convert_element_type"}
-    _least(graph, region, closed)
+    _least(graph, region)
     for index, (primitive, params) in enumerate(region.params):
         name = primitive.name
         if name in elementwise:
@@ -741,20 +742,22 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
             graph.register(zero(literal))
 
 
-def _least(graph: EGraph, region: terms.Region, closed) -> None:
-    """The walked maxima's least finite value, a literal of their dtype (`least`), refused where the maxima
-    are of more than one dtype: no one shift is each one's."""
-    peaks = {jnp.dtype(equation.outvars[0].aval.dtype) for equation in closed.jaxpr.eqns
-             if equation.primitive.name == "reduce_max"}
-    if len(peaks) > 1:
-        raise Refused(f"maxima of more than one dtype ({sorted(map(str, peaks))}): no one shift corrects "
-                      "them")
-    if peaks and jnp.issubdtype(dtype := peaks.pop(), jnp.floating):
-        region.literals.append(np.asarray(jnp.finfo(dtype).min, dtype))
-        literal = Term.literal(i64(len(region.literals) - 1))
-        region.shaped(literal, ())
-        graph.register(set_(least()).to(i64(len(region.literals) - 1)),
-                       set_(rules.shape(literal)).to(Vec[i64]()))
+def _least(graph: EGraph, region: terms.Region) -> None:
+    """Each floating value's dtype's least finite value (`least`), stated of every value a walked maximum
+    may anchor (its own, or one made from it: a broadcast, a difference), one literal a dtype: maxima of two
+    dtypes are each corrected by their own, where one value for the whole program refused them."""
+    floors: dict[np.dtype, int] = {}
+    for term, _ in region.shapes:
+        dtype = region.dtypes.get(terms.key(term))
+        if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+            continue
+        if dtype not in floors:
+            region.literals.append(np.asarray(jnp.finfo(dtype).min, dtype))
+            floors[dtype] = len(region.literals) - 1
+            literal = Term.literal(i64(floors[dtype]))
+            region.shaped(literal, ())
+            graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
+        graph.register(set_(least(term)).to(i64(floors[dtype])))
 
 
 def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:
