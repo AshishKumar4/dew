@@ -53,8 +53,10 @@ def float64_forward(module, variables, *args, **kwargs):
 
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
-        outputs, terms = float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                                       *widened((variables, *args)))
+        # One forward a module, so each call of it reads one trace (`_traced`); keyword options its own.
+        forward = (FORWARDS.setdefault(wide, wide.apply) if not kwargs
+                   else lambda held, *given: wide.apply(held, *given, **kwargs))
+        outputs, terms = float64_terms(forward, *widened((variables, *args)))
     narrow = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(outputs)
                      if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != jnp.float64})
     if narrow:
@@ -79,7 +81,7 @@ def float64_terms(fn, *args):
     values pick, `_static`) is evaluated by the same rules traced once into
     one compiled float64 program (`_compiled`), which each later call of `fn`
     on arguments of the same shapes runs; in any other, each run of such
-    steps between its branches and loops is one (`_compiled_run`), the
+    steps between its branches and loops is one (`_span`), the
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
     closed, tree = _traced(fn, args)
@@ -93,15 +95,14 @@ def float64_terms(fn, *args):
 
 
 TRACES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Each function's traced programs, by its arguments' structure, shapes and dtypes (`_traced`), held
-while the function lives."""
+"""Each function's traced programs, by its arguments' structure, shapes, dtypes and weak types (`_traced`),
+held while the function lives."""
 
-PROGRAMS: dict = {}
-"""Each program's first traced jaxpr, by its text: the one every later trace of it evaluates (`_traced`)."""
+FORWARDS: dict = {}
+"""Each module's float64 forward (`float64_forward`), one function a module, so its trace is reused."""
 
 COMPILED: dict = {}
 """Each static program's compiled evaluation (`_compiled`), by its jaxpr."""
-
 
 STATIC: dict = {}
 """Whether each jaxpr is static (`_static`), by the jaxpr."""
@@ -117,19 +118,23 @@ def _static(jaxpr) -> bool:
 
 def _traced(fn, args):
     """`fn`'s program at `args` and its outputs' tree, traced once a function and arguments' structure,
-    shapes and dtypes, as jit traces (its closure's arrays the program's constants); the jaxpr the first
-    trace of the same program text gave, so a function made afresh each call (`float64_forward`'s) reads
-    one program, and its compiled runs (`_compiled`, `_compiled_run`) compile once."""
-    from jax.extend.core import ClosedJaxpr
-
+    shapes, dtypes and weak types, as jit traces (its closure's arrays the program's constants), so its
+    compiled runs (`_compiled`, `_span`) compile once."""
     leaves, structure = jax.tree.flatten(args)
-    key = (structure, tuple((np.shape(leaf), jnp.result_type(leaf)) for leaf in leaves))
+    key = (structure, tuple((np.shape(leaf), jnp.result_type(leaf), jax.dtypes.is_weakly_typed(leaf))
+                            for leaf in leaves))
     traces = TRACES.setdefault(fn, {})
     if key not in traces:
         closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
-        jaxpr = PROGRAMS.setdefault(str(closed.jaxpr), closed.jaxpr)
-        traces[key] = (ClosedJaxpr(jaxpr, closed.consts), jax.tree.structure(shapes))
+        traces[key] = (closed, jax.tree.structure(shapes))
     return traces[key]
+
+
+def released() -> None:
+    """Forget every trace and compiled evaluation the walk keeps, and the arrays they hold: where the
+    suite releases its compiled programs (tests/conftest.py's `release`)."""
+    for cache in (TRACES, FORWARDS, COMPILED, STATIC, LAYOUTS, RUNS):
+        cache.clear()
 
 
 def _compiled(jaxpr):
@@ -145,7 +150,7 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
     (`float64_terms`), from `args` and the energies `given` for them (none for
     a computation's own inputs). A value no sum made has none. `compiling`
     evaluates each run of static steps between a branch and a loop
-    (`_runs`) as one compiled program (`_compiled_run`)."""
+    (`_runs`) as one compiled program (`_span`)."""
     from jax.extend.core import Literal
 
     wanted, last, runs = _layout(jaxpr)
@@ -164,12 +169,9 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
     for start, stop in spans:
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:
-            # A static run of the walk's steps, compiled once (`_compiled_run`), the values it reads in.
-            reads = _run_reads(run)
-            kept = [var for var in _run_writes(run) if last.get(var, len(jaxpr.eqns)) >= stop]
-            outputs, made = _compiled_run(jaxpr, start, stop, reads, kept, wanted)(
-                [read(var) for var in reads], [energy(var) for var in reads])
-            written = kept
+            # A static run of the walk's steps, compiled once (`_span`), the values it reads in.
+            reads, written, freed, runner = _span(jaxpr, start, stop)
+            outputs, made = runner([read(var) for var in reads], [energy(var) for var in reads])
         else:
             (equation,) = run
             inputs = [read(var) for var in equation.invars]
@@ -177,10 +179,11 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False):
                 outputs, made = _applied(equation, inputs, [energy(var) for var in equation.invars],
                                          any(var in wanted for var in equation.outvars), compiling)
             written = equation.outvars
-        for var in {var for equation in run for var in equation.invars if not isinstance(var, Literal)}:
-            if start <= last.get(var, -1) < stop:
-                values.pop(var, None)
-                energies.pop(var, None)
+            freed = [var for var in equation.invars
+                     if not isinstance(var, Literal) and last.get(var) == start]
+        for var in freed:
+            values.pop(var, None)
+            energies.pop(var, None)
         for var, value, made_energy in zip(written, outputs, made, strict=True):
             values[var], energies[var] = value, made_energy
     return [read(var) for var in jaxpr.outvars], [energy(var) for var in jaxpr.outvars]
@@ -234,42 +237,35 @@ def _runs(jaxpr) -> list[tuple[int, int]]:
     return spans
 
 
-def _run_writes(run) -> list:
-    """The variables a run of steps defines, in order."""
-    return [var for equation in run for var in equation.outvars]
-
-
-def _run_reads(run) -> list:
-    """The variables a run of steps reads from before it, in order of first read."""
-    from jax.extend.core import Literal
-
-    written, reads = set(), []
-    for equation in run:
-        for var in equation.invars:
-            if not isinstance(var, Literal) and var not in written and var not in reads:
-                reads.append(var)
-        written.update(equation.outvars)
-    return reads
-
-
 RUNS: dict = {}
-"""Each static run's compiled evaluation (`_compiled_run`), by its program, its span and the energies it
-reads."""
+"""Each static span's record (`_span`), by its program and span."""
 
 
-def _compiled_run(jaxpr, start: int, stop: int, reads, kept, wanted):
-    """`jaxpr`'s run of static steps `start` to `stop` evaluated as the walk evaluates them (`_applied`),
-    compiled once a program (`_traced`) and span, reading `reads`' values and energies and returning
-    `kept`'s."""
+def _span(jaxpr, start: int, stop: int):
+    """`jaxpr`'s run of static steps `start` to `stop`, read once a program (`_traced`) and span: the
+    variables it reads from before it and those it keeps for after it (an output, or a later step's
+    input), those whose last reader it holds, which go after it, and its steps evaluated as the walk
+    evaluates them (`_applied`), compiled, from the read variables' values and energies to the kept
+    ones'."""
     from jax.extend.core import Literal
 
-    run = jaxpr.eqns[start:stop]
-    marks = tuple(any(var in wanted for var in equation.outvars) for equation in run)
-    key = (jaxpr, start, stop, marks)
+    key = (jaxpr, start, stop)
     if key not in RUNS:
+        wanted, last, _ = _layout(jaxpr)
+        run = jaxpr.eqns[start:stop]
+        written, reads = set(), []
+        for equation in run:
+            reads += [var for var in equation.invars
+                      if not isinstance(var, Literal) and var not in written and var not in reads]
+            written.update(equation.outvars)
+        kept = [var for equation in run for var in equation.outvars
+                if last.get(var, len(jaxpr.eqns)) >= stop]
+        freed = [var for var in reads if start <= last.get(var, -1) < stop]
+        marks = [any(var in wanted for var in equation.outvars) for equation in run]
+
         def evaluate(read_values, read_energies):
-            values, energies = dict(zip(reads, read_values, strict=True)), dict(
-                zip(reads, read_energies, strict=True))
+            values = dict(zip(reads, read_values, strict=True))
+            energies = dict(zip(reads, read_energies, strict=True))
             for equation, mark in zip(run, marks, strict=True):
                 inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
                 given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
@@ -278,7 +274,8 @@ def _compiled_run(jaxpr, start: int, stop: int, reads, kept, wanted):
                 values.update(zip(equation.outvars, outputs, strict=True))
                 energies.update(zip(equation.outvars, made, strict=True))
             return [values[var] for var in kept], [energies[var] for var in kept]
-        RUNS[key] = jax.jit(evaluate)
+
+        RUNS[key] = (reads, kept, freed, jax.jit(evaluate))
     return RUNS[key]
 
 

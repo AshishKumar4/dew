@@ -10,6 +10,7 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import lane_environment
 import jax
 import numpy as np
 import optax
@@ -438,7 +439,14 @@ def joint_runs(tmp_path_factory):
     on rows of several questions, two steps, and a run of the first step alone, the two-step run's
     directory holding its first step as the run left it there, its step compiled once for both. Built once
     for the module's two tests of them."""
-    tmp_path = tmp_path_factory.mktemp("joint")
+    with pytest.MonkeyPatch.context() as patch:
+        # The module's own rung records, data and Hub caches, as each test's (`own_settings`).
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        return _joint_runs(tmp_path_factory.mktemp("joint"))
+
+
+def _joint_runs(tmp_path):
+    """`joint_runs` built under `tmp_path`."""
     release = tmp_path / "release"
     release.mkdir()
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:

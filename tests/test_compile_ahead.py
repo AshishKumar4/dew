@@ -11,6 +11,7 @@ import itertools
 import json
 import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -87,6 +88,8 @@ def admitted(tmp_path_factory):
 
     records = tmp_path_factory.mktemp("rungs")
     with pytest.MonkeyPatch.context() as patch:
+        # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
         trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
