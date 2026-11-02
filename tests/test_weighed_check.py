@@ -171,7 +171,8 @@ def test_a_sum_across_devices_is_weighed_as_a_sum_and_a_gather_as_a_move():
     mesh = jax.make_mesh((2,), ("x",), devices=jax.devices()[:2])
     sharded = jax.shard_map(lambda a, b: (jax.lax.psum(a @ b, "x"), jax.lax.all_gather(a, "x", tiled=True,
                                                                                          axis=1)),
-                            mesh=mesh, in_specs=(P(None, "x"), P("x", None)), out_specs=(P(), P()))
+                            mesh=mesh, in_specs=(P(None, "x"), P("x", None)), out_specs=(P(), P()),
+                            check_vma=False)
     a, b, _ = draw(0)
     placed = (jax.device_put(a, jax.NamedSharding(mesh, P(None, "x"))),
               jax.device_put(b.T, jax.NamedSharding(mesh, P("x", None))))
