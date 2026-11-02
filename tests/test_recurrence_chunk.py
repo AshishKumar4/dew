@@ -85,8 +85,10 @@ def formed(forms: str, fn):
 def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector where it runs it,
     and for the rated scan's where that runs it: the portable math ('xla') and the recurrence template
-    ('mosaic_gpu') both."""
-    named = {'gated_delta_rule': kernel, **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu') else {})}
+    ('mosaic_gpu') both, the port of mamba_ssm's kernels ('pallas') the scan's alone, the rated scan's
+    reference under the fast forms (test_recurrence_template_stability's `reference_arm`)."""
+    named = {**({} if kernel == 'pallas' else {'gated_delta_rule': kernel}),
+             **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu', 'pallas') else {})}
     with generation.chosen(**named):
         return chunk(hooks, *args, **kwargs)
 """A row of one sequence, and of packed documents."""
