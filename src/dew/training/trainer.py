@@ -79,15 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import (
-    Link,
-    Schedule,
-    boxed,
-    boxed_axes,
-    measured_links,
-    pipeline_microbatches,
-    ruled_boxes,
-)
+from dew.nn.sharding import Link, Schedule, boxed, boxed_axes, measured_links, pipeline_microbatches
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -98,7 +90,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import declaring, held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -303,7 +295,8 @@ class Trainer(Generic[Loss, Effects]):
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
-        self._config, self._optimizer = (None, objective.optimizer(optimizer)) if built else (optimizer, None)
+        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
+                                         if built else (optimizer, None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -493,8 +486,8 @@ class Trainer(Generic[Loss, Effects]):
 
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
         """The optimizer's state of `params`, Muon's grouping reading the axes
-        modules boxed on them in `initialized`."""
-        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
+        modules boxed on them in `initialized`, every one of them: placement alone filters by its rules."""
+        with boxed(boxed_axes(initialized)):
             return self.optimizer.init(params)
 
     def _groups(self, state: TrainState) -> dict[str, str] | None:
@@ -502,7 +495,7 @@ class Trainer(Generic[Loss, Effects]):
         modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
         if self._config is None:
             return None
-        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+        with boxed(self._boxed_axes()):
             return self._config.groups(state.variables["params"])
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -526,9 +519,9 @@ class Trainer(Generic[Loss, Effects]):
             return self._shardings(state)
 
     def _declared(self):
-        """The context in which the layout reads the axes the objective's
-        modules box, as its rules place them."""
-        return boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))
+        """The context in which the layout, the optimizer and the step read the axes the objective's
+        modules box: every one, which placement filters by its rules (`Layout._declared`)."""
+        return boxed(self._boxed_axes())
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -1430,7 +1423,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._examples is not None)
-        self._optimizer = self.objective.optimizer(built)
+        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -1603,7 +1596,7 @@ class Trainer(Generic[Loss, Effects]):
             # of examples starts at none consumed, a run on another clock keeps none, and its schedules
             # take the run's own form (`reclocked`).
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
-            with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+            with boxed(self._boxed_axes()):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)
             shardings, _ = self._validated(initial)

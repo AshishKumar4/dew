@@ -530,11 +530,15 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
 
 
 def parameter_path(path) -> Suffix:
-    """The parameter's own path: the trailing run of dict keys under a leaf.
+    """The parameter's own path: the trailing run of dict keys under a leaf, a boxed parameter's value
+    (`.value` under its `nn.LogicallyPartitioned`) read as the parameter it holds.
 
     An optimizer state nests a copy of the parameter tree inside its own
     structure, so what identifies a parameter is where its path ends.
     """
+    path = tuple(path)
+    if path and isinstance(path[-1], jax.tree_util.GetAttrKey) and path[-1].name == "value":
+        path = path[:-1]
     names = []
     for entry in reversed(path):
         if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
@@ -605,12 +609,15 @@ def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
 
 
 def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) -> dict[Suffix, LogicalAxes]:
-    """`table`'s boxes that name an axis `rules` places. A box whose names
-    the rules never mention keeps the shape heuristic, as an undeclared
-    parameter does, where its names alone would leave it whole: a Flax model
-    boxing with its own names (MaxText's 'activation_*', 'kv')."""
+    """`table`'s boxes placement reads under `rules`: those that name an axis the rules place, and those
+    that name none at all, a parameter its module keeps whole on every device. A box whose names the
+    rules never mention keeps the shape heuristic, as an undeclared parameter does, where its names alone
+    would leave it whole: a Flax model boxing with its own names (MaxText's 'activation_*', 'kv'). Only
+    placement filters: what a parameter's axes are (an optimizer's matrix, a diagnostic) reads the whole
+    table."""
     named = {name for name, _ in rules}
-    return {path: names for path, names in table.items() if named.intersection(names)}
+    return {path: names for path, names in table.items()
+            if named.intersection(names) or all(name is None for name in names)}
 
 
 def current_boxes() -> Mapping[Suffix, LogicalAxes]:
@@ -681,9 +688,12 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     """
     names = parameter_path(path)
     held = _BOXED.get()
-    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
-    if axes is None:
+    # A declaration of no axes, a scalar's `()`, is a declaration all the same.
+    found = [table[key] for table, key in ((held, names), (held, ("params", *names)), (declared, names))
+             if key in table]
+    if not found:
         return None
+    axes = found[0]
     if ndim > len(axes):
         raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
     return axes[len(axes) - ndim:]

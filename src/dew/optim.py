@@ -52,7 +52,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import declarations, declared_axes
+from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -154,12 +154,35 @@ def muon_weight_dimension_numbers(params):
     return jax.tree_util.tree_map_with_path(lambda path, _: placed[path][0], params)
 
 
+def declaring(optimizer: optax.GradientTransformation,
+              table: Callable[[], Mapping[tuple[str, ...], LogicalAxes]]) -> optax.GradientTransformation:
+    """`optimizer` reading its parameters' logical axes from `table()` (`dew.nn.sharding.boxed`) wherever
+    its init and update are traced: Muon finds each matrix's sides in its update too, which optax resolves
+    from the updates it is handed (optax/contrib/_muon.py, `update_fn`), and a step, a plan's footprint
+    and a lowering ahead each trace it apart. `table` is read at each trace, so a trainer hands the axes
+    its objective's init boxes once it has traced them (`Trainer._boxed_axes`). A caller of Dew's
+    optimizers outside a trainer gives its unboxed parameters and gradients the same way, under
+    `boxed(boxed_axes(variables))`."""
+    def init(params):
+        with boxed(table()):
+            return optimizer.init(params)
+
+    def update(updates, state, params=None, **extra):
+        with boxed(table()):
+            return optimizer.update(updates, state, params, **extra)
+
+    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
+        return optax.GradientTransformationExtraArgs(init, update)
+    return optax.GradientTransformation(init, update)
+
+
 def _placements(params) -> dict[jax.tree_util.KeyPath, tuple[optax.contrib.MuonDimensionNumbers | None, str]]:
     """Each parameter's Muon dimension numbers, None for AdamW, and the reason (`muon_partition`), by its
     path. A matrix's declared sides are read first, so a projection of one head, `[embed, 1, head_dim]`,
     is the matrix its declaration names; only a parameter no declaration makes a matrix is read as a
     per-channel filter by its shape."""
-    declared = declarations(params)
+    # Boxes the parameters carry are theirs, read ahead of any table (`boxed_axes`).
+    declared = {**declarations(params), **boxed_axes(params)}
     leaves = jax.tree_util.tree_leaves_with_path(params)
     decaying = jax.tree_util.tree_leaves(weight_decay_mask(params))
     placed = {}
