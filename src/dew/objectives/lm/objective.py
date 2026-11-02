@@ -1473,7 +1473,7 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict, rows=rows)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _ = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
