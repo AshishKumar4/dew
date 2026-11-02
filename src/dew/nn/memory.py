@@ -27,14 +27,14 @@ Two computations give the one function. A row of one document runs chunk by chun
 compacted to the front (`valid_order`), each chunk's gradients one `vmap` at the chunk's start, the
 momentum and retention across the chunk their affine steps composed between each pair of its tokens
 (one associative scan of 2 x 2 scalars, `_transfers`) and each state one sum of the updates they carry,
-and the chunk's readouts one `vmap` over its states. A packed row, and a cached call, run token by token (`_stepped`),
-which is the definition. The state is the network's parameters, a traced carry. Each head's network
-is this layer's child (`head_0`, ...), whose parameters are its W_0, and every application runs that
-child at its own scope over the weights the step holds, read-only (`_substituted`), so the layer
-composes with a scanned layer stack and remat, and a method interceptor the model computes under finds
-each head's sites at their paths, as at any child; the chunk's carry is named (`CARRY`) for a remat
-policy. The heads run one after another, each vectorized over its rows and tokens, and may hold
-different trees (an adapter on one head alone).
+and the chunk's readouts one `vmap` over its states. A packed row, and a cached call, run token by
+token (`_stepped`), which is the definition. The state is the network's parameters, a traced carry.
+Each head's network is this layer's child (`head_0`, ...), whose parameters are its W_0, and every
+application runs that child at its own scope over the weights the step holds, read-only
+(`_substituted`), so the layer composes with a scanned layer stack and remat, and a method interceptor
+the model computes under finds each head's sites at their paths, as at any child; the chunk's carry is
+named (`CARRY`) for a remat policy. The heads run one after another, each vectorized over its rows and
+tokens, and may hold different trees (an adapter on one head alone).
 
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
 does at any Dense, its dropout drawing from each token's key in a forward that carries the dropout
