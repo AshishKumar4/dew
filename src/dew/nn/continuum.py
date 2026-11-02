@@ -188,19 +188,19 @@ def chain_states(modules, x: jax.Array, index: int | None = None) -> jax.Array:
 
 
 def level_parameters(continuum: Levels, params: Mapping):
-    """A model's continuum levels' parameters in its `params`: one level's tree, or a chain's trees in
-    order (`ContinuumLink`)."""
+    """A model's continuum levels' parameters in its `params`: one level's tree, or a chain's trees by
+    their scopes' names, `continuum_0` on (`ContinuumLink`)."""
     if isinstance(continuum, ContinuumLevel):
         return params["continuum"]
-    return tuple(params[f"continuum_{index}"]["continuum"] for index in range(len(continuum)))
+    return {f"continuum_{index}": params[f"continuum_{index}"]["continuum"]
+            for index in range(len(continuum))}
 
 
 def with_level_parameters(continuum: Levels, params: Mapping, levels) -> dict:
     """`params` holding `levels` as a model's continuum levels' parameters (`level_parameters`)."""
     if isinstance(continuum, ContinuumLevel):
         return {**params, "continuum": levels}
-    return {**params, **{f"continuum_{index}": {**params[f"continuum_{index}"], "continuum": level}
-                         for index, level in enumerate(levels)}}
+    return {**params, **{name: {**params[name], "continuum": level} for name, level in levels.items()}}
 
 
 @struct.dataclass
