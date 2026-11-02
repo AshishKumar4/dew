@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
+from dew import algebra
 from dew.algebra import SATURATION, derive
 from dew.nn import precision
 
@@ -109,9 +110,14 @@ def tile_of(values: dict, tile: int) -> dict:
     return {name: value[keys] if AXES[name][0] == "keys" else value for name, value in values.items()}
 
 
+def shaped(tile: dict) -> dict:
+    """A tile's operands' shapes and dtypes, by name: a walk's (`Derived.init`, `merge`, `finish`)."""
+    return {name: (value.shape, value.dtype) for name, value in tile.items()}
+
+
 def walked(forms: derive.Derived, tiles: list[dict]):
     """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state."""
-    state = forms.init({name: (value.shape, value.dtype) for name, value in tiles[0].items()})
+    state = forms.init(shaped(tiles[0]))
     for tile in tiles:
         state = forms.step(state, tile)
     return state
@@ -121,34 +127,36 @@ def walked_whole(forms: derive.Derived):
     """The declaration's derived step over every key tile in order, finished: a function of (q, k, v)."""
     def run(q, k, v):
         values = operands(q, k, v)
-        return forms.finish(walked(forms, [tile_of(values, tile) for tile in range(KEYS // TILE)]), values)
+        return forms.finish(walked(forms, [tile_of(values, tile) for tile in range(KEYS // TILE)]), values,
+                            shapes=shaped(tile_of(values, 0)))
 
     return run
 
 
-@pytest.mark.parametrize("name", list(DECLARED))
-def test_the_derived_walk_computes_the_declared_function(name):
-    """The declaration's derived step over every key tile in order, finished: on par with the whole-operand
-    function against the float64 truth (check 1)."""
-    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
-    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(DECLARED[name][0])), draw, f"{name} walked",
-                    seeds=16)
-
-
-@pytest.mark.parametrize("name", list(DECLARED))
-def test_two_walks_merged_compute_the_declared_function(name):
-    """The keys walked in two disjoint halves, each from the empty state, their states merged (a split walk's
-    combine, the work scheduler's fix-up), finished: on par with the whole-operand function."""
-    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
+def merged_whole(forms: derive.Derived):
+    """The keys walked in two disjoint halves, each from the empty state, their states merged and finished: a
+    function of (q, k, v)."""
     tiles = KEYS // TILE
 
-    def split(q, k, v):
+    def run(q, k, v):
         values = operands(q, k, v)
         first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
         second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
-        return forms.finish(forms.merge(first, second, values), values)
+        shapes = shaped(tile_of(values, 0))
+        return forms.finish(forms.merge(first, second, values, shapes=shapes), values, shapes=shapes)
 
-    assert_as_exact(jax.jit(split), jax.jit(whole(DECLARED[name][0])), draw, f"{name} merged", seeds=16)
+    return run
+
+
+@pytest.mark.parametrize("walk", ["walked", "merged"])
+@pytest.mark.parametrize("name", list(DECLARED))
+def test_the_derived_walk_computes_the_declared_function(name, walk):
+    """The declaration's derived step over every key tile in order, finished, or over the keys in two disjoint
+    halves, each from the empty state, their states merged (a split walk's combine, the work scheduler's
+    fix-up), finished: on par with the whole-operand function against the float64 truth (check 1)."""
+    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
+    run = walked_whole(forms) if walk == "walked" else merged_whole(forms)
+    assert_as_exact(jax.jit(run), jax.jit(whole(DECLARED[name][0])), draw, f"{name} {walk}", seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):
@@ -219,15 +227,7 @@ def test_a_merge_of_a_shift_that_reads_an_operand_computes_the_declared_function
     """A walk whose shift reads an operand of the queries beside the walked maximum, walked in two halves
     and merged: on par with the whole-operand function (check 1)."""
     forms = derive.derive(declared(floored), accurate=False, saturation=SATURATION)
-    tiles = KEYS // TILE
-
-    def split(q, k, v):
-        values = operands(q, k, v)
-        first = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2)])
-        second = walked(forms, [tile_of(values, tile) for tile in range(tiles // 2, tiles)])
-        return forms.finish(forms.merge(first, second, values), values)
-
-    assert_as_exact(jax.jit(split), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
+    assert_as_exact(jax.jit(merged_whole(forms)), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
 
 
 def with_a_count(q, k, v, rows, keys):
@@ -260,13 +260,74 @@ def weights(q, k, v, rows, keys):
     return jnp.exp(s - jnp.max(s, axis=-1)[:, None])
 
 
+def one_tile(declaration: derive.Reduction, tile: dict):
+    """`declaration`'s derived walk over the one `tile`, finished."""
+    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+    shapes = shaped(tile)
+    return forms.finish(forms.step(forms.init(shapes), tile), tile, shapes=shapes)
+
+
+ROW_ONES = np.ones((2,), np.float32)
+"""A declaration's constant, an array the derivation reads as a constant of its program."""
+
+
+def test_a_declarations_ranges_bound_the_operands_they_name_beside_its_constants():
+    """A declaration reading an array constant, its row scale's range declared (2^-10) and its walked
+    values unbounded, two of them near float32's largest: the scaled values' sum along the walk is finite
+    and the walk keeps the scale inside it, as nothing bounds the values (bible §6). Read past the constant's
+    place, the scale's range bounded the values, and the scale taken out of their sum overflowed it."""
+    tile = {"s": jnp.full((2,), 2.0 ** -10, jnp.float32),
+            "x": jnp.asarray([[3e38, 3e38, 0.0, 0.0]] * 2, jnp.float32)}
+
+    def scaled(s, x):
+        return jnp.sum((s * ROW_ONES)[:, None] * x, axis=1)
+
+    declaration = derive.Reduction(scaled, {"s": ("rows",), "x": ("rows", "keys")}, walked="keys",
+                                   exponent="e", ranges={"s": 2.0 ** -10})
+    assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
+def test_a_complex_functions_bound_is_none_of_a_real_ones():
+    """`sin` of a complex value is unbounded (`sin(pi/2 + 88j)` is 8.3e37, finite in complex64): a walk's sum
+    of eight such sines, each scaled by its row's small float32 scale, is finite, and the walk keeps the scale
+    inside its sum (bible §6), where a real sine's bound of 1 would take it out, the eight sines' sum past
+    float32's largest."""
+    tile = {"s": jnp.full((2,), 2.0 ** -10, jnp.float32),
+            "z": jnp.full((2, 8), np.pi / 2 + 88j, jnp.complex64)}
+
+    def scaled(s, z):
+        return jnp.sum(s.astype(jnp.complex64)[:, None] * jnp.sin(z), axis=1)
+
+    declaration = derive.Reduction(scaled, {"s": ("rows",), "z": ("rows", "keys")}, walked="keys",
+                                   exponent="e")
+    assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
+def test_a_walks_finish_is_its_own_whatever_walk_came_before():
+    """A sum returned in its operand's dtype, walked over bfloat16 tiles and then over float32 ones, whose
+    states are alike (a float32 sum each, as JAX sums a narrow value): each walk's finish its own forms', the
+    bfloat16 walk's output bfloat16 as the declaration's is."""
+    declaration = derive.Reduction(lambda x: jnp.sum(x, axis=0).astype(x.dtype), {"x": ("keys",)},
+                                   walked="keys", exponent="e")
+    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+    narrow, wide = ({"x": jnp.linspace(0.0, 1.0, 8, dtype=dtype)} for dtype in (jnp.bfloat16, jnp.float32))
+    states = [forms.step(forms.init(shaped(tile)), tile) for tile in (narrow, wide)]
+    for tile, state in zip((narrow, wide), states, strict=True):
+        finished = forms.finish(state, tile, shapes=shaped(tile))
+        assert finished.dtype == tile["x"].dtype
+        np.testing.assert_array_equal(np.asarray(finished),
+                                      np.asarray(jnp.sum(tile["x"]).astype(tile["x"].dtype)))
+
+
+@pytest.mark.parametrize("target", [None, "v6e"], ids=["here", "a TPU"])
 @pytest.mark.parametrize("function", [squared_shift, weights])
-def test_a_declaration_no_monoid_holds_is_refused(function):
+def test_a_declaration_no_monoid_holds_is_refused(function, target):
     """A walked sum that reads the walked maximum other than through its exponent, and an output that varies
-    along the walked axis, are refused before any form is built."""
+    along the walked axis, are refused before any form is built, priced here or for a TPU, whose vector
+    units' rate no fact states: a reading no rule rewrote costs past every form whatever the rates."""
     forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
     first = tile_of(operands(*draw(0)), 0)
-    with pytest.raises(derive.Refused):
+    with algebra.passes(target=target), pytest.raises(derive.Refused):
         forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
 
 
@@ -308,12 +369,12 @@ def test_a_backward_walked_over_queries_sums_dk_dv_and_maps_dq():
     def derived(q, k, v):
         values = dict(zip(("q", "k", "v", "do", "lse", "delta"), gradients(q, k, v), strict=True))
         first = tile(values, 0)
-        state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
+        state = forms.init(shaped(first))
         dqs = []
         for index in range(QUERIES // QUERY_TILE):
             state = forms.step(state, tile(values, index))
             dqs.append(forms.mapped(tile(values, index))[0])
-        _, dk, dv = forms.finish(state, values)
+        _, dk, dv = forms.finish(state, values, shapes=shaped(first))
         return jnp.concatenate(dqs), dk, dv
 
     def small(seed):

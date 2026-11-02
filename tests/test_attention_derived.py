@@ -4,20 +4,26 @@
 walk merged, and are held on par against the float64 truth (check 1). The derived forms replace the oracle
 only on par with it and no slower in the kernel."""
 
+import contextlib
 import dataclasses
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from test_algebra_derive import walked
+from test_algebra_derive import shaped, walked
 
 from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
 from dew.nn.precision import float32_einsum
 
+SOURCE = Path(__file__).resolve().parents[1] / "src"
 ROWS, KEYS, WIDTH, TILE = 16, 96, 32, 32
 QUERY_PLACES = jnp.arange(ROWS) * (KEYS // ROWS)
 KEY_PLACES = jnp.arange(KEYS)
@@ -53,12 +59,13 @@ def derived_walk(base2: bool, mask: str, split: bool):
 
     def run(logits, value):
         values = {"logits": jnp.where(MASKS[mask](), logits, -jnp.inf), "values": value}
+        shapes = shaped(tiles(values, 0))
         if split:
             state = forms.merge(walk(values, range(count // 2)), walk(values, range(count // 2, count)),
-                                values)
+                                values, shapes=shapes)
         else:
             state = walk(values, range(count))
-        return forms.finish(state, values)
+        return forms.finish(state, values, shapes=shapes)
 
     return run
 
@@ -189,7 +196,7 @@ def derived_backward(form: str, along: str):
                   "anchor": jnp.zeros_like(delta), "delta": delta}
         parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
         mapped = [forms.mapped(part) for part in parts]
-        dq, dk, dv, *_ = forms.finish(walked(forms, parts), values)
+        dq, dk, dv, *_ = forms.finish(walked(forms, parts), values, shapes=shaped(parts[0]))
         if along == "rows":
             return jnp.concatenate([parts[0] for parts in mapped]), dk, dv
         return (dq, jnp.concatenate([parts[1] for parts in mapped]),
@@ -237,32 +244,55 @@ def test_the_backward_serving_each_cell_is_on_par(form, walked):
                     f"attention backward {form} {walked}", seeds=16, truth_fn=xla_backward(form))
 
 
+@contextlib.contextmanager
+def fast(derived: bool):
+    """Within the block, the run's fast forms (the base-2 fold the declaration states; the accurate forms it
+    states none of), the template's walks the hand-written forms or the derived ones
+    (`dew.algebra.forms.derived`)."""
+    with (generation.run_precision(dataclasses.replace(generation.numerics(), forms="fast")),
+          algebra_forms.derived(derived)):
+        yield
+
+
+CALLS = {"plain": {}, "residuals": {"residuals": True}, "dropped": {"drop": 0.25}}
+"""The forward calls the derived walk serves: a call's output, a training call's with its residuals (the
+forward's step, merge and finish whatever walk the training step takes), and a dropping call's."""
+
+
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+@pytest.mark.parametrize("call", list(CALLS))
 @pytest.mark.parametrize("form", ["full", "causal"])
-def test_the_portable_mainloop_computes_attention_by_either_forms(form, derived):
-    """The plain-JAX mainloop's forward (`attention_portable.attend`) under the run's fast forms with its
-    walk's step, merge and finish the hand-written forms or the derived ones behind the switch
-    (`dew.algebra.forms.derived`), the product of its weights with the values its own (`Keys.dot`): on par
-    with the reference (check 1) either way."""
+def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, derived):
+    """The plain-JAX mainloop's forward (`attention_portable.attend`) over fp16 operands (a plain walk, of no
+    compensation or guard, which the derived forms serve) under the run's fast forms, its walk's step, merge
+    and finish the hand-written forms or the derived ones behind the switch, the product of its weights with
+    the values its own (`Keys.dot`): on par with the reference (check 1) either way, a plain call's, a
+    training call's (with its residuals) and a dropping call's."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
+    rate = CALLS[call].get("drop")
+    residuals = CALLS[call].get("residuals", False)
 
-    def ours(q, k, v):
-        # The run's fast forms, the base-2 fold the declaration states (the accurate forms it states none of).
-        fast = dataclasses.replace(generation.numerics(), forms="fast")
-        with generation.run_precision(fast), algebra_forms.derived(derived):
+    def hooks(words):
+        return None if rate is None else template.Hooks(drop=template.Dropout(
+            words, jnp.arange(1, dtype=jnp.int32), jnp.arange(1, dtype=jnp.int32), rate))
+
+    def ours(q, k, v, words):
+        with fast(derived):
             out = attention_portable.attend(q[None, :, None], k[None, :, None], v[None, :, None], spans,
-                                            **TILES)
-        return out[0, :, 0]
+                                            hooks(words), residuals=residuals, **TILES)
+        return (out[0] if residuals else out)[0, :, 0]
 
-    def reference(q, k, v):
-        return template.reference(q[None, :, None], k[None, :, None], v[None, :, None], spans, None)[0, :, 0]
+    def reference(q, k, v, words):
+        return template.reference(q[None, :, None], k[None, :, None], v[None, :, None], spans,
+                                  hooks(words))[0, :, 0]
 
     def operands(seed):
         rng = np.random.default_rng(seed)
-        return tuple(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float32) for _ in range(3))
+        return (*(jnp.asarray(rng.standard_normal((LENGTH, DEPTH)), jnp.float16) for _ in range(3)),
+                jax.random.bits(jax.random.key(seed), (2,), jnp.uint32))
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), operands, f"portable forward {form} derived {derived}",
-                    seeds=16)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
+                    f"portable forward {form} {call} derived {derived}", seeds=16)
 
 
 @pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
@@ -275,8 +305,7 @@ def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, de
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 
     def ours(q, k, v, dout):
-        fast = dataclasses.replace(generation.numerics(), forms="fast")
-        with generation.run_precision(fast), algebra_forms.derived(derived):
+        with fast(derived):
             grads = attention_portable.backward(q[None, :, None], k[None, :, None], v[None, :, None], spans,
                                                 None, dout[None, :, None], **TILES)
         return grads.query[0, :, 0], grads.key[0, :, 0], grads.value[0, :, 0]
@@ -292,3 +321,104 @@ def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, de
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), operands,
                     f"portable backward {form} derived {derived}", seeds=16)
+
+
+def one_key(dtype, query, key, value, dout, *, scale: float = SCALE):
+    """A call's operands of one query and `len(key)` keys, each a row of width 8 (`[1, n, 1, 8]`)."""
+    def laid(rows):
+        rows = np.asarray(rows, np.float64).reshape(len(rows), -1)
+        return jnp.asarray(np.pad(rows, ((0, 0), (0, 8 - rows.shape[1])))[None, :, None, :], dtype)
+
+    return laid(query), laid(key), laid(value), laid(dout), {"block_q": 8, "block_k": 8, "pad": 8,
+                                                             "scale": scale}
+
+
+def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
+    """A bf16 query of one key, its value `(1, 2^-8)` and its output's cotangent `(1, 1)`: its score
+    cotangent `P (dP - D)` is zero, `dP` the reference's `1 + 2^-8` and `D` the output's row sum, so its
+    query's gradient is exactly zero, as the reference's is, under the derived backward too: its `dP`
+    accumulates in fp32 (one rounded to bf16 is 1, and its cotangent -2^-8)."""
+    query, key, value, dout, tiles = one_key(jnp.bfloat16, [[1.0]], [[1.0]], [[1.0, 2.0 ** -8]], [[1.0, 1.0]])
+    spans = template.spans(1, 1, 1)
+    with fast(derived=True):
+        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    np.testing.assert_array_equal(np.asarray(grads.query, np.float32), 0.0)
+
+
+def test_a_derived_backward_scales_its_cotangents_before_their_products():
+    """An fp32 query of zero over two keys of first components 2^127 and -2^127, values 4 and -4, the
+    output's cotangent 1 and the scale 1/4: the score cotangents are 2 and -2, whose products with the keys
+    at the scale give a query gradient of 2^127, finite as the reference's, where their unscaled sum 2^129
+    overflows (bible §6)."""
+    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0]], [[2.0 ** 127], [-(2.0 ** 127)]],
+                                             [[4.0], [-4.0]], [[1.0]], scale=0.25)
+    spans = template.spans(1, 2, 1)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None, scale=0.25), query, key, value)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
+    with fast(derived=True):
+        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
+
+
+def test_a_derived_forward_keeps_an_fp16_weight_its_dropout_multiplies_finite():
+    """The fp16 witness of the stability suite (tests/test_attention_dropout.py) behind the switch: a rate of
+    1 - 2^-16 (a kept weight's multiplier 2^16) with one of two equal-logit keys kept. The kept weight times
+    its multiplier is past fp16's largest; its normalized weight times it is not, as the reference's is, and
+    the output is finite (the dropping step's scaled parts, which the declaration states none of)."""
+    rate = 1.0 - 2.0 ** -16
+    seeds = jnp.arange(1 << 16, dtype=jnp.uint32)[:, None, None]
+    kept = np.asarray(template.Draw((seeds, jnp.zeros_like(seeds)), jnp.int32(0), jnp.int32(0), rate).keep(
+        jnp.zeros((1, 1), jnp.int32), jnp.arange(2, dtype=jnp.int32)[None, :]))
+    words = jnp.asarray([next(index for index in range(kept.shape[0]) if int(kept[index, 0].sum()) == 1), 0],
+                        jnp.uint32)
+    hooks = template.Hooks(drop=template.Dropout(words, jnp.arange(1, dtype=jnp.int32),
+                                                 jnp.arange(1, dtype=jnp.int32), rate))
+    query, key, value, _, tiles = one_key(jnp.float16, [[0.0]], [[0.0], [0.0]], [[2.0 ** -10] * 8] * 2,
+                                          [[0.0]])
+    spans = template.spans(1, 2, 1)
+    assert np.isfinite(np.asarray(template.reference(query, key, value, spans, hooks))).all()
+    with fast(derived=True):
+        out = attention_portable.attend(query, key, value, spans, hooks, **tiles)
+    assert np.isfinite(np.asarray(out)).all()
+
+
+def test_a_derived_backward_at_a_scale_of_zero_gives_zero_query_and_key_gradients():
+    """A call at a scale of zero (`attention.prescale`'s own case) under the derived backward: its weights
+    uniform, its query's and key's gradients zero, as the hand-written backward's are, its value's finite."""
+    rng = np.random.default_rng(0)
+    query, key, value, dout = (jnp.asarray(rng.standard_normal((1, LENGTH, 1, DEPTH)), jnp.float32)
+                               for _ in range(4))
+    spans = template.spans(LENGTH, LENGTH, 1)
+    tiles = {**TILES, "scale": 0.0}
+    with fast(derived=True):
+        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    np.testing.assert_array_equal(np.asarray(grads.query), 0.0)
+    np.testing.assert_array_equal(np.asarray(grads.key), 0.0)
+    assert np.isfinite(np.asarray(grads.value)).all()
+
+
+FRESH = """
+import dataclasses
+import jax, jax.numpy as jnp
+from dew.algebra import forms
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention as template, attention_portable
+
+operands = [jnp.full((1, 16, 1, 8), 0.1 * (index + 1), jnp.float16) for index in range(3)]
+fast = dataclasses.replace(generation.numerics(), forms="fast")
+with generation.run_precision(fast), forms.derived(True):
+    out = attention_portable.attend(*operands, template.spans(16, 16, 1), block_q=8, block_k=8, pad=8,
+                                    residuals=True)
+print(bool(jnp.all(jnp.isfinite(out[0]))))
+"""
+"""A fresh process's first derived walk: a training call's forward, its step the training walk's own."""
+
+
+def test_a_fresh_processs_training_forward_finishes_by_the_derived_forms():
+    """A training call's forward (`residuals=True`, its walk the hand-written training step's) as a fresh
+    process's first call under the derived forms: its finish takes the derived forms of the state it holds,
+    whatever walk came before it in the process (none here), and its output is finite."""
+    done = subprocess.run([sys.executable, "-c", FRESH], capture_output=True, text=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+    assert done.returncode == 0, done.stderr[-3000:]
+    assert done.stdout.strip().splitlines()[-1] == "True"

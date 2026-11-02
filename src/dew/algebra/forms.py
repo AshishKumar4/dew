@@ -7,7 +7,7 @@ the one switch the templates take their derived forms behind (`derived`)."""
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -39,8 +39,9 @@ class Derived(NamedTuple):
     product (`evaluator`) and its own accumulator for a sum stepped as `state * factor + weights @ values`
     (`accumulate(state, factor, weights, values)`, the factor a row's), and with `outputs` (places) returns
     those of the tile's outputs along the walked axis beside the state, by the same evaluation; its `merge(a,
-    b, operands=None)` and `finish(state, operands=None)` read the state (and the unwalked operands given),
-    their forms those its walk took."""
+    b, operands=None, shapes=)` and `finish(state, operands=None, shapes=)` read the state (and the unwalked
+    operands given) by the forms of the walk whose tiles were of `shapes` (`init`'s), named, as a state's
+    values alone name no walk (a bfloat16 walk's float32 sums are a float32 walk's too)."""
 
     init: Callable
     step: Callable
@@ -193,7 +194,7 @@ def derived_on() -> bool:
 
 
 def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
-              known: Mapping[str, jax.Array]) -> jax.Array:
+              known: Mapping[Hashable, jax.Array]) -> jax.Array:
     """A form's value (`evaluator`'s)."""
     return evaluator(region, leaves, known)(form)
 
@@ -202,14 +203,15 @@ PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
 
 
-def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[str, jax.Array], *,
-              product: Callable[[jax.Array, jax.Array], jax.Array] | None = None
-              ) -> Callable[[terms.Term], jax.Array]:
+def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
+              product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+              chosen: Mapping[Hashable, terms.Term] | None = None) -> Callable[[terms.Term], jax.Array]:
     """The values of a region's forms, each term once however many forms read it: its leaves the given
     values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
-    outside the language over them, each term `known` names (by its text) its value there, each matrix
-    product `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product
-    Dew's (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
+    outside the language over them, their inputs in the forms `chosen` names for them (by `terms.key`)
+    where given, each term `known` names (by `terms.key`) its value there, each matrix product
+    `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product Dew's
+    (`float32_dot_general`), every other term the engine's (`terms.value_of`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
     given = dict(enumerate(leaves))
@@ -217,13 +219,14 @@ def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[str, jax.Ar
     def leaf(index: int):
         if given.get(index) is None:
             opaque = outside[index]
-            inputs = [literal if term is None else value(term)
+            picked = chosen or {}
+            inputs = [literal if term is None else value(picked.get(terms.key(term), term))
                       for term, literal in zip(opaque.inputs, opaque.literals, strict=True)]
             given.update(zip(opaque.outputs, bound(opaque.equation, inputs), strict=True))
         return given[index]
 
     def value(term: terms.Term) -> jax.Array:
-        key = str(term)
+        key = terms.key(term)
         if key in values:
             return values[key]
         if (args := get_callable_args(term, terms.Term.leaf)) is not None:

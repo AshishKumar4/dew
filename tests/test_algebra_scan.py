@@ -277,7 +277,8 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
 def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_state_is_bounded(
         update_fn, operands, draw_fn):
     """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit keys,
-    gates under 1, decays at most 1, values under the draws' 8): where its entering state is ranged too
+    so tokens' corrections overlap by at most their gates, under 1; decays at most 1; values under the draws'
+    8): where its entering state is ranged too
     (`Scan.ranges`' "state"), its carry (`step` over a chunk's prepared values) reads the state through one
     product, a matrix the chunk prepared times the state, the solve, the decays and every other product among
     the prepared values. With no range on the state, the solve's distribution over `W h` makes an
@@ -285,7 +286,7 @@ def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_sta
     product reads the state."""
     names = ("q", "k", "v", "g", "beta")
     chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
-    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0), "v": 8.0}
+    ranges = {"k": 1.0, "beta": 1.0, "overlap": 1.0, "g": (-np.inf, 0.0), "v": 8.0}
 
     def carried_products(declared: dict) -> list[str]:
         forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
@@ -300,6 +301,58 @@ def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_sta
     assert bounded.count("dot_general") == 1, bounded
     assert not any(name.startswith("custom_vjp") for name in bounded), bounded
     assert carried_products(ranges).count("dot_general") > 1
+
+
+def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
+    """The gated delta rule's two-token chunk, its keys sixteen ones (each element under its declared 1, two
+    tokens' overlap 16), unit write gates and decays, values of 2^124 and an entering state of 2^120, each
+    ranged (`Scan.ranges`): the keys read the state as the values exactly, so every write is zero and the
+    token scan finite. The derived chunk is finite too (bible §6): its solve's inverse is bounded over the
+    keys' contraction, 17 a pair here, so distributing it over the values, past float32's largest, is not
+    taken."""
+    tokens = 2
+    chunk = {"q": jnp.full((tokens, KEY), 2.0 ** -10), "k": jnp.ones((tokens, KEY)),
+             "v": jnp.full((tokens, VALUE), 2.0 ** 124), "g": jnp.zeros((tokens,)),
+             "beta": jnp.ones((tokens,))}
+    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0), "v": 2.0 ** 124, "state": 2.0 ** 120}
+    declared = scan.Scan(gated_delta, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32),
+                         ranges=ranges)
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+    h = jnp.full((KEY, VALUE), 2.0 ** 120)
+    expected = []
+    for index in range(tokens):
+        token = [chunk[name][index] for name in GATED]
+        expected.append(gated_readout(h := gated_delta(h, *token), *token))
+    assert np.all(np.isfinite(np.asarray(expected))) and np.all(np.isfinite(np.asarray(h)))
+    entering = (jnp.zeros((KEY,), jnp.float32), jnp.full((KEY, VALUE), 2.0 ** 120))
+    prepared = forms.prepare(chunk)
+    outputs, (_, leaving) = forms.mapped(prepared, entering), forms.step(entering, prepared)
+    assert np.all(np.isfinite(np.asarray(outputs))) and np.all(np.isfinite(np.asarray(leaving)))
+
+
+def test_a_chunks_decay_gradient_reads_no_pair_of_its_future():
+    """The gated delta rule's two-token chunk whose first query and second key are parallel at 2^128 (a pair
+    no decay joins: the second token is the first's future) and every pair a decay joins orthogonal or small:
+    the token scan's outputs and decay gradients are finite, and the derived chunk's are too, its future
+    pair's product selected away before its decay's derivative reads it."""
+    tokens = 2
+    q = jnp.zeros((tokens, KEY)).at[0, 0].set(2.0 ** 127).at[1, 1].set(1.0)
+    k = jnp.zeros((tokens, KEY)).at[0, 1].set(1.0).at[1, 0].set(2.0)
+    chunk = {"q": q, "k": k, "v": jnp.ones((tokens, VALUE)), "g": jnp.zeros((tokens,)),
+             "beta": jnp.ones((tokens,))}
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+
+    def derived(g):
+        prepared = forms.prepare({**chunk, "g": g})
+        return jnp.sum(forms.mapped(prepared, forms.init({})))
+
+    def tokenwise(g):
+        return jnp.sum(gated_tokenwise(gated_delta)(chunk["q"], chunk["k"], chunk["v"], g, chunk["beta"])[0])
+
+    for fn in (tokenwise, derived):
+        value, gradient = jax.value_and_grad(fn)(chunk["g"])
+        assert np.isfinite(value) and np.all(np.isfinite(gradient)), fn.__name__
 
 
 def _primitives(jaxpr):

@@ -15,7 +15,7 @@ import logging
 import re
 import struct
 import threading
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Mapping
 
 import jax
 import tokamax
@@ -353,13 +353,10 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
     """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled with
-    its asking Triton launches' configs refused, as a spill refuses one (`kept`). XLA's refusal names no
-    kernel, so the launches the program's Triton kernels name (`kernel_of`, their launches' digests) are
-    tried in the program's order, each refused beside those kept so far: one whose refusal compiles the
-    program ends the search; one whose refusal leaves XLA asking other bytes asked those (another launch
-    asks the rest), so it is kept and the rest tried again; one whose refusal changes nothing asks nothing
-    past the block. Each kept launch's miss is recorded and logged at the bytes its refusal removed; none
-    compiling, the refusal stands, each a miss not stepped."""
+    its asking Triton launches' configs refused (`stepped_down`'s search over the launches the program's
+    Triton kernels name, `kernel_of`, their launches' digests), as a spill refuses one (`kept`). Each kept
+    launch's miss is recorded and logged at the bytes its refusal removed; none compiling, the refusal
+    stands, each a miss not stepped."""
     from dew.training._lowering import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
@@ -369,38 +366,86 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         launch = None if call.kind != "triton" or digest is None else traced(digest)
         if launch is not None:
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
-    kept: list[tuple[tuple[str, Hashable], str, Launch, int]] = []
-    pending, asking = dict(tried), asked
+
+    def compiling(entries: list) -> tuple[_Registry, tuple[jax.stages.Compiled, list]]:
+        with _proposing([(refusal, kernel) for refusal, kernel, _ in entries]) as proposal:
+            return proposal, _compiled_reported(relower(), options)
+
+    found = stepped_down(tried, asked, compiling)
+    if found is None:
+        for kernel, launch in tried.values():
+            _missed_block(kernel, launch, asked, stepped=False)
+        raise error
+    (proposal, (replacement, spilling)), kept = found
+    _commit(proposal)
+    for refusal, (kernel, launch), removed in kept:
+        _record(refusal, None, frozenset({kernel}))
+        _missed_block(kernel, launch, removed, stepped=True)
+    _recorded(_misses_of(spilling), stepped=False)
+    return replacement
+
+
+def stepped_down[T](tried: Mapping[tuple[str, Hashable], tuple[str, Launch]], asked: int,
+                    compiling: Callable[[list], T]) -> tuple[T, list] | None:
+    """The search `_unblocked` makes for the launches of `tried` (each refusal, its launch's identity and
+    config, by its kernel and launch) whose refusals compile a program XLA refused for asking `asked` shared
+    bytes past a block: `compiling(entries)` compiles with each `(refusal, kernel, launch)` of `entries`
+    refused, raising XLA's refusal or `Exhausted`. Each launch is tried in turn, refused beside those kept so
+    far: one whose refusal compiles the program ends the search; one whose refusal leaves XLA asking other
+    bytes asked those (another launch asks the rest), so it is kept and the rest tried again. One whose
+    refusal changes nothing asked nothing past the block, or as many bytes as another launch still asks (two
+    call shapes' launches deriving one tile): where no launch's refusal alone changes what XLA asks, each
+    is held in turn beside the rest, and once the program compiles, each held one is dropped where it
+    compiles without it. Returns the compile and each refusal kept with its launch and the bytes asked
+    before it, or None where none compiles."""
+    # Each refusal kept: its launch, the bytes asked before it, and whether its refusal changed them.
+    kept: list[tuple[tuple[str, Hashable], tuple[str, Launch], int, bool]] = []
+    pending, asking, holding = dict(tried), asked, False
+
+    def compiled(entries):
+        return compiling([(refusal, kernel, launch) for refusal, (kernel, launch), *_ in entries])
+
+    def refused(error: Exception) -> int:
+        left = SHARED_REFUSED.search(str(error))
+        if left is None:
+            raise error
+        return int(left.group(1))
+
     while pending:
         progressed = False
-        for refusal, (kernel, launch) in list(pending.items()):
+        for refusal, held in list(pending.items()):
+            entry = (refusal, held, asking, True)
             try:
-                proposed = [*((held, name) for held, name, _, _ in kept), (refusal, kernel)]
-                with _proposing(proposed) as proposal:
-                    replacement, spilling = _compiled_reported(relower(), options)
+                program = compiled([*kept, entry])
             except Exhausted:
                 del pending[refusal]
                 continue
             except jax.errors.JaxRuntimeError as again:
-                left = SHARED_REFUSED.search(str(again))
-                if left is None:
-                    raise
-                if int(left.group(1)) != asking:
-                    kept.append((refusal, kernel, launch, asking))
+                left = refused(again)
+                if left != asking or holding:
+                    kept.append((refusal, held, asking, left != asking))
                     del pending[refusal]
-                    asking, progressed = int(left.group(1)), True
+                    asking, progressed = left, True
                 continue
-            _commit(proposal)
-            for held, name, held_launch, removed in [*kept, (refusal, kernel, launch, asking)]:
-                _record(held, None, frozenset({name}))
-                _missed_block(name, held_launch, removed, stepped=True)
-            _recorded(_misses_of(spilling), stepped=False)
-            return replacement
+            needed = [*kept, entry]
+            for other in [*kept]:
+                if other[3]:
+                    continue
+                # A held refusal the program compiles without asked nothing past the block.
+                try:
+                    program = compiled([each for each in needed if each is not other])
+                except Exhausted:
+                    continue
+                except jax.errors.JaxRuntimeError as again:
+                    refused(again)
+                    continue
+                needed.remove(other)
+            return program, [(refusal, held, removed) for refusal, held, removed, _ in needed]
         if not progressed:
-            break
-    for kernel, launch in tried.values():
-        _missed_block(kernel, launch, asked, stepped=False)
-    raise error
+            if holding:
+                break
+            holding = True
+    return None
 
 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:

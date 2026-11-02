@@ -287,8 +287,8 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
-               grad_scale: float, how: algebra.Recompute, block_q: int, block_k: int, split: bool,
-               accurate: bool, drop=None):
+               prescale: float, grad_scale: float, how: algebra.Recompute, block_q: int, block_k: int,
+               split: bool, accurate: bool, drop=None):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
     each query's denominator and `D - c` from the forward's split `sums` (`algebra.split_delta`), or without
     `split` from a first pass at the forward's maximum (`algebra.off_anchor_delta`) but for the rows whose
@@ -325,14 +325,19 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             hi, tile_of = ranges_walk(bounds.ranges[row, i])
             lo = 0
 
-        def tile(step):
+        def formed(step, *, slopes: bool = False):
+            # A key tile's coordinates, mask, keys and values, and its logits as the forward formed them,
+            # with their hook's slopes where asked.
             j = tile_of(step)
             columns = j * block_k + jnp.arange(block_k)
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
-            return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
+            seen = _seen(spans, row, rows, columns)
+            logits, slope = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
+                                                columns[None, :], params, scale=factor, slopes=slopes)
+            return columns, seen, k_tile, v_tile, logits, slope
 
         before, state_total = algebra.off_anchor_start(peak0, total0, maxima, value.shape[-1], shifts)
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
@@ -340,9 +345,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         if draw is not None:
             # Dropout's D: each dropped product centred about its query's first visible tile's least one.
             def terms(j):
-                columns, seen, params, k_tile, v_tile = tile(j)
-                logits, _ = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
-                                                columns[None, :], params, scale=factor)
+                columns, seen, _, v_tile, logits, _ = formed(j)
                 products = algebra.dropped_products(interpreted_dot(do, v_tile.T),
                                                     draw(q_pos, columns[None, :]))
                 return algebra.below(logits, m, how), products, seen, columns[None, :]
@@ -356,9 +359,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             if not split:
                 # D without the forward's split sums: the dQ launch's own pass over the keys.
                 def row_terms(j, state):
-                    columns, seen, params, k_tile, v_tile = tile(j)
-                    logits, _ = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
-                                                    columns[None, :], params, scale=factor)
+                    columns, _, _, v_tile, logits, _ = formed(j)
                     at_anchor = columns[None, :] == chosen[:, None]
                     exponentials, rest, own, small = algebra.off_anchor_weights(logits, maxima, at_anchor,
                                                                                 v_tile.dtype, shifts, how)
@@ -378,9 +379,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             # the pass's own at the end (`algebra.dq_finish`); the weights' sums unnormalized, as the Triton
             # launch's.
             def step(j, carry):
-                columns, seen, params, k_tile, v_tile = tile(j)
-                logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
-                                                     columns[None, :], params, scale=factor, slopes=True)
+                columns, seen, k_tile, v_tile, logits, slopes = formed(j, slopes=True)
                 weights = algebra.normalized(logits, m, jnp.ones_like(m), how)[0]
                 zt = None if draw is None else draw(q_pos, columns[None, :])
                 cotangents = algebra.grad_scores(weights, interpreted_dot(do, v_tile.T), anchor, delta, seen,
@@ -394,9 +393,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
 
 
         if algebra.backward_derived(how, accurate=accurate):
-            found = _derived_dq(tile, q, do, q_pos, m, anchor, delta, prior, lo, hi, draw,
-                                score_mod=score_mod, score_kinds=score_kinds, summed=summed, scale=scale,
-                                grad_scale=grad_scale, factor=factor)
+            found = _derived_dq(formed, q, do, q_pos, m, anchor, delta, prior, lo, hi, draw,
+                                hooked=score_mod is not None, score_kinds=score_kinds, summed=summed,
+                                prescale=prescale, grad_scale=grad_scale)
         else:
             found = sweep(anchor, delta, chosen, prior)
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
@@ -431,23 +430,20 @@ def _dq_outputs(dq, rows_out, chosen, written, kinds: tuple[Kind, ...], blocks: 
     return jnp.swapaxes(queried(dq), 1, 2), tuple(queried(x) for x in rows_out), queried(chosen), grads
 
 
-def _derived_dq(tile, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, score_mod,
-                score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], scale: float, grad_scale: float,
-                factor: float) -> algebra.DqSums:
+def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, hooked: bool,
+                score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], prescale: float, grad_scale: float
+                ) -> algebra.DqSums:
     """A dQ pass's sums by the derived forms behind the switch (`algebra.derived_backward`): dQ the walk's
-    over the keys `lo` to `hi` (`tile(j)` each key tile's coordinates, mask, hook parameters, keys and
-    values), at the pass's D (`anchor`, `delta`) and denominator `total`, its logits and dQ at the call's
-    whole scale, its query the call's own (the launch's `q` is taken by the power of two,
+    over the keys `lo` to `hi` (`formed(j)` each key tile's coordinates, mask, keys, values, logits and hook
+    slopes, the dQ launch's), at the pass's D (`anchor`, `delta`) and denominator `total`, dQ at the call's
+    whole scale, its query the call's own (the launch's `q` is taken by the power of two `prescale`,
     `attention.prescale`: exactly undone); the row sums D's refinement and the hook's parameters read
     (`algebra.dq_rows`) from each tile's weights and cotangents the walk gives."""
-    forms = algebra.derived_backward(grad_scale, "keys", score_mod is not None, draw is not None)
-    power = grad_scale / scale
-    call_q = q if power == 1.0 else q / jnp.asarray(power, q.dtype)
+    forms = algebra.derived_backward(grad_scale, "keys", hooked, draw is not None)
+    call_q = by_power(q, 1.0 / prescale)
 
     def tiles_at(j):
-        columns, seen, params, k_tile, v_tile = tile(j)
-        logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
-                                             columns[None, :], params, scale=factor, slopes=True)
+        columns, seen, k_tile, v_tile, logits, slopes = formed(j, slopes=True)
         tiles = {"logits": logits, "q": call_q, "k": k_tile, "values": v_tile, "dout": do, "peak": m,
                  "total": total, "anchor": anchor, "delta": delta}
         if slopes is not None:
@@ -463,11 +459,10 @@ def _derived_dq(tile, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, sc
         sums, _ = algebra.dq_rows(sums, weights, cotangents, slopes, seen, kinds=score_kinds, summed=summed)
         return state, sums
 
-    first = tiles_at(lo)[0]
-    state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
-    state, sums = jax.lax.fori_loop(lo, hi, step,
-                                    (state, algebra.no_dq_sums(q.shape[0], q.shape[1], len(score_kinds))))
-    return sums._replace(dq=forms.finish(state)[0])
+    shapes = {name: (value.shape, value.dtype) for name, value in tiles_at(lo)[0].items()}
+    empty = algebra.no_dq_sums(q.shape[0], q.shape[1], len(score_kinds))
+    state, sums = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), empty))
+    return sums._replace(dq=forms.finish(state, shapes=shapes)[0])
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
@@ -489,6 +484,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     start, end, query_ids, key_ids = spans
     ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
+    derived = algebra.backward_derived(how, accurate=accurate)
+
     def program(index):
         j, rest = index // (batch * heads), index % (batch * heads)
         row, head = rest // heads, rest % heads
@@ -497,98 +494,84 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         kv_head = head // group
         k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
         v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
+        # Behind the switch, dK and dV the derived walk's over the query tiles (`algebra.derived_backward`),
+        # at the dQ launch's D and denominator; else this module's contributions. Either way each tile's
+        # cotangents give the key and tile parameters' gradients (`hooked`).
+        forms = (algebra.derived_backward(grad_scale, "rows", score_mod is not None, draw is not None)
+                 if derived else None)
 
-        def step(i, carry):
-            dk, dv, tiled, *grads = carry
+        def tile_at(i):
+            # A query tile's rows, queries, output cotangents, mask, logits as the forward formed them and
+            # their hook's slopes, and dropout multipliers.
             rows = i * block_q + jnp.arange(block_q)
             q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
             do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
             seen = _seen(spans, row, rows, columns)
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
-            m, denominator = peak[row, head, rows], total[row, head, rows]
             logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(by_power(q, prescale), k_tile.T),
                                                  seen, rows[:, None], columns[None, :], params, scale=factor,
                                                  slopes=True)
-            inverse_total = algebra.inverse(denominator)
-            exponentials, weights = algebra.normalized(logits, m, inverse_total, how)
             zt = None if draw is None else draw(rows[:, None], columns[None, :])
-            cotangents = algebra.grad_scores(exponentials, interpreted_dot(do, v_tile.T),
-                                             anchor[row, head, rows], delta[row, head, rows], seen,
-                                             columns[None, :] == key_index[row, head, rows][:, None],
-                                             inverse_total, multiplier=zt)
-            pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dv = dv + transposed_dot(*algebra.value_operands(exponentials, weights, do, denominator,
-                                                             multiplier=zt))
-            # At the call's whole scale against the call's own queries, the logits' alone taken by the power.
-            dk = dk + algebra.cotangent_product(pulled * grad_scale, q, transposed_dot, accurate=accurate)
-            tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
-                          for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
-                                                                                       strict=True)
-                                                            if kind == Kind.TILE), strict=True))
-            return dk, dv, tiled, *(grad + piece if kind == Kind.KEY else grad
-                                    for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True))
+            return rows, q, do, seen, logits, slopes, zt
 
-        if algebra.backward_derived(how, accurate=accurate):
-            return derived_keys(j, row, head, draw, columns, k_tile, v_tile)
-        sums = [jnp.zeros((block_k,), jnp.float32) if kind == Kind.KEY else jnp.zeros((), jnp.float32)
-                for kind in score_kinds]
-        zeros = jnp.zeros((block_k, width), jnp.float32), jnp.zeros((block_k, value_width), jnp.float32)
-        tiled = tuple(jnp.zeros((queries, block_k), jnp.float32) for kind in score_kinds if kind == Kind.TILE)
-        dk, dv, tiled, *grads = jax.lax.fori_loop(ranges.q_lo[row, j], ranges.q_hi[row, j], step,
-                                                  (*zeros, tiled, *sums))
-        keyed = iter(grad for grad, kind in zip(grads, score_kinds, strict=True) if kind == Kind.KEY)
-        columns_of = iter(tiled)
-        return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
-                             for kind in score_kinds if kind in DKV_GRADS)
-
-    def derived_keys(j, row, head, draw, columns, k_tile, v_tile):
-        # Behind the switch, dK and dV the derived walk's over the query tiles (`algebra.derived_backward`),
-        # at the dQ launch's D and denominator, the key and tile parameters' gradients from each tile's
-        # cotangents the walk gives (`algebra.pulled`).
-        forms = algebra.derived_backward(grad_scale, "rows", score_mod is not None, draw is not None)
-
-        def tiles_at(i):
-            rows = i * block_q + jnp.arange(block_q)
-            q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
-            seen = _seen(spans, row, rows, columns)
-            params = tuple(_tile_param(param, kind, row, head, rows, columns)
-                           for param, kind in zip(score_params, score_kinds, strict=True))
-            logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(by_power(q, prescale), k_tile.T),
-                                                 seen, rows[:, None], columns[None, :], params, scale=factor,
-                                                 slopes=True)
-            tiles = {"logits": logits, "q": q, "k": k_tile, "values": v_tile,
-                     "dout": jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q),
+        def tiles_of(i):
+            # The derived walk's operands of query tile `i`, and the tile's slopes and mask.
+            rows, q, do, seen, logits, slopes, zt = tile_at(i)
+            tiles = {"logits": logits, "q": q, "k": k_tile, "values": v_tile, "dout": do,
                      "peak": peak[row, head, rows], "total": total[row, head, rows],
                      "anchor": anchor[row, head, rows], "delta": delta[row, head, rows]}
             if slopes is not None:
                 tiles["slope"] = slopes[0]
-            if draw is not None:
-                tiles["keep"] = draw(rows[:, None], columns[None, :])
+            if zt is not None:
+                tiles["keep"] = zt
             return tiles, slopes, seen
 
-        def step(i, carry):
-            state, tiled, *grads = carry
-            tiles, slopes, seen = tiles_at(i)
-            if slopes is None:
-                return forms.step(state, tiles), tiled, *grads
-            state, (cotangents,) = forms.step(state, tiles, outputs=(4,))
-            _, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
+        def hooked(i, hooks, cotangents, slopes, seen):
+            # Query tile `i`'s cotangents through the hook (`algebra.pulled`), and the tile parameters'
+            # gradients written at its rows and the key parameters' summed.
+            tiled, *grads = hooks
+            pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
                           for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
                                                                                        strict=True)
                                                             if kind == Kind.TILE), strict=True))
-            return state, tiled, *(grad + piece if kind == Kind.KEY else grad
-                                   for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True))
+            return pulled, (tiled, *(grad + piece if kind == Kind.KEY else grad
+                                     for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True)))
 
-        first = tiles_at(ranges.q_lo[row, j])[0]
-        state = forms.init({name: (value.shape, value.dtype) for name, value in first.items()})
-        sums = [jnp.zeros((block_k,), jnp.float32) if kind == Kind.KEY else jnp.zeros((), jnp.float32)
-                for kind in score_kinds]
+        def step(i, carry):
+            sums, hooks = carry
+            if forms is not None:
+                tiles, slopes, seen = tiles_of(i)
+                if slopes is None:
+                    return forms.step(sums, tiles), hooks
+                sums, (cotangents,) = forms.step(sums, tiles, outputs=(4,))
+                return sums, hooked(i, hooks, cotangents, slopes, seen)[1]
+            rows, q, do, seen, logits, slopes, zt = tile_at(i)
+            m, denominator = peak[row, head, rows], total[row, head, rows]
+            inverse_total = algebra.inverse(denominator)
+            exponentials, weights = algebra.normalized(logits, m, inverse_total, how)
+            cotangents = algebra.grad_scores(exponentials, interpreted_dot(do, v_tile.T),
+                                             anchor[row, head, rows], delta[row, head, rows], seen,
+                                             columns[None, :] == key_index[row, head, rows][:, None],
+                                             inverse_total, multiplier=zt)
+            pulled, hooks = hooked(i, hooks, cotangents, slopes, seen)
+            dk, dv = sums
+            dv = dv + transposed_dot(*algebra.value_operands(exponentials, weights, do, denominator,
+                                                             multiplier=zt))
+            # At the call's whole scale against the call's own queries, the logits' alone taken by the power.
+            dk = dk + algebra.cotangent_product(pulled * grad_scale, q, transposed_dot, accurate=accurate)
+            return (dk, dv), hooks
+
+        lo, hi = ranges.q_lo[row, j], ranges.q_hi[row, j]
+        shapes = {name: (value.shape, value.dtype) for name, value in tiles_of(lo)[0].items()}
+        sums = forms.init(shapes) if forms is not None else (jnp.zeros((block_k, width), jnp.float32),
+                                                             jnp.zeros((block_k, value_width), jnp.float32))
         tiled = tuple(jnp.zeros((queries, block_k), jnp.float32) for kind in score_kinds if kind == Kind.TILE)
-        state, tiled, *grads = jax.lax.fori_loop(ranges.q_lo[row, j], ranges.q_hi[row, j], step,
-                                                 (state, tiled, *sums))
-        _, dk, dv, *_ = forms.finish(state)
+        hooks = (tiled, *(jnp.zeros((block_k,) if kind == Kind.KEY else (), jnp.float32)
+                          for kind in score_kinds))
+        sums, (tiled, *grads) = jax.lax.fori_loop(lo, hi, step, (sums, hooks))
+        dk, dv = forms.finish(sums, shapes=shapes)[1:3] if forms is not None else sums
         keyed = iter(grad for grad, kind in zip(grads, score_kinds, strict=True) if kind == Kind.KEY)
         columns_of = iter(tiled)
         return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
@@ -623,7 +606,7 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
     spans = start, end, query_ids, key_ids
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial, prescale=prescale))
-    shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale,
+    shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "prescale": prescale,
               "grad_scale": scale * prescale, "how": how,
               "block_q": block_q, "block_k": block_k, "accurate": accurate, "drop": drop}
     sums = others, own, others_total, forward_total
@@ -633,7 +616,7 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
                                                spans, score_params, split=split, **shared)
     delta, anchor, m, denominator, _ = softmax
     dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
-                                    score_params, prescale=prescale, **shared)
+                                    score_params, **shared)
     return (dq, *softmax, chosen, *dq_grads, dk, dv, *key_grads)
 
 

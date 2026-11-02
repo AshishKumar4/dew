@@ -71,9 +71,12 @@ class Scan:
     operands (`operands`' axes by name, the walked one dropped), the state of `state`'s shape and dtype.
     `reset`, where given, names an operand of `operands`, booleans along the walked axis alone that neither
     reads, marking each token a zero state enters (a packed document's first). `ranges` bounds operands by
-    name, a magnitude (l2-normalised keys 1, a sigmoid's gate 1) or an interval (a log decay's `(-inf, 0)`),
+    name, a magnitude, each element's (a sigmoid's gate 1, keys 1) or an interval (a log decay's `(-inf, 0)`),
     the range facts a reordering's new intermediates are held under (docs/design/algebra.md §6.3); an operand
-    it names none of is unbounded, and the state is where it names "state" (a bound on its entering value).
+    it names none of is unbounded, the state is where it names "state" (a bound on its entering value), and
+    "overlap" bounds two tokens' corrections' overlap, `|s_i C_i . B_j|`, a vector bound the elementwise ones
+    do not state (keys of unit norm under a write gate at most `b`: `b`, by Cauchy-Schwarz; else the
+    elementwise bounds' product times the keys' count).
     Its decays (the exponentials of its update's exponents) are at most 1: its
     exponents are at most zero, as a gated recurrence's log decays are."""
 
@@ -275,15 +278,23 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
             # A literal output (a delta rule's unit correction scale) bounds itself.
             bounded[DECAYS + 1 + index] = float(np.max(np.abs(np.asarray(literal, np.float64))))
             continue
-        magnitude = region.magnitudes.get(str(output))
-        if magnitude is not None and not any(magnitude.degrees):
-            bounded[DECAYS + 1 + index] = 2.0 ** magnitude.log2
+        magnitude = region.magnitudes.get(terms.key(output))
+        if magnitude is not None:
+            bounded[DECAYS + 1 + index] = 2.0 ** magnitude
     # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
     # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
-    # entries `s_i C_i . B_j` times a decay at most 1, at most the corrections' bounds' product.
-    tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(("B", "U", "s", "C", "Q", "R"))}
-    if all(tokens_at[name] in bounded for name in ("B", "s", "C")):
-        entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]]
+    # entries `s_i C_i . B_j` times a decay at most 1, a contraction over the keys: at most the declared
+    # overlap (`Scan.ranges`' "overlap"), else the corrections' elementwise bounds' product times the keys'
+    # count (two tokens of 16 keys each element at most 1 overlap by 16).
+    places = ("B", "U", "s", "C", "Q", "R")
+    tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(places)}
+    overlap = declaration.ranges.get("overlap")
+    entry = None if overlap is None else max(map(abs, overlap)) if isinstance(overlap, tuple) else overlap
+    if entry is None and all(tokens_at[name] in bounded for name in ("B", "s", "C")):
+        B = region.outputs[places.index("B")]
+        keys = math.prod(np.shape(region.literal_outputs[0]) if B is None else region.shape(B))
+        entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]] * keys
+    if entry is not None:
         bounded[DECAYS] = (1.0 + entry) ** max(chunk_size - 1, 0)
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
@@ -611,20 +622,31 @@ def _paired(left, right, between):
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
-    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908)."""
+    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908). A pair no decay joins
+    (`between` zero, a token's future) is zero, selected, not multiplied: its product, or its cotangent, may
+    be infinite near float32's largest (a future corrected write's), whose product by a zero decay is NaN in
+    every query's gradient the pair reads (the chunked op's reverse mode, near the largest) and in the
+    decays'."""
+    active = jnp.any(between != 0, axis=-1)
     if between.shape[-1] == 1:
-        return float32_matmul(left, right.T) * between[..., 0]
-    return float32_einsum("ik,ijk->ij", left, right[None] * between)
+        # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
+        # decay's derivative would read it.
+        return jnp.where(active, float32_matmul(left, right.T), 0.0) * between[..., 0]
+    return jnp.where(active, float32_einsum("ik,ijk->ij", left, right[None] * between), 0.0)
 
 
-@jax.custom_vjp
 def _lowered(overlaps):
     """`(I + overlaps)^-1` less its unit diagonal, `overlaps` strictly lower: the template's inverse by
     doubling (`recurrence_algebra.doubled` of `-overlaps`), each product a Dew product (`float32_matmul`),
     log2(C) levels of products where a forward substitution took C dependent row steps (the derived forward's
     every chunk 64 launches in sequence). The solve applies it with the unit diagonal outside the product
     (`_applied`, `given + L given`, as `weighted` adds it), so the product rounds the off-diagonal terms
-    alone. Its derivative, with `X = I + L`, `-X^T dL X^T` below the diagonal."""
+    alone. Differentiated at every order (`_lowered_rule`): its reverse derivative, with `X = I + L`,
+    `-X^T dL X^T` below the diagonal, its tangent the doubling's own."""
+    return _lowered_rule()(overlaps)
+
+
+def _doubled(overlaps):
     # The template's algebra imports the compile point, which imports this package: read at a call.
     from dew.nn.kernels import recurrence_algebra
 
@@ -647,17 +669,23 @@ def _below(square):
     return jnp.where(jnp.tril(jnp.ones(square.shape, bool), -1), square, 0.0)
 
 
-def _lowered_forward(overlaps):
-    lower = _lowered(overlaps)
-    return lower, lower
+@functools.cache
+def _lowered_rule() -> Callable:
+    """`_doubled` differentiated at every order (`generation.linear_tangent`): reverse mode by its inverse's
+    own transpose (`_lowered`'s), forward mode and every order above it by the doubling's tangent, so a
+    `jax.jvp` of the derived forms runs where a custom VJP alone refused it."""
+    from dew.nn.kernels import generation
 
+    def forward(overlaps):
+        lower = _doubled(overlaps)
+        return lower, lower
 
-def _lowered_backward(lower, d_lower):
-    back = _applied(lower.T, d_lower)
-    return (_below(-_applied(lower, back.T).T),)
+    def backward(lower, operands, d_lower):
+        del operands
+        back = _applied(lower.T, d_lower)
+        return (_below(-_applied(lower, back.T).T),)
 
-
-_lowered.defvjp(_lowered_forward, _lowered_backward)
+    return generation.linear_tangent(forward, backward, _doubled)
 
 
 def _compensated(values, *, reverse: bool = False) -> tuple[jax.Array, jax.Array]:
@@ -701,14 +729,26 @@ def _decays_value(exponents, base2: bool) -> _Decays:
                    between=jnp.where(below, _exp(base2, jnp.where(below, gaps, 0.0)), 0.0))
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _decays_of(exponents, base2: bool) -> _Decays:
-    return _decays_value(exponents, base2)
+    return _decays_rule(base2)(exponents)
 
 
-def _decays_forward(exponents, base2: bool):
-    decays = _decays_value(exponents, base2)
-    return decays, decays
+@functools.cache
+def _decays_rule(base2: bool) -> Callable:
+    """`_decays_value` differentiated at every order (`generation.linear_tangent`): reverse mode by
+    `_decays_backward`, forward mode and every order above it by the decays' own tangent, so a `jax.jvp` of
+    the derived forms runs where a custom VJP alone refused it."""
+    from dew.nn.kernels import generation
+
+    def forward(exponents):
+        decays = _decays_value(exponents, base2)
+        return decays, decays
+
+    def backward(decays, operands, cotangents):
+        del operands
+        return _decays_backward(base2, decays, cotangents)
+
+    return generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2))
 
 
 def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
@@ -729,8 +769,6 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     whole = (cotangents.whole * decays.whole)[None]
     return ((from_on + before + spanning + whole) * weight,)
 
-
-_decays_of.defvjp(_decays_forward, _decays_backward)
 
 
 def _earlier(sums) -> jax.Array:

@@ -10,10 +10,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, REVERSE_ONLY, assert_contract, normal_draw
+from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
-from dew.algebra import SATURATION, scan
+from dew.algebra import SATURATION, forms as algebra_forms, scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.recurrence import mainloop, selective
@@ -254,10 +254,12 @@ def test_the_selective_scan_holds_its_orders(edge):
                     plain_fn=plain, without=REVERSE_ONLY)
 
 
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_chunked_op_holds_every_order(edge):
+def test_the_chunked_op_holds_every_order(edge, derived):
     """The chunked op (`recurrence_chunk.chunk`: its kernel a product, `_per_product`, differentiated
-    through the portable math, and the skip `D v`, `recurrence.skipped`, each through
+    through the portable math, its forms the hand-written ones or those derived from the token update behind
+    the switch, `dew.algebra.forms.derived`, and the skip `D v`, `recurrence.skipped`, each through
     `generation.linear_tangent`), the gated delta rule with a decay a head, its queries scaled, and the skip,
     from a zero memory: every order of its output finite wherever float64 is a normal float32 and the rule a
     token at a time with its skip is (`plain_delta_rule`, in float64 the truth), at queries, keys and values
@@ -272,7 +274,8 @@ def test_the_chunked_op_holds_every_order(edge):
 
     def chunked(query, key, value, g, beta, skip):
         operands = recurrence_chunk.Chunk(query, key, value, log_decay=g, beta=beta, skip=skip)
-        return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
+        with algebra_forms.derived(derived):
+            return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
 
     def recurrent(query, key, value, g, beta, skip):
         out, _ = plain_delta_rule(query, key, value, g, beta, jnp.zeros((1, 2, 8, 8), query.dtype),
@@ -414,10 +417,9 @@ def _read(h, q, k, v, g, beta):
 def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
-    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`):
-    the primal, the reverse derivative and reverse over reverse finite wherever float64 is a normal float32
-    and the token-by-token scan's are, at unit queries, keys and values and at ones whose products near
-    float32's least normal. Forward mode does not run: both are custom VJPs (`FORWARD_ORDERS`)."""
+    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order,
+    forward mode among them, finite wherever float64 is a normal float32 and the token-by-token scan's are,
+    at unit queries, keys and values and at ones whose products near float32's least normal."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     draws = jax.random.split(jax.random.key(3311 + per_key), 7)
     scale = EDGES[edge]
@@ -450,4 +452,4 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
     direction = tuple(jax.random.normal(draws[5], x.shape) for x in primals)
     cotangent = jax.random.normal(draws[6], (tokens, values))
     assert_contract(derived, primals, direction, cotangent, f"the derived delta rule {edge}",
-                    truth_fn=tokenwise, plain_fn=tokenwise, without=FORWARD_ORDERS)
+                    truth_fn=tokenwise, plain_fn=tokenwise)

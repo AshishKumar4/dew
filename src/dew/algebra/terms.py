@@ -12,12 +12,13 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import Expr, StringLike, Vec, get_callable_args, get_literal_value, i64, i64Like, method
+from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -126,33 +127,42 @@ class Region:
     depth: int
     equations: int
     stock: Mapping[str, int]
-    dtypes: Mapping[str, np.dtype]
-    magnitudes: Mapping[str, Magnitude | None]
-    extents: dict[str, tuple[int, ...]] = dataclasses.field(init=False)
+    dtypes: Mapping[Hashable, np.dtype]
+    magnitudes: Mapping[Hashable, Magnitude | None]
+    products: dict[int, tuple[np.dtype | None, ...]] = dataclasses.field(default_factory=dict)
+    """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
+    extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
         self.extents = {}
         for term, extent in self.shapes:
-            self.extents.setdefault(str(term), extent)
+            self.extents.setdefault(key(term), extent)
 
     def shape(self, term: Term) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
-        terms carry (`shapes`, `extents` by text)."""
-        return self.extents[str(term)]
+        terms carry (`shapes`, `extents` by `key`)."""
+        return self.extents[key(term)]
 
     def shaped(self, term: Term, extent: tuple[int, ...]) -> None:
         """`term`, a term a derivation adds (a literal of its own), held at `extent`."""
         self.shapes.append((term, extent))
-        self.extents.setdefault(str(term), extent)
+        self.extents.setdefault(key(term), extent)
 
     def roots(self) -> list[Term]:
         """The terms extraction chooses forms for: each output and each input of an equation outside the
         language, once each, in program order."""
-        seen: dict[str, Term] = {}
+        seen: dict[Hashable, Term] = {}
         for term in [*(term for opaque in self.opaque for term in opaque.inputs), *self.outputs]:
             if term is not None:
-                seen.setdefault(str(term), term)
+                seen.setdefault(key(term), term)
         return list(seen.values())
+
+
+def key(term: Expr) -> Hashable:
+    """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
+    are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
+    step's pass)."""
+    return term.__egg_typed_expr__
 
 
 def protected(equation: jcore.JaxprEqn) -> bool:
@@ -161,67 +171,48 @@ def protected(equation: jcore.JaxprEqn) -> bool:
     return PROTECTED in str(equation.source_info.name_stack)
 
 
-SLOTS = 6
-"""The unbounded values a region's magnitudes name apart (`Magnitude.degrees`: its operands without a
-declared range, its equations' outside the language); a value of a seventh has none (None)."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Magnitude:
-    """A bound on a value's magnitude (docs/design/algebra.md §6.3): `2**log2` times the product of its
-    unbounded operands' magnitudes, each at least 1 (`max(1, |x_i|)`), to the powers `degrees`, one a slot
-    (`SLOTS`). A sum's is under twice the larger of its terms' (each operand's magnitude at least 1), a
-    product's their product, a contraction's their product times its length."""
-
-    log2: int
-    degrees: tuple[int, ...] = (0,) * SLOTS
-
-    def times(self, other: Magnitude, log2: int = 0) -> Magnitude:
-        return Magnitude(self.log2 + other.log2 + log2,
-                         tuple(a + b for a, b in zip(self.degrees, other.degrees, strict=True)))
-
-    def plus(self, other: Magnitude, log2: int = 1) -> Magnitude:
-        return Magnitude(max(self.log2, other.log2) + log2,
-                         tuple(max(a, b) for a, b in zip(self.degrees, other.degrees, strict=True)))
-
-    def within(self, other: Magnitude) -> bool:
-        """Whether this bound is under `other`'s for every operand magnitude."""
-        pairs = zip(self.degrees, other.degrees, strict=True)
-        return self.log2 <= other.log2 and all(a <= b for a, b in pairs)
-
+Magnitude = int
+"""A bound on a value's magnitude (docs/design/algebra.md §6.3): its power of two, `|x| <= 2**log2`, a number
+its constants', its declared ranges' and its equations' prove; a value no number bounds has none (None). A
+sum's is twice the larger of its terms', a product's their product, a contraction's their product times its
+length."""
 
 NOTHING = -(2 ** 20)
-"""A zero's `Magnitude.log2`: under every other."""
+"""A zero's magnitude: under every other."""
 
 
 def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]] | None = None) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
     one (and each protected one, `protected`) a leaf for each output, after its inputs' terms. Each term's
-    magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index: a bound on
-    its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its exponential by 1; an input
-    with none takes a slot of its own) and its equations'."""
+    magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index, the
+    constants apart: a bound on its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its
+    exponential by 1; an input with none is unbounded) and its equations'."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
-    indexed: dict[tuple[str, str], int] = {}
+    indexed: dict[tuple[str, str, tuple | None], int] = {}
     literals: list = []
     shapes: list[tuple[Term, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
 
-    def param(primitive: jcore.Primitive, values: Mapping) -> int:
-        key = (primitive.name, repr(sorted(values.items(), key=lambda named: named[0])))
+    products: dict[int, tuple[np.dtype | None, ...]] = {}
+
+    def param(primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+        # A product's operands' dtypes key its parameters too, its mode's (`cost.work`).
+        key = (primitive.name, repr(sorted(values.items(), key=lambda named: named[0])), operands)
         if key not in indexed:
             indexed[key] = len(params)
             params.append((primitive, dict(values)))
+            if operands is not None:
+                products[indexed[key]] = operands
         return indexed[key]
 
     env: dict[jcore.Var, Term] = {}
-    dtypes: dict[str, np.dtype] = {}
-    magnitudes: dict[str, Magnitude | None] = {}
+    dtypes: dict[Hashable, np.dtype] = {}
+    magnitudes: dict[Hashable, Magnitude | None] = {}
     leaves = 0
-    free = iter(range(SLOTS))
     declared = dict(ranges or {})
     given = [*(_magnitude(value) for value in closed.consts),
-             *(_declared(index, declared, free) for index in range(len(jaxpr.invars)))]
+             *(_declared(declared.get(index)) for index in range(len(jaxpr.invars)))]
     # The values at most 0 (an operand declared so, and the layouts and conversions of one), whose
     # exponential is at most 1.
     nonpositive = {var for index, var in enumerate(jaxpr.invars)
@@ -242,7 +233,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
         return env[atom]
 
     def magnitude_of(atom) -> Magnitude | None:
-        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[str(env[atom])]
+        return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[key(env[atom])]
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
@@ -257,7 +248,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
             out = equation.outvars[0]
             env[out] = read(source).shaped("broadcast_in_dim", param(equation.primitive, composed))
             shapes.append((env[out], _shape(out)))
-            _typed(dtypes, magnitudes, env[out], out, magnitudes[str(env[source])])
+            _typed(dtypes, magnitudes, env[out], out, magnitudes[key(env[source])])
             if source in nonpositive:
                 nonpositive.add(out)
             laid[out] = (source, composed["broadcast_dimensions"])
@@ -286,8 +277,8 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
         for var in equation.outvars:
             env[var] = Term.leaf(leaves)
             shapes.append((env[var], _shape(var)))
-            # An equation outside the language bounds nothing: its output an unbounded value of its own.
-            _typed(dtypes, magnitudes, env[var], var, _free(free))
+            # An equation outside the language bounds nothing.
+            _typed(dtypes, magnitudes, env[var], var, None)
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
@@ -298,15 +289,16 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes)
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products)
 
 
-BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf", "sign"})
-"""The language's functions whose magnitude is at most 1 whatever their operand's."""
+BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf"})
+"""The language's functions whose magnitude is at most 1 over a real operand of any magnitude (over a complex
+one, `sin(pi/2 + 89j)` is 2.2e38: unbounded)."""
 KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min", "floor",
                                "ceil", "round"}) | SHAPES
 """The language's equations whose output is no larger in magnitude than their operand's."""
-UNIT = Magnitude(0)
+UNIT = 0
 KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
 """The language's equations whose output is at most 0 where their operand is."""
 
@@ -315,35 +307,38 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magn
     """A bound on the magnitude of `equation`'s output from its operands' (`operands`, `Magnitude`), None
     where its primitive proves none (an exponential of a value of any magnitude, a quotient)."""
     name = equation.primitive.name
-    if name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite") or name in BOUNDED:
+    real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
+                   for atom in equation.invars)
+    if (name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite", "sign")
+            or (name in BOUNDED and real)):
         return UNIT
-    given = [bound for bound in operands if bound is not None]
-    if len(given) < len(operands):
+    if any(bound is None for bound in operands):
         return None
+    given: list[int] = [bound for bound in operands if bound is not None]
     if name in ("add", "sub"):
-        return given[0].plus(given[1])
+        return max(given) + 1
     if name == "mul":
-        return given[0].times(given[1])
+        return given[0] + given[1]
     if name in ("max", "min"):
-        return given[0].plus(given[1], 0)
+        return max(given)
     if name == "select_n":
-        return functools.reduce(lambda a, b: a.plus(b, 0), given[1:])
+        return max(given[1:])
     if name in KEEPING_MAGNITUDE:
         return given[0]
     if name == "square":
-        return given[0].times(given[0])
+        return 2 * given[0]
     if name == "integer_pow" and equation.params["y"] >= 1:
-        return functools.reduce(lambda a, _: a.times(given[0]), range(equation.params["y"] - 1), given[0])
-    if name in ("exp", "exp2") and given[0].degrees == (0,) * SLOTS and given[0].log2 <= 6:
+        return equation.params["y"] * given[0]
+    if name in ("exp", "exp2") and given[0] <= 6:
         # An exponential of a value under 64: under 2**(64 log2(e)).
-        return Magnitude(math.ceil(2 ** given[0].log2 * (math.log2(math.e) if name == "exp" else 1.0)))
+        return math.ceil(2 ** given[0] * (math.log2(math.e) if name == "exp" else 1.0))
     if name == "reduce_sum":
         shape = _shape(equation.invars[0])
-        return given[0].times(UNIT, _log2(math.prod(shape[axis] for axis in equation.params["axes"])))
+        return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))
     if name == "dot_general":
         (contracted, _), _ = equation.params["dimension_numbers"]
         shape = _shape(equation.invars[0])
-        return given[0].times(given[1], _log2(math.prod(shape[axis] for axis in contracted)))
+        return given[0] + given[1] + _log2(math.prod(shape[axis] for axis in contracted))
     return None
 
 
@@ -353,36 +348,31 @@ def _log2(value: float) -> int:
 
 
 def _magnitude(value) -> Magnitude | None:
-    """A constant's magnitude, its elements' largest; None for one of no number (a key's)."""
+    """A constant's magnitude, its elements' largest (a complex one's modulus); None for one of no number (a
+    key's)."""
     array = np.asarray(value)
     if not (np.issubdtype(array.dtype, np.number) or array.dtype == bool):
         return None
-    largest = float(np.max(np.abs(array.astype(np.float64)))) if array.size else 0.0
-    return Magnitude(_log2(largest)) if math.isfinite(largest) else None
+    # In complex128, which holds every integer's absolute value (int32's least's too) and a complex modulus.
+    largest = float(np.max(np.abs(array.astype(np.complex128)))) if array.size else 0.0
+    return _log2(largest) if math.isfinite(largest) else None
 
 
-def _declared(index: int, ranges: Mapping[int, float | tuple[float, float]], free) -> Magnitude | None:
-    """Input `index`'s magnitude: its declared range's (an interval's larger end's magnitude), else a slot of
-    its own (`_free`)."""
-    declared = ranges.get(index)
+def _declared(declared: float | tuple[float, float] | None) -> Magnitude | None:
+    """An input's magnitude from its declared range (an interval's larger end's), None where it declares
+    none."""
     if declared is None:
-        return _free(free)
+        return None
     largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
-    return Magnitude(_log2(largest)) if math.isfinite(largest) else _free(free)
-
-
-def _free(free) -> Magnitude | None:
-    """An unbounded value's magnitude: the next slot of `free` its own (`SLOTS`; None past them)."""
-    slot = next(free, None)
-    return None if slot is None else Magnitude(0, tuple(int(each == slot) for each in range(SLOTS)))
+    return _log2(largest) if math.isfinite(largest) else None
 
 
 def _typed(dtypes: dict, magnitudes: dict, term: Term, atom, magnitude: Magnitude | None) -> None:
-    """`term`'s dtype (`atom`'s) and its magnitude, the first where its text names two values."""
-    key = str(term)
+    """`term`'s dtype (`atom`'s) and its magnitude, the first where one term names two values."""
+    named = key(term)
     if isinstance(atom.aval, ShapedArray):
-        dtypes.setdefault(key, np.dtype(atom.aval.dtype))
-    magnitudes.setdefault(key, magnitude)
+        dtypes.setdefault(named, np.dtype(atom.aval.dtype))
+    magnitudes.setdefault(named, magnitude)
 
 
 @functools.cache
@@ -409,13 +399,13 @@ def spoken(equation: jcore.JaxprEqn) -> bool:
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
     """One chosen `form`'s value over `region_`'s leaves' `values` (a region of the language alone, whose
     leaves are its inputs), each shared term evaluated once."""
-    known: dict[str, jax.Array] = {}
+    known: dict[Hashable, jax.Array] = {}
 
     def value(term: Term) -> jax.Array:
-        key = str(term)
-        if key not in known:
-            known[key] = value_of(term, value, region_, values)
-        return known[key]
+        named = key(term)
+        if named not in known:
+            known[named] = value_of(term, value, region_, values)
+        return known[named]
 
     return value(form)
 
@@ -454,7 +444,9 @@ def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | N
         if dtypes == {given.get("preferred_element_type")}:
             # A product accumulating in its operands' own dtype is one of no preferred type (`rules.plain`).
             given["preferred_element_type"] = None
-        return read(equation.invars[0]).dot(read(equation.invars[1]), param(primitive, given))
+        operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
+                         for var in equation.invars)
+        return read(equation.invars[0]).dot(read(equation.invars[1]), param(primitive, given, operands))
     return None
 
 
@@ -463,23 +455,22 @@ def _index(argument) -> int:
 
 
 def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, leaves: Sequence) -> jax.Array:
-    """One term's value, its operands' from `value`."""
+    """One term's value, its operands' from `value`, each equation of several operands bound over them aligned
+    as the lax function it came from aligns them (`jax_core.auto_insert_reshard`): a literal or a constant
+    beside a value a checked `shard_map`'s manual axes vary varies as it does."""
     if (args := get_callable_args(term, Term.leaf)) is not None:
         return leaves[_index(args[0])]
     if (args := get_callable_args(term, Term.literal)) is not None:
         return region_.literals[_index(args[0])]
-    for constructor in (Term.binary, Term.compare):
+    for constructor in (Term.binary, Term.compare, Term.dot):
         if (args := get_callable_args(term, constructor)) is not None:
-            left, _, right, index = args
+            # A product's operands lead its arguments; an operation's name stands between a binary's two.
+            left, right, index = args if constructor is Term.dot else (args[0], args[2], args[3])
             primitive, given = region_.params[_index(index)]
-            return primitive.bind(value(left), value(right), **given)
-    if (args := get_callable_args(term, Term.dot)) is not None:
-        left, right, index = args
-        primitive, given = region_.params[_index(index)]
-        return primitive.bind(value(left), value(right), **given)
+            return primitive.bind(*jax_core.auto_insert_reshard(value(left), value(right)), **given)
     if (args := get_callable_args(term, Term.select)) is not None:
-        predicate, false, true = args
-        return jax.lax.select_n_p.bind(value(predicate), value(false), value(true))
+        operands = jax_core.auto_insert_reshard(*(value(operand) for operand in args))
+        return jax.lax.select_n_p.bind(*operands)
     # Each other constructor's primitive parameters, by index, last after its operand and its other arguments.
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
@@ -498,9 +489,9 @@ def subterms(form: Term) -> Iterator[Term]:
     seen, pending = set(), [form]
     while pending:
         term = pending.pop()
-        if (key := str(term)) in seen:
+        if (named := key(term)) in seen:
             continue
-        seen.add(key)
+        seen.add(named)
         yield term
         for constructor in LANGUAGE:
             if (args := get_callable_args(term, constructor)) is not None:

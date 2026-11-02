@@ -162,40 +162,44 @@ def row_truth(x, weights, parts, grads, segments):
 def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
     """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
     lengths that leave runs and a tile partly past the end, and over packed documents that start inside a
-    window: bf16 pieces and gradients rounded where XLA rounds them, a call's of fp32 pieces on par with
-    XLA's from float64 over seeded draws (check 1)."""
+    window: bf16 pieces and the projection's bf16 gradient rounded where XLA rounds them, and every fp32 leaf
+    (a call's of fp32 pieces, and the taps' and bias's gradients, fp32 sums over every token whatever the
+    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1)."""
     segments = documents(*shape) if packed else None
-    if jnp.dtype(out) == jnp.float32:
-        def drawn(seed):
-            x, weights, shift, _ = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid,
-                                            seed=seed)
-            return x, weights, shift, cotangents(x, parts, out, seed=seed + 1)
+    _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
 
-        _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+    def drawn(seed):
+        x, weights, shift, _ = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid,
+                                        seed=seed)
+        return x, weights, shift, cotangents(x, parts, out, seed=seed + 1)
 
-        def conv(fn):
-            return lambda x, weights, shift, grads: run(fn, x, weights, shift, kept, parts, out, grads,
-                                                       segments=segments)
+    # The leaves check 1 holds: every one of an fp32 call, the taps' and bias's gradients of a bf16 one.
+    wide = jnp.dtype(out) == jnp.float32
 
-        def exact(x, weights, shift, grads):
-            return truth(x, weights, shift, kept, parts, grads, segments=segments)
+    def held(found):
+        pieces, grads = found
+        return (pieces, grads) if wide else grads[1:]
 
-        assert_as_exact(jax.jit(conv(kernel_conv)), jax.jit(conv(xla_conv1d)), drawn,
-                        f"the conv to fp32 {jnp.dtype(dtype).name} {shape} {parts}", seeds=FP32_SEEDS,
-                        truth_fn=exact)
+    def conv(fn):
+        return lambda x, weights, shift, grads: held(run(fn, x, weights, shift, kept, parts, out, grads,
+                                                         segments=segments))
+
+    def exact(x, weights, shift, grads):
+        return held(truth(x, weights, shift, kept, parts, grads, segments=segments))
+
+    assert_as_exact(jax.jit(conv(kernel_conv)), jax.jit(conv(xla_conv1d)), drawn,
+                    f"the conv to {jnp.dtype(out).name} {jnp.dtype(dtype).name} {shape} {parts}",
+                    seeds=FP32_SEEDS, truth_fn=exact)
+    if wide:
         return
-    x, weights, shift, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
-    grads = cotangents(x, parts, out)
+    x, weights, shift, grads = drawn(0)
     got, got_grads = run(kernel_conv, x, weights, shift, kept, parts, out, grads, segments=segments)
     want, want_grads = run(xla_conv1d, x, weights, shift, kept, parts, out, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
-    for number, (piece, reference, value) in enumerate(zip(got, want, exact, strict=True)):
+    exact_pieces, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
+    for number, (piece, reference, value) in enumerate(zip(got, want, exact_pieces, strict=True)):
         assert piece.dtype == jnp.dtype(out)
         assert_rounds_where_the_reference_does(piece, reference, value, f"piece {number}")
-    for name, grad, reference, value in zip(("x", "taps", "bias"), got_grads, want_grads, exact_grads,
-                                            strict=True):
-        if grad is not None:
-            assert_rounds_where_the_reference_does(grad, reference, value, f"d{name}")
+    assert_rounds_where_the_reference_does(got_grads[0], want_grads[0], exact_grads[0], "dx")
 
 
 def test_padding_tokens_are_zero_and_pass_no_gradient():

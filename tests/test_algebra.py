@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.core import eval_jaxpr
 from reference_error import assert_as_exact
 
 from dew import algebra
@@ -150,6 +151,35 @@ def test_a_rewritten_program_is_finite_wherever_the_program_is(name):
     assert np.all(np.isfinite(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0]))
 
 
+def cos_at(values) -> jax.Array:
+    """Float32 arguments whose `cos` is each of `values` exactly, as XLA computes it: the first of a fine
+    grid of each, so a witness's precondition is a fact of the function itself."""
+    grid = jnp.linspace(0.0, 1e-3, 1_000_001, dtype=jnp.float32)
+    found = np.asarray(jnp.cos(grid))
+    at = [int(np.argmax(found == np.float32(value))) for value in values]
+    assert all(found[index] == np.float32(value) for index, value in zip(at, values, strict=True))
+    return grid[jnp.asarray(at)]
+
+
+def test_two_joined_sums_stay_finite_wherever_the_program_is():
+    """Two sums of bounded terms beside a scale multiplied into two bounded terms: `2^126 cos(u)` and
+    `2^126 cos(v)`, under 2^126 each, at `[2^126, 2^126]` and `[2^126 - 2^102, 2^126 - 2^103]` sum to
+    float32's largest, while their terms summed first, `[2^127, 2^127 - 2^103]` once rounded, sum past it.
+    The joined sum's bound counts its reduction's length, so it stays apart, finite as the program is (bible
+    §6), whatever else the program rewrites."""
+    def program(u, v, x, y, a):
+        x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+        return jnp.sum(2.0 ** 126 * jnp.cos(u)) + jnp.sum(2.0 ** 126 * jnp.cos(v)), a * x + a * y
+
+    u = jnp.zeros((2,), jnp.float32)
+    v = cos_at([1.0 - 2.0 ** -24, 1.0 - 2.0 ** -23])
+    x, y, a = rows(11, (8,), (8,), (8,))
+    operands_ = (u, v, x, y, a)
+    assert np.isfinite(program(*operands_)[0])
+    closed = jax.make_jaxpr(algebra.rewritten(program))(*operands_)
+    assert np.isfinite(eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0])
+
+
 def count(closed, primitive: str) -> int:
     """The equations of `closed` binding `primitive`."""
     return sum(equation.primitive.name == primitive for equation in closed.jaxpr.eqns)
@@ -199,14 +229,26 @@ def test_a_row_scalar_leaves_a_sum_along_its_rows():
 
 def test_literals_keep_their_exact_values_and_types():
     """A program's literals pass through the rewrite as the program wrote them: integers, booleans and floats
-    each in its own type and value."""
+    each in its own type and value, int32's least among them."""
     def literal(x, n):
-        return jnp.where(n > np.int32(2_000_000_011), x * 3.5, x - 1.25), n + np.int32(2_000_000_011)
+        return (jnp.where(n > np.int32(2_000_000_011), x * 3.5, x - 1.25), n + np.int32(2_000_000_011),
+                jnp.sum(n * np.int32(-(2 ** 31))))
 
     x, n = rows(5, (4,))[0], jnp.asarray([2_000_000_013, 1, 2_000_000_011, 7], jnp.int32)
     for given, got in zip(literal(x, n), jax.jit(algebra.rewritten(literal))(x, n), strict=True):
         assert given.dtype == got.dtype
         np.testing.assert_array_equal(np.asarray(given), np.asarray(got))
+
+
+def test_a_values_products_by_two_literals_are_one_product_by_their_sum():
+    """`a * 2 + a * 4`, whose only bounded terms are its literals, is `a * 6`: one product, exactly."""
+    def doubled(a):
+        return a * 2.0 + a * 4.0
+
+    (a,) = rows(8, (8, 64))
+    closed = jax.make_jaxpr(algebra.rewritten(doubled))(a)
+    assert count(closed, "mul") == 1
+    np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(doubled))(a)), np.asarray(doubled(a)))
 
 
 def test_products_that_widen_keep_their_widening():

@@ -87,7 +87,8 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
         return (lambda x, y, a: fn(x, y, a, 2)) if pass_n == "positionally" else (
             lambda x, y, a: fn(x, y, a, n=2))
 
-    assert_as_exact(called(rewritten), called(plain), lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)),
+    # 64 rows a draw: at 8 the draws' log ratios spread past what the gate resolves in 80 seeds.
+    assert_as_exact(called(rewritten), called(plain), lambda seed: rows(seed, (64, 64), (64, 64), (64, 64)),
                     f"a static count passed {pass_n}", seeds=16)
 
 
@@ -136,7 +137,7 @@ def test_two_sums_xla_reads_once_are_priced_as_xla_prices_them():
     assert read(two) == read(one) == 2 * 64 * 128 * 4
     written = jax.make_jaxpr(algebra.rewritten(two))(*operands_)
     if count(written, "reduce_sum") == 1:
-        assert program.xla_seconds(written) < program.xla_seconds(jax.make_jaxpr(two)(*operands_))
+        assert cost.cheaper(program.xla_priced(written), program.xla_priced(jax.make_jaxpr(two)(*operands_)))
     assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
                     "two sums", seeds=16)
 
@@ -284,3 +285,65 @@ def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
     assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
                     "a scale through a contraction", seeds=16)
 
+
+
+def test_an_uncatalogued_gpu_prices_forms_by_its_own_facts():
+    """A GPU of a known family no row names (an sm121, its multiprocessors, clock and bandwidth its own):
+    the pass prices a program by its facts (`cost.target`), not an H100's, so a form is chosen for the
+    device the program compiles for."""
+    unseen = generation.GpuTarget("sm121", "an unseen consumer Blackwell", 99 * 1024, multiprocessors=48,
+                                  clock_hz=2.4e9, memory_bandwidth=273e9)
+    with generation.assumed(unseen):
+        priced = cost.target()
+    assert (priced.generation, priced.multiprocessors, priced.memory_bandwidth) == ("sm121", 48, 273e9)
+
+
+@pytest.mark.parametrize("tpu", ["v5e", "v6e"])
+def test_a_tpus_program_is_rewritten_by_the_rates_it_states(tpu):
+    """A TPU's target states its MXU's rate and not its vector or transcendental units' (`cost.cheaper`): a
+    program of a product reduced (`sum(a * b)` and two joinable sums of products) traces and runs rewritten
+    for it, on par with the program (check 1), a form taken only where it does no more work at a rate the
+    TPU states none of."""
+    def program_(a, b, x):
+        return jnp.sum(a * b, axis=-1) + jnp.sum(a * x, axis=-1)
+
+    with algebra.passes(target=tpu):
+        assert_as_exact(jax.jit(algebra.rewritten(program_)), jax.jit(program_),
+                        lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)), f"a {tpu} program", seeds=16)
+
+
+def test_a_products_mode_prices_it():
+    """A product of fp32 operands at the default precision (`Precision.DEFAULT`, stated: the suite configures
+    the highest) takes the tensor cores' TF32 mode, one of 16-bit operands their 16-bit mode, and one at
+    `Precision.HIGHEST` the CUDA cores (`cost.work`): an H100's TF32 rate is half its 16-bit one and its
+    CUDA cores' far below both, so the three price apart."""
+    def product(precision, dtype):
+        def contracted(a, b):
+            return jnp.dot(a, b, precision=precision, preferred_element_type=jnp.float32)
+
+        a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
+        region = terms.region(jax.make_jaxpr(contracted)(a, b))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    half, tf32, highest = (product(None, jnp.bfloat16), product(jax.lax.Precision.DEFAULT, jnp.float32),
+                           product(jax.lax.Precision.HIGHEST, jnp.float32))
+    flops = 2.0 * 64 ** 3
+    assert (half.flops, tf32.tf32_flops, highest.operations) == (flops, flops, flops)
+
+
+def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():
+    """A rewrite's record as a fit search persists it (`planning.rewrite_record`, `FitSearch.kernels`): the
+    node and iteration limits its saturation had beside whether one stopped it (docs/design/algebra.md
+    §6.8), through JSON whole."""
+    import json
+
+    from dew.training import planning
+
+    with report.refusals():
+        jax.make_jaxpr(algebra.rewritten(two_sums))(*rows(0, (8, 64), (8, 64), (8, 64)))
+        made = report.rewrites()[-1]
+    record = json.loads(json.dumps(planning.rewrite_record(made)))
+    assert (tuple(record["limits"]), record["limited"]) == (tuple(made.limits), made.limited)

@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
-from float64_terms import float64_terms
+from float64_terms import compiled_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import as_given, assert_as_exact, widened
@@ -401,22 +401,27 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
     score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
     logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
-    traces from `reference` (`float64_terms`). A call resuming from an initial state (`score` naming sinks
-    or a resumed partial) takes check 1's own terms (None): its weights start from the state, which
-    `attention_terms` does not carry."""
+    traces from `reference` (`compiled_terms`, one float64 program on the device for every draw). A call
+    resuming from an initial state (`score` naming sinks or a resumed partial) takes check 1's own terms
+    (None): its weights start from the state, which `attention_terms` does not carry."""
     if {"sinks", "resumed"} & set(score):
         return None
     keep = template.dense(spans)[:, None]
+    # The parameters' terms over every draw, one compiled float64 program (`compiled_terms`).
+    traced_terms = None if reference is None else compiled_terms(reference)
 
     def terms(query, key, value, dout, *hooks):
-        if not hooks:
-            return tuple(attention_terms(query, key, value, dout, keep)[1:])
-        params, _ = hooks
+        params = hooks[0] if hooks else ()
         wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
-        found = attention_terms(query, key, value, dout, keep,
-                                score=lambda raw: template.score_modded(raw, hooked(wide, None)))
+        found = attention_terms(query, key, value, dout, keep, score=None if hooked is None else (
+            lambda raw: template.score_modded(raw, hooked(wide, None))))
+        if not params:
+            # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
+            # draw's hooks `((), None)` as they are.
+            return (*found[1:], *hooks)
+        assert traced_terms is not None, "a hooked call's parameters' terms trace its reference"
         with jax.enable_x64(new_val=True):
-            _, traced = float64_terms(reference, *widened((query, key, value, dout, *hooks)))
+            _, traced = traced_terms(*widened((query, key, value, dout, *hooks)))
         return (*found[1:], *traced[3:])
 
     return terms
@@ -1072,40 +1077,57 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     _check_backward("causal", (1, 64, 2, 1), form="default", interpret=True, keys=256)
 
 
-@INTERPRETS
-def test_a_shared_key_backward_over_a_partial_key_tile_reads_no_padded_key():
+def _shared_key_backward(spans, query, key, value, dout):
     """The fast backward's one launch whose two consumers share a key tile (`fused-shared-keys`, each 32 of
-    its 64 keys) over 96 keys under the interpreter: the last tile's second piece is all padding. Every real
-    logit is near -128 (each query 32 and each key -64 along one feature, the scale 1/16 at width 256), so a
-    padded key's logit of 0 would weigh exp(128): the gradients on par with the reference (check 1)."""
+    its 64 keys) under the interpreter: the query's, key's and value's gradients."""
+    accurate, config = _backward_form("fused-shared-keys")
+    with _device(interpret=True):
+        residuals = attention_mosaic.forward(query, key, value, spans, None, interpret=True,
+                                             residuals=template.Kept.SPLIT)[1:]
+        with _pinned(backward=config):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                              accurate=accurate, interpret=True)
+    return grads.query, grads.key, grads.value
+
+
+@INTERPRETS
+def test_a_shared_key_backward_over_a_partial_key_tile_is_on_par_with_the_reference():
+    """The shared-key launch over 96 keys, whose last tile's second piece is all padding, under the
+    interpreter: the gradients on par with the reference over drawn operands (check 1)."""
     shape, keys, width = (1, 128, 2, 1), 96, 256
     spans = template.spans(shape[1], keys, shape[0])
-    accurate, config = _backward_form("fused-shared-keys")
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        query = rng.standard_normal((shape[0], shape[1], shape[2], width)) * 1e-2
-        key = rng.standard_normal((shape[0], keys, shape[3], width)) * 1e-2
-        query[..., 0], key[..., 0] = 32.0, -64.0
-        value = rng.standard_normal((shape[0], keys, shape[3], width))
-        dout = rng.standard_normal((shape[0], shape[1], shape[2], width))
-        return tuple(jnp.asarray(array, jnp.bfloat16) for array in (query, key, value, dout))
-
-    def ours(query, key, value, dout):
-        with _device(interpret=True):
-            residuals = attention_mosaic.forward(query, key, value, spans, None, interpret=True,
-                                                 residuals=template.Kept.SPLIT)[1:]
-            with _pinned(backward=config):
-                grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
-                                                  accurate=accurate, interpret=True)
-        return grads.query, grads.key, grads.value
+        return tuple(jnp.asarray(rng.standard_normal(extent), jnp.bfloat16)
+                     for extent in ((shape[0], shape[1], shape[2], width), (shape[0], keys, shape[3], width),
+                                    (shape[0], keys, shape[3], width), (shape[0], shape[1], shape[2], width)))
 
     def reference(query, key, value, dout):
         _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None), query, key, value)
         return pull(dout)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "a shared key tile past the keys", seeds=SEEDS,
-                    terms=_gradient_terms(spans))
+    assert_as_exact(jax.jit(functools.partial(_shared_key_backward, spans)), jax.jit(reference), draw,
+                    "a shared key tile past the keys", seeds=SEEDS, terms=_gradient_terms(spans))
+
+
+@INTERPRETS
+def test_a_shared_key_backward_over_a_partial_key_tile_reads_no_padded_key():
+    """The shared-key launch over 96 keys under the interpreter, every real logit near -128 (each query 32
+    and each key -64 along one feature, the scale 1/16 at width 256) and the output's cotangent zero: a
+    padded key's logit of 0 would weigh exp(128), past fp32's largest, whose zero cotangent makes NaN of
+    every query's gradient. The gradients are the reference's, zero, and finite (the stability rule's
+    claims on the fast form, docs/design/testing.md)."""
+    shape, keys, width = (1, 128, 2, 1), 96, 256
+    spans = template.spans(shape[1], keys, shape[0])
+    rng = np.random.default_rng(0)
+    query = rng.standard_normal((shape[0], shape[1], shape[2], width)) * 1e-2
+    key = rng.standard_normal((shape[0], keys, shape[3], width)) * 1e-2
+    query[..., 0], key[..., 0] = 32.0, -64.0
+    value = rng.standard_normal((shape[0], keys, shape[3], width))
+    operands = tuple(jnp.asarray(array, jnp.bfloat16) for array in (query, key, value, np.zeros_like(query)))
+    for grad in jax.jit(functools.partial(_shared_key_backward, spans))(*operands):
+        np.testing.assert_array_equal(np.asarray(grad, np.float32), 0.0)
 
 
 @INTERPRETS

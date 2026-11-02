@@ -636,9 +636,12 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
                    'kimi-linear-kda, no floor': (32, 32, 128, 128, True),
-                   'nemotron-h-4b-ssd': (8, 96, 128, 80, False)}
-"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`): key heads,
-value heads, key and value widths, and whether the decay is a key dimension's."""
+                   'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
+                   'a 192-wide value head': (16, 16, 128, 192, False)}
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`), and a gated
+delta rule's value head 192 wide, whose training launches take a value block of whole staged blocks (a
+bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value widths,
+and whether the decay is a key dimension's."""
 
 FLOORLESS = frozenset({'kimi-linear-kda, no floor'})
 """The gate's geometries under a decay a key dimension that declare no floor: each sub-chunk's own pairs
@@ -798,16 +801,19 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
                for training in (False, True) for variant in (None, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
+               and (name != 'a 192-wide value head' or (training and dtype == jnp.bfloat16 and not packed))
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
                                                            ('kimi-linear-kda, no floor', jnp.bfloat16),
-                                                           ('nemotron-h-4b-ssd', jnp.bfloat16)})
+                                                           ('nemotron-h-4b-ssd', jnp.bfloat16),
+                                                           ('a 192-wide value head', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group: every
 geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the training pass of the
 gated delta rule in both and of Kimi delta attention and the SSD in 16 bits (Kimi's keys, 128 wide, past what
-an fp32 call takes under a decay a key dimension); one row's 16-bit forward at its derived tiles apart from
+an fp32 call takes under a decay a key dimension), and the 192-wide value head's 16-bit training pass alone;
+one row's 16-bit forward at its derived tiles apart from
 each of its variants (`variant`, a test each: an fp32 forward, which every family refuses, has none). One test
 compiling them all took 674 seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three
 variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada)."""
@@ -1000,9 +1006,7 @@ def _gated(target: str, group: tuple):
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
-                                           for group in GATE_GROUPS
-                                           # The SSD's A100 forward output launch's model miss is row 2943's.
-                                           if not (target == 'sm80' and group[0] in RATED and not group[2])])
+                                           for group in GATE_GROUPS])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,

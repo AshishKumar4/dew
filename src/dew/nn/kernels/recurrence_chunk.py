@@ -41,7 +41,7 @@ from dew.algebra.scan import RESET_DECAY
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, l2norm
-from dew.nn.sharding import grouped_heads, manual_map, rows_like
+from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .generation import INHERENT, triton_runs
@@ -797,8 +797,9 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
     reset = None if starts is None else "first"
     declared = axes if reset is None else {**axes, reset: ("time",)}
-    # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it.
-    ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound})}
+    # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
+    # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
+    ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), dtype), reset=reset, ranges=ranges),
                              saturation=SATURATION)
@@ -816,7 +817,12 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     if reset is not None:
         # Each head's tokens reset where their row's document starts; a padded token starts none.
         operands[reset] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
-    entering = (jnp.zeros((rows, heads, width, columns), dtype) if state is None else state.astype(dtype))
+    # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
+    # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
+    # do, keys, gates or resets replicated or not.
+    varying = (query, key, value, g, beta, starts)
+    entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), dtype), value) if state is None
+                            else state.astype(dtype), *varying)
 
     def walked(operands, h):
         # Each chunk's values that read no memory at once; the memory alone in sequence; then each chunk's
@@ -826,7 +832,8 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
         def one(carried, chunk):
             return forms.step(carried, chunk), carried
 
-        carried, entering = jax.lax.scan(one, (jnp.zeros((width,), jnp.float32), h), prepared)
+        decayed = varying_like(jnp.zeros((width,), jnp.float32), *jax.tree.leaves(operands))
+        carried, entering = jax.lax.scan(one, (decayed, h), prepared)
         outputs = jax.vmap(forms.mapped)(prepared, entering)
         return outputs.reshape(-1, columns), carried[1]
 

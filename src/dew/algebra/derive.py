@@ -415,20 +415,19 @@ DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
 PLAIN = _plain()
 
 
-UNBOUNDED = Work(operations=math.inf)
-"""A reading's work (`_priced`): a form that keeps one is no form."""
 _READINGS = (Term.stepped, Term.merged, Term.finished, Term.held)
 
 
 def _priced(region: terms.Region, schedule) -> DagCostModel:
     """The template's tile walk's price of each node (`cost.model` under `cost.walk`: a form the template's
     algebra takes runs between its mainloop's products, not as XLA fuses it), each of the derivation's
-    readings unbounded."""
+    readings infinite in every schedule (`cost.Seconds.extra`: a form that keeps one is no form, whatever
+    rates the target states)."""
     timed = cost.model(region, schedule)
 
     def marginal(graph: EGraph, node) -> cost.Seconds:
         if any(get_callable_args(node, reading) is not None for reading in _READINGS):
-            return cost.Seconds(UNBOUNDED, schedule)
+            return cost.Seconds(Work(), schedule, math.inf)
         return timed.marginal_cost(graph, node)
 
     return DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
@@ -482,17 +481,9 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                      for reduction, aval in zip(made.reductions, typed, strict=True))
 
     def carried(made: _Forms, *states) -> dict:
-        return {str(Term.state(i64(index), i64(side))): state[index] for side, state in enumerate(states)
+        return {terms.key(Term.state(i64(index), i64(side))): state[index]
+                for side, state in enumerate(states)
                 for index in range(len(made.reductions))}
-
-    def held(state) -> _Forms:
-        # The forms a state's walk took: the merges and finishes read the state alone, so its shapes name
-        # them whatever tile the walk took.
-        shapes = tuple(tuple(value.shape) for value in state)
-        for made in reversed(cache.values()):
-            if tuple(made.region.shape(reduction) for reduction in made.reductions) == shapes:
-                return made
-        raise Refused(f"a state of shapes {shapes} no walk formed (`init`, `step`)")
 
     def step(state, tiles, *, product=None, accumulate=None, outputs: Sequence[int] = ()):
         made = forms(shaped(tiles))
@@ -514,16 +505,16 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                 raise Refused(f"output {index} is no output along the walked axis")
         return tuple(stepped), tuple(value(made.outputs[index]) for index in outputs)
 
-    def merge(a, b, operands=None):
-        made = held(a)
+    def merge(a, b, operands=None, *, shapes: Mapping):
+        made = forms(shapes)
         # A merge reads no walked operand (`_derived`), its unwalked ones whole.
         leaves = [*made.consts, *(None if operands is None or name in walked_axes else operands[name]
                                   for name in names)]
         value = evaluator(made.region, leaves, carried(made, a, b))
         return tuple(value(form) for form in made.merges)
 
-    def finish(state, operands=None):
-        made = held(state)
+    def finish(state, operands=None, *, shapes: Mapping):
+        made = forms(shapes)
         leaves = [*made.consts, *(None if operands is None else operands[name] for name in names)]
         value = evaluator(made.region, leaves, carried(made, state))
         # A literal output is its literal; one along the walked axis, `mapped`'s.
@@ -586,8 +577,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
     with jax.disable_jit():
         closed = jax.make_jaxpr(inlined(named))(*avals)
-    first = len(closed.jaxpr.constvars)
-    region = terms.region(closed, {first + index: declaration.ranges[name] for index, name in enumerate(names)
+    # The ranges by input, as the region reads them (its constants apart).
+    region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
                                    if name in declaration.ranges})
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
@@ -597,11 +588,11 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     graph.run(WALKING.saturate())
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
-    reductions = tuple({str(term): term for term in found}.values())
+    reductions = tuple({terms.key(term): term for term in found}.values())
     for index, reduction in enumerate(reductions):
         graph.register(set_(slot(reduction)).to(i64(index)))
         region.params.append((jax.lax.convert_element_type_p, {
-            "new_dtype": region.dtypes[str(reduction)], "weak_type": False, "sharding": None}))
+            "new_dtype": region.dtypes[terms.key(reduction)], "weak_type": False, "sharding": None}))
         graph.register(set_(retype(i64(index))).to(i64(len(region.params) - 1)))
         for side in (0, 1):
             graph.register(set_(rules.shape(Term.state(i64(index), i64(side)))).to(
@@ -756,7 +747,7 @@ def _operand_and_result_shapes(region: terms.Region, index: int):
     for term, extent in region.shapes:
         args = get_callable_args(term, Term.shaped) or get_callable_args(term, Term.reduce)
         if args is not None and int(get_literal_value(args[-1])) == index:
-            return region.extents.get(str(args[0])), extent
+            return region.extents.get(terms.key(args[0])), extent
     return None, None
 
 
@@ -795,7 +786,7 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
     anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
     lifted = set()
     for reduction in reductions:
-        to = region.extents.get(str(reduction))
+        to = region.extents.get(terms.key(reduction))
         if to is None:
             continue
         for given in anchors:

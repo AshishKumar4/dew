@@ -381,22 +381,29 @@ derive it from its arguments' facts.
 | `rounding(t)` | `String` (`exact`, `reorders`, `bounded`) | the worse | the compile-time admission of a set |
 
 What is built of the table: `shape`, and `range` as a bound on each value's magnitude
-(`terms.Magnitude`): `2**log2` times a product of powers of the program's unbounded operands' magnitudes
-(each at least 1, one slot an operand). The region states it as it traces a program
-(`terms.Region.magnitudes`). A constant's bound is its largest element, and a declared operand's is its range
-(`scan.Scan.ranges`: l2-normalised keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no
-declared range takes a slot of its own. Each equation in the language composes its operands' bounds: sums
-take twice the larger, products multiply, contractions and sums along an axis multiply by their length, and a
-bounded function (`tanh`, a comparison) is 1. An exponential of an operand, or a quotient, has no bound.
+(`terms.Magnitude`): a number, `|x| <= 2**log2`, proved from the program's constants, its declared ranges and
+its equations, or none. The region states it as it traces a program (`terms.Region.magnitudes`). A
+constant's bound is its largest element's magnitude (a complex one's modulus), and a declared operand's is its
+range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's constants apart: l2-normalised
+keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
+outside the language, has none. Each equation in the language composes its operands' bounds: sums take twice
+the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
+function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`) is 1, a complex operand's sine
+or tangent none (`sin(pi/2 + 89j)` is 2.2e38). An exponential of an unbounded operand, or a quotient, has no
+bound; an exponential of an operand at most 0 is at most 1.
 
 The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
-finite. A reordering is admitted only when every new intermediate it makes has a bound that is a number, from
-declared ranges and constants alone with no unbounded operand's power, and that bound is under one the program as
-written reaches, or under the narrowest float's largest power of two (`rules.reaches`; `rules.dominated`): a number
-bound under the float's largest is a finite value's. A bound over an unbounded operand bounds nothing: the
-reference's value may sit far below it while the new intermediate overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is
-finite, and `0.5 (x + y)` is not. Each rule computes its new intermediates' bounds from its
-operands' (`rules.log2_bound`, `rules.degree`) and states them for the rules after it (`rules.made`).
+finite. A reordering is admitted only when every new intermediate it makes has a number bound under the
+program's reach, the narrowest float's largest power of two (`rules.reach`; `rules.dominated`): a number bound
+under the float's largest is a finite value's wherever the program's values are. A value no number bounds
+admits nothing: the reference's value may sit far below any bound over it while the new intermediate
+overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. Each rule computes its new
+intermediates' bounds from its operands' (`rules.log2_bound`) and states them for the rules after it
+(`rules.made`); a new reduction bounds its new sum of terms and itself, its length's power above them
+(`rules.sum_length`): `sum(x) + sum(y)` of `x = [2**126, 2**126]` and `y = [2**126 - 2**102, 2**126 - 2**103]`
+is float32's largest, while `sum(x + y)` overflows. A scan's solve inverse, a prepared operand, is bounded by
+`(1 + a)^(C - 1)` over a chunk of `C` tokens, `a` an overlap's bound: the corrections' elementwise bounds'
+product times the keys' count it contracts (two tokens of 16 unit keys overlap by 16).
 
 So `a*x + a*y -> a*(x + y)` fires only where `x` and `y` carry declared ranges that keep their sum under what
 the program reaches. The delta rule's carry does not distribute its solve over `U - W h`, which is fla's WY
@@ -506,12 +513,20 @@ class Extraction:
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
-  an operation's work by unit (tensor-core FLOPs, CUDA-core fp32 operations, SFU exponentials, conversions) and
-  its bytes by level (device memory, shared memory). The algebra's terms price through it (`cost.work`: a
-  product's FLOPs and operand bytes, a reduction's operations and the bytes it reads, a special function's
-  exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing).
-  A template's instructions price through the same record. No per-operation price exists anywhere else.
-- A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts:
+  an operation's work by unit (tensor-core FLOPs by mode, the 16-bit mode's and TF32's; CUDA-core fp32
+  operations, a product at `Precision.HIGHEST` among them; SFU exponentials; conversions) and its bytes by
+  level (device memory, shared memory). The algebra's terms price through it (`cost.work`: a product's FLOPs in
+  its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
+  algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
+  exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
+  a leaf's bytes, read once). A template's instructions price through the same record. No per-operation price
+  exists anywhere else.
+- A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each
+  unit's rate from them (`templates.cost.rates`); a unit a target states no rate of (a TPU's vector and
+  transcendental units, which no primary source states) is priced by none, and a form is cheaper only where it
+  takes fewer seconds and no more of that work (`cost.cheaper`), so it is cheaper whatever the rate. A process
+  of no accelerator prices as the interpreted templates' H100, a GPU no row names by its family's and its
+  runtime's facts (`cost.target`):
   - XLA's fusion (`cost.fused`), for the compile-time pass over a program and error-aware extraction. A
     program's operands are read from device memory once, however many reductions read them (XLA's fusion
     reads a sibling reduction's inputs once), and elementwise work fuses into its consumer. Each unit's work
@@ -521,9 +536,16 @@ class Extraction:
     unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
 - Where a rewrite is one XLA makes itself (`Rules.xla`: commutativity, which its HloCSE ignores; the sums'
   linearity, which its multi-output fusion matches), the model does not decide its profit: the pass takes it
-  only where XLA's own cost analysis of the compiled candidate is lower (`program.xla_seconds`). A pass whose
-  admitted sets are all XLA's (the accurate numerics') does not run. The e-graph decides for the algebra XLA
-  does not derive (distribution, factoring through contractions, scale folds).
+  only where XLA's own cost analysis of the compiled window is lower with it (`program.xla_priced`). Which
+  forms those are is a root's provenance, not the matches a saturation counted: a region saturates under
+  XLA's sets first, its e-graph kept (egglog's `push`), and where a form is taken, a root whose form XLA's sets
+  alone reach (`Rewrite.xla_own`) is XLA's to decide, whatever else the window rewrites. A pass whose admitted
+  sets are all XLA's (the accurate numerics') does not run. The e-graph decides for the algebra XLA does not
+  derive (distribution, factoring through contractions, scale folds).
+- The pass saturates and extracts each window cluster in an e-graph of its own (§6.7): clusters share no
+  equation. One e-graph of a program's every window grew its extraction with the program: a gemma3n training
+  step's took past 500 seconds, 14 million cost additions in one extraction. A term keys a dictionary by its
+  declaration (`terms.key`), not its text, which egglog formats through black at about a millisecond a term.
 - Extraction for a template's interface prices candidates through the tile walk; the compile-time pass prices
   them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.
@@ -587,6 +609,13 @@ class Rewrite:
 - The pass sits where a function is jitted (§2): `OuterProgram._jitted` jits `rewritten(fn)`, so `lower`,
   `trace`, `compiled` and every relowering read one program; `Trainer._jitted` jits the rewritten step, the
   host-master phases and the rollouts theirs. `footprint`'s `make_jaxpr` traces the same rewritten function.
+- A region is a window cluster (`program._windows`): each head a rule may lower the price at with the
+  equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up to
+  `CLUSTER` equations, each saturated and extracted in an e-graph of its own (§6.5), its cheaper roots' forms
+  spliced where their equations stood. A region whose only bounded terms are its literals builds no e-graph
+  (`rules.reorderable`): every reordering makes its new intermediate of an operand the program bounds (§6.3),
+  and commutativity alone leaves every price as it was. Most of a training step's regions are its own math
+  over unbounded values: a gemma3n step's 2879 each fired commutativity alone.
 - `passes` is the seam's switch. `PASSES` lives in JAX's trace context, so every jit and every executable map
   that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
   never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
@@ -635,13 +664,23 @@ forms where the declarations state the walk:
 
 - The attention forward. Every mainloop's step, merge and finish take the declaration's forms, with the sums
   in the mainloop's own accumulator and every product through its own issuer. The declaration covers
-  natural and base-2 exponents, keys-first tiles, dropout's multipliers, initial states and score hooks.
+  natural and base-2 exponents, keys-first tiles, initial states and score hooks; its products sum in fp32.
+  A dropping call's step keeps the template's: the declaration narrows a dropped weight unnormalized, past
+  fp16's largest at a rate near 1, where the template's scaled parts keep it. A walk's merge and finish name
+  the forms they read by the walk's tiles (`Derived.merge`, `finish`: a state's values alone name no walk, a
+  bf16 walk's fp32 sums being an fp32 walk's too); the attention state's merge and finish read the same
+  forms at any keys a tile or values' dtype, so the template names its base's walk at the state's rows and
+  width (`attention_algebra._stated`), whatever walk came before.
 - The attention backward. The plain-JAX mainloop walks dQ over the keys and dK and dV over the queries by
-  the backward declaration's forms. Every Mosaic backward launch takes its tiles' weights and score
-  cotangents from the tile declaration (`softmax_cotangents`) over its own products. Both cover hooks'
-  slopes, dropout, the first pass's D and initial states.
+  the backward declaration's forms, each launch's tile reader and hook gradients shared with its
+  hand-written algebra; its dP sums in fp32 and its cotangents take the scale before their products, the
+  reference's order. Every Mosaic backward launch takes its tiles' weights and score cotangents from the
+  tile declaration (`softmax_cotangents`) over its own products. Both cover hooks' slopes, dropout, the
+  first pass's D and initial states.
 - The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
-  (`derived_rule`). The Mosaic mainloop takes its system's pairs and its readout's scores from tile
+  (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
+  `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
+  carries typed as its operands vary. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
   prefix's decays.
 

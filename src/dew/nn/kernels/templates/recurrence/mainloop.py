@@ -463,15 +463,20 @@ def _masks(rows: int, columns: int) -> list:
     return [(rows, columns, jnp.int32)]
 
 
-def _product(call: _Call, lhs: tuple, rhs: tuple) -> list:
+def _product(call: _Call, lhs: tuple, rhs: tuple, *, rhs_transposed: bool = False,
+             rhs_swizzle: int | None = None) -> list:
     """The operand fragments one product `[rows, depth] @ [depth, columns]` holds at once where the family's
     products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
     depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
-    (`Family.fragment_depth`), each in the warps replicating it (`lhs_copies`, `rhs_copies`): the GEMM's own
-    rule (`resources.operand_fragments`, each operand's parts); none where they read shared memory."""
+    (`Family.fragment_depth`), or where it is staged transposed (`rhs_transposed`: its depth its stage's
+    columns, a key tile's in `Q Kᵀ`) a whole swizzle of its depth (`rhs_swizzle` bytes, the widest its rows
+    fill where None), as its load takes it (`Family.rhs_fragment_depth`), each in the warps replicating it
+    (`lhs_copies`, `rhs_copies`): the GEMM's own rule (`resources.operand_fragments`, each operand's parts);
+    none where they read shared memory."""
     (left, rows, depth), (right, _, columns) = lhs, rhs
     return resources.operand_fragments(call.family, rows, depth, columns, left.stored, right.stored,
-                                       lhs_parts=left.parts, rhs_parts=right.parts)
+                                       lhs_parts=left.parts, rhs_parts=right.parts,
+                                       rhs_transposed=rhs_transposed, rhs_swizzle=rhs_swizzle)
 
 
 def _widest(*tiles: list) -> list:
@@ -905,18 +910,23 @@ def _solves_apart(call: _Call) -> bool:
     return _merged(call).parts > 1
 
 
+def whole_blocks(width: int, block: int) -> list[int]:
+    """The widths a row of `width` steps through a whole number of `block`s at a time, widest first, each
+    dividing it: a row's every block staged whole (192 columns of 64-column blocks take 192 or 64, never
+    96, which cuts a 64-column swizzle)."""
+    return [each for each in range(width, 0, -block) if width % each == 0 and each % block == 0]
+
+
 def _fitting_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple], widest: int,
-                   narrowest: int) -> int:
-    """A launch's block of a row it takes a block at a time: `widest` halved down to `narrowest` until its
-    register model (`held(block)`, `_Held`, beside its addresses into its staging and landing tiles there,
-    `staged(block)`) fits a consumer thread's registers (`Family.registers`), as the launch states them; the
-    narrowest where none does, which the launch then refuses."""
+                   unit: int) -> int:
+    """A launch's block of a row it takes a block at a time: the widest whole number of `unit`s dividing
+    `widest` (`whole_blocks`) whose register model (`held(block)`, `_Held`, beside its addresses into its
+    staging and landing tiles there, `staged(block)`) fits a consumer thread's registers
+    (`Family.registers`), as the launch states them; `unit` where none does, which the launch then
+    refuses."""
     family = call.family
-    block = widest
-    while block > narrowest and (held(block).registers(family, _addressed(*staged(block)))
-                                 > family.registers(1)):
-        block //= 2
-    return block
+    return next((block for block in whole_blocks(widest, unit)
+                 if held(block).registers(family, _addressed(*staged(block))) <= family.registers(1)), unit)
 
 
 def _key_block(call: _Call, held: Callable[[int], _Held], staged: Callable[[int], tuple]) -> int:
@@ -1588,7 +1598,23 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     return blocks, staging
 
 
-def _output_held(call: _Call, bv: int) -> _Held:
+def _output_swizzle(call: _Call, bv: int, staging: tuple, landing: dict) -> int:
+    """The swizzle `_output` stages its keys at under a decay a head (`Kᵀ` read transposed, each load a
+    whole swizzle of its depth, `Family.rhs_fragment_depth`): the widest its key rows fill whose consumer
+    thread's registers fit (`_output_held`, beside its addresses into its `staging` and `landing` tiles),
+    halved down to the narrowest Mosaic stages; the narrowest where none fits, which the launch then refuses.
+    Nemotron-H 4B's SSD output held a bf16 key block's whole 64-column depth at 128 bytes, 255 registers
+    and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (ssd80, row 2943)."""
+    family = call.family
+    swizzle = mosaic.widest_swizzle(call.given.stored, call.width)
+    while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
+            _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
+            > family.registers(1)):
+        swizzle //= 2
+    return swizzle
+
+
+def _output_held(call: _Call, bv: int, swizzle: int | None = None) -> _Held:
     """What `_output`'s consumer thread holds. Under a decay a head: a value block's phase, its output's
     fp32 sum (the memory's and the local product's, each its own accumulator where products overlap,
     `Family.products_overlap`), its values and one product's fragments (`_product`); and the first step's
@@ -1619,7 +1645,11 @@ def _output_held(call: _Call, bv: int) -> _Held:
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + ([_f32(CHUNK, CHUNK // 2)] if call.gated_keys else []))
-    scored = _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK))
+    # The keys staged as they arrive, a token a row: `Kᵀ`'s depth its stage's columns, a whole swizzle of it
+    # a load (`swizzle`, `_output_swizzle`'s; a 128-byte one's 64 bf16 columns held Nemotron-H 4B's SSD
+    # output 48 registers past a model of 16, 255 and a spill on an A100, where it stated 216; row 2943).
+    scored = _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK), rhs_transposed=True,
+                      rhs_swizzle=swizzle)
     if call.value_width // bv == 1:
         return _Held(phases=(values + products, scores + scored))
     # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
@@ -1729,11 +1759,14 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
     # memory and local products.
     scored = 0 if call.per_key else 2 * CHUNK * CHUNK * width
     work = Work(scored + 2 * CHUNK * (width + CHUNK) * value_width, steps)
+    landing = {"out": ((CHUNK, bv), out_dtype)}
+    swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
+    keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(8), work=work,
-                   held=_output_held(call, bv), staging=staging, landing={"out": ((CHUNK, bv), out_dtype)},
+                   held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
                    # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes alone).
-                   persistent=True, reduces=held.parts > 1)(
+                   persistent=True, reduces=held.parts > 1, swizzles=keys)(
         q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken, beta,
         *(() if skip is None else (skip.astype(jnp.float32),)))
 

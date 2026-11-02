@@ -93,21 +93,22 @@ def _carried():
     shape = rules.shape
     # A matrix product's contraction's length's power: its left operand's columns'.
     contracted = (eq(left).to(shape(x)), eq(length).to(rules.log2_of(left[i64(1)])))
-    facts, power, degrees = rules.magnitude(x, "x")
     transposed = x.shaped(String("transpose"), s)
+    power = var("power", i64)
     sets = [
-        # x^T @ y as transpose(x) @ y, so it associates and factors with plain products; the transpose a
-        # layout of x, of its magnitude.
+        # x^T @ y as transpose(x) @ y, so it associates and factors with plain products: exact, a layout of
+        # x, whose magnitude it takes where x has one.
         rule(eq(t).to(x.dot(y, p)), eq(m).to(plain_of(p)), eq(s).to(swap_of(p)), rules.matrix(x),
-             rules.matrix(y), eq(reads(y)).to(one), *facts).then(
-            union(t).with_(transposed.dot(y, m)), *rules.made(transposed, power, degrees)),
+             rules.matrix(y), eq(reads(y)).to(one)).then(union(t).with_(transposed.dot(y, m))),
+        rule(eq(t).to(x.shaped(String("transpose"), s)), eq(power).to(rules.log2_bound(x))).then(
+            *rules.made(t, power)),
     ]
     # x @ (y @ z) as (x @ y) @ z, the state's product last: x @ y new.
-    facts, power, degrees = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
+    facts, power = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
     sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), rules.matrix_product(m), rules.matrix(x),
                      rules.matrix(y), rules.matrix(z), eq(reads(z)).to(one), *contracted, *facts,
-                     *rules.dominated(power, degrees, "new")).then(
-        union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power, degrees)))
+                     *rules.dominated(power, "new")).then(
+        union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power)))
     for combined in ("add", "sub"):
         plain = (rules.matrix_product(m), rules.plain(q), rules.matrix(x), rules.matrix(y), rules.matrix(z))
         # x @ (y +- z) as x @ y +- x @ z: both new.
@@ -115,17 +116,16 @@ def _carried():
         with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
         sets.append(rule(eq(t).to(x.dot(y.binary(combined, z, q), m)), *plain, eq(shape(y)).to(shape(z)),
                          eq(reads(y.binary(combined, z, q))).to(one), *contracted, *with_y[0], *with_z[0],
-                         *rules.dominated(with_y[1], with_y[2], "y"),
-                         *rules.dominated(with_z[1], with_z[2], "z")).then(
+                         *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z")).then(
             union(t).with_(x.dot(y, m).binary(combined, x.dot(z, m), q)),
-            *rules.made(x.dot(y, m), with_y[1], with_y[2]), *rules.made(x.dot(z, m), with_z[1], with_z[2])))
+            *rules.made(x.dot(y, m), with_y[1]), *rules.made(x.dot(z, m), with_z[1])))
         # x @ z +- y @ z as (x +- y) @ z: x +- y new.
-        facts, power, degrees = rules.summed_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"))
+        facts, power = rules.summed_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"))
         added = x.binary(combined, y, q)
         sets.append(rule(eq(t).to(x.dot(z, m).binary(combined, y.dot(z, m), q)), *plain,
                          eq(shape(x)).to(shape(y)), eq(reads(z)).to(one), *facts,
-                         *rules.dominated(power, degrees, "new")).then(
-            union(t).with_(added.dot(z, m)), *rules.made(added, power, degrees)))
+                         *rules.dominated(power, "new")).then(
+            union(t).with_(added.dot(z, m)), *rules.made(added, power)))
     return ruleset(*sets, name="carried")
 
 
@@ -209,7 +209,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     schedule = cost.walk(cost.target())
     carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule))
     emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule))
-    prepared = list({str(term): term for form in (*carry_forms, *emit_forms)
+    prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     consts = list(closed.consts)
 
@@ -219,7 +219,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
 
     def reading_forms(chosen: list[Term]) -> Callable:
         def run(given: tuple, h) -> tuple:
-            known = {str(term): value for term, value in zip(prepared, given, strict=True)}
+            known = {terms.key(term): value for term, value in zip(prepared, given, strict=True)}
             leaves = [*([None] * first), h]
             return tuple(forms.evaluated(region, form, leaves, known) for form in chosen)
 
@@ -245,6 +245,8 @@ def _products(graph: EGraph, region: terms.Region) -> None:
         if not graph.check_bool(rules.plain(i64(index))):
             continue
         made = _parameters(region, primitive, {**params, "dimension_numbers": plain})
+        # The plain product multiplies the transposed one's operands (`terms.Region.products`).
+        region.products.setdefault(made, region.products.get(index, ()))
         swapped = _parameters(region, jax.lax.transpose_p, {"permutation": (1, 0)})
         graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
                        set_(plain_of(i64(index))).to(i64(made)), set_(swap_of(i64(index))).to(i64(swapped)))

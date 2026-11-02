@@ -75,13 +75,16 @@ def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_
     assert default.chosen.seconds == min(candidate.seconds for candidate in admitted)
 
 
+@pytest.mark.parametrize("target", [None, "v5e"], ids=["here", "a TPU"])
 @pytest.mark.parametrize(("function", "stable"), [
     (lambda x: jnp.log(1.0 + x), "log1p"), (lambda x: jnp.exp(x) - 1.0, "expm1")])
-def test_a_small_values_digits_are_kept_by_its_stable_form(function, stable):
+def test_a_small_values_digits_are_kept_by_its_stable_form(function, stable, target):
     """`log(1 + x)` and `exp(x) - 1` of a millionth lose most of its digits; the accurate policy takes
-    `log1p(x)` and `expm1(x)`, which the form as written is not as exact as."""
+    `log1p(x)` and `expm1(x)`, which the form as written is not as exact as, priced here or for a TPU, whose
+    vector units' rate no fact states: the stable proposal's risk is seconds of its own."""
     admits = gate(function, small)
-    choice = choose(function, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    with algebra.passes(target=target):
+        choice = choose(function, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert stable in primitives(choice.chosen.function, small(0))
     assert not admits(function, choice.chosen.function)
 
@@ -95,3 +98,16 @@ def test_a_chosen_form_returns_the_functions_outputs(function):
                     admits=gate(function, small))
     assert_as_exact(jax.jit(choice.chosen.function), jax.jit(function), small, "a chosen form's outputs",
                     seeds=8)
+
+
+def test_a_form_an_equation_outside_the_language_reads_is_the_one_its_candidate_computes():
+    """`log(1 + x)` read by a strided slice (an equation outside the language, `terms.Region.opaque`): the
+    accurate policy prices the slice's input as `log1p(x)` and its candidate computes that form, keeping a
+    millionth's digits (`log1p` among its primitives, and as exact as the form as written is not)."""
+    def sliced(x):
+        return jnp.log(1.0 + x)[:, ::2]
+
+    admits = gate(sliced, small)
+    choice = choose(sliced, OPERANDS, accurate=True, saturation=algebra.SATURATION, admits=admits)
+    assert "log1p" in primitives(choice.chosen.function, small(0))
+    assert not admits(sliced, choice.chosen.function)

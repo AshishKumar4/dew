@@ -735,3 +735,37 @@ def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
 
     assert_as_exact(jax.jit(tangent("v6e")), jax.jit(tangent()), draw, "a TPU's scan under jvp",
                     seeds=PORTABLE_SEEDS, truth_fn=tangent())
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("replicated", [(), (2, 5)], ids=["every operand split", "values and memory whole"])
+@pytest.mark.parametrize("entering", [False, True], ids=["zero memory", "a memory entering"])
+def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering, replicated):
+    """The portable math's forms derived from the token update behind the switch
+    (`dew.algebra.forms.derived`, `recurrence_chunk.derived_rule`) inside a `shard_map` that checks varying
+    axes over operands that vary by row, or with the values and the entering memory whole beside split keys
+    and gates, from a zero memory and from one that enters: its carries vary as its operands do, and its
+    outputs and gradients are finite."""
+    keys = jax.random.split(jax.random.key(2911), 7)
+    q = l2norm(jax.random.normal(keys[0], (2, 32, 1, 16)))
+    k = l2norm(jax.random.normal(keys[1], (2, 32, 1, 16)))
+    v = jax.random.normal(keys[2], (2, 32, 2, 16))
+    g = -jnp.exp(jax.random.normal(keys[3], (2, 32, 2)) - 2.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (2, 32, 2)))
+    state = jax.random.normal(keys[5], (2, 2, 16, 16)) if entering else None
+    do = jax.random.normal(keys[6], v.shape)
+    rows = P("data")
+
+    def rule(q, k, v, g, beta, *given):
+        return recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, *given, chunk_size=16)[0]
+
+    operands = (q, k, v, g, beta, *(() if state is None else (state,)))
+    # A whole operand holds one device's rows, the same on every device.
+    operands = tuple(x[:1] if index in replicated else x for index, x in enumerate(operands))
+    specs = tuple(P() if index in replicated else rows for index in range(len(operands)))
+    mapped = jax.shard_map(rule, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=specs,
+                           out_specs=rows, check_vma=True)
+    with algebra_forms.derived():
+        got = jax.jit(jax.value_and_grad(lambda *given: jnp.sum(mapped(*given) * do),
+                                         argnums=range(len(operands))))(*operands)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(got))

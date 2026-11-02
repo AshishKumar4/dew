@@ -8,7 +8,7 @@ the reals and differ in error, which depends on every operand form a candidate r
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 
 import jax
 from egglog import Vec
@@ -53,7 +53,7 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     for name, model in (("cheapest", timed), ("stable", cost.stable(region, cost.fused(facts)))):
         chosen, _ = program.extracted(graph, bundle, model)
         candidates.append(Candidate(name, _priced(region, chosen, timed),
-                                    _valued(region, closed.consts, dict(zip(map(str, roots), chosen,
+                                    _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen,
                                                                             strict=True)), tree)))
     references = candidates if accurate else candidates[:1]
     admitted = [candidate for candidate in candidates
@@ -73,14 +73,15 @@ def _priced(region: terms.Region, chosen: list[terms.Term], model) -> float:
     return price.value
 
 
-def _valued(region: terms.Region, consts, chosen: dict[str, terms.Term], tree) -> Callable:
+def _valued(region: terms.Region, consts, chosen: dict[Hashable, terms.Term], tree) -> Callable:
     """The function `region`'s program computes with each root in its chosen form (`chosen`, by the root's
-    text), over its operands: each output its root's form, a literal output its literal, in the program's
-    output structure `tree`, an equation outside the language evaluated where a form reads its leaf."""
+    key, `terms.key`), over its operands: each output its root's form, a literal output its literal, in the
+    program's output structure `tree`, an equation outside the language evaluated where a form reads its
+    leaf, over its own inputs' chosen forms (the roots too), so the candidate computes the forms it was
+    priced as."""
     def valued(*operands):
-        leaves = [*consts, *operands]
-        outputs = [literal if term is None else
-                   forms.evaluated(region, chosen.get(str(term), term), leaves, {})
+        value = forms.evaluator(region, [*consts, *operands], {}, chosen=chosen)
+        outputs = [literal if term is None else value(chosen.get(terms.key(term), term))
                    for term, literal in zip(region.outputs, region.literal_outputs, strict=True)]
         return jax.tree.unflatten(tree, outputs)
     return valued

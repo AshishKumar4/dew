@@ -55,6 +55,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _views,
     _walk_stores,
     kept_forward,
+    whole_blocks,
 )
 
 
@@ -638,8 +639,8 @@ def _query_key_split(call: _Call) -> int:
         return resources.shared_bytes(call.family, scope(1))
 
     budget = generation.shared_budget(call.target)
-    widths = [vq for vq in range(call.value_width, 0, -call.block) if call.value_width % vq == 0]
-    return next((vq for vq in widths if streamed(vq) <= budget), call.block)
+    return next((vq for vq in whole_blocks(call.value_width, call.block) if streamed(vq) <= budget),
+                call.block)
 
 
 def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,

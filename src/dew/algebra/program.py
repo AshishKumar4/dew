@@ -13,7 +13,7 @@ import functools
 import inspect
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -62,12 +62,15 @@ class AlgebraReport:
 
 @dataclasses.dataclass(frozen=True)
 class Rewrite:
-    """A region's terms (`terms.region`), each root's cheapest form by its text (`picked`, empty where none is
-    cheaper than the region as traced), and the report of the rewrite that chose them."""
+    """A region's terms (`terms.region`), each root's cheapest form by its key (`terms.key`; `picked`, empty
+    where none is cheaper than the region as traced), the report of the rewrite that chose them, and the roots
+    (by key) whose form XLA's own rewrites alone reach (`xla_own`, `Rules.xla`), which XLA's cost analysis
+    decides."""
 
     region: terms.Region
-    picked: Mapping[str, terms.Term]
+    picked: Mapping[Hashable, terms.Term]
     report: AlgebraReport
+    xla_own: frozenset[Hashable] = frozenset()
 
 
 @contextlib.contextmanager
@@ -143,26 +146,45 @@ of another read from outside it."""
 
 def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
-    are cheaper than the windows as traced: all windows saturated in one e-graph and extracted together,
-    each cheaper value's form traced and spliced in where its equation stood, the rest of the program kept
-    as traced, so a body is never traced again."""
-    windows = _windows(jaxpr)
-    if windows is None:
-        return jaxpr
-    combined, yielded = windows
-    done = _region(combined, accurate=accurate, saturation=saturation)
-    kernel_report.record_rewrite(done.report)
-    if not done.picked:
-        return jaxpr
-    leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
-              for var in combined.invars if isinstance(var.aval, ShapedArray)]
-    if len(leaves) != len(combined.invars):
-        return jaxpr
+    are cheaper than the windows as traced: each cluster saturated in an e-graph of its own (clusters share no
+    equation, so none shares a form with another; one e-graph of every window's terms grew its extraction
+    with the program, past 500 seconds a gemma3n training step's), each cheaper value's form traced and
+    spliced in where its equation stood, the rest of the program kept as traced, so a body is never traced
+    again."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
-    for out, root in zip(yielded, done.region.outputs, strict=True):
-        form = None if root is None else done.picked.get(str(root))
-        if form is None or str(form) == str(root):
+    for window, yielded in _windows(jaxpr):
+        done = _region(window, accurate=accurate, saturation=saturation)
+        kernel_report.record_rewrite(done.report)
+        if done.picked:
+            spliced.update(_splices(window, yielded, done, made_by, spliced))
+    if not spliced:
+        return jaxpr
+    return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
+                                     for kept in spliced.get(id(equation), [equation])]))
+
+
+def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
+             made_by: Mapping[jcore.Var, jcore.JaxprEqn], taken: Mapping[int, list]) -> dict[int, list]:
+    """The equations each value `window` yields (`yielded`, as the program names them) is made by in its
+    cheapest form (`done`), by the id of the program's equation they stand in for (`made_by`): a value another
+    window's form made already (`taken`) kept as that one made it. A form XLA's own rewrites alone reach
+    (`Rewrite.xla_own`) is taken only where XLA's cost analysis of the compiled window is lower with it
+    (`xla_priced`), whatever else the window rewrites."""
+    leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
+              for var in window.invars if isinstance(var.aval, ShapedArray)]
+    if len(leaves) != len(window.invars):
+        return {}
+    in_window: dict = {var: equation for equation in window.eqns for var in equation.outvars}
+    spliced: dict[int, list[jcore.JaxprEqn]] = {}
+    # The same forms in the window's own names, which XLA's cost analysis compiles alone.
+    own: dict[int, list[jcore.JaxprEqn]] = {}
+    xla_own: set[int] = set()
+    own_xla: set[int] = set()
+    for out, mine, root in zip(yielded, window.outvars, done.region.outputs, strict=True):
+        form = None if root is None else done.picked.get(terms.key(root))
+        made_at = id(made_by[out])
+        if form is None or terms.key(form) == terms.key(root) or made_at in taken or made_at in spliced:
             continue
         traced = jax.make_jaxpr(lambda *values, form=form: terms.form_value(done.region, form, list(values)))(
             *leaves)
@@ -170,41 +192,42 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
         if traced.consts or not isinstance(made, jcore.Var) or made in traced.jaxpr.invars or (
                 traced.out_avals[0].strip_weak_type() != out.aval.strip_weak_type()):
             continue
-        renamed = {**dict(zip(traced.jaxpr.invars, combined.invars, strict=True)), made: out}
+        inputs = dict(zip(traced.jaxpr.invars, window.invars, strict=True))
+        for named, made_as, key in ((spliced, out, id(made_by[out])), (own, mine, id(in_window[mine]))):
+            renamed = {**inputs, made: made_as}
+            def renaming(atom, renamed=renamed):
+                return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
 
-        def renaming(atom, renamed=renamed):
-            return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
+            named[key] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
+                                           outvars=[renaming(var) for var in equation.outvars])
+                          for equation in traced.jaxpr.eqns]
+        if terms.key(root) in done.xla_own:
+            xla_own.add(id(made_by[out]))
+            own_xla.add(id(in_window[mine]))
+    if not xla_own:
+        return spliced
 
-        if id(made_by[out]) in spliced:
-            continue
-        spliced[id(made_by[out])] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
-                                                      outvars=[renaming(var) for var in equation.outvars])
-                                     for equation in traced.jaxpr.eqns]
-    if not spliced:
-        return jaxpr
-    rewritten = _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
-                                          for kept in spliced.get(id(equation), [equation])]))
-    fired = {name for name, count in done.report.fired.items() if count}
-    if fired and all(rules.RULES[name].xla for name in fired) and (
-            jaxpr.constvars or xla_seconds(rewritten) >= xla_seconds(jaxpr)):
-        # Only XLA's own rewrites fired: XLA's cost analysis of the compiled program decides, not the model
-        # (a body whose constants it does not hold is not compiled alone: kept as it is).
-        return jaxpr
-    return rewritten
+    def splicing(chosen) -> jcore.Jaxpr:
+        return _live(window.replace(eqns=[made for equation in window.eqns
+                                          for made in (own[id(equation)] if id(equation) in chosen
+                                                       else [equation])]))
+
+    if cost.cheaper(xla_priced(splicing(own)), xla_priced(splicing(own.keys() - own_xla))):
+        return spliced
+    return {key: value for key, value in spliced.items() if key not in xla_own}
 
 
-def xla_seconds(jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr) -> float:
-    """`jaxpr`'s seconds by XLA's own cost analysis of its compiled program (its FLOPs, transcendentals and
+def xla_priced(jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr) -> cost.Seconds:
+    """`jaxpr`'s price by XLA's own cost analysis of its compiled program (its FLOPs, transcendentals and
     bytes accessed) at the pass's device's rates (`cost.Fused`): the price of a rewrite XLA would match
     itself, which the e-graph's model cannot see XLA's fusion of."""
     closed = jaxpr if isinstance(jaxpr, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(jaxpr, ())
     avals = list(closed.in_avals)
     analysis = jax.jit(jcore.jaxpr_as_fun(closed)).lower(*avals).compile().cost_analysis()
     analysis = (analysis[0] if isinstance(analysis, list) else analysis) or {}
-    rates = cost.fused(cost.target())
-    return (analysis.get("flops", 0.0) / rates.operations
-            + analysis.get("transcendentals", 0.0) / rates.exponentials
-            + analysis.get("bytes accessed", 0.0) / rates.bandwidth)
+    work = cost.Work(operations=analysis.get("flops", 0.0), exponentials=analysis.get("transcendentals", 0.0),
+                     device_bytes=analysis.get("bytes accessed", 0.0))
+    return cost.Seconds(work, cost.fused(cost.target()))
 
 
 def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -219,12 +242,12 @@ def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return jaxpr.replace(eqns=kept[::-1])
 
 
-def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
-    """`jaxpr`'s windows as one jaxpr: each head a rule may lower the price at (`rules.heads`) with the
-    equations of the language that make its operands, `WINDOW` deep, windows that share an equation joined up
-    to `CLUSTER` equations; its inputs each value a window reads from outside it, its outputs each value a
-    window makes that the program reads outside it (the values the rewrite may compute anew), in program
-    order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
+def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
+    """`jaxpr`'s windows, each cluster a jaxpr of its own: each head a rule may lower the price at
+    (`rules.heads`) with the equations of the language that make its operands, `WINDOW` deep, windows that
+    share an equation joined up to `CLUSTER` equations; its inputs each value it reads from outside it, its
+    outputs each value it makes that the program reads outside it (the values the rewrite may compute anew),
+    in program order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
     made = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
 
     def maker(atom) -> jcore.JaxprEqn | None:
@@ -235,7 +258,7 @@ def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
         equation.primitive.name,
         [None if (operand := maker(atom)) is None else operand.primitive.name for atom in equation.invars])]
     if not heads:
-        return None
+        return []
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
     clusters: list[dict[int, jcore.JaxprEqn]] = []
     for head in heads:
@@ -258,11 +281,12 @@ def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
             if not isinstance(atom, jcore.Literal):
                 read.setdefault(atom, set()).add(id(equation))
     returned = {atom for atom in jaxpr.outvars if not isinstance(atom, jcore.Literal)}
-    outside: dict[jcore.Var, None] = {}
-    equations: list[jcore.JaxprEqn] = []
-    outputs: list[jcore.Var] = []
-    yielded: list[jcore.Var] = []
+    windows = []
     for cluster in clusters:
+        outside: dict[jcore.Var, None] = {}
+        equations: list[jcore.JaxprEqn] = []
+        outputs: list[jcore.Var] = []
+        yielded: list[jcore.Var] = []
         fresh: dict[jcore.Var, jcore.Var] = {}
         members = sorted(cluster.values(), key=lambda member: order[id(member)])
         for equation in members:
@@ -279,26 +303,62 @@ def _windows(jaxpr: jcore.Jaxpr) -> tuple[jcore.Jaxpr, list[jcore.Var]] | None:
             if out in returned or read.get(out, set()) - cluster.keys():
                 outputs.append(fresh[out])
                 yielded.append(out)
-    return jcore.Jaxpr([], list(outside), outputs, equations), yielded
+        windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
+    return windows
 
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
     """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
-    the admitted rule sets where they are cheaper than the region as traced, with the report of the
-    rewrite."""
+    the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), with the roots
+    whose form XLA's own sets alone reach (`Rewrite.xla_own`: the region saturated under them first) and the
+    report of the rewrite. A region no reordering may touch (`rules.reorderable`) builds no e-graph. The
+    saturated graph's forms are extracted first; only where one differs from its root are the region as
+    traced and XLA's sets' forms extracted too, each from the graph as it stood (egglog's `push`, `pop`): a
+    region whose forms are its roots' (commutativity's alone) takes one extraction."""
     began = time.perf_counter()
     region = terms.region(closed)
-    graph, bundle, roots = graphed(region)
+    admitted = rules.admitted(accurate)
+    if not rules.reorderable(region):
+        fired = dict.fromkeys((sets.name for sets in admitted), 0)
+        report = AlgebraReport(region.equations, tuple(fired), fired, saturation.limits(region),
+                               iterations=0, nodes=0, limited=False, before=0.0, after=0.0,
+                               seconds=time.perf_counter() - began)
+        return Rewrite(region, {}, report)
     priced = cost.model(region, cost.fused(cost.target()))
-    _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
-    saturated = saturate(graph, region, rules.admitted(accurate), saturation)
+    own = tuple(sets for sets in admitted if sets.xla)
+    graph, bundle, roots = graphed(region)
+    graph.push()
+    first = saturate(graph, region, own, saturation) if own and len(own) < len(admitted) else None
+    graph.push()
+    saturated = saturate(graph, region, admitted, saturation)
+    nodes = node_count(graph)
     forms, after = extracted(graph, bundle, priced)
-    cheaper = after.value < before.value
-    picked = {str(root): form for root, form in zip(roots, forms, strict=True)} if cheaper else {}
+    changed = [terms.key(root) for root, form in zip(roots, forms, strict=True)
+               if terms.key(form) != terms.key(root)]
+    graph.pop()
+    theirs = None
+    if changed and first is not None and any(count for name, count in first.fired.items()
+                                             if rules.RULES[name].rounding != "exact"):
+        # The forms XLA's own sets alone reach, from the graph they saturated (an exact set's alone,
+        # commutativity's, leave every price as it was).
+        theirs, _ = extracted(graph, bundle, priced)
+    graph.pop()
+    before = after
+    if changed:
+        _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
+    picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
+              if changed and cost.cheaper(after, before) else {})
+    if theirs is not None:
+        xla_own = frozenset(terms.key(root) for root, form, xla_form in zip(roots, forms, theirs, strict=True)
+                            if terms.key(form) == terms.key(xla_form) != terms.key(root))
+    else:
+        xla_own = frozenset(changed) if own and first is None else frozenset()
+    if first is not None:
+        saturated = saturated.after(first)
     report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
-                           saturated.iterations, node_count(graph), saturated.limited, before.value,
-                           after.value, time.perf_counter() - began)
-    return Rewrite(region, picked, report)
+                           saturated.iterations, nodes, saturated.limited, before.value, after.value,
+                           time.perf_counter() - began)
+    return Rewrite(region, picked, report, xla_own)
 
 
 def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]:
@@ -306,89 +366,92 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
     computes in its operands' dtype, which broadcasts lay along one axis, which literals are powers of two or
     one, the primitives a stable rule writes), its roots bundled, the facts saturated."""
     graph = EGraph()
-    stated(graph, region)
     roots = region.roots()
     bundle = terms.Term.bundle(Vec[terms.Term](*roots))
-    graph.register(bundle)
+    stated(graph, region, bundle)
     graph.run(rules.FACTS.saturate())
     return graph, bundle, roots
 
 
-def stated(graph: EGraph, region: terms.Region) -> None:
-    """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s): each term's
-    shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one axis, which
-    literals are powers of two or one, the primitives a stable rule writes, each term's magnitude
-    (`rules.log2_bound`, `rules.degree`), the magnitudes the program reaches (`rules.reaches`), which a
-    reordering's new intermediates are held under (§6.3), and each extent's power of two (`rules.log2_of`)."""
-    for term, extent in region.shapes:
-        graph.register(set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent))))
+def stated(graph: EGraph, region: terms.Region, *registered) -> None:
+    """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s) beside
+    `registered` in one call (egglog's every call its own program: 200 facts took 98 ms one at a time, 53 at
+    once): each term's shape, which arithmetic computes in its operands' dtype, which broadcasts lay along one
+    axis, which literals are powers of two or one, the primitives a stable rule writes, each term's number
+    bound (`rules.log2_bound`), the program's reach (`rules.reach`), which a reordering's new intermediates
+    are held under (§6.3), each extent's power of two (`rules.log2_of`) and each reduction's length's
+    (`rules.sum_length`)."""
+    facts: list = [*registered]
+    facts += [set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent)))
+              for term, extent in region.shapes]
     arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
-            graph.register(rules.plain(i64(index)))
+            facts.append(rules.plain(i64(index)))
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
             if len(missing) == 1 and laid == tuple(axis for axis in range(rank) if axis != missing[0]):
-                graph.register(rules.along(i64(index), i64(missing[0])))
-    for name, index in region.stock.items():
-        graph.register(set_(rules.stock(String(name))).to(i64(index)))
-    _products(graph, region)
-    floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
-    limit = math.floor(math.log2(min(floats))) if floats else 0
-    reached = set()
-    for term, sizes in region.shapes:
-        for size in sizes:
-            graph.register(set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())))
-        bound = region.magnitudes.get(str(term))
+                facts.append(rules.along(i64(index), i64(missing[0])))
+    facts += [set_(rules.stock(String(name))).to(i64(index)) for name, index in region.stock.items()]
+    facts += _products(region)
+    sizes = {size for _, extent in region.shapes for size in extent}
+    facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
+    for term, _ in region.shapes:
+        bound = region.magnitudes.get(terms.key(term))
         if bound is not None:
-            graph.register(*rules.made(term, i64(bound.log2), [i64(each) for each in bound.degrees]))
-            # A bound the reference reaches holds a reordering's intermediates where it is a number: its
-            # declared ranges' and constants' alone (no unbounded operand's power), under the narrowest
-            # float's largest power of two. A bound over an unbounded operand bounds nothing: the
-            # reference's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y
-            # at 3e38 against 0.5 (x + y)).
-            if not any(bound.degrees) and bound.log2 <= limit:
-                reached.add(bound.log2)
-    # A number bound under the narrowest float's largest power of two is a finite value's.
+            facts += rules.made(term, i64(bound))
+        if (args := get_callable_args(term, terms.Term.reduce)) is not None:
+            _, params = region.params[int(get_literal_value(args[3]))]
+            extent = region.shape(args[0])
+            length = math.prod(extent[axis] for axis in params["axes"])
+            facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
+    # A bound of numbers alone (the declared ranges', the constants', and what the equations prove of them)
+    # holds where the program's values are: a new intermediate under the narrowest float's largest power of
+    # two is finite wherever the program is. A bound over an unbounded operand would bound nothing: the
+    # program's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y at 3e38
+    # against 0.5 (x + y)), so an unbounded value has none (`terms.Magnitude`).
+    floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
     if floats:
-        reached.add(limit)
-    for log2 in reached:
-        graph.register(rules.reaches(i64(log2), *([i64(0)] * terms.SLOTS)))
+        facts.append(set_(rules.reach()).to(i64(math.floor(math.log2(min(floats))))))
+    if facts:
+        graph.register(*facts)
 
 
-def _products(graph: EGraph, region: terms.Region) -> None:
+def _products(region: terms.Region) -> list:
     """The facts a region's products state: which compute in their operands' dtype (`rules.plain`: no
     accumulation wider than their operands they round back from), which of those are matrix products
     (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
     each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
     plain_numbers = (((1,), (0,)), ((), ()))
+    facts: list = []
     for term, extent in region.shapes:
         if len(extent) == 2:
-            graph.register(rules.matrix(term))
+            facts.append(rules.matrix(term))
         if (args := get_callable_args(term, terms.Term.dot)) is None:
             continue
         index = int(get_literal_value(args[2]))
         _, params = region.params[index]
         wanted = params.get("preferred_element_type")
-        operands = {region.dtypes.get(str(args[0])), region.dtypes.get(str(args[1]))}
+        operands = {region.dtypes.get(terms.key(args[0])), region.dtypes.get(terms.key(args[1]))}
         if wanted is None or operands == {jnp.dtype(wanted)}:
-            graph.register(rules.plain(i64(index)))
+            facts.append(rules.plain(i64(index)))
             if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:
-                graph.register(rules.matrix_product(i64(index)))
+                facts.append(rules.matrix_product(i64(index)))
     matrices = {extent for _, extent in region.shapes if len(extent) == 2}
-    for extent in matrices:
+    for extent in sorted(matrices):
         for axis in (0, 1):
             region.params.append((jax.lax.broadcast_in_dim_p, {
                 "shape": extent, "broadcast_dimensions": (axis,), "sharding": None}))
-            graph.register(set_(rules.lifted(Vec[i64](*(i64(size) for size in extent)), i64(axis))).to(
+            facts.append(set_(rules.lifted(Vec[i64](*(i64(size) for size in extent)), i64(axis))).to(
                 i64(len(region.params) - 1)))
     for index, value in enumerate(region.literals):
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
-            graph.register(rules.exact_scale(literal))
+            facts.append(rules.exact_scale(literal))
         if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value == 1:
-            graph.register(rules.unit(literal))
+            facts.append(rules.unit(literal))
+    return facts
 
 
 @dataclasses.dataclass(frozen=True)
@@ -400,6 +463,12 @@ class Saturated:
     limits: tuple[int, int]
     iterations: int
     limited: bool
+
+    def after(self, first: Saturated) -> Saturated:
+        """This saturation and `first`, which ran before it on the same graph, as one."""
+        fired = {name: count + first.fired.get(name, 0) for name, count in self.fired.items()}
+        return Saturated(fired, self.limits, first.iterations + self.iterations,
+                         first.limited or self.limited)
 
 
 def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
