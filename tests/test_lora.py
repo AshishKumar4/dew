@@ -45,7 +45,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
-from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, parameter_path
+from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, drawn_axes, parameter_path
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -512,15 +512,17 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
     factors = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, adapter.variables["params"])
-    numbers = muon_weight_dimension_numbers(factors)
-    assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
-    optimizer = OPTIMIZER_MAP["muon"](1e-3)
     tokens = jnp.asarray(reference["input_ids"])
+    # The axes the adapted model draws its factors in, as a run's table holds them.
+    with boxed(drawn_axes(adapter.model.init, tokens)):
+        numbers = muon_weight_dimension_numbers(factors)
+        assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
+        optimizer = OPTIMIZER_MAP["muon"](1e-3)
 
-    def loss(moving):
-        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
+        def loss(moving):
+            return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
 
-    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+        updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
     moved = optax.apply_updates(factors, updates)
     for path, before in jax.tree_util.tree_leaves_with_path(factors):
         after = node(moved, tuple(key.key for key in path))
