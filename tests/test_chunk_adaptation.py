@@ -71,10 +71,9 @@ three, past gradient descent's 2 (the configurations below it peak at 1.64), and
 by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its paired ratio to narrow
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
-documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): their sites hold each
-element within its program's rounding bound instead (`assert_within_rounding`, ledger 1714), and the
-one-token window's error each window adds is held from the level the window starts at
-(`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
+documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): ledger 1714 holds their
+end-to-end contracts open, and the one-token window's error each window adds is held from the level
+the window starts at (`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
 
 
 def corner(rate: float, scale: float, window: int, damped: bool = False) -> bool:
@@ -632,9 +631,9 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half, the half over
-    weights where its step is stable (the divergent corner's gradient is held within its rounding bound,
-    `test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding`), and at the corner
-    itself through damped steps of `up`, their rates constants of the step, one draw a seed."""
+    weights where its step is stable (the divergent corner's gradient awaits the gate, `CORNER_WINDOWS`),
+    and at the corner itself through damped steps of `up`, their rates constants of the step, one draw
+    a seed: the contract the undamped corner leaves open (ledger 1714)."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = (ChunkAdaptation(window=3, rate=rate, select=("up",), damped=True) if damped
                   else ChunkAdaptation(window=3, rate=rate))
@@ -652,104 +651,6 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     site(differentiated(dew), reference, gradient_draw, rate, scale, 3,
          f"the gradient through the windows' {'damped ' if damped else ''}steps over {kind}, rate {rate}, "
          f"scale {scale}", seeds, damped=damped)
-
-
-BOUND_SEEDS, BOUND_ROWS = 8, 8
-"""The draws, and each one's rows, that a diverging corner's site holds element by element
-(`assert_within_rounding`)."""
-
-
-def assert_within_rounding(dew, reference, drawn, seeds, label: str) -> None:
-    """Where the inner step diverges, the claim check 1 cannot pool (ledger 1714): each of Dew's float32
-    outputs, draw by draw and element by element, within its own program's rounding bound of the math.
-    A program's float32 result moves from its float64 value by at most u32 kappa to first order, kappa
-    the sum over its roundings of the output's float64 sensitivity to each times the most that rounding
-    moves it, every operation's own count of roundings taken from its jaxpr (`rounding_bound`: one for
-    an IEEE operation, m - 1 for a sum of m terms, m for an inner product, an elementary function's
-    measured ulps), never fitted. Dew's program in float64 is the literal loop's math, each within
-    u64 times its own kappa, so |dew32 - loop64| <= u32 kappa_dew + u64 (kappa_dew + kappa_loop)."""
-    from rounding_bound import rounding_bound
-
-    single, double = 2.0 ** -24, 2.0 ** -53
-    # The seeds' draws stacked, each program mapped over them: one program a site, each draw's own
-    # elements its own outputs.
-    seeds = range(seeds) if isinstance(seeds, int) else seeds
-    arguments = jax.tree.map(lambda *leaves: np.stack(leaves), *(drawn(seed) for seed in seeds))
-    ours = jax.tree.map(np.asarray, jax.jit(jax.vmap(dew))(*arguments))
-    _, kappa = rounding_bound(jax.vmap(dew), *arguments)
-    truth, theirs = rounding_bound(jax.vmap(reference), *arguments)
-    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(ours)[0]]
-    for path, got, want, own, other in zip(paths, jax.tree.leaves(ours), jax.tree.leaves(truth),
-                                           jax.tree.leaves(kappa), jax.tree.leaves(theirs), strict=True):
-        bound = single * own + double * (own + other)
-        error = np.abs(np.asarray(got, np.float64) - want)
-        assert np.all(np.isfinite(got)), f"{label}, {path}: not finite"
-        worst = np.unravel_index(np.argmax(error - bound), error.shape) if error.size else ()
-        assert np.all(error <= bound), (
-            f"{label}, seed {seeds[worst[0]] if worst else 0}, {path}{list(worst[1:])}: {error[worst]:.3e} "
-            f"past its rounding bound {bound[worst]:.3e}")
-
-
-@pytest.mark.parametrize("kind", LAYOUTS)
-def test_the_one_token_window_where_the_inner_step_diverges_is_within_its_rounding(kind):
-    """At the corner, 0.5 N(0, 1) weights stepped by a half every token, a step's rate times its
-    window's curvature is past 2, where gradient descent diverges (`CORNER_WINDOWS`: a row's rounding
-    grows by 10^13 over eleven steps), and check 1's pooled ratio does not resolve: each loss within
-    Dew's rounding bound of the literal loop's float64 truth (`assert_within_rounding`), over every
-    layout."""
-    fields = {name: jnp.asarray(value) for name, value in fields_of(kind, BOUND_ROWS).items()}
-    adaptation = ChunkAdaptation(window=1, rate=0.5)
-    assert corner(0.5, 0.5, 1)
-
-    def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
-                              predict=False, logits=False).losses
-
-    def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation, truth=True)
-
-    assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=BOUND_ROWS), BOUND_SEEDS,
-                           f"the one-token window at the corner over {kind}")
-
-
-def test_the_corner_bound_holds_no_rate_a_thousandth_off():
-    """The corner's bound has teeth: Dew's one-token window stepped at a rate a thousandth past the
-    reference's falls outside its rounding bound at the corner (`assert_within_rounding`), two draws."""
-    adaptation = ChunkAdaptation(window=1, rate=0.5)
-    off = ChunkAdaptation(window=1, rate=0.5 * (1 + 2 ** -10))
-
-    def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, off, predict=False,
-                              logits=False).losses
-
-    def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation, truth=True)
-
-    with pytest.raises(AssertionError, match="past its rounding bound"):
-        assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=BOUND_ROWS), 2, "a rate off")
-
-
-@pytest.mark.parametrize("half", [0, 1], ids=["first-draws", "last-draws"])
-@pytest.mark.parametrize("kind", LAYOUTS)
-def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding(kind, half):
-    """The outer loss's gradient through the windows' steps at the corner, 0.5 N(0, 1) weights stepped
-    by a half every three tokens, rate times curvature past 2 (`CORNER_WINDOWS`), where check 1's pooled
-    ratio does not resolve: each leaf within Dew's rounding bound of the literal loop's float64 truth
-    (`assert_within_rounding`), over every layout."""
-    fields = {name: jnp.asarray(value) for name, value in fields_of(kind, BOUND_ROWS).items()}
-    adaptation = ChunkAdaptation(window=3, rate=0.5)
-    assert corner(0.5, 0.5, 3)
-
-    def gradient_draw(seed):
-        variables, hidden, targets, weights = draw(seed, rows=BOUND_ROWS)
-        return variables, hidden, targets, weights, np.float32(1.0)
-
-    dew, reference = weighted_loss(fields, adaptation), weighted_loss(fields, adaptation, truth=True)
-
-    # Each half of the draws its own test, each within CI's time.
-    draws = range(half * BOUND_SEEDS // 2, (half + 1) * BOUND_SEEDS // 2)
-    assert_within_rounding(differentiated(dew), differentiated(reference), gradient_draw, draws,
-                           f"the outer gradient at the corner over {kind}")
 
 
 def test_each_window_steps_from_its_level_as_the_literal_loop():
