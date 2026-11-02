@@ -99,10 +99,10 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post42,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post45,<0.12.1`.
 <!-- END JAX requirement -->
 
-It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) are Dew's builds of the same release, carrying the Mosaic GPU fixes below that live in the plugin, and the index serves them too. Every other package, jaxlib and the CUDA PJRT plugins included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of the same release, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. Every other package, jaxlib included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
 - The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
@@ -128,16 +128,15 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A persistent compilation cache entry is written aside and renamed into place, so a process reading the cache beside its writer, as packed jobs on one GPU do, sees the whole entry or none of it.
 - Resetting the compilation cache (`jax.experimental.compilation_cache.compilation_cache.reset_cache`) takes the lock its initialization holds, so a compile that sets the cache up while a reset runs is waited for, and the reset never leaves a cache behind that its flags call uninitialized.
 - `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
-- Mosaic GPU compiles a kernel's PTX with nvJitLink off, so ptxas honours its warpgroups' register raises (`setmaxnreg`), which it ignored in a relocatable compile (ptxas warning C7504; upstream f365a65e3a). This fix lives in the CUDA plugin.
-- A Mosaic GPU kernel may state its minimum resident blocks per SM (`min_blocks_per_sm`), which bounds the registers ptxas gives each thread. This fix lives in the CUDA plugin.
+- Mosaic GPU compiles a kernel's PTX with nvJitLink off, so ptxas honours its warpgroups' register raises (`setmaxnreg`), which it ignored in a relocatable compile (ptxas warning C7504; upstream f365a65e3a). This fix lives in the PJRT plugin, where Mosaic GPU's custom call compiles: post42 carried it in the CUDA plugin alone, and its kernels compiled through the release's PJRT plugin, so it holds from post43.
+- A Mosaic GPU kernel may state its minimum resident blocks per SM (`min_blocks_per_sm`), which bounds the registers ptxas gives each thread. This fix lives in the CUDA and PJRT plugins.
 - Mosaic GPU's untiled CP_ASYNC copies follow the source's strides and alignment, so a block narrower than its row reads the rows it names.
 - A Mosaic GPU `mma.sync` multiplies float32 operands as TF32 (`m16n8k8.tf32`), each rounded to nearest first, and transfers 32-bit operands without `ldmatrix`.
 - Mosaic GPU issues scoped and ordered atomics, memory fences and `griddepcontrol` (programmatic dependent launch), and Pallas Mosaic GPU's `barrier_wait` takes an explicit parity, checked by its interpreter.
 - Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
-- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, preventing the full-band and partial-tail divisors from becoming one runtime divisor.
-- A compiled executable keeps the SHA-256 of its exact serialized bytes, taken where the persistent compilation cache writes or reads them, so an executable loaded from the cache names the artifact its writer compiled.
-- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision; grouped expert products can take reverse-over-reverse derivatives.
+- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision, a named dot algorithm among them; grouped expert products can take reverse-over-reverse derivatives.
 - A reduction's forward derivative keeps a symbolic zero tangent zero instead of materializing it, and Mosaic GPU's warpgroup loads preserve their requested fragment layout.
+- Triton's pipeliner gives a loaded tile a second shared-memory buffer a stage where a wgmma reads it from shared memory and another use reads it in registers, so the next stage's copy no longer overwrites the tile while the wgmma still reads it (Pallas Triton attention's backward on an H100 computed dK wrong, and differently each run, at two stages). The patch is to the Triton XLA builds, in the CUDA and PJRT plugins, from post45.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
