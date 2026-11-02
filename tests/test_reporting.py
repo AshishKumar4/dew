@@ -10,6 +10,7 @@ import re
 import selectors
 import subprocess
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -136,6 +137,22 @@ def test_a_journal_reads_back_what_a_fit_logged_its_final_validation_and_nonfini
     step, nonfinite = read[-1]
     assert step == 3 and nonfinite['psnr'] == math.inf and nonfinite['floor'] == -math.inf
     assert math.isnan(nonfinite['loss'])
+
+
+def test_a_journal_reads_back_the_second_each_report_was_logged_at(tmp_path):
+    """`LocalTracker.timed` answers the reports `scalars` does, each with the wall-clock second it was
+    logged at: within the seconds around the call that logged it."""
+    windows = []
+    with LocalTracker(tmp_path) as tracker:
+        for step in range(3):
+            before = time.time()
+            tracker.log({'loss': 1.0 / (step + 1)}, step)
+            windows.append((before, time.time()))
+        read = tracker.timed()
+    assert [(step, values) for step, _, values in read] == [(step, {'loss': 1.0 / (step + 1)})
+                                                            for step in range(3)]
+    for (earliest, latest), (_, logged, _) in zip(windows, read, strict=True):
+        assert earliest <= logged <= latest
 
 
 @pytest.mark.parametrize('preview', [True])

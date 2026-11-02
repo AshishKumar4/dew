@@ -52,14 +52,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from collections.abc import Iterator
-from typing import Protocol
+from typing import Any, ClassVar, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import Fetched, owned_program
 from dew.nn.precision import divided
 from dew.rl.env import TimeStep, chosen
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering, rotation
@@ -424,7 +424,8 @@ def gate_axes(facing: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def drawn_camera(racing: Racing, key: jax.Array, ramp: jax.Array) -> Camera:
     """A drone's camera for an episode (`Camera`), each quantity uniform in its range, the image's spreads
-    about neutral scaled by `ramp`; the scene's looks drawn where `ramp` is above none, else the first."""
+    about neutral scaled by `ramp`; each of the scene's looks drawn for a `ramp` share of episodes, else the
+    first, so a curriculum's first raise varies a tenth of its scenes rather than every one."""
     keys = iter(jax.random.split(key, 10))
 
     def within(low: float, high: float, shape: tuple[int, ...] = ()) -> jax.Array:
@@ -433,14 +434,15 @@ def drawn_camera(racing: Racing, key: jax.Array, ramp: jax.Array) -> Camera:
     def about(low: float, high: float, neutral: float) -> jax.Array:
         return neutral + ramp * (within(low, high) - neutral)
 
-    return Camera(uptilt=jnp.deg2rad(within(*racing.uptilt)),
-                  fov=jnp.deg2rad(within(racing.fov - racing.fov_spread, racing.fov + racing.fov_spread)),
-                  mount=jnp.deg2rad(within(-racing.mount_spread, racing.mount_spread, (2,))),
-                  exposure=about(*racing.exposure, neutral=1.0),
-                  white_balance=1 + ramp * within(-racing.white_balance, racing.white_balance, (3,)),
-                  gamma=about(*racing.gamma, neutral=1.0), noise=ramp * within(*racing.noise),
-                  shutter=ramp * within(*racing.shutter),
-                  look=jnp.where(ramp > 0, jax.random.randint(next(keys), (4,), 0, 1 << 16), 0))
+    camera = {"uptilt": jnp.deg2rad(within(*racing.uptilt)),
+              "fov": jnp.deg2rad(within(racing.fov - racing.fov_spread, racing.fov + racing.fov_spread)),
+              "mount": jnp.deg2rad(within(-racing.mount_spread, racing.mount_spread, (2,))),
+              "exposure": about(*racing.exposure, neutral=1.0),
+              "white_balance": 1 + ramp * within(-racing.white_balance, racing.white_balance, (3,)),
+              "gamma": about(*racing.gamma, neutral=1.0), "noise": ramp * within(*racing.noise),
+              "shutter": ramp * within(*racing.shutter)}
+    look = jax.random.randint(next(keys), (4,), 0, 1 << 16)
+    return Camera(**camera, look=jnp.where(within(0.0, 1.0, (4,)) < ramp, look, 0))
 
 
 def _start(racing: Racing, course: Course, key: jax.Array, difficulty: jax.Array) -> tuple[
@@ -501,18 +503,46 @@ def started(racing: Racing, key: jax.Array, difficulty: jax.Array, ramp: jax.Arr
                 difficulty=difficulty, ramp=ramp)
 
 
-def commanded(racing: Racing, race: Race, action: jax.Array) -> tuple[Race, jax.Array, jax.Array]:
+class Commanded(Protocol):
+    """A drone a flight controller commands (`commanded`): its drawn `body`, its `rate_limit`, its latency in
+    whole control steps (`delay`) and the commands `pending` (`delayed`), a dataclass whose `pending` a
+    command replaces."""
+
+    __dataclass_fields__: ClassVar[dict[str, Any]]
+
+    @property
+    def body(self) -> Body: ...
+
+    @property
+    def rate_limit(self) -> jax.Array: ...
+
+    @property
+    def delay(self) -> jax.Array: ...
+
+    @property
+    def pending(self) -> jax.Array: ...
+
+
+def commanded[D: Commanded](quadrotor: Quadrotor, drone: D,
+                            action: jax.Array) -> tuple[D, jax.Array, jax.Array]:
     """A drone's action `[4]` in [-1, 1] as the flight controller takes it after the drone's latency: the
     collective thrust (N), the throttle's share of the hover below zero and of the span from the hover to the
-    nominal drone's full thrust above; the body rates (rad/s), its share of the drone's rate limit."""
+    nominal `quadrotor`'s full thrust above; the body rates (rad/s), its share of the drone's rate limit. The
+    drone, a gate race's (`Race`) or any other with its fields, comes back with the command pushed."""
     action = jnp.clip(action, -1, 1)
-    hover = race.body.mass * GRAVITY
-    full = racing.quadrotor.nominal_thrust
+    hover = drone.body.mass * GRAVITY
+    full = quadrotor.nominal_thrust
     collective = hover + action[0] * jnp.where(action[0] >= 0, full - hover, hover)
-    command = jnp.concatenate([collective[None], action[1:] * race.rate_limit])
-    pending = jnp.concatenate([command[None], race.pending[:-1]])
-    sent = pending[race.delay]
-    return dataclasses.replace(race, pending=pending), sent[0], sent[1:]
+    command = jnp.concatenate([collective[None], action[1:] * drone.rate_limit])
+    pending, sent = delayed(drone.pending, drone.delay, command)
+    return dataclasses.replace(drone, pending=pending), sent[0], sent[1:]
+
+
+def delayed(pending: jax.Array, delay: jax.Array, command: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A command sent after `delay` control steps: the commands `pending` `[D + 1, ...]`, newest first, with
+    `command` pushed, and the one `delay` steps old, which the flight controller takes now."""
+    pending = jnp.concatenate([command[None], pending[:-1]])
+    return pending, pending[delay]
 
 
 def bars(racing: Racing) -> np.ndarray:
@@ -784,7 +814,7 @@ class FlightEnv:
 
     def flown(self, race: Race, action: jax.Array) -> tuple[Race, jax.Array]:
         """The race after the drone flies a control step under `action`, and its path through it."""
-        race, collective, rates = commanded(self.racing, race, action)
+        race, collective, rates = commanded(self.racing.quadrotor, race, action)
         key, noise = jax.random.split(race.key)
         flight, path = flown(self.racing.quadrotor, race.body, race.flight, collective, rates, noise,
                              self.racing.hz, race.ramp)
@@ -870,6 +900,17 @@ class Viewed(Protocol):
     def flight(self) -> Flight: ...
 
 
+class _Programs(NamedTuple):
+    """A `Seen`'s programs over one environment, each fetched once and run every step with no dispatch key
+    built (`dew.nn.kernels.options.Fetched`): a batch of episodes' start, a step, the views the environment
+    shows and the scene a renderer draws, over the batch's states."""
+
+    started: Fetched
+    stepped: Fetched
+    observe: Fetched
+    scene: Fetched
+
+
 class Seen:
     """A batch of drones of a JAX environment `env` (stepped on device), seen through `renderer`'s cameras,
     as a `dew.rl.simulator.Simulator`: actions `[B, A]`; observations a dict of the `views` asked for, some
@@ -897,18 +938,31 @@ class Seen:
         self.count = renderer.count if renderer is not None else int(count or 0)
         self.action_size = env.action_size
         self._env = env
-        self._started = OuterProgram(lambda env, key: jax.vmap(env.reset)(jax.random.split(key, self.count)))
-        self._stepped = OuterProgram(lambda env, states, action: jax.vmap(env.step)(states, action))
         aspect = 1.0 if renderer is None else renderer.aspect
-        self._shown = OuterProgram(jax.vmap(lambda state, image, key: developed(image, state.camera, key)))
-        self._observe = OuterProgram(lambda env, states: jax.vmap(env.observed)(states))
-        self._scene = OuterProgram(lambda env, states: jax.vmap(env.scene)(states))
-        self._cameras = OuterProgram(jax.vmap(lambda state: (cameras(state, aspect),
-                                                        cameras(state, aspect, state.camera.shutter))))
+        self._shown = Fetched(owned_program(jax.vmap(lambda state, image, key: developed(image, state.camera,
+                                                                                         key))))
+        self._cameras = Fetched(owned_program(jax.vmap(lambda state: (cameras(state, aspect),
+                                                                      cameras(state, aspect,
+                                                                              state.camera.shutter)))))
+        self._over: tuple[object, _Programs] | None = None
 
     def _env_now(self):
         """The environment the next episodes and steps run in."""
         return self._env
+
+    def _programs(self) -> _Programs:
+        """The programs over the environment it runs in now (`_env_now`), made again where a curriculum
+        changes the environment: its static fields are part of what they compile, and the programs of the
+        environment it left go with it."""
+        env = self._env_now()
+        if self._over is None or self._over[0] != env:
+            count = self.count
+            self._over = (env, _Programs(
+                started=Fetched(owned_program(lambda key: jax.vmap(env.reset)(jax.random.split(key, count)))),
+                stepped=Fetched(owned_program(lambda states, action: jax.vmap(env.step)(states, action))),
+                observe=Fetched(owned_program(jax.vmap(env.observed))),
+                scene=Fetched(owned_program(jax.vmap(env.scene)))))
+        return self._over[1]
 
     def _observed(self, observation: dict[str, jax.Array]) -> dict[str, jax.Array]:
         shown = dict(observation)
@@ -917,25 +971,26 @@ class Seen:
             if renderer is None:
                 raise ValueError("a race without a renderer shows no image")
             closed, opened = self._cameras(self._states)
-            image = received(renderer.render(self._scene(self._env_now(), self._states), closed, opened))
+            image = received(renderer.render(self._programs().scene(self._states), closed, opened))
             self._key, key = jax.random.split(self._key)
             shown["image"] = self._shown(self._states, image, jax.random.split(key, self.count))
         return {view: shown[view] for view in self.views}
 
     def reset(self, seed: int) -> dict[str, jax.Array]:
         self._key, key = jax.random.split(jax.random.key(seed))
-        self._states, step = self._started(self._env_now(), key)
+        self._states, step = self._programs().started(key)
         return self._observed(step.observation)
 
     def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
         mask = jnp.asarray(mask, bool)
         self._key, key = jax.random.split(self._key)
-        fresh, _ = self._started(self._env_now(), key)
+        programs = self._programs()
+        fresh, _ = programs.started(key)
         self._states = chosen(mask, fresh, self._states)
-        return self._observed(self._observe(self._env_now(), self._states))
+        return self._observed(programs.observe(self._states))
 
     def step(self, action: jax.Array) -> TimeStep:
-        self._states, step = self._stepped(self._env_now(), self._states, jnp.asarray(action))
+        self._states, step = self._programs().stepped(self._states, jnp.asarray(action))
         return TimeStep(self._observed(step.observation), step.reward, step.terminated, step.truncated)
 
     @contextlib.contextmanager
@@ -980,7 +1035,7 @@ def _scene(racing: Racing, race: Race) -> Scene:
 
 
 __all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS",
-           "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "Seen",
-           "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
-           "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics", "privileged",
-           "quaternion", "raced", "shown", "started", "struck"]
+           "Camera", "Commanded", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
+           "Seen", "Viewed", "airframe", "bars", "cameras", "commanded", "corners", "delayed", "developed",
+           "drawn_camera", "drawn_course", "facings", "gate_axes", "looking", "mounted", "nearest", "physics",
+           "privileged", "quaternion", "raced", "shown", "started", "struck"]

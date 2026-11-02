@@ -183,7 +183,9 @@ fitted to them, and a rule set ships only with measured receipts.
     default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits the rewritten step the
     same way, and so does every objective's step it builds, an RL update's included.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
-    `dreamer`) jit theirs the same way.
+    `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
+    an environment through `Objective.program`, the rest through `options.program` and `owned_program`, so none
+    is built as an `OuterProgram` of its own (SLOP025).
   - A training step's traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
   - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices

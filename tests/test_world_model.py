@@ -101,3 +101,25 @@ def test_a_labeled_model_trains_its_actions_into_its_predictions():
 
     gradient = jax.grad(loss)(variables["params"])
     assert np.any(np.asarray(gradient["action_projection"]["kernel"]))
+
+
+def test_a_clip_of_uint8_pixels_trains_as_the_frames_in_minus_one_to_one_it_encodes():
+    """The data workers write clips as uint8 pixels (`presets.clips`), which the objectives read as the
+    frames they encode, (pixel - 127.5) / 127.5 in [-1, 1], and floats as they are given: every pixel
+    value is that frame, and a tokenizer's loss over a clip of pixels is its loss over those frames."""
+    from dew.objectives.base import Step
+    from dew.objectives.world_model import CausalTokenizer, TokenizerObjective, unit_frames
+
+    every = np.arange(256, dtype=np.uint8)
+    encoded = ((every.astype(np.float64) - 127.5) / 127.5).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(unit_frames(every)), encoded)
+    np.testing.assert_array_equal(np.asarray(unit_frames(encoded)), encoded)
+
+    pixels = np.random.default_rng(8).integers(0, 256, (2, 4, 8, 8, 1), dtype=np.uint8)
+    frames = ((pixels.astype(np.float64) - 127.5) / 127.5).astype(np.float32)
+    objective = TokenizerObjective(CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2,
+                                                   latents=4, bottleneck=4))
+    variables = objective.fresh_variables(jax.random.key(9), None)
+    step = Step(jnp.asarray(0), jax.random.key(10), None)
+    stats = [objective.loss(variables, {"video": video}, step)[0] for video in (pixels, frames)]
+    np.testing.assert_array_equal(np.asarray(stats[0].total), np.asarray(stats[1].total))
