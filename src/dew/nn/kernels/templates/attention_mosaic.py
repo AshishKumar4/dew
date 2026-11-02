@@ -610,8 +610,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
             fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right])
         if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
             # fp16's parts scaled (`product.Scaled`): each part's product its own accumulator, restored and
-            # added into dQ's (`operands.Issuer.summed`), beside the cotangents and the part.
-            fragments.append([cotangents[0], cotangents[1], (block_q, width // config.columns, jnp.float32)])
+            # added into dQ's (`operands.Issuer.summed`), beside the cotangents and both parts, formed first.
+            fragments.append([cotangents[0], cotangents[1], cotangents[1],
+                              (block_q, width // config.columns, jnp.float32)])
         phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
         return phases + anchor + rows + vectors
     if config.shared_keys:
@@ -669,8 +670,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         fragments.append([step[0], weights, weights, right])
     if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's dV and dK parts scaled (`product.Scaled`): each product its own accumulator, restored and
-        # added into dV's or dK's (`operands.Issuer.summed`), beside the cotangents and the part.
-        fragments.append([step[0], weights, (block_k, max(width, value_width) // columns, jnp.float32)])
+        # added into dV's or dK's (`operands.Issuer.summed`), beside the cotangents and both parts, formed
+        # first.
+        fragments.append([step[0], weights, weights, (block_k, max(width, value_width) // columns, jnp.float32)])
     phases = resources.live_registers(family, carried, step, pullback, *added, *fragments)
     return phases + statistics + vectors
 

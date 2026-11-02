@@ -134,6 +134,11 @@ class Issuer:
         spilling 280 bytes a thread (wide-kv at e1f928585); elsewhere a product a block, as listed."""
         products = self._entries(products)
         first = next(products)
+        if not isinstance(first, product.Blocks) and isinstance(first[1], product.Scaled):
+            # Scaled products (fp16's) each issue in a scope of their own (`Family.summed`): every part formed
+            # here, before any, as a part formed in one product's scope (the next taken as it is issued) is
+            # no value of the next's (Mosaic GPU: "captures non-scalar array constants", ET-FP16-h100).
+            products = iter(list(products))
         family, interpret = self.call.family, self.call.interpret
         if shape is None:
             lhs, rhs = (first.left(0), first.right(0)) if isinstance(first, product.Blocks) else first[1:]
