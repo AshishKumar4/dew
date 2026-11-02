@@ -304,7 +304,7 @@ class InContextMemory(nn.Module):
             if not projected:
                 return x[:, :, None, :]
             out = Dense(self.heads * features, use_bias=False, dtype=self.dtype, precision=self.precision,
-                        name=name)(x)
+                        kernel_axes=("embed", "heads" if name == "q_proj" else "kv"), name=name)(x)
             return out.reshape(*x.shape[:2], self.heads, features)
 
         query, key, value = (view(name, projected) for name, projected in (
@@ -433,7 +433,7 @@ class InContextMemory(nn.Module):
         read = read.astype(self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
-                         name="o_proj")(read.reshape(batch, length, -1))
+                         kernel_axes=("attention", "embed"), name="o_proj")(read.reshape(batch, length, -1))
         else:
             read = read.reshape(batch, length, -1)
         return read

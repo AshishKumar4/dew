@@ -46,18 +46,20 @@ def layer_norm(dtype, epsilon: float = 1e-6):
 
 
 def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
-              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu):
+              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu,
+              sharded: bool = True):
     """Apply `TimestepEmbedding` or `PixArtAlphaTextProjection` to `x`.
 
     Both are a linear layer, an activation and a second linear layer. The
     activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
-    as `{name}_linear_1` and `{name}_linear_2` in the calling module.
+    as `{name}_linear_1` and `{name}_linear_2` in the calling module, each
+    sharding its output, the model's width, where `sharded`; a model that
+    names no axes of them (the UNet's) leaves them to the shape heuristic.
     """
     names = (f"{name}_linear_1", f"{name}_linear_2")
-    # Each shards its output, the model's width.
+    axes = tuple((layer, (None, "embed")) for layer in names) if sharded else ()
     mlp = GatedMLP(features, features, in_features=x.shape[-1], activation=activation, use_bias=bias,
-                    names=names, named_axes=tuple((layer, (None, "embed")) for layer in names), dtype=dtype,
-                    precision=precision, name=name)
+                    names=names, named_axes=axes, dtype=dtype, precision=precision, name=name)
     nn.share_scope(owner, mlp)
     return mlp(x)
 

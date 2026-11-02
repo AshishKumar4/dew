@@ -40,7 +40,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
 from dew.nn.scatter import gather_positions
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared, logical_axes
 from dew.nn.text_encoders import clip_layer
 
 if TYPE_CHECKING:
@@ -91,7 +91,9 @@ class _PositionTable(nn.Module):
         shape = (self.rows, self.features)
         if self.specification.singleton:
             shape = (1, *shape)
-        table = self.param("embedding", self.specification.initializer, shape).reshape(
+        # A singleton batch axis a checkpoint holds names none.
+        axes = (None,) * (len(shape) - 1) + ("embed",)
+        table = self.param("embedding", declared(self.specification.initializer, axes), shape).reshape(
             self.rows, self.features)
         return table if indices is None else table_rows(table, indices, self.dtype or table.dtype)
 
@@ -390,12 +392,14 @@ class VisionTransformer(nn.Module):
                 raise ValueError("convolutional patch projection takes NCHW images")
             hidden = Conv(lay.hidden_size, (lay.patch_size, lay.patch_size),
                           strides=(lay.patch_size, lay.patch_size), padding="VALID", use_bias=lay.patch_bias,
+                          kernel_init=declared(nn.initializers.lecun_normal(), (None, None, None, "embed")),
+                          bias_init=declared(nn.initializers.zeros_init(), ("embed",)),
                           dtype=self.dtype, precision=self.precision, name="patch_embed")(
                               jnp.asarray(pixel_values).transpose(0, 2, 3, 1))
             hidden = hidden.reshape(hidden.shape[0], pixels.shape[1], lay.hidden_size)
         else:
             hidden = Dense(lay.hidden_size, use_bias=lay.patch_bias, dtype=self.dtype,
-                           precision=self.precision, name="patch_embed",
+                           precision=self.precision, name="patch_embed", kernel_axes=(None, "embed"),
                            dot_general=float32_dot_general)(pixels)
         tokens = lay.special_tokens
         class_position = None

@@ -42,6 +42,7 @@ from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
 from .norms import LayerNorm
 from .precision import at_least_fp32, float32_einsum
+from .sharding import declared
 from .sparse_selection import top_k_selection
 
 
@@ -91,9 +92,12 @@ class KPoolIndexer(IndexerFront, nn.Module):
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
         dense = self.declare_front()
-        self.wk = dense(self.head_dim, name='wk')
-        # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
-        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
+        self.wk = dense(self.head_dim, name='wk', kernel_axes=('embed', 'index'))
+        # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763), as wide as
+        # the indexer.
+        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm',
+                                scale_init=declared(nn.initializers.ones, ('index',)),
+                                bias_init=declared(nn.initializers.zeros, ('index',)))
         self.index_kpool_compress_ape = self.param(
             'index_kpool_compress_ape', nn.initializers.zeros, (self.kpool, self.head_dim), jnp.float32)
         self.index_kpool_compress_gate = self.param(

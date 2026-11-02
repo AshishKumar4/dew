@@ -54,7 +54,8 @@ class Continuum(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         # The ungated feed-forward `down`, `up`, the latter zero at its start.
         mlp = GatedMLP(self.level.hidden, x.shape[-1], activation(self.level.activation), output_init_std=0.0,
-                       linear=Dense, names=("down", "up"), dtype=self.dtype, precision=self.precision)
+                       linear=Dense, names=("down", "up"), dtype=self.dtype, precision=self.precision,
+                       named_axes=(("down", ("embed", "mlp")), ("up", ("mlp", "embed"))))
         nn.share_scope(self, mlp)
         # The residual sums in at least fp32 and rounds once to the states' dtype, the head's input.
         wide = at_least_fp32(x.dtype)

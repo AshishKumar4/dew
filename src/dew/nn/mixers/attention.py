@@ -542,7 +542,8 @@ class CausalSelfAttention(nn.Module):
                     raise ValueError("a DEX layer's chosen heads and lambda_init are its variables, which "
                                      "a layer built without them reads from the variables it is given")
                 return jnp.asarray(value, dtype)
-            return self.variable(DEX_COLLECTION, name, drawn).value
+            # Whole on every device, as DEX's parameters are.
+            return self.variable(DEX_COLLECTION, name, declared(drawn, (None,) * jnp.ndim(value))).value
 
         # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
         # every device (`dew.nn.dex`).

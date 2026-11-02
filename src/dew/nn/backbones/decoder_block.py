@@ -774,9 +774,9 @@ class DecoderBlock(nn.Module):
                 Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                 dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
-                                              name='per_layer_input_gate')
+                                              name='per_layer_input_gate', kernel_axes=('embed', 'mlp'))
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
-                                              name='per_layer_projection')
+                                              name='per_layer_projection', kernel_axes=('mlp', 'embed'))
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
         if self.altup is not None:
             if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
@@ -1303,7 +1303,7 @@ class MTPBlock(nn.Module):
         self.hnorm = norm(name='hnorm')
         maps = self.projections()
         def dense(name):
-            return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
+            return Dense(maps[name][1], use_bias=False, dtype=self.dtype, kernel_axes=(None, "embed"),
                          precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')

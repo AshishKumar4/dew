@@ -308,18 +308,21 @@ class Router(nn.Module):
                                self.kernel_axes), (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
-                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
+                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, declared(jnp.zeros, ('exp',)),
                 (self.num_experts,), jnp.float32)
         if self.media_bias:
             self.bias_vl = self.variable(
-                EXPERT_BIAS_COLLECTION, 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
+                EXPERT_BIAS_COLLECTION, 'media_bias', declared(jnp.zeros, ('exp',)), (self.num_experts,),
+                jnp.float32)
         if self.hash_vocab is not None:
             if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
                     "balancing bias, no expert groups and no routing blocks")
+            # A token's experts, read by token: whole on every device.
             self.tid2eid = self.variable(
-                EXPERT_BIAS_COLLECTION, 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
+                EXPERT_BIAS_COLLECTION, 'tid2eid', declared(jnp.zeros, (None, None)),
+                (self.hash_vocab, self.top_k), jnp.int32)
 
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
