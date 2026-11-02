@@ -60,6 +60,7 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
+from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, runtime_facts, tpu
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
@@ -245,10 +246,7 @@ class AheadOfTime:
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
         """The step `save` wrote to `path`."""
-        loaded = pickle.loads(Path(path).read_bytes())
-        if not isinstance(loaded, AheadOfTime):
-            raise ValueError(f"{path} holds no step compiled ahead of time")
-        return loaded
+        return _saved(path, AheadOfTime, "step")
 
     def loaded(self) -> jax.stages.Compiled:
         """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
@@ -308,7 +306,7 @@ def computation_flags(flags: str | None = None) -> tuple[str, ...]:
     division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in their order, as
     XLA reads a flag given twice by its last value."""
     given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
-    return tuple(flag for flag in given.split() if not flag.startswith(PHASE_FLAGS))
+    return tuple(setting for setting in given.split() if not setting.startswith(PHASE_FLAGS))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,10 +365,7 @@ class AheadPrograms:
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:
         """The programs `save` wrote to `path`."""
-        loaded = pickle.loads(Path(path).read_bytes())
-        if not isinstance(loaded, AheadPrograms):
-            raise ValueError(f"{path} holds no programs compiled ahead of time")
-        return loaded
+        return _saved(path, AheadPrograms, "programs")
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
@@ -390,6 +385,14 @@ class AheadPrograms:
         return programs
 
 
+def _saved[Saved](path: str | Path, kind: type[Saved], what: str) -> Saved:
+    """What a `save` of `kind` wrote to `path`, refused where it is not one (`what` it holds)."""
+    loaded = pickle.loads(Path(path).read_bytes())
+    if not isinstance(loaded, kind):
+        raise ValueError(f"{path} holds no {what} compiled ahead of time")
+    return loaded
+
+
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
                      generation: str) -> AheadPrograms:
     """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
@@ -406,10 +409,12 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     for name, (function, arguments) in programs.items():
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
                        for argument in arguments)
-        with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
-            lowered = jax.jit(function, out_shardings=placed).trace(*shapes).lower()
-        with uncached():
-            compiled = lowered.compile()
+        # Through Dew's compile point, as a run compiles it: a launch whose kernel spills there is derived
+        # again at its next config.
+        program = owned_program(function, out_shardings=placed)
+        with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)), uncached():
+            compiled = program.compiled(*shapes)
+            lowered = program.lower(*shapes)
         try:
             built[name] = AheadProgram.of(program_of(lowered), compiled)
         except (NotImplementedError, ValueError) as refused:
@@ -429,11 +434,19 @@ class ExecutableOnly(RuntimeError):
 COMPILE_EVENTS = ("/jax/core/compile/jaxpr_trace_duration", "/jax/core/compile/jaxpr_to_mlir_module_duration",
                   "/jax/core/compile/backend_compile_duration")
 """JAX's own events of a trace, a lowering and a backend compile (`jax.monitoring`)."""
-_held = threading.local()
 
 
-def _refused(event: str, duration: float, **_: object) -> None:
-    if getattr(_held, "depth", 0) and event in COMPILE_EVENTS:
+class _Held(threading.local):
+    """How many `executable_only` blocks this thread is within."""
+
+    depth = 0
+
+
+_held = _Held()
+
+
+def _refused(event: str, duration_secs: float, **kwargs: str | int) -> None:
+    if _held.depth and event in COMPILE_EVENTS:
         raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
                              "program compiled ahead was missing, or code traced around it")
 
@@ -451,7 +464,7 @@ def executable_only() -> Iterator[None]:
     step ends, so this stops a run, not the step itself; that no compile ran anywhere in a run, children
     included, is its compilers' own dumps left empty (`dumps`, `compiled_in`)."""
     _listening()
-    _held.depth = getattr(_held, "depth", 0) + 1
+    _held.depth += 1
     try:
         yield
     finally:
@@ -474,7 +487,7 @@ def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
         with tempfile.NamedTemporaryFile(dir=root / part, prefix=".written-"):
             pass
     given = environment.get("XLA_FLAGS", "").split()
-    flags = [flag for flag in given if not flag.startswith(DUMP_FLAGS)]
+    flags = [setting for setting in given if not setting.startswith(DUMP_FLAGS)]
     kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
     dumping = [*flags, f"--xla_dump_to={root / 'xla'}"]
     return {**kept, "XLA_FLAGS": " ".join(dumping), "MOSAIC_GPU_DUMP_TO": str(root / "mosaic")}
