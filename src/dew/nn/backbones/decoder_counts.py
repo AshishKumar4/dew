@@ -111,8 +111,8 @@ def logits_flops(decoder: CausalTransformer, lengths) -> float:
     projections = decoder.projections()
     tied = (decoder.embedding_features or decoder.emb_features, decoder.vocab_size)
     count = projection_flops(lengths, *projections.get('lm_head', tied))
-    for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
-        if site in projections:
+    for site in projections:
+        if site in ('head_dense', 'project_out') or site.startswith('continuum_'):
             count += projection_flops(lengths, *projections[site])
     if decoder.head_transform is not None:
         count += gate_flops(decoder.norms, ('head_norm',), projections['head_dense'][1], lengths, routed=None)
@@ -148,9 +148,16 @@ def prediction_matrix_usage(decoder: CausalTransformer, path: tuple[str, ...], l
         copies = (decoder.mtp_hyper_connections.hc_mult
                   if relative[1] == 'h_proj' and decoder.mtp_hyper_connections is not None else 1)
         return rows[depth][0] * copies
-    if relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out'):
+    if _head_scope(relative[0]):
         return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
     return np.zeros_like(lengths)
+
+
+def _head_scope(scope: str) -> bool:
+    """Whether a decoder's top scope `scope` is head work, read on every head read: the head's own maps,
+    and the continuum levels before it (`continuum`, a chain's `continuum_0` on), which every head read
+    takes the states through."""
+    return scope in ('lm_head', 'head_dense', 'continuum', 'project_out') or scope.startswith('continuum_')
 
 
 def matrix_usage(decoder: CausalTransformer, path: tuple[str, ...], lengths, *, logits: bool):
@@ -158,8 +165,7 @@ def matrix_usage(decoder: CausalTransformer, path: tuple[str, ...], lengths, *, 
     relative = path[1:] if path and path[0] == 'params' else path
     if not relative:
         raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
-    # The continuum level stands before the head, which every head read takes it through.
-    head = relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out')
+    head = _head_scope(relative[0])
     if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
         return np.zeros(np.shape(lengths), np.int64)
     passes = layer_passes(decoder, int(relative[0].removeprefix('layers_'))) if relative[0].startswith(
