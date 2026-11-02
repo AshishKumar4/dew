@@ -1672,6 +1672,9 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
                         + ('weight' if leaf == 'kernel' else 'bias'))
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
+        if len(parts) == 3 and module == 'self_attn' and leaf == 'sinks':
+            # A layer's learned sink logits, which `dew_path` reads under this name (`_V4_TENSORS`).
+            return f'model.layers.{index}.self_attn.sinks'
         theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
