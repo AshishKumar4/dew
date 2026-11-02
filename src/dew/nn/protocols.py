@@ -290,14 +290,16 @@ class SteppedInContext(Protocol):
     `in_context` says whether the model holds a level, and what a damped step's rate reads
     (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model, bounds on the curvature and slope
     of a slot's loss in the states `head_logits` reads; `level_terms`, the level's |x|^2 and |f|^2 at final
-    states and its output map's norm; `level_slopes`, its activation's derivative bounds."""
+    states as its maps multiply them and its output map's norm, for the parts that step; `level_slopes`,
+    its activation's derivative bounds."""
 
     @property
     def in_context(self) -> bool: ...
 
     def head_bounds(self) -> tuple[jax.Array, jax.Array]: ...
 
-    def level_terms(self, states: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]: ...
+    def level_terms(self, states: jax.Array, parts: tuple[str, ...]
+                    ) -> tuple[jax.Array, jax.Array, jax.Array]: ...
 
     def level_slopes(self) -> tuple[float, float | None]: ...
 

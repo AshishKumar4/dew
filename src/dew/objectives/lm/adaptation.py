@@ -64,13 +64,17 @@ class ChunkAdaptation:
     activation's on |act'| and |act''| (`level_slopes`), a slot's curvature is at most
     Ls (|U|^2 p1^2 |x|^2 [D steps] + |f|^2 [U steps]) + Gs (|U| p2 |x|^2 [D steps] + p1 |x| [both step]),
     |U| and |f| taken at their largest along the window's step (`stepped`), summed over the window by its
-    weights. Under an affine head the loss is convex in `up`, and a step below 1 / L of a convex loss is
-    non-expansive, so stepping `up` alone moves two nearby levels no further apart, whatever the rate:
-    their rounding grows at most by what each window adds. A softcap, a head transform or a step of
-    `down` leaves the loss non-convex, where a step below 1 / L expands two levels' distance by at most
-    1 + rate L, under 2, a window, not by the rate times curvature past 2 of an undamped step, whose
-    rounding grows by 10^4 over three windows of 0.5 N(0, 1) weights at a rate of a half (ledger 1714).
-    An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused.
+    weights, x and f as `down` and `up` multiply them (a checkpoint's quantizer of their inputs applied),
+    L a constant of the step, not differentiated. Under an affine head the loss is convex in `up`, and a
+    step below 1 / L of a convex loss is non-expansive, so stepping `up` alone moves two nearby levels no
+    further apart, whatever the rate: their rounding grows at most by what each window adds. A softcap,
+    a head transform or a step of `down` leaves the loss non-convex, where a step below 1 / L expands two
+    levels' distance by at most 1 + rate L, under 2, a window, not by the rate times curvature past 2 of
+    an undamped step, whose rounding grows by 10^4 over three windows of 0.5 N(0, 1) weights at a rate
+    of a half (ledger 1714).
+    An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused,
+    as are a step of a kernel its product rounds and a step of `down` through an `up` that rounds its
+    input or kernel (`Continuum.step_terms`), the loss piecewise constant in what steps.
 
     `carry` says what a document's first window reads: "document", the level the run trains, each
     document afresh, Titans' and TTT's reset; "run", the level the run carried, each row's documents
@@ -201,19 +205,20 @@ TERMS = 4
 def damping(model: nn.Module, variables, start, hidden, weights, adaptation: ChunkAdaptation):
     """A damped step's bounds (`ChunkAdaptation.damped`): the head's on a slot loss's curvature and slope
     in the states (`SteppedInContext.head_bounds`), the norm of the level's start's output map, and each
-    slot's weighted terms `[B, S, TERMS]` at the level's start (`level_terms`), whose window sums set its
-    rate (`step_rate`); zeros for an undamped step. A step of `down` under an activation whose act'' no
-    number bounds is refused (ReLU's, a point mass at zero)."""
+    slot's weighted terms `[B, S, TERMS]` at the level's start (`level_terms`, of the parts that step),
+    whose window sums set its rate (`step_rate`); zeros for an undamped step. A step of `down` under an
+    activation whose act'' no number bounds is refused (ReLU's, a point mass at zero)."""
     if not adaptation.damped:
         zero = jnp.zeros((), jnp.float32)
         return zero, zero, zero, jnp.zeros((*weights.shape, TERMS), jnp.float32)
-    if "down" in damped_parts(start, adaptation) and model.level_slopes()[1] is None:
+    parts = damped_parts(start, adaptation)
+    if "down" in parts and model.level_slopes()[1] is None:
         raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                          "activation's second derivative, which a ReLU has none of (a point mass at zero), "
                          "so no rate bounds it there: select=('up',), or a smooth activation")
     curvature, slope = _arrays(model.apply(variables, method="head_bounds"))
     held = model.with_in_context_level(variables, start)
-    squares, inputs, norm = _arrays(model.apply(held, hidden, method="level_terms"))
+    squares, inputs, norm = _arrays(model.apply(held, hidden, parts, method="level_terms"))
     lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
     terms = jnp.stack([squares, inputs, fed * lengths, lengths], axis=-1)
     return (jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope), jax.lax.stop_gradient(norm),
@@ -232,7 +237,9 @@ def step_rate(model: nn.Module, adaptation: ChunkAdaptation, parts: tuple[str, .
     curvature and slope and the start's output-map norm (`damping`), `moved` per row the Frobenius norms
     `down` and `up` have moved from the start before the window, and `gradient` the window's. A part's
     largest norm along the step is its start's plus what it moved and what this step moves it at most,
-    the rate times its gradient's norm."""
+    the rate times its gradient's norm. The rate is a constant of the step, as its bound is: the outer
+    gradient flows through the step's gradient, not through the bound it reads (whose distances are
+    zero at a run's start, where their root has no derivative)."""
     curvature, slope, norm = bounds
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(TERMS))
     p1, p2 = model.level_slopes()
@@ -256,7 +263,7 @@ def step_rate(model: nn.Module, adaptation: ChunkAdaptation, parts: tuple[str, .
         stretch = stretch + inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares
         if "down" in parts:
             bend = bend + p1 * lengths
-    return rate / (1 + rate * (curvature * stretch + slope * bend))
+    return jax.lax.stop_gradient(rate / (1 + rate * (curvature * stretch + slope * bend)))
 
 
 def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,

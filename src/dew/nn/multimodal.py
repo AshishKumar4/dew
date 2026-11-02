@@ -548,9 +548,10 @@ class MultimodalTransformer(DecoderWrapper):
         """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
         return self.language_model.continuum_states(hidden)
 
-    def level_terms(self, hidden):
-        """What bounds a step of the decoder's level at its final states (`SteppedInContext`)."""
-        return self.language_model.level_terms(hidden)
+    def level_terms(self, hidden, parts: tuple[str, ...]):
+        """What bounds a damped step of the decoder's level's `parts` at its final states
+        (`SteppedInContext`)."""
+        return self.language_model.level_terms(hidden, parts)
 
     @nn.nowrap
     def level_slopes(self) -> tuple[float, float | None]:

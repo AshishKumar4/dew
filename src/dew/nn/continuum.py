@@ -12,6 +12,7 @@ its logits are the model's without it. The objective that steps it in context is
 """
 
 import dataclasses
+from collections.abc import Callable
 
 import flax.linen as nn
 import jax
@@ -23,6 +24,10 @@ from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
+from dew.quantization import quantized_products
+
+Rounding = Callable[[jax.Array], jax.Array]
+"""A map's input as its product reads it: a checkpoint's quantizer's round trip (`InputQuantizer.qdq`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,13 +70,58 @@ class Continuum(nn.Module):
         wide = at_least_fp32(x.dtype)
         return (x.astype(wide) + self.mlp(x).astype(wide)).astype(x.dtype)
 
-    def step_terms(self, x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """What bounds a step of the level's kernels at states `x` `[..., features]`
-        (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, f = act(down(x)) the
-        inputs `up` multiplies, and the Frobenius norm of the map `up` applies, an adapter's factors on it
-        included, at least its spectral norm; in at least fp32."""
+    @property
+    def down(self) -> nn.Module:
+        """The level's first map, D: the feed-forward's `up_proj`, stored as `down`."""
+        return self.mlp.up_proj
+
+    @property
+    def up(self) -> nn.Module:
+        """The level's output map, U, zero at its start: the feed-forward's `down_proj`, stored as `up`."""
+        return self.mlp.down_proj
+
+    def applied_kernel(self, name: str) -> jax.Array:
+        """The kernel the map `name` (`down`, `up`) multiplies its input by on this call: its own. A method
+        interceptor that changes that answers for itself (`CausalTransformer.applied_kernel`): `dew.lora`'s
+        adds its factors' update, and a frozen FP8 site's is its codes decoded."""
+        return getattr(self, name).get_variable("params", "kernel")
+
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the map `name` other than as a linear map of its input: as the Qwix
+        quantization the call runs under quantizes its activations or gradients
+        (`dew.quantization.quantized_products`), and as a method interceptor answers for itself (a
+        checkpoint's input quantization and frozen FP8 products, `dew.lora`'s dropout on a training
+        forward)."""
+        return quantized_products(self, name).inputs
+
+    def step_terms(self, x: jax.Array, parts: tuple[str, ...], down_input: Rounding | None = None,
+                   up_input: Rounding | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
+        (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
+        `down` and `up` multiply them (`down_input`, `up_input`: a checkpoint's quantizer of the map's
+        input, none where None), and the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`,
+        an adapter's update on it included), at least its spectral norm; in at least fp32.
+
+        A map whose product rounds its kernel (Qwix's quantized weights) makes the loss piecewise constant
+        in that kernel, and an `up` that computes other than the linear map of its input by its kernel
+        (`nonlinear_input`, or its kernel rounded) makes the level's output piecewise constant in `down`,
+        through its rounding of f: the gradient jumps at every rounding boundary, and no curvature bounds
+        a step there, refused. A quantizer of `down`'s input rounds the states, which no step moves."""
+        for name in parts:
+            if quantized_products(self, name).weights:
+                raise ValueError(f"a damped step of the level's `{name}` bounds the loss's curvature in its "
+                                 "kernel, and this call's quantization rounds that kernel in its product, "
+                                 "making the loss piecewise constant in it, which no curvature bounds: step "
+                                 "it undamped")
+        if "down" in parts and (self.nonlinear_input("up") or quantized_products(self, "up").weights):
+            raise ValueError("a damped step of the level's `down` bounds the loss's curvature through the "
+                             "map `up` applies to f = act(D x), and this call's `up` rounds its input or its "
+                             "kernel, making the level's output piecewise constant in `down`, which no "
+                             "curvature bounds: select=('up',), or step it undamped")
         wide = at_least_fp32(x.dtype)
-        hidden = activation(self.level.activation)(self.mlp.up_proj(x)).astype(wide)
-        applied = self.mlp.down_proj(jnp.eye(self.level.hidden, dtype=x.dtype)).astype(wide)
-        return (jnp.sum(jnp.square(x.astype(wide)), axis=-1), jnp.sum(jnp.square(hidden), axis=-1),
-                jnp.sqrt(jnp.sum(jnp.square(applied))))
+        read = x if down_input is None else down_input(x)
+        hidden = activation(self.level.activation)(self.down(x))
+        fed = hidden if up_input is None else up_input(hidden)
+        kernel = self.applied_kernel("up").astype(wide)
+        return (jnp.sum(jnp.square(read.astype(wide)), axis=-1),
+                jnp.sum(jnp.square(fed.astype(wide)), axis=-1), jnp.sqrt(jnp.sum(jnp.square(kernel))))

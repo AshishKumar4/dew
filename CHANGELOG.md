@@ -13,9 +13,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate bounds the window's curvature along the step from the
   head's bounds (`head_bounds`) and the activation's (`SLOPES`), so it never overshoots, and stays
-  non-expansive where the loss is convex (an affine head, `up` alone). A step of `down` under ReLU and a
-  quantized head input stay refused, as no curvature bounds them (both were refused before, with every
-  head but an affine one).
+  non-expansive where the loss is convex (an affine head, `up` alone). Its terms read the level's inputs as
+  its maps multiply them, a checkpoint's quantizer applied, and its rate is a constant of the step. A step
+  of `down` under ReLU, a head map that rounds its input or whose kernel Qwix rounds, a step of a level
+  kernel Qwix rounds, and a step of `down` through an `up` that rounds stay refused, as no curvature
+  bounds them (ReLU's and a quantized head were refused before, with every head but an affine one).
 - A mixture a run bounds in examples counts each member's source examples where their rows are delivered,
   and what a step after the mix refuses of a member's rows under that member, through objective steps,
   batched steps, packs, windows and the shuffles after them (they were counted as the mix drew them, and

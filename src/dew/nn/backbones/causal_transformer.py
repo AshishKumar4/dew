@@ -52,6 +52,7 @@ from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.quantization import quantized_products
 from dew.registry import from_record, read_arguments
 
 from ..activations import HIDDEN_ACT, SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
@@ -1260,28 +1261,29 @@ class CausalTransformer(nn.Module):
         return self.continuum is not None
 
     def head_bounds(self) -> tuple[jax.Array, jax.Array]:
-        """Bounds, over every state, on the curvature and the slope of a slot's cross entropy in the
-        states the head past the continuum level reads (`head_logits`): the norms of its Hessian and its
-        gradient there (`SteppedInContext`), read from the bound model; constants of the step, not
-        differentiated. With A the head's rows (`vocabulary_rows`, an adapter applied) and |A| their
-        Frobenius norm, at least the spectral: the cross entropy's Hessian in the logits is at most 1/2 and
-        its gradient p - y at most sqrt 2, so an affine head's are |A|^2 / 2 and sqrt 2 |A|. A logit
-        softcap c tanh(u / c) has a slope of at most 1 and a second derivative of at most 4 / (3 sqrt 3 c),
-        each logit's gradient at most 1, which adds |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign.
-        A head transform N(phi(D s)) before A, N its norm of gain g and epsilon e, has a Jacobian of at
-        most |g| p1 |D| / sqrt e (a norm's is |g| over its input's root mean square, at least sqrt e) and a
-        second derivative of at most |g| (6 p1^2 / e + p2 / sqrt e) |D|^2 (a norm's is 6 |g| / e at most),
-        p1, p2 its activation's `SLOPES`: a real bound, its epsilon making it a loose one. A quantizer of the
-        head's own input makes the head piecewise constant in its states, whose gradient no Lipschitz bound
-        holds: refused. A checkpoint's quantizer of the trunk's modules alone leaves the head as it is, and
-        a tied head reads its table with none. nGPT's gains never meet a level (`setup`)."""
-        # The head's own inputs: `lm_head`'s, and `project_out`'s before it past an embedding's own width.
-        heads = [*([] if self.tie_embeddings else [self.lm_head]), *([] if self.embedding_features is None
-                                                                  else [self.project_out])]
-        if any(self._quantizer(head) is not None for head in heads):
-            raise ValueError("a damped step bounds the head's curvature in its states, and a quantizer of "
-                             "the head's input makes the head piecewise constant there, its gradient jumping "
-                             "at every rounding boundary, which no curvature bounds: step it undamped")
+        """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states
+        `head_logits` reads (`SteppedInContext`), from the bound model: constants of the step. With |A| the
+        Frobenius norm of the head's rows (`vocabulary_rows`, an adapter applied), at least the spectral,
+        an affine head's are |A|^2 / 2 and sqrt 2 |A| (the cross entropy's Hessian in the logits is at most
+        1/2, its gradient p - y at most sqrt 2); a logit softcap c tanh(u / c), of slope at most 1, adds
+        |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign; a transform N(phi(D s)), N a norm of gain g and
+        epsilon e, has a Jacobian of at most |g| p1 |D| / sqrt e and a second derivative of at most
+        |g| (6 p1^2 / e + p2 / sqrt e) |D|^2, p1, p2 phi's `SLOPES` (a norm's are |g| / sqrt e and 6 |g| / e).
+        A head map (`lm_head`, a tied head's `embed_tokens`, `project_out`, `head_dense`) that rounds its
+        input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel Qwix
+        rounds multiplies by a matrix these norms do not read: refused. nGPT's gains never meet a level
+        (`setup`)."""
+        heads = [*(["embed_tokens"] if self.tie_embeddings else ["lm_head"]),
+                 *([] if self.embedding_features is None else ["project_out"]),
+                 *([] if self.head_transform is None else ["head_dense"])]
+        rounded = [name for name in heads
+                   if self.nonlinear_input(name) or quantized_products(self, name).weights]
+        if rounded:
+            raise ValueError(f"a damped step bounds the head's curvature and slope in its states, and the "
+                             f"head's {rounded} round their inputs, making the head piecewise constant "
+                             f"there, its gradient jumping at every rounding boundary, which no curvature "
+                             f"bounds, or multiply by their kernels rounded, a matrix these bounds do not "
+                             f"read: step it undamped")
         rows = jnp.asarray(self.vocabulary_rows())
         table = jnp.sum(jnp.square(rows.astype(at_least_fp32(rows.dtype))))
         curvature, slope = table / 2, jnp.sqrt(2 * table)
@@ -1315,12 +1317,16 @@ class CausalTransformer(nn.Module):
             raise ValueError("this model has no continuum level")
         return self.continuum_level(hidden)
 
-    def level_terms(self, hidden) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """What bounds a step of the continuum level's kernels at final states `hidden`
-        (`Continuum.step_terms`, `SteppedInContext`)."""
+    def level_terms(self, hidden, parts: tuple[str, ...]) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """What bounds a damped step of the continuum level's `parts` at final states `hidden`
+        (`Continuum.step_terms`, `SteppedInContext`), each map's input as a checkpoint's quantizer of it
+        rounds it (`input_quantizer`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level.step_terms(hidden)
+        level = self.continuum_level
+        quantizers = [self._quantizer(getattr(level, name)) for name in ("down", "up")]
+        return level.step_terms(hidden, parts, *(None if quantizer is None else quantizer.qdq
+                                                 for quantizer in quantizers))
 
     @nn.nowrap
     def level_slopes(self) -> tuple[float, float | None]:
@@ -2131,6 +2137,14 @@ class CausalTransformer(nn.Module):
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
         return getattr(self, name).get_variable("params", "kernel")
+
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` other than as a linear map of its input: as the
+        Qwix quantization the call runs under quantizes its activations or gradients
+        (`dew.quantization.quantized_products`), and as a method interceptor answers for itself (a
+        checkpoint's input quantization and frozen FP8 products, `dew.lora`'s dropout on a training
+        forward). A damped step's head bounds read it (`head_bounds`)."""
+        return quantized_products(self, name).inputs
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

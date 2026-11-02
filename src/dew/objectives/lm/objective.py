@@ -1291,7 +1291,9 @@ class LMObjective(TokenScorer):
         """
         if self._carries and CARRIED not in tree:
             # A run that carries its level starts with nothing carried.
-            level = self.model.in_context_level(tree) if isinstance(self.model, SteppedInContext) else None
+            # The level as the model reads it, its frozen leaves among it; the tree keeps its split.
+            level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)
+                     else None)
             if level is None:
                 raise ValueError("the model has no continuum level to step in context")
             tree = {**tree, CARRIED: carried_start(level)}

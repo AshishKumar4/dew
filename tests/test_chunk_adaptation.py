@@ -6,6 +6,7 @@ that steps the level by `rate` times its window's summed weighted gradient, writ
 the scan, on par with it by check 1 against its own float64 run."""
 
 import functools
+import math
 from pathlib import Path
 
 import jax
@@ -406,6 +407,31 @@ def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
     site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level's update over {kind}", CARRY_SEEDS)
 
 
+@pytest.mark.parametrize("frozen", ["level", "down"])
+def test_a_run_carries_a_level_whose_leaves_are_frozen(frozen):
+    """A run that carries its level starts with nothing carried in the level's whole tree, its frozen
+    leaves among it (`thaw`), and scores through it: the whole level frozen, or its `down` alone, the
+    variables keeping their split."""
+    from dew.batch import FROZEN
+
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
+    tree = MODEL.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))
+    level = dict(tree["params"]["continuum"])
+    if frozen == "level":
+        params = {name: value for name, value in tree["params"].items() if name != "continuum"}
+        cold = {"continuum": level}
+    else:
+        cold = {"continuum": {"down": level.pop("down")}}
+        params = {**tree["params"], "continuum": level}
+    split = {**tree, "params": params, FROZEN: cold}
+    completed = objective.complete_variables(jax.random.key(0), split)
+    assert jax.tree.structure(completed[CARRIED]) == jax.tree.structure(tree["params"]["continuum"])
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(completed[CARRIED]))
+    assert completed[FROZEN] == split[FROZEN]
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(completed, tokens).losses)))
+
+
 def _replayed():
     """The batch for each step of a run, its position the stream's checkpointed state."""
     return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
@@ -522,10 +548,29 @@ def _steep(variables):
     return {**variables, "params": {**variables["params"], "embed_tokens": table}}
 
 
+def _scaled(variables, scale: float = 0.37):
+    """`variables` with each checkpoint input quantizer's scale at `scale`, a positive one, where a draw
+    holds N(0, 1) values."""
+    from dew.quantization import QUANTIZATION
+
+    return {**variables, QUANTIZATION: jax.tree.map(lambda leaf: np.full_like(leaf, scale),
+                                                    variables[QUANTIZATION])}
+
+
+def _checkpoint(site: str, **options) -> CausalTransformer:
+    """The test decoder built with `options`, computing under a checkpoint's FP8 quantizer of `site`'s
+    input."""
+    from dew.quantization import InputQuantization
+
+    return InputQuantization(format="modelopt", sites=((site, "fp8"),)).apply(decoder(**options))
+
+
 DAMPED_HEADS = {"steep": (MODEL, _steep), "softcap": (decoder(final_logit_softcap=2.0), None),
-                "transform": (decoder(head_transform="gelu"), None)}
+                "transform": (decoder(head_transform="gelu"), None),
+                "quantized": (_checkpoint("continuum/down"), _scaled)}
 """Heads a damped step bounds: the steep tied head (`_steep`), a logit softcap of 2 and a GELU head
-transform, each with its variables' transform where it has one."""
+transform, each with its variables' transform where it has one; and the level's `down` reading its
+input through a checkpoint's FP8 quantizer, its states rounded (`_checkpoint`)."""
 
 
 @pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
@@ -534,19 +579,22 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     """A damped step's rate times the largest curvature, of either sign, of its window's loss in the
     kernels it steps is at most 1 (`ChunkAdaptation.damped`), at the level's start and at the level its
     step reaches, for each of `up`, `down` and both and for an affine head whose leading direction the
-    ones vector is orthogonal to, a logit softcap and a head transform, at a rate whose plain step is far
-    past 2 over that curvature: the step never overshoots."""
+    ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
+    input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
+    overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
     from dew.objectives.lm.adaptation import damping, step_rate
 
     model, transform = DAMPED_HEADS[head]
     _, hidden, targets, weights = draw(0, scale=0.5)
     variables = drawn_variables(0, model)
     variables = variables if transform is None else transform(variables)
-    level, window, rate = variables["params"]["continuum"], slice(0, 3), 50.0
+    window, rate = slice(0, 3), 50.0
+    level = variables["params"]["continuum"]
     adaptation = ChunkAdaptation(window=3, rate=rate, select=parts, damped=True)
     states, picked, weighed = hidden[:1, window], targets[:1, window], weights[:1, window]
 
-    def loss(kernels):
+    def loss(kernels, variables, states, weighed):
+        level = variables["params"]["continuum"]
         stepped = {**level, **{part: {**level[part], "kernel": kernel} for part, kernel in kernels.items()}}
         held = model.with_in_context_level(variables, stepped)
         logits = model.apply(variables, model.apply(held, states, method="continuum_states"),
@@ -555,20 +603,24 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
         return -jnp.sum(weighed[0] * chosen)
 
     kernels = {part: level[part]["kernel"] for part in parts}
-    gradient = jax.grad(loss)(kernels)
+    gradient = jax.grad(loss)(kernels, variables, states, weighed)
     *bounds, terms = damping(model, variables, level, states, weighed, adaptation)
     moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
     damped = float(step_rate(model, adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
-    flat, unflatten = jax.flatten_util.ravel_pytree(kernels)
-    for at in (kernels, reached):
-        point = jax.flatten_util.ravel_pytree(at)[0]
-        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector)))(point), np.float64)
-        largest = np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max()
-        assert damped * largest <= 1 + 1e-6, (head, parts)
-    plain = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector)))(flat), np.float64)
-    assert rate * np.abs(np.linalg.eigvalsh((plain + plain.T) / 2)).max() > 2
+
+    def curvature(at) -> float:
+        """The largest |eigenvalue| of the loss's float64 Hessian in the kernels at `at`."""
+        point, unflatten = jax.flatten_util.ravel_pytree(widened(at))
+        wide = widened((variables, states, weighed))
+        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector), *wide))(point))
+        return float(np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max())
+
+    with jax.enable_x64(new_val=True):
+        largest = [curvature(kernels), curvature(reached)]
+    assert all(damped * curvature <= 1 for curvature in largest), (head, parts, damped, largest)
+    assert rate * largest[0] > 2
 
 
 def test_a_zero_heads_damped_step_is_finite():
@@ -618,25 +670,26 @@ def differentiated(fn):
         lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
 
 
-DAMPED_GRADIENT_SEEDS = {"documents": 32, "packed": 128, "padded": 64}
-"""Check 1's declared seeds for the outer gradient through damped steps at the corner, one draw a seed,
-sized paired by `seeds_for` on armada."""
+DAMPED_GRADIENT_SEEDS = {("documents", "up"): 32, ("packed", "up"): 128, ("padded", "up"): 64,
+                         ("documents", "both"): 0, ("packed", "both"): 0, ("padded", "both"): 0}
+"""Check 1's declared seeds for the outer gradient through damped steps at the corner, of `up` or of both
+parts, one draw a seed, sized paired by `seeds_for` on armada."""
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("rate", "scale", "damped"),
-                         [(0.1, 0.5, False), (0.5, 0.25, False), (0.5, 0.5, True)],
-                         ids=["tenth", "half", "damped-corner"])
+                         [(0.1, 0.5, None), (0.5, 0.25, None), (0.5, 0.5, "up"), (0.5, 0.5, "both")],
+                         ids=["tenth", "half", "damped-corner", "damped-corner-both"])
 def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half, the half over
     weights where its step is stable (the divergent corner's gradient awaits the gate, `CORNER_WINDOWS`),
-    and at the corner itself through damped steps of `up`, their rates constants of the step, one draw
-    a seed: the contract the undamped corner leaves open (ledger 1714)."""
+    and at the corner itself through damped steps of `up` and of both parts, their rates constants of
+    the step, one draw a seed: the contract the undamped corner leaves open (ledger 1714)."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
-    adaptation = (ChunkAdaptation(window=3, rate=rate, select=("up",), damped=True) if damped
-                  else ChunkAdaptation(window=3, rate=rate))
+    adaptation = (ChunkAdaptation(window=3, rate=rate) if damped is None else
+                  ChunkAdaptation(window=3, rate=rate, select=("up",) if damped == "up" else (), damped=True))
 
     def gradient_draw(seed):
         variables, hidden, targets, weights = draw(seed, scale=scale)
@@ -647,10 +700,11 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     def reference(truth):
         return differentiated(weighted_loss(fields, adaptation, truth=truth))
 
-    seeds = DAMPED_GRADIENT_SEEDS[kind] if damped else GRADIENT_SEEDS[kind, rate, scale]
+    seeds = GRADIENT_SEEDS[kind, rate, scale] if damped is None else DAMPED_GRADIENT_SEEDS[kind, damped]
+    label = {None: "", "up": "damped ", "both": "jointly damped "}[damped]
     site(differentiated(dew), reference, gradient_draw, rate, scale, 3,
-         f"the gradient through the windows' {'damped ' if damped else ''}steps over {kind}, rate {rate}, "
-         f"scale {scale}", seeds, damped=damped)
+         f"the gradient through the windows' {label}steps over {kind}, rate {rate}, scale {scale}", seeds,
+         damped=damped is not None)
 
 
 def test_each_window_steps_from_its_level_as_the_literal_loop():
@@ -887,19 +941,23 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
 @pytest.mark.parametrize("act", sorted(SLOPES, key=lambda function: function.__name__),
                          ids=lambda function: function.__name__)
 def test_each_activations_slopes_bound_its_derivatives(act):
-    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: at least their float64
-    maxima over [-40, 40] at a step of 1e-4, past which every one is flat, and within 1e-4 of them; a
+    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: their float64 maxima over
+    [-40, 40] at a step of 1e-4, past which every one is flat, rounded up at the seventh decimal; a
     ReLU's act'' is a point mass, no number (None)."""
     with jax.enable_x64(new_val=True):
         grid = jnp.linspace(-40.0, 40.0, 800_001, dtype=jnp.float64)
         first = jax.vmap(jax.grad(act))(grid)
         second = jax.vmap(jax.grad(jax.grad(act)))(grid)
+
+    def rounded_up(values) -> float:
+        return math.ceil(float(jnp.abs(values).max()) * 10 ** 7) / 10 ** 7
+
     p1, p2 = SLOPES[act]
-    assert float(jnp.abs(first).max()) <= p1 < float(jnp.abs(first).max()) + 1e-4
+    assert p1 == rounded_up(first)
     if p2 is None:
         assert act is jax.nn.relu
     else:
-        assert float(jnp.abs(second).max()) <= p2 < float(jnp.abs(second).max()) + 1e-4
+        assert p2 == rounded_up(second)
 
 
 def test_what_the_adaptation_cannot_serve_is_refused():
@@ -927,7 +985,6 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         adapted.build_task(variables)
     # A damped step of `down` bounds its curvature through its activation's act'', which a ReLU's point
     # mass at zero leaves unbounded: refused there, and its `up` alone steps.
-    damped = ChunkAdaptation(select=("up",), damped=True)
     relu = decoder(ContinuumLevel(hidden=4, activation="relu"))
     for parts, refused in ((("down",), True), (("up",), False)):
         objective = LMObjective(relu, LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
@@ -938,28 +995,71 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         else:
             assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
                                                                         tokens).losses)))
-    # A checkpoint's quantizer of the head's own input makes the head piecewise constant in its states,
-    # whose gradient no curvature bounds, and refuses; one of a trunk module alone leaves the head as it
-    # is, and the step runs.
-    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
-
-    for site, refused in (("lm_head", True), ("layers_0/self_attn/q_proj", False)):
-        quantized = InputQuantization(format="modelopt", sites=((site, "fp8"),)).apply(
-            decoder(tie_embeddings=False))
-        objective = LMObjective(quantized, LENGTH, adaptation=damped)
-        variables = objective.init(jax.random.key(0))
-        scales = variables[QUANTIZATION]
-        for path in site.split("/")[:-1]:
-            scales = scales[path]
-        scales[site.split("/")[-1]][INPUT_SCALES["fp8"]] = jnp.asarray(0.37, jnp.float32)
-        tokens = jnp.zeros((1, LENGTH + 1), jnp.int32)
-        if refused:
-            with pytest.raises(ValueError):
-                objective.token_scores(variables, tokens)
-        else:
-            assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
     with pytest.raises(ValueError):
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
+
+
+def _qwix(pattern: str, **options) -> CausalTransformer:
+    """The test decoder built with `options`, its products at modules `pattern` selects trained in int8
+    (Qwix's quantization)."""
+    from dew.quantization import Quantization
+
+    return Quantization(patterns=(pattern,)).apply(decoder(**options))
+
+
+ROUNDED = {
+    "checkpoint-lm_head": (lambda: _checkpoint("lm_head", tie_embeddings=False), ("up",), True),
+    "checkpoint-head_dense": (lambda: _checkpoint("head_dense", head_transform="gelu"), ("up",), True),
+    "checkpoint-trunk": (lambda: _checkpoint("layers_0/self_attn/q_proj", tie_embeddings=False), (), False),
+    "checkpoint-up-up": (lambda: _checkpoint("continuum/up"), ("up",), False),
+    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), True),
+    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), True),
+    "checkpoint-down-both": (lambda: _checkpoint("continuum/down"), (), False),
+    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), True),
+    "qwix-tied": (lambda: _qwix("embed_tokens"), ("up",), True),
+    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), True),
+    "qwix-down-up": (lambda: _qwix("continuum/down"), ("up",), False),
+    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), True),
+}
+"""Models whose head or level rounds a product, the parts a damped step steps through them, and whether
+it is refused (`test_a_damped_step_refuses_what_rounds_where_it_steps`)."""
+
+
+@pytest.mark.parametrize("case", sorted(ROUNDED))
+def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
+    """A damped step's bounds hold where the maps it reads are linear in what it moves. A head map that
+    rounds its input (a checkpoint's quantizer of `lm_head`'s or of a transform's `head_dense`'s input)
+    makes the head piecewise constant in its states, and one Qwix quantizes (`lm_head`, a tied head's
+    `embed_tokens`) rounds its inputs or multiplies by its kernel rounded; a level map whose kernel
+    Qwix rounds makes the loss piecewise constant in that kernel, and an `up` that rounds its input makes
+    the level's output piecewise constant in `down`: each refused (ValueError). The rest runs, finite: a
+    trunk module's quantizer, `up` alone through its quantized input, both parts through a quantized
+    `down` input, and `up` alone where Qwix rounds `down`'s products."""
+    build, parts, refused = ROUNDED[case]
+    objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
+    variables = objective.init(jax.random.key(0))
+    # A checkpoint's quantizer reads the scale its variables hold, positive.
+    variables = _scaled(variables) if case.startswith("checkpoint") else variables
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    if refused:
+        with pytest.raises(ValueError):
+            objective.token_scores(variables, tokens)
+    else:
+        assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+
+
+def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
+    """A damped step's terms read x and f as the level's maps multiply them (`level_terms`): a
+    checkpoint's quantizer of `down`'s input at a scale that rounds every state to zero zeroes each
+    state's |x|^2, and one of `up`'s each slot's |f|^2, where the unquantized level's are positive."""
+    _, hidden, _, _ = draw(0, scale=0.5)
+    for site, term in (("continuum/down", 0), ("continuum/up", 1)):
+        model = _checkpoint(site)
+        plain = MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms")[term]
+        rounded = model.apply(_scaled(drawn_variables(0, model), 1e30), hidden, ("up",),
+                              method="level_terms")[term]
+        assert np.all(np.asarray(plain) > 0), site
+        assert not np.any(np.asarray(rounded)), site
 
 
 def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
