@@ -18,7 +18,7 @@ from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
 from dew.objectives.rl.tssm import TSSM
-from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean
+from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean, unimix_log_probs
 from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
 
 
@@ -50,6 +50,21 @@ def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
         expected.append(-(share * row[below] + (1 - share) * row[above]))
     assert_computes_the_oracle(found, np.asarray(expected), "the two-hot loss", roundings=roundings)
     assert_computes_the_oracle(inverted, targets, "symexp of symlog", roundings=8)
+
+
+@pytest.mark.parametrize("unimix", [0.0, 0.01])
+def test_a_categoricals_log_probabilities_stay_finite_where_a_class_is_far_below(unimix):
+    """A latent's log-probabilities (`unimix_log_probs`) of logits a thousand below their row's largest,
+    with and without the uniform mixture, are the mixture's written in float64 from the log-softmax: finite
+    wherever float32's log-softmax is, so the world model's KL over them stays finite."""
+    logits = np.asarray([[0.0, -1000.0, -3.0, 2.5], [-40.0, 0.0, -1000.0, 1.0]], np.float32)
+    found = np.asarray(unimix_log_probs(jnp.asarray(logits), unimix))
+    wide = logits.astype(np.float64)
+    log_softmax = wide - wide.max(-1, keepdims=True)
+    log_softmax = log_softmax - np.log(np.exp(log_softmax).sum(-1, keepdims=True))
+    expected = log_softmax if not unimix else np.log((1 - unimix) * np.exp(log_softmax) + unimix / 4)
+    assert np.isfinite(found).all()
+    assert_computes_the_oracle(found, expected, "the latent's log-probabilities", roundings=16)
 
 
 def test_lambda_returns_are_the_codes_recursion():
