@@ -6,9 +6,11 @@ that steps the level by `rate` times its window's summed weighted gradient, writ
 the scan, on par with it by check 1 against its own float64 run."""
 
 import functools
+import math
 from pathlib import Path
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -17,11 +19,12 @@ from affine_run import Replaying, dataset
 from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
+from dew.nn.activations import HIDDEN_ACT, SLOPES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
 from dew.objectives.lm import LMObjective, Samples
-from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
+from dew.objectives.lm.adaptation import CARRIED, ChunkAdaptation, adapted_scores
 from dew.training import Checkpoints, Trainer
 
 VOCAB = 16
@@ -117,17 +120,23 @@ def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
-                levels: bool = False, truth: bool = False):
+                levels: bool = False, truth: bool = False, finals: bool = False):
     """Equation 71 read literally, token by token along each row: a run of a document's real tokens
     starts from the level's start; each real token reads its window's level, and at the first real
     token of the run's next window the level steps by `rate` times the summed gradient of the window's
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
     real where the mask marks it and its document is not 0, as every reader of rows takes it. With
     `levels`, also the level each token reads. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy. A damped step's rate is rate / (1 + rate L), L half the head table's squared
-    Frobenius norm (the test decoder ties its head to its embeddings) times the window's weighted sum
-    of |silu(state down)|^2, the inputs `up` multiplies; both are constants of the step, not
-    differentiated.
+    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at
+    rate / (1 + rate L), L written from `ChunkAdaptation.damped`'s bound for the test decoder's affine
+    head tied to its embeddings E: Ls = |E|^2 / 2 and Gs = sqrt 2 |E| (Frobenius norms), SiLU's derivative
+    bounds p1, p2, the window's weighted sums of |x|^2, |f|^2, |f| |x| and |x| (x the state, f its
+    silu(x D) at the level's start), and |U| and D's distance from the start along the step; every bound
+    is a constant of the step, not differentiated.
+
+    A level a run carries (`ChunkAdaptation.carry`, "run") starts at the trained level plus the carried
+    collection's, and runs through the row's documents in turn: a run is the row's real tokens. With
+    `finals`, each row's level at its end, its open window's step applied, is returned beside the losses.
 
     With `truth`, each token's loss is written log(1 + sum over the other tokens of exp(their logit less
     the target's)), whose derivative at the target is minus the others' probabilities summed: the
@@ -137,13 +146,16 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     is about 4e-17."""
     params = variables["params"]
     start = params["continuum"]
+    carries = adaptation.carry == "run"
+    if carries:
+        start = jax.tree.map(jnp.add, start, variables["carried"])
     rows, length = targets.shape
     valid = fields.get("attention_mask")
     documents = fields.get("segment_ids")
     real = (jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool))
     if documents is not None:
         real = real & (jnp.asarray(documents) != 0)
-    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
+    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None or carries
                  else jnp.asarray(documents, jnp.int32))
 
     def token_loss(level, state, target):
@@ -158,12 +170,34 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     def choose(condition, first, second):
         return jax.tree.map(lambda one, other: jnp.where(condition, one, other), first, second)
 
-    curvature = jax.lax.stop_gradient(jnp.sum(jnp.square(params["embed_tokens"]["embedding"])) / 2)
+    table = jax.lax.stop_gradient(jnp.sum(jnp.square(params["embed_tokens"]["embedding"])))
+    curvature, slope = table / 2, jnp.sqrt(2 * table)
+    p1, p2 = SLOPES[HIDDEN_ACT[LEVEL.activation]]
+    parts = [name for name in ("down", "up") if not adaptation.select or name in adaptation.select]
+    output = jax.lax.stop_gradient(jnp.sqrt(jnp.sum(jnp.square(start["up"]["kernel"]))))
+
+    def damped_rate(level, summed, energy):
+        squares, inputs, crossed, lengths = energy
+        rate = adaptation.rate
+
+        def reach(name):
+            moved = jnp.sqrt(jnp.sum(jnp.square(level[name]["kernel"] - start[name]["kernel"])))
+            return moved + rate * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
+
+        spread = reach("down") if "down" in parts else 0.0
+        norm = output + (reach("up") if "up" in parts else 0.0)
+        stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
+            inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts else 0.0)
+        bend = (norm * p2 * squares if "down" in parts else 0.0) + (
+            p1 * lengths if parts == ["down", "up"] else 0.0)
+        return rate / (1 + rate * jax.lax.stop_gradient(curvature * stretch + slope * bend))
 
     def stepped(level, summed, energy):
-        rate = (adaptation.rate / (1 + adaptation.rate * curvature * energy) if adaptation.damped
-                else adaptation.rate)
-        return {name: jax.tree.map(lambda leaf, grad: leaf - rate * grad, part, summed[name])
+        if adaptation.damped:
+            rate = damped_rate(level, summed, energy)
+            return {name: {**part, "kernel": part["kernel"] - rate * summed[name]["kernel"]}
+                    if name in parts else part for name, part in level.items()}
+        return {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part, summed[name])
                 if not adaptation.select or name in adaptation.select else part
                 for name, part in level.items()}
 
@@ -186,16 +220,18 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         (gradient,) = pull(weighed)
         summed = jax.tree.map(jnp.add, summed, gradient)
         inputs = jax.lax.stop_gradient(jax.nn.silu(state @ start["down"]["kernel"]))
-        energy = energy + weighed * jnp.sum(jnp.square(inputs))
+        squares, fed = jnp.sum(jnp.square(state)), jnp.sum(jnp.square(inputs))
+        terms = jnp.stack([squares, fed, jnp.sqrt(fed * squares), jnp.sqrt(squares)])
+        energy = energy + weighed * jax.lax.stop_gradient(terms)
         read = (loss, level) if levels else loss
         return (level, summed, energy, count + here_real, opened, document, begun), read
 
     def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
-        first = (start, zeros, jnp.zeros((), hidden.dtype), jnp.int32(0), jnp.int32(-1), jnp.int32(0),
+        first = (start, zeros, jnp.zeros((4,), hidden.dtype), jnp.int32(0), jnp.int32(-1), jnp.int32(0),
                  jnp.zeros((), bool))
-        _, losses = jax.lax.scan(token, first, (row_hidden, row_targets, row_weights, row_real,
-                                                row_documents))
-        return losses
+        (level, summed, energy, *_), losses = jax.lax.scan(
+            token, first, (row_hidden, row_targets, row_weights, row_real, row_documents))
+        return (losses, stepped(level, summed, energy)) if finals else losses
 
     return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
 
@@ -309,6 +345,124 @@ def scan_as_equation_71(kind: str, window: int, rate: float, scale: float) -> No
          ADAPTATION_SEEDS[window, rate, scale])
 
 
+CARRY_SEEDS = 8
+"""Check 1's declared seeds for a carried level's windows and its rows' mean step, each a draw."""
+
+
+def carried_draw(seed: int):
+    """A draw (`draw`) whose variables carry a level moved by 0.1 N(0, 1) (`CARRIED`)."""
+    variables, hidden, targets, weights = draw(seed)
+    rng = np.random.default_rng(seed + 1_000)
+    carried = jax.tree.map(lambda leaf: (0.1 * rng.standard_normal(leaf.shape)).astype(np.float32),
+                           variables["params"]["continuum"])
+    return {**variables, CARRIED: carried}, hidden, targets, weights
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_a_carried_level_steps_through_a_rows_documents_as_equation_71_reads_them(kind):
+    """A level the run carries (`carry="run"`) starts at the trained level plus what is carried, and
+    each row's documents step it in turn, a packed row's second document reading the level its first
+    left: each loss on par with the literal loop's (check 1), over every layout, at a window of three
+    and a rate of a tenth."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.1, carry="run")
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(truth):
+        return lambda variables, hidden, targets, weights: equation_71(
+            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
+
+    site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level over {kind}", CARRY_SEEDS)
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
+    """What an update carries on (`carried_update`) is what was carried plus the mean, over the rows
+    whose targets weigh anything, of how far each row's windows moved the level, its last window's step
+    applied: on par with the literal loop's rows' final levels (check 1), over every layout."""
+    from dew.objectives.lm.adaptation import carried_update
+
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.1, carry="run")
+
+    def dew(variables, hidden, targets, weights):
+        moved = adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                               predict=False, logits=False).moved
+        return carried_update(variables[CARRIED], moved)
+
+    def reference(truth):
+        def carried(variables, hidden, targets, weights):
+            _, finals = equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                                    truth=truth, finals=True)
+            start = jax.tree.map(jnp.add, variables["params"]["continuum"], variables[CARRIED])
+            counted = jnp.sum(weights, axis=1) > 0
+            return jax.tree.map(lambda held, final, began: held + jnp.sum(jnp.where(
+                counted.reshape(-1, *[1] * (began.ndim)), final - began, 0), axis=0) / jnp.sum(counted),
+                variables[CARRIED], finals, start)
+        return carried
+
+    site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level's update over {kind}", CARRY_SEEDS)
+
+
+@pytest.mark.parametrize("frozen", ["level", "down"])
+def test_a_run_carries_a_level_whose_leaves_are_frozen(frozen):
+    """A run that carries its level starts with nothing carried in the level's whole tree, its frozen
+    leaves among it (`thaw`), and scores through it: the whole level frozen, or its `down` alone, the
+    variables keeping their split."""
+    from dew.batch import FROZEN
+
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
+    tree = MODEL.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))
+    level = dict(tree["params"]["continuum"])
+    if frozen == "level":
+        params = {name: value for name, value in tree["params"].items() if name != "continuum"}
+        cold = {"continuum": level}
+    else:
+        cold = {"continuum": {"down": level.pop("down")}}
+        params = {**tree["params"], "continuum": level}
+    split = {**tree, "params": params, FROZEN: cold}
+    completed = objective.complete_variables(jax.random.key(0), split)
+    assert jax.tree.structure(completed[CARRIED]) == jax.tree.structure(tree["params"]["continuum"])
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(completed[CARRIED]))
+    assert completed[FROZEN] == split[FROZEN]
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(completed, tokens).losses)))
+
+
+def _replayed():
+    """The batch for each step of a run, its position the stream's checkpointed state."""
+    return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
+        0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
+
+
+def _checkpointed(objective, directory):
+    """A trainer of `objective` checkpointing under `directory`."""
+    return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
+                   checkpoints=Checkpoints(str(directory)))
+
+
+def test_a_run_that_carries_its_level_resumes_what_it_carried_bit_for_bit(tmp_path):
+    """A run that carries its level (`carry="run"`) starts with nothing carried, carries its rows' steps
+    from its first update, and a run resumed from its checkpoint ends where the uninterrupted one does,
+    bit for bit, what it carried among its state."""
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
+
+    def trainer(directory):
+        return _checkpointed(objective, directory)
+
+    start = objective.init(jax.random.key(0))
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(start[CARRIED]))
+    whole = trainer(tmp_path / "whole").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    assert any(np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(whole.variables[CARRIED]))
+    for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
+
+
 PADDING_SEEDS = 8
 """Check 1's declared seeds for padding marked by document 0 alone or beside an all-true mask,
 sized paired by `seeds_for` on armada."""
@@ -354,15 +508,17 @@ DAMPED_SEEDS = {(1, 0.5): 8, (3, 0.5): 8, (3, 0.1): 8}
 `seeds_for` on armada, the most any layout took."""
 
 
+@pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("window", "rate"), [(1, 0.5), (3, 0.5), (3, 0.1)])
-def test_a_damped_step_is_equation_71s_at_its_bounded_rate(kind, window, rate):
-    """`up` stepped at rate / (1 + rate L), L the bound on its window's curvature (`ChunkAdaptation.damped`):
-    each loss on par with the literal loop's at the same rate (check 1), over weights drawn at a half,
-    at a rate of a half, where an undamped step diverges and its sites pool draws (`CORNER_WINDOWS`),
-    here one draw a seed, and at a tenth; one token a window and three, over every layout."""
+def test_a_damped_step_is_equation_71s_at_its_bounded_rate(kind, window, rate, parts):
+    """`up`, `down` or both stepped at rate / (1 + rate L), L the bound on its window's curvature along the
+    step (`ChunkAdaptation.damped`): each loss on par with the literal loop's at the same rate (check 1),
+    over weights drawn at a half, at a rate of a half, where an undamped step diverges and its sites pool
+    draws (`CORNER_WINDOWS`), here one draw a seed, and at a tenth; one token a window and three, over
+    every layout."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
-    adaptation = ChunkAdaptation(window=window, rate=rate, select=("up",), damped=True)
+    adaptation = ChunkAdaptation(window=window, rate=rate, select=parts, damped=True)
 
     def dew(variables, hidden, targets, weights):
         return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
@@ -372,24 +528,15 @@ def test_a_damped_step_is_equation_71s_at_its_bounded_rate(kind, window, rate):
         return lambda variables, hidden, targets, weights: equation_71(
             MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
 
-    site(dew, reference, draw, rate, 0.5, window, f"a damped step over {kind} at a window of {window}, "
-         f"rate {rate}", DAMPED_SEEDS[window, rate], damped=True)
+    site(dew, reference, draw, rate, 0.5, window, f"a damped step of {'+'.join(parts)} over {kind} at a "
+         f"window of {window}, rate {rate}", DAMPED_SEEDS[window, rate], damped=True)
 
 
-def test_a_damped_rate_holds_below_one_over_its_windows_curvature_whatever_the_heads_direction():
-    """A damped step's rate times the largest curvature of its window's loss in `up`'s kernel is at
-    most 1, the bound under which gradient descent on a convex loss moves two levels no further apart,
-    for a head whose leading direction the ones vector is orthogonal to (a power iteration from it
-    would never see that direction) and at a rate whose plain step is far past 2 over that curvature;
-    a zero head's curvature is zero."""
-    from dew.objectives.lm.adaptation import head_curvature, up_energy
-
-    variables, hidden, targets, weights = draw(0, scale=0.5)
-    table = np.asarray(variables["params"]["embed_tokens"]["embedding"])
-    # A head whose Gram has the ones direction and a leading one orthogonal to it as exact eigenvectors:
-    # 8 a (u_0 - u_1) / sqrt(2), u_k the k-th basis vector, beside 0.01 b ones / sqrt(F), its vocabulary
-    # vectors a and b orthogonal, so a power iteration from the ones vector stays on the small eigenvalue
-    # (the first review's P1).
+def _steep(variables):
+    """`variables` whose tied head's Gram has the ones direction and a leading one orthogonal to it as exact
+    eigenvectors: 8 a (u_0 - u_1) / sqrt(2), u_k the k-th basis vector, beside 0.01 b ones / sqrt(F), its
+    vocabulary vectors a and b orthogonal, so a power iteration from the ones vector stays on the small
+    eigenvalue (the first review's P1)."""
     rng = np.random.default_rng(1)
     leading = np.zeros(FEATURES)
     leading[0], leading[1] = 2 ** -0.5, -(2 ** -0.5)
@@ -397,87 +544,167 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_whatever_the_h
     b = rng.standard_normal(VOCAB)
     b -= (a @ b) / (a @ a) * a
     steep = 8.0 * np.outer(a, leading) + 0.01 * np.outer(b, np.full(FEATURES, FEATURES ** -0.5))
-    held = {**variables, "params": {**variables["params"],
-                                    "embed_tokens": {"embedding": steep.astype(np.float32)}}}
-    level, window, rate = held["params"]["continuum"], slice(0, 3), 50.0
-    energy = jnp.sum((weights * up_energy(MODEL, held, level, hidden))[0, window])
-    bound = head_curvature(MODEL, held) * energy
+    table = {"embedding": steep.astype(np.float32)}
+    return {**variables, "params": {**variables["params"], "embed_tokens": table}}
 
-    def loss(kernel):
-        stepped = MODEL.with_in_context_level(held, {**level, "up": {**level["up"], "kernel": kernel}})
-        logits = MODEL.apply(stepped, MODEL.apply(stepped, hidden[0, window], method="continuum_states"),
-                             method="head_logits")
-        picked = jnp.take_along_axis(jax.nn.log_softmax(logits), targets[0, window, None], axis=-1)[:, 0]
-        return -jnp.sum(weights[0, window] * picked)
 
-    kernel = level["up"]["kernel"]
-    hessian = np.asarray(jax.hessian(loss)(kernel), np.float64).reshape(kernel.size, kernel.size)
-    largest = np.linalg.eigvalsh(hessian).max()
-    assert rate * largest > 2
-    assert rate / (1 + rate * float(bound)) * largest <= 1 + 1e-6
+def _scaled(variables, scale: float = 0.37):
+    """`variables` with each checkpoint input quantizer's scale at `scale`, a positive one, where a draw
+    holds N(0, 1) values."""
+    from dew.quantization import QUANTIZATION
+
+    return {**variables, QUANTIZATION: jax.tree.map(lambda leaf: np.full_like(leaf, scale),
+                                                    variables[QUANTIZATION])}
+
+
+def _checkpoint(site: str, **options) -> CausalTransformer:
+    """The test decoder built with `options`, computing under a checkpoint's FP8 quantizer of `site`'s
+    input."""
+    from dew.quantization import InputQuantization
+
+    return InputQuantization(format="modelopt", sites=((site, "fp8"),)).apply(decoder(**options))
+
+
+DAMPED_HEADS = {"steep": (MODEL, _steep), "softcap": (decoder(final_logit_softcap=2.0), None),
+                "transform": (decoder(head_transform="gelu"), None),
+                "quantized": (_checkpoint("continuum/down"), _scaled)}
+"""Heads a damped step bounds: the steep tied head (`_steep`), a logit softcap of 2 and a GELU head
+transform, each with its variables' transform where it has one; and the level's `down` reading its
+input through a checkpoint's FP8 quantizer, its states rounded (`_checkpoint`)."""
+
+
+@pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
+@pytest.mark.parametrize("head", sorted(DAMPED_HEADS))
+def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step(head, parts):
+    """A damped step's rate times the largest curvature, of either sign, of its window's loss in the
+    kernels it steps is at most 1 (`ChunkAdaptation.damped`), at the level's start and at the level its
+    step reaches, for each of `up`, `down` and both and for an affine head whose leading direction the
+    ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
+    input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
+    overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
+    from dew.objectives.lm.adaptation import damping, step_rate
+
+    model, transform = DAMPED_HEADS[head]
+    _, hidden, targets, weights = draw(0, scale=0.5)
+    variables = drawn_variables(0, model)
+    variables = variables if transform is None else transform(variables)
+    window, rate = slice(0, 3), 50.0
+    level = variables["params"]["continuum"]
+    adaptation = ChunkAdaptation(window=3, rate=rate, select=parts, damped=True)
+    states, picked, weighed = hidden[:1, window], targets[:1, window], weights[:1, window]
+
+    def loss(kernels, variables, states, weighed):
+        level = variables["params"]["continuum"]
+        stepped = {**level, **{part: {**level[part], "kernel": kernel} for part, kernel in kernels.items()}}
+        held = model.with_in_context_level(variables, stepped)
+        logits = model.apply(variables, model.apply(held, states, method="continuum_states"),
+                             method="head_logits")[0]
+        chosen = jnp.take_along_axis(jax.nn.log_softmax(logits), picked[0, :, None], axis=-1)[:, 0]
+        return -jnp.sum(weighed[0] * chosen)
+
+    kernels = {part: level[part]["kernel"] for part in parts}
+    gradient = jax.grad(loss)(kernels, variables, states, weighed)
+    *bounds, terms = damping(model, variables, level, states, weighed, adaptation)
+    moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
+    damped = float(step_rate(model, adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
+                             {part: {"kernel": gradient[part][None]} for part in parts})[0])
+    reached = {part: kernels[part] - damped * gradient[part] for part in parts}
+
+    def curvature(at) -> float:
+        """The largest |eigenvalue| of the loss's float64 Hessian in the kernels at `at`."""
+        point, unflatten = jax.flatten_util.ravel_pytree(widened(at))
+        wide = widened((variables, states, weighed))
+        hessian = np.asarray(jax.hessian(lambda vector: loss(unflatten(vector), *wide))(point))
+        return float(np.abs(np.linalg.eigvalsh((hessian + hessian.T) / 2)).max())
+
+    with jax.enable_x64(new_val=True):
+        largest = [curvature(kernels), curvature(reached)]
+    assert all(damped * curvature <= 1 for curvature in largest), (head, parts, damped, largest)
+    assert rate * largest[0] > 2
+
+
+def test_a_zero_heads_damped_step_is_finite():
+    """A zero head's curvature and slope are zero, and its damped step's losses are finite."""
+    variables, hidden, targets, weights = draw(0, scale=0.5)
     zero = {**variables, "params": {**variables["params"],
-                                    "embed_tokens": {"embedding": np.zeros_like(table)}}}
-    assert float(head_curvature(MODEL, zero)) == 0
+                                    "embed_tokens": {"embedding": np.zeros((VOCAB, FEATURES), np.float32)}}}
+    assert [float(bound) for bound in MODEL.apply(zero, method="head_bounds")] == [0.0, 0.0]
     zeroed = adapted_scores(MODEL, zero, hidden, targets, weights, {},
                             ChunkAdaptation(window=3, rate=0.5, select=("up",), damped=True),
                             predict=False, logits=False).losses
     assert np.all(np.isfinite(np.asarray(zeroed)))
 
 
-def test_a_damped_step_steps_ups_kernel_alone_an_adapters_factors_held():
-    """A damped step steps `up`'s kernel and nothing beside it: an adapter's factors on `up` (LoRA's
-    `lora_A` and `lora_B`) hold, so the level's output stays linear in what steps and its loss convex
-    there; an undamped selection of `up` steps every leaf of it."""
+def test_a_damped_step_steps_its_parts_kernels_alone_an_adapters_factors_held():
+    """A damped step steps its selected parts' kernels and nothing beside them (both `down` and `up`
+    where it selects none): an adapter's factors on them (LoRA's `lora_A` and `lora_B`) hold, which its
+    bound takes as the level's; an undamped selection of `up` steps every leaf of it."""
     from dew.objectives.lm.adaptation import _stepped_mask
 
-    level = {"down": {"kernel": np.zeros((2, 2))},
-             "up": {"kernel": np.zeros((2, 2)), "lora_A": np.zeros((2, 1)), "lora_B": np.zeros((1, 2))}}
+    adapter = {"lora_A": np.zeros((2, 1)), "lora_B": np.zeros((1, 2))}
+    level = {"down": {"kernel": np.zeros((2, 2)), **adapter}, "up": {"kernel": np.zeros((2, 2)), **adapter}}
+    held = {"lora_A": False, "lora_B": False}
     damped = _stepped_mask(level, ChunkAdaptation(select=("up",), damped=True))
-    assert damped == {"down": {"kernel": False}, "up": {"kernel": True, "lora_A": False, "lora_B": False}}
+    assert damped == {"down": {"kernel": False, **held}, "up": {"kernel": True, **held}}
+    both = _stepped_mask(level, ChunkAdaptation(damped=True))
+    assert both == {"down": {"kernel": True, **held}, "up": {"kernel": True, **held}}
     plain = _stepped_mask(level, ChunkAdaptation(select=("up",)))
-    assert plain == {"down": {"kernel": False}, "up": {"kernel": True, "lora_A": True, "lora_B": True}}
+    assert plain == {"down": {"kernel": False, **held},
+                     "up": {"kernel": True, "lora_A": True, "lora_B": True}}
 
 
-DAMPED_GRADIENT_SEEDS = {"documents": 32, "packed": 128, "padded": 64}
-"""Check 1's declared seeds for the outer gradient through damped steps at the corner, one draw a seed,
-sized paired by `seeds_for` on armada."""
+def weighted_loss(fields, adaptation: ChunkAdaptation, *, truth: bool | None = None):
+    """The rows' weighted losses through the adapted level as a function of a draw: Dew's
+    (`adapted_scores`), or the literal loop's where `truth` is given (`equation_71`)."""
+    def loss(variables, hidden, targets, weights):
+        losses = (adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                                 predict=False, logits=False).losses if truth is None else
+                  equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth))
+        return jnp.sum(weights * losses)
+    return loss
+
+
+def differentiated(fn):
+    """`fn` of a draw differentiated in its variables and states under a cotangent (`with_gradients`)."""
+    return lambda variables, hidden, targets, weights, cotangent: with_gradients(
+        lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+
+
+DAMPED_GRADIENT_SEEDS = {("documents", "up"): 32, ("packed", "up"): 128, ("padded", "up"): 64,
+                         ("documents", "both"): 32, ("packed", "both"): 64, ("padded", "both"): 64}
+"""Check 1's declared seeds for the outer gradient through damped steps at the corner, of `up` or of both
+parts, one draw a seed, sized paired by `seeds_for` on armada."""
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("rate", "scale", "damped"),
-                         [(0.1, 0.5, False), (0.5, 0.25, False), (0.5, 0.5, True)],
-                         ids=["tenth", "half", "damped-corner"])
+                         [(0.1, 0.5, None), (0.5, 0.25, None), (0.5, 0.5, "up"), (0.5, 0.5, "both")],
+                         ids=["tenth", "half", "damped-corner", "damped-corner-both"])
 def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half, the half over
     weights where its step is stable (the divergent corner's gradient awaits the gate, `CORNER_WINDOWS`),
-    and at the corner itself through damped steps of `up`, their rates constants of the step, one draw
-    a seed: the contract the undamped corner leaves open (ledger 1714)."""
+    and at the corner itself through damped steps of `up` and of both parts, their rates constants of
+    the step, one draw a seed: the contract the undamped corner leaves open (ledger 1714)."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
-    adaptation = (ChunkAdaptation(window=3, rate=rate, select=("up",), damped=True) if damped
-                  else ChunkAdaptation(window=3, rate=rate))
+    adaptation = (ChunkAdaptation(window=3, rate=rate) if damped is None else
+                  ChunkAdaptation(window=3, rate=rate, select=("up",) if damped == "up" else (), damped=True))
 
     def gradient_draw(seed):
         variables, hidden, targets, weights = draw(seed, scale=scale)
         return variables, hidden, targets, weights, np.float32(1.0)
 
-    def dew(variables, hidden, targets, weights):
-        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, fields,
-                                                adaptation, predict=False, logits=False).losses)
-
-    def differentiated(fn):
-        return lambda variables, hidden, targets, weights, cotangent: with_gradients(
-            lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+    dew = weighted_loss(fields, adaptation)
 
     def reference(truth):
-        return differentiated(lambda variables, hidden, targets, weights: jnp.sum(weights * equation_71(
-            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)))
+        return differentiated(weighted_loss(fields, adaptation, truth=truth))
 
-    seeds = DAMPED_GRADIENT_SEEDS[kind] if damped else GRADIENT_SEEDS[kind, rate, scale]
+    seeds = GRADIENT_SEEDS[kind, rate, scale] if damped is None else DAMPED_GRADIENT_SEEDS[kind, damped]
+    label = {None: "", "up": "damped ", "both": "jointly damped "}[damped]
     site(differentiated(dew), reference, gradient_draw, rate, scale, 3,
-         f"the gradient through the windows' {'damped ' if damped else ''}steps over {kind}, rate {rate}, "
-         f"scale {scale}", seeds, damped=damped)
+         f"the gradient through the windows' {label}steps over {kind}, rate {rate}, scale {scale}", seeds,
+         damped=damped is not None)
 
 
 def test_each_window_steps_from_its_level_as_the_literal_loop():
@@ -697,24 +924,42 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     bit: the loss reads the batch and the variables alone."""
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1))
 
-    def rows():
-        # The batch for each step, its position the stream's checkpointed state.
-        return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
-            0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
-
     def trainer(directory):
-        return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
-                       checkpoints=Checkpoints(str(directory)))
+        return _checkpointed(objective, directory)
 
-    whole = trainer(tmp_path / "whole").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
-    trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
-    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1,
+    whole = trainer(tmp_path / "whole").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1,
                                                checkpoint_every=2)
     start = objective.init(jax.random.key(0))["params"]["continuum"]
     assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),
                               np.asarray(start["up"]["kernel"]))
     for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
+
+
+@pytest.mark.parametrize("act", sorted(SLOPES, key=lambda function: function.__name__),
+                         ids=lambda function: function.__name__)
+def test_each_activations_slopes_bound_its_derivatives(act):
+    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: each is its float64 maximum
+    over [-40, 40] on a grid of step 2e-5, past which every one is flat, plus half the step times the
+    next derivative's maximum there (every real lies within half a step of the grid), rounded up at the
+    seventh decimal; a ReLU's act'' is a point mass, no number (None)."""
+    step = 2e-5
+    with jax.enable_x64(new_val=True):
+        grid = jnp.linspace(-40.0, 40.0, round(80 / step) + 1, dtype=jnp.float64)
+        first, second, third = (float(jnp.abs(jax.vmap(derivative)(grid)).max()) for derivative in (
+            jax.grad(act), jax.grad(jax.grad(act)), jax.grad(jax.grad(jax.grad(act)))))
+
+    def bound(peak: float, next_peak: float) -> float:
+        return math.ceil((peak + step / 2 * next_peak) * 10 ** 7) / 10 ** 7
+
+    p1, p2 = SLOPES[act]
+    assert p1 == bound(first, second)
+    if p2 is None:
+        assert act is jax.nn.relu
+    else:
+        assert p2 == bound(second, third)
 
 
 def test_what_the_adaptation_cannot_serve_is_refused():
@@ -740,34 +985,86 @@ def test_what_the_adaptation_cannot_serve_is_refused():
     assert adapted.task_settings() is None
     with pytest.raises(TypeError):
         adapted.build_task(variables)
-    # A damped step bounds the loss's curvature in `up` alone, under a head affine in its states.
-    with pytest.raises(ValueError):
-        ChunkAdaptation(damped=True)
-    damped = ChunkAdaptation(select=("up",), damped=True)
-    capped = LMObjective(decoder(final_logit_softcap=30.0), LENGTH, adaptation=damped)
-    with pytest.raises(ValueError):
-        capped.token_scores(capped.init(jax.random.key(0)), jnp.zeros((1, LENGTH + 1), jnp.int32))
-    # A checkpoint's quantizer of the head's own input makes the head no longer affine in its states,
-    # and refuses; one of a trunk module alone leaves it affine, and the step runs.
-    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
-
-    for site, refused in (("lm_head", True), ("layers_0/self_attn/q_proj", False)):
-        quantized = InputQuantization(format="modelopt", sites=((site, "fp8"),)).apply(
-            decoder(tie_embeddings=False))
-        objective = LMObjective(quantized, LENGTH, adaptation=damped)
-        variables = objective.init(jax.random.key(0))
-        scales = variables[QUANTIZATION]
-        for path in site.split("/")[:-1]:
-            scales = scales[path]
-        scales[site.split("/")[-1]][INPUT_SCALES["fp8"]] = jnp.asarray(0.37, jnp.float32)
+    # A damped step of `down` bounds its curvature through its activation's act'', which a ReLU's point
+    # mass at zero leaves unbounded: refused there, and its `up` alone steps.
+    relu = decoder(ContinuumLevel(hidden=4, activation="relu"))
+    for parts, refused in ((("down",), True), (("up",), False)):
+        objective = LMObjective(relu, LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
         tokens = jnp.zeros((1, LENGTH + 1), jnp.int32)
         if refused:
             with pytest.raises(ValueError):
-                objective.token_scores(variables, tokens)
+                objective.token_scores(objective.init(jax.random.key(0)), tokens)
         else:
-            assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+            assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
+                                                                        tokens).losses)))
     with pytest.raises(ValueError):
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
+
+
+def _qwix(pattern: str, **options) -> CausalTransformer:
+    """The test decoder built with `options`, its products at modules `pattern` selects trained in int8
+    (Qwix's quantization)."""
+    from dew.quantization import Quantization
+
+    return Quantization(patterns=(pattern,)).apply(decoder(**options))
+
+
+ROUNDED = {
+    "checkpoint-lm_head": (lambda: _checkpoint("lm_head", tie_embeddings=False), ("up",), True),
+    "checkpoint-head_dense": (lambda: _checkpoint("head_dense", head_transform="gelu"), ("up",), True),
+    "checkpoint-trunk": (lambda: _checkpoint("layers_0/self_attn/q_proj", tie_embeddings=False), (), False),
+    "checkpoint-up-up": (lambda: _checkpoint("continuum/up"), ("up",), False),
+    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), True),
+    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), True),
+    "checkpoint-down-both": (lambda: _checkpoint("continuum/down"), (), False),
+    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), True),
+    "qwix-tied": (lambda: _qwix("^$"), ("up",), True),
+    "qwix-lookup": (lambda: _qwix("embed_tokens"), ("up",), False),
+    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), True),
+    "qwix-down-up": (lambda: _qwix("continuum/down"), ("up",), False),
+    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), True),
+}
+"""Models whose head or level rounds a product, the parts a damped step steps through them, and whether
+it is refused (`test_a_damped_step_refuses_what_rounds_where_it_steps`)."""
+
+
+@pytest.mark.parametrize("case", sorted(ROUNDED))
+def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
+    """A damped step's bounds hold where the maps it reads are linear in what it moves. A head map that
+    rounds its input (a checkpoint's quantizer of `lm_head`'s or of a transform's `head_dense`'s input)
+    makes the head piecewise constant in its states, and one Qwix quantizes (`lm_head`, a tied head's
+    product in the model's own scope, `^$`) rounds its inputs or multiplies by its kernel rounded; a
+    level map whose kernel Qwix rounds makes the loss piecewise constant in that kernel, and an `up`
+    that rounds its input makes the level's output piecewise constant in `down`: each refused
+    (ValueError). The rest runs, finite: a
+    trunk module's quantizer, a Qwix rule over the embedding's lookup alone, `up` alone through its
+    quantized input, both parts through a quantized `down` input, and `up` alone where Qwix rounds
+    `down`'s products."""
+    build, parts, refused = ROUNDED[case]
+    objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
+    variables = objective.init(jax.random.key(0))
+    # A checkpoint's quantizer reads the scale its variables hold, positive.
+    variables = _scaled(variables) if case.startswith("checkpoint") else variables
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    if refused:
+        with pytest.raises(ValueError):
+            objective.token_scores(variables, tokens)
+    else:
+        assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+
+
+def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
+    """A damped step's terms read x and f as the level's maps multiply them (`level_terms`): a
+    checkpoint's quantizer of `down`'s input at a scale that rounds every state to zero zeroes each
+    state's |x|^2, and one of `up`'s each slot's |f|^2, where the unquantized level's are positive."""
+    _, hidden, _, _ = draw(0, scale=0.5)
+    for site, term in (("continuum/down", 0), ("continuum/up", 1)):
+        model = _checkpoint(site)
+        plain = MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms")[term]
+        rounded = model.apply(_scaled(drawn_variables(0, model), 1e30), hidden, ("up",),
+                              method="level_terms")[term]
+        assert np.all(np.asarray(plain) > 0), site
+        assert not np.any(np.asarray(rounded)), site
 
 
 def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
