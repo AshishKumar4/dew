@@ -57,6 +57,9 @@ class LayerKind:
     tokens (`dew.nn.inputs.counted_places`). This is MaxText's
     `chunk_attn_window_size` and Llama 4's `attention_chunk_size`. None
     attends to all keys. A kind sets a window or a chunk, not both."""
+    num_heads: int | None = None
+    """This kind's query head count; None takes the model's. Laguna's sliding
+    layers have 64 where its full ones have 48 (num_attention_heads_per_layer)."""
     num_kv_heads: int | None = None
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers have fewer than its sliding ones (num_global_key_value_heads)."""
@@ -102,7 +105,7 @@ class ResolvedKind:
 
     `LayerKind` is what a config states, so a field the config leaves to the
     model is None there. `ResolvedKind` is what the model resolved it to, so
-    `num_kv_heads`, `rope_theta` and `head_dim` are numbers. The window, the
+    `num_heads`, `num_kv_heads`, `rope_theta` and `head_dim` are numbers. The window, the
     chunk and the rotary ramps stay optional, since a kind may have none.
     `mixer` is passed through unchanged, and the model's default applies when
     it is unset.
@@ -111,6 +114,7 @@ class ResolvedKind:
     window: int | None
     bidirectional_window: bool
     chunk: int | None
+    num_heads: int
     num_kv_heads: int
     rope_theta: float
     rope_scaling: Scaling | None

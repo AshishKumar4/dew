@@ -1063,7 +1063,7 @@ _HEAD_NORMS = ('q_norm', 'k_norm')
 # The MLA projections and norms live under self_attn beside the standard
 # ones, with no counterpart in another family, so they extend the map by
 # pattern. A tensor that is present maps, whatever the family.
-_MLA_PROJECTIONS = ('q_a_proj', 'q_b_proj', 'kv_a_proj_with_mqa',
+_MLA_PROJECTIONS = ('q_a_proj', 'q_b_proj', 'q_gate_proj', 'kv_a_proj_with_mqa',
                     'kv_b_proj', 'o_proj')
 _MLA_NORMS = ('q_a_layernorm', 'kv_a_layernorm')
 # One leaf per projection for the router and the shared experts; the routed
@@ -1085,6 +1085,30 @@ SHORT_CONV_LEAVES: Leaves = {
 """A gated short convolution layer's tensors (LFM2's and LFM3's), by their names past `model.layers.N.`,
 under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projections and its `[D, 1, K]`
 taps."""
+
+MAMBA_LEAVES: Leaves = {
+    **{f'mamba.{leaf}': ('self_attn', leaf) for leaf in ('A_log', 'D', 'dt_bias')},
+    'mamba.norm.weight': ('self_attn', 'norm', 'weight'),
+    **{f'mamba.{linear}.{leaf}': ('self_attn', linear, 'kernel' if leaf == 'weight' else 'bias')
+       for linear in ('in_proj', 'x_proj', 'dt_proj', 'out_proj') for leaf in ('weight', 'bias')},
+    **{f'mamba.conv1d.{leaf}': ('self_attn', 'conv1d', leaf) for leaf in ('weight', 'bias')},
+    **{f'mamba.{norm}.weight': ('self_attn', norm, 'scale')
+       for norm in ('dt_layernorm', 'b_layernorm', 'c_layernorm')},
+}
+"""A Mamba mixer's tensors, by their names past `model.layers.N.`, under the mixer's slot: Jamba's Mamba-1
+(`dew.nn.mixers.mamba.Mamba`), its projections, its `[D, 1, K]` taps, its `A_log` and `D`, and the norms
+of its raw step, B and C (`Mamba.step_norm_eps`); Falcon-H1's Mamba-2 (`dew.nn.mixers.mamba2.Mamba2`), its
+projections and taps, its heads' `A_log`, `D` and `dt_bias`, and its gated norm's weight."""
+
+
+GATED_NORM_LEAVES: Leaves = {
+    **{f'{site}.norm.weight': (site, 'norm', 'scale') for site in _PRE_NORMS},
+    **{f'{site}.mlp.{linear}.weight': (site, 'mlp', linear, 'kernel')
+       for site in _PRE_NORMS for linear in ('fc1', 'fc2')},
+}
+"""A gated block norm's tensors (A.X-K2's), by their names past `model.layers.N.`: its RMS norm's weight
+and its gate's two maps (`dew.nn.norms.GatedRMSNorm`)."""
+
 
 XIELU_LEAVES: Leaves = {f'mlp.act_fn.{name}': ('mlp', 'act_fn', name)
                         for name in ('alpha_p', 'alpha_n', 'beta', 'eps')}

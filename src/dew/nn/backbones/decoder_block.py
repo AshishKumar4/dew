@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -38,15 +38,27 @@ from ..hyper_connections import (
     gated_write,
     mix_streams,
 )
-from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..inputs import (
+    FEEDFORWARD_ROUTES,
+    MIXER_ROUTES,
+    AttentionMetadata,
+    LayerInputs,
+    MixerCall,
+    PredictionPhase,
+    routing_blocks,
+)
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
+from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
+from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
-from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
+from ..protocols import ProjectionGroup, ReadsTrain, RoutesBySite, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
+
+if TYPE_CHECKING:
+    from .causal_transformer import CausalTransformer
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
@@ -63,6 +75,12 @@ class NormSpec:
     scale: bool = True
     offset: bool | None = None
     groups: int = 1
+    gate_rank: int | None = None
+    """Where set, an RMS norm's output scaled by its own low-rank sigmoid gate this wide
+    (`dew.nn.norms.GatedRMSNorm`, A.X-K2's), on the layers `gated_layers` names: 'every' layer, or the
+    'routed' ones alone (A.X-K2 gates its feed-forward's norm where it routes), a layer's norm's choice;
+    a norm outside the layers (the final one's, the embedding's, the head's) gates wherever it runs."""
+    gated_layers: Literal['every', 'routed'] = 'every'
 
 
 NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
@@ -70,24 +88,54 @@ NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_n
 """The decoder's norms a `NormSpec` may change, by the module name each is built under."""
 
 
+def norm_gated(spec: NormSpec, name: str, routed: bool | None) -> bool:
+    """Whether the norm `name` of `spec` is gated (`NormSpec.gate_rank`): on every layer, or on the
+    `routed` layers alone; a norm outside the layers (`routed` None) on 'every' only, as it has no
+    layer to route."""
+    if spec.gate_rank is None:
+        return False
+    if spec.gated_layers == 'routed' and routed is None:
+        raise ValueError(f"{name} runs outside the layers, so it has no routed layers to gate on; "
+                         "gate it on 'every' layer")
+    return spec.gated_layers == 'every' or bool(routed)
+
+
+def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths, *,
+               routed: bool | None) -> float:
+    """The work of the gated norms among `sites` (`norm_gated`), each gate's map down to its rank and
+    back (`dew.nn.norms.NormGate`)."""
+    held = specs or {}
+    return sum(2 * projection_flops(lengths, width, held[site].gate_rank or 0)
+               for site in sites if site in held and norm_gated(held[site], site, routed))
+
+
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None,
-                 specs: Mapping[str, NormSpec] | None = None) -> Callable[..., nn.Module]:
+                 specs: Mapping[str, NormSpec] | None = None,
+                 routed: bool | None = None) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
-    `specs` changes it there. 'layer' keeps torch's exact variance, the
-    reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
-    (`dew.nn.norms.LayerNorm`), whose mean and square reduce in one pass,
-    which the vision towers run."""
+    `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
+    `norm_gated` says: a layer's on the layers it names, the `routed` layer's
+    among them or not, and a norm outside the layers (`routed` None) wherever
+    it runs. 'layer' keeps torch's exact variance, the reference decoders'
+    formula; 'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`),
+    whose mean and square reduce in one pass, which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
         eps = epsilon if spec.eps is None else spec.eps
+        gated = norm_gated(spec, name, routed)
         if kind == 'rms':
-            return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
-                           scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
-                           dtype=dtype, name=name)
+            norm = functools.partial(
+                RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
+                scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
+            if gated and spec.gate_rank is not None:
+                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, name=name)
+            return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
+        if spec.gate_rank is not None:
+            raise ValueError(f"{name}, a {kind} norm, takes no gate; a gated norm is an RMS norm's")
         if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
             raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis and a "
                              f"weight offset from one only as a scaled 'layer' norm, not {spec}")
@@ -149,7 +197,9 @@ class Mixture:
     `weight_sum_epsilon` is the term a renormalization of non-softmax weights
     adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6),
     and `weight_sum_min` the least it divides by (ERNIE 4.5's `moe_norm_min`,
-    `Router.weight_sum_min`).
+    `Router.weight_sum_min`). `router_softcap` caps the gate logits (Laguna's,
+    `Router.logit_softcap`), and `excluded_group_score` is what an expert outside
+    a token's best groups is chosen by (`Router.excluded_group_score`).
     """
 
     experts: int
@@ -165,6 +215,8 @@ class Mixture:
     bias_in_weights: bool = False
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
     weight_sum_min: float = 0.0
+    router_softcap: float | None = None
+    excluded_group_score: float | None = None
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -225,11 +277,12 @@ class Mixture:
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
                 or self.bias_in_weights or self.routing_block is not None
                 or self.scale_inputs or self.shared_features or self.latent_features is not None
-                or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min):
+                or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min
+                or self.router_softcap is not None or self.excluded_group_score is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
                 "score function, scaling, groups, balancing bias, routing blocks, input scaling, "
-                "shared branch or renormalization bounds to set")
+                "shared branch, renormalization bounds or logit cap to set")
 
     @property
     def beside_dense(self) -> bool:
@@ -278,7 +331,8 @@ class Mixture:
                                          'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
                                          'latent_features', 'latent_norm', 'media_bias',
-                                         'weight_sum_epsilon', 'weight_sum_min')
+                                         'weight_sum_epsilon', 'weight_sum_min', 'router_softcap',
+                                         'excluded_group_score')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:
@@ -306,6 +360,7 @@ class Mixture:
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
             weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
+            router_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
             media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
@@ -682,6 +737,21 @@ class DecoderBlock(nn.Module):
             'per_layer_projection': (self.per_layer_input_dim, self.emb_features)}
 
     @nn.nowrap
+    def _built_norms(self) -> tuple[str, ...]:
+        """The norms the block builds, which its setup and its count of their gates share: the mixer's
+        where its wiring norms the stream and the layer norms its attention's input, the feed-forward's
+        where it has one that no norm shared with the mixer reads, the sublayers' outputs' where its
+        wiring norms them, and the per-layer input's where it reads one."""
+        normed = self.wiring.pre_norms or self.wiring.residual_norms
+        return tuple(site for site, built in (
+            ('input_layernorm', normed and self.attention_norm),
+            ('post_attention_layernorm', normed and self.feedforward is not None
+             and not self.wiring.shared_parallel_norm),
+            ('attention_output_norm', self.wiring.output_norms),
+            ('mlp_output_norm', self.wiring.output_norms and self.feedforward is not None),
+            ('post_per_layer_input_norm', bool(self.per_layer_input_dim))) if built)
+
+    @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
         if self.engram is not None:
             raise MissingFlopsCount("DecoderBlock needs its memory-extension geometry")
@@ -690,6 +760,7 @@ class DecoderBlock(nn.Module):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+        count += gate_flops(self.norms, self._built_norms(), self.emb_features, lengths, routed=self.routed)
         if self.laurel_rank is not None:
             count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
         if self.altup is not None:
@@ -729,18 +800,18 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms)
+            dtype=self.dtype, specs=self.norms, routed=self.routed)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        normed = self.wiring.pre_norms or self.wiring.residual_norms
-        if normed and self.attention_norm:
+        built = self._built_norms()
+        if 'input_layernorm' in built:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if normed and self.feedforward is not None and not self.wiring.shared_parallel_norm:
+        if 'post_attention_layernorm' in built:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.wiring.residual_norms and (self.hyper_connections is not None or self.altup is not None
                                            or self.residual_site is not None or self.laurel_rank is not None
@@ -754,10 +825,10 @@ class DecoderBlock(nn.Module):
             raise ValueError("normed_residual and stream_multiplier join the plain stream: they take no "
                              "hyper-connections, AltUp, depth residuals, LAuReL, parallel experts, "
                              "cross-attention or an unnormed attention")
-        if self.wiring.output_norms:
+        if 'attention_output_norm' in built:
             self.attention_output_norm = norm(name='attention_output_norm')
-            if self.feedforward is not None:
-                self.mlp_output_norm = norm(name='mlp_output_norm')
+        if 'mlp_output_norm' in built:
+            self.mlp_output_norm = norm(name='mlp_output_norm')
         if self.feedforward is not None:
             self.mlp = self.feedforward(name='mlp')
         elif self.parallel is not None or self.laurel_rank is not None:
@@ -777,7 +848,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
                                               name='per_layer_projection')
-            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
+            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')  # in `_built_norms`
         if self.altup is not None:
             if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
                 raise ValueError(
@@ -896,10 +967,10 @@ class DecoderBlock(nn.Module):
             normed = self.input_layernorm(read)
         if self.wiring.normed_residual:
             state = state._replace(x=normed)
-        routes = self._routes(per_layer_input)
+        mixer_routes, routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
-            routes if self._mixer_routes else {}, None if per_layer_input is None else per_layer_input.depth)
+            mixer_routes, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train, "attention")
@@ -913,7 +984,6 @@ class DecoderBlock(nn.Module):
                 x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype)
             )
         if self.feedforward is not None:
-            routes = routes if self.routed else {}
             if joined is not None:
                 state, mlp_input = self._stream_normed(*joined, attention_branch)
                 state, read, site = self._read(state, "mlp")
@@ -1204,22 +1274,38 @@ class DecoderBlock(nn.Module):
                 "model passes down the stack as attention_metadata.token_ids")
         return {"tokens": attention_metadata.token_ids}
 
-    @property
-    def _mixer_routes(self) -> bool:
-        """Whether the token mixer is the layer's routed site. A layer replays
-        one routing record, so its mixer and its feed-forward do not both route."""
-        routes = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
-        if routes and self.routed:
-            raise ValueError("a layer replays one routing record, and this one routes in both its mixer "
-                             "and its feed-forward; route in one of them")
-        return routes
-
-    def _routes(self, per_layer_input: LayerInputs | None) -> dict:
-        """The layer's replayed experts, for its one routed site, the feed-forward
-        or the mixer; nothing without a record."""
+    def _routes(self, per_layer_input: LayerInputs | None) -> tuple[dict, dict]:
+        """The layer's replayed experts for its token mixer and for its feed-forward, each the call's
+        `routes` where that site routes, nothing without a record. A record keyed by site path
+        (`LayerInputs.experts`) gives the feed-forward its `FEEDFORWARD_ROUTES` entry and the mixer its
+        `MIXER_ROUTES` entry, or a composed mixer (`RoutesBySite`) each of its sites' entries below it; a
+        layer's one record, its one routed site."""
         if per_layer_input is None or per_layer_input.experts is None:
-            return {}
-        return {"routes": (per_layer_input.experts, per_layer_input.routed)}
+            return {}, {}
+        experts, routed = per_layer_input.experts, per_layer_input.routed
+        mixer = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
+        if not isinstance(experts, Mapping):
+            if mixer and self.routed:
+                raise ValueError("a layer's one routing record replays one routed site, and this layer "
+                                 "routes in both its mixer and its feed-forward; key the record by site path "
+                                 f"({FEEDFORWARD_ROUTES!r}, {MIXER_ROUTES!r})")
+            record = {"routes": (experts, routed)}
+            return (record if mixer else {}), (record if self.routed else {})
+        sites = ([f"{MIXER_ROUTES}/{site}" for site in self.self_attn.routed_sites]
+                 if isinstance(self.self_attn, RoutesBySite) else [MIXER_ROUTES]) if mixer else []
+        wanted = [*sites, *([FEEDFORWARD_ROUTES] if self.routed else [])]
+        missing = [site for site in wanted if site not in experts]
+        if missing:
+            raise ValueError(f"the routing record names {sorted(experts)}, not this layer's routed sites "
+                             f"{missing}")
+        if not mixer:
+            mixed = {}
+        elif isinstance(self.self_attn, RoutesBySite):
+            below = len(MIXER_ROUTES) + 1
+            mixed = {"routes": ({site[below:]: experts[site] for site in sites}, routed)}
+        else:
+            mixed = {"routes": (experts[MIXER_ROUTES], routed)}
+        return mixed, ({"routes": (experts[FEEDFORWARD_ROUTES], routed)} if self.routed else {})
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
@@ -1349,3 +1435,40 @@ class MTPBlock(nn.Module):
 
 __all__ = ["DECODER_REMAT", "BlockWiring", "DecoderBlock", "MTPBlock", "Mixture", "RematPolicy",
            "remat_policy", "remat_record"]
+
+
+def feedforward_factories(model: "CausalTransformer"):
+    """Build the three feed-forward factories a layer of `model` can use.
+
+    Returns the dense gated MLP, the routed experts in its place and the
+    branch beside it, each a partial that the block calls with a name; the
+    mixture builds the routed one (`Mixture.build`) and places it
+    (`Mixture.beside_dense`). A model with no mixture gets only the first,
+    and None for the other two.
+    """
+    init_std, output_init_std = model.init_stds
+    # Every gated MLP in the model shares the activation and the clamp:
+    # the dense feed-forwards, the shared branch and the routed experts.
+    gated_mlp = functools.partial(GatedMLP, out_features=model.emb_features,
+                                  activation=model.mlp, use_bias=model.mlp_bias,
+                                  swiglu_limit=model.swiglu_limit, ngpt=model.ngpt,
+                                  init_std=init_std, output_init_std=output_init_std,
+                                  dtype=model.dtype, precision=model.precision)
+    dense = gated_mlp if model.mlp_multipliers is None else functools.partial(
+        gated_mlp, gate_multiplier=float(model.mlp_multipliers[0]),
+        down_multiplier=float(model.mlp_multipliers[1]))
+    mixture = model.mixture
+    if model.mlp == 'swigluoai' and (mixture is None or len(model.sparse_layers) != model.num_layers):
+        raise ValueError('swigluoai requires routed experts on every layer')
+    if mixture is None:
+        return dense, None, None
+    # The dense width is read only where the experts take it: layers that differ in it have none.
+    width = model.hidden_features if mixture.expert_features is None else mixture.expert_features
+    built = mixture.build(
+        out_features=model.emb_features, activation=model.mlp, dense=gated_mlp, hidden_features=width,
+        swiglu_limit=model.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
+        norm_eps=model.norm_eps, scale_offset=model.scale_offset,
+        scale_after_cast=model.scale_after_cast, dtype=model.dtype, precision=model.precision)
+    # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
+    routed, parallel = (None, built) if mixture.beside_dense else (built, None)
+    return dense, routed, parallel

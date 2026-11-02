@@ -29,13 +29,15 @@ def predictor(kind="attention", **overrides):
     return decoder(kind).clone(**{"max_seq_len": 16, "num_nextn_predict_layers": 1, **overrides})
 
 
-@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
+@pytest.mark.parametrize("kind", ["attention", "mla", "recurrent", "parallel"])
 def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
     """At zero temperature the target is a point mass, so every rejected draft
     is replaced by the target's own token and the whole run has to equal the
     greedy walk. It only can if the accepted prefix is replayed into the
     cache: a recurrent mixer keeps a running summary that no cursor rewinds,
-    and reusing the draft's state would show up on the next token."""
+    and reusing the draft's state would show up on the next token. A parallel
+    hybrid (Falcon-H1's Mamba-2 beside attention, its prediction depth's mixer
+    the same) drafts and verifies through both branches' caches (ledger 3575)."""
     model = predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = model.init(jax.random.key(0), prompts)

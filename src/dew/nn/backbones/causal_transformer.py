@@ -61,7 +61,6 @@ from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
-from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
@@ -88,7 +87,6 @@ from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
-from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
 from ..norms import RMSNorm
 from ..precision import (
@@ -118,6 +116,7 @@ from .decoder_block import (
     NormSpec,
     RematPolicy,
     decoder_norm,
+    feedforward_factories,
     remat_policy,
     remat_record,
 )
@@ -218,6 +217,10 @@ class CausalTransformer(nn.Module):
     """The dense feed-forward width. None means four times `emb_features`, a
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
+    mlp_multipliers: tuple[float, float] | None = None
+    """The dense feed-forward's gate and output multipliers (Falcon-H1's `mlp_multipliers`,
+    `GatedMLP.gate_multiplier` and `down_multiplier`); None for neither. The shared and routed experts
+    take none."""
     max_seq_len: int = 2048
     context_length: int | None = None
     """The context a checkpoint states (max_position_embeddings), which an export writes back;
@@ -289,6 +292,9 @@ class CausalTransformer(nn.Module):
     value_scale: float | None = None
     """The factor that multiplies the values as they are projected, before
     they are cached: MiMo-V2-Flash's `attention_value_scale`."""
+    key_multiplier: float | None = None
+    """The factor that multiplies the keys as they are projected, before
+    they are rotated and cached: Falcon-H1's `key_multiplier`."""
     attention_sinks: bool = False
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
@@ -585,6 +591,7 @@ class CausalTransformer(nn.Module):
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
+            num_heads=self.num_heads if kind.num_heads is None else kind.num_heads,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
@@ -672,7 +679,7 @@ class CausalTransformer(nn.Module):
         there and nowhere else.
         """
         resolved = {
-            "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
+            "num_heads": kind.num_heads, "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
             "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling,
             "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
             "attention_chunk": kind.chunk,
@@ -728,39 +735,6 @@ class CausalTransformer(nn.Module):
                 f"{sorted(set(types))}")
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
-    def feedforward_factories(self):
-        """Build the three feed-forward factories a layer can use.
-
-        Returns the dense gated MLP, the routed experts in its place and the
-        branch beside it, each a partial that the block calls with a name; the
-        mixture builds the routed one (`Mixture.build`) and places it
-        (`Mixture.beside_dense`). A model with no mixture gets only the first,
-        and None for the other two.
-        """
-        init_std, output_init_std = self.init_stds
-        # Every gated MLP in the model shares the activation and the clamp:
-        # the dense feed-forwards, the shared branch and the routed experts.
-        gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
-                                      activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
-                                      init_std=init_std, output_init_std=output_init_std,
-                                      dtype=self.dtype, precision=self.precision)
-        mixture = self.mixture
-        if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
-            raise ValueError('swigluoai requires routed experts on every layer')
-        if mixture is None:
-            return gated_mlp, None, None
-        # The dense width is read only where the experts take it: layers that differ in it have none.
-        width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
-        built = mixture.build(
-            out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
-            swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
-            norm_eps=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
-        # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
-        routed, parallel = (None, built) if mixture.beside_dense else (built, None)
-        return gated_mlp, routed, parallel
-
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Real-row hidden-state work, summing the same block factories as setup (`decoder_counts`). A
@@ -803,14 +777,14 @@ class CausalTransformer(nn.Module):
         """Each layer's block as setup builds it, unbound, which its counts read (`decoder_counts`)."""
         types, mixer = self.per_layer_types, self.layer_mixer
         specs = self._layer_specs(types, self.layer_kinds(types), mixer)
-        factories = self.feedforward_factories()
+        factories = feedforward_factories(self)
         return [self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
                 for index in range(self.num_layers)]
 
     @nn.nowrap
     def prediction_blocks(self) -> list[MTPBlock]:
         """Each prediction depth's block as setup builds it, unbound, which its counts read."""
-        types, factories = self.per_layer_types, self.feedforward_factories()
+        types, factories = self.per_layer_types, feedforward_factories(self)
         return self._prediction_depths(types, self.layer_kinds(types), self.layer_mixer, factories[0],
                                        factories[1], self.wiring)
 
@@ -880,7 +854,7 @@ class CausalTransformer(nn.Module):
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
-        gated_mlp, routed, parallel = self.feedforward_factories()
+        gated_mlp, routed, parallel = feedforward_factories(self)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
@@ -1090,9 +1064,9 @@ class CausalTransformer(nn.Module):
         # experts) and is dense otherwise.
         mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
-        if (self.index_share_for_mtp_iteration
-                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
-            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
+        if self.index_share_for_mtp_iteration and not prediction_mixer.shares_prediction_index:
+            raise ValueError("index_share_for_mtp_iteration requires a prediction mixer that shares its "
+                             "index (`MixerBase.shares_prediction_index`): a k-pool, or a kind composing one")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, kv_shared=False))
         widths = self.mlp_widths
@@ -1621,7 +1595,8 @@ class CausalTransformer(nn.Module):
           query's key intervals, whose union it reads, R of them, static, its
           key positions windowed within each run alone (the template's spans,
           `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
-        - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
+        - `routed_experts` `[B, S, layers, top_k]` (or one such a routed site, keyed by
+          it, `LayerInputs.experts`, where a layer routes at several) replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
           `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
           it covers (`dew.nn.protocols.Routes`).
@@ -2051,14 +2026,19 @@ class CausalTransformer(nn.Module):
                 raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
             return None if embeddings is None and depth is None else LayerInputs(embeddings=embeddings,
                                                                                  depth=depth)
-        routed_experts = jnp.asarray(routed_experts)
-        if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
-            raise ValueError(
-                f"routed_experts is [batch, tokens, layers, top_k], {(*tokens.shape, self.num_layers)} "
-                f"leading for this model; got {routed_experts.shape}")
+        # One record for each layer's one routed site, or one a site, keyed by it (`LayerInputs.experts`).
+        keyed = isinstance(routed_experts, Mapping)
+        records = {name: jnp.asarray(record) for name, record in
+                   (routed_experts.items() if keyed else (('routed_experts', routed_experts),))}
+        for name, record in records.items():
+            if record.ndim != 4 or record.shape[:3] != (*tokens.shape, self.num_layers):
+                raise ValueError(
+                    f"{f'routed_experts[{name!r}]' if keyed else name} is [batch, tokens, layers, top_k], "
+                    f"{(*tokens.shape, self.num_layers)} leading for this model; got {record.shape}")
         coverage = None if routed is None else jnp.broadcast_to(
-            jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
-        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage, depth=depth)
+            jnp.asarray(routed, bool)[:, :, None], (*tokens.shape, self.num_layers))
+        return LayerInputs(embeddings=embeddings, experts=records if keyed else records['routed_experts'],
+                           routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).

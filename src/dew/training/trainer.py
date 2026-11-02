@@ -2178,7 +2178,7 @@ class Trainer(Generic[Loss, Effects]):
                                   for name, value in summary.formed(scores).items() if name not in scores}
         if formed:
             dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed, previews=(),
-                                coordinated_batches=0).report(self._display, self.tracker)
+                                coordinated_batches=0)._report(self._display, self.tracker)
         return dataclasses.replace(evaluations[0], scores={**scores, **formed},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
@@ -2483,6 +2483,6 @@ class Trainer(Generic[Loss, Effects]):
             # them, so the evaluation's own report leaves them out.
             dataclasses.replace(evaluation, scores={
                 name: value for name, value in evaluation.scores.items() if name not in (training or {})}
-            ).report(self._display, self.tracker)
+            )._report(self._display, self.tracker)
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 

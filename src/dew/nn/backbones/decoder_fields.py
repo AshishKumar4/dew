@@ -121,10 +121,10 @@ def _kinds(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
             raise ValueError(
                 f"{layer_type!r} keeps a window on both sides of a query, which "
                 f"needs a window and a model that is not causal")
-        if kind.num_kv_heads < 1 or model.num_heads % kind.num_kv_heads:
+        if kind.num_heads < 1 or kind.num_kv_heads < 1 or kind.num_heads % kind.num_kv_heads:
             raise ValueError(
-                f"num_heads ({model.num_heads}) must be a multiple of the key/value "
-                f"heads of {layer_type!r} ({kind.num_kv_heads})")
+                f"the query heads of {layer_type!r} ({kind.num_heads}) must be a positive multiple of "
+                f"its key/value heads ({kind.num_kv_heads})")
 
 def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
     """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms

@@ -164,11 +164,14 @@ class ModelSource:
         return self._remote_class('AutoConfig')
 
     def configured(self, fields: Mapping[str, object]) -> PretrainedConfig:
+        """The source's config of `fields`, a config's JSON, its records of infinite floats read back as
+        its own load reads them (`_records.decoded_floats`)."""
         from transformers import AutoConfig
 
+        stated = _records.decoded_floats(fields)
         if 'AutoConfig' not in self.references:
-            return AutoConfig.for_model(self.model_type, **fields)
-        return self.config_class().from_dict(dict(fields))
+            return AutoConfig.for_model(self.model_type, **stated)
+        return self.config_class().from_dict(dict(stated))
 
     def causal_lm(self, config: PretrainedConfig) -> PreTrainedModel:
         """The source's causal LM of `config`, float32, on torch's current device."""
@@ -368,6 +371,10 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
+    if isinstance(per_layer := hf_config.get('num_attention_heads_per_layer'), list):
+        # Each layer's own query heads (Laguna's) keep their share of the key heads.
+        counts = _records.integers(per_layer, 'num_attention_heads_per_layer')
+        fields['num_attention_heads_per_layer'] = [count // kv_heads * small_kv for count in counts]
     if key('head_dim') in hf_config:
         # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
         # two equal.
@@ -801,16 +808,20 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
                      train: bool) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """The source's logits over `ids` and every parameter's gradient of their sum against `cotangent`,
-    by the parameter's stored name, in training or eval mode, eager attention."""
+    """The source's logits over `ids` and every trained parameter's gradient of their sum against
+    `cotangent`, by the parameter's stored name, in training or eval mode, eager attention. A trained
+    parameter the backward reaches no path to (one read under `torch.no_grad`, as DeepSeek V3.2's
+    lightning indexer is, whose top-k selection carries no gradient) has a gradient of zeros, which torch
+    leaves unset."""
     import torch
 
     model.train(train)
     model.zero_grad()
     logits = model(input_ids=torch.from_numpy(ids.astype(np.int64)), use_cache=False).logits
     (logits * torch.from_numpy(cotangent)).sum().backward()
-    gradients = {name: parameter.grad.detach().numpy().copy() for name, parameter in model.named_parameters()
-                 if parameter.grad is not None}
+    gradients = {name: (np.zeros(tuple(parameter.shape), np.float32) if parameter.grad is None
+                        else parameter.grad.detach().numpy().copy())
+                 for name, parameter in model.named_parameters() if parameter.requires_grad}
     model.eval()
     return logits.detach().numpy(), gradients
 

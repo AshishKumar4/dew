@@ -687,6 +687,15 @@ class Admitted:
     continuing: bool = struct.field(pytree_node=False, default=True)
 
 
+FEEDFORWARD_ROUTES = 'feedforward'
+"""The routing record's key for a layer's routed feed-forward, where the record is keyed by site
+(`LayerInputs.experts`)."""
+
+MIXER_ROUTES = 'mixer'
+"""The routing record's key for a layer's routed token mixer, and the root of a composed mixer's sites'
+paths (`mixer/<branch>`, `dew.nn.protocols.RoutesBySite`), where the record is keyed by site."""
+
+
 @struct.dataclass
 class LayerInputs:
     """Inputs each decoder layer reads for itself, as `[B, S, layers, ...]` leaves.
@@ -696,13 +705,18 @@ class LayerInputs:
     from a bank one layer at a time, or runs as a pipeline stage. `embeddings`
     is Gemma 3n/4's per-layer input signal. `experts` and `routed` are a
     routing replay's `[..., top_k]` expert ids and coverage
-    (`dew.nn.protocols.Routes`), with `routed` broadcast over the layer axis.
+    (`dew.nn.protocols.Routes`), with `routed` broadcast over the layer axis:
+    one record for a layer's one routed site, or, for layers that route at
+    several, one a routed site keyed by its path: `FEEDFORWARD_ROUTES`,
+    `MIXER_ROUTES`, and a composed mixer's sites below it
+    (`mixer/<branch>`, nested by `/`). Each layer reads the paths of its own
+    sites; a stack whose layers route at different sites holds every path.
     `depth` is each layer's index in the stack, for a mixer that computes by
     it (`MixerBase.reads_depth`, MiniMax's lightning rates).
     """
 
     embeddings: jax.Array | None = None
-    experts: jax.Array | None = None
+    experts: jax.Array | Mapping[str, jax.Array] | None = None
     routed: jax.Array | None = None
     depth: jax.Array | None = None
 
