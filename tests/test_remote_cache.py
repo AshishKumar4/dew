@@ -67,7 +67,8 @@ def test_a_collection_that_runs_no_test_fetches_no_bundle(cache_worker, tmp_path
     tests = Path(__file__).resolve().parent
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")]),
            "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token", "JAX_PLATFORMS": "cpu",
-           "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache")}
+           "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache"), "JAX_ENABLE_COMPILATION_CACHE": "true"}
+    # The cache on, whether this suite runs it cold or not (DEW_TEST_NO_CACHE turns JAX's off for its children).
     env.pop("DEW_TEST_NO_CACHE", None)
 
     def fetched(*options: str) -> list[str]:
