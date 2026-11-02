@@ -89,34 +89,44 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
 
-@pytest.mark.parametrize("slices", [1, 3, 7])
-def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
-    """Slices of a row's keys, each its output normalized, its maximum and its denominator, and a sink's
-    initial state, merged (`merged`): the row's softmax over every key and the sink at once, a slice of no
-    key adding nothing."""
-    rng = np.random.default_rng(0)
-    logits = rng.standard_normal((2, 3, 1, 40)) * 4.0
-    values = rng.standard_normal((2, 3, 1, 40, 8))
-    sink = rng.standard_normal((2, 1, 3))
-    cuts = np.linspace(0, 40, slices + 1).astype(int)
+def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
+    normalized `[B, S, Q, KV, Dv]`, its maximum and denominator `[B, KV, S, Q]`."""
     outs, maxima, totals = [], [], []
     for lo, hi in itertools.pairwise(cuts):
         part = logits[..., lo:hi]
-        peak = part.max(axis=-1) if hi > lo else np.full(part.shape[:-1], -np.inf)
-        weights = np.exp(part - peak[..., None]) if hi > lo else part
-        total = weights.sum(axis=-1)
-        summed = np.einsum("bqhk,bqhkd->bqhd", weights, values[..., lo:hi, :])
-        outs.append(summed / np.where(total > 0, total, 1)[..., None])
+        peak = jnp.max(part, axis=-1)
+        weights = jnp.exp(part - peak[..., None])
+        total = jnp.sum(weights, axis=-1)
+        outs.append(jnp.einsum("bqhk,bqhkd->bqhd", weights, values[..., lo:hi, :]) / total[..., None])
         maxima.append(peak)
         totals.append(total)
-    out = jnp.asarray(np.stack(outs, axis=1), jnp.float32)
-    maximum = jnp.asarray(np.transpose(np.stack(maxima, axis=1), (0, 3, 1, 2)), jnp.float32)
-    total = jnp.asarray(np.transpose(np.stack(totals, axis=1), (0, 3, 1, 2)), jnp.float32)
-    initial = template.Initial(jnp.asarray(sink, jnp.float32), jnp.ones(sink.shape, jnp.float32),
-                               jnp.zeros((*sink.shape, 8), jnp.float32))
-    found = attention_decode.merged(out, maximum, total, initial)
-    scores = np.concatenate([logits, np.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
-    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
-    weights /= weights.sum(axis=-1, keepdims=True)
-    expected = np.einsum("bqhk,bqhkd->bqhd", weights[..., :40], values)
-    np.testing.assert_allclose(found, expected, rtol=1e-5, atol=1e-6)
+    outs.append(jnp.zeros_like(outs[0]))
+    maxima.append(jnp.full_like(maxima[0], -jnp.inf))
+    totals.append(jnp.zeros_like(totals[0]))
+    rows = (jnp.transpose(jnp.stack(x, axis=1), (0, 3, 1, 2)) for x in (maxima, totals))
+    return (jnp.stack(outs, axis=1), *rows)
+
+
+@pytest.mark.parametrize("slices", [1, 3, 7])
+def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
+    """Slices of a row's keys, each its output normalized, its maximum and its denominator, a slice of no
+    key, and a sink's initial state, merged (`merged`): on par with the row's softmax over every key and the
+    sink at once (check 1)."""
+    cuts = np.linspace(0, 40, slices + 1).astype(int)
+
+    def ours(logits, values, sink):
+        initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
+        return attention_decode.merged(*_states(logits, values, cuts), initial)
+
+    def whole(logits, values, sink):
+        scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
+        weights = jax.nn.softmax(scores, axis=-1)[..., :-1]
+        return jnp.einsum("bqhk,bqhkd->bqhd", weights, values)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (4.0 * jax.random.normal(streams[0], (2, 3, 1, 40)),
+                jax.random.normal(streams[1], (2, 3, 1, 40, 8)), jax.random.normal(streams[2], (2, 1, 3)))
+
+    assert_as_exact(jax.jit(ours), jax.jit(whole), draw, f"decode merge over {slices} slices", seeds=SEEDS)
