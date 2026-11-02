@@ -126,7 +126,7 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
 
 
-def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, ...]:
+def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
     normalized `[B, S, Q, KV, Dv]`, its maximum and denominator `[B, KV, S, Q]`."""
     outs, maxima, totals = [], [], []
@@ -141,8 +141,8 @@ def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, ...]
     outs.append(jnp.zeros_like(outs[0]))
     maxima.append(jnp.full_like(maxima[0], -jnp.inf))
     totals.append(jnp.zeros_like(totals[0]))
-    rows = (jnp.transpose(jnp.stack(x, axis=1), (0, 3, 1, 2)) for x in (maxima, totals))
-    return (jnp.stack(outs, axis=1), *rows)
+    maximum, total = (jnp.transpose(jnp.stack(x, axis=1), (0, 3, 1, 2)) for x in (maxima, totals))
+    return jnp.stack(outs, axis=1), maximum, total
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])
@@ -155,7 +155,8 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
     def ours(logits, values, sink):
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
-        return attention_decode.merged(spec, *_states(logits, values, cuts), initial)
+        out, maximum, total = _states(logits, values, cuts)
+        return attention_decode.merged(spec, out, maximum, total, initial)
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
