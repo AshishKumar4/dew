@@ -1060,9 +1060,8 @@ class DreamerRollout:
             # own pace (`_owed`).
             self._paced = (updates, self._taken - self._prefilled)
         live = self._started(variables, act_key) if self._live is None else self._live
-        owed = self._owed(int(state.updates) + 1)
         envs = live.returns.shape[0]
-        due = max(owed - (self._taken - self._prefilled), 0)
+        due = max(self._owed(int(state.updates) + 1, envs) - (self._taken - self._prefilled), 0)
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
         self._live = live
@@ -1070,13 +1069,15 @@ class DreamerRollout:
         # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
         return self._drawn(sample_key)
 
-    def _owed(self, updates: int) -> int:
-        """The environment steps owed for `updates` updates: those owed where the rollout went on from, and
-        the steps of the updates since at its pace (`_paced_steps`), rounded as a run at that pace from
-        the start rounds them, so a resumed run takes the uninterrupted run's steps."""
+    def _owed(self, updates: int, envs: int) -> int:
+        """The environment steps owed for `updates` updates over `envs` environments stepped together: those
+        owed where the rollout went on from, and from there the steps its updates train on at its pace
+        (`_paced_steps`) in whole steps of every environment, as a run at that pace from the start takes
+        them, so a resumed run takes the steps the uninterrupted run took."""
         assert self._paced is not None
         since, owed = self._paced
-        return owed + self._paced_steps(updates) - self._paced_steps(since)
+        now, then = self._paced_steps(updates), self._paced_steps(since)
+        return owed + envs * (-(-now // envs) + -then // envs)
 
     def _paced_steps(self, updates: int) -> int:
         """The environment steps `updates` updates train on at the rollout's batch, length and train ratio,
