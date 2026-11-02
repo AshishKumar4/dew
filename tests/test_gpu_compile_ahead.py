@@ -1,7 +1,8 @@
 """Programs compiled ahead for this GPU's generation by a process that sees no GPU load in a fresh process on
-the GPU and run there with nothing compiled, bit for bit as the same programs jitted (ledger 2716: a GPU node
-spends its time on its device's work alone; 2026-11-02, an H100 ran a CPU host's sm90 build of a dot and the
-template attention's forward so)."""
+the GPU and run there with nothing compiled, bit for bit as the same programs compiled here through Dew's
+compile point for the generation's facts, as the build compiles them (ledger 2716: a GPU node spends its time
+on its device's work alone; 2026-11-02, an H100 ran a CPU host's sm90 build of a dot and the template
+attention's forward so)."""
 
 import os
 import pickle
@@ -14,6 +15,8 @@ import numpy as np
 import pytest
 from ahead_programs import arguments, programs
 
+from dew.nn.kernels.generation import assumed
+from dew.nn.kernels.options import owned_program
 from dew.training.ahead import BuildTarget, compiled_in, dumps
 
 pytestmark = pytest.mark.gpu(reason="a program compiled ahead runs on the GPU it was built for")
@@ -33,7 +36,8 @@ import sys
 import jax
 import numpy as np
 
-from dew.training.ahead import AheadPrograms, executable_only
+from dew.telemetry.instrumentation import executable_only
+from dew.training.ahead import AheadPrograms
 
 loaded = AheadPrograms.load(sys.argv[1]).loaded()
 with open(sys.argv[2], "rb") as file:
@@ -46,7 +50,8 @@ with open(sys.argv[3], "wb") as file:
 """
 
 
-def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_for_bit_as_jitted(tmp_path):
+def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_for_bit_as_compiled_here(
+        tmp_path):
     generation = BuildTarget.of(jax.devices()).generation
     for name, text in (("build.py", BUILD), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
@@ -65,5 +70,6 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
     assert compiled_in(tmp_path / "dumps") == []
     ahead = pickle.loads((tmp_path / "outputs.pkl").read_bytes())
     for name, (function, _) in programs(generation).items():
-        jitted = np.asarray(jax.jit(function)(*arrays[name]))
-        assert ahead[name].dtype == jitted.dtype and ahead[name].tobytes() == jitted.tobytes(), name
+        with assumed(generation):
+            here = np.asarray(owned_program(function)(*arrays[name]))
+        assert ahead[name].dtype == here.dtype and ahead[name].tobytes() == here.tobytes(), name

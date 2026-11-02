@@ -203,17 +203,27 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
 
 
 def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gpus(tmp_path):
-    """A step saved is the step loaded, executable and what XLA stated of it; this CPU host, which is
-    not the topology the step was compiled for, refuses to load it."""
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    """A step saved is the step loaded, executable and what XLA stated of it, with the target it was built
+    for (`BuildTarget`), the one rule every loader holds: this CPU host, which is not the topology the step
+    was compiled for, refuses to load it, and a run reproducing it derives its launches for its GPU only on
+    one of as many multiprocessors, as a balanced tail's grid past the GPU's residency can wait on a
+    program that never starts (row 3606)."""
+    from dew.training.ahead import AheadOfTime, BuildTarget, compile_ahead, compile_only_gpus
 
     ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(compile_only_gpus("sm80", 2))),
                           token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     ahead.save(tmp_path / "step.dew-aot")
     loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
     assert loaded == ahead
+    assert isinstance(loaded.built, BuildTarget)
+    assert (loaded.built.generation, loaded.built.devices) == ("sm80", 2)
+    assert loaded.built.multiprocessors == loaded.target.multiprocessors
     with pytest.raises(ValueError):
         loaded.loaded()
+    assert loaded.derived_for(loaded.target) == loaded.target
+    fewer = dataclasses.replace(loaded.target, multiprocessors=loaded.target.multiprocessors - 6)
+    with pytest.raises(ValueError):
+        loaded.derived_for(fewer)
 
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
@@ -755,26 +765,30 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
     """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
     compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
     the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
-    missing)."""
+    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts the
+    compiles the block let run, another thread's and those after it, and none it stopped."""
     import threading
 
-    from dew.training.ahead import ExecutableOnly, executable_only
+    from dew.telemetry.instrumentation import Compiles, ExecutableOnly, executable_only
 
     x = jnp.arange(8.0)
     compiled = jax.jit(lambda value: value * 3).lower(x).compile()
     traced = jax.jit(lambda value: value * 5).trace(x)
     lowered = jax.jit(lambda value: value * 7).lower(x)
     elsewhere = []
-    with executable_only():
-        assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
-        for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
-            with pytest.raises(ExecutableOnly):
-                step()
-        thread = threading.Thread(target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
-        thread.start()
-        thread.join()
-    assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
-    assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+    with Compiles(None) as compiles:
+        with executable_only():
+            assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
+            for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
+                with pytest.raises(ExecutableOnly):
+                    step()
+            thread = threading.Thread(
+                target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
+            thread.start()
+            thread.join()
+        assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
+        assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+    assert compiles.count == 2
 
 
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
