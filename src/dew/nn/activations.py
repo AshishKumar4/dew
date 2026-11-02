@@ -108,9 +108,12 @@ class Xielu(nn.Module):
     """Apertus's xIELU (transformers' `XIELUActivation`, arXiv 2411.13010): `alpha_p * x**2 + beta * x` for
     a positive input, `(expm1(min(x, eps)) - x) * alpha_n + beta * x` otherwise, where `alpha_p` is the
     softplus of its learned `alpha_p` and `alpha_n` is `beta` plus the softplus of its own, each a `[1]`
-    parameter, computed in the input's dtype as the reference's Python form computes it. `beta` and `eps`
-    are the reference's buffers, which its checkpoint stores and no step trains: Dew holds them as
-    constants (`constants` collection), their defaults the reference's."""
+    parameter, computed in the input's dtype as the reference's Python form computes it: Apertus holds
+    the activation's parameters in the model's dtype (`XIELUActivation(dtype=config.dtype)`), which Dew's
+    parameters, cast to the compute dtype as every layer's are, stand for; each softplus runs in at least
+    float32 and rounds once, as torch's does. `beta` and `eps` are the reference's buffers, which its
+    checkpoint stores and no step trains: Dew holds them as constants (`constants` collection), their
+    defaults the reference's."""
     alpha_p_init: float = 0.8
     alpha_n_init: float = 0.8
     beta: float = 0.5
@@ -128,8 +131,9 @@ class Xielu(nn.Module):
         beta = self.variable('constants', 'beta', lambda: jnp.asarray(self.beta, self.param_dtype)).value
         eps = self.variable('constants', 'eps', lambda: jnp.asarray(self.eps, self.param_dtype)).value
         alpha_p, alpha_n, beta, eps = (value.astype(x.dtype) for value in (alpha_p, alpha_n, beta, eps))
-        alpha_p = jax.nn.softplus(alpha_p)
-        alpha_n = beta + jax.nn.softplus(alpha_n)
+        wide = at_least_fp32(x.dtype)
+        alpha_p = jax.nn.softplus(alpha_p.astype(wide)).astype(x.dtype)
+        alpha_n = beta + jax.nn.softplus(alpha_n.astype(wide)).astype(x.dtype)
         return jnp.where(x > 0, alpha_p * x * x + beta * x,
                          (jnp.expm1(jnp.minimum(x, eps)) - x) * alpha_n + beta * x)
 

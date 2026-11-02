@@ -793,7 +793,8 @@ def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tm
     """LFM2's biased convolution zeroes its padded slots' input before its projections, so their bias
     product reaches the real tokens' history after them (ledger 3165): tier 2 assembles it, and a
     left-padded prompt prefilled through the cache and a token decoded after it give logits on par with
-    the source's forward over the same rows and mask, from its float64 twin (check 1)."""
+    the source's forward over the same rows and mask, from its float64 twin (check 1); a paused slot of a
+    decode step, padding of no prompt, advances no convolution's history."""
     from interop_support import tiny_config
     from transformers import AutoModelForCausalLM
 
@@ -837,6 +838,20 @@ def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tm
     wide = float64_twin(model, lambda: built(torch.float64)).eval()
     assert_as_exact(as_given(ours), theirs(model.eval()), draw, "a biased short convolution's padded rows",
                     seeds=BIASED_CONV_SEEDS, truth_fn=theirs(wide, float64))
+
+    ids, token = draw(0)
+    _, cache = loaded.model.apply(loaded.variables, ids, attention_mask=mask, decode=True, mutable=["cache"])
+    _, cache = loaded.model.apply({**loaded.variables, **cache}, ids, attention_mask=mask, decode=True,
+                                  mutable=["cache"])
+    paused = np.array([[True], [False]])
+    _, stepped = loaded.model.apply({**loaded.variables, **cache}, token, attention_mask=paused, decode=True,
+                                    mutable=["cache"])
+    histories = [[np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+                  if "conv_state" in jax.tree_util.keystr(path)] for tree in (cache, stepped)]
+    assert histories[0]
+    for before, after in zip(*histories, strict=True):
+        np.testing.assert_array_equal(after[1], before[1])
+        assert not np.array_equal(after[0], before[0])
 
 
 ERNIE_CLAMP_SEEDS = 8

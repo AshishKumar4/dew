@@ -692,7 +692,9 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
     """Qwen2.5-VL's and Qwen3-VL-MoE's text decoders, which transformers builds no causal LM for, load
     text-only as the Qwen2 and Qwen3-MoE decoders they are, their M-RoPE the plain rotary a text-only row
     turns (ledger 3069): their logits over drawn text hold check 1 against the VLM's own forward over
-    text alone, from its float64 twin."""
+    text alone, from its float64 twin; the config read as its class reads it, with no root head policy
+    (an untied head, the class's default) and, for Qwen2.5-VL, flat at the root as its published
+    releases state it, loads the same decoder bit for bit."""
     import torch
     from interop_support import token_draw, torch_logits
     from reference_error import as_given, assert_as_exact
@@ -718,3 +720,15 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(model), token_draw(0x3069, 250, (2, 12)), f"{model_type}'s text logits",
                     seeds=VLM_TEXT_SEEDS, truth_fn=torch_logits(wide, float64))
+    import shutil
+
+    saved = json.loads((tmp_path / "config.json").read_text())
+    restated = {key: value for key, value in saved.items() if key != "tie_word_embeddings"}
+    if model_type == "qwen2_5_vl":
+        restated = {**{key: value for key, value in restated.pop("text_config").items()
+                       if key not in ("model_type", "tie_word_embeddings")}, **restated}
+    shutil.copytree(tmp_path, tmp_path.parent / "restated")
+    (tmp_path.parent / "restated" / "config.json").write_text(json.dumps(restated))
+    again = Pretrained.load(tmp_path.parent / "restated", dtype="float32", attention_impl="reference",
+                            text_only=True)
+    jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)

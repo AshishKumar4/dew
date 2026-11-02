@@ -812,12 +812,10 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """
     if config.get("model_type") != "qwen3_vl":
         raise ValueError(f"Qwen-Image's text encoder is a qwen3_vl model, not {config.get('model_type')!r}")
-    text = dict(_records.record(config["text_config"], "text_config"))
+    text = dict(decoders.vlm_text(config, set()))
     if text.get("model_type") != "qwen3_vl_text":
         raise ValueError(f"A qwen3_vl text_config is qwen3_vl_text, not {text.get('model_type')!r}")
-    return {**decoders.plain_text_rope(text), "model_type": decoders.TEXT_FAMILIES["qwen3_vl_text"],
-            "tie_word_embeddings": _records.boolean(config.get("tie_word_embeddings", False),
-                                                   "tie_word_embeddings")}
+    return {**decoders.plain_text_rope(text), "model_type": decoders.TEXT_FAMILIES["qwen3_vl_text"]}
 
 
 _TEXT_ENCODER = ("encoders", "conditioning", "text_encoder")

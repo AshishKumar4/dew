@@ -1745,7 +1745,7 @@ def _media_wrapper(config: Mapping[str, object]) -> bool:
     (`DecoderFamily.wrapper`). DiffusionGemma nests its text config too.
     """
     family = config.get("model_type")
-    return (family != "diffusion_gemma" and "text_config" in config
+    return (family != "diffusion_gemma" and decoders.carries_text(config)
             and (family not in decoders.families() or decoders.bundles(config)))
 
 
