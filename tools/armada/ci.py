@@ -1523,20 +1523,25 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     reading = Reading()
     held = [looked_up(python, [name], part, common, {name: at} if at else {}, cache, release, reading)
             for name, part, at in entries]
-    rows, code = [], 0
-    for index, ((name, part, at), found) in enumerate(zip(entries, held, strict=True)):
+    rows: list[dict] = []
+
+    def published(found: dict) -> None:
+        """A row in the task's verdict, beside the rows before it, the moment it is made."""
+        rows.append(found)
+        out.write_text(json.dumps({"rows": rows}))
+
+    code = 0
+    # Each file in a pytest process of its own (`alone`), one after another: a file's record is what its own
+    # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
+    # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
+    for index, ((name, part, _), found) in enumerate(zip(entries, held, strict=True)):
         if found:
-            rows += found
+            for each in found:
+                published(each)
             continue
-        # A row past the deadline is not run: red as its deadline cut it off (`tested`, `file_row`). Each row
-        # is published to `out` beside the rows before it as it is written, before its record goes to the
-        # cache, which can be slow (`tested`'s `ahead`; review: a slow cache withheld the finished rows).
-        piece = out.with_name(f"{out.name}.{index}")
-        left = deadline - (time.monotonic() - began)
-        code = max(code, tested(python, [name], part, piece, left, cache, grace, common, started, coverage,
-                                whole=whole, release=release, kept={name: at} if at else {},
-                                container=container, found=[], ahead=(out, rows)))
-        rows += json.loads(piece.read_text())["rows"]
+        code = max(code, tested(python, name, part, out.with_name(f"{out.name}.{index}"),
+                                deadline - (time.monotonic() - began), grace, common, started, published,
+                                coverage, whole=whole, release=release, container=container))
     out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
@@ -1618,61 +1623,41 @@ class Container:
     executed: bool = False
 
 
-def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
-           common: str, environ: Mapping[str, str], coverage: Path | None = None,
+def tested(python: str, name: str, split: str, out: Path, deadline: float, grace: float, common: str,
+           environ: Mapping[str, str], published: Callable[[dict], None], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None, container: Container | None = None,
-           found: list[dict] | None = None, ahead: tuple[Path, list[dict]] | None = None) -> int:
-    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
-    reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
-    site's map task (`SITE`) is never reused: its draws, among its artifacts, are what its judge reads.
+           container: Container | None = None) -> int:
+    """Test file `name` (in `split`'s group) run in a pytest process of its own (`alone`) under `environ`
+    beside this process's, within `deadline` seconds (none left: red as its deadline cut it off, `file_row`),
+    its row handed to `published` before its record goes to the cache, which can be slow (review: a slow
+    cache withheld the finished rows), and its exit returned. With `network`, the network-marked tests alone,
+    with the Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's.
+    Its scratch logs are kept beside `out`.
 
     Every file that executes may leave anything behind (a file, a process, shared memory, a socket, the GPU's
     state), so a file's run is kept for reuse only where it ran first in a container no task had run in
     (`Container`), from the state its environment's snapshot left: what no key holds then is the same for
     every run (Main, 2026-11-01). A run not kept so is still recorded, keyed by nothing, for what the GPU
-    tier and lane read of it (its reads of the backend, its peak). A reused row runs nothing, so every row the
-    cache holds is reused first: `found`, where the caller looked them up before any of its calls ran a file
-    (`task`). With `ahead`, a caller's verdict and the rows it holds before these: each row is published there
-    too as it is written, before its record goes to the cache (`task`)."""
+    tier and lane read of it (its reads of the backend, its peak)."""
     began = time.monotonic()
     container = Container() if container is None else container
     group = split or (f"{RELEASE}{release}" if release else "")
     site = SITE.fullmatch(group)
-    rows = list(found) if found is not None else looked_up(python, tests, group, common, kept, cache,
-                                                           release, network=network)
-    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
-    if not tests:
-        out.write_text(json.dumps({"rows": rows}))
-        return 0
-    # Each file in a pytest process of its own (`alone`), one after another: a file's record is what its own
-    # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
-    # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
-    # The task's start (`task` names it; a call made on its own, its own), before which every program it may
-    # run as a tool was made (followed.py's `tool`).
-    environ = {followed.STARTED_AT: str(time.time()), **environ}
-    for index, name in enumerate(tests):
-        # The checkout as a run that may keep its key finds it, as its inputs must stand after (`moved`), read
-        # only where time is left, and the file given what the reading left (review).
-        fresh = container.fresh and not container.executed and deadline > time.monotonic() - began
-        before = standing() if fresh else None
-        left = deadline - (time.monotonic() - began)
-        alone_ = alone(python, name, split, out.with_name(f"{out.name}.{index}"), left, grace, environ,
-                       coverage, network, whole, release, site) if left > 0 else None
-        container.executed = container.executed or alone_ is not None
-        rows.append(file_row(python, name, group, site, alone_, deadline))
-        # The verdict first, so no cache write that waits on the Worker keeps it from armada.
-        out.write_text(json.dumps({"rows": rows}))
-        if ahead is not None:
-            ahead[0].write_text(json.dumps({"rows": [*ahead[1], *rows]}))
-        if alone_ is None:
-            continue
-        if coverage is None and not release:
-            # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which
-            # runs under its requirement's overlay and on the whole suite's run alone.
-            record(python, rows[-1:], alone_.log, common, network, alone_.opened, before)
-    return 0
+    # The checkout as a run that may keep its key finds it, as its inputs must stand after (`moved`), read
+    # only where time is left, and the file given what the reading left (review).
+    fresh = container.fresh and not container.executed and deadline > time.monotonic() - began
+    before = standing() if fresh else None
+    left = deadline - (time.monotonic() - began)
+    alone_ = alone(python, name, split, out, left, grace, environ, coverage, network, whole, release,
+                   site) if left > 0 else None
+    container.executed = container.executed or alone_ is not None
+    found = file_row(python, name, group, site, alone_, deadline)
+    published(found)
+    if alone_ is not None and coverage is None and not release:
+        # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
+        # under its requirement's overlay and on the whole suite's run alone.
+        record(python, [found], alone_.log, common, network, alone_.opened, before)
+    return found["exitCode"] and 1
 
 
 def looked_up(python: str, tests: list[str], group: str, common: str,

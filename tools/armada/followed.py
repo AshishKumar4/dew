@@ -532,11 +532,17 @@ def _beneath_popen() -> bool:
 
 
 def _this_python(program) -> bool:
+    """Whether `program` starts this Python in this environment: the same interpreter, named from this
+    environment's own directory, where Python finds the environment (pyvenv.cfg) and so the `.pth` that starts
+    `follow` (`installed`). The environment's interpreter is a link to the base one, which, started by its own
+    path, has neither (review: a followed child's exec of `sys._base_executable` passed as this Python and ran
+    unrecorded)."""
     if not isinstance(program, (str, bytes, os.PathLike)):
         return False
     path = os.fsdecode(program)
-    return os.path.realpath(path if os.sep in path else os.path.join(sys.prefix, "bin", path)) == \
-        os.path.realpath(sys.executable)
+    path = os.path.abspath(path if os.sep in path else os.path.join(sys.prefix, "bin", path))
+    return os.path.dirname(path) == os.path.dirname(os.path.abspath(sys.executable)) and \
+        os.path.realpath(path) == os.path.realpath(sys.executable)
 
 
 def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
