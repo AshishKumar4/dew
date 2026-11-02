@@ -409,14 +409,16 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
         out_dtypes: tuple | None = None, dense: bool = False,
-        paired: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        paired: jax.Array | None = None, first: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
     With `dense`, the one matrix multiplies every row without a grouped schedule. With `paired`, a second
     matrix of `rhs`'s shape, each tile multiplies its rows by both, one load of the rows, two
     accumulators, which the epilogue takes together (`epilogue(acc, paired_acc, *side_tiles)`: a gate and
-    an up projection with their SwiGLU) or the outputs are, both (`out_dtypes`).
+    an up projection with their SwiGLU) or the outputs are, both (`out_dtypes`). With `first`, an int32
+    scalar, `rhs` is a stack of more matrices than `group_sizes` has groups, group `g` reading matrix
+    `first + g` where it lies (a banked layer's experts); the grid and the tile table are the groups'.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
@@ -426,16 +428,17 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     epilogue's, each brought to shared memory by TMA."""
     block_n, block_k = tiles.block_n, tiles.block_k
     rows, k = lhs.shape
-    g, k2, n = rhs.shape
+    matrices, k2, n = rhs.shape
+    g = group_sizes.shape[0]
     if transpose_rhs:
         k2, n = n, k2
-    if dense and g != 1:
+    if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
     if paired is not None and paired.shape != rhs.shape:
         raise ValueError(f"a paired matrix {paired.shape} is not its product's {rhs.shape}")
     accumulators = 1 if paired is None else 2
     if k != k2 or k % block_k or n % block_n:
-        raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+        raise ValueError(f"a [{rows}, {k}] x [{matrices}, {k2}, {n}] product does not take {tiles}")
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     if k == 0:
         # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
@@ -467,6 +470,11 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                    jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
         table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
+        if first is not None:
+            # Group `g` reads the stack's matrix `first + g`; the unrouted rows' group, past every matrix,
+            # reads none and stores zeros, as it does past the groups' own.
+            group = table[:, 0]
+            table = table.at[:, 0].set(jnp.where(group < g, group + first, matrices))
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = _rows_extended(lhs, 0, extent)
@@ -479,7 +487,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     tail = None
     if dense and paired is None and tiles.cluster == 1 and family_of(tiles, lhs.dtype).fixes_up:
         tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors)
-    outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
+    outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g, matrices), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail)
@@ -497,7 +505,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
     the family owning the operands' streams across tiles, their staging and the outputs' stores
     (`mosaic.Family.persist`). Each consumer's prologue rewrites its share of the rows' slot, its epilogue
-    takes its share of each side tile. `lhs` is padded; `table` is `tile_groups`' at the pair's rows (`gmm`).
+    takes its share of each side tile. `lhs` is padded; `table` is `tile_groups`' at the pair's rows (`gmm`);
+    `shape` the padded rows, the width, the depth, the groups the grid tiles and the matrices `rhs` holds
+    (more than the groups where they read a stack from its `first`, `gmm`).
     One multiprocessor a tile or, at `tiles.cluster` 2, a pair of them a cluster running two row tiles of
     one group, which load the group's matrix block once between them (`mosaic.Family.streams`' multicast);
     both run each pair's steps (or neither), its second's rows past the group stored nowhere. A `paired`
@@ -509,7 +519,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     family = family_of(tiles, lhs.dtype)
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
-    m, n, k, g = shape
+    m, n, k, g, held = shape
     block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
     pair = tiles.cluster
     share = block_m // consumers
@@ -540,7 +550,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         schedule = functools.partial(
             _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem,
             matrix_gmems=dict(zip(matrices, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
-            shape=(m, steps, g), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
+            shape=(m, steps, held), grid=grid, tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped},
             interpreted=bool(interpret))
 
@@ -631,7 +641,8 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     multiplies any row, its steps, its streams' views (`_gmm_views`) and its group, row block and column
     tile: its pair's but for this multiprocessor's row block; in a balanced tail, the first of the tile's
     steps its program walks and how many, its partials' gatherer and its program (`tail.Tail.segment`).
-    `shape` is the padded rows, the steps and the groups."""
+    `shape` is the padded rows, the steps and the matrices `rhs` holds, past which a group (the unrouted
+    rows') reads none."""
     m, steps, groups = shape
     pair = tiles.cluster
     index = tail_of.ordered(tail, index, programs, interpreted)
