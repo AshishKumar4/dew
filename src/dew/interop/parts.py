@@ -312,17 +312,15 @@ def _read_lfm2_mlp(view: PartView) -> Mapping[str, object]:
 def _read_short_conv(view: PartView) -> Mapping[str, object]:
     """LFM2's gated short convolution (`dew.nn.mixers.short_conv.GatedShortConv`): `in_proj` to B, C and x,
     the depthwise causal convolution of B * x over `conv_kernel_size` taps, gated by C, and `out_proj`
-    back; a per-layer fact (`_with_convolutions`). Its `bias`, biasing all three, is `Ambiguous`."""
+    back; a per-layer fact (`_with_convolutions`). Its `bias` biases all three together, padded slots
+    holding their bias product as the source's zeroed inputs do (`GatedShortConv`); one biasing some
+    of them alone is `Ambiguous`."""
     conv, width = view.conv, view.in_proj.in_features
     taps = int(view.conv_kernel_size)
     if (conv.groups != width or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)
             or view.in_proj.out_features != 3 * width):
         raise Ambiguous("the convolution is not one causal depthwise filter per channel over its taps")
-    if _biased(view.in_proj, view.out_proj, conv):
-        # Its padded slots, zeroed before `in_proj`, still convolve their bias terms into the next real
-        # tokens' history, which Dew's held convolution keeps empty.
-        raise Ambiguous("the convolution is biased, so its padded slots convolve their bias terms")
-    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': False}}}
+    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': _biased(view.in_proj, view.out_proj, conv)}}}
 
 
 def _read_mlp(view: PartView) -> Mapping[str, object]:

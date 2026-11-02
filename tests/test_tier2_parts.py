@@ -6,6 +6,7 @@ whose code renames every class and attribute (`renamed`), and a decoder built of
 Mixtral's routed experts and Gemma's (1 + w) norms (`mixed`). Each loads natively and its logits hold
 check 1 against its own code run by transformers, from that code's float64 twin.
 """
+import contextlib
 import json
 
 import jax
@@ -642,18 +643,58 @@ def test_closures_whose_containers_alias_apart_compute_apart():
     assert matched_class(Lfm2MoeShortConv, Lfm2ShortConv) is not None
 
 
-def test_a_biased_short_convolution_is_left_to_tier_3():
-    """LFM2's biased convolution zeroes its padded slots before its input projection, so they still convolve
-    their bias terms into the next real tokens' history, which Dew's held convolution keeps empty: tier 2
-    assembles none of it."""
+BIASED_CONV_SEEDS = 8
+"""The biased convolution's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tmp_path):
+    """LFM2's biased convolution zeroes its padded slots' input before its projections, so their bias
+    product reaches the real tokens' history after them (ledger 3165): tier 2 assembles it, and a
+    left-padded prompt prefilled through the cache and a token decoded after it give logits on par with
+    the source's forward over the same rows and mask, from its float64 twin (check 1)."""
     from interop_support import tiny_config
     from transformers import AutoModelForCausalLM
 
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_bias=True,
-                                                             layer_types=["conv", "full_attention"] * 2))
-    with pytest.raises(parts.Ambiguous):
-        parts.assemble(model)
+    def built(dtype):
+        return AutoModelForCausalLM.from_config(
+            tiny_config("lfm2", head_dim=None, conv_bias=True, layer_types=["conv", "full_attention"] * 2),
+            dtype=dtype)
+
+    torch.manual_seed(0)
+    model = built(torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", max_seq_len=32)
+    assert isinstance(verify_mapping(model.config.to_dict()), VerifiedMapping)
+    mask = np.ones((2, 12), bool)
+    mask[1, :5] = False
+    vocab = model.config.vocab_size
+
+    def draw(seed):
+        rng = np.random.default_rng([0x3165, seed])
+        return (rng.integers(0, vocab, (2, 12)).astype(np.int32),
+                rng.integers(0, vocab, (2, 1)).astype(np.int32))
+
+    def ours(ids, token):
+        _, cache = loaded.model.apply(loaded.variables, ids, attention_mask=mask, decode=True,
+                                      mutable=["cache"])
+        prompt, cache = loaded.model.apply({**loaded.variables, **cache}, ids, attention_mask=mask,
+                                           decode=True, mutable=["cache"])
+        step, _ = loaded.model.apply({**loaded.variables, **cache}, token, decode=True, mutable=["cache"])
+        return {"prompt": np.asarray(prompt, np.float64)[mask], "step": np.asarray(step, np.float64)[:, -1]}
+
+    def theirs(source, precision=None):
+        def run(ids, token):
+            joined = torch.from_numpy(np.concatenate([ids, token], 1)).long()
+            held = torch.from_numpy(np.concatenate([mask, np.ones((2, 1), bool)], 1)).long()
+            with (precision or contextlib.nullcontext)(), torch.no_grad():
+                logits = source(joined, attention_mask=held, use_cache=False).logits.double().numpy()
+            return {"prompt": logits[:, :-1][mask], "step": logits[:, -1]}
+        return as_given(run)
+
+    wide = float64_twin(model, lambda: built(torch.float64)).eval()
+    assert_as_exact(as_given(ours), theirs(model.eval()), draw, "a biased short convolution's padded rows",
+                    seeds=BIASED_CONV_SEEDS, truth_fn=theirs(wide, float64))
 
 
 ERNIE_CLAMP_SEEDS = 8
