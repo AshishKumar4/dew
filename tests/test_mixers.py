@@ -455,7 +455,7 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     if isinstance(value, ParallelMixer):
         nothing = tuple(mixers[name] for name in ATTENDS_NOTHING)
         branches = zip(value.branches, factory.keywords["branches"], strict=True)
-        attending = tuple(built for branch, (_, built, _, _) in branches
+        attending = tuple(built for branch, (_, built, *_) in branches
                           if not isinstance(branch.mixer, nothing))
     assert attending
     for built in attending:

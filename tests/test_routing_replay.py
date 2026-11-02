@@ -154,8 +154,9 @@ def site_choices(obj, params, tokens, routes=None) -> dict[str, np.ndarray]:
     sown = obj.token_scores(params, tokens, routing=True, routes=routes).routing
     chosen = {FEEDFORWARD_ROUTES: {}, "experts": {}}
     for path, leaf in jax.tree_util.tree_leaves_with_path(sown):
-        keys = [entry.key for entry in path]
-        if keys[-2] == "indices":
+        # A sown leaf sits in a tuple under its name; its dict keys name the site.
+        keys = [entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)]
+        if keys[-1] == "indices":
             site = "experts" if "self_attn" in keys else FEEDFORWARD_ROUTES
             chosen[site][int(keys[0].split("_")[1])] = np.asarray(leaf)
     return {site: np.stack([layers[index] for index in sorted(layers)], axis=2)
