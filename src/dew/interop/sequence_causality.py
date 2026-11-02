@@ -404,7 +404,7 @@ def _scan(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
     output reads that step and the carry of the steps before it, and its last carry every step; over
     another axis, its body walked with its carried values' axes held fixed."""
     params = eqn.params
-    consts, carries = params["num_consts"], params["num_carry"]
+    consts, carries = _scan_groups(eqn)
     body = params["jaxpr"].jaxpr
     xs = list(given[consts + carries:])
     if any(value == 0 for value in xs if isinstance(value, int)):
@@ -424,6 +424,18 @@ def _scan(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
     out = _fixed(walk, body, list(given[:consts]), list(given[consts:consts + carries]), steps)
     return [*out[:carries], *[value + 1 if isinstance(value, int) and value >= 0 else value
                               for value in out[carries:]]]
+
+
+def _scan_groups(eqn: core.JaxprEqn) -> tuple[int, int]:
+    """A scan's constant and carried inputs' counts: its parameters', or, where it states its inputs'
+    and outputs' groups (`ft_in`, `ft_out`), theirs, its carries in matching its carries out."""
+    params = eqn.params
+    if "num_consts" in params:
+        return params["num_consts"], params["num_carry"]
+    consts, carried, _ = (len(group) for group in params["ft_in"].elts)
+    if len(params["ft_out"].elts[0]) != carried or len(params["jaxpr"].jaxpr.outvars) != len(eqn.outvars):
+        raise SequenceMixed("a scan forwards some of its carries past its body, which the walk does not align")
+    return consts, carried
 
 
 def _while(walk: _Walk, eqn: core.JaxprEqn, given: list[Held]) -> list[Held]:
