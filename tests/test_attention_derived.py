@@ -361,6 +361,30 @@ def test_a_derived_backward_masks_an_empty_querys_overflowing_product():
     assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+def test_a_query_a_hook_empties_takes_no_cotangent(derived):
+    """Two fp32 queries over one key, a score hook hiding it from the second (its logit -inf, its denominator
+    0, its output the reference's zero), the value's first component 2^127 and the second query's output
+    cotangent 4 there: its `dO Vᵀ` is 2^129, past fp32's largest, beside weights of 0. Every gradient is
+    finite under either forms, as the reference's: the query takes no cotangent
+    (`attention.launch_arguments`)."""
+    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+                                             [[0.0], [4.0]])
+    hooks = template.Hooks(score_mod=first_query_only)
+    spans = template.spans(2, 1, 1)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
+    with fast(derived):
+        grads = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
+
+
+def first_query_only(s, q_pos, k_pos):
+    """A score hook hiding every key from each query but the first."""
+    del k_pos
+    return jnp.where(q_pos == 0, s, -jnp.inf)
+
+
 def test_a_derived_backward_scales_its_cotangents_before_their_products():
     """An fp32 query of zero over two keys of first components 2^127 and -2^127, values 4 and -4, the
     output's cotangent 1 and the scale 1/4: the score cotangents are 2 and -2, whose products with the keys

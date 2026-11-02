@@ -3,6 +3,7 @@ its timings, written and read back equal, through tokamax's public API alone."""
 
 import dataclasses
 import functools
+import itertools
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import sys
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import tokamax
 
@@ -185,59 +187,148 @@ def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
         assert keys[0] == keys[2]
 
 
-def _refusing_hook(tile):
-    """A module-level hook that refuses to run: a launch's identity names it without running it."""
-    raise AssertionError("a launch's identity ran its hook")
+def _times(scale, tile):
+    """A module-level hook body: the tile times `scale`."""
+    return tile * scale
 
 
 @dataclasses.dataclass(frozen=True)
-class _Scaled:
-    """A module-level hook class whose call refuses to run: named by its class and its fields."""
+class _Times:
+    """A module-level hook class: the tile times its scale, or plus it."""
 
-    scale: float
+    scale: object
+    added: bool = False
 
     def __call__(self, tile):
-        raise AssertionError(f"a launch's identity ran its hook at {self.scale}")
+        return tile + self.scale if self.added else tile * self.scale
 
 
-def test_a_launchs_identity_names_its_named_hooks_without_running_them():
-    """A launch's identity (`KernelOp.identified`, every launch's, tuning or not) names a module-level hook,
-    a dataclass of one and a partial of them by their parts, running none: equal parts alike, another field's
-    value or a list for a tuple apart. The whole identity, its kernels' names (`report.launching`), reads an
-    argument's hooks alike."""
+def _hooks() -> list:
+    """Hooks of every kind a launch holds: module-level functions, dataclasses of one and partials of them
+    over numbers, arrays, lists and tuples and in either keyword order, closures over each, callable objects
+    equal whatever they compute, hooks whose state is no field, and partials over random keys."""
+    row = np.arange(16, dtype=np.float32)
+    scales = (2.0, 3.0, 2, row, row[::-1].copy(), [2.0], (2.0,))
+
+    def closure(scale):
+        return lambda tile: tile * (scale[0] if isinstance(scale, (list, tuple)) else scale)
+
+    def branching(scale):
+        return lambda tile: tile * (2 if isinstance(scale, list) else 3)
+
+    def first_keyword(tile, **settings):
+        return tile * next(iter(settings.values()))
+
+    def keyed(tile, key):
+        return tile + jax.random.key_data(key)[0].astype(tile.dtype)
+
+    return [_scaled_hook, *(_Times(scale) for scale in scales if not isinstance(scale, (list, tuple))),
+            _Times(2.0, added=True), *(functools.partial(_times, scale) for scale in scales[:5]),
+            *(closure(scale) for scale in scales), branching([1]), branching((1,)),
+            functools.partial(jnp.add, 1.0), functools.partial(jnp.multiply, 2.0),
+            functools.partial(first_keyword, a=2.0, b=3.0), functools.partial(first_keyword, b=3.0, a=2.0),
+            _Initialized(2.0), _Initialized(3.0), _Equal(2.0), _Equal(3.0),
+            functools.partial(keyed, key=jax.random.key(0)), functools.partial(keyed, key=jax.random.key(1))]
+
+
+def test_two_hooks_share_an_identity_only_where_they_lower_to_one_program():
+    """The identity's invariant (`tuning.KernelOp.identified`): two hooks of one launch's identity lower to
+    one program, the same equations and constants, over every pair of hooks of every kind (`_hooks`)."""
     op = _HookedKernel()
-    named = op.identified("prologue", _Scaled(2.0))
-    assert named == op.identified("prologue", _Scaled(2.0))
-    assert str(named).startswith("described:")
-    assert named != op.identified("prologue", _Scaled(3.0))
-    partial = functools.partial(_Scaled, 2.0)
-    assert op.identified("prologue", partial) != op.identified("prologue", functools.partial(_Scaled, 3.0))
-    assert tuning.described(([1],)) != tuning.described(((1,),))
-    hooked = _HookedKernel(prologue=_refusing_hook)
-    whole = report._identity(hooked, hooked.bind(TILE, _Hooks(_Scaled(3.0), (0,))))
-    assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(_Scaled(3.0), (0,))))
-    for changed in (_Hooks(_Scaled(4.0), (0,)), _Hooks(_Scaled(3.0), (1,))):
-        assert whole != report._identity(hooked, hooked.bind(TILE, changed))
+    tile = jnp.ones((8, 16), jnp.float32)
+    hooks = _hooks()
+    keys = [op.identified("prologue", hook) for hook in hooks]
+
+    def lowered(hook):
+        closed = jax.make_jaxpr(hook)(tile)
+        return str(closed.jaxpr), [np.asarray(constant).tobytes() for constant in closed.consts]
+
+    for (first, one), (second, other) in itertools.combinations(zip(keys, hooks, strict=True), 2):
+        if first == second:
+            assert lowered(one) == lowered(other), f"{one} and {other} share {first}"
 
 
-def test_a_closure_hook_is_traced_once_while_it_lives():
-    """A closure's parts do not say what its call reads (`tuning.described`), so a launch's identity traces
-    it, once for the object while it lives (a model's layers share it): twice asked, traced once; two
-    closures of one line computing apart, apart."""
-    traced = []
+TRACES: list[str] = []
+"""Each field `_CountingKernel` traced, in order."""
 
-    def counting(scale):
+
+@dataclasses.dataclass(frozen=True)
+class _CountingKernel(_HookedKernel):
+    """`_HookedKernel`, each trace of a hook field counted (`TRACES`): JAX's own tracing cache serves a
+    function's second trace without calling it, so the hook's calls do not count the identity's traces."""
+
+    def traced(self, name, value):
+        TRACES.append(name)
+        return super().traced(name, value)
+
+
+def test_a_hook_is_traced_once_while_it_lives_under_one_configuration():
+    """A launch's identity traces a hook once for its object while it lives (a model's layers share it), at
+    the op's layouts and the trace's configuration: twice asked, traced once; another object of one code,
+    apart; a bundle rebuilt around the same callable (a bind's), traced once for it; a frozen dataclass
+    hook rebuilt each call (a softcap's), traced once for its class and fields, and one whose state is no
+    field, once an object; under another random bits' construction, apart where its program differs. The
+    whole identity, its kernels' names (`report.launching`), reads it alike."""
+    def scaling(scale):
         def hook(tile):
-            traced.append(scale)
             return tile * scale
         return hook
 
-    op, shared = _HookedKernel(), counting(2.0)
+    TRACES.clear()
+    op, shared = _CountingKernel(), scaling(2.0)
     first = op.identified("prologue", shared)
-    assert first == op.identified("prologue", shared) and traced == [2.0]
-    assert op.identified("prologue", counting(3.0)) != first
-    doubled, tripled = lambda tile: tile * 2, lambda tile: tile * 3
-    assert op.identified("prologue", doubled) != op.identified("prologue", tripled)
+    assert first == op.identified("prologue", shared) and TRACES == ["prologue"]
+    assert op.identified("prologue", scaling(3.0)) != first
+    assert op.identified("hooks", _Hooks(shared, (0,))) == op.identified("hooks", _Hooks(shared, (0,)))
+    # The bundle's trace traces its function within it.
+    assert TRACES == ["prologue", "prologue", "hooks", "prologue"]
+    TRACES.clear()
+    assert op.identified("prologue", _Times(2.0)) == op.identified("prologue", _Times(2.0))
+    assert op.identified("prologue", _Times(2.0, added=True)) != op.identified("prologue", _Times(2.0))
+    assert op.identified("prologue", _Initialized(2.0)) == op.identified("prologue", _Initialized(2.0))
+    assert TRACES == ["prologue"] * 4
+    hooked = _HookedKernel(prologue=shared)
+    whole = report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
+    assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(shared, (0,))))
+    assert whole != report._identity(hooked, hooked.bind(TILE, _Hooks(scaling(4.0), (0,))))
+
+    def drawing(tile):
+        return tile + jax.random.bits(jax.random.key(0), tile.shape).astype(tile.dtype)
+
+    with jax.threefry_partitionable(new_val=True):
+        partitionable = op.identified("prologue", drawing)
+    with jax.threefry_partitionable(new_val=False):
+        assert op.identified("prologue", drawing) != partitionable
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Initialized:
+    """A hook class whose scale is no field of it (`InitVar`): no description of its fields says what its
+    call reads."""
+
+    scale: dataclasses.InitVar[float]
+
+    def __post_init__(self, scale):
+        object.__setattr__(self, "_scale", scale)
+
+    def __call__(self, tile):
+        return tile * self._scale
+
+
+class _Equal:
+    """A callable object equal to every other of its class and hashing alike, whatever its scale."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def __eq__(self, other):
+        return isinstance(other, _Equal)
+
+    def __hash__(self):
+        return 0
+
+    def __call__(self, tile):
+        return tile * self.scale
 
 
 def _scaled_hook(tile):

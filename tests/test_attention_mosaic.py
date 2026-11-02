@@ -1114,6 +1114,30 @@ def test_a_shared_key_backward_over_a_partial_key_tile_is_on_par_with_the_refere
 
 
 @INTERPRETS
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
+def test_a_common_walks_holder_wholly_past_the_keys_reads_none(derived):
+    """The fast backward's one launch fed by its consumers (`wgmma.fed`, each consumer 64 of a slot's
+    queries, walking the slot's common range) over 64 keys at 64-key tiles, its second key holder wholly
+    padding, under the interpreter: every real logit -128 and the padding's 0, which weighs exp(128), past
+    fp32's largest, against zero keys and values. The gradients are finite, as the reference's, the holder
+    past the call's keys masked (`attention_algebra.Forward.walked_keys`), under either forms."""
+    query = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(128.0)
+    key = jnp.zeros((1, 64, 1, 64), jnp.bfloat16).at[..., 0].set(-1.0)
+    value = jnp.zeros_like(key)
+    dout = jnp.zeros_like(query).at[..., 0].set(1.0)
+    spans = template.spans(64, 64, 1)
+    fast = dataclasses.replace(generation.numerics(), forms="fast")
+    with generation.run_precision(fast), algebra_forms.derived(derived), _device(interpret=True):
+        residuals = attention_mosaic.forward(query, key, value, spans, None, interpret=True, scale=1.0,
+                                             residuals=template.Kept.SPLIT)[1:]
+        with _pinned(backward=attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed")):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                              accurate=False, interpret=True, scale=1.0)
+    for grad in (grads.query, grads.key, grads.value):
+        assert np.isfinite(np.asarray(grad, np.float32)).all()
+
+
+@INTERPRETS
 def test_a_shared_key_backward_over_a_partial_key_tile_reads_no_padded_key():
     """The shared-key launch over 96 keys under the interpreter, every real logit near -128 (each query 32
     and each key -64 along one feature, the scale 1/16 at width 256) and the output's cotangent zero: a

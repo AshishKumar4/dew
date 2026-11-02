@@ -111,33 +111,16 @@ def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
 
-def test_two_sums_xla_reads_once_are_priced_as_xla_prices_them():
-    """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`) against one sum of their terms: the model
-    reads each operand once either way (XLA's fusion does, its cost analysis 65,564 bytes against 65,540),
-    so neither is cheaper for the bytes it reads; the join is XLA's own rewrite (`rules.Rules.xla`), taken
-    only where XLA's analysis of the compiled program is cheaper, and the program computes what it computes
-    (check 1)."""
+def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
+    """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
+    way and counts one reduction's operations and one addition fewer joined, so it joins them, and the
+    program computes what it computes (check 1)."""
     def two(x, y):
         return jnp.sum(jnp.tanh(x), axis=-1) + jnp.sum(jnp.tanh(y), axis=-1)
 
-    def one(x, y):
-        return jnp.sum(jnp.tanh(x) + jnp.tanh(y), axis=-1)
-
     shapes = ((64, 128), (64, 128))
     operands_ = rows(3, *shapes)
-
-    def read(fn) -> float:
-        # The device bytes the model prices the program as traced at (`cost.work`).
-        region = terms.region(jax.make_jaxpr(fn)(*operands_))
-        graph, bundle, _ = program.graphed(region)
-        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(cost.target())))
-        return price.work.device_bytes
-
-    assert read(two) == read(one) == 2 * 64 * 128 * 4
-    written = jax.make_jaxpr(algebra.rewritten(two))(*operands_)
-    if count(written, "reduce_sum") == 1:
-        assert cost.cheaper(program.xla_priced(written), program.xla_priced(jax.make_jaxpr(two)(*operands_)))
+    assert count(jax.make_jaxpr(algebra.rewritten(two))(*operands_), "reduce_sum") == 1
     assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
                     "two sums", seeds=16)
 
@@ -351,3 +334,35 @@ def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():
         made = report.rewrites()[-1]
     record = json.loads(json.dumps(planning.rewrite_record(made)))
     assert (tuple(record["limits"]), record["limited"]) == (tuple(made.limits), made.limited)
+
+
+@jax.jit
+def _layer(x, w):
+    """A jitted layer a model calls at each of its call sites: one body JAX shares across them."""
+    return jnp.tanh(x @ w) + x
+
+
+def test_a_body_shared_by_its_call_sites_stays_shared():
+    """A model calling one jitted layer eight times, nothing to rewrite: with the pass on, every call site
+    holds one body, as with it off, and the lowered module has one function for the layer, so a model's
+    layers lower and compile once, their kernels too, not once a call site (each rebuilt body made a
+    Qwen3.5-4B training step's compile 52 to 487 seconds on an H100). A retrace takes the same rewritten
+    body."""
+    def model(x, ws):
+        for w in ws:
+            x = _layer(x, w)
+        return jnp.sum(x)
+
+    x, *ws = rows(0, *[(64, 64)] * 9)
+
+    def shared(*, on: bool):
+        with algebra.passes(on):
+            closed = jax.make_jaxpr(algebra.rewritten(model))(x, ws)
+            text = jax.jit(algebra.rewritten(model)).lower(x, ws).as_text()
+        bodies = [equation.params["jaxpr"] for equation in closed.jaxpr.eqns
+                  if equation.primitive.name in ("pjit", "jit")]
+        return {id(body) for body in bodies}, text.count("func.func")
+
+    off, on, again = shared(on=False), shared(on=True), shared(on=True)
+    assert (len(on[0]), on[1]) == (len(off[0]), off[1]) == (1, 2)
+    assert again[0] == on[0]

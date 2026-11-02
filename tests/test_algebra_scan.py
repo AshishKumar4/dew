@@ -422,6 +422,56 @@ def test_a_chunk_of_a_vast_declared_step_derives():
         assert np.all(np.isfinite(np.asarray(forms.mapped(forms.prepare(chunk), forms.init({})))))
 
 
+def scalar_ssd(dtype=jnp.float32):
+    """A scalar SSD's derived forms (`h = exp(g) h + b v`, read `q h`) of a `dtype` state."""
+    def ssd(h, q, b, v, g):
+        return jnp.exp(g) * h + b[:, None] * v[None, :]
+
+    def read(h, q, b, v, g):
+        return q @ h
+
+    operands = {"q": ("time", "key"), "b": ("time", "key"), "v": ("time", "value"), "g": ("time",)}
+    return scan.derive_scan(scan.Scan(ssd, read, operands, walked="time", state=((1, 1), dtype),
+                                      ranges={"g": (-np.inf, 0.0)}), saturation=SATURATION)
+
+
+def ones_chunk(g, dtype=jnp.float32):
+    """A chunk of unit readers, keys and writes at log decays `g`."""
+    tokens = g.shape[0]
+    ones = jnp.ones((tokens, 1), dtype)
+    return {"q": ones, "b": ones, "v": ones, "g": g}
+
+
+@pytest.mark.parametrize("decays", [[-100.0, -(2.0 ** 127)], [-(2.0 ** 127), -(2.0 ** 127)]])
+def test_a_walk_through_a_vanished_decay_differentiates_and_merges_finite(decays):
+    """A two-token scalar SSD chunk whose last decay vanishes (after a live one, or both): its final state 1,
+    its decays' gradient and their gradient's tangent (forward over reverse, through the portable pullback),
+    and its walk merged after another's, all finite, as the token scan's are."""
+    forms = scalar_ssd()
+
+    def final(g):
+        return jnp.sum(forms.step(forms.init({}), forms.prepare(ones_chunk(g)))[1])
+
+    g = jnp.asarray(decays, jnp.float32)
+    value, gradient = jax.value_and_grad(final)(g)
+    _, tangent = jax.jvp(jax.grad(final), (g,), (jnp.ones_like(g),))
+    walked = forms.step(forms.init({}), forms.prepare(ones_chunk(g)))
+    merged = forms.merge(forms.init({}), walked, None)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in (value, gradient, tangent, *merged))
+
+
+def test_a_float64_walk_carries_its_decay_in_its_own_dtype():
+    """A float64 scalar SSD walked over two chunks by `lax.scan`: the walk's decay stays float64 through its
+    steps (its carry's type unchanged), and its final state is finite."""
+    with jax.enable_x64(new_val=True):
+        forms = scalar_ssd(jnp.float64)
+        prepared = jax.vmap(forms.prepare)(jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]),
+                                                       ones_chunk(jnp.zeros((4,), jnp.float64), jnp.float64)))
+        state, _ = jax.lax.scan(lambda carried, chunk: (forms.step(carried, chunk), None), forms.init({}),
+                                prepared)
+        assert state[0].dtype == jnp.float64 and np.isfinite(np.asarray(state[1])).all()
+
+
 def _primitives(jaxpr):
     """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
     derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""
