@@ -622,7 +622,7 @@ def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
     served = []
     for variables in (trained.variables, whole):
         task = TextGeneration(model, whole, None, sampling=Sampling(temperature=0.0))
-        server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+        server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=16))
         try:
             server.load(variables, 1)
             served.append(server.submit([1, 2, 3], 4, key=5).result().tokens)
