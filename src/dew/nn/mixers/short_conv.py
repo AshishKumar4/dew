@@ -28,8 +28,9 @@ class GatedShortConv(nn.Module):
 
     The decode cache holds the last K-1 convolved inputs, `conv_state` `[B, K-1, D]` in the
     projections' dtype; padded slots read and advance none, and packed documents convolve apart
-    (`held_conv1d`), but a biased layer's leading padding (a left-padded prompt's) holds what the
-    source's does: the projections' bias product, the source zeroing a padded slot's input before them.
+    (`held_conv1d`), but a biased layer's leading padding (a left-padded prompt's, in a row's first
+    call, `conv_started` `[B]` marking a row that has consumed a real token) holds what the source's
+    does: the projections' bias product, the source zeroing a padded slot's input before them.
     Parameter names are the checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
 
     reads: ClassVar[frozenset[str]] = frozenset()
@@ -67,14 +68,21 @@ class GatedShortConv(nn.Module):
         batch, length, width = x.shape
         tokens = coordinates_of(call.metadata, batch, length)
         valid = tokens.valid
+        started = None
+        if call.decode and self.use_bias:
+            # Whether each row has consumed a real token: only a row's first call can open with a
+            # prompt's padding.
+            started = self.variable('cache', 'conv_started', jnp.zeros, (batch,), bool)
         if self.use_bias and valid is not None and tokens.segments is None:
-            # A row's leading padding, the slots before a real token of it (a left-padded prompt's, not
-            # a paused slot's or a row's trailing ones): the source zeroes its input before the
-            # projections (LFM2's `apply_mask_to_padding_states`), so a biased layer's slots there hold
-            # the projections' bias product, which the real tokens after them convolve (ledger 3165).
+            # A prompt's leading padding, the slots before the first real token of a row that has
+            # consumed none (not a paused slot, a row's trailing slots or a continuation's): the source
+            # zeroes its input before the projections (LFM2's `apply_mask_to_padding_states`), so a
+            # biased layer's slots there hold the projections' bias product, which the real tokens
+            # after them convolve (ledger 3165).
             held_valid = jnp.asarray(valid, bool)
+            fresh = jnp.ones((batch, 1), bool) if started is None else ~started.value[:, None]
             leading = (~held_valid & (jnp.cumsum(held_valid, axis=1) == 0)
-                       & held_valid.any(axis=1, keepdims=True))
+                       & held_valid.any(axis=1, keepdims=True) & fresh)
             x = jnp.where(leading[..., None], jnp.zeros_like(x), x)
             valid = held_valid | leading
         gate_in, gate_out, value = jnp.split(self.in_proj(x), 3, axis=-1)
@@ -88,6 +96,9 @@ class GatedShortConv(nn.Module):
             if not allocated:
                 # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
                 return self.out_proj(jnp.zeros_like(mixed))
+        if started is not None:
+            started.value = started.value | (jnp.ones((batch,), bool) if valid is None
+                                             else jnp.asarray(valid, bool).any(axis=1))
         convolved, history = held_conv1d(mixed, taps, valid, None if held is None else held.value,
                                          bias=bias, segments=tokens.segments,
                                          right_padded=tokens.right_padded, dtype=mixed.dtype,

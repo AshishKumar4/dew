@@ -715,8 +715,8 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
     torch.manual_seed(0)
     model = built(torch.float32)
     scatter_weights(model)
-    model.save_pretrained(tmp_path)
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", text_only=True)
+    model.save_pretrained(tmp_path / "saved")
+    loaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference", text_only=True)
     forward = jax.jit(loaded.model.apply)
     wide = float64_twin(model, lambda: built(torch.float64)).eval()
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
@@ -724,13 +724,13 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
                     seeds=VLM_TEXT_SEEDS, truth_fn=torch_logits(wide, float64))
     import shutil
 
-    saved = json.loads((tmp_path / "config.json").read_text())
+    saved = json.loads((tmp_path / "saved" / "config.json").read_text())
     restated = {key: value for key, value in saved.items() if key != "tie_word_embeddings"}
     if model_type == "qwen2_5_vl":
         restated = {**{key: value for key, value in restated.pop("text_config").items()
                        if key not in ("model_type", "tie_word_embeddings")}, **restated}
-    shutil.copytree(tmp_path, tmp_path.parent / "restated")
-    (tmp_path.parent / "restated" / "config.json").write_text(json.dumps(restated))
-    again = Pretrained.load(tmp_path.parent / "restated", dtype="float32", attention_impl="reference",
+    shutil.copytree(tmp_path / "saved", tmp_path / "restated")
+    (tmp_path / "restated" / "config.json").write_text(json.dumps(restated))
+    again = Pretrained.load(tmp_path / "restated", dtype="float32", attention_impl="reference",
                             text_only=True)
     jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)

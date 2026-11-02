@@ -483,27 +483,24 @@ def load_names(model: PreTrainedModel, inventory: Collection[str] | None = None
     """The name `model`'s transformers load gives each stored key (`convert_and_load_state_dict_in_model`,
     by the conversion mapping it keeps for the model, `get_model_conversion_mapping`): every renaming,
     then at most one converter, the base model's prefix added or dropped as the model holds the name,
-    and the stored name itself where only it is held. A renaming that renames a key by whether another
-    is stored (`GroupWeightRename`) reads the checkpoint's whole `inventory`, which each such group is
-    first run over in sorted order, as transformers' load iterates it, so it renames each key as that
-    load does; None where it holds one and no inventory is given, which no read of one name tells."""
+    and the stored name itself where only it is held. Where a renaming renames a key by whether another
+    is stored (`GroupWeightRename`), the whole pipeline runs once over the checkpoint's `inventory` in
+    the order transformers' load iterates it (`dot_natural_key`), each key's name the one that pass
+    gives it, as that load names it; None where it holds one and no inventory is given, which no read
+    of one name tells."""
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
         GroupWeightRename,
         WeightConverter,
         WeightRenaming,
+        dot_natural_key,
         rename_source_key,
     )
 
     transforms = get_model_conversion_mapping(model)
-    groups = [transform for transform in transforms if isinstance(transform, GroupWeightRename)]
-    if groups and inventory is None:
+    grouped = any(isinstance(transform, GroupWeightRename) for transform in transforms)
+    if grouped and inventory is None:
         return None
-    for group in groups:
-        # Seen over the whole checkpoint first: a group renames its keys once its first pattern's key
-        # is seen (`GroupWeightRename.rename_source_key`), which transformers' sorted pass sees first.
-        for stored in sorted(inventory or ()):
-            group.rename_source_key(stored)
     renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
     held, prefix = model.state_dict(), model.base_model_prefix
@@ -516,4 +513,9 @@ def load_names(model: PreTrainedModel, inventory: Collection[str] | None = None
             converter for converter in converters if pattern in converter.source_patterns)
         return LoadName(name, rename_source_key(stored, renamings, [])[0], converter, pattern)
 
-    return loaded
+    if not grouped:
+        return loaded
+    # One pass in the load's own order: a group renames its later keys once it has seen its first
+    # pattern's (`GroupWeightRename.rename_source_key`), each key as renamed by the renamings before it.
+    named = {stored: loaded(stored) for stored in sorted(inventory or (), key=dot_natural_key)}
+    return lambda stored: named[stored] if stored in named else loaded(stored)

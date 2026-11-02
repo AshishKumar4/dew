@@ -707,42 +707,67 @@ class GroupedConfig(LlamaConfig):
 '''
 
 
-def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory(tmp_path):
+@pytest.mark.parametrize("renamed_first", [False, True])
+def test_a_conversion_that_renames_by_another_keys_presence_reads_the_checkpoints_inventory(tmp_path,
+                                                                                          renamed_first):
     """A type of known parts whose checkpoint conversion renames a key by whether another is stored
     (transformers' `GroupWeightRename`, as Kimi K2.5's vision tower's: an older checkpoint's `a_norm` is
     the model's input norm and its `input_layernorm` the feed-forward's, a newer one stores the model's
     own names) verifies from parts and loads either checkpoint as transformers' load reads it, over the
-    checkpoint's whole inventory (ledger 3114): both load to the same decoder, bit for bit."""
+    checkpoint's whole inventory (ledger 3114): both load to the same decoder, bit for bit, and its
+    translation over the older checkpoint's names maps them all. Each key is named as transformers' own
+    load names it, value for value, also where an ordinary renaming before the group takes `a_norm` (to
+    the feed-forward's norm), so the group never sees its first pattern's key and renames nothing
+    (`renamed_first`)."""
     from safetensors.torch import load_file, save_file
     from transformers.conversion_mapping import register_checkpoint_conversion_mapping
-    from transformers.core_model_loading import GroupWeightRename
+    from transformers.core_model_loading import GroupWeightRename, WeightRenaming
 
-    renames = GroupWeightRename(
+    renames = [GroupWeightRename(
         source_patterns=[r"layers.(\d+).a_norm", r"layers.(\d+).input_layernorm"],
-        target_patterns=[r"layers.\1.input_layernorm", r"layers.\1.post_attention_layernorm"])
-    register_checkpoint_conversion_mapping("grouped_llama", [renames], overwrite=True)
+        target_patterns=[r"layers.\1.input_layernorm", r"layers.\1.post_attention_layernorm"])]
+    if renamed_first:
+        renames.insert(0, WeightRenaming(r"layers.(\d+).a_norm", r"layers.\1.post_attention_layernorm"))
     source = ("grouped_llama", "grouped", lambda: GROUPED, GROUPED_CONFIG, "GroupedConfig",
               "GroupedForCausalLM")
-    write_source(tmp_path / "older", "grouped", source=source)
-    path = tmp_path / "older" / "model.safetensors"
-    stored = load_file(path)
-    if any(".a_norm." in name for name in stored):
-        # The save wrote the conversion's source names; the newer checkpoint is the model's own.
-        newer = {name.replace(".input_layernorm.", ".post_attention_layernorm.").replace(".a_norm.",
-                 ".input_layernorm.") if ".input_layernorm." in name or ".a_norm." in name else name:
-                 tensor for name, tensor in stored.items()}
-        older = stored
-    else:
-        older = {name.replace(".input_layernorm.", ".a_norm.").replace(".post_attention_layernorm.",
-                 ".input_layernorm."): tensor for name, tensor in stored.items()}
-        newer = stored
-    shutil.copytree(tmp_path / "older", tmp_path / "newer")
-    save_file(older, path, metadata={"format": "pt"})
-    save_file(newer, tmp_path / "newer" / "model.safetensors", metadata={"format": "pt"})
+    # Saved under the model's own names (no conversion yet), the newer checkpoint; the older one renamed.
+    register_checkpoint_conversion_mapping("grouped_llama", [], overwrite=True)
+    write_source(tmp_path / "newer", "grouped", source=source)
+    register_checkpoint_conversion_mapping("grouped_llama", renames, overwrite=True)
+    path = tmp_path / "newer" / "model.safetensors"
+    newer = load_file(path)
+    held = (("post_attention_layernorm", "a_norm"),) if renamed_first else (
+        ("input_layernorm", "a_norm"), ("post_attention_layernorm", "input_layernorm"))
+    older = {}
+    for name, tensor in newer.items():
+        for own, stored in held:
+            if f".{own}." in name:
+                name = name.replace(f".{own}.", f".{stored}.")
+                break
+        older[name] = tensor
+    shutil.copytree(tmp_path / "newer", tmp_path / "older")
+    save_file(older, tmp_path / "older" / "model.safetensors", metadata={"format": "pt"})
     assert any(".a_norm." in name for name in older) and not any(".a_norm." in name for name in newer)
+    # The older checkpoint's keys named as transformers' own load names them, value for value.
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import sources
+
+    theirs = AutoModelForCausalLM.from_pretrained(tmp_path / "older", trust_remote_code=True,
+                                                  dtype=torch.float32).state_dict()
+    names = sources.load_names(AutoModelForCausalLM.from_pretrained(
+        tmp_path / "newer", trust_remote_code=True, dtype=torch.float32), older.keys())
+    assert names is not None
+    for key, tensor in older.items():
+        np.testing.assert_array_equal(theirs[names(key).name].numpy(), tensor.numpy(), err_msg=key)
+    if renamed_first:
+        # Its save reverses the two renamings into one name (`a_norm` both), which no load reads back,
+        # so the probe, which loads its own save, has nothing to verify.
+        return
     config = json.loads((tmp_path / "older" / "config.json").read_text())
     verified = verify_mapping(config, remote=tmp_path / "older")
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
+    verified.translate(config, older.keys())
     loads = [Pretrained.load(tmp_path / folder, dtype="float32", attention_impl="reference",
                              trust_remote_code=True) for folder in ("older", "newer")]
     jax.tree.map(np.testing.assert_array_equal, loads[0].variables, loads[1].variables)
@@ -794,7 +819,8 @@ def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tm
     product reaches the real tokens' history after them (ledger 3165): tier 2 assembles it, and a
     left-padded prompt prefilled through the cache and a token decoded after it give logits on par with
     the source's forward over the same rows and mask, from its float64 twin (check 1); a paused slot of a
-    decode step, padding of no prompt, advances no convolution's history."""
+    decode step, padding of no prompt, advances no convolution's history, and a continuation's masked
+    slot before its real token is no prompt's padding either: the real token reads as it would alone."""
     from interop_support import tiny_config
     from transformers import AutoModelForCausalLM
 
@@ -852,6 +878,11 @@ def test_a_biased_short_convolution_reads_its_padded_slots_as_its_source_does(tm
     for before, after in zip(*histories, strict=True):
         np.testing.assert_array_equal(after[1], before[1])
         assert not np.array_equal(after[0], before[0])
+    held = np.concatenate([token, token], axis=1)
+    continued, _ = loaded.model.apply({**loaded.variables, **cache}, held, attention_mask=np.array(
+        [[False, True], [False, True]]), decode=True, mutable=["cache"])
+    alone, _ = loaded.model.apply({**loaded.variables, **cache}, token, decode=True, mutable=["cache"])
+    np.testing.assert_array_equal(np.asarray(continued)[:, -1], np.asarray(alone)[:, -1])
 
 
 ERNIE_CLAMP_SEEDS = 8

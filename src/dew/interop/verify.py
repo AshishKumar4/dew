@@ -550,7 +550,7 @@ class VerifiedMapping:
         and its tensors may carry names the shrunk reference did not build.
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
-        entry = self.entry(hf_config) if entry is None else entry
+        entry = self.entry(hf_config, tensor_names) if entry is None else entry
         record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
