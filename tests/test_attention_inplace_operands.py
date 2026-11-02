@@ -16,7 +16,9 @@ parameters of one kind on an H100, on par with the reference path's (check 1), h
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from attention_oracle import attention_terms, kept
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
@@ -98,6 +100,36 @@ def _drawn(width: int, heads: int, kv_heads: int, kind=None):
     return draw
 
 
+def _terms(causal: bool):
+    """The gradients' float64 terms (`attention_terms`): a causal query that keeps few keys has a dQ that
+    cancels toward zero in float64, held to its terms' rounding, not to its own size."""
+    keep = kept(LENGTH, LENGTH, causal=causal)
+
+    def terms(query, key, value, dout):
+        return tuple(attention_terms(query, key, value, dout, keep)[1:4])
+
+    return terms
+
+
+def _hooked_terms(kind):
+    """`_terms` of the hooked step `s + a + 2 b` (`_hooked_route`): the hook's parameters a bias of the logits
+    (`attention_terms`' fifth, an entry's), summed over the queries a key parameter shares, and twice it for
+    `b`."""
+    keep = kept(LENGTH, LENGTH, causal=True)
+
+    def terms(query, key, value, dout, a, b):
+        def tile(param):
+            param = np.asarray(param, np.float64)
+            return param[:, :, None, :] if kind is template.Kind.KEY else param
+
+        bias = np.broadcast_to(tile(a) + 2.0 * tile(b), (1, HEADS, LENGTH, LENGTH))
+        _, dq, dk, dv, entries = attention_terms(query, key, value, dout, keep, bias=bias)
+        shared = np.sqrt(np.sum(np.square(entries), axis=2)) if kind is template.Kind.KEY else entries
+        return dq, dk, dv, shared, 2.0 * shared
+
+    return terms
+
+
 @ON_HOPPER
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 @pytest.mark.parametrize("name", CALLS)
@@ -112,7 +144,7 @@ def a_routes_one_launch_backward_is_on_par_on_an_h100(name: str, causal: bool) -
             return _route(causal)(*operands)
 
     assert_as_exact(jax.jit(ours), jax.jit(_route(causal, "reference")), _drawn(width, heads, kv_heads),
-                    f"one launch {name} {'causal' if causal else 'full'}", seeds=SEEDS)
+                    f"one launch {name} {'causal' if causal else 'full'}", seeds=SEEDS, terms=_terms(causal))
 
 
 @ON_HOPPER
@@ -122,4 +154,4 @@ def a_routes_hooked_backward_is_on_par_on_an_h100(name: str) -> None:
     reference path's (check 1), the dK/dV launch's two hook gradients two buffers (row 3180)."""
     kind = HOOKED[name]
     assert_as_exact(jax.jit(_hooked_route(kind)), jax.jit(_hooked_route(kind, reference=True)),
-                    _drawn(64, HEADS, 2, kind), f"hooked {name}", seeds=SEEDS)
+                    _drawn(64, HEADS, 2, kind), f"hooked {name}", seeds=SEEDS, terms=_hooked_terms(kind))
