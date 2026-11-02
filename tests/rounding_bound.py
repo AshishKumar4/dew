@@ -93,18 +93,8 @@ class TapRule:
             if key in params:
                 params[key] = _wide(params[key])
         operands = [_widened(value) for value in inputs]
-        if name == "reduce_precision":
-            # The float64 evaluation keeps its value, the rounding it is weighed.
-            outputs = list(operands)
-        elif name in SCATTERS:
-            # A scatter's combining computation is traced for its dtype: built again for the widened one.
-            operand, indices, updates = operands
-            outputs = [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
-                                      indices_are_sorted=params["indices_are_sorted"],
-                                      unique_indices=params["unique_indices"], mode=params["mode"])]
-        else:
-            outputs = equation.primitive.bind(*operands, **equation.primitive.get_bind_params(params))
-            outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
+        # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed.
+        outputs = list(operands) if name == "reduce_precision" else _bound(equation, params, operands)
         if name in EXACT:
             return outputs
         tapped = []
@@ -201,9 +191,21 @@ def _weight(equation, name, params, operands, value):
         return jnp.square(operands[0]) + magnitude
     if name not in SUMMED:
         raise ValueError(f"the rounding scale has no rule for {name}: add it to EXACT, ONCE, ULPS or SUMMED")
-    terms = equation.primitive.bind(*(jnp.abs(operand) for operand in operands),
-                                    **equation.primitive.get_bind_params(params))
+    (terms,) = _bound(equation, params, [jnp.abs(operand) for operand in operands])
     return _terms_count(equation, name, params) * terms
+
+
+def _bound(equation, params, operands) -> list:
+    """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
+    scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
+    name = equation.primitive.name
+    if name in SCATTERS:
+        operand, indices, updates = operands
+        return [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
+                               indices_are_sorted=params["indices_are_sorted"],
+                               unique_indices=params["unique_indices"], mode=params["mode"])]
+    outputs = equation.primitive.bind(*operands, **equation.primitive.get_bind_params(params))
+    return list(outputs) if equation.primitive.multiple_results else [outputs]
 
 
 def _converted(equation, operand, magnitude):
