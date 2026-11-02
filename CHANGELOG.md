@@ -7,6 +7,24 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- API change: a model's `init` returns each parameter whose logical axes its module names in Flax's
+  partitioning box (`nn.LogicallyPartitioned`), declared where the module draws it
+  (`nn.with_logical_partitioning`, `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), as Flax's
+  partitioning and MaxText read them. Every Dew entry (the trainer, objectives, `Pretrained`, LoRA,
+  generation, export, checkpoints) takes boxed and plain trees alike; code that reads the arrays of an
+  `init` itself calls `nn.unbox(variables)` first. The process-wide `@logical_axes` table of trailing
+  module names is gone: a parameter takes the axes its own module names, and no model's names place
+  another's (a user model's own `gate` took Dew's MoE router's axes once that was imported). A run
+  reads its objective's draw once for the table its placement and Muon read
+  (`Objective.parameter_axes`); placements are unchanged for every catalogued model but where the old
+  table named a parameter by another module's name (attention's qk-norm scales lost MLA's 'index',
+  Gemma 4's router scale is 'embed', the hash router's token table is whole on every device).
+- A program Dew compiles is keyed on the concrete mesh it is called under, so a mesh of one shape over
+  other devices compiles its own and runs on its devices.
+- A flat `NormalAttention`'s projections declare `[embed, heads]` and their output `[heads, embed]`,
+  the matrices Muon steps, where they took the headed form's three axes.
+- A model an adapter targets unlike along a scanned run of like layers draws afresh, each layer's
+  factors at its own rank.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
   them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
   memory read that packs them as it holds them bounds the passes with its pack. A run bounded in

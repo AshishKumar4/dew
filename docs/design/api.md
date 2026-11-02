@@ -254,15 +254,11 @@ The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a sto
 ### 3.8 Distributed
 
 ```python
-@models("causal_transformer")
-@logical_axes({
-    ("embed_tokens",): ("vocab", "embed"),
-    ("q_proj",): ("embed", "heads"), ...
-})
-class CausalTransformer(nn.Module): ...
+self.q_proj = Dense(heads * head_dim, kernel_axes=("embed", "heads"), name="q_proj")
+self.scale = self.param("scale", declared(nn.initializers.ones, ("embed",)), (width,))
 ```
 
-Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/distributed.py:115-217`), declared on the module it names. Each class keeps its own declarations, and a suffix has one set of axes across the process: a second class that declares it otherwise is refused at the decorator, both named, and a class outside Dew qualifies a one-name suffix with its holder's name (`("head", "readout")`), so it places no other model's `readout`. `Layout` merges the declarations of the modules in the tree; Muon reads them through the same function. Models stay plain Flax modules with no partitioning metadata in `init`, which is the reason the table exists (`distributed.py:57-62`). A test asserts that every parameter of every registered model is declared or explicitly heuristic.
+Each parameter's logical axes are declared where its module draws it, in Flax's own partitioning box (`nn.with_logical_partitioning`; `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), so a model's `init` returns its parameters boxed, as Flax's partitioning and MaxText read them. A run reads its objective's draw once, traced for its shapes alone, into one table by each parameter's path (`Objective.parameter_axes`); every tree enters Dew plain (`dew.nn.sharding.unboxed`, no constraint applied), and `Layout` and Muon read the run's table. There is no process-wide table of module names: a parameter takes the axes its own module names, whatever another model calls its modules. `tests/test_placement_snapshot.py` holds every parameter of every catalogued model, its optimizer state and EMA beside two, to the placement recorded at the main the declarations moved from.
 
 ### 3.9 Config and CLI
 
@@ -424,7 +420,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 
 ## 8. How to build against this design
 
-- A new model is a module with `@models(name)` and `@logical_axes({...})`, and needs nothing else.
+- A new model is a module with `@models(name)` whose parameters declare their axes where they are drawn, and needs nothing else.
 - A new modality is an `Objective`. It may add a preset registry and a discrete or continuous process; it never touches the trainer.
 - A new sampler is a `Solver` with a `step`. It states which schedules it integrates.
 - A new metric is a function `(artifact, batch) -> value` behind `@metrics(name)`.
