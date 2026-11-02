@@ -578,6 +578,44 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
                     seeds=BANKED_EXPERT_SEEDS, truth_fn=truth)
 
 
+def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_layer_cache():
+    """A scanned MoE stack decoding over a banked store (`HeldBanks.place`) allocates its decode cache as
+    the store holds the run's weights, the run's layers one array under the run's name, and every later
+    call reads and writes that bank where it lies, each layer's keys and values at the call's own slots,
+    rather than stacking the layers' caches into a bank and cutting them apart again each call. A prefill
+    and single-token steps over it decode bit for bit as the same stack's calls over the plain loop's
+    per-layer cache, which the stack stacks and unstacks each call, and each layer of the bank reads back
+    as that cache's layer, bit for bit."""
+    ids = jax.random.randint(jax.random.key(4), (2, 10), 0, VOCAB)
+    routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
+    scanned = tiny(num_layers=4, max_seq_len=16, scan_layers=True, mixture=routed)
+    variables = tiny(num_layers=4, max_seq_len=16, mixture=routed).init(jax.random.key(0), ids)
+    banked = HeldBanks(variables).place(scanned)
+
+    @jax.jit
+    def decoded(cache):
+        """A prefill of five tokens, then a token a call: every call's logits, and the cache they leave."""
+        prefilled, state = scanned.apply({**banked, "cache": cache}, ids[:, :5], decode=True,
+                                         mutable=["cache"])
+
+        def step(cache, column):
+            logits, state = scanned.apply({**banked, "cache": cache}, column[:, None], decode=True,
+                                          mutable=["cache"])
+            return state["cache"], logits[:, 0]
+
+        cache, steps = jax.lax.scan(step, state["cache"], jnp.moveaxis(ids[:, 5:], 1, 0))
+        return jnp.concatenate([prefilled, jnp.moveaxis(steps, 0, 1)], axis=1), cache
+
+    allocated = scanned.apply(banked, ids[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    assert "layers_0_3" in allocated and not any(f"layers_{index}" in allocated for index in range(4))
+    logits, held = decoded(allocated)
+    expected, layers = decoded(scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"])
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(expected))
+    for index in range(4):
+        jax.tree.map(lambda bank, leaf, index=index: np.testing.assert_array_equal(
+            np.asarray(bank[index]), np.asarray(leaf)), held["layers_0_3"], layers[f"layers_{index}"])
+
+
 SOURCE_SCAN_SEEDS = 8
 """A loaded source's scanned decode's check-1 seeds, sized by `seeds_for` on armada."""
 
