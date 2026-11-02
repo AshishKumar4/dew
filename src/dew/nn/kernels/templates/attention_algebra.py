@@ -2325,28 +2325,33 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     return summed / per_query
 
 
-def declaration(*, base2: bool, keys_first: bool = False):
+def declaration(*, base2: bool, keys_first: bool = False, factor: float | None = None):
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
-    where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so. Its
-    derived forms stand beside this module's (`plain_step`, `merge`, `finish`), behind the one switch
-    (`dew.algebra.forms.derived`, `derived_forms`), which they replace only on par with them against float64
-    and no slower in the kernel (docs/design/algebra.md)."""
+    where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
+    tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
+    derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
+    hand step's 62 fewer multiplies a step at Qwen3's tile. Its derived forms stand beside this module's
+    (`plain_step`, `merge`, `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`),
+    which they replace only on par with them against float64 and no slower in the kernel
+    (docs/design/algebra.md)."""
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
 
     def walked(logits, values):
-        return softmax_of(logits, values, base2=base2, keys_first=keys_first)
+        scaled = logits if factor is None else logits * np.float32(factor)
+        return softmax_of(scaled, values, base2=base2, keys_first=keys_first)
 
     return derive.Reduction(walked, {"logits": tile, "values": ("keys", "width")}, walked="keys",
                             exponent=2 if base2 else "e")
 
 
 @functools.cache
-def derived_forms(base2: bool, keys_first: bool = False) -> derive.Derived:
+def derived_forms(base2: bool, keys_first: bool = False, factor: float | None = None) -> derive.Derived:
     """The forward's derived forms (`declaration`'s, the fast class), the template's behind the switch
-    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own."""
+    (`dew.algebra.forms.derived`): `plain_step`, `merge` and `finish` take them in place of their own; a
+    step over raw products, their `factor` (`declaration`)."""
     from dew.algebra import SATURATION
-    return derive.derive(declaration(base2=base2, keys_first=keys_first), accurate=False,
+    return derive.derive(declaration(base2=base2, keys_first=keys_first, factor=factor), accurate=False,
                          saturation=SATURATION)
 
 
@@ -2362,9 +2367,10 @@ def states_derived(spec: Forward, *states: Partial) -> bool:
         state.guard is None and state.low is None for state in states)
 
 
-def _slotted(key: tuple[bool, bool], shapes: Mapping) -> tuple[str, ...]:
-    """The `Partial` field each of the derived forms' carried states is (`Derived.slots`) at a walk of tiles
-    of `shapes`: its maximum `m`, its sum of one value a query `total`, its sum of a row a query `acc`."""
+def _slotted(key: tuple, shapes: Mapping) -> tuple[str, ...]:
+    """The `Partial` field each of the derived forms' (`derived_forms(*key)`) carried states is
+    (`Derived.slots`) at a walk of tiles of `shapes`: its maximum `m`, its sum of one value a query `total`,
+    its sum of a row a query `acc`."""
     slots = derived_forms(*key).slots
     assert slots is not None, "a reduction's derived forms name their slots"
     fields = tuple("m" if monoid == "max" else "total" if len(shape) == 1 else "acc"
@@ -2389,9 +2395,11 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
     `modify` writes them) and values; the weighted values' sums the mainloop's own where it holds them
     (`Keys.accumulate`), every product the mainloop's (`Keys.dot`)."""
-    key = (spec.base2, bool(keys.coords.keys_first))
+    # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
+    raw = keys.products is not None
+    key = (spec.base2, bool(keys.coords.keys_first), *((spec.factor,) if raw else ()))
     forms = derived_forms(*key)
-    tiles = {"logits": keys.logits, "values": keys.values}
+    tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
     fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
     held_by = keys.accumulate
 

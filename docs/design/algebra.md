@@ -117,7 +117,10 @@ inferred. A bare custom derivative in `src/dew` fails a slop check, not a defaul
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): linearity of sums, scalars hoisted out of reductions along
     constant axes, distributivity, `dot_general` ⇄ multiply and sum, inner products moved across linear maps
-    (⟨x, L y⟩ = ⟨Lᵀ x, y⟩), and a scale moved through a contraction (`(diag(1/t) E)ᵀ dO ≡ Eᵀ (diag(1/t) dO)`);
+    (⟨x, L y⟩ = ⟨Lᵀ x, y⟩), a scale moved through a contraction (`(diag(1/t) E)ᵀ dO ≡ Eᵀ (diag(1/t) dO)`),
+    and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
+    its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
+    does;
   - **identities** (compile time and dev time): rsqrt and sqrt, exp and log, abs and sign, cast chains;
   - **reuse** (compile time and dev time): a value the forward already computed;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max

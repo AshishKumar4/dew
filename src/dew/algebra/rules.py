@@ -83,6 +83,12 @@ def unit(term: Term) -> Unit: ...
 
 
 @function
+def positive_scale(term: Term) -> Unit: ...
+"""Holds where a term is a scalar literal past zero: a scale by it keeps every comparison, so a maximum or a
+minimum of a scaled value is the scaled maximum or minimum (`_linear`)."""
+
+
+@function
 def exact_scale(term: Term) -> Unit: ...
 """Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
 dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
@@ -223,7 +229,10 @@ def _stable() -> Ruleset:
 
 
 def _linear() -> Ruleset:
-    """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a product's bilinearity
+    """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a positive scalar's
+    scale taken out of a maximum or a minimum it keeps the order of (`positive_scale`: `max(c x) = c max(x)`,
+    each element's one rounding of `c x` kept as the reduced one's, so it reorders no rounding and makes no
+    new magnitude), a product's bilinearity
     (two products sharing an operand, one product of the summed others, and a power of two's scale of the
     product on either operand instead), each over arithmetic in its operands' dtype (`plain`), and a value a
     broadcast lays along every axis but a sum's taken out of the sum where the other factor has the product's
@@ -261,6 +270,20 @@ def _linear() -> Ruleset:
              *dominated(power, "new")).then(
             union(t).with_(new.dot(a, multiplied)), *made(new, power)),
     ]
+    # A positive scale out of a maximum or a minimum: the scaled elements' order is the elements', so the
+    # reduced element is one, its one rounding of `c x` the result's; a scale broadcast to the operand's
+    # shape (a scalar's) leaves the reduced value's as a scalar's.
+    for reduced in ("max", "min"):
+        for scaled in (lambda c: x.binary("mul", c, multiplied), lambda c: c.binary("mul", x, multiplied)):
+            sets += [
+                rule(eq(t).to(scaled(a).reduce(reduced, axes, summed)), positive_scale(a), plain(multiplied),
+                     eq(shape(a)).to(scalar)).then(
+                    union(t).with_(x.reduce(reduced, axes, summed).binary("mul", a, multiplied))),
+                rule(eq(t).to(scaled(a.shaped("broadcast_in_dim", laid)).reduce(reduced, axes, summed)),
+                     positive_scale(a), plain(multiplied), eq(shape(a)).to(scalar),
+                     eq(shape(x)).to(shape(a.shaped("broadcast_in_dim", laid)))).then(
+                    union(t).with_(x.reduce(reduced, axes, summed).binary("mul", a, multiplied))),
+            ]
     facts, power = magnitude(x, "x")
     length = var("length", i64)
     sum_of = x.reduce("sum", axes, summed)

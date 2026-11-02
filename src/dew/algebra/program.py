@@ -396,6 +396,8 @@ def _products(region: terms.Region) -> list:
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             facts.append(rules.exact_scale(literal))
+        if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value > 0:
+            facts.append(rules.positive_scale(literal))
         if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value == 1:
             facts.append(rules.unit(literal))
     return facts
