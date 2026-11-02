@@ -9,8 +9,9 @@ IN holds cases `<case>.input_ids` and `<case>.attention_mask` (tests/kimi_suppor
 gets `<case>.reference.<leaf>` and `<case>.truth.<leaf>`: each valid position's logits of the batch's
 forward (`logits`) and, for K3, the first row's at the shapes its cached decode computes them (`stepped`,
 ledger 1543). The float32 run is the release's as each tool's `main` runs it, on the CUDA device; the
-float64 run is its twin as each tool's `truth` builds it, on the CPU, fla's kernels answered by its own
-references (`fla_float64`); each holds the fixture's weights.
+float64 run is its twin as each tool's `truth` builds it, fla's kernels answered by its own references
+(`fla_float64`), on the CUDA device too, whose float64 units carry it; each holds the fixture's
+weights.
 """
 
 from __future__ import annotations
@@ -51,8 +52,8 @@ def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
 
 
 def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], contextlib.ExitStack]]:
-    """`site`'s float32 release on the CUDA device, its float64 twin on the CPU, and the context its twin
-    runs in (fla's references installed, `torch_precision.float64`)."""
+    """`site`'s float32 release and its float64 twin on the CUDA device, and the context its twin runs in
+    (fla's references installed, `torch_precision.float64`)."""
     from fla_float64 import installed
     from safetensors.torch import load_file
     from torch_precision import float64
@@ -76,7 +77,7 @@ def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], co
         return stack
 
     with wide_context():
-        wide = tool.released_model(*released[:2], config, tensors, torch.float64).eval()
+        wide = tool.released_model(*released[:2], config, tensors, torch.float64).cuda().eval()
     return narrow, wide, wide_context
 
 
@@ -93,7 +94,7 @@ def main() -> None:
                     for leaf, value in outputs(narrow, inputs, "cuda", stepped).items()}
             with wide_context():
                 out |= {f"{name}.truth.{leaf}": value
-                        for leaf, value in outputs(wide, inputs, "cpu", stepped).items()}
+                        for leaf, value in outputs(wide, inputs, "cuda", stepped).items()}
         return out
 
     serve(run)
