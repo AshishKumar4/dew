@@ -160,7 +160,7 @@ def _applied(equation, inputs, taps, weights):
     if name not in ONCE and name not in ULPS and name not in SUMMED and name not in ("integer_pow",
                                                                                      "one_minus_square"):
         raise ValueError(f"the rounding bound has no rule for {name}: add it to EXACT, ONCE, ULPS or SUMMED")
-    if name == "convert_element_type" and not _narrows(equation):
+    if name == "convert_element_type" and not _narrows(equation, inputs):
         return outputs
     rounded = []
     for value, is_float in zip(outputs, floats, strict=True):
@@ -174,13 +174,19 @@ def _applied(equation, inputs, taps, weights):
     return rounded
 
 
-def _narrows(equation) -> bool:
-    """Whether a conversion rounds: to a float narrower than its operand, or from an integer."""
+def _narrows(equation, inputs) -> bool:
+    """Whether a conversion rounds: to a float narrower than its operand. One from an integer is
+    exact below 2^24, as float32 holds every integer there, which the programs' integers are (refused
+    past it)."""
     source, target = equation.invars[0].aval.dtype, equation.outvars[0].aval.dtype
     if not jnp.issubdtype(target, jnp.floating):
         return False
     if not jnp.issubdtype(source, jnp.floating):
-        return True
+        value = inputs[0]
+        if not isinstance(value, jax.core.Tracer) and np.any(np.abs(np.asarray(value, np.float64)) >= 2 ** 24):
+            raise ValueError("an integer of 2^24 or more converts to float32 with rounding the bound does "
+                             "not weigh")
+        return False
     return jnp.finfo(target).bits < jnp.finfo(source).bits
 
 
