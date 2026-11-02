@@ -27,7 +27,6 @@ from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED, gather_positions
-from dew.objectives.base import token_log_probs
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
@@ -212,8 +211,8 @@ def draw(state: StepState, logits: jax.Array,
         scores = transform(state, raw)
         keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
         token = select(keys, scores, state.active)
-        behavior = token_log_probs(scores, token)
-    selected = token_log_probs(raw, token)
+        behavior = categorical.token_log_probs(scores, token)
+    selected = categorical.token_log_probs(raw, token)
     return token, behavior, selected
 
 
@@ -690,7 +689,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
         scores.append(drawn)
         candidates.append(token)
         offered.append(sure[-1])
-        sure.append(sure[-1] & (jnp.exp(token_log_probs(drawn, token)) >= plan.confidence))
+        sure.append(sure[-1] & (jnp.exp(categorical.token_log_probs(drawn, token)) >= plan.confidence))
         states.append(states[depth].commit(token, active))
         return token
 
@@ -736,8 +735,8 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
                                            drafted.offered, drafted.ending)
     accepted = []
     for at in range(1, block_size):
-        ratio = (token_log_probs(targets[at], candidates[at])
-                 - token_log_probs(drafts[at], candidates[at]))
+        ratio = (categorical.token_log_probs(targets[at], candidates[at])
+                 - categorical.token_log_probs(drafts[at], candidates[at]))
         uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
@@ -764,9 +763,9 @@ def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement
     emitted = jnp.where(slots < matched[:, None],
                         jnp.concatenate([proposed, jnp.zeros((rows, 1), jnp.int32)], axis=1),
                         replacement[:, None])
-    behavior = jnp.stack([token_log_probs(targets[at], emitted[:, at])
+    behavior = jnp.stack([categorical.token_log_probs(targets[at], emitted[:, at])
                           for at in range(block_size + 1)], axis=1)
-    original = jnp.stack([token_log_probs(raw[at], emitted[:, at])
+    original = jnp.stack([categorical.token_log_probs(raw[at], emitted[:, at])
                           for at in range(block_size + 1)], axis=1)
     return emitted, behavior, original
 

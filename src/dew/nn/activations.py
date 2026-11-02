@@ -28,8 +28,10 @@ import functools
 import math
 from collections.abc import Callable
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax.typing import Dtype
 
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, rounded_to
@@ -97,6 +99,56 @@ UNGATED: dict[str, Activation] = {
     'gelu': gelu_tanh, 'gelu_exact': gelu_exact_torch, 'relu': jax.nn.relu, 'relu2': relu2,
     'quick_gelu': quick_gelu, 'silu': silu}
 """The activations an ungated feed-forward takes, by Dew's names."""
+
+
+_SLOPES: dict[Activation, tuple[float, float | None]] = {
+    gelu_exact: (1.1289122, 0.7978924), gelu_exact_torch: (1.1289122, 0.7978924),
+    gelu_tanh: (1.1290011, 0.7978924), quick_gelu: (1.0998479, 0.851009), silu: (1.0998444, 0.5000031),
+    jax.nn.relu: (1.0, None)}
+"""Upper bounds on each activation's `sup |phi'|` and `sup |phi''|` over the reals, which a curvature bound
+through it reads (`dew.objectives.lm.adaptation`): the exact GELU's are Phi(sqrt 2) + sqrt 2 phi(sqrt 2) and
+2 phi(0), SiLU's sigma(x)(1 + x(1 - sigma(x))) at its root 2 + x(1 - 2 sigma(x)) = 0 and 1/2, quick GELU's
+SiLU's at 1.702 x, and 1.702 / 2, each its float64 maximum on a grid of step 2e-5 plus half the step times
+the next derivative's maximum there, rounded up at the seventh decimal (`tests/test_chunk_adaptation.py`).
+ReLU's `phi''` is a point mass at zero, which no number bounds (None)."""
+
+
+XIELU = 'xielu'
+"""The ungated feed-forward's learned activation (`Xielu`), by the name a decoder's `mlp` gives it."""
+
+
+class Xielu(nn.Module):
+    """Apertus's xIELU (transformers' `XIELUActivation`, arXiv 2411.13010): `alpha_p * x**2 + beta * x` for
+    a positive input, `(expm1(min(x, eps)) - x) * alpha_n + beta * x` otherwise, where `alpha_p` is the
+    softplus of its learned `alpha_p` and `alpha_n` is `beta` plus the softplus of its own, each a `[1]`
+    parameter, computed in the input's dtype as the reference's Python form computes it: Apertus holds
+    the activation's parameters in the model's dtype (`XIELUActivation(dtype=config.dtype)`), which Dew's
+    parameters, cast to the compute dtype as every layer's are, stand for; each softplus runs in at least
+    float32 and rounds once, as torch's does. `beta` and `eps` are the reference's buffers, which its
+    checkpoint stores and no step trains: Dew holds them as constants (`constants` collection), their
+    defaults the reference's."""
+    alpha_p_init: float = 0.8
+    alpha_n_init: float = 0.8
+    beta: float = 0.5
+    eps: float = -1e-6
+    param_dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        def inverse_softplus(value: float):
+            return lambda key, shape, dtype: jnp.full(shape, math.log(math.expm1(value)), dtype)
+
+        alpha_p = self.param('alpha_p', inverse_softplus(self.alpha_p_init), (1,), self.param_dtype)
+        alpha_n = self.param('alpha_n', inverse_softplus(self.alpha_n_init - self.beta), (1,),
+                             self.param_dtype)
+        beta = self.variable('constants', 'beta', lambda: jnp.asarray(self.beta, self.param_dtype)).value
+        eps = self.variable('constants', 'eps', lambda: jnp.asarray(self.eps, self.param_dtype)).value
+        alpha_p, alpha_n, beta, eps = (value.astype(x.dtype) for value in (alpha_p, alpha_n, beta, eps))
+        wide = at_least_fp32(x.dtype)
+        alpha_p = jax.nn.softplus(alpha_p.astype(wide)).astype(x.dtype)
+        alpha_n = beta + jax.nn.softplus(alpha_n.astype(wide)).astype(x.dtype)
+        return jnp.where(x > 0, alpha_p * x * x + beta * x,
+                         (jnp.expm1(jnp.minimum(x, eps)) - x) * alpha_n + beta * x)
 
 
 def ungated_activation(name: str, x: jax.Array) -> jax.Array:

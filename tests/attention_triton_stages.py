@@ -4,16 +4,17 @@ Triton's pipeliner (LowerLoops.cpp's `loadRequiresAdditionalBuffer`) gave a load
 of its own a stage. The dK/dV launch reads its query tile twice, raw and by the call's power of two
 (`attention.prescale`: bf16's and fp32's), so at two stages the next stage's copy overwrote the tile under
 dK's product: an H100's dK wrong, and different a repeat (FS-TRITON-RACE1-h100, ET-P0RACE-h100). The root
-fix is the pipeliner's, in the jaxlib the locks pin. Each cell is a route's training step that reaches that
-launch on an H100, on par with the reference path's (check 1, with its float64 terms) and the same bit for
-bit a repeat (the launches it runs add nothing atomically).
+fix is the pipeliner's, in the PJRT plugin the locks pin (jax-cuda12 and jax-cuda13 pjrt post45). Each
+cell is a route's training step that reaches that launch on an H100, on par with the reference path's
+(check 1, with its float64 terms) and the same bit for bit a repeat (the launches it runs add nothing
+atomically).
 """
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
+from gpu_flow import repeats_bit_for_bit
 from reference_error import assert_as_exact
 from test_attention_mosaic import ON_HOPPER
 
@@ -88,8 +89,5 @@ def a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100(name: str) -> 
 
     ours = jax.jit(_step(name, implementation))
     assert_as_exact(ours, jax.jit(_step(name, "reference")), _drawn(name), name, seeds=SEEDS, terms=terms)
-    operands = _drawn(name)(0)
-    first = ours(*operands)
-    for _ in range(REPEATS - 1):
-        for index, (a, b) in enumerate(zip(first, ours(*operands), strict=True)):
-            assert np.array_equal(np.asarray(a), np.asarray(b)), f"{name}: leaf {index} differs run again"
+    repeats_bit_for_bit(ours, *_drawn(name)(0), runs=REPEATS,
+                        names=[f"{name}'s {leaf}" for leaf in ("output", "dQ", "dK", "dV")])

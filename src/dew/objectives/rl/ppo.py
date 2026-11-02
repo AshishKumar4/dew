@@ -15,6 +15,7 @@ from dew._coordination import agreed, from_every_process
 from dew.batch import Batch, Coordinates, Variables, coordinates, part, token_coordinates
 from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
+from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
@@ -82,6 +83,11 @@ class ValueHead(nn.Module):
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
         return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """The backbone's runs a pipeline over `stages` stacks, under `backbone` (`StagedStacks`)."""
+        return part_stage_sites("backbone", self.backbone, store, stages)
 
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
@@ -165,6 +171,12 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         reference = self.actor.ema
         self.ema = None if reference is None else EMASpec(reference.decay,
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """The policy's runs a pipeline over `stages` stacks, under `policy`, and the critic's, under
+        `critic`, each as its module declares them."""
+        return (*nested_sites("policy", self.actor.stage_sites(part(store, "policy"), stages)),
+                *part_stage_sites("critic", self.critic, store, stages))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The actor's modules, then the critic."""

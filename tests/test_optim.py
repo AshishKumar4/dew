@@ -1571,7 +1571,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     twice its real part to the bit, as each update scales both alike and a doubling rounds as its half
     does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real, and so is
     the rate the tree steps at: no step casts a complex value to a real one."""
-    from dew.optim import OptimConfig, QuantizedMoments, learning_rate
+    from dew._moments import QuantizedMoments
+    from dew.optim import OptimConfig, learning_rate
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}
@@ -1596,7 +1597,7 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
 def test_adams_default_first_moment_keeps_its_promoted_dtype():
     """With no requested moment dtype, Adam's first moment of a bf16 parameter under fp32 gradients is
     the promoted fp32 moment Optax keeps, not rounded back to the parameter's bf16."""
-    from dew.optim import scale_by_adam
+    from dew._moments import scale_by_adam
 
     params = {"w": jnp.ones((8,), jnp.bfloat16)}
     transform = scale_by_adam()

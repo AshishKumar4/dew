@@ -28,7 +28,11 @@ class GatedShortConv(nn.Module):
 
     The decode cache holds the last K-1 convolved inputs, `conv_state` `[B, K-1, D]` in the
     projections' dtype; padded slots read and advance none, and packed documents convolve apart
-    (`held_conv1d`). Parameter names are the checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
+    (`held_conv1d`), as LFM3's code zeroes a padded slot's convolved input. Under `padding_holds_bias`
+    a biased layer's leading padding (a left-padded prompt's, in a row's first call, `conv_started`
+    `[B]` marking a row that has consumed a real token) holds what LFM2's code does: the projections'
+    bias product, its code zeroing a padded slot's input before them alone. Parameter names are the
+    checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
 
     reads: ClassVar[frozenset[str]] = frozenset()
     """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a convolution reads the K-1
@@ -37,6 +41,7 @@ class GatedShortConv(nn.Module):
     emb_features: int
     kernel: int = 3
     use_bias: bool = False
+    padding_holds_bias: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -64,6 +69,25 @@ class GatedShortConv(nn.Module):
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
         batch, length, width = x.shape
         tokens = coordinates_of(call.metadata, batch, length)
+        valid = tokens.valid
+        started = None
+        biased_padding = self.use_bias and self.padding_holds_bias
+        if call.decode and biased_padding:
+            # Whether each row has consumed a real token: only a row's first call can open with a
+            # prompt's padding.
+            started = self.variable('cache', 'conv_started', jnp.zeros, (batch,), bool)
+        if biased_padding and valid is not None and tokens.segments is None:
+            # A prompt's leading padding, the slots before the first real token of a row that has
+            # consumed none (not a paused slot, a row's trailing slots or a continuation's): the source
+            # zeroes its input before the projections (LFM2's `apply_mask_to_padding_states`), so a
+            # biased layer's slots there hold the projections' bias product, which the real tokens
+            # after them convolve (ledger 3165).
+            held_valid = jnp.asarray(valid, bool)
+            fresh = jnp.ones((batch, 1), bool) if started is None else ~started.value[:, None]
+            leading = (~held_valid & (jnp.cumsum(held_valid, axis=1) == 0)
+                       & held_valid.any(axis=1, keepdims=True) & fresh)
+            x = jnp.where(leading[..., None], jnp.zeros_like(x), x)
+            valid = held_valid | leading
         gate_in, gate_out, value = jnp.split(self.in_proj(x), 3, axis=-1)
         mixed = gate_in * value
         taps, bias = self.conv()
@@ -75,7 +99,10 @@ class GatedShortConv(nn.Module):
             if not allocated:
                 # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
                 return self.out_proj(jnp.zeros_like(mixed))
-        convolved, history = held_conv1d(mixed, taps, tokens.valid, None if held is None else held.value,
+        if started is not None:
+            started.value = started.value | (jnp.ones((batch,), bool) if valid is None
+                                             else jnp.asarray(valid, bool).any(axis=1))
+        convolved, history = held_conv1d(mixed, taps, valid, None if held is None else held.value,
                                          bias=bias, segments=tokens.segments,
                                          right_padded=tokens.right_padded, dtype=mixed.dtype,
                                          activation=False)
@@ -87,16 +114,19 @@ class GatedShortConv(nn.Module):
 @dataclasses.dataclass(frozen=True)
 class ShortConvMixer(MixerBase):
     """Liquid's gated short convolution layer kind (`GatedShortConv`), by the config's field names:
-    `conv_L_cache` taps and `conv_bias`. The context's attention geometry is not read: the layer has
-    no keys to cache, no rope and no window."""
+    `conv_L_cache` taps and `conv_bias`, and whether a biased layer's leading padding holds its bias
+    product (`GatedShortConv.padding_holds_bias`, LFM2's). The context's attention geometry is not read:
+    the layer has no keys to cache, no rope and no window."""
 
     residuals = ('conv',)
 
     conv_L_cache: int = 3
     conv_bias: bool = False
+    padding_holds_bias: bool = False
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
             raise ValueError("short_conv requires causal=True; its convolution reads only earlier tokens")
         return functools.partial(GatedShortConv, emb_features=ctx.emb_features, kernel=self.conv_L_cache,
-                                 use_bias=self.conv_bias, dtype=ctx.dtype, precision=ctx.precision)
+                                 use_bias=self.conv_bias, padding_holds_bias=self.padding_holds_bias,
+                                 dtype=ctx.dtype, precision=ctx.precision)

@@ -267,8 +267,8 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
 
     accurate = False
     op, ba, _ = attention._gated_backward("sm90", width, accurate, "none")
-    # The one launch its two consumers feed (FlashAttention 3's), pinned: the derivation takes it where the
-    # one launch is allowed (`attention_mosaic.ONE_LAUNCH`, held off for row 3180).
+    # The one launch its two consumers feed (FlashAttention 3's), pinned, so the test does not move with the
+    # derivation.
     config = attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family="wgmma.fed")
     with generation.assumed("sm90"), attention._pinned(backward=config):
         models = attention._backward_models(op, ba, config)
