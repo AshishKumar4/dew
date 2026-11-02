@@ -156,7 +156,8 @@ def _applied(equation, inputs, taps, weights):
     floats = [jnp.issubdtype(var.aval.dtype, jnp.floating) for var in equation.outvars]
     if not any(floats) or name in EXACT:
         return outputs
-    if name not in ONCE and name not in ULPS and name not in SUMMED and name != "integer_pow":
+    if name not in ONCE and name not in ULPS and name not in SUMMED and name not in ("integer_pow",
+                                                                                     "one_minus_square"):
         raise ValueError(f"the rounding bound has no rule for {name}: add it to EXACT, ONCE, ULPS or SUMMED")
     if name == "convert_element_type" and not _narrows(equation):
         return outputs
@@ -192,6 +193,9 @@ def _weight(equation, name, params, inputs, value):
     if name == "integer_pow":
         exponent = abs(int(params["y"]))
         return max(exponent - 1, 1) * magnitude
+    if name == "one_minus_square":
+        # The square rounds by its magnitude, which the difference carries, and the difference by its own.
+        return jnp.square(inputs[0]) + magnitude
     operands = [jnp.abs(operand) for operand in inputs]
     terms = equation.primitive.bind(*operands, **equation.primitive.get_bind_params(params))
     if name == "dot_general":
