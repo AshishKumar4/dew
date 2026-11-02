@@ -268,7 +268,10 @@ Magnitude = int
 """A bound on a value's magnitude (docs/design/algebra.md §6.3): its power of two, `|x| <= 2**log2`, a number
 its constants', its declared ranges' and its equations' prove; a value no number bounds has none (None). A
 sum's is twice the larger of its terms', a product's their product, a contraction's their product times its
-length."""
+length. Proved under its arithmetic's contract (`_real_bound`): IEEE rounding to nearest, a native
+transcendental given one power past its real range, a contraction's mode one it states the rounding of
+(`_contraction_slack`); an equation outside the contract is unbounded, so overflow admission
+(`rules.dominated`) never reads a bound no argument holds."""
 
 NOTHING = -(2 ** 20)
 """A zero's magnitude: under every other."""
@@ -296,7 +299,8 @@ def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
     (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
     magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index, the
     constants apart: a bound on its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its
-    exponential by 1; an input with none is unbounded) and its equations'."""
+    exponential by 2, one power past the reals' 1 for a native exponential; an input with none is
+    unbounded) and its equations'."""
     if forms is Skeleton:
         return _region(closed, ranges, Skeleton)
     return _region(closed, ranges, Term)
@@ -386,8 +390,11 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             held = isinstance(source, jcore.Var) and source in nonpositive
             if name in KEEPING_SIGN and held and (name != "convert_element_type" or _keeps_sign(source, out)):
                 nonpositive.add(out)
+            # An exponential of a value at most 0 is at most 1 in the reals, at most 2 as computed: a native
+            # exponential is not certified under 1 (`ex2.approx`'s relative error, 2**-22.5, is more than an
+            # ulp of 1), so it is given one power.
             exponentiated = name in ("exp", "exp2") and held
-            _typed(dtypes, magnitudes, term, out, UNIT if exponentiated else _bounded(equation, operands))
+            _typed(dtypes, magnitudes, term, out, UNIT + 1 if exponentiated else _bounded(equation, operands))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -485,8 +492,9 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     result whose exact value is under a representable power of two `2**c` rounds to at most it: the
     rules whose bound is such a power spend no slack):
     - a comparison, `is_finite`, `sign`: at most 1 by its definition;
-    - `tanh`, `logistic`, `sin`, `cos`, `erf` of a real operand: at most 1 everywhere (XLA's rounds within
-      it), unbounded over a complex one;
+    - `tanh`, `logistic`, `sin`, `cos`, `erf` of a real operand: at most 1 everywhere in the reals, and at
+      most 2 as computed: a native implementation's polynomial is not certified within the real range (an
+      ulp past 1 breaks a bound of exactly 1), so it is given one power; unbounded over a complex operand;
     - `add`, `sub`: `|x +- y| <= 2**a + 2**b <= 2**(max(a, b) + 1)`, monotone in each operand;
     - `mul`: `|x y| <= 2**(a + b)`, bilinear, its extreme at the box's corners;
     - `max`, `min`, a selection, `neg`, `abs`, a conversion, a layout change, a maximum or minimum along an
@@ -499,7 +507,11 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     - a sum along axes of `n` elements: each term's range summed, `n 2**a <= 2**(a + ceil(log2 n))`
       (separable; each partial sum rounds under the power, a float of under `2**p` terms exactly, more
       rounding back to it);
-    - a contraction of `n` terms: `n 2**(a + b)`, a sum of bilinear terms, separable alike.
+    - a contraction of `n` terms: `n 2**(a + b)`, a sum of bilinear terms, separable alike, where its mode
+      rounds each operand once to nearest (a power of two rounds to itself) and accumulates monotonely; a
+      mode that splits its operands into parts (bf16 x3, x6, x9, TF32 x3, `Precision.HIGH`'s bf16 x3 on a
+      TPU) sums their products' rounding too, given one power; a mode whose rounding no source states (FP8
+      fast accumulation) proves none (`_contraction_slack`).
     Any other equation proves none (a quotient, a logarithm, a power of a float exponent)."""
     name = equation.primitive.name
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
@@ -507,8 +519,11 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     if name in BITWISE:
         # An integer's its dtype's range, a boolean's 1 (`_bounded`).
         return None
-    if name in COMPARISONS or name in ("is_finite", "sign") or (name in BOUNDED and real):
+    if name in COMPARISONS or name in ("is_finite", "sign"):
         return UNIT
+    if name in BOUNDED and real:
+        # One power past the real range for a native implementation's rounding.
+        return UNIT + 1
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
@@ -536,9 +551,36 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
         shape = _shape(equation.invars[0])
         return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))
     if name == "dot_general":
+        slack = _contraction_slack(equation.params.get("precision"))
+        if slack is None:
+            return None
         (contracted, _), _ = equation.params["dimension_numbers"]
         shape = _shape(equation.invars[0])
-        return given[0] + given[1] + _log2(math.prod(shape[axis] for axis in contracted))
+        return given[0] + given[1] + _log2(math.prod(shape[axis] for axis in contracted)) + slack
+    return None
+
+
+SPLIT_PRESETS = frozenset({"BF16_BF16_F32_X3", "BF16_BF16_F32_X6", "BF16_BF16_F32_X9", "TF32_TF32_F32_X3"})
+"""The dot algorithms that split each operand into parts and sum their products (`_contraction_slack`)."""
+SINGLE_PRESETS = frozenset({"DEFAULT", "F16_F16_F16", "F16_F16_F32", "BF16_BF16_BF16", "BF16_BF16_F32",
+                            "TF32_TF32_F32", "F32_F32_F32", "F64_F64_F64"})
+"""The dot algorithms that round each operand once to nearest and accumulate (`_contraction_slack`)."""
+
+
+def _contraction_slack(precision) -> int | None:
+    """The powers a contraction's bound adds for its mode (`dot_general`'s `precision`): none where it rounds
+    each operand once to nearest (`SINGLE_PRESETS`, `Precision.DEFAULT` and `HIGHEST`); one where it splits
+    them into parts whose products it sums (`SPLIT_PRESETS`, `Precision.HIGH`: a TPU's bf16 x3); None, no
+    bound, where no source states its rounding (an FP8 preset's fast accumulation, an algorithm given by
+    its own types)."""
+    if precision is None:
+        return 0
+    if isinstance(precision, jax.lax.DotAlgorithmPreset):
+        return 0 if precision.name in SINGLE_PRESETS else 1 if precision.name in SPLIT_PRESETS else None
+    if isinstance(precision, tuple) and all(isinstance(part, jax.lax.Precision) for part in precision):
+        return 1 if jax.lax.Precision.HIGH in precision else 0
+    if isinstance(precision, jax.lax.Precision):
+        return 1 if precision == jax.lax.Precision.HIGH else 0
     return None
 
 
