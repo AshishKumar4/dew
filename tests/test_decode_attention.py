@@ -76,13 +76,11 @@ def on_the_gpu():
     return contextlib.nullcontext() if ON_GPU else assumed("sm80")
 
 
-def dense_case(dtype, windowed=False):
+def dense_operands(dtype, windowed=False) -> tuple:
     """Rows reading 1 key (an idle slot), a block's worth, one past it, 77 keys and the whole capacity
-    of 32 blocks, at Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256), and their
-    float64 truth: 32 steps of the loop, a slice each at the most, so the slices of each config cut
-    short rows to empty ones. `windowed` starts the rows within a block, at one, mid-row and a
-    window of 300 keys before a full row's end, as a sliding window's decode reads them."""
-
+    of 32 blocks, at Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256): the queries, keys,
+    values and lengths, and with `windowed` the rows' starts within a block, at one, mid-row and a window of
+    300 keys before a full row's end, as a sliding window's decode reads them."""
     rng = np.random.default_rng(0)
     capacity = 32 * decode_attention.BLOCK
     lengths = jnp.asarray([1, decode_attention.BLOCK, decode_attention.BLOCK + 1, 77, capacity], jnp.int32)
@@ -90,12 +88,21 @@ def dense_case(dtype, windowed=False):
     query = jnp.asarray(rng.normal(size=(rows, 4, 2, 256)), dtype)
     key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
     value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
     starts = jnp.asarray([0, 3, 1, 40, capacity - 300] if windowed else [0] * rows, jnp.int32)
-    read = spanned(starts, lengths, capacity)
+    return query, key, value, lengths, *((starts,) if windowed else ())
+
+
+def dense_case(dtype, windowed=False):
+    """`dense_operands` and their float64 truth: 32 steps of the loop, a slice each at the most, so the slices
+    of each config cut short rows to empty ones."""
+    arrays = dense_operands(dtype, windowed)
+    query, key, value, lengths = arrays[:4]
+    starts = arrays[4] if windowed else jnp.zeros_like(lengths)
+    read = spanned(starts, lengths, key.shape[1])
     with jax.enable_x64(new_val=True):
-        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))
-    return (query, key, value, lengths, *((starts,) if windowed else ())), truth
+        truth = np.asarray(exact_attention(*(jnp.asarray(x, jnp.float64) for x in (query, key, value)),
+                                           keep=read))
+    return arrays, truth
 
 
 def spanned(starts, lengths, capacity):
@@ -145,7 +152,7 @@ SOFTCAP = 0.5
 def grouped_case(dtype):
     """`dense_case`'s keys, lengths and capacity under 2 query positions of 4 query heads, a key head's
     pair reading it as gpt-oss's 64 read their 8."""
-    (_, key, value, lengths), _ = dense_case(dtype)
+    _, key, value, lengths = dense_operands(dtype)
     query = jnp.asarray(np.random.default_rng(1).normal(size=(key.shape[0], 2, 4, key.shape[-1])), dtype)
     return query, key, value, lengths
 

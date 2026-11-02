@@ -18,7 +18,15 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm90,
+    operands,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -37,10 +45,9 @@ from dew.nn.kernels.templates.attention import (
 
 QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's lowers and holds check 1 on an A100 (row 2078,
-ET-2078-A100CHECK3), but its natural, guarded and backward launches spill at every tile its model admits and
-no register fact yet decides them (the toolkit's sm80 matrix), so its calls take FA2 or the Pallas-Triton
-mainloop by legality."""
+feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
+compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
+ET-2078-A100CHECK3)."""
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
@@ -62,8 +69,10 @@ def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
 
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
-    which their legality matched (`MosaicForward.legal`)."""
-    found = {family.name: family for family in layouts(generation.gpu_target().generation, dtype)}
+    which their legality matched (`MosaicForward.legal`). A config names its physical layout; which configs
+    a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
+    A100's mma.sync, its resource witness) resolves too."""
+    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
@@ -71,6 +80,12 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
+
+
+def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
+    """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
+    transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
+    return dict.fromkeys(names, mosaic.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -95,6 +110,11 @@ class Tiles:
     relaunch_columns: int | None = None
     natural_form: bool = False
     columns: int | None = None
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     def __post_init__(self):
         if self.stages < 2:
@@ -132,10 +152,25 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_dq: bool = False
+    """Whether the keys-first fused launch's consumers, each its own keys, exchange their score cotangents
+    for a cooperative dQ: each forms its half of dQ's columns over every key and adds it, one tile's dQ added
+    once a program (FlashAttention 3's width 128, run_mha_bwd_hdim128: AtomLayoutMdQ 1 over two MMA
+    warpgroups; each consumer adding a whole tile over its own keys adds twice, the measured bound,
+    ET-DQBOUND-h100)."""
+    producer_dq: bool = False
+    """Whether a shared dQ's adds are its producer's (`mosaic.Outbox`): each consumer stages its share of a
+    tile's dQ, which the producer adds by TMA's reduction a ring's depth behind its loads and frees once
+    read, the adds' waits off the consumers' walk (FlashAttention 3's dQ store warp)."""
     shared_keys: bool = False
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
     dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     @property
     def dkv(self) -> "BackwardTiles":
@@ -168,25 +203,87 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     return whole(power_of_two(width), family.column_unit(dtype))
 
 
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
+    """The phases a step's products hold where its family's read their operands from registers
+    (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
+    `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
+    `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
+    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
+    transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
+    stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
+    fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
+    `narrow` (`Tiles.narrow`)."""
+    if not family.operands_in_registers:
+        return []
+    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
+    return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
+                                                       lhs_parts=0 if register_lhs else 1,
+                                                       rhs_transposed=transposed,
+                                                       rhs_swizzle=narrowest if transposed else None)
+            for rows, depth, columns, beside, register_lhs, transposed in products]
+
+
+def stagings(family: mosaic.Family) -> tuple[bool, ...]:
+    """Whether a launch's transposed streams stage narrowest (`Tiles.narrow`), the stagings a derivation
+    tries in turn: the family's own swizzle first, then the narrowest where its products read their
+    operands from registers (`Family.operands_in_registers`), whose fragments a narrow stage shrinks."""
+    return (False, True) if family.operands_in_registers else (False,)
+
+
+class _Issuing(NamedTuple):
+    """What an `operands.Issuer` reads of a launch: its family and whether it interprets."""
+
+    family: mosaic.Family
+    interpret: bool
+
+
+def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
+    """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
+    (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
+    taken (`algebra.formed_parts`)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1})
+    right = operands.Parts((rhs,), rhs.dtype)
+    return issuer.summed((("part", part, right) for part in parts), into=acc)
+
+
 def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
-    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs)."""
-    keys = config.consumers * config.block_k if isinstance(config, BackwardTiles) else config.block_k
+    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs, a shared
+    dQ's dK/dV program a key block each of its consumers': padded to a block of the dQ launch's consumers,
+    its last program's last consumer read keys past the padded call, NaN interpreted), its keys whole
+    blocks of the dK/dV launch's programs too (`dkv_holders`: a layout and consumers of its own, padded
+    to the dQ launch's, its last keys had no program to write them)."""
+    if isinstance(config, BackwardTiles):
+        keys = (config.dkv.consumers if config.shared_dq else config.consumers) * config.block_k
+        keys = math.lcm(keys, dkv_holders(config) * config.block_k)
+    else:
+        keys = config.block_k
     return math.lcm(config.consumers * config.block_q, keys)
+
+
+def split_queries(family: mosaic.Family) -> bool:
+    """Whether the dK/dV program's consumers share one key block and split each slot's queries between them:
+    on a layout whose consumers feed their own rings (`Transport.feeds_itself`), each consumer's step its
+    share of the queries' tiles and per-query statistics (`a05-twoconsumer`); else each consumer its own
+    keys."""
+    return family.feeds_itself
+
+
+def holders(family: mosaic.Family, consumers: int) -> int:
+    """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""
+    return 1 if split_queries(family) else consumers
+
+
+def dkv_holders(config: BackwardTiles) -> int:
+    """The key blocks a program of the dK/dV launch at `config` holds (`holders`), its layout's own."""
+    dkv = config.dkv
+    return holders(bundles.named(dkv.family, jnp.bfloat16), dkv.consumers)
 
 
 def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int, int]:
     """A call's queries and keys as a launch at `config` pads them (`padded_call`, `_block`)."""
     block = _block(config)
     return whole(max(queries, 1), block), whole(max(keys, 1), block)
-
-
-@functools.cache
-def _parts(accurate: bool, dtype) -> int:
-    """The parts a backward tile's score cotangents take to their products in the form `accurate` names
-    (`algebra.cotangent_parts`: one in the fast form's bf16, three in the accurate form's)."""
-    tile = jax.ShapeDtypeStruct((1, 1), jnp.float32)
-    return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
 DROPPING = Refusal('dropout_places',
@@ -358,22 +455,26 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
     return [var in live for var in jaxpr.invars]
 
 
-def varying_slopes(hooks: Hooks | None) -> int:
-    """The tiles a backward step's score-hook pullback forms that vary with its inputs (`algebra.scored`):
-    its output and its slope along each input it differentiates, the logits and each floating parameter,
-    but a constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the
-    fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced
-    258); traced, never run, on a tile, each slope along its own input alone, or where the hook takes no
-    forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
+def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
+    """The tiles a backward launch's score-hook pullback forms that vary with its inputs (`algebra.scored`):
+    its output and its slope along each input it differentiates, the logits and each floating parameter of
+    the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or `DKV_GRADS`: the dK/dV launch takes
+    no query's or head's slope, an A100's and an H100's dK/dV under a temperature, a softcap with sinks and
+    ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their slopes priced 4, 4 and 3), but a
+    constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the fast dQ
+    under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced 258);
+    traced, never run, on a tile, each slope along its own input alone, or where the hook takes no forward
+    derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
-    return _varying_slopes(hooks.score_mod, params)
+    return _varying_slopes(hooks.score_mod, params, graded)
 
 
 @functools.lru_cache(maxsize=256)
-def _varying_slopes(score_mod, params: tuple) -> int:
-    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes."""
+def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
+    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes in a launch forming
+    the gradients of the kinds `graded`."""
     tile = (TILE_SIDES[0], TILE_SIDES[0])
     positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
     values = [_entries(kind, dtype, tile) for kind, dtype in params]
@@ -388,7 +489,8 @@ def _varying_slopes(score_mod, params: tuple) -> int:
         return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
 
     count = int(_varies(score_mod, logits, positions, positions, *values))
-    for place in (0, *(1 + index for index in floating_params(values))):
+    formed = [index for index in floating_params(values) if params[index][0] in graded]
+    for place in (0, *(1 + index for index in formed)):
         try:
             count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
         except TypeError:
@@ -748,14 +850,16 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
             q_pos=None, columns=None, *, keys_first: bool = False, read: tuple[bool, bool] = (False, False),
-            draw: Draw | None = None) -> algebra.Coords:
+            draw: Draw | None = None, tile_keys: int | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
     intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
     keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
     a row's: each one's places a vector broadcast where the step surely reads them (`read`, its queries' and
-    its keys', `algebra.places_read`), a tile otherwise."""
+    its keys', `algebra.places_read`), a tile otherwise. A part of the walk's tile (a consumer's share of
+    its keys) states the whole tile's keys (`tile_keys`, `algebra.Coords.key_count`), so a part past the
+    call's keys is masked as its tile is."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
 
     def places(start, axis: int) -> jax.Array:
@@ -774,12 +878,19 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     if q_pos is None:
         q_pos = (places(first, query_axis) if queries_read and not keys_first
                  else first + family.iota(shape, query_axis))
+    key_start = key_offsets = None
     if columns is not None and not keys_first:
         k_pos = k_first + columns
+    elif keys_read and not keys_first:
+        # A row's keys as the start its lane decides and the offsets its registers do (`Coords.key_start`).
+        base, key_offsets = family.column_offsets(shape)
+        key_start = k_first + base
+        k_pos = key_start + key_offsets
     else:
         k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
     if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, tile_keys=tile_keys,
+                              key_start=key_start, key_offsets=key_offsets)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
     of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
                            else (family.rows_of, family.columns_of))
@@ -793,7 +904,7 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
         ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first)
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys)
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):

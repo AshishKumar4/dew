@@ -718,9 +718,11 @@ def probed(variables: Variables, name: str | None) -> Variables:
 
 
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
-    """Every leaf of a variables subtree, by its dict-key path."""
+    """Every leaf of a variables subtree, by its dict-key path: a node that is no mapping is one leaf, whole
+    (a quantized kernel with its scales, Qwix's struct dataclasses a served model's params hold)."""
     return {tuple(entry.key for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(
+                tree, is_leaf=lambda node: node is not None and not isinstance(node, Mapping))}
 
 
 def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:

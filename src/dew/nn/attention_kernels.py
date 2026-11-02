@@ -14,7 +14,7 @@ from dew.devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
-from .kernels.selection import Kernel, Op, Refusal, Requirement
+from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 from .precision import wide_cpu_arithmetic
@@ -433,8 +433,8 @@ TEMPLATE_SUPPORTS = (
           lambda case: not case.dense_bias or (not case.row_bias
                                                and generation.gpu_target().architecture.wgmma),
           "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
-          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
-          "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
+          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's "
+          "Pallas-Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
           "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
           row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
@@ -518,10 +518,10 @@ reference path, which takes every call, so it runs where the preference names it
 
 
 def _decode_preferred(case: AttentionCase) -> str:
-    """The kernel a decode call runs: on a GPU the decode kernel, the template's decode mainloop (measured
-    1.57 times as fast as cuDNN in geometric mean on an A100 over Qwen3-0.6B's 28 decode shapes; no cell
-    declares cuDNN, `generation.TARGETS`' note), which hands a call it does not take to the next kernel by
-    legality; xla elsewhere."""
+    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`, no
+    template's yet: ledger row 3424; measured 1.57 times as fast as cuDNN in geometric mean on an A100 over
+    Qwen3-0.6B's 28 decode shapes; no cell declares cuDNN, `generation.TARGETS`' note), which hands a call
+    it does not take to the next kernel by legality; xla elsewhere."""
     return 'decode' if generation.backend() == 'gpu' else 'xla'
 
 
@@ -548,8 +548,3 @@ def decodes(case: AttentionCase) -> bool:
     if case.sinks or case.softcap is not None:
         return generation.backend() == 'gpu' and case.heads % case.kv_heads == 0
     return case.folds and case.heads == case.kv_heads
-
-
-def kernel_refusals(op: Op[AttentionCase], kernel: str, case: AttentionCase) -> list[Refusal]:
-    """Every requirement of `op`'s `kernel` that `case` fails, as refusals, in order."""
-    return op.kernel(kernel).failed(case)

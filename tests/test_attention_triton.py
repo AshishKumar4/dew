@@ -740,6 +740,76 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
         assert staged >= requested > budget
 
 
+def _trained(spans: template.KeySpans):
+    """A training step's backward over `spans` on this mainloop, its forward's residuals its own."""
+    def backward(query, key, value, dout):
+        grads = attention_triton.backward(query, key, value, spans, None, dout, natural=True)
+        return grads.query, grads.key, grads.value
+    return backward
+
+
+@pytest.mark.parametrize("width", [64, 128, 256])
+@pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
+def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
+    """The forward and a training step's backward (its forward kept, the guarded training forward's
+    rewalk among its launches) at the tiles they derive on a GPU of a 99 KB block (an RTX PRO 6000's, an
+    A10's), causal, bf16, compiled by XLA's CUDA backend for a compile-only device of it on this CPU
+    (tests/kernel_compile.py): every Triton launch within the block (a width-256 training forward derived
+    32 x 64, whose rewalk asked 114688 bytes, and XLA refused the whole program)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.bfloat16)
+
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, None, natural=True)
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
+                             KernelCase("backward", lambda: (_trained(spans), (shape,) * 4))],
+                            generation_name)
+    assert len(found) == 2
+    assert not failures(found), "\n".join(failures(found))
+
+
+def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
+    """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
+    block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
+    naming no kernel, where its launches ask more shared memory than the GPU's 99 KB block; the run's
+    compile (`report.kept`) refuses each launch whose refusal moves what XLA asks, each derivation takes its
+    next config, and the program compiles, every miss recorded stepped and its launch's config refused."""
+    import dataclasses
+
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.templates import report
+
+    said = dataclasses.replace(generation.TARGETS["sm120"],
+                               shared_limit=generation.TARGETS["sm80"].shared_limit)
+    spans = template.spans(512, 512, 1, causal=True)
+    mesh = kernel_compile._device("sm120")
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 256), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+    backward = _trained(spans)
+
+    def lowered():
+        # A function of its own each lowering, as a run's relowering takes (`OuterProgram._jitted`): JAX keeps
+        # a function's trace.
+        def fresh(*operands):
+            return backward(*operands)
+
+        with generation.assumed(said), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
+            return jax.jit(fresh).trace(*[shape] * 4).lower()
+
+    with report.refusals():
+        report.kept(lowered(), relower=lowered)
+        misses = [miss for miss in report.misses() if miss.shared is not None]
+        refused = [config for _, config, _ in report.refused_launches()]
+    assert misses and all(miss.stepped for miss in misses), misses
+    assert {miss.config for miss in misses} == set(refused), (misses, refused)
+
+
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(target):
     """The softcap through a `jax.custom_vjp`, whose forward rule calls the hook itself as JAX's

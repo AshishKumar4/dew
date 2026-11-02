@@ -481,7 +481,8 @@ def test_a_padded_calls_padding_rows_stay_finite_and_flag_no_overflow():
     def accumulate(acc, scale, parts, value):
         return acc + algebra.summed_products(parts, value, dot)
 
-    keys_of = algebra.Keys(coords, logits, lambda: value, dot, products=products)
+    keys_of = algebra.Keys(coords, logits, algebra.Operand(value.shape, value.dtype, lambda: value), dot,
+                           products=products)
     state = algebra.plain_step(spec, algebra.started(spec, None, rows, width, None), keys_of)
     arg = algebra.argmax(algebra.no_argmax(rows), logits, coords.k_pos)
     start = algebra.anchored(spec, algebra.started(spec, None, rows, width, None), arg)
@@ -522,7 +523,8 @@ def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(n
     def keys_at(logits, values, index, accumulate=None):
         positions = algebra.Coords(jnp.arange(queries)[:, None], index * tile + jnp.arange(tile)[None, :])
         value = values[index * tile:(index + 1) * tile]
-        return algebra.Keys(positions, logits[index], lambda: value, dot, accumulate)
+        values = algebra.Operand(value.shape, value.dtype, lambda: value)
+        return algebra.Keys(positions, logits[index], values, dot, accumulate)
 
     def walk(logits, values, *, anchored: bool):
         nothing = jnp.zeros((queries,), logits.dtype)

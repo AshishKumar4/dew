@@ -75,17 +75,9 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
     return seen if ids is None else seen & (ids[0] == ids[1])
 
 
-def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
-    """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row` (`within`)."""
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
-    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
-
-
 def dense(spans: KeySpans) -> jax.Array:
-    """`visible` over every query and key: `[B, Q, K]` boolean, by broadcasting alone (`within`), so a
-    batch-sharded call's spans take no gather."""
+    """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
+    alone, so a batch-sharded call's spans take no gather."""
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
@@ -563,10 +555,11 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
 
 
 @dataclasses.dataclass(frozen=True)
-class Capped:
+class Capped(tuning.FieldHook):
     """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
     `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
-    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+    its static facts serves every layer of one cap (`tuning.lowered_once`), and its call reads its cap
+    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`)."""
 
     softcap: float
 
@@ -576,11 +569,11 @@ class Capped:
 
 
 @dataclasses.dataclass(frozen=True)
-class Biased:
+class Biased(tuning.FieldHook):
     """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
     tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
     `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
-    equal inner hooks (`Capped`)."""
+    equal inner hooks (`Capped`); its call reads its inner hook alone (`tuning.FieldHook`)."""
 
     score_mod: Callable | None = None
 
@@ -1227,8 +1220,12 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
     power, scale = prescale(query.dtype, width, scale)
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
+    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it, none at
+    # a query a score hook leaves seeing no key (its denominator 0, its output the reference's zero), whose
+    # weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`).
     dout = dout.astype(query.dtype)
+    if hooks.score_mod is not None:
+        dout = jnp.where(jnp.swapaxes(residuals[1], 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:

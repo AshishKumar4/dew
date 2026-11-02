@@ -57,6 +57,7 @@ import os
 import threading
 import time
 import types
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
 
@@ -66,6 +67,7 @@ import jax.core
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from jax._src import config as jax_config
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
@@ -396,6 +398,52 @@ def reading() -> Iterator[None]:
         _READING.reset(token)
 
 
+_TRACED: dict[Hashable, tuple[tuple[weakref.ref, ...], str | None]] = {}
+"""Each hook's traced key (`KernelOp.identified`) by the op, field and configuration tracing it and its
+callables' identities (`_held_key`), beside weak references to those callables: an entry leaves with the
+first of them collected, and a lookup whose references no longer reach its callables (an identity a new
+object took) is none."""
+
+
+class FieldHook:
+    """A hook whose call reads its class's code and its frozen dataclass fields alone, which its type
+    promises by subclassing this: one rebuilt each call with equal fields (a softcap's `Capped`) shares its
+    analysis by its class and fields (`_held_key`). Any other callable keys by its identity, whatever its
+    layout: a class's slots, constructor or init-only values may hold state its fields do not."""
+
+
+def _held_key(value, leaves: list, path: frozenset = frozenset()) -> Hashable:
+    """`value` as `_TRACED` keys it: a field hook (`FieldHook`) by its class's identity (appended to
+    `leaves`) and its fields' keys, or by its own identity where they hold no key (a cycle back to it, an
+    array); any other callable by its identity (appended to `leaves`); a tuple's, a list's and a dataclass's
+    parts in turn (a launch's hooks bundle, rebuilt each bind around one retained callable); any other
+    value as it hashes (a static's own contract, as `jax.jit` reads it). `TypeError` for a value no hash
+    holds, a graph that reaches a part of itself (`path`) among them."""
+    if id(value) in path:
+        raise TypeError("a hook's parts reach the hook again")
+    inner = path | {id(value)}
+    if isinstance(value, FieldHook) and dataclasses.is_dataclass(value):
+        held: list = []
+        try:
+            fields = tuple((field.name, _held_key(getattr(value, field.name), held, inner))
+                           for field in dataclasses.fields(value))
+        except TypeError:
+            leaves.append(value)
+            return "callable", id(value)
+        leaves.extend((type(value), *held))
+        return "fields", id(type(value)), fields
+    if callable(value):
+        leaves.append(value)
+        return "callable", id(value)
+    if isinstance(value, (tuple, list)):
+        return type(value).__name__, tuple(_held_key(part, leaves, inner) for part in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _named(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves, inner))
+                                          for field in dataclasses.fields(value))
+    hash(value)
+    return type(value).__qualname__, value
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelOp(tokamax.Op):
     """One Pallas launch: its heuristic (a template's derived) config, or, where an opt-in tuning run
@@ -545,6 +593,41 @@ class KernelOp(tokamax.Op):
         naming `HOOKS` defines it."""
         raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
+    def identified(self, name: str, value: Callable | str | None) -> str | None:
+        """The hook field or argument `name`'s value as a launch's identity reads it every launch, tuning or
+        not (`report._identity`: its kernels' names, its refusals): what it computes (`traced`), traced
+        once for each of its callable objects while they live, at this op's layouts and under the trace's
+        configuration (`_TRACED`, `_held_key`: a model's layers share their hooks, and a launch's identity
+        traces none of them again). A key already as it is.
+
+        The invariant: two hooks share an identity only where they lower to one program, the same equations
+        and constants, under one configuration: the identity is the program's own digest (`program`), held
+        for the objects it was traced from, never a description of them (a callable's parts need not say
+        what its call reads)."""
+        if value is None or isinstance(value, str):
+            return self.traced(name, value)
+        try:
+            leaves: list = []
+            place = (type(self), name, jax_config.trace_context(), _held_key(value, leaves),
+                     tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
+                           if field.name not in (*self.HOOKS, "config", "vjp")))
+            hash(place)
+        except TypeError:
+            # A part no hash holds (an array): traced each time.
+            return self.traced(name, value)
+        found = _TRACED.get(place)
+        if found is not None and all(ref() is leaf for ref, leaf in zip(found[0], leaves, strict=True)):
+            return found[1]
+        key = self.traced(name, value)
+        try:
+            refs = tuple(weakref.ref(leaf, lambda _, place=place: _TRACED.pop(place, None))
+                         for leaf in leaves)
+        except TypeError:
+            # A callable no weak reference holds: traced each time.
+            return key
+        _TRACED[place] = (refs, key)
+        return key
+
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
         call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
@@ -626,44 +709,109 @@ def holdable(value: Hashable | jax.Array) -> bool:
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
-    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's printed form
-    (its primitives, shapes, dtypes and literals) and of the values of the arrays it closes over, the
-    same in every process, so every process keys a launch alike and takes process 0's config
-    (`_settle`). A captured array that is itself traced (a value of the enclosing computation) is data
-    the compiled launch reads, so it keys by its shape and dtype alone."""
-    closed = jax.make_jaxpr(function)(*arguments)
-    digest = hashlib.sha256(str(closed).encode())
+    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's structure (each
+    equation's primitive, operands in binding order, parameters and output types, a nested jaxpr's alike) and
+    of the values of the arrays it closes over, the same in every process, so every process keys a launch
+    alike and takes process 0's config (`_settle`). Never its printed form: JAX's printer took a launch's
+    hooks seconds a step (the class of the algebra pass's printed terms). A captured array that is itself
+    traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
+    and dtype alone."""
+    # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
+    # equal hook of another call would take this one's program.
+    closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
+    digest = hashlib.sha256()
+
+    def update(*parts) -> None:
+        digest.update(repr(parts).encode())
 
     def constants(values) -> None:
         for constant in values:
             if isinstance(constant, jax.core.Tracer):
-                digest.update(repr((constant.shape, str(constant.dtype))).encode())
+                update("traced", constant.shape, str(constant.dtype))
             else:
-                value = np.asarray(constant)
-                digest.update(repr((value.shape, str(value.dtype))).encode())
+                value = _host(constant)
+                update("constant", str(jnp.asarray(constant).dtype), value.shape, str(value.dtype))
                 digest.update(np.ascontiguousarray(value).tobytes())
 
-    def nested(jaxpr) -> None:
-        # A nested computation's own constants (a jitted helper's, a branch's), in program order.
+    def walk(jaxpr: jax_core.Jaxpr) -> None:
+        names: dict[jax_core.Var, int] = {}
+
+        def bound(var: jax_core.Var) -> int:
+            return names.setdefault(var, len(names))
+
+        def atom(value) -> Hashable:
+            if isinstance(value, jax_core.Literal):
+                return "literal", str(value.aval), _parameter(value.val)
+            return bound(value)
+
+        update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
-            for parameter in equation.params.values():
+            context = equation.ctx
+            update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
+                   tuple((bound(var), str(var.aval)) for var in equation.outvars),
+                   # The configuration an equation evaluates and lowers under (a key's bits' construction).
+                   _parameter((context.compute_type, context.threefry_partitionable, context.xla_metadata,
+                               str(context.cur_abstract_mesh), str(context.cur_layout_mode),
+                               context.remove_size_one_mesh_axis)))
+            for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
                     if isinstance(inner, jax_core.Jaxpr):
+                        update("nested", name)
                         constants(inner.consts)
-                        nested(inner)
+                        walk(inner)
+                    else:
+                        update(name, _parameter(inner))
+        update("outputs", *(atom(value) for value in jaxpr.outvars))
 
     constants(closed.consts)
-    nested(closed.jaxpr)
+    walk(closed.jaxpr)
     return "traced:" + digest.hexdigest()[:16]
 
 
-def _identity(op: tokamax.Op) -> tokamax.Op:
-    """`op` as its picks name it: without the config, the vjp and the device
-    check a call sets, its hook fields by what they compute (`KernelOp.traced`)."""
-    fields = {field.name: field for field in dataclasses.fields(op)}
-    hooks = ({name: op.traced(name, getattr(op, name)) for name in op.HOOKS if name in fields}
-             if isinstance(op, KernelOp) else {})
+def _host(value) -> np.ndarray:
+    """An array constant's values on the host, as `program` reads them: a typed random key by its key data
+    (its dtype names its implementation; no key converts to NumPy itself)."""
+    if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jax.dtypes.prng_key):
+        return np.asarray(jax.random.key_data(value))
+    return np.asarray(value)
+
+
+def _parameter(value) -> Hashable:
+    """An equation's parameter as `program`'s digest reads it, the same in every process: a number or a
+    string as it is, a sequence's and a set's parts in order (a set's sorted by their own, which a process's
+    hash seed does not order), a mapping's items sorted, an array by its shape, dtype and bytes' digest, a
+    function by its module and name, any other object by its type and its representation less a memory
+    address (which no two processes share); each tagged with its kind."""
+    if value is None or isinstance(value, (bool, int, float, complex, str)):
+        return type(value).__name__, value
+    if isinstance(value, (tuple, list)):
+        return type(value).__name__, tuple(_parameter(part) for part in value)
+    if isinstance(value, (set, frozenset)):
+        return "set", tuple(sorted((_parameter(part) for part in value), key=repr))
+    if isinstance(value, dict):
+        return "mapping", tuple(sorted(((_parameter(key), _parameter(part)) for key, part in value.items()),
+                                       key=repr))
+    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
+        array = _host(value)
+        return ("array", str(value.dtype), array.shape, str(array.dtype),
+                hashlib.sha256(array.tobytes()).hexdigest()[:16])
+    if isinstance(value, types.FunctionType):
+        return "function", value.__module__, value.__qualname__
+    text = repr(value)
+    return type(value).__qualname__, None if " at 0x" in text else text
+
+
+def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
+    """`op` as its picks name it: without the config, the vjp and the device check a call sets, its hook
+    fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
+    picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
+    (`KernelOp.identified`, `report._identity`), tracing nothing."""
+    if not isinstance(op, KernelOp):
+        return op.replace(config=None, vjp=None, bypass_device_check=False)
+    fields = {field.name for field in dataclasses.fields(op)}
+    read = op.traced if traced else op.identified
+    hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
     return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 
@@ -751,14 +899,12 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     return op.operands([leaves[index] for index in places], 0), fill
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
+def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels, each run after `FLUSH_BYTES` are read, so every config starts
-    with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
-    reads the times, or a stand-in with its `Cupti`."""
-    if profiler is None:
-        from jax.experimental.mosaic.gpu import profiler
+    kernels (Mosaic GPU's profiler's `Cupti`), each run after `FLUSH_BYTES` are
+    read, so every config starts with its operands out of cache."""
+    from jax.experimental.mosaic.gpu import profiler
 
     arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
@@ -988,13 +1134,6 @@ def settled(launches: str) -> bool:
              if isinstance(op := ba.op, KernelOp)]
     with reading():
         return _settle(found, measure=False) == 0
-
-
-def missing(lowered: jax.stages.Lowered) -> int:
-    """How many launches of `lowered`, a program lowered under `launches`,
-    have no stored pick on this process."""
-    return sum(isinstance(op := ba.op, KernelOp) and _pick(op.keyed(ba)) is None
-               for ba in _bound_args(lowered))
 
 
 def _settle(found: list[Launch], *, measure: bool) -> int:

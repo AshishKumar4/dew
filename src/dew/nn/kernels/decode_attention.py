@@ -156,7 +156,8 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         key, value = read(step)
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
         logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
-        return algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
+        return algebra.Keys(coords, logits, algebra.Operand(value.shape, value.dtype, lambda: value),
+                            functools.partial(kernel_dot, interpret=interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -255,12 +256,9 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
 
 def _combined(spec: algebra.Forward, *parts, axis: int):
     """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima, totals,
-    shifts and reaches) merged in slice order (`algebra.merge`), as the normalized output in fp32: an
-    empty slice's state (a maximum of -inf) merges as nothing."""
-    states = [algebra.imported(tuple(jnp.take(part, split, axis=axis) for part in parts))
-              for split in range(parts[0].shape[axis])]
-    return algebra.finish(spec, functools.reduce(functools.partial(algebra.merge, spec), states),
-                          initial=True)[0]
+    shifts and reaches) merged at once (`algebra.merged`), as the normalized output in fp32: an empty
+    slice's state (a maximum of -inf) merges as nothing."""
+    return algebra.finish(spec, algebra.merged(spec, algebra.imported(parts), axis), initial=True)[0]
 
 
 def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, headroom: bool):

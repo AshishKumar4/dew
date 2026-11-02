@@ -104,7 +104,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
-        dk_ref, dv_ref = dkv_ref.at[0], dkv_ref.at[1]
+        dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], ((0, 1),))
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
@@ -124,7 +124,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             family.loaded(((k_ref.at[keys_view], k_smem, loads.at[0]),
                            (v_ref.at[keys_view], v_smem, loads.at[1])), issued=share == 0)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first + share * (
-                block_k // consumers), shape=(block_q, block_k // consumers))
+                block_k // consumers), shape=(block_q, block_k // consumers), tile_keys=block_k)
             mine = pl.ds(share * columns, columns)
             smem = out_smem.at[share]
 

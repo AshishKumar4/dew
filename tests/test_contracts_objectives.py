@@ -50,7 +50,7 @@ def test_the_categorical_losses_hold_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_ruled_loss_holds_every_order(edge):
-    """`Objective.with_gradients`'s seam (`base._ruled`, a custom JVP): a value whose derivative in the
+    """`Objective.with_gradients`'s seam (`base._ruled`, a surrogate): a value whose derivative in the
     parameters is a stated rule, every order finite wherever float64 is a normal float32 and the plain
     formula, the value plus the rule's inner product with the parameters' move, is."""
     value, first, second = normal_draw(2691, (3,), (4, 5), (6,), scale=EDGES[edge])
@@ -71,17 +71,17 @@ def test_a_ruled_loss_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_whole_logits_losses_hold_every_order(edge):
-    """`chunked._whole_losses` (a custom JVP, the categorical's own derivative): each row's cross entropy
-    and log partition of whole logits, every order finite wherever float64 is a normal float32 and the
-    plain formula, jax.nn's log-softmax and logsumexp as written, is."""
+def test_the_label_terms_hold_every_order(edge):
+    """`categorical.label_terms` (a custom JVP, the categorical's own derivative, which the whole-logits head
+    reads): each row's cross entropy and log partition of whole logits, every order finite wherever float64
+    is a normal float32 and the plain formula, jax.nn's log-softmax and logsumexp as written, is."""
     (logits,) = normal_draw(2701, (4, 7), scale=EDGES[edge])
     (direction,) = normal_draw(2702, logits.shape, scale=EDGES[edge])
     (cotangent,) = normal_draw(2703, (2, 4))
     targets = jnp.asarray([0, 3, 6, 2], jnp.int32)
 
     def whole(logits):
-        return jnp.stack(chunked._whole_losses(logits, targets))
+        return jnp.stack(categorical.label_terms(logits, targets))
 
     def plain(logits):
         rows = jnp.arange(logits.shape[0])

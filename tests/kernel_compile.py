@@ -27,9 +27,11 @@ import compile_evidence
 import jax
 import jax.experimental.topologies as topologies
 import numpy as np
+from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
+from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
 from dew.training._lowering import kernel_calls, triton_kernels
@@ -37,6 +39,9 @@ from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
+
+MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
+"""Mosaic GPU's refusal, as it lowers, of a kernel whose shared memory a block of the GPU does not hold."""
 
 SHARED = re.compile(r"smem_scratch_bytes=(\d+)")
 TENSOR_MEMORY = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
@@ -54,7 +59,8 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 @dataclasses.dataclass(frozen=True)
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
-    (Mosaic's resource estimate), its registers a thread and its spilled bytes as the GPU compiles its PTX
+    (its binary's launch and Mosaic's resource estimate, respectively), its registers a thread and its
+    spilled bytes as the GPU compiles its PTX
     (`inherited`, their only source: None until it reads them), what the reports left `unread`: a kernel no
     binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
     `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
@@ -88,12 +94,12 @@ class Report:
 
 def reports(estimates: dict[str, str], binaries: list[report.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
-    """Each kernel's `Report` of its shared memory and tensor memory from its resource estimate (`estimates`,
-    Pallas's printed `Resources`) and its binary (`binaries`, `report.binaries`), paired by the kernel's name
-    and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its registers and spills
-    are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel (`_estimates` pairs them
-    by the program's order): one past the shared memory its binary's launch asks for, or none where it asks
-    for some, is another kernel's, and raises, as two binaries of one launch do."""
+    """Each kernel's `Report` of its total shared memory from its binary (`binaries`, `report.binaries`)
+    and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`), paired by the
+    kernel's name and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its
+    registers and spills are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel
+    (`_estimates` pairs them by the program's order): one past the shared memory its binary's launch asks
+    for, or none where it asks for some, is another kernel's, and raises, as two binaries of one launch do."""
     found: dict[str, report.Binary] = {}
     for binary in binaries:
         if found.setdefault(report.launch_name(binary.kernel, binary.launch), binary) != binary:
@@ -107,11 +113,13 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
                              f"launch asks for {binary.shared}: the estimate is another kernel's")
         # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
-        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                                 ("binary", binary)) if not read)
+        unread = tuple(field for field, read in (
+            ("shared bytes", shared is not None and binary is not None and binary.shared is not None),
+            ("tensor memory columns", tmem), ("binary", binary)) if not read)
         kernel, launch = report.kernel_of(name)
         found_reports.append(Report(
-            kernel, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
+            kernel, binary.shared if binary is not None else None,
+            sum(map(int, tmem.groups())) if tmem else None,
             None, None, unread, (modules or {}).get(name), launch))
     return found_reports
 
@@ -143,6 +151,21 @@ def staged_copy(shape: tuple[int, ...], dtype):
 def _device(generation: str) -> Mesh:
     """A one-device mesh of a compile-only device of `generation`."""
     return Mesh(np.array(compile_only_gpus(generation)), ("data",))
+
+
+def lowered_for(fn, args, generation: str):
+    """`fn` traced on `args`, its abstract leaves placed on a compile-only device of the CUDA `generation`
+    (`_device`), and lowered as on that GPU (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA
+    compiles for it, never run."""
+    mesh = _device(generation)
+    replicated = NamedSharding(mesh, PartitionSpec())
+    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
+                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+    # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
+    # Its bound checks the total allocation, including barriers outside the scratch estimate.
+    with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+          mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
+        return jax.jit(fn).trace(*placed).lower()
 
 
 def refused(record: dict) -> bool:
@@ -210,18 +233,18 @@ def _compiled(case, generation: str, record: dict,
     each one's resource estimate Pallas prints as it lowers, `record['binaries']` each one's binary
     (`report.binaries`), `record['modules']` each one's kernel hash, by kernel name, and in `directory` the
     PTX Mosaic prints as it compiles, a `<kernel>.ptx` each."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
-    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
     estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
     try:
-        with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
-              estimating as estimated):
-            lowered = jax.jit(fn).trace(*placed).lower()
+        with estimating as estimated:
+            lowered = lowered_for(fn, args, generation)
     except Exception as error:  # A case that does not lower is its own failure.
-        record["error"] = f"it does not lower: {str(error)[-800:]}"
+        # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
+        refused = MOSAIC_REFUSED.search(str(error))
+        if refused is None:
+            record["error"] = f"it does not lower: {str(error)[-800:]}"
+        else:
+            record["shared"] = int(refused.group(1))
         return None
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
@@ -463,18 +486,31 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
         "", ENTRY.sub(lambda entry: f"{entry.group(1)}.maxnreg {cap}\n", ptx, count=1))
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
+    text, took = _ptxas_text(capped, generation, relocatable)
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
+    return max(used, default=0), max(spilled, default=0), took
+
+
+def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
+    """ptxas's own report (`-v`) on the kernel `ptx` for the CUDA `generation`, compiled relocatably or
+    whole-program (`_ptxas`), and whether it took the kernel."""
     major, minor = capability(generation) or (0, 0)
     arch = f"sm_{major}{minor}{'a' if major >= 9 else ''}"
     with tempfile.NamedTemporaryFile("w", suffix=".ptx") as source:
-        source.write(capped)
+        source.write(ptx)
         source.flush()
         relocating = ("--compile-only",) if relocatable else ()
         ran = subprocess.run([str(PTXAS), f"-arch={arch}", "-v", *relocating, source.name, "-o", os.devnull],
                              capture_output=True, text=True, check=False)
-    text = ran.stdout + ran.stderr
-    used = [int(count) for count in REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return max(used, default=0), max(spilled, default=0), ran.returncode == 0
+    return ran.stdout + ran.stderr, ran.returncode == 0
+
+
+def ptxas_notes(ptx: str, generation: str) -> str:
+    """What ptxas says of the kernel `ptx` as the GPU compiles it (`RELOCATABLE`): its registers and spills,
+    and the notes it makes of the code, a warpgroup MMA's serialization among them ("wgmma.mma_async
+    instructions are serialized"), which the gate's registers and spills do not state."""
+    return _ptxas_text(ptx, generation, RELOCATABLE)[0]
 
 
 def _assembled(ptx: str, generation: str, cap: int, *, honored: bool) -> tuple[int, int, bool]:
@@ -686,7 +722,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             stated = record.get("models", {}).get(found_kernel.kernel)
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
-                              f"bytes of scratch, the kernel asks for {found_kernel.shared}")
+                              f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
         record["evidence"] = _register_evidence(record)
     return failed
 
@@ -808,3 +844,20 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
             text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
             record["error"] = f"{type(error).__name__}: {text}"
     return found
+
+
+class Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses. Its first tile is a paired product's widest, 128 x
+    256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
+    addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
+    compile only while its walk held a stage's addresses in registers, and none since the walk forms them
+    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    launch (`report.refused_launches`, the relowering's proposals included)."""
+
+    def registers(self, ba, config):
+        return 0
+
+    def candidate(self, ba, config, target):
+        return super().candidate(ba, config, target) and (
+            config.block_n == 256 or bool(report.refused_launches()))

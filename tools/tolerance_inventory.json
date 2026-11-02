@@ -437,14 +437,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_mamba2.py": {
-   "comparisons": 2,
-   "lane": "Training"
-  },
-  "tests/test_mamba2_interop.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_masked_diffusion.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -617,10 +609,6 @@
    "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_recurrence_template_stability.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_reference_runs.py": {
    "comparisons": 4,
    "lane": "Models, Serving & RL"
@@ -668,10 +656,6 @@
   "tests/test_serving.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_short_conv.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
   },
   "tests/test_source_schedulers.py": {
    "comparisons": 7,

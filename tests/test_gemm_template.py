@@ -1331,8 +1331,8 @@ def test_a_kernel_gradient_its_consumers_feed_holds_check_1(exact_sums):
 @pytest.mark.parametrize("generation_name", generations("sm80"))
 def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generation_name):
     """On an A100, through the template, a kernel gradient pinned to a tile whose four warps split two
-    along its rows (`mosaic_sm80.Mma.for_tile` at 128 x 128) stepping 32 rows, its transposed stage's row
-    atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
+    along its rows (`mosaic_sm80.MmaIssuer.specialized` at 128 x 128) stepping 32 rows, its transposed stage's
+    row atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
     of no whole step, an empty one and one of a row among them, on par with XLA's over the draws (check 1),
     truth float64's."""
     tiles = mosaic_gpu.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")

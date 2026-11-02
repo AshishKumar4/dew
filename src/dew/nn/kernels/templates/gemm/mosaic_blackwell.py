@@ -25,7 +25,9 @@ upstream's:
   least, which each tile's loads take.
 
 Each sums exact products of its 16-bit operands in fp32 (the tensor memory accumulator) and rounds once.
-The prologue, the kernel gradient and a pair of CTAs (tcgen05's two-CTA products) are later rungs.
+A pair of CTAs (`Tiles.cluster`, tcgen05's two-CTA products, `mosaic_sm100.Topology`) takes a tile of twice
+the rows and twice the columns, each CTA its rows' half of the left operand and half of the right one's
+columns, the leader issuing the products over both. The prologue and the kernel gradient are later rungs.
 """
 
 import dataclasses
@@ -39,6 +41,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, mosaic_sm100, tail
+from dew.nn.kernels.templates.axes import named
 from dew.nn.kernels.templates.gemm.mosaic_gpu import GroupInfo, tile_groups
 from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
 
@@ -48,13 +51,16 @@ class Tiles:
     """One launch's output tile (`block_m` x `block_n`, tcgen05's M of one CTA and its N, two accumulators
     of it in tensor memory), contraction step (`block_k`), the steps in flight (`stages`), the column
     tiles in each band of the planar snake (`grid_block_n`) and the columns the store warpgroup takes at
-    a time (`epilogue_n`)."""
+    a time (`epilogue_n`); and the CTAs one product spans (`cluster`: 2, a pair whose tile is `2 * block_m`
+    rows by `2 * block_n` columns, each CTA's share `block_m` rows and its accumulators `2 * block_n` columns,
+    `block_n` at most 128, tcgen05's N on each CTA of a pair)."""
     block_m: int = 128
     block_n: int = 128
     block_k: int = 64
     stages: int = 4
     grid_block_n: int = 1
     epilogue_n: int = 64
+    cluster: int = 1
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
@@ -67,29 +73,36 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     The depth must divide by `tiles.block_k` and the width by `tiles.block_n`, and `tiles.block_n` by
     `tiles.epilogue_n`."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    topology = mosaic_sm100.Topology(tiles.cluster)
+    # A tile's rows and columns: a CTA's, or a pair's both.
+    tile_m, tile_n = block_m * tiles.cluster, block_n * tiles.cluster
     rows, depth = lhs.shape
     groups = rhs.shape[0]
     rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
-    if (depth != rhs_depth or depth % block_k or width % block_n or block_n % tiles.epilogue_n
-            or block_m != TCGEN05.rows):
+    if (depth != rhs_depth or depth % block_k or width % tile_n or tile_n % tiles.epilogue_n
+            or block_m != TCGEN05.rows or tiles.cluster not in (1, 2) or (topology.paired and block_n > 128)):
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {tiles}")
-    lhs = _rows_padded(lhs, 0, block_m)
+    if target.multiprocessors is None:
+        raise ValueError(f"{target.generation} states no multiprocessors, which a persistent launch spans")
+    lhs = _rows_padded(lhs, 0, tile_m)
     m = lhs.shape[0]
     sizes = group_sizes.astype(jnp.int32)
     lengths = jnp.concatenate([sizes, jnp.maximum(m - jnp.sum(sizes), 0)[None]])
-    row_tiles = pl.cdiv(m, block_m) + groups
-    table = tile_groups(lengths, block_m, row_tiles)
-    epilogue_operands = tuple(_rows_padded(side, axes.index('rows'), block_m) if 'rows' in axes else side
+    row_tiles = pl.cdiv(m, tile_m) + groups
+    table = tile_groups(lengths, tile_m, row_tiles)
+    epilogue_operands = tuple(_rows_padded(side, axes.index('rows'), tile_m) if 'rows' in axes else side
                               for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
-    grid = (row_tiles, width // block_n)
+    grid = (row_tiles, width // tile_n)
     transforms = mosaic_sm100.swizzled(lhs.dtype, block_k)
     side_extent = {'rows': block_m, 'columns': tiles.epilogue_n}
-    shape = _Shape(m, groups, depth // block_k, block_n // tiles.epilogue_n, transpose_rhs, side_extent)
+    shape = _Shape(m, groups, depth // block_k, tile_n // tiles.epilogue_n, transpose_rhs, side_extent)
+    # Each CTA's stage: its rows of the left operand, its half of the right one's columns.
     stages = mosaic_sm100.Stages(tiles.stages, (
         ((block_m, block_k), lhs.dtype, transforms),
-        ((block_n, block_k) if transpose_rhs else (block_k, block_n), lhs.dtype, transforms)))
-    accumulators = mosaic_sm100.Accumulators(2, block_m, block_n)
+        ((block_n, block_k) if transpose_rhs else (block_k, block_n), lhs.dtype, transforms)),
+        topology, (0, 0 if transpose_rhs else 1))
+    accumulators = mosaic_sm100.Accumulators(2, block_m, tile_n, topology)
 
     def kernel(table_gmem, lhs_gmem, rhs_gmem, *refs):
         sides = refs[:len(epilogue_operands)]
@@ -101,7 +114,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="sm", init_carry=jnp.int32(0))
         def computed(loop: plgpu.NDLoopInfo, carry):
             mi, ni = tail.planar_snake(loop.index[0], grid, 1, tiles.grid_block_n)
-            rows_of = GroupInfo.create(table_gmem, block_m, mi)
+            rows_of = GroupInfo.create(table_gmem, tile_m, mi)
             # The unrouted rows' group multiplies nothing, and a slot past the last tile has no rows; the
             # ring's turn is the steps the computed tiles before took, the accumulator's their count.
             tile = _Tile(rows_of, ni, (rows_of.group_id < groups) & (rows_of.actual_size > 0),
@@ -122,14 +135,14 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     scratch = (
         stages.scratch(), accumulators.scratch(target),
         tuple(plgpu.SMEM((block_m, tiles.epilogue_n), dtype) for dtype in dtypes),
-        tuple(plgpu.SMEM(tuple(side_extent[axis] for axis in axes), side.dtype)
-              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True)),
+        tuple(plgpu.SMEM(named(side_axes, side_extent), side.dtype)
+              for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True)),
         plgpu.Barrier(num_barriers=max(len(epilogue_operands), 1)),
     )
     outs = TCGEN05.kernel(
         kernel, out_type=tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes),
-        grid=(target.multiprocessors,), grid_names=("sm",), scratch=scratch, interpret=interpret,
-        name="dew_gmm_blackwell")(table, lhs, rhs, *epilogue_operands)
+        grid=(target.multiprocessors // tiles.cluster,), grid_names=("sm",), scratch=scratch,
+        interpret=interpret, name="dew_gmm_blackwell", topology=topology)(table, lhs, rhs, *epilogue_operands)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
@@ -167,68 +180,79 @@ class _Tile(NamedTuple):
 
 def _load(tile: _Tile, lhs_gmem, rhs_gmem, scratch: _Scratch, *, tiles: Tiles, shape: _Shape) -> None:
     """The load warp: each step's operand blocks into the ring's next stage (`Ring.load`)."""
-    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    block_k, tile_m, tile_n = tiles.block_k, tiles.block_m * tiles.cluster, tiles.block_n * tiles.cluster
     matrix = rhs_gmem.at[jnp.minimum(tile.info.group_id, shape.groups - 1)]
-    columns = pl.ds(tile.column * block_n, block_n)
+    columns = pl.ds(tile.column * tile_n, tile_n)
 
     @pl.loop(0, shape.steps)
     def _(step):
         depths = pl.ds(step * block_k, block_k)
         block = matrix.at[columns, depths] if shape.transpose_rhs else matrix.at[depths, columns]
-        scratch.ring.load(tile.first + step, (lhs_gmem.at[pl.ds(tile.info.block_start, block_m), depths],
-                                              block))
+        scratch.ring.load(scratch.ring.turn(tile.first + step),
+                          (lhs_gmem.at[pl.ds(tile.info.block_start, tile_m), depths], block))
 
 
 def _products(tile: _Tile, scratch: _Scratch, *, shape: _Shape) -> None:
     """The product warp: each step's product into the tile's accumulator once its stage is loaded,
-    releasing the stage when read, once the accumulator's tile before last is read out."""
-    acc = scratch.tensor.acquire(tile.done)
+    releasing the stage when read, once the accumulator's tile before last is read out; the steps a
+    rotation of the ring at a time, each at its stage as a constant (`mosaic.rotations`). Of a pair, the
+    leader issues the products over both CTAs, and each CTA's product warp waits for its accumulator's
+    read, as every phase of a barrier is waited for by the threads that wait on it."""
+    turn = scratch.tensor.turn(tile.done)
+    acc = scratch.tensor.acquire(turn)
+    topology = scratch.ring.topology
 
-    @pl.loop(0, shape.steps)
-    def _(step):
-        (a_smem, b_smem), consumed = scratch.ring.acquire(tile.first + step)
-        plgpu.tcgen05_mma(acc, a_smem, b_smem.T if shape.transpose_rhs else b_smem, consumed,
-                          accumulate=step > 0)
+    def step(index, at: mosaic.Turn):
+        (a_smem, b_smem), consumed = scratch.ring.acquire(at)
+        TCGEN05.product(acc, a_smem, b_smem.T if shape.transpose_rhs else b_smem, consumed,
+                        accumulate=index > tile.first, topology=topology)
 
-    scratch.tensor.issued(tile.done)
+    @pl.when(topology.leads())
+    def _():
+        mosaic.rotations(tile.first, tile.first + shape.steps, 0, scratch.ring.stages, step)
+        scratch.tensor.issued(turn)
 
 
 def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes, *, tiles: Tiles,
             shape: _Shape) -> None:
     """The store warpgroup: the tile's accumulator out of tensor memory a chunk of columns at a time once
     its products are done, through the epilogue, each output's rows of the tile's group stored; the
-    accumulator freed. A tile of the unrouted rows stores the epilogue of a zero accumulator."""
-    rows_of, chunk_n = tile.info, tiles.epilogue_n
+    accumulator freed. A tile of the unrouted rows stores the epilogue of a zero accumulator. Of a pair,
+    each CTA stores its own rows of the group's."""
+    rows_of, chunk_n, block_m = tile.info, tiles.epilogue_n, tiles.block_m
+    # This CTA's rows of the tile, and of them the group's.
+    own = scratch.ring.topology.index() * block_m
+    first = jnp.clip(rows_of.start_within_block - own, 0, block_m)
+    stored = jnp.clip(rows_of.start_within_block + rows_of.actual_size - own, 0, block_m) - first
 
     def store(chunk_of):
         for chunk in range(shape.chunks):
-            column = tile.column * tiles.block_n + chunk * chunk_n
+            column = tile.column * tiles.block_n * tiles.cluster + chunk * chunk_n
             acc = chunk_of(chunk)
             values = (acc,) if epilogue is None else _epilogue(
                 epilogue, acc, sides, scratch.side_smems, scratch.side_full, epilogue_axes,
-                {'rows': rows_of.block_start, 'columns': column}, shape.side_extent)
+                {'rows': rows_of.block_start + own, 'columns': column}, shape.side_extent)
             for o_smem, o_gmem, value in zip(scratch.o_smems, outs, values, strict=True):
-                o_smem[...] = value.astype(o_smem.dtype)
-                plgpu.commit_smem()
-                mosaic.store_rows(o_smem, o_gmem, rows_of.block_start, rows_of.start_within_block,
-                                  rows_of.actual_size, column, min(tiles.block_m, shape.rows))
+                mosaic.staged_rows(o_smem, value, o_gmem, rows_of.block_start + own, first, stored, column,
+                                   min(block_m, shape.rows))
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     @pl.when(tile.computes)
     def _():
-        store(scratch.tensor.read(tile.done, chunk_n))
-        scratch.tensor.release(tile.done)
+        turn = scratch.tensor.turn(tile.done)
+        store(scratch.tensor.read(turn, chunk_n))
+        scratch.tensor.release(turn)
 
-    pl.when(~tile.computes)(lambda: store(lambda chunk: plgpu.layout_cast(
-        jnp.zeros((tiles.block_m, chunk_n), jnp.float32), mosaic_sm100.STORED)))
+    pl.when(~tile.computes)(lambda: store(lambda chunk: TCGEN05.zeros((tiles.block_m, chunk_n))))
 
 
 def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:
     """`epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile at the chunk's rows and
     columns brought to shared memory by TMA first (`mosaic.loaded`)."""
-    mosaic.loaded(tuple((gmem.at[tuple(pl.ds(origins[axis], extent[axis]) for axis in axes)], smem,
-                         barriers.at[index])
-                        for index, (gmem, smem, axes) in enumerate(zip(gmems, smems, axes_of, strict=True))))
+    blocks = {axis: pl.ds(origins[axis], extent[axis]) for axis in origins}
+    sides = zip(gmems, smems, axes_of, strict=True)
+    mosaic.loaded(tuple((gmem.at[named(side_axes, blocks)], smem, barriers.at[index])
+                        for index, (gmem, smem, side_axes) in enumerate(sides)))
     outs = epilogue(acc, *(smem[...] for smem in smems))
     return outs if isinstance(outs, tuple) else (outs,)
 
