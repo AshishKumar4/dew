@@ -23,6 +23,7 @@ import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
 
+import jax
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
@@ -114,8 +115,8 @@ def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
 def _small_integer(value) -> bool:
     """Whether a program's constant is an integer or boolean array of at most `CONCRETE` entries, which
     the walk holds as its value."""
-    array = np.asarray(value)
-    return (np.issubdtype(array.dtype, np.integer) or array.dtype == np.bool_) and array.size <= CONCRETE
+    return (isinstance(value, np.ndarray | jax.Array) and _indexing(value.dtype)
+            and math.prod(value.shape) <= CONCRETE)
 
 
 class _Walk:
@@ -169,8 +170,8 @@ class _Walk:
         where they are integers or booleans of at most `CONCRETE` entries: the indices a gather, a slice
         or an update reads, and the tests that choose them."""
         if (any(operand is None for operand in operands) or _programs(eqn)
-                or not all((np.issubdtype(_dtype(var), np.integer) or _dtype(var) == np.bool_)
-                           and math.prod(_shape(var)) <= CONCRETE for var in eqn.outvars)):
+                or not all(_indexing(_dtype(var)) and math.prod(_shape(var)) <= CONCRETE
+                           for var in eqn.outvars)):
             return [None] * len(eqn.outvars)
         bound = eqn.primitive.bind(*operands, **eqn.params)
         return [np.asarray(output) for output in (bound if eqn.primitive.multiple_results else [bound])]
@@ -180,8 +181,14 @@ def _shape(var) -> tuple[int, ...]:
     return tuple(var.aval.shape) if isinstance(var.aval, ShapedArray) else ()
 
 
-def _dtype(var) -> np.dtype:
-    return var.aval.dtype if isinstance(var.aval, ShapedArray) else np.dtype(np.float32)
+def _dtype(var) -> object:
+    return var.aval.dtype if isinstance(var.aval, ShapedArray) else None
+
+
+def _indexing(dtype: object) -> bool:
+    """Whether `dtype` is an integer or boolean one, which indices and their tests hold (a key's
+    extended dtype is neither)."""
+    return isinstance(dtype, np.dtype) and (np.issubdtype(dtype, np.integer) or dtype == np.bool_)
 
 
 def _flat(given: Sequence[Held]) -> Reads:
@@ -525,8 +532,6 @@ def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
     shape = _shape(eqn.invars[0])
     if held is None or math.prod(shape) > CONCRETE or math.prod(out) > CONCRETE:
         return [operand.flat()]
-    import jax
-
     ids = np.broadcast_to(np.arange(shape[operand.axis]).reshape(
         [-1 if dim == operand.axis else 1 for dim in range(len(shape))]), shape)
     taken = np.asarray(jax.lax.gather(ids, held, numbers, eqn.params["slice_sizes"],
