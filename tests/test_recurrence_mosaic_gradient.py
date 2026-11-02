@@ -75,10 +75,13 @@ def restarted(fn, case: str):
 
 
 PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
-                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-recomputed': 402}}
+                               'one sequence-bf16-kept': 122, 'a decay a key dimension-bf16-recomputed': 402,
+                               'a decay a key dimension-bf16-kept': 483, 'a ragged length-fp32-kept': 653}}
 """The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
-ledger 2127; the recomputed decay a key dimension's at a42fefc6b, kda-recompute), which the whole suite runs
-(`timed`)."""
+ledger 2127; the recomputed decay a key dimension's at a42fefc6b, kda-recompute; the kept one's and an fp32
+call's on train 479's at e82eab19a, the fast backward taking an fp32 call under the run's fast forms and
+fla_kda's form a decay a key dimension, each checked whole where they were refused), which the whole suite
+runs (`timed`)."""
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
@@ -91,8 +94,9 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
     and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
-    an fp32 call's or one whose launches the device does not hold (`Mosaic.trains`), the rule refuses as it is
-    traced: the delta rule's selector gives it the port or the portable math, whose check 1
+    an fp32 call's outside the run's fast forms (`mainloop_backward.fast_backward_form`) or one whose launches
+    the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
+    gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
     hooks = case_hooks(case)
 
