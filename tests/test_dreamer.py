@@ -650,6 +650,40 @@ def test_a_dreamer_rollout_restored_after_collecting_for_an_uncommitted_update_o
     assert resumed.environment_steps == uninterrupted.environment_steps
 
 
+def test_a_dreamer_rollout_restored_in_a_later_phase_owes_each_update_at_its_own_pace_once():
+    """A Dreamer rollout of 16-step windows restored at 64 (a later phase), called twice for its fourth
+    update, takes the steps that update trains on once: restored between the two calls, it takes on the
+    second and the update after it the steps the rollout restored once takes. One of 32-step windows
+    restored at 16 takes for its next update the steps that update trains on at 16 (4, a step of each of
+    its eight targets)."""
+    from types import SimpleNamespace
+
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def drawing(length, restored=None):
+        rollout = DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
+                                 prefill=64, checkpointed_replay=True)
+        if restored is not None:
+            rollout.restored(restored.saved())
+        return rollout
+
+    def called(rollout, updates):
+        for update in updates:
+            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update))
+        return rollout
+
+    earlier = called(drawing(16), (0, 1, 2))
+    once = called(drawing(64, earlier), (3, 3, 4))
+    stopped = called(drawing(64, earlier), (3,))
+    resumed = called(drawing(64, stopped), (3, 4))
+    assert resumed.environment_steps == once.environment_steps
+    longer = called(drawing(32), (0, 1))
+    shorter = called(drawing(16, longer), (2,))
+    assert shorter.environment_steps - longer.environment_steps == 8
+
+
 def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
     """A DreamerV3 run on targets a simulator steps, with a cooldown at its third update whose branch
     collects steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the
