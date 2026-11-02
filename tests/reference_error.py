@@ -1153,6 +1153,23 @@ class _Weighed:
     units: list
     zeros: object
     ones: object
+    heavy: list | None = None
+    """Each floating leaf's heavy elements (`_heavy`), a mask, None for a leaf of none: its residuals
+    judged as a leaf of their own beside the light ones' (`classed`)."""
+
+    def classed(self, tree, masked: bool = True):
+        """`tree`, of the truth's structure, each floating leaf with heavy elements (`heavy`) split into
+        `{"heavy": ..., "light": ...}`, the other class's elements zero in each where `masked` (sizes, not
+        masked, stay whole in each), so each class is judged as its own leaf, pooled and by rows, a row of
+        no heavy element as it was."""
+        if self.heavy is None:
+            return tree
+        leaves, structure = jax.tree.flatten(tree, is_leaf=lambda leaf: leaf is None)
+        split = [leaf if mask is None or leaf is None
+                 else {"heavy": np.where(mask, leaf, 0.0) if masked else leaf,
+                       "light": np.where(mask, 0.0, leaf) if masked else leaf}
+                 for leaf, mask in zip(leaves, self.heavy, strict=True)]
+        return structure.unflatten(split)
 
     def weighed(self, tree, arm: str):
         """`tree`, an arm's outputs, each floating element e at its truth t and scale c read as its residual
@@ -1191,7 +1208,32 @@ class _Weighed:
                     f"rounding scale is zero), and the arm is not exact: {value[at]!r} against "
                     f"{true[at]!r}")])
             weighed.append(np.where(exact, 0.0, (value - true) / (unit * np.where(exact, 1.0, scale))))
-        return structure.unflatten(weighed), self.zeros
+        return self.classed(structure.unflatten(weighed)), self.classed(self.zeros)
+
+
+def _heavy(reference_fn, truth_fn, draw, seeds) -> list:
+    """Each floating output leaf's heavy elements, as a mask, None for a leaf of none: those whose share of
+    the reference's squared error from float64, pooled over `seeds`' draws, exceeds their uniform share of
+    their row (1/n, n its length along the leaf's last axis). The unweighted RMS, which defines on par, is
+    theirs, so the weighed check judges them apart from the light rest (`_Weighed.classed`, ledger 1714): an
+    error moved onto them never hides behind the rest's weighed one."""
+    totals = None
+    for seed in seeds:
+        inputs = draw(seed)
+        with summed_as_run():
+            ran = jax.device_get(reference_fn(*inputs))
+        with jax.enable_x64(new_val=True):
+            true = jax.device_get((truth_fn or reference_fn)(*widened(inputs)))
+        squares = [np.square(np.asarray(arm, np.float64) - np.asarray(truth, np.float64))
+                   if _float_leaf(truth) and np.ndim(truth) else None
+                   for arm, truth in zip(jax.tree.leaves(ran), jax.tree.leaves(true), strict=True)]
+        totals = squares if totals is None else [None if total is None else total + square
+                                                 for total, square in zip(totals, squares, strict=True)]
+    masks = []
+    for total in totals or []:
+        heavy = None if total is None else total * total.shape[-1] > np.sum(total, axis=-1, keepdims=True)
+        masks.append(heavy if heavy is not None and heavy.any() else None)
+    return masks
 
 
 def _scales(scale) -> list:
@@ -1210,6 +1252,8 @@ class _Conditioning:
     rounding scale at a draw's inputs (`rounding_scale`) weighs every arm's error there (`_Weighed`)."""
 
     program: Callable
+    heavy: list | None = None
+    """Each floating output leaf's heavy elements (`_heavy`), which the weighed check judges apart."""
 
     def at(self, cases) -> dict[int, _Weighed]:
         """Each truth's weighing by its id, from `cases` of (truth, its inputs, its seed), a truth held
@@ -1244,7 +1288,8 @@ class _Conditioning:
                  else None for shape in jax.tree.leaves(shapes)]
         zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if _float_leaf(leaf) else leaf, truth)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if _float_leaf(leaf) else None, truth)
-        return _Weighed(truth, scale, units, zeros, ones)
+        weighing = _Weighed(truth, scale, units, zeros, ones, self.heavy)
+        return dataclasses.replace(weighing, ones=weighing.classed(ones, masked=False))
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
@@ -1905,11 +1950,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     if conditioning is not None:
         def weighed():
-            # The weighed check over its own declared seeds, logged as its own.
+            # The weighed check over its own declared seeds, logged as its own, its heavy elements judged
+            # apart (`_heavy`), classed over the draws it takes, alike in every process that runs it.
+            span = (1 + REDRAW) * conditioning
+            heavy = _heavy(reference_fn, truth_fn, draw, range(span))
             _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
                          truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                          library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                         weighing=_Conditioning(reference_fn), upto=(1 + REDRAW) * conditioning)
+                         weighing=_Conditioning(reference_fn, heavy), upto=span)
 
         try:
             assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -2275,7 +2323,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         over, unresolved, stage = judged(None, seeds)
         verdict = _verdict(over, unresolved)
         if conditioning is not None and verdict == "inconclusive":
-            over, unresolved, stage = judged(_Conditioning(reference_fn), conditioning)
+            heavy = _heavy(reference_fn, truth_fn, draw, range(base, base + (1 + REDRAW) * conditioning))
+            over, unresolved, stage = judged(_Conditioning(reference_fn, heavy), conditioning)
             verdict = f"{_verdict(over, unresolved)}, conditioned"
         verdicts.append((verdict, stage, [str(finding) for finding in over + unresolved]))
     return verdicts
