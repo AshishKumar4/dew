@@ -1,6 +1,7 @@
 """Dory 1.0 4B's release receipt: Dew's decoding of the release held to vLLM's recorded engine run by
 check 1, at every loop count, cache and dtype the recorder ran (tools/dory_vllm_reference.py `RUNS`),
-each run's verdict and seconds written to OUT/receipt.json.
+each run's verdict and seconds written to OUT/verdicts.json (a GPU node writes its own receipt.json
+there) and printed, a failure's message with it.
 
     python tools/dory_release_receipt.py OUT [RUN ...]
 
@@ -41,8 +42,9 @@ def main() -> None:
             message = "".join(traceback.format_exception_only(error))
             receipt[name] = {"verdict": "failed", "error": message[-2000:]}
         receipt[name]["seconds"] = round(time.perf_counter() - began, 1)
-        print(name, receipt[name]["verdict"], receipt[name]["seconds"], flush=True)
-        (out / "receipt.json").write_text(json.dumps(receipt, indent=1))
+        print(name, receipt[name]["verdict"], receipt[name]["seconds"], receipt[name].get("error", ""),
+              flush=True)
+        (out / "verdicts.json").write_text(json.dumps(receipt, indent=1))
     if any(entry["verdict"] != "passed" for entry in receipt.values()):
         raise SystemExit(1)
 
