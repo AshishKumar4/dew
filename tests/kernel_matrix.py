@@ -28,10 +28,10 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
-2, or 4; a causal, a full or a causal call over four documents; no hook, two key or two tile parameters of
-one shape added to the logits (two in-place gradients of one shape, row 3180's), or a softcap; the backward
-in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or the accurate
-form."""
+2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
+parameters of one shape added to the logits (two in-place gradients of one shape, row 3180's), or a softcap;
+the backward in one launch, two, or one whose consumers share a key block; the operands' dtype; the fast or
+the accurate form."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (

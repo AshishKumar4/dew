@@ -181,21 +181,27 @@ def _step(case: dict[str, str], spans, *, reference: bool):
     return step
 
 
-def _drawn(case: dict[str, str]):
-    """A draw of `case`'s operands by seed: unit Gaussians in its dtype (and its bias's two parameters, fp32,
-    of half that size)."""
-    heads, kv_heads, width, dtype, _, _ = _case(case)
-
+def operands(width: int, heads: int, kv_heads: int, dtype, kind: template.Kind | None = None):
+    """A draw of an attention training step's operands by seed: unit Gaussians in `dtype` (and, under a hook
+    of `kind`, its two parameters, fp32, of half that size), for the matrix's cells and the in-place
+    regressions (attention_inplace_operands) alike."""
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 6)
         query, dout = (jax.random.normal(stream, (1, LENGTH, heads, width), dtype) for stream in streams[:2])
         key, value = (jax.random.normal(stream, (1, LENGTH, kv_heads, width), dtype)
                       for stream in streams[2:4])
-        params = (tuple(0.5 * jax.random.normal(stream, _param_shape(BIAS[case["hook"]], heads), jnp.float32)
-                        for stream in streams[4:]) if case["hook"] in BIAS else ())
+        params = (() if kind is None else
+                  tuple(0.5 * jax.random.normal(stream, _param_shape(kind, heads), jnp.float32)
+                        for stream in streams[4:]))
         return query, key, value, dout, *params
 
     return draw
+
+
+def _drawn(case: dict[str, str]):
+    """A draw of `case`'s operands by seed (`operands`)."""
+    heads, kv_heads, width, dtype, _, _ = _case(case)
+    return operands(width, heads, kv_heads, dtype, BIAS.get(case["hook"]))
 
 
 CASES = (
