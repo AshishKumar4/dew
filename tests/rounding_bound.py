@@ -32,13 +32,12 @@ ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "conv
                   "reduce_precision"})
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
 
-ULPS = {"exp": 2.0, "exp2": 2.0, "log": 2.0, "log1p": 2.0, "expm1": 2.0, "logistic": 2.0, "tanh": 2.0,
-        "erf": 2.0, "erfc": 2.0, "rsqrt": 2.0, "pow": 4.0, "sin": 2.0, "cos": 2.0, "tan": 4.0,
-        "atan2": 2.0, "asinh": 2.0, "acosh": 2.0, "atanh": 2.0, "cbrt": 2.0, "lgamma": 4.0,
-        "digamma": 4.0}
-"""Each elementary function's error bound, in units of u times its result: XLA CPU's float32
-implementations measured at most these over every float32 input's exponent range
-(`tests/test_chunk_adaptation.py::test_each_elementary_functions_ulps_bound_xla_cpus`)."""
+ULPS = {"exp": 1.42, "log": 2.05, "log1p": 3.64, "expm1": 1.21, "logistic": 2.49, "tanh": 4.9,
+        "erf": 6.71, "rsqrt": 2.8}
+"""Each elementary function's error bound, in units of u times its true result: the largest of XLA
+CPU's float32 implementations over every normal float32 input whose result is a normal float32, read
+exhaustively against float64 references (2^32 inputs each, 11-02), rounded up at the second decimal.
+XLA CPU flushes subnormal inputs to zero, so the bound holds where no elementary function reads one."""
 
 SUMMED = frozenset({"dot_general", "reduce_sum", "cumsum"})
 """Sums of terms, bounded by their terms' magnitudes."""
@@ -75,8 +74,10 @@ def rounding_bound(fn, *args, batch: int = 64):
         def sensitivities(basis):
             _, pull = jax.vjp(tapped, zeros)
             (cotangents,) = jax.vmap(pull)(basis)
+            # A rounding no output reads has no cotangent.
             return sum(jnp.sum(jnp.abs(cotangent) * magnitude, axis=tuple(range(1, cotangent.ndim)))
-                       for cotangent, magnitude in zip(cotangents, magnitudes, strict=True))
+                       for cotangent, magnitude in zip(cotangents, magnitudes, strict=True)
+                       if cotangent is not None)
 
         total = sum(sizes)
         kappa = np.zeros(total)
