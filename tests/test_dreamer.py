@@ -18,7 +18,7 @@ from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
 from dew.objectives.rl.tssm import TSSM
-from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean
+from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean, unimix_log_probs
 from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
 
 
@@ -50,6 +50,23 @@ def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
         expected.append(-(share * row[below] + (1 - share) * row[above]))
     assert_computes_the_oracle(found, np.asarray(expected), "the two-hot loss", roundings=roundings)
     assert_computes_the_oracle(inverted, targets, "symexp of symlog", roundings=8)
+
+
+@pytest.mark.parametrize("unimix", [0.0, 0.01])
+def test_a_categoricals_log_probabilities_stay_finite_where_a_class_is_far_below(unimix):
+    """A latent's log-probabilities (`unimix_log_probs`) of logits a thousand below their row's largest,
+    with and without the uniform mixture, are finite in float32, so the world model's KL over them stays
+    finite, and in float64 the mixture's written from the log-softmax, where a probability's log is -inf
+    once its softmax underflows (below about -745 in float64)."""
+    logits = np.asarray([[0.0, -1000.0, -3.0, 2.5], [-40.0, 0.0, -1000.0, 1.0]], np.float32)
+    assert np.isfinite(np.asarray(unimix_log_probs(jnp.asarray(logits), unimix))).all()
+    wide = logits.astype(np.float64)
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(unimix_log_probs(jnp.asarray(wide), unimix))
+    log_softmax = wide - wide.max(-1, keepdims=True)
+    log_softmax = log_softmax - np.log(np.exp(log_softmax).sum(-1, keepdims=True))
+    expected = log_softmax if not unimix else np.log((1 - unimix) * np.exp(log_softmax) + unimix / 4)
+    assert_computes_the_oracle(found, expected, "the latent's log-probabilities", roundings=16)
 
 
 def test_lambda_returns_are_the_codes_recursion():
@@ -584,6 +601,28 @@ def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps
     owed = [math.ceil(updates * 8 * 16 / 32.0) for updates in (3, 5)]
     taken = resumed.environment_steps - 24 * 8 - owed[0]
     assert owed[1] - owed[0] <= taken < owed[1] - owed[0] + 8
+
+
+def test_a_dreamer_run_resumed_with_longer_windows_owes_the_updates_after_it_at_their_pace(tmp_path):
+    """A DreamerV3 run of 16-step windows, resumed at its third update by a rollout drawing 64-step windows
+    (as a later phase of training lengthens them), owes its fourth and fifth updates the steps their
+    windows train on alone: after its prefill it takes at least those steps, and less than one step of
+    every target more, where owing the whole run's updates at the longer windows' pace would take twice
+    as many."""
+    objective = DreamerV3Objective(tiny())
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def drawing(length):
+        return DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
+                              prefill=64)
+
+    first = drawing(16)
+    dreamer_fit(tmp_path / "run", objective, first, 3)
+    resumed = drawing(64)
+    dreamer_fit(tmp_path / "run", objective, resumed, 5)
+    owed = 2 * 8 * 64 // 32
+    taken = resumed.environment_steps - first.environment_steps - 64 * 8
+    assert owed <= taken < owed + 8
 
 
 def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
