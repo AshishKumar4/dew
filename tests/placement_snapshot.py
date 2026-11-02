@@ -58,13 +58,20 @@ def _components() -> dict:
 
 def _features() -> dict:
     """Decoders that turn on a feature whose modules declare axes no catalogued model reaches: continual
-    learning's levels, DEX's chosen heads, routed value experts and Engram's hashed tables."""
+    learning's levels, DEX's chosen heads, routed value experts, Engram's hashed tables, nGPT's step
+    rates (Dory's fixture), learned positions beside a head bias, an attention gated by its own
+    projection, Qwen3-Next's fused delta-net projections and a shared expert's gate."""
     from dew.nn.backbones.decoder_block import Mixture
     from dew.nn.continuum import ContinuumLevel
     from dew.nn.dex import DifferentialExtension
     from dew.nn.engram import Engram
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.value_experts import ValueExperts
+    from dew.registry import mixers
+
+    delta = {"class": "gated_delta_net", "fields": {
+        "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}
 
     ids = (jnp.zeros((1, 8), jnp.int32),)
     fields = {
@@ -77,9 +84,24 @@ def _features() -> dict:
         "engram": {"engram": Engram(layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=16,
                                     n_heads=2, head_dim=4, compressed_vocab_size=16),
                    "hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
+        "positions": {"position_embedding": "learned", "head_bias": True, "tie_embeddings": False},
+        "own_gate": {"output_gate": True, "mixer": mixers.build("attention", gate_projection="own")},
+        "fused_delta": {"layer_types": ("linear_attention", "full_attention"),
+                        "kinds": {"linear_attention": {"mixer": delta}}},
+        "shared_gate": {"mixture": Mixture(experts=4, top_k=2, layers=(1,), shared_features=8,
+                                           shared_gate=True)},
     }
-    return {f"decoder+{name}": lambda extra=extra: (tiny(max_seq_len=128, **extra), ids, {})
-            for name, extra in fields.items()}
+    def dory():
+        # nGPT's step rates in a looped decoder that holds nGPT's every constraint: Dory's fixture's.
+        from pathlib import Path
+
+        from dew.interop import Pretrained
+
+        fixture = Path(__file__).with_name("fixtures") / "hf" / "dory-tiny"
+        return Pretrained.load(fixture, dtype="float32", attention_impl="reference").model, ids, {}
+
+    return {**{f"decoder+{name}": lambda extra=extra: (tiny(max_seq_len=128, **extra), ids, {})
+               for name, extra in fields.items()}, "decoder+ngpt": dory}
 
 
 def _towers() -> dict:

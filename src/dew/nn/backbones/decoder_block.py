@@ -46,7 +46,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
-from ..sharding import RESIDUAL, constrain
+from ..sharding import RESIDUAL, constrain, declared
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
@@ -1080,7 +1080,8 @@ class DecoderBlock(nn.Module):
             raise ValueError("an nGPT block steps its one residual along the sphere: it takes no "
                              "hyper-connections, depth mixture, altup, laurel, per-layer inputs or "
                              "parallel branch")
-        start = nn.initializers.constant(ngpt.start)
+        # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
+        start = declared(nn.initializers.constant(ngpt.start), ("embed",))
         self.attn_alpha = self.param('attn_alpha', start, (self.emb_features,), jnp.float32)
         if self.feedforward is not None:
             self.mlp_alpha = self.param('mlp_alpha', start, (self.emb_features,), jnp.float32)
