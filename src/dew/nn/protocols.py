@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank
+    from dew.nn.continuum import HeadTerms
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
+    from dew.nn.norms import NormBounds
     from dew.quantization import InputQuantizer
 
 __all__ = [
@@ -290,15 +292,15 @@ class SteppedInContext(Protocol):
     head the steps run between, the level on final states (`continuum_states`) and the head past it
     (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
     `in_context` says whether the model holds a level, and what a damped step's rate reads
-    (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model, bounds on the curvature and slope
-    of a slot's loss in the states `head_logits` reads; `level_terms`, for the parts that step, the
-    level's |x|^2 and |f|^2 at final states as its maps multiply them, its output map's norm and its
-    activation's derivative bounds."""
+    (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model at the states `head_logits`
+    reads, what bounds the curvature and slope of a slot's loss in them (`HeadTerms`); `level_terms`, for
+    the parts that step, the level's |x|^2 and |f|^2 at final states as its maps multiply them, its output
+    map's norm and its activation's derivative bounds."""
 
     @property
     def in_context(self) -> bool: ...
 
-    def head_bounds(self) -> tuple[jax.Array, jax.Array]: ...
+    def head_bounds(self, states: jax.Array) -> HeadTerms: ...
 
     def level_terms(self, states: jax.Array, parts: tuple[str, ...]
                     ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]: ...
@@ -310,6 +312,19 @@ class SteppedInContext(Protocol):
     def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
 
     def head_logits(self, states: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class BoundedNorm(Protocol):
+    """A norm whose derivatives in its input a curvature bound through it reads (a damped in-context
+    step's under a head transform, `CausalTransformer.head_bounds`): `spread(x)`, per row the root mean
+    square its statistic reads (of `x` centered for a layer norm, the least of its groups' for a grouped
+    RMS norm), and `derivative_bounds(width)`, its bounds at a floor of that spread (`NormBounds`). A norm
+    that bounds none of its derivatives declares neither, and a bound through it is refused."""
+
+    def spread(self, x: jax.Array) -> jax.Array: ...
+
+    def derivative_bounds(self, width: int) -> NormBounds: ...
 
 
 @runtime_checkable

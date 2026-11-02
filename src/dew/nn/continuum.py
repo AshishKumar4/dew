@@ -11,6 +11,8 @@ its logits are the model's without it. The objective that steps it in context is
 `dew.objectives.lm.adaptation`; a plain one trains the level as any other parameters.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import math
 from collections.abc import Callable
@@ -18,11 +20,13 @@ from collections.abc import Callable
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from flax import struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import _SLOPES, activation
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
+from dew.nn.norms import NormBounds
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.quantization import InputQuantizer, quantized_products
@@ -98,7 +102,7 @@ class Continuum(nn.Module):
     def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
-        (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
+        (`dew.objectives.lm.adaptation._damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
         `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
         for none), the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`, an adapter's
         update on it included), at least its spectral norm, in at least fp32; and the activation's bounds
@@ -138,26 +142,54 @@ class Continuum(nn.Module):
                 jnp.sqrt(jnp.sum(jnp.square(kernel))), p1, p2 or 0.0)
 
 
-def _head_loss_bounds(table: jax.Array, softcap: float | None = None, transform: tuple | None = None
-                     ) -> tuple[jax.Array, jax.Array]:
-    """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states a
-    head reads, `table` the squared Frobenius norm |A|^2 of its rows A, at least the spectral: an affine
-    head's are |A|^2 / 2 and sqrt 2 |A| (the cross entropy's Hessian in the logits is at most 1/2, its
-    gradient p - y at most sqrt 2); a logit `softcap` c tanh(u / c), of slope at most 1, adds
-    |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign; a `transform` N(phi(D s)) before A, given as
-    ((p1, p2), |D|^2, g, e) with N a norm of largest gain g and epsilon e and p1, p2 phi's `_SLOPES`, has a
-    Jacobian of at most |g| p1 |D| / sqrt e and a second derivative of at most
-    |g| (6 p1^2 / e + p2 / sqrt e) |D|^2 (a norm's are |g| / sqrt e and 6 |g| / e). Constants of the step,
-    not differentiated (`dew.objectives.lm.adaptation.damping`)."""
-    curvature, slope = table / 2, jnp.sqrt(2 * table)
-    if softcap is not None:
-        curvature = table * (0.5 + 4 / (3 * math.sqrt(3) * softcap))
-    if transform is not None:
-        (p1, p2), spread, gain, epsilon = transform
-        jacobian = jnp.sqrt(gain ** 2 * p1 ** 2 * spread / epsilon)
-        bent = gain * (6 * p1 ** 2 / epsilon + (p2 or 0) / math.sqrt(epsilon)) * spread
-        curvature, slope = jacobian ** 2 * curvature + slope * bent, jacobian * slope
-    return jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope)
+@struct.dataclass
+class HeadTransform:
+    """What bounds a head transform N(phi(D s)) before a head's rows (`HeadTerms`): phi's `slopes` (p1, p2,
+    `_SLOPES`), the Frobenius norm of D (`dense`), at least its spectral, and N's derivative bounds
+    (`NormBounds`)."""
+
+    slopes: tuple[float, float | None] = struct.field(pytree_node=False)
+    dense: jax.Array
+    norm: NormBounds
+
+
+@struct.dataclass
+class HeadTerms:
+    """What bounds the curvature and the slope of a slot's cross entropy in the states a head reads
+    (`CausalTransformer.head_bounds`, `dew.objectives.lm.adaptation`), constants of the step, not
+    differentiated. With |A| the Frobenius norm of the head's rows, at least the spectral, the logits'
+    `curvature` and `slope` are |A|^2 / 2 and sqrt 2 |A| (the cross entropy's Hessian in the logits is at
+    most 1/2, its gradient p - y at most sqrt 2), a logit softcap c tanh(u / c), of slope at most 1,
+    adding |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign. A `transform` (`HeadTransform`) adds its
+    own, read at each slot's `spread` of its norm's input at the level's start, `[B, S]`."""
+
+    curvature: jax.Array
+    slope: jax.Array
+    spread: jax.Array
+    transform: HeadTransform | None = None
+
+    @classmethod
+    def of(cls, table: jax.Array, softcap: float | None, spread: jax.Array,
+           transform: HeadTransform | None = None) -> HeadTerms:
+        """The terms of a head of squared Frobenius norm `table` and logit `softcap` (None for none)."""
+        curvature = table * (0.5 if softcap is None else 0.5 + 4 / (3 * math.sqrt(3) * softcap))
+        return cls(*jax.lax.stop_gradient((curvature, jnp.sqrt(2 * table), spread)), transform)
+
+    def at(self, floor: jax.Array, moved: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Bounds on the curvature and the slope over every state within `moved` (2-norm) of the states of
+        a window whose slots' least spread is `floor`, per row. Through a transform N(phi(D s)), its
+        norm's input moves by at most p1 |D| `moved`, where the norm's Jacobian and second derivative are
+        at most n1 and n2 (`NormBounds.at`), so the transform's Jacobian is at most J = n1 p1 |D| and its
+        second derivative at most (n2 p1^2 + n1 p2) |D|^2: the curvature J^2 times the logits' plus their
+        slope times that, the slope J times theirs."""
+        if self.transform is None:
+            return jnp.broadcast_to(self.curvature, jnp.shape(floor)), jnp.broadcast_to(self.slope,
+                                                                                          jnp.shape(floor))
+        (p1, p2), dense = self.transform.slopes, self.transform.dense
+        first, second = self.transform.norm.at(floor, p1 * dense * moved)
+        jacobian = first * p1 * dense
+        bent = (second * p1 ** 2 + first * (p2 or 0.0)) * jnp.square(dense)
+        return jnp.square(jacobian) * self.curvature + self.slope * bent, jacobian * self.slope
 
 
 def _squared_norm(value: jax.Array) -> jax.Array:

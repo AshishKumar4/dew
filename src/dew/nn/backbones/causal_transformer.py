@@ -49,7 +49,7 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel, _head_loss_bounds, _squared_norm
+from dew.nn.continuum import Continuum, ContinuumLevel, HeadTerms, HeadTransform, _squared_norm
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.quantization import quantized_products
@@ -101,7 +101,14 @@ from ..precision import (
     scaled_logits,
 )
 from ..progress import Progress
-from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
+from ..protocols import (
+    BoundedNorm,
+    OutputTable,
+    Projection,
+    ProjectionGroup,
+    QuantizesInputs,
+    declared_groups,
+)
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from ..value_experts import ValueExperts
@@ -1237,10 +1244,11 @@ class CausalTransformer(nn.Module):
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
 
-    def head_bounds(self) -> tuple[jax.Array, jax.Array]:
-        """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states
-        `head_logits` reads (`dew.nn.continuum._head_loss_bounds`, `SteppedInContext`), from the bound model's
-        rows (`vocabulary_rows`, an adapter applied), softcap and transform. A head map (`lm_head`,
+    def head_bounds(self, states) -> HeadTerms:
+        """What bounds the curvature and the slope of a slot's cross entropy in the `states` `head_logits`
+        reads (`HeadTerms`, `SteppedInContext`), from the bound model's rows (`vocabulary_rows`, an adapter
+        applied), softcap and transform, a transform's norm read at the states (`BoundedNorm`; a norm that
+        bounds no derivatives is refused). A head map (`lm_head`,
         `project_out`, `head_dense`, or a tied head's product in the model's own scope) that rounds its
         input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel
         Qwix rounds multiplies by a matrix these norms do not read: refused."""
@@ -1256,11 +1264,17 @@ class CausalTransformer(nn.Module):
                              f"{rounded} round their inputs, making it piecewise constant there, which no "
                              f"curvature bounds, or their kernels, a matrix these bounds do not read: step "
                              f"it undamped")
-        transform = None if self.head_transform is None else (
-            _SLOPES[UNGATED[self.head_transform]], _squared_norm(self.applied_kernel("head_dense")),
-            self.head_norm.largest_gain(), self.head_norm.epsilon)
-        return _head_loss_bounds(_squared_norm(jnp.asarray(self.vocabulary_rows())), self.final_logit_softcap,
-                                transform)
+        table = _squared_norm(jnp.asarray(self.vocabulary_rows()))
+        if self.head_transform is None:
+            return HeadTerms.of(table, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
+        if not isinstance(self.head_norm, BoundedNorm):
+            raise ValueError(f"a damped step bounds a head transform's curvature through its norm's "
+                             f"derivatives, which {type(self.head_norm).__name__} bounds none of")
+        dense = self.applied_kernel("head_dense")
+        spread = self.head_norm.spread(ungated_activation(self.head_transform, self.head_dense(states)))
+        return HeadTerms.of(table, self.final_logit_softcap, spread, HeadTransform(
+            _SLOPES[UNGATED[self.head_transform]], jnp.sqrt(_squared_norm(dense)),
+            self.head_norm.derivative_bounds(dense.shape[-1])))
 
     @nn.nowrap
     def in_context_level(self, variables):

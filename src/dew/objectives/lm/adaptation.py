@@ -36,6 +36,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.batch import document_ranks, document_starts, prefix_sum, real_slots, token_layout
+from dew.nn.continuum import HeadTerms
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import SteppedInContext
@@ -163,25 +164,48 @@ def _where(choice: jax.Array, first, second):
 
 
 _TERMS = 4
-"""What each slot adds to its window's damping (`_damping`): weighted |x|^2, |f|^2, |f| |x| and |x|."""
+"""What each slot adds to its window's damping (`_damping`): weighted |x|^2, |f|^2, |f| |x| and |x|, the
+sums of a window's; and, beside them, its head norm's input's spread (`HeadTerms.spread`), least over a
+window's slots that weigh anything, and its |f| and |x|, largest over them (`_gathered`)."""
+
+
+def _gathered(mask: jax.Array, terms: jax.Array) -> jax.Array:
+    """A window's terms `[B, _TERMS + 3]` over the slots of `terms` `[B, W, _TERMS + 3]` that `mask`
+    holds (`_TERMS`): the sums, the least spread and the largest |f| and |x|."""
+    sums = jnp.sum(jnp.where(mask[..., None], terms[..., :_TERMS], 0), axis=1)
+    least = jnp.min(jnp.where(mask, terms[..., _TERMS], jnp.inf), axis=1)
+    most = jnp.max(jnp.where(mask[..., None], terms[..., _TERMS + 1:], 0), axis=1)
+    return jnp.concatenate([sums, least[:, None], most], axis=-1)
+
+
+def _joined(one: jax.Array, other: jax.Array) -> jax.Array:
+    """Two parts' window terms `[B, _TERMS + 3]` as one window's (`_gathered`)."""
+    return jnp.concatenate([one[:, :_TERMS] + other[:, :_TERMS],
+                            jnp.minimum(one[:, _TERMS:_TERMS + 1], other[:, _TERMS:_TERMS + 1]),
+                            jnp.maximum(one[:, _TERMS + 1:], other[:, _TERMS + 1:])], axis=-1)
 
 
 def _damping(model: nn.Module, variables, start, hidden, weights, adaptation: ChunkAdaptation):
-    """A damped step's bounds (`ChunkAdaptation.damped`): the head's on a slot loss's curvature and slope
-    in the states (`SteppedInContext.head_bounds`), the norm of the level's start's output map and its
-    activation's p1, p2, and each slot's weighted terms `[B, S, _TERMS]` at the level's start
-    (`level_terms`, of the parts that step, which refuses what no curvature bounds), whose window sums
-    set its rate (`_step_rate`); zeros for an undamped step."""
+    """A damped step's bounds (`ChunkAdaptation.damped`): what bounds the head's curvature and slope in a
+    slot loss's states (`SteppedInContext.head_bounds`, `HeadTerms`) at the level's start, the norm of the
+    start's output map and its activation's p1, p2, and each slot's terms `[B, S, _TERMS + 3]` at the start
+    (`level_terms`, of the parts that step, which refuses what no curvature bounds), whose windows
+    gather them (`_gathered`) into their rates (`_step_rate`); zeros for an undamped step."""
     if not adaptation.damped:
         zero = jnp.zeros((), jnp.float32)
-        return zero, zero, zero, zero, zero, jnp.zeros((*weights.shape, _TERMS), jnp.float32)
+        head = HeadTerms(zero, zero, jnp.zeros(weights.shape, jnp.float32))
+        return head, zero, zero, zero, jnp.zeros((*weights.shape, _TERMS + 3), jnp.float32)
     parts = _damped_parts(start, adaptation)
-    curvature, slope = _arrays(model.apply(variables, method="head_bounds"))
     held = model.with_in_context_level(variables, start)
+    head = model.apply(variables, model.apply(held, hidden, method="continuum_states"), method="head_bounds")
     squares, inputs, norm, p1, p2 = _arrays(model.apply(held, hidden, parts, method="level_terms"))
     lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
-    terms = jnp.stack([squares, inputs, fed * lengths, lengths], axis=-1)
-    return jax.lax.stop_gradient((curvature, slope, norm, p1, p2, weights[..., None] * terms))
+    counted = weights > 0
+    # A slot that weighs nothing bounds nothing of its window's (`_gathered`).
+    terms = jnp.stack([*(weights * term for term in (squares, inputs, fed * lengths, lengths)),
+                       jnp.where(counted, head.spread, jnp.inf), jnp.where(counted, fed, 0),
+                       jnp.where(counted, lengths, 0)], axis=-1)
+    return jax.lax.stop_gradient((head, norm, p1, p2, terms))
 
 
 def _arrays(applied) -> tuple[jax.Array, ...]:
@@ -191,15 +215,19 @@ def _arrays(applied) -> tuple[jax.Array, ...]:
 
 def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums, moved, gradient):
     """A damped window's rate per row, rate / (1 + rate L), L its loss's curvature bound along the step
-    (`ChunkAdaptation.damped`): the window's `sums` `[B, _TERMS]` of its slots' terms, `bounds` the head's
-    curvature and slope, the start's output-map norm and its activation's p1, p2 (`_damping`), `moved` per
-    row the Frobenius norms `down` and `up` have moved from the start before the window, and `gradient`
-    the window's. A part's largest norm along the step is its start's plus what it moved and what this
-    step moves it at most, the rate times its gradient's norm. The rate is a constant of the step, as its
-    bound is: the outer gradient flows through the step's gradient, not through the bound it reads (whose
-    distances are zero at a run's start, where their root has no derivative)."""
-    curvature, slope, norm, p1, p2 = bounds
+    (`ChunkAdaptation.damped`): the window's `sums` `[B, _TERMS + 3]` of its slots' terms (`_gathered`),
+    `bounds` the head's terms (`HeadTerms`), the start's output-map norm and its activation's p1, p2
+    (`_damping`), `moved` per row the Frobenius norms `down` and `up` have moved from the start before the
+    window, and `gradient` the window's. A part's largest norm along the step is its start's plus what it
+    moved and what this step moves it at most, the rate times its gradient's norm, and a slot's state
+    s = x + U f moves by at most |U - U0| |f| + |U0| |f - f0| along it, |f - f0| at most p1 |x| times D's
+    distance: the head's bounds are read over every state that far from the window's (`HeadTerms.at`). The
+    rate is a constant of the step, as its bound is: the outer gradient flows through the step's gradient,
+    not through the bound it reads (whose distances are zero at a run's start, where their root has no
+    derivative)."""
+    head, norm, p1, p2 = bounds
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(_TERMS))
+    least, fed, longest = (sums[:, index] for index in range(_TERMS, _TERMS + 3))
     rate = adaptation.rate
 
     def reach(part: str) -> jax.Array:
@@ -211,6 +239,8 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
 
     # D's distance along the step bounds how far f = act(D x) moves, p1 |x| per unit; U's, its norm.
     spread, output = reach("down"), norm + reach("up")
+    turned = p1 * spread * longest
+    curvature, slope = head.at(least, reach("up") * (fed + turned) + norm * turned)
     bend = jnp.zeros_like(squares)
     stretch = jnp.zeros_like(squares)
     if "down" in parts:
@@ -294,7 +324,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
                 losses, _ = scored((at,), jnp.zeros_like(tail, jnp.int32), states, block_targets)
                 return jnp.sum(jnp.where(tail, block_weights * losses, 0.0))
             closed = jax.tree.map(jnp.add, partial, jax.grad(tail_loss)(level))
-            closed_energy = energy + jnp.sum(jnp.where(tail[..., None], block_energies, 0), axis=1)
+            closed_energy = _joined(energy, _gathered(tail, block_energies))
             levels = (level, stepped(level, closed, closed_energy), started)
             chosen = jnp.where(tail, 0, jnp.where(following, 1, 2))
         else:
@@ -318,15 +348,15 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
         for index, alternative in enumerate(levels[1:], start=1):
             opened = _where(chosen[:, -1] == index, alternative, opened)
         continuing = (last_run == run) & (last_place == place)
-        reached_energy = jnp.sum(jnp.where(last[..., None], block_energies, 0), axis=1)
+        reached_energy = _gathered(last, block_energies)
         carried = (opened, _where(continuing, closed, reached),
                    jnp.where(continuing[:, None], closed_energy, reached_energy), last_run, last_place)
         return carried, (losses, top, log_z, block_logits if logits else None)
 
     zeros = jax.tree.map(jnp.zeros_like, started)
     # Before a row's first real token no run is open: run 0, window -1.
-    first = (started, zeros, jnp.zeros((rows, _TERMS), energies.dtype), jnp.zeros((rows,), runs.dtype),
-             jnp.full((rows,), -1, windows.dtype))
+    first = (started, zeros, _gathered(jnp.zeros((rows, 1), bool), energies[:, :1]),
+             jnp.zeros((rows,), runs.dtype), jnp.full((rows,), -1, windows.dtype))
     _, (losses, top, log_z, whole) = jax.lax.scan(
         jax.checkpoint(block), first, inputs)
 

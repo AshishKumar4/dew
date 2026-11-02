@@ -469,7 +469,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
     input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
     overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
-    from dew.objectives.lm.adaptation import _damping, _step_rate
+    from dew.objectives.lm.adaptation import _damping, _gathered, _step_rate
 
     model, transform = DAMPED_HEADS[head]
     _, hidden, targets, weights = draw(0, scale=0.5)
@@ -493,7 +493,8 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     gradient = jax.grad(loss)(kernels, variables, states, weighed)
     *bounds, terms = _damping(model, variables, level, states, weighed, adaptation)
     moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
-    damped = float(_step_rate(adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
+    gathered = _gathered(jnp.ones(terms.shape[:2], bool), terms)
+    damped = float(_step_rate(adaptation, parts, bounds, gathered, moved,
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
@@ -515,7 +516,8 @@ def test_a_zero_heads_damped_step_is_finite():
     variables, hidden, targets, weights = draw(0, scale=0.5)
     zero = {**variables, "params": {**variables["params"],
                                     "embed_tokens": {"embedding": np.zeros((VOCAB, FEATURES), np.float32)}}}
-    assert [float(bound) for bound in MODEL.apply(zero, method="head_bounds")] == [0.0, 0.0]
+    head = MODEL.apply(zero, hidden, method="head_bounds")
+    assert [float(bound) for bound in (head.curvature, head.slope)] == [0.0, 0.0]
     zeroed = adapted_scores(MODEL, zero, hidden, targets, weights, {},
                             ChunkAdaptation(window=3, rate=0.5, select=("up",), damped=True),
                             predict=False, logits=False).losses
