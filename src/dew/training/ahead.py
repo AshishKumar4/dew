@@ -59,7 +59,7 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
-from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, tpu
+from dew.nn.kernels.generation import GpuTarget, assumed, capability, device_target, gpu_mesh, gpu_target, tpu
 from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
@@ -360,15 +360,23 @@ class BuildTarget:
     host: str
 
     @staticmethod
+    def built(generation: str, multiprocessors: int | None, devices: int) -> BuildTarget:
+        """The target of `devices` devices of `generation` with `multiprocessors`, under this process's JAX,
+        jaxlib, computing XLA flags and host: the one place a build's environment is read."""
+        return BuildTarget(generation, multiprocessors, devices, importlib.metadata.version("jax"),
+                           importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
+
+    @staticmethod
     def of(devices: Sequence) -> BuildTarget:
-        """The target `devices` are, under this process's JAX, XLA flags and host."""
-        device = devices[0]
-        # A GPU's generation by its compute capability and its multiprocessors as it reports them
-        # (`gpu_target` of this process's own GPU), a TPU's by its kind.
-        target = gpu_target() if device.platform == "gpu" else gpu_target(device.device_kind)
-        return BuildTarget(target.generation, target.multiprocessors, len(devices),
-                           importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
-                           computation_flags(), platform.machine())
+        """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), under
+        this process's JAX, XLA flags and host; refused where they are not all of one generation and
+        multiprocessors."""
+        found = {(target.generation, target.multiprocessors) for target in map(device_target, devices)}
+        if len(found) != 1:
+            raise ValueError(f"these devices are of several targets, {sorted(found, key=str)}: programs "
+                             "compiled ahead load onto devices of one")
+        ((generation, multiprocessors),) = found
+        return BuildTarget.built(generation, multiprocessors, len(devices))
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's."""
@@ -449,10 +457,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    target = BuildTarget(generation, gpu_target(generation).multiprocessors, 1,
-                         importlib.metadata.version("jax"),
-                         importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
-    return AheadPrograms(target, built)
+    return AheadPrograms(BuildTarget.built(generation, gpu_target(generation).multiprocessors, 1), built)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -685,6 +690,5 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget(generation, target.multiprocessors, len(devices), importlib.metadata.version("jax"),
-                          importlib.metadata.version("jaxlib"), computation_flags(), platform.machine()),
+        built=BuildTarget.built(generation, target.multiprocessors, len(devices)),
         refusals=report.refused_launches(), sampled=sampled)

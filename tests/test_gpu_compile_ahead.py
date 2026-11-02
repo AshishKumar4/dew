@@ -52,7 +52,11 @@ with open(sys.argv[3], "wb") as file:
 
 def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_for_bit_as_compiled_here(
         tmp_path):
-    generation = BuildTarget.of(jax.devices()).generation
+    own = BuildTarget.of(jax.devices()[:1])
+    generation = own.generation
+    # A target is the device's own, whatever generation this process assumes.
+    with assumed("sm80" if generation != "sm80" else "sm90"):
+        assert BuildTarget.of(jax.devices()[:1]) == own
     for name, text in (("build.py", BUILD), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
     tests = str(Path(__file__).resolve().parent)

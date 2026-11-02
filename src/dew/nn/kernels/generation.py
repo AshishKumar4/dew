@@ -635,7 +635,12 @@ def device_generation() -> str:
         return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
-    device = jax.local_devices()[0]
+    return _generation(jax.local_devices()[0])
+
+
+def _generation(device) -> str:
+    """`device`'s own generation: a CUDA device's by its compute capability, a TPU's by its kind, another
+    platform's its name."""
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
@@ -643,6 +648,14 @@ def device_generation() -> str:
         kind = device.device_kind or 'tpu'
         return gpu_target(kind).generation
     return device.platform
+
+
+def device_target(device) -> GpuTarget:
+    """`device`'s own target, whatever `assumed` says: its generation (`_generation`) and, a CUDA device's,
+    the facts it reports of itself (`runtime_facts`), its multiprocessors among them. What a program
+    compiled for a target is checked against before it loads (`dew.training.ahead.BuildTarget`)."""
+    target = gpu_target(_generation(device))
+    return runtime_facts(target, device) if device.platform == 'gpu' else target
 
 
 def chosen_kernel(choice: str, default: str) -> str:

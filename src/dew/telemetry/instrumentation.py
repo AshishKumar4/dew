@@ -76,23 +76,31 @@ _held = _Held()
 
 
 def _heard(event: str, duration_secs: float, **metadata: str | int) -> None:
-    """`EVENTS`' one listener: an event raises `ExecutableOnly` on a thread within `executable_only`, and is
-    told to every open `Compiles` otherwise."""
+    """`EVENTS`' one listener: an event is told to every open `Compiles`, as JAX records it once the work is
+    done, and then raises `ExecutableOnly` on a thread within `executable_only`."""
     kind = EVENTS.get(event)
     if kind is None:
         return
-    if _held.depth:
-        raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
-                             "program compiled ahead was missing, or code traced around it")
     with _open_lock:
         listening = list(_open)
     for compiles in listening:
         compiles.heard(kind, duration_secs, metadata)
+    if _held.depth:
+        raise ExecutableOnly(f"{event} in a process held to loaded programs alone (executable_only): a "
+                             "program compiled ahead was missing, or code traced around it")
 
 
-@functools.cache
+_listener_lock = threading.Lock()
+_listener: list[bool] = []
+"""Whether `_heard` is registered with JAX, which appends a listener each time it is given one."""
+
+
 def _listening() -> None:
-    jax.monitoring.register_event_duration_secs_listener(_heard)
+    """`_heard` registered with JAX once a process, however many threads first open a block at once."""
+    with _listener_lock:
+        if not _listener:
+            jax.monitoring.register_event_duration_secs_listener(_heard)
+            _listener.append(True)
 
 
 @contextlib.contextmanager

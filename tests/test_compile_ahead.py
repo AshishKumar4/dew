@@ -765,8 +765,8 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
     """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
     compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
     the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
-    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts the
-    compiles the block let run, another thread's and those after it, and none it stopped."""
+    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts every
+    compile done, the one the block stopped as JAX recorded it done, another thread's and those after it."""
     import threading
 
     from dew.telemetry.instrumentation import Compiles, ExecutableOnly, executable_only
@@ -788,7 +788,7 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
             thread.join()
         assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
         assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
-    assert compiles.count == 2
+    assert compiles.count == 3
 
 
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
