@@ -215,24 +215,35 @@ def pickle_load(path):
 
 @pytest.mark.gpu(reason="hands a step compiled ahead for the canonical H100 to a run on this host's H100")
 @lowers("sm90")
-def test_a_run_handed_a_step_compiled_ahead_for_another_h100_takes_it(tmp_path, nonce):
+def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_one_of_its_multiprocessors(
+        tmp_path, nonce):
     """A run in a fresh process handed a step compiled ahead for the canonical H100, whose launch's first
-    tile spilled, on this host's H100, which may count other multiprocessors (an H100 PCIe's 114 against
-    132), lowers the saved program: it derives its launches for the target the step was compiled for
-    (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile
-    the step compiled ahead (ledger 2453)."""
+    tile spilled, on this host's H100 lowers the saved program where this H100 counts its 132
+    multiprocessors: it derives its launches for the target the step was compiled for
+    (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile the
+    step compiled ahead (ledger 2453). Where it counts others (an H100 PCIe's 114) the run is refused, as a
+    balanced tail's grid derived past a GPU's residency waits on a program that never starts (row 3606)."""
     step = str(tmp_path / "step.dew-aot")
     spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    canonical = generation.gpu_target("sm90").multiprocessors
+    if generation.device_target(jax.devices()[0]).multiprocessors != canonical:
+        from dew.training.ahead import AheadOfTime, handed
+
+        with pytest.raises(ValueError), handed(AheadOfTime.load(step)):
+            pass
+        return
     handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
     assert handed["step"] == 1 and handed["ahead"] is True
 
 
 def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     """While a step compiled ahead is reproduced (`handed`), its launches derive for the GPU it was
-    compiled for (`AheadOfTime.target`), where this process's GPU is of its generation and holds a
-    block's shared memory its launches take, however many multiprocessors it counts; outside, the
-    process's own facts. A GPU of another generation, one holding less shared memory a block, or one
-    whose shared memory is unknown, is refused (ledger 2453)."""
+    compiled for (`AheadOfTime.target`), where this process's GPU is of its generation, counts as many
+    multiprocessors and holds a block's shared memory its launches take, whatever its name or memory;
+    outside, the process's own facts. A GPU of another generation, of other multiprocessors (an H100
+    PCIe's 114: a balanced tail's grid derived past a GPU's residency waits on a program that never
+    starts, row 3606), holding less shared memory a block, or whose shared memory is unknown, is refused
+    (ledger 2453)."""
     import dataclasses
 
     from dew.nn.kernels.generation import assumed, gpu_target
@@ -240,19 +251,20 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
 
     canonical = gpu_target("sm90")
     step = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {}, canonical)
-    pcie = dataclasses.replace(canonical, device_kind="NVIDIA H100 PCIe", multiprocessors=114)
-    with assumed(pcie):
+    h200 = dataclasses.replace(canonical, device_kind="NVIDIA H200")
+    with assumed(h200):
         with handed(step):
             assert gpu_target() == canonical
-        assert gpu_target() == pcie
+        assert gpu_target() == h200
     # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
     earlier = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {})
     vars(earlier).pop("target")
-    with assumed(pcie), pytest.raises(ValueError), handed(earlier):
+    with assumed(h200), pytest.raises(ValueError), handed(earlier):
         pass
-    smaller = dataclasses.replace(pcie, shared_limit=canonical.shared_limit - 1)
-    unknown = dataclasses.replace(pcie, shared_limit=None)
-    for other in (gpu_target("sm80"), smaller, unknown):
+    pcie = dataclasses.replace(canonical, device_kind="NVIDIA H100 PCIe", multiprocessors=114)
+    smaller = dataclasses.replace(h200, shared_limit=canonical.shared_limit - 1)
+    unknown = dataclasses.replace(h200, shared_limit=None)
+    for other in (gpu_target("sm80"), pcie, smaller, unknown):
         with assumed(other), pytest.raises(ValueError), handed(step):
             pass
 

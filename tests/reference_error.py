@@ -107,7 +107,7 @@ from check1_statistics import (
     root_mean,
     shown,
 )
-from float64_terms import compiled_terms, float64_terms
+from float64_terms import float64_terms
 from map_judge import DRAWS, PoolRefused, judging, pooled_units, record_units
 
 from dew.accuracy import distance, reduction_bound, within
@@ -1157,7 +1157,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
     `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
     truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's with each output's terms (`compiled_terms`, `float64_terms`),
+    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`),
     every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
     terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
     widened inputs."""
@@ -1805,12 +1805,13 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
     """The site's terms program: `terms_fn`, the site's own, or by default (`terms` None) one sized from
     `truth` where its first draw holds a row of float64 zero (`_cancelling_terms`); none where `terms` is
     False, or in a judge, whose draws are its map tasks' records, each row sized by the terms its task
-    found (`map_judge.judging`): no truth runs there. A program traced for its terms is compiled once for
-    the site's every draw (`compiled_terms`)."""
+    found (`map_judge.judging`): no truth runs there. A program traced for its terms is traced once a
+    signature, its static runs compiled once for the site's every draw (`float64_terms`)."""
     if terms is not False and not judging() and terms_fn is None:
         program = truth_program if isinstance(truth_program, _Truth) else None
         terms_fn = _cancelling_terms(draw, truth, program)
-    return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else compiled_terms(terms_fn)
+    return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
+        float64_terms, terms_fn)
 
 
 def _narrow(draws: _Draws) -> list[str]:
