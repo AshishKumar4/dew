@@ -127,38 +127,39 @@ def pytest_collection_modifyitems_markers(items):
 
 
 @functools.cache
-def marks_watched() -> None:
-    """Each marker a lookup asks for (`pytest.mark.<name>`) written as its owner's input (`pytest_configure`),
-    pytest's lookup wrapped once a process, however many sessions configure in it."""
-    looked = pytest.MarkGenerator.__getattr__
+def watched() -> None:
+    """pytest's own entry points to the marker registrations wrapped once a process, as this plugin is
+    imported, before any conftest's hook of any kind or order can read them (review: a conftest's command-line hook, run
+    first, read them before a watch set in a hook of this plugin's). A test's or a conftest's read of every
+    registration (`Config.getini("markers")`) is its owner's input, pytest's own reads of them, at configure
+    and at a mark's first use, none; and each marker a lookup asks for (`pytest.mark.<name>`, which
+    --strict-markers validates as it looks it up), its owner's input whether any test then carries it or not
+    (review: a helper evaluating an unregistered marker it never applies fails its importers' collection once
+    the registration goes)."""
+    looked, read = pytest.MarkGenerator.__getattr__, pytest.Config.getini
 
     def looking(self, name):
         if not name.startswith("_"):
             lifetime.write(lifetime.owner(), f"{MARKER}{name}")
         return looked(self, name)
 
+    def reading(self, name):
+        if name == "markers" and os.sep + "_pytest" + os.sep not in sys._getframe(1).f_code.co_filename:
+            lifetime.write(lifetime.owner(), f"{MARKER}*")
+        return read(self, name)
+
     pytest.MarkGenerator.__getattr__ = looking
+    pytest.Config.getini = reading
+
+
+watched()
 
 
 def pytest_cmdline_main(config):
-    """The recorder's watches set before pytest configures anything (review: a configure hook, tryfirst or
-    not, of a conftest registered after this plugin ran first, and its read of the registrations went unseen):
-    a test's or a conftest's read of every registration (`config.getini("markers")`), its owner's input,
-    pytest's own reads of them, at configure and at a mark's first use, none. And each marker a lookup asks
-    for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input whether
-    any test then carries it or not (review: a helper evaluating an unregistered marker it never applies fails
-    its importers' collection once the registration goes). Its settings read, a pytest that configures after
-    it in this process (a test's `pytest.main`) is another session (`lifetime.settled`)."""
+    """The recorded pytest's settings read: a pytest that configures after it in this process (a test's
+    `pytest.main`) is another session, whose read of its settings is its owner's input
+    (`lifetime.settled`)."""
     lifetime.settled()
-    marks_watched()
-    getini = config.getini
-
-    def watched(name):
-        if name == "markers" and os.sep + "_pytest" + os.sep not in sys._getframe(1).f_code.co_filename:
-            lifetime.write(lifetime.owner(), f"{MARKER}*")
-        return getini(name)
-
-    config.getini = watched
 
 
 def pytest_deselected(items):

@@ -770,6 +770,22 @@ def test_the_registrations_a_conftests_configure_reads_are_every_files_input(
     assert reused() == [False]
 
 
+def test_the_registrations_a_conftests_first_command_line_hook_reads_are_every_files_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A conftest's own command-line hook, asking to run first, reading the marker registrations makes them an
+    input of the files it runs for (review: it ran before the hook that set the recorder's watch), so a
+    registration it needs reruns them when it changes."""
+    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "conftest.py": "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_cmdline_main(config):\n"
+                       "    assert any('tidy' in line for line in config.getini('markers'))\n",
+        "test_plain.py": "def test_plain():\n    pass\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
 def test_a_marker_registered_in_a_string_setting_is_its_users_input(ci, tmp_path, monkeypatch, cache_worker):
     """A marker registered in pytest's settings as one string of lines, as pytest also takes them, is the
     input of each file that uses it, read as pytest reads the string (review: the string was read a character
