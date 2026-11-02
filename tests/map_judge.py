@@ -6,11 +6,15 @@ witness of run options its outcomes; each reads and writes through `record_units
 """
 
 import hashlib
+import json
 import os
 import pickle
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
+
+import psutil
 
 DRAWS = "DEW_CHECK1_DRAWS"
 """The environment variable that runs every sharded site as one map task: `start:stop`, the units the task
@@ -67,7 +71,10 @@ def _file(site: str) -> str:
 
 def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
     """Where DRAWS names a range `start:stop`, `payload(start, stop)` written to RECORDS as the site's
-    record of those units (pickled whole, then moved into place), and True; else False."""
+    record of those units (pickled whole, then moved into place), and True; else False. Beside it, the
+    seconds from the task's process's start to its units (`before`: its imports, collection, the site's
+    setup and compiles) and those its units took (`draws`), so a run's map tasks say what each paid before
+    any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut)."""
     span = os.environ.get(DRAWS)
     if not span:
         return False
@@ -77,9 +84,13 @@ def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
         raise ValueError(f"{label}: a map task ({DRAWS}={span}) writes its records to {RECORDS}, which is "
                          f"unset")
     site = site_id(label)
+    began = time.time()
     found = payload(start, stop)
+    seconds = {"site": site, "start": start, "stop": stop,
+               "before": began - psutil.Process().create_time(), "draws": time.time() - began}
     path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.with_suffix(".seconds.json").write_text(json.dumps(seconds))
     written = path.with_name(path.name + ".partial")
     written.write_bytes(pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
     written.rename(path)
