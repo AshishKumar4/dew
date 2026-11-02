@@ -653,21 +653,22 @@ def assert_within_rounding(dew, reference, drawn, seeds: int, label: str) -> Non
     from rounding_bound import rounding_bound
 
     single, double = 2.0 ** -24, 2.0 ** -53
-    for seed in range(seeds):
-        arguments = drawn(seed)
-        ours = jax.tree.map(np.asarray, jax.jit(dew)(*arguments))
-        _, kappa = rounding_bound(dew, *arguments)
-        truth, theirs = rounding_bound(reference, *arguments)
-        paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(ours)[0]]
-        for path, got, want, own, other in zip(paths, jax.tree.leaves(ours), jax.tree.leaves(truth),
-                                               jax.tree.leaves(kappa), jax.tree.leaves(theirs), strict=True):
-            bound = single * own + double * (own + other)
-            error = np.abs(np.asarray(got, np.float64) - want)
-            assert np.all(np.isfinite(got)), f"{label}, seed {seed}, {path}: not finite"
-            worst = np.unravel_index(np.argmax(error - bound), error.shape) if error.size else ()
-            assert np.all(error <= bound), (
-                f"{label}, seed {seed}, {path}{list(worst)}: {error[worst]:.3e} past its rounding bound "
-                f"{bound[worst]:.3e}")
+    # The seeds' draws stacked, each program mapped over them: one program a site, each draw's own
+    # elements its own outputs.
+    arguments = jax.tree.map(lambda *leaves: np.stack(leaves), *(drawn(seed) for seed in range(seeds)))
+    ours = jax.tree.map(np.asarray, jax.jit(jax.vmap(dew))(*arguments))
+    _, kappa = rounding_bound(jax.vmap(dew), *arguments)
+    truth, theirs = rounding_bound(jax.vmap(reference), *arguments)
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(ours)[0]]
+    for path, got, want, own, other in zip(paths, jax.tree.leaves(ours), jax.tree.leaves(truth),
+                                           jax.tree.leaves(kappa), jax.tree.leaves(theirs), strict=True):
+        bound = single * own + double * (own + other)
+        error = np.abs(np.asarray(got, np.float64) - want)
+        assert np.all(np.isfinite(got)), f"{label}, {path}: not finite"
+        worst = np.unravel_index(np.argmax(error - bound), error.shape) if error.size else ()
+        assert np.all(error <= bound), (
+            f"{label}, seed {worst[0] if worst else 0}, {path}{list(worst[1:])}: {error[worst]:.3e} past its "
+            f"rounding bound {bound[worst]:.3e}")
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
