@@ -13,6 +13,7 @@ from ..attention_residuals import DepthAttention
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUpLayer
 from ..hyper_connections import stream_head
+from .decoder_block import gate_flops
 
 if TYPE_CHECKING:
     import flax.linen as nn
@@ -46,6 +47,14 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     if decoder.attention_residuals is not None:
         sources = decoder.attention_residuals.blocks(decoder.num_layers) + 1
         count += depth_counter(DepthAttention(decoder.emb_features, parent=None), lengths, sources)
+    # The gated norms outside the layers (`NormSpec.gate_rank`): the embedding's once, and the final
+    # one's once and between a loop's passes where it steps them.
+    final = decoder.ngpt is None and decoder.final_norm
+    steps = decoder.loop.steps if decoder.loop is not None and decoder.loop.step_norm else 1
+    count += gate_flops(decoder.norms, ('embedding_layernorm',) if decoder.embedding_norm else (),
+                        decoder.emb_features, lengths, routed=None)
+    count += steps * gate_flops(decoder.norms, ('norm',) if final else (), decoder.emb_features, lengths,
+                                routed=None)
     return count
 
 
@@ -89,6 +98,8 @@ def logits_flops(decoder: CausalTransformer, lengths) -> float:
     for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
         if site in projections:
             count += projection_flops(lengths, *projections[site])
+    if decoder.head_transform is not None:
+        count += gate_flops(decoder.norms, ('head_norm',), projections['head_dense'][1], lengths, routed=None)
     return count
 
 

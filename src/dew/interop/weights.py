@@ -88,8 +88,12 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, Stored]) 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
                      path: tuple[str, ...] = ()) -> np.dtype:
     """Floating payloads use parameter storage, or under `AUTO` keep the dtype
-    each was stored in; integer and boolean state keeps its dtype."""
-    if path and (path[0] == 'constants' or (path[0] == 'params' and path[-1] == 'head_bias')):
+    each was stored in; integer and boolean state keeps its dtype. Constants, a
+    head's bias and a lightning indexer's head weights (`weights_proj`, which
+    V3.2's, A.X-K2's and V4's references keep in fp32, `_keep_in_fp32_modules`,
+    and which a narrower indexer reads cast down alike) stay fp32."""
+    if path and (path[0] == 'constants' or (path[0] == 'params' and (
+            path[-1] == 'head_bias' or tuple(path[-2:]) == ('weights_proj', 'kernel')))):
         param_dtype = 'float32'
     if param_dtype == AUTO:
         return stored

@@ -295,9 +295,9 @@ def _read_laguna_attention(view: PartView) -> Mapping[str, object]:
 
 
 def _read_keyed_attention(view: PartView) -> Mapping[str, object]:
-    """Falcon-H1's attention: Llama's, its keys times `key_multiplier` before their rotation, which scales
-    every score alike: read as the scores' scale (`attention_scale`), its own times that multiplier."""
-    return {**_read_attention(view), 'attention_scale': float(view.scaling) * float(view.key_multiplier)}
+    """Falcon-H1's attention: Llama's, its keys times `key_multiplier` as projected, before their rotation
+    and cache (`key_multiplier`)."""
+    return {**_read_attention(view), 'key_multiplier': float(view.key_multiplier)}
 
 
 def _read_nope_attention(view: PartView) -> Mapping[str, object]:

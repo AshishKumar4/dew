@@ -66,36 +66,54 @@ class NormSpec:
     gate_rank: int | None = None
     """Where set, an RMS norm's output scaled by its own low-rank sigmoid gate this wide
     (`dew.nn.norms.GatedRMSNorm`, A.X-K2's), on the layers `gated_layers` names: 'every' layer, or the
-    'routed' ones alone (A.X-K2 gates its feed-forward's norm where it routes)."""
+    'routed' ones alone (A.X-K2 gates its feed-forward's norm where it routes), a layer's norm's choice;
+    a norm outside the layers (the final one's, the embedding's, the head's) gates wherever it runs."""
     gated_layers: Literal['every', 'routed'] = 'every'
 
-
-PRE_NORMS = ('input_layernorm', 'post_attention_layernorm')
-"""The norms before a block's sublayers, which a norm's gate may scale (`NormSpec.gate_rank`)."""
 
 NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
               'post_per_layer_input_norm', 'embedding_layernorm', 'norm', 'head_norm')
 """The decoder's norms a `NormSpec` may change, by the module name each is built under."""
 
 
+def norm_gated(spec: NormSpec, name: str, routed: bool | None) -> bool:
+    """Whether the norm `name` of `spec` is gated (`NormSpec.gate_rank`): on every layer, or on the
+    `routed` layers alone; a norm outside the layers (`routed` None) on 'every' only, as it has no
+    layer to route."""
+    if spec.gate_rank is None:
+        return False
+    if spec.gated_layers == 'routed' and routed is None:
+        raise ValueError(f"{name} runs outside the layers, so it has no routed layers to gate on; "
+                         "gate it on 'every' layer")
+    return spec.gated_layers == 'every' or bool(routed)
+
+
+def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths, *,
+               routed: bool | None) -> float:
+    """The work of the gated norms among `sites` (`norm_gated`), each gate's map down to its rank and
+    back (`dew.nn.norms.NormGate`)."""
+    held = specs or {}
+    return sum(2 * projection_flops(lengths, width, held[site].gate_rank or 0)
+               for site in sites if site in held and norm_gated(held[site], site, routed))
+
+
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None,
                  specs: Mapping[str, NormSpec] | None = None,
-                 routed: bool = False) -> Callable[..., nn.Module]:
+                 routed: bool | None = None) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
-    `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated on
-    the layers it names, the `routed` layer's among them or not. 'layer'
-    keeps torch's exact variance, the reference decoders' formula;
-    'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose
-    mean and square reduce in one pass, which the vision towers run."""
+    `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
+    `norm_gated` says: a layer's on the layers it names, the `routed` layer's
+    among them or not, and a norm outside the layers (`routed` None) wherever
+    it runs. 'layer' keeps torch's exact variance, the reference decoders'
+    formula; 'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`),
+    whose mean and square reduce in one pass, which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
         eps = epsilon if spec.eps is None else spec.eps
-        if spec.gate_rank is not None and name not in PRE_NORMS:
-            raise ValueError(f"{name} takes no gate: a gated norm is a pre-norm, one of {PRE_NORMS}")
-        gated = spec.gate_rank is not None and (spec.gated_layers == 'every' or routed)
+        gated = norm_gated(spec, name, routed)
         if kind == 'rms':
             norm = functools.partial(
                 RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
@@ -707,15 +725,19 @@ class DecoderBlock(nn.Module):
             'per_layer_projection': (self.per_layer_input_dim, self.emb_features)}
 
     @nn.nowrap
-    def _pre_norms(self) -> tuple[str, ...]:
-        """The pre-norms (`PRE_NORMS`) the block builds: the mixer's where its wiring norms the stream and
-        the layer norms its attention's input, the feed-forward's where it has one that no norm shared
-        with the mixer reads."""
+    def _built_norms(self) -> tuple[str, ...]:
+        """The norms the block builds, which its setup and its count of their gates share: the mixer's
+        where its wiring norms the stream and the layer norms its attention's input, the feed-forward's
+        where it has one that no norm shared with the mixer reads, the sublayers' outputs' where its
+        wiring norms them, and the per-layer input's where it reads one."""
         normed = self.wiring.pre_norms or self.wiring.residual_norms
         return tuple(site for site, built in (
             ('input_layernorm', normed and self.attention_norm),
             ('post_attention_layernorm', normed and self.feedforward is not None
-             and not self.wiring.shared_parallel_norm)) if built)
+             and not self.wiring.shared_parallel_norm),
+            ('attention_output_norm', self.wiring.output_norms),
+            ('mlp_output_norm', self.wiring.output_norms and self.feedforward is not None),
+            ('post_per_layer_input_norm', bool(self.per_layer_input_dim))) if built)
 
     @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
@@ -726,11 +748,7 @@ class DecoderBlock(nn.Module):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-        # A gated pre-norm's gate maps the width down to its rank and back (`dew.nn.norms.NormGate`).
-        for site in self._pre_norms():
-            spec = (self.norms or {}).get(site, NormSpec())
-            if spec.gate_rank is not None and (spec.gated_layers == 'every' or self.routed):
-                count += 2 * projection_flops(lengths, self.emb_features, spec.gate_rank)
+        count += gate_flops(self.norms, self._built_norms(), self.emb_features, lengths, routed=self.routed)
         if self.laurel_rank is not None:
             count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
         if self.altup is not None:
@@ -777,7 +795,7 @@ class DecoderBlock(nn.Module):
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        built = self._pre_norms()
+        built = self._built_norms()
         if 'input_layernorm' in built:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
@@ -795,10 +813,10 @@ class DecoderBlock(nn.Module):
             raise ValueError("normed_residual and stream_multiplier join the plain stream: they take no "
                              "hyper-connections, AltUp, depth residuals, LAuReL, parallel experts, "
                              "cross-attention or an unnormed attention")
-        if self.wiring.output_norms:
+        if 'attention_output_norm' in built:
             self.attention_output_norm = norm(name='attention_output_norm')
-            if self.feedforward is not None:
-                self.mlp_output_norm = norm(name='mlp_output_norm')
+        if 'mlp_output_norm' in built:
+            self.mlp_output_norm = norm(name='mlp_output_norm')
         if self.feedforward is not None:
             self.mlp = self.feedforward(name='mlp')
         elif self.parallel is not None or self.laurel_rank is not None:
@@ -818,7 +836,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
                                               name='per_layer_projection')
-            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')
+            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')  # in `_built_norms`
         if self.altup is not None:
             if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
                 raise ValueError(

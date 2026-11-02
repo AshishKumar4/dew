@@ -49,6 +49,27 @@ def tiny(**overrides):
     return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, **overrides})
 
 
+
+def test_a_key_multiplier_scales_the_keys_before_they_rotate_and_are_cached():
+    """Falcon-H1's `key_multiplier` scales each key as projected, before its rotation and its cache
+    (`MixerContext.key_multiplier`), so a narrow key keeps its source's range through the rotation: at a
+    power of two the cached keys are the unscaled model's times it, bit for bit."""
+    model = tiny()
+    ids = jax.random.randint(jax.random.key(7), (2, 5), 0, VOCAB)
+    params = model.init(jax.random.key(8), ids)
+
+    def cached_keys(decoder):
+        cache = decoder.apply(params, ids.shape[0], method=CausalTransformer.init_cache, mutable=["cache"])[1]
+        _, mutated = decoder.apply({**params, **cache}, ids, decode=True, mutable=["cache"])
+        return [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(mutated["cache"])
+                if jax.tree_util.DictKey("cached_key") in path]
+
+    plain, scaled = cached_keys(model), cached_keys(tiny(key_multiplier=0.5))
+    assert plain
+    for unscaled, held in zip(plain, scaled, strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(unscaled) * 0.5)
+
+
 def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
 

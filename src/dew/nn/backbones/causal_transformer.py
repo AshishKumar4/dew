@@ -292,6 +292,9 @@ class CausalTransformer(nn.Module):
     value_scale: float | None = None
     """The factor that multiplies the values as they are projected, before
     they are cached: MiMo-V2-Flash's `attention_value_scale`."""
+    key_multiplier: float | None = None
+    """The factor that multiplies the keys as they are projected, before
+    they are rotated and cached: Falcon-H1's `key_multiplier`."""
     attention_sinks: bool = False
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch

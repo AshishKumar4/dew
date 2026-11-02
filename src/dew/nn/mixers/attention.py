@@ -651,6 +651,9 @@ class CausalSelfAttention(nn.Module):
                      else self.v_proj(x))
         else:
             key, value = projected
+        if self.ctx.key_multiplier is not None:
+            # Before its norm and rotation, as Falcon-H1's keys (`k_proj(x) * key_multiplier`).
+            key = scaled(key, self.ctx.key_multiplier)
         key = checkpoint_name(key, 'k_proj')
         if not self.ctx.k_eq_v:
             value = checkpoint_name(value, 'v_proj')

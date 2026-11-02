@@ -420,7 +420,8 @@ def test_no_token_reaches_another_document(kind):
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
-                 "value_scale": 0.5, "o_proj_bias": True, "attention_dropout_rate": 0.1}
+                 "value_scale": 0.5, "key_multiplier": 0.5, "o_proj_bias": True,
+                 "attention_dropout_rate": 0.1}
 """A value each attention policy (`MixerContext.policies`) asks with."""
 
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}

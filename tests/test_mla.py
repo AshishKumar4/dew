@@ -48,6 +48,7 @@ from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
+from dew.interop.weights import decoding_storage
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -253,8 +254,9 @@ def block_draw(name: str):
 def test_a_float16_indexer_weighs_its_heads_in_float32():
     """V3.2's indexer at float16 weighs its heads by a float32 `weights_proj` over its input cast up, as
     its reference keeps that module in a float16 load (`_keep_in_fp32_modules`,
-    modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830): the weights are bit for bit a float32
-    indexer's over the float16 input cast up, as float32."""
+    modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830), and its kernel stays float32 through the
+    storage generation casts float32 master weights to (`decoding_storage`): the weights are bit for bit a
+    float32 indexer's over the float16 input cast up, as float32."""
     hidden = jnp.asarray(np.random.default_rng(0x3080).standard_normal((2, 5, 32)), jnp.float16)
 
     def weigh(module, x):
@@ -262,7 +264,9 @@ def test_a_float16_indexer_weighs_its_heads_in_float32():
 
     half = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float16)
     variables = half.init(jax.random.key(0), hidden, method=weigh)
-    weights = half.apply(variables, hidden, method=weigh)
+    stored = decoding_storage(half, variables)
+    assert stored["params"]["weights_proj"]["kernel"].dtype == jnp.float32
+    weights = half.apply(stored, hidden, method=weigh)
     single = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float32)
     wide = single.apply(variables, hidden.astype(jnp.float32), method=weigh)
     assert weights.dtype == jnp.float32
