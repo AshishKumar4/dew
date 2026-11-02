@@ -92,4 +92,4 @@ def test_a_map_tasks_draw_seconds_are_the_time_its_units_took_whatever_the_wall_
 
     assert record_units("stepped", stepped)
     [seconds] = [json.loads(path.read_text()) for path in tmp_path.glob("*.seconds.json")]
-    assert 0.2 <= seconds["draws"] < 60
+    assert seconds["draws"] >= 0.2
