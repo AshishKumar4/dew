@@ -14,10 +14,13 @@ import jax
 import numpy as np
 import pytest
 from ahead_programs import arguments, programs
+from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
+from token_support import token_rows
 
 from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.options import owned_program
-from dew.training.ahead import BuildTarget, compiled_in, dumps
+from dew.training import MeshSpec
+from dew.training.ahead import BuildTarget, compile_ahead, compile_only_gpus, compiled_in, dumps
 
 pytestmark = pytest.mark.gpu(reason="a program compiled ahead runs on the GPU it was built for")
 
@@ -48,6 +51,35 @@ with executable_only():
 with open(sys.argv[3], "wb") as file:
     pickle.dump(results, file)
 """
+TRAIN = """
+import sys
+
+import jax
+from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
+from token_support import token_rows
+
+from dew.training import MeshSpec
+from dew.training.ahead import AheadOfTime
+
+run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True)
+assert int(run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1).step) == 1
+"""
+COMPUTING = "--xla_gpu_enable_fast_min_max=true"
+"""An XLA flag that changes what a program computes, which a process loading programs compiled without it is
+refused for (`BuildTarget.held`)."""
+
+
+def environment_of(tmp_path: Path) -> dict[str, str]:
+    """This process's environment for a fresh one running a script under `tmp_path`, with this suite's
+    modules importable."""
+    tests = str(Path(__file__).resolve().parent)
+    paths = os.pathsep.join([str(tmp_path), tests, os.environ.get("PYTHONPATH", "")])
+    return {**os.environ, "PYTHONPATH": paths}
+
+
+def computing_otherwise(environment: dict[str, str]) -> dict[str, str]:
+    """`environment` with `COMPUTING` among its XLA flags."""
+    return {**environment, "XLA_FLAGS": f"{environment.get('XLA_FLAGS', '')} {COMPUTING}".strip()}
 
 
 def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_for_bit_as_compiled_here(
@@ -59,21 +91,39 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         assert BuildTarget.of(jax.devices()[:1]) == own
     for name, text in (("build.py", BUILD), ("run.py", RUN)):
         (tmp_path / name).write_text(text)
-    tests = str(Path(__file__).resolve().parent)
-    paths = os.pathsep.join([str(tmp_path), tests, os.environ.get("PYTHONPATH", "")])
-    environment = {**os.environ, "PYTHONPATH": paths}
+    environment = environment_of(tmp_path)
     # Built where no GPU is visible, as a CPU host builds them.
     build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot")]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
     (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
-    # Loaded and run in a fresh process whose compilers' dumps must stay empty.
-    subprocess.run([sys.executable, str(tmp_path / "run.py"), str(tmp_path / "programs.dew-aot"),
-                    str(tmp_path / "arguments.pkl"), str(tmp_path / "outputs.pkl")],
-                   env=dumps(tmp_path / "dumps", environment), check=True)
+    # Loaded and run in a fresh process whose compilers' dumps must stay empty; refused in one whose XLA
+    # computes otherwise.
+    run = [sys.executable, str(tmp_path / "run.py"), str(tmp_path / "programs.dew-aot"),
+           str(tmp_path / "arguments.pkl"), str(tmp_path / "outputs.pkl")]
+    subprocess.run(run, env=dumps(tmp_path / "dumps", environment), check=True)
     assert compiled_in(tmp_path / "dumps") == []
+    refused = subprocess.run(run, env=computing_otherwise(environment), capture_output=True, text=True)
+    assert refused.returncode != 0 and COMPUTING in refused.stderr, refused.stderr[-2000:]
     ahead = pickle.loads((tmp_path / "outputs.pkl").read_bytes())
     for name, (function, _) in programs(generation).items():
         with assumed(generation):
             here = np.asarray(owned_program(function)(*arrays[name]))
         assert ahead[name].dtype == here.dtype and ahead[name].tobytes() == here.tobytes(), name
+
+
+def test_a_step_compiled_ahead_for_this_gpu_trains_here_and_is_refused_where_xla_computes_otherwise(
+        tmp_path):
+    """A trainer's step compiled ahead for this GPU's generation and saved trains from it in a fresh process
+    of this environment, and a fresh process whose XLA computes otherwise is refused by the trainer's loader,
+    naming the flag: the one rule every loader holds (row 3606)."""
+    generation = BuildTarget.of(jax.devices()[:1]).generation
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    target = MeshSpec().build(compile_only_gpus(generation, 1))
+    compile_ahead(fine_tune(target, xla=True), batch).save(tmp_path / "step.dew-aot")
+    (tmp_path / "train.py").write_text(TRAIN)
+    environment = environment_of(tmp_path)
+    train = [sys.executable, str(tmp_path / "train.py"), str(tmp_path / "step.dew-aot")]
+    subprocess.run(train, env=environment, check=True)
+    refused = subprocess.run(train, env=computing_otherwise(environment), capture_output=True, text=True)
+    assert refused.returncode != 0 and COMPUTING in refused.stderr, refused.stderr[-2000:]
