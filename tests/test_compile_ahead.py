@@ -742,10 +742,13 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     built.save(tmp_path / "programs.dew-aot")
     loaded = AheadPrograms.load(tmp_path / "programs.dew-aot")
     assert loaded == built
-    with pytest.raises(ValueError, match="device_kind"):
+    with pytest.raises(ValueError, match="generation 'sm90'"):
         loaded.loaded()
     here = BuildTarget.of(jax.devices()[:1])
-    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "device_kind"]
+    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "multiprocessors"]
+    # A kind of the generation with its multiprocessors is its target, whatever its memory or its name: the
+    # build's target is sm90's facts, 132 multiprocessors.
+    assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
 
 
 def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():

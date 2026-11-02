@@ -60,7 +60,7 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
-from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, tpu
+from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, runtime_facts, tpu
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, step_flops
@@ -314,15 +314,18 @@ def computation_flags(flags: str | None = None) -> tuple[str, ...]:
 @dataclasses.dataclass(frozen=True)
 class BuildTarget:
     """What programs compiled ahead (`compile_programs`) were built for and with, which a process loading them
-    (`AheadPrograms.loaded`) must be: the GPU kind and how many, the generation whose facts their launches
-    derived for, the JAX and jaxlib that compiled them, the XLA flags that decide what they compute
-    (`computation_flags`), and the host architecture their host code was built for (a Mosaic kernel carries
-    host code beside its cubin). The CUDA plugin is not part of it: an H100 ran sm90 programs a CUDA 12 plugin
-    built, unchanged, under the CUDA 13 plugin of a node's own environment, bit for bit as the jitted programs
-    (2026-11-02, GS-compileahead-pilot-h100)."""
+    (`AheadPrograms.loaded`) must be: the generation whose facts XLA compiled for and their launches
+    derived for (`target_config`), its multiprocessors among them, which a launch's grid and XLA's fusions
+    read, and how many devices; the JAX and jaxlib that compiled them, the XLA flags that decide what they
+    compute (`computation_flags`), and the host architecture their host code was built for (a Mosaic
+    kernel carries host code beside its cubin). A GPU kind of the generation with as many multiprocessors
+    runs them: an A100 of 40 GB as one of 80 (2026-11-03, GS-compile-programs3-a100 was refused on the
+    kind's name alone); an H100 PCIe (114) does not run an SXM's (132). The CUDA plugin is not part of it:
+    an H100 ran sm90 programs a CUDA 12 plugin built, unchanged, under the CUDA 13 plugin of a node's own
+    environment, bit for bit as the jitted programs (2026-11-02, GS-compileahead-pilot-h100)."""
 
     generation: str
-    device_kind: str
+    multiprocessors: int | None
     devices: int
     jax: str
     jaxlib: str
@@ -332,9 +335,13 @@ class BuildTarget:
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
         """The target `devices` are, under this process's JAX, XLA flags and host."""
-        kind = devices[0].device_kind
-        return BuildTarget(gpu_target(kind).generation, kind, len(devices), importlib.metadata.version("jax"),
-                           importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
+        device = devices[0]
+        target = gpu_target(device.device_kind)
+        # A GPU's own multiprocessors as it reports them (`runtime_facts`), the table's where it is no GPU.
+        target = runtime_facts(target, device) if device.platform == "gpu" else target
+        return BuildTarget(target.generation, target.multiprocessors, len(devices),
+                           importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
+                           computation_flags(), platform.machine())
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's."""
@@ -409,7 +416,8 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             raise ValueError(f"program {name!r} cannot be compiled ahead (an array it closed over is a "
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
-    target = BuildTarget(generation, devices[0].device_kind, 1, importlib.metadata.version("jax"),
+    target = BuildTarget(generation, gpu_target(generation).multiprocessors, 1,
+                         importlib.metadata.version("jax"),
                          importlib.metadata.version("jaxlib"), computation_flags(), platform.machine())
     return AheadPrograms(target, built)
 
