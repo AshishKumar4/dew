@@ -25,6 +25,7 @@ from steady_state import guarded, steady_state
 from tool_policy import ToolPolicy
 
 from dew.inference import RunProcessor, TextGeneration
+from dew.inference.banks import HeldBanks
 from dew.inference.loading import place
 from dew.inference.serving import Server
 from dew.mesh import BATCH_AXES
@@ -1006,6 +1007,30 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
                                        decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+
+
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws(options):
+    """A scanned MoE decoder over a banked store (`dew.inference.banks.HeldBanks.place`, the run's weights
+    one array a leaf) keeps its resident cache banked as its weights are, the run's layers one array under
+    the run's name, which every step reads and writes where it lies: an admitted prompt lands in its row of
+    every layer of it, dense or paged, and each row draws what the task over the same store draws alone."""
+    def routed(*, scanned: bool) -> CausalTransformer:
+        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=4, num_heads=2, head_dim=8,
+                                 mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scanned,
+                                 mixture=Mixture(experts=4, top_k=2))
+
+    scanned = routed(scanned=True)
+    weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bound = TextGeneration(scanned, HeldBanks(weights).place(scanned), RunProcessor(Digits()),
+                           sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, **options)
+    assert "layers_0_3" in server.cache and not any(f"layers_{index}" in server.cache for index in range(4))
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
 
