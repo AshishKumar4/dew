@@ -98,23 +98,30 @@ class Plan:
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, pages: Pages | None = None) -> Plan:
-    """The work list of a packed call (`packed`) on `target`: the forward's derived config, and slices
-    opened until the programs fill the multiprocessors at the config's residency
-    (`resources.resident_programs`, its registers; its shared memory's), each at least a key tile."""
+    """The work list of a packed call (`packed`) on `target`: the forward's derived config and its slices.
+    One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
+    nothing). Else as many as its programs' residency fills (`resources.resident_programs`, its registers;
+    its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter slice's
+    walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
+    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
+    whole step took 13)."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=True,
                                               out_dtype=jnp.float32, masked=True, pages=pages)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
     if config is None:
         raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
+    processors = target.multiprocessors or 1
+    tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
+    programs = query.shape[0] * query.shape[2] * tiles
+    if programs >= processors:
+        return Plan(config, 1)
     family = bundle_of(config, query.dtype)
     resident = resources.resident_programs(family, config.consumers, op.registers(ba, config), target)
     if target.shared_limit:
         resident = min(resident, max(1, target.shared_limit // op.staged_bytes(ba, config, target)))
-    tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
-    programs = query.shape[0] * query.shape[2] * tiles
-    wanted = math.ceil((target.multiprocessors or 1) * resident / programs)
-    return Plan(config, max(1, min(wanted, math.ceil(spans.keys / config.block_k))))
+    longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
+    return Plan(config, max(1, min(math.ceil(processors * resident / programs), longest)))
 
 
 def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
