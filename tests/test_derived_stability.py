@@ -133,8 +133,9 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
     out, pull = jax.vjp(reference, query, key, value)
     theirs = (out, *pull(dout))
     with derived():
-        mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles),
-                *attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)[:3])
+        made = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+        mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles), made.query, made.key,
+                made.value)
     for leaf, ours, exact in zip(("output", "dq", "dk", "dv"), mine, theirs, strict=True):
         finite = np.isfinite(np.asarray(exact, np.float32))
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"
