@@ -11,6 +11,8 @@ launches at the derivation's where it takes two, else (a call whose derivation t
 deterministic mode's) at the dK/dV launch on the layout whose consumers feed their rings (`FED`).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -99,28 +101,38 @@ def _backward_op(case: dict[str, str]):
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
-def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
-    """The backward config `case` pins (its launch form on the Mosaic mainloop, the module's docstring), or
-    None where another mainloop runs its backward; raises where the route serves no such form."""
+@functools.cache
+def _route(call: tuple[tuple[str, str], ...]):
+    """What the Mosaic backward does with a call (`case` but its launch): whether it declines it, and else the
+    config it derives and the two launches' pin (`FED`) where that is legal, under the call's generation."""
+    case = dict(call)
     with generation.assumed(case["generation"]):
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
-            if case["launch"] != "two":
-                raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
-            return None
-        derived = op.derived(ba, target)
-        if derived is None:
-            raise ValueError(f"the Mosaic backward derives no config for {case}")
-        if case["launch"] == "two":
-            config = derived if not derived.fused else attention_mosaic.BackwardTiles(
-                64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
-        elif derived.fused and derived.shared_keys == (case["launch"] == "shared-keys"):
-            config = derived
-        else:
-            config = None
-        if config is None or not op.legal(ba, config, target):
-            raise ValueError(f"the route serves no {case['launch']} launch for {case}")
-        return config
+            return True, None, None
+        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
+        return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
+
+
+def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
+    """The backward config `case` pins (its launch form on the Mosaic mainloop, the module's docstring), or
+    None where another mainloop runs its backward; raises where the route serves no such form."""
+    declined, derived, two = _route(tuple((axis, value) for axis, value in case.items() if axis != "launch"))
+    if declined:
+        if case["launch"] != "two":
+            raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
+        return None
+    if derived is None:
+        raise ValueError(f"the Mosaic backward derives no config for {case}")
+    if case["launch"] == "two":
+        config = derived if not derived.fused else two
+    elif derived.fused and derived.shared_keys == (case["launch"] == "shared-keys"):
+        config = derived
+    else:
+        config = None
+    if config is None:
+        raise ValueError(f"the route serves no {case['launch']} launch for {case}")
+    return config
 
 
 def supported(case: dict[str, str]) -> bool:
@@ -169,7 +181,28 @@ def _drawn(case: dict[str, str]):
     return draw
 
 
-CASES = ()
+CASES = (
+    ('sm90', '64', 'mha', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '128', 'gqa-8-2', 'full', 'key-bias', 'two', 'float16', 'accurate'),
+    ('sm80', '256', 'gqa-8-4', 'documents', 'tile-bias', 'two', 'bfloat16', 'fast'),
+    ('sm80', '64', 'mha', 'causal', 'softcap', 'two', 'float16', 'accurate'),
+    ('sm90', '256', 'gqa-8-2', 'full', 'plain', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'documents', 'plain', 'two', 'float16', 'accurate'),
+    ('sm80', '128', 'mha', 'causal', 'key-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '256', 'mha', 'causal', 'tile-bias', 'two', 'float16', 'accurate'),
+    ('sm90', '64', 'gqa-8-2', 'documents', 'softcap', 'two', 'bfloat16', 'fast'),
+    ('sm80', '64', 'gqa-8-2', 'full', 'tile-bias', 'two', 'bfloat16', 'accurate'),
+    ('sm90', '64', 'gqa-8-4', 'causal', 'key-bias', 'two', 'float16', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'full', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '128', 'mha', 'full', 'softcap', 'two', 'bfloat16', 'fast'),
+    ('sm90', '256', 'mha', 'documents', 'key-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '64', 'gqa-8-2', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '256', 'mha', 'causal', 'plain', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm90', '256', 'gqa-8-4', 'causal', 'softcap', 'two', 'bfloat16', 'fast'),
+    ('sm90', '128', 'mha', 'causal', 'tile-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '256', 'gqa-8-4', 'causal', 'plain', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm80', '64', 'mha', 'causal', 'plain', 'two', 'bfloat16', 'fast'),
+)
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("attention")`, regenerated where the axes or the route's support change)."""
 
