@@ -148,8 +148,10 @@ def _axes(variables, table=None) -> dict[str, tuple]:
     """Each leaf's declared logical axes, as the layout reads them, by its key path: those `variables`
     box, or the run's `table` (`Objective.parameter_axes`) for a state that mirrors them."""
     rules = Layout().axis_rules
+    # The EMA mirrors the variables whole under its field, as a trainer's state holds it.
+    ema = (jax.tree_util.DictKey("ema"),)
     with boxed(ruled_boxes(boxed_axes(variables) if table is None else table, rules)):
-        return {jax.tree_util.keystr(path): declared_axes(path, leaf.ndim)
+        return {jax.tree_util.keystr(path): declared_axes(path[1:] if path[:1] == ema else path, leaf.ndim)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(variables))}
 
 
