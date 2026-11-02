@@ -44,6 +44,7 @@ import logging
 import os
 import pickle
 import platform
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -458,8 +459,12 @@ def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
     root = directory.resolve()
     for part in ("xla", "mosaic"):
         (root / part).mkdir(parents=True, exist_ok=True)
-        if not os.access(root / part, os.W_OK | os.X_OK):
-            raise PermissionError(f"{root / part} cannot be written, where a run's compiles go")
+        if (root / part).is_symlink():
+            raise ValueError(f"{root / part} is a link, whose writes compiled_in would not read")
+        # A file written and removed, as a compiler's dump would be: a full or read-only filesystem refuses
+        # it.
+        with tempfile.NamedTemporaryFile(dir=root / part, prefix=".written-"):
+            pass
     given = environment.get("XLA_FLAGS", "").split()
     flags = [flag for flag in given if not flag.startswith(DUMP_FLAGS)]
     kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
@@ -471,6 +476,8 @@ def compiled_in(directory: Path) -> list[Path]:
     """What the compilers of a run given `dumps(directory, ...)` wrote: none where nothing compiled. Refused
     where `directory` is not one `dumps` made, or cannot be read, never read as empty."""
     root = directory.resolve()
+    if linked := [part for part in ("xla", "mosaic") if (root / part).is_symlink()]:
+        raise ValueError(f"{root}'s {', '.join(linked)} dump directory is a link, whose writes go unread")
     if missing := [part for part in ("xla", "mosaic") if not (root / part).is_dir()]:
         raise FileNotFoundError(f"{root} holds no {', '.join(missing)} dump directory: dumps made none here")
 
