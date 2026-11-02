@@ -158,6 +158,23 @@ def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
     assert graph.check_bool(algebra.rules.positive_scale(literal))
 
 
+def test_each_contraction_states_its_own_length():
+    """Two products of one parameters' index (one dimension numbers, one dtype) contracting 2 and 4096
+    elements: each states its own contracted length's power (`rules.contracted_length`, by its product), where
+    one stated per parameters' index let a reordering of the longer read the shorter's and admit a sum past
+    the program's reach (row 3577)."""
+    from egglog import EGraph, eq, get_callable_args, i64
+
+    closed = jax.make_jaxpr(lambda b, c, a, x: (jnp.dot(b, c), jnp.dot(a, x)))(
+        *rows(1, (8, 2), (2, 16), (8, 4096), (4096, 16)))
+    region = terms.region(closed)
+    graph = EGraph()
+    program.stated(graph, region)
+    short, long = (term for term, _ in region.shapes if get_callable_args(term, terms.Term.dot) is not None)
+    assert graph.check_bool(eq(algebra.rules.contracted_length(short)).to(i64(1)))
+    assert graph.check_bool(eq(algebra.rules.contracted_length(long)).to(i64(12)))
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
