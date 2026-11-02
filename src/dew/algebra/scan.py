@@ -1,14 +1,12 @@
 """A recurrence's chunk forms derived from its token update (docs/design/algebra.md §6.9, `Scan`): a state `h`
 updated token by token, `h = update(h, x_t)`, read out each token, `o_t = readout(h, x_t)`.
 
-The derivation reads the update's and the readout's jaxprs at one token, each value that reads the state as
-a sum of terms (`_Term`): the state scaled, a rank-one correction of it (`a (c^T h)`), and a rank-one input
-free of it (`B (x) u`), each scaled by a product of the token's scalars. The update must be affine in the
-state: a decay `D_t = exp(z_t)` (or `exp2`) on the state, a scalar or each row's own (a per-key vector);
-corrections, each `-s_t B_t (c_t^T D_t h)`, reading the decayed state along the input's own vector `B_t`;
-and one input `B_t (x) u_t`. So `h_t = (I - s_t B_t c_t^T) D_t h_{t-1} + B_t u_t^T`: the gated delta rule
-(a scalar decay, `s = beta`, `B = c = k`, `u = beta v`), Kimi's delta attention (a per-key decay), or with
-no correction Mamba-2's state space. The readout must contract the
+The derivation reads the update's and the readout's jaxprs at one token as an affine map of the state by
+rules (`linear_scan.parts`): a decay `D_t = exp(z_t)` (or `exp2`) on the state, a scalar or each row's own
+(a per-key vector); one input `B_t (x) u_t` free of it; and corrections along the input's own vector,
+reading the decayed state, `-s_t B_t (c_t^T D_t h)`. So `h_t = (I - s_t B_t c_t^T) D_t h_{t-1} + B_t u_t^T`:
+the gated delta rule (a scalar decay, `s = beta`, `B = c = k`, `u = beta v`), Kimi's delta attention (a
+per-key decay), or with no correction Mamba-2's state space. The readout must contract the
 state with a vector `q_t` along `B_t`'s axis, plus a part free of it. Over a chunk, with `G` the decay
 exponents' inclusive prefix (per key), `Gamma[i, j, k] = exp(G_ik - G_jk)` for `j <= i` and
 `gamma = exp(G)`, the inputs each token's correction leaves, `w`, solve the unit lower-triangular system
@@ -44,12 +42,11 @@ import numpy as np
 from jax import lax
 from jax.extend import core as jcore
 
-from dew.algebra import carry, program, terms
-from dew.algebra.forms import Derived, Program, Refused, aval, environment, evaluate, read_by
+from dew.algebra import carry, cost, linear_scan, program, terms
+from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
 
 Axes = tuple[str, ...]
-Atom = jcore.Var | jcore.Literal
 
 RESET_DECAY = -1e4
 """The exponent a reset token's decay takes in place of its own (natural or base 2): the state entering it
@@ -59,10 +56,6 @@ so a span's exponent is a difference of finite partials (an infinity less an inf
 kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an infinity times 0 is a NaN);
 thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
 difference of two partials exact past them."""
-
-_KEEPING = frozenset({"convert_element_type", "reshape", "expand_dims", "squeeze", "copy", "copy_p"})
-"""Equations that keep a value's elements and shape class (a cast, a unit-axis reshape)."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Scan:
@@ -87,55 +80,6 @@ class Scan:
     state: tuple[tuple[int, ...], jnp.dtype]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Term:
-    """One term of a value that reads the state, or of a row it reads: `kind` "state" (`h`), "corrected"
-    (`left (right^T h)`), "input" (`left (x) right`, free of the state), "read" (`right^T h`, a row) or
-    "free" (`right`, a row's part free of the state); scaled by `sign` times the product of `factors`, the
-    token's scalars. `left` and `right` are vectors of the traced jaxpr, along the state's first axis but
-    an input's or a free row's `right`, along its second. A state term's `diag`, a first-axis vector, scales
-    the state's rows (a per-key decay), and a read or a correction of it reads the rows so scaled."""
-
-    kind: str
-    factors: tuple = ()
-    sign: float = 1.0
-    left: Atom | None = None
-    right: Atom | None = None
-    diag: Atom | None = None
-
-    def scaled(self, factor=None, sign: float = 1.0) -> _Term:
-        return dataclasses.replace(self, factors=self.factors + ((factor,) if factor is not None else ()),
-                                   sign=self.sign * sign)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Symbolic:
-    """A value that reads the state: `shape` "matrix" (the state's), "row" (a vector along its second axis)
-    or "spread" (a row broadcast along the first axis), the sum of `terms`."""
-
-    shape: str
-    terms: tuple[_Term, ...]
-
-
-@dataclasses.dataclass(frozen=True)
-class _Affine:
-    """A token's affine update and linear readout as the traced jaxprs' values: the decay's exponent
-    (`exponent`, base 2 where `base2`, a scalar or each key's own where `per_key`), the input (`input`), the
-    corrections (`corrections`, each with the decay among its factors, which `strength` leaves out), the
-    readout's contraction (`read`) and its free terms (`free`)."""
-
-    update: Program
-    readout: Program
-    exponent: Atom
-    base2: bool
-    per_key: bool
-    decay: Atom
-    input: _Term
-    corrections: tuple[_Term, ...]
-    read: _Term
-    free: tuple[_Term, ...]
 
 
 def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived:
@@ -165,10 +109,15 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             return jax.make_jaxpr(named)(jax.ShapeDtypeStruct(shape, dtype), *tokens)
 
     corrects: list = []  # whether a token corrects the state, once a chunk was read
+    decomposed: dict = {}  # the token's affine map by its operands' types, its e-graph saturated once
 
     def parts(chunk: Mapping):
-        affine = _affine(traced(declaration.update, chunk), traced(declaration.readout, chunk))
-        corrects[:] = [bool(affine.corrections)]
+        types = tuple((chunk[name].shape, str(chunk[name].dtype)) for name in names)
+        if types not in decomposed:
+            decomposed[types] = linear_scan.parts(traced(declaration.update, chunk),
+                                                   traced(declaration.readout, chunk))
+        affine = decomposed[types]
+        corrects[:] = [affine.correction is not None]
         # An operand with no walked axis (a rate, a skip) is every token's.
         axes = [declaration.operands[name].index(declaration.walked)
                 if declaration.walked in declaration.operands[name] else None for name in names]
@@ -195,17 +144,24 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
-        B, _, s, C, _, _ = values
-        # The solve's inverse reads no state: an operand of the chunk's function, prepared with the rest.
-        lower = _inverse_of(decays, B, s, C) if affine.corrections else jnp.zeros((B.shape[0],) * 2, B.dtype)
-        given = (*decays, lower, *values)
-        key = (affine.base2, bool(affine.corrections), *((value.shape, str(value.dtype)) for value in given))
+        tokens = dict(zip(TOKENS, values, strict=True))
+        extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1])
+        corrected = affine.correction is not None
+        form = _form(extents, corrected)
+        # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
+        # operands of its function, whose state the carry reads (`carry.split`).
+        held = _prepared(form, tokens, decays)
+        given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
+        key = (affine.base2, corrected, *((value.shape, str(value.dtype)) for value in given))
         if key not in splits:
             h = jax.ShapeDtypeStruct(shape, dtype)
             avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
-            splits[key] = carry.split(functools.partial(_chunk, bool(affine.corrections)), h, avals, (1,),
-                                      saturation=saturation,
-                                      ranges=_ranges(declaration, names, chunk, affine, B.shape[0]),
+            ranges = _ranges(declaration, names, chunk, affine, extents.tokens)
+            bound = ranges.pop("inverse", None)
+            ranges.update({DECAYS + len(TOKENS) + place: bound for place, node in enumerate(held)
+                           if bound is not None and linear_scan.inverse(node)})
+            splits[key] = carry.split(functools.partial(_chunk, form, tuple(held)), h, avals, (1,),
+                                      saturation=saturation, ranges=ranges,
                                       state_range=declaration.ranges.get("state"))
         return Prepared((natural, splits[key].prepare(*given)), splits[key])
 
@@ -259,14 +215,25 @@ class Prepared:
 
 
 DECAYS = 4
-"""The chunk function's leading operands: its decays (`_Decays`' four fields), the solve's inverse after."""
+"""The chunk function's leading operands: its decays (`_Decays`' four fields), its tokens' values after."""
+
+TOKENS = ("B", "U", "s", "C", "Q", "R")
+"""A token's values (`_token`'s), as the chunk's form names them (`linear_scan.Chunk.token`)."""
+
+
+@functools.cache
+def _form(extents: linear_scan.Extents, corrected: bool) -> linear_scan.Form:
+    """The chunk's form at its extents, derived by the identities of affine scans and extracted by the
+    work-span model under XLA's schedule (`linear_scan.derive`)."""
+    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(cost.target()))
 
 
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
-            chunk_size: int) -> dict[int, float]:
+            chunk_size: int) -> dict:
     """The chunk function's operands' ranges (`_chunk`'s, `carry.split`'s): its decays at most 1, each token
-    value's (`_token`'s) as the declared operands bound it (`terms.Region`'s magnitudes), the solve's inverse
-    by its entries' bound; a value an unbounded operand's has none."""
+    value's (`_token`'s) as the declared operands bound it (`terms.Region`'s magnitudes), and the solve's
+    inverse's entries' bound under "inverse" (`prepare` places it); a value an unbounded operand's has
+    none."""
     tokens = [jax.ShapeDtypeStruct(tuple(extent for extent, axis in zip(chunk[name].shape,
                                                                           declaration.operands[name],
                                                                           strict=True)
@@ -280,19 +247,19 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
     for index, (output, literal) in enumerate(zip(region.outputs, region.literal_outputs, strict=True)):
         if output is None:
             # A literal output (a delta rule's unit correction scale) bounds itself.
-            bounded[DECAYS + 1 + index] = float(np.max(np.abs(np.asarray(literal, np.float64))))
+            bounded[DECAYS + index] = float(np.max(np.abs(np.asarray(literal, np.float64))))
             continue
         magnitude = region.magnitudes.get(terms.key(output))
         if magnitude is not None:
             # No bound where it passes float64's range (a step of 2**1023 declared, `prepare`'s values).
-            bounded[DECAYS + 1 + index] = math.inf if magnitude >= 1024 else 2.0 ** magnitude
+            bounded[DECAYS + index] = math.inf if magnitude >= 1024 else 2.0 ** magnitude
     # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
     # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
     # entries `s_i C_i . B_j` times a decay at most 1, a contraction over the keys: at most the declared
     # overlap (`Scan.ranges`' "overlap"), else the corrections' elementwise bounds' product times the keys'
     # count (two tokens of 16 keys each element at most 1 overlap by 16).
-    places = ("B", "U", "s", "C", "Q", "R")
-    tokens_at = {name: DECAYS + 1 + place for place, name in enumerate(places)}
+    places = TOKENS
+    tokens_at = {name: DECAYS + place for place, name in enumerate(places)}
     overlap = declaration.ranges.get("overlap")
     entry = None if overlap is None else max(map(abs, overlap)) if isinstance(overlap, tuple) else overlap
     if entry is None and all(tokens_at[name] in bounded for name in ("B", "s", "C")):
@@ -302,327 +269,142 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
     if entry is not None:
         # No bound where it passes float64's range (16 unit keys over 256 tokens: 17**255).
         power = max(chunk_size - 1, 0) * math.log2(1.0 + entry)
-        bounded[DECAYS] = math.inf if power >= 1024 else 2.0 ** power
+        bounded["inverse"] = math.inf if power >= 1024 else 2.0 ** power
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
-def _chunk(corrects: bool, h, entering, to_last, whole, between, lower, B, U, s, C, Q, R):
+def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, between, *values):
     """A chunk's outputs and the state it leaves, from the state `h` entering it, its decays (`_Decays`'
-    fields, each at most 1), its solve's inverse less its diagonal (`_inverse_of`, zeros where no token
-    corrects the state) and its tokens' values (`_token`): the module's forms, which `carry.split`
+    fields, each at most 1), its tokens' values (`_token`'s, `TOKENS`) and the form's prepared values
+    (`held`'s nodes, `_prepared`): the extracted form evaluated (`_evaluated`), which `carry.split`
     splits."""
     decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
-    w = _corrected(decays, lower, U, s, C, h) if corrects else U
-    carried = float32_einsum("tk,tv->kv", B * decays.to_last, w)
-    outputs = float32_matmul(Q * decays.entering, h) + float32_matmul(_paired(Q, B, decays.between), w) + R
-    return outputs, decays.whole[:, None] * h + carried
+    tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
+    known = {linear_scan.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
+    return (_evaluated(form.outputs, tokens, decays, h, known),
+            _evaluated(form.state, tokens, decays, h, known))
 
 
-def _producer(jaxpr: jcore.Jaxpr, var):
-    for equation in jaxpr.eqns:
-        if var in equation.outvars:
-            return equation
-    return None
+def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays) -> dict:
+    """The form's largest values that read no state but its tokens and decays (a solve's inverse, a gram,
+    a token decayed), by node, evaluated."""
+    known: dict = {}
+    nodes = linear_scan.prepared((form.outputs, form.state))
+    return {node: _evaluated(node, tokens, decays, None, known) for node in nodes}
 
 
-def _scalar(atom) -> bool:
-    return isinstance(atom, jcore.Literal) or aval(atom).shape == ()
+def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
+    """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
+    `h`, each node once (`known`, by node)."""
+    from egglog import get_callable_args, get_literal_value
+
+    Chunk = linear_scan.Chunk
+    named = linear_scan.key(node)
+    if named in known:
+        return known[named]
+
+    def of(child):
+        return _evaluated(child, tokens, decays, h, known)
+
+    if (args := get_callable_args(node, Chunk.token)) is not None:
+        value = tokens[get_literal_value(args[0])]
+    elif get_callable_args(node, Chunk.entering) is not None:
+        value = h
+    elif (args := get_callable_args(node, Chunk.decay)) is not None:
+        value = getattr(decays, get_literal_value(args[0]))
+    elif (args := get_callable_args(node, Chunk.loop)) is not None:
+        value = _looped(tokens, decays, h, of(args[0]), corrected=True)
+    elif (args := get_callable_args(node, Chunk.plain)) is not None:
+        value = _looped(tokens, decays, h, of(args[0]), corrected=False)
+    elif (args := get_callable_args(node, Chunk.pair)) is not None:
+        value = (of(args[0]), of(args[1]))
+    elif (args := get_callable_args(node, Chunk.outputs)) is not None:
+        value = of(args[0])[0]
+    elif (args := get_callable_args(node, Chunk.state)) is not None:
+        value = of(args[0])[1]
+    elif (args := get_callable_args(node, Chunk.gram)) is not None:
+        strict = get_literal_value(args[2])
+        between = decays.between
+        if strict:
+            below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]
+            between = jnp.where(below, between, 0.0)
+        value = _paired(of(args[0]), of(args[1]), between)
+    elif (args := get_callable_args(node, Chunk.rows)) is not None:
+        value = of(args[1])[:, None] * of(args[0])
+    elif (args := get_callable_args(node, Chunk.times)) is not None:
+        value = of(args[0]) * of(args[1])
+    elif (args := get_callable_args(node, Chunk.matmul)) is not None:
+        value = float32_matmul(of(args[0]), of(args[1]))
+    elif (args := get_callable_args(node, Chunk.plus)) is not None:
+        value = of(args[0]) + of(args[1])
+    elif (args := get_callable_args(node, Chunk.minus)) is not None:
+        value = of(args[0]) - of(args[1])
+    elif (args := get_callable_args(node, Chunk.decayed)) is not None:
+        value = decays.whole[:, None] * of(args[0])
+    elif (args := get_callable_args(node, Chunk.written)) is not None:
+        value = float32_einsum("tk,tv->kv", of(args[0]) * decays.to_last, of(args[1]))
+    elif (args := get_callable_args(node, Chunk.doubled)) is not None:
+        value = _lowered(of(args[0]))
+    elif (args := get_callable_args(node, Chunk.substituted)) is not None:
+        value = _substituted(of(args[0]), of(args[1]))
+    else:
+        raise Refused(f"a chunk form's node of no evaluation: {node}")
+    known[named] = value
+    return value
 
 
-def _vector_along(jaxpr: jcore.Jaxpr, atom, axis: int, rank: int):
-    """The vector `atom` broadcasts along `axis` of a rank-`rank` value (through broadcasts and
-    element-keeping equations), or None."""
-    position, base = None, atom
-    chain = []
-    while isinstance(base, jcore.Var) and len(aval(base).shape) != 1:
-        equation = _producer(jaxpr, base)
-        if equation is None or equation.primitive.name not in _KEEPING | {"broadcast_in_dim"}:
-            return None
-        chain.append(equation)
-        base = equation.invars[0]
-    if not isinstance(base, jcore.Var) or len(aval(base).shape) != 1:
-        return None
-    position = 0
-    for equation in reversed(chain):
-        if equation.primitive.name == "broadcast_in_dim":
-            position = equation.params["broadcast_dimensions"][position]
-        else:
-            before, after = aval(equation.invars[0]).shape, aval(equation.outvars[0]).shape
-            long_before = [index for index, extent in enumerate(before) if extent != 1]
-            long_after = [index for index, extent in enumerate(after) if extent != 1]
-            if [before[index] for index in long_before] != [after[index] for index in long_after]:
-                return None
-            position = long_after[long_before.index(position)]
-    return base if position == axis and len(aval(atom).shape) == rank else None
+def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool):
+    """The token loop over the chunk, each token's step in turn (its decay `exp(z_t)` the pair of it and the
+    token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs and the state it leaves."""
+    B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
+    outputs = []
+    for t in range(B.shape[0]):
+        decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
+        h = decay[:, None] * h
+        if corrected:
+            h = h - s[t] * B[t][:, None] * float32_matmul(C[t][None, :], h)
+        h = h + B[t][:, None] * values[t][None, :]
+        outputs.append(float32_matmul(Q[t][None, :], h)[0] + R[t])
+    return jnp.stack(outputs), h
 
 
-def _symbolic(jaxpr: jcore.Jaxpr, state) -> dict:
-    """Each value of `jaxpr` that reads `state`, as a `_Symbolic` sum of terms; refused where one is not of
-    the module's form."""
-    env = {state: _Symbolic("matrix", (_Term("state"),))}
-    for equation in jaxpr.eqns:
-        read = [var for var in equation.invars if isinstance(var, jcore.Var) and var in env]
-        if not read:
-            continue
-        (out,) = equation.outvars
-        env[out] = _rule(jaxpr, equation, env)
-    return env
+def _substituted(lower, given):
+    """`(I + lower)^-1 given` by forward substitution, `lower` strictly lower: a row a step, each reading the
+    rows before it."""
+    def row(index, solved):
+        return solved.at[index].set(given[index] - float32_matmul(lower[index][None, :], solved)[0])
+
+    return lax.fori_loop(0, given.shape[0], row, jnp.zeros_like(given))
 
 
-def _rule(jaxpr: jcore.Jaxpr, equation: jcore.JaxprEqn, env: dict) -> _Symbolic:
-    """One equation's output that reads the state (`_symbolic`)."""
-    name, operands = equation.primitive.name, equation.invars
-    symbolic = [env.get(var) if isinstance(var, jcore.Var) else None for var in operands]
-    first = symbolic[0]
-    if first is not None and name in _KEEPING:
-        return first
-    if first is not None and name == "neg":
-        return _Symbolic(first.shape, tuple(term.scaled(sign=-1.0) for term in first.terms))
-    if name in ("add", "sub"):
-        return _summed(jaxpr, operands, symbolic, minus=name == "sub")
-    if name == "mul":
-        return _product(jaxpr, operands, symbolic)
-    if first is not None and name == "broadcast_in_dim":
-        dimensions = tuple(equation.params["broadcast_dimensions"])
-        if first.shape == "row" and dimensions == (1,) and len(equation.params["shape"]) == 2:
-            return _Symbolic("spread", first.terms)
-        if first.shape in ("spread", "matrix") and dimensions == (0, 1):
-            return first
-        raise Refused("a value of the state broadcast other than a row along the state's first axis")
-    if name == "dot_general":
-        (left_axes, right_axes), batch = equation.params["dimension_numbers"]
-        second = symbolic[1]
-        if first is None and second is not None:
-            return _contracted(operands[0], second, left_axes, right_axes, batch)
-        if first is not None and second is None:
-            return _contracted(operands[1], first, right_axes, left_axes, batch)
-    raise Refused(f"the state read through {name}, which no chunk form here holds")
-
-
-def _summed(jaxpr, operands, symbolic, *, minus: bool) -> _Symbolic:
-    """A sum of two values, at least one of which reads the state; a free one is an input (a matrix's) or a
-    free row (a row's)."""
-    shape = next(value.shape for value in symbolic if value is not None)
-    terms = []
-    for index, (operand, value) in enumerate(zip(operands, symbolic, strict=True)):
-        sign = -1.0 if minus and index == 1 else 1.0
-        if value is None:
-            value = _free(jaxpr, operand, shape)
-        elif value.shape != shape:
-            raise Refused("a sum of values of the state of different shapes")
-        terms.extend(term.scaled(sign=sign) for term in value.terms)
-    return _Symbolic(shape, tuple(terms))
-
-
-def _free(jaxpr, operand, shape: str) -> _Symbolic:
-    """A value free of the state, as the terms of a sum of `shape`: a row's vector, or a matrix's outer
-    product of two vectors (scaled by scalars)."""
-    if shape == "row":
-        if _scalar(operand) or len(aval(operand).shape) != 1:
-            raise Refused("a row of the state plus a value that is not a row")
-        return _Symbolic("row", (_Term("free", right=operand),))
-    factors, left, right = _outer_factors(jaxpr, operand)
-    return _Symbolic("matrix", (_Term("input", tuple(factors), left=left, right=right),))
-
-
-def _outer_factors(jaxpr, atom) -> tuple[list, Atom, Atom]:
-    """A free matrix as scalars times the outer product of a first-axis and a second-axis vector."""
-    factors, left, right = _factored(jaxpr, atom)
-    if left is None or right is None:
-        raise Refused("a free term of the update that is not an outer product of two vectors")
-    return factors, left, right
-
-
-def _factored(jaxpr, atom) -> tuple[list, Atom | None, Atom | None]:
-    """A free rank-two value as a product of scalars, at most one first-axis vector and at most one
-    second-axis vector, each broadcast; refused where it is not."""
-    factors, left, right = [], None, None
-    pending = [atom]
-    while pending:
-        value = pending.pop()
-        producer = _producer(jaxpr, value) if isinstance(value, jcore.Var) else None
-        if _scalar(value):
-            factors.append(value)
-        elif (found := _vector_along(jaxpr, value, 0, 2)) is not None and left is None:
-            left = found
-        elif (found := _vector_along(jaxpr, value, 1, 2)) is not None and right is None:
-            right = found
-        elif producer is not None and producer.primitive.name == "mul":
-            pending.extend(producer.invars)
-        elif producer is not None and _passes(producer):
-            pending.append(producer.invars[0])
-        else:
-            raise Refused("a free term of the update that is not a product of scalars and two vectors")
-    return factors, left, right
-
-
-def _product(jaxpr, operands, symbolic) -> _Symbolic:
-    """A product with a value that reads the state: by a scalar, or a spread row by a first-axis vector (a
-    rank-one correction, or an input where the row is free)."""
-    if all(value is not None for value in symbolic):
-        raise Refused("a product of two values of the state (the state read twice)")
-    index = 0 if symbolic[0] is not None else 1
-    value, other = symbolic[index], operands[1 - index]
-    if _scalar(other) or value.shape == "row":
-        if not _scalar(other):
-            scalar = _scalar_broadcast(jaxpr, other)
-            if scalar is None:
-                raise Refused("a row of the state scaled by a value that is not a scalar")
-            other = scalar
-        return _Symbolic(value.shape, tuple(term.scaled(other) for term in value.terms))
-    factors, left, right = _factored(jaxpr, other)
-    if right is not None:
-        raise Refused("the state scaled by a value along its second axis (no chunk form here)")
-    scaled = list(value.terms)
-    for factor in factors:
-        scaled = [term.scaled(factor) for term in scaled]
-    if left is None:
-        return _Symbolic(value.shape, tuple(scaled))
-    if value.shape == "matrix":
-        # The state's rows scaled by a first-axis vector: a per-key decay, once.
-        if any(term.kind != "state" or term.diag is not None for term in scaled):
-            raise Refused("a value of the state other than the state itself scaled per row")
-        return _Symbolic("matrix", tuple(dataclasses.replace(term, diag=left) for term in scaled))
-    kinds = {"read": "corrected", "free": "input"}
-    return _Symbolic("matrix", tuple(_Term(kinds[term.kind], term.factors, term.sign, left=left,
-                                           right=term.right, diag=term.diag) for term in scaled))
-
-
-def _passes(producer: jcore.JaxprEqn) -> bool:
-    """Whether a factor passes through `producer` unchanged in its role: an element-keeping equation, a
-    scalar's broadcast, or a broadcast that keeps a rank-two value's axes."""
-    name = producer.primitive.name
-    return name in _KEEPING or (name == "broadcast_in_dim" and (
-        _scalar(producer.invars[0]) or tuple(producer.params["broadcast_dimensions"]) == (0, 1)))
-
-
-def _scalar_broadcast(jaxpr, atom):
-    producer = _producer(jaxpr, atom) if isinstance(atom, jcore.Var) else None
-    while producer is not None and producer.primitive.name in _KEEPING | {"broadcast_in_dim"}:
-        atom = producer.invars[0]
-        if _scalar(atom):
-            return atom
-        producer = _producer(jaxpr, atom) if isinstance(atom, jcore.Var) else None
-    return None
-
-
-def _contracted(vector, value: _Symbolic, vector_axes, state_axes, batch) -> _Symbolic:
-    """`vector^T value`: a row read from the state where `value` is the state scaled, contracting its first
-    axis with a vector."""
-    del vector_axes
-    if batch[0] or len(aval(vector).shape) != 1 or tuple(state_axes) != (0,) or value.shape != "matrix":
-        raise Refused("the state contracted other than along its first axis with a vector")
-    if any(term.kind != "state" for term in value.terms):
-        raise Refused("a row read from a corrected state (a correction of a correction)")
-    return _Symbolic("row", tuple(_Term("read", term.factors, term.sign, right=vector, diag=term.diag)
-                                  for term in value.terms))
-
-
-def _affine(update: Program, readout: Program) -> _Affine:
-    """The token's parts (`_Affine`), refused where the update or the readout is not of the module's form."""
-    (out,) = update.jaxpr.outvars
-    symbolic = _symbolic(update.jaxpr, update.jaxpr.invars[0]).get(out)
-    if symbolic is None or symbolic.shape != "matrix":
-        raise Refused("the update does not read the state")
-    held = [term for term in symbolic.terms if term.kind == "state"]
-    inputs = [term for term in symbolic.terms if term.kind == "input"]
-    corrections = tuple(term for term in symbolic.terms if term.kind == "corrected")
-    if len(held) != 1 or len(inputs) != 1:
-        raise Refused("the update is not one decayed state plus one input")
-    (state,) = held
-    decay, exponent, base2 = _decay(update.jaxpr, state)
-    (given,) = inputs
-    for correction in corrections:
-        decayed = correction.diag is decay if state.diag is not None else (
-            correction.diag is None and decay in correction.factors)
-        if correction.left is not given.left or not decayed:
-            raise Refused("a correction along a vector other than the input's, or not decayed with the state")
-    (read_out,) = readout.jaxpr.outvars
-    read = _symbolic(readout.jaxpr, readout.jaxpr.invars[0]).get(read_out)
-    if read is None or read.shape != "row":
-        raise Refused("the readout does not read the state as a row")
-    reads = [term for term in read.terms if term.kind == "read"]
-    if len(reads) != 1:
-        raise Refused("the readout reads the state other than once")
-    free = tuple(term for term in read.terms if term.kind == "free")
-    return _Affine(update, readout, exponent, base2, state.diag is not None, decay, given, corrections,
-                   reads[0], free)
-
-
-def _decay(jaxpr, state: _Term) -> tuple[Atom, Atom, bool]:
-    """The state term's decay `exp(z)` (or `exp2`): the factor (a scalar, or the rows' per-key vector) and
-    its exponent."""
-    if state.diag is not None:
-        producer = _producer(jaxpr, state.diag) if isinstance(state.diag, jcore.Var) else None
-        if state.sign != 1.0 or state.factors or producer is None or producer.primitive.name not in (
-                "exp", "exp2"):
-            raise Refused("the state's per-key decay is not one exponential, whose exponent the prefix sums")
-        return state.diag, producer.invars[0], producer.primitive.name == "exp2"
-    exponentials = []
-    for factor in state.factors:
-        producer = _producer(jaxpr, factor) if isinstance(factor, jcore.Var) else None
-        if producer is not None and producer.primitive.name in ("exp", "exp2"):
-            exponentials.append((factor, producer))
-    if state.sign != 1.0 or len(state.factors) != 1 or len(exponentials) != 1:
-        raise Refused("the state's decay is not one exponential, whose exponent the prefix sums")
-    ((factor, producer),) = exponentials
-    return factor, producer.invars[0], producer.primitive.name == "exp2"
-
-
-def _token(affine: _Affine, token: tuple) -> tuple:
+def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     """One token's exponent, input vector `B` and values `U`, correction strength `s` and vector `C`, reader
-    `Q` and free readout `R` (zeros where the readout has none)."""
-    update, readout = affine.update, affine.readout
-    zero = jnp.zeros(aval(update.jaxpr.invars[0]).shape, aval(update.jaxpr.invars[0]).dtype)
+    `Q` and free readout `R` (zeros where the readout has none): the affine map's parts
+    (`linear_scan.Parts`) at the token's values, each in float32 at least."""
+    shape = aval(parts.update.jaxpr.invars[0]).shape
+    zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
+    envs: dict = {}
 
-    def values(closed, atoms):
-        env = environment(closed, (zero, *token), {})
-        evaluate(closed, env, read_by(closed.jaxpr, {atom for atom in atoms if isinstance(atom, jcore.Var)}))
-        return lambda atom: atom.val if isinstance(atom, jcore.Literal) else env[atom]
+    def read(index: int):
+        traced, atom = parts.atoms[index]
+        if isinstance(atom, jcore.Literal):
+            return jnp.asarray(atom.val)
+        env = envs.setdefault(id(traced), environment(traced, (zero, *token), {}))
+        evaluate(traced, env, read_by(traced.jaxpr, {atom}))
+        return env[atom].astype(at_least_fp32(env[atom].dtype))
 
-    def coefficient(term: _Term, read, leaving=None):
-        product = jnp.float32(term.sign)
-        for factor in term.factors:
-            if factor is not leaving:
-                product = product * read(factor)
-        return product
+    def along(term, extent: int):
+        value = linear_scan.value_of(term, read, shape[0])
+        return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
 
-    terms = (affine.input, *affine.corrections)
-    read = values(update, [affine.exponent, *(atom for term in terms for atom in
-                                              (*term.factors, term.left, term.right))])
-    B = read(affine.input.left)
-    U = coefficient(affine.input, read) * read(affine.input.right)
-    # The corrections, each decay * (-strength) * B (c^T h), are one: B ((sum of strength c)^T h), of unit
-    # strength where any corrects.
-    s = jnp.float32(1.0 if affine.corrections else 0.0)
-    C = jnp.zeros_like(B)
-    for correction in affine.corrections:
-        C = C - coefficient(correction, read, leaving=affine.decay) * read(correction.right)
-    weights = () if affine.read.diag is None else (affine.read.diag,)
-    out = values(readout, [*affine.read.factors, affine.read.right, *weights,
-                           *(atom for term in affine.free for atom in (*term.factors, term.right))])
-    # A readout that weighs the state's rows first (`_Term.diag`) reads them through its vector so weighed.
-    Q = coefficient(affine.read, out) * out(affine.read.right)
-    for weight in weights:
-        Q = Q * out(weight)
-    R = sum((coefficient(term, out) * out(term.right) for term in affine.free),
-            jnp.zeros((aval(update.jaxpr.invars[0]).shape[1],), jnp.float32))
-    keys = aval(update.jaxpr.invars[0]).shape[0] if affine.per_key else 1
-    return jnp.broadcast_to(read(affine.exponent), (keys,)), B, U, s, C, Q, R
-
-
-def _inverse_of(decays: _Decays, B, s, C):
-    """The unit lower-triangular solve's inverse less its diagonal (`_lowered`) of the corrections'
-    decayed overlaps: it reads no state, so a chunk's walk prepares it with its other values."""
-    strictly = jnp.tril(jnp.ones(decays.between.shape[:2], bool), -1)[:, :, None]
-    return _lowered(s[:, None] * _paired(C, B, jnp.where(strictly, decays.between, 0.0)))
-
-
-def _corrected(decays: _Decays, lower, U, s, C, h):
-    """The inputs each token's correction leaves (the module's `w`): the solve (its inverse less its
-    diagonal `lower`, `_inverse_of`) of the corrections, from the state entering the chunk."""
-    given = U - float32_matmul(s[:, None] * C * decays.entering, h)
-    return _applied(lower, given)
+    keys, values = shape
+    B, U = along(parts.left, keys), along(parts.right, values)
+    corrects = parts.correction is not None
+    # A correction `B (X^T D h)` is the transition's `-s B C^T D h`: `C = -X`, of unit strength.
+    C = -along(parts.correction, keys) if corrects else jnp.zeros_like(B)
+    s = jnp.float32(1.0 if corrects else 0.0)
+    exponent = along(parts.exponent, keys if parts.per_key else 1)
+    return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
 
 
 def _paired(left, right, between):

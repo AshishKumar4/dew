@@ -143,6 +143,13 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
     return "fp32", 1
 
 
+def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32) -> Work:
+    """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at the default precision,
+    in their mode (`_mode`): a chunk form's products (`dew.algebra.linear_scan`), Dew's fp32 products."""
+    mode, passes = _mode(None, {jnp.dtype(dtype)})
+    return Work(**{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
+
+
 @functools.total_ordering
 @dataclasses.dataclass(frozen=True, eq=False)
 class Seconds:
@@ -201,19 +208,23 @@ def cheaper(form: Seconds, than: Seconds) -> bool:
 class Fused:
     """XLA's schedule (the compile-time pass's): a reduction or a product reads its operands in one pass over
     device memory and elementwise work fuses into its consumer, costing its units' work alone, each at the
-    whole device's rate (`templates.cost.rates`), in series; no tie to break."""
+    whole device's rate (`templates.cost.rates`), in series, or its span at a loop iteration's latency where
+    longer (the work-span model, `templates.cost.spanned`); no tie to break."""
 
     facts: generation.GpuTarget
 
     def __call__(self, done: Work) -> float:
-        return sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0])
+        work = sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0])
+        return max(work, kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=True))[0])
 
     def tiebreak(self, done: Work) -> float:
         del done
         return 0.0
 
     def unpriced(self, done: Work) -> tuple[float, ...]:
-        return kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[1]
+        latency = kernel_cost.step_latency(self.facts, device=True)
+        return (*kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[1],
+                kernel_cost.spanned(done, latency)[1])
 
 
 def fused(facts: generation.GpuTarget) -> Fused:
@@ -237,7 +248,9 @@ class Walk:
         return sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[0])
 
     def unpriced(self, done: Work) -> tuple[float, ...]:
-        return kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[1]
+        latency = kernel_cost.step_latency(self.facts, device=False)
+        return (*kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[1],
+                kernel_cost.spanned(done, latency)[1])
 
 
 def walk(facts: generation.GpuTarget) -> Walk:

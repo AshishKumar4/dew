@@ -49,8 +49,10 @@ class Work:
     at the default precision, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
     `Precision.HIGHEST`'s FLOPs among them; special-function exponentials; conversions, which run on the
     CUDA cores at their rate until a target states one of their own) and its bytes by level (device memory,
-    shared memory). The algebra's terms and a template's instructions both price through it; a schedule
-    turns it into seconds: XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk
+    shared memory), and its span, the dependent steps on its critical path (a loop's iterations, each reading
+    the last). The algebra's terms and a template's instructions both price through it; a schedule turns it
+    into seconds by the work-span model (Brent's): the larger of its work at its units' rates and its span
+    at a dependent step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk
     (`walked`)."""
 
     flops: float = 0.0
@@ -60,12 +62,15 @@ class Work:
     device_bytes: float = 0.0
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
+    span: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
+        # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
+        # which the term that chains them states (`dew.algebra.linear_scan`).
         return Work(self.flops + other.flops, self.operations + other.operations,
                     self.exponentials + other.exponentials, self.conversions + other.conversions,
                     self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
-                    self.tf32_flops + other.tf32_flops)
+                    self.tf32_flops + other.tf32_flops, max(self.span, other.span))
 
 
 @functools.cache
@@ -111,8 +116,25 @@ def units(work: Work, at: tuple[float | None, ...]) -> tuple[list[float], tuple[
     return priced, unpriced
 
 
+def spanned(work: Work, latency: float | None) -> tuple[float, float]:
+    """`work`'s span at a dependent step's `latency` (`Work.span`), and its span at no latency stated
+    (`GpuTarget.step_seconds` None), which no time prices (0 where one does)."""
+    if not work.span:
+        return 0.0, 0.0
+    return (0.0, work.span) if latency is None else (work.span * latency, 0.0)
+
+
+def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
+    """A dependent step's latency on a schedule's path: XLA's loop iteration (`GpuTarget.step_seconds`) for
+    the whole device's; a template's in-kernel step from its instructions' latencies, which no fact states
+    yet, so none."""
+    return target.step_seconds if device else None
+
+
 def walked(work: Work, target: generation.GpuTarget) -> float:
-    """The seconds a program of a template's tile walk spends on `work`: its units' work overlapped, each at
-    its rate on one multiprocessor, the longest unit's time (`units`); its device bytes the launch's, which a
-    form of its algebra does not change."""
-    return max(units(work, rates(target, device=False))[0])
+    """The seconds a program of a template's tile walk spends on `work` by the work-span model: its units'
+    work overlapped, each at its rate on one multiprocessor, the longest unit's time (`units`), or its span
+    at an in-kernel step's latency where longer (`spanned`); its device bytes the launch's, which a form of
+    its algebra does not change."""
+    return max(*units(work, rates(target, device=False))[0],
+               spanned(work, step_latency(target, device=False))[0])

@@ -294,7 +294,8 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `stable`, `linear_scan`, `error_free` |
+| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `stable`, `error_free` |
+| `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
 | `dew.nn.derivatives` | Below the engine, so every model module can import it: the marker primitive, its kinds, and the custom-derivative declarations (`kernel_derivative`, `numerics_derivative`, `numerics_tangent`, `surrogate`, row 3271) |
@@ -541,6 +542,13 @@ class Extraction:
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
     takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, the longest
     unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
+- Either schedule's time is the work-span model's (Brent's): the larger of a form's work at its units'
+  rates and its span, its critical path's dependent steps, at one step's latency. On XLA's path a step is
+  an iteration of a loop XLA lowers, its launches and its predicate (`GpuTarget.step_seconds`, each GPU's
+  measured as the slope of a loop's time over its iterations: an A100's 5.96 µs, an H100's 4.93 µs, an RTX
+  PRO 6000's 3.68 µs); a token loop's tokens and a substitution's rows are a step each. On the template's
+  path a step's latency is its instructions', which the resource model does not state yet, so a span there
+  is priced by no time.
 - Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
   condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
   and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
@@ -669,6 +677,28 @@ largest terms that read no state are the walk's prepared values (`Derived.prepar
 at once; the carry alone runs in sequence. The delta rule's carry is one product of the state by a matrix the
 chunk prepared, its solve against the state off the carry.
 
+The chunk function's algorithm is derived by rules (`linear_scan.py`); nothing of its form is written. The
+token's update and readout, traced at one token, enter an e-graph as their algebra over the state
+(`Token`): scalars, vectors along the keys or the values laid as columns or rows, products, sums,
+exponentials, and a vector's contraction with a matrix over the keys. A value free of the state whose
+equation the language has no constructor for is a leaf. The algebra's identities saturate: products and
+sums commute and associate, products distribute and factor, and a contraction is linear in each operand.
+Where the update is affine, its class then holds the form: a decay `exp(z)` (or `exp2`) on the state, a
+scalar's or each key's, a rank-one input `B U^T`, and corrections along `B` that read the decayed state
+(`Affine.decayed`, `corrected`). The readout's form is a contraction with a vector plus a free part
+(`Affine.readout`). An update or readout that reaches no such form is refused. The affine update then
+enters a second e-graph as its chunk's token loop, and the identities of affine scans hold every equal
+chunk algorithm side by side:
+- `wy`: the corrections' loop is a plain loop over the inputs that a unit lower-triangular system solves;
+- `dual`: a plain loop is its outputs' masked quadratic form plus its state's decayed sum;
+- a solve is its inverse by doubling or a forward substitution;
+- a solve is linear in its given values, so the part of the system that reads the state is off it.
+
+The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
+splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
+compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
+sound over the reals from their declarations (tests/test_linear_scan.py).
+
 Behind the one switch (`dew.algebra.forms.derived`, in JAX's trace context), the templates take their derived
 forms where the declarations state the walk:
 
@@ -712,9 +742,9 @@ a derived form replaces a hand-written one only where it states the walk, passes
 - Error-aware extraction with the compensation rules (`error_free`'s TwoSum and product splitting,
   rewriting into compensated forms where check 1 needs them) is the next derivation build. It covers the
   accurate forms and the guard.
-- `scan.py` still matches its update with its own symbolic matcher and emits one chunk algorithm. Doubling
-  against substitution, a per-key decay's sub-chunk factoring and the decays' hoisting are hard-coded
-  rather than extracted under a kernel cost.
+- The chunk's decays (`scan._decays`: the compensated prefix and its exponentials) and a gram's evaluation
+  by decay kind (`scan._paired`) are written, not extracted. The compensated prefix is the declaration's
+  numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
 - A Mosaic launch built from the derived chunk forms' terms is the generator's work (§6.11). Until then the
   Mosaic recurrence takes derived tile algebra inside its own launches.
 - The derived forms run at trace time.
@@ -734,11 +764,10 @@ class Reduction:                     # attention, and any walk whose state is a 
 
 @dataclass(frozen=True)
 class Scan:                          # a recurrence
-    update: jax.extend.core.ClosedJaxpr     # (h, x_t) -> h, seen as h <- A_t h + b_t
+    update: jax.extend.core.ClosedJaxpr     # (h, x_t) -> h, read as h <- A_t h + B_t U_t^T by rules
     readout: jax.extend.core.ClosedJaxpr    # (h, x_t) -> o_t
     operands: Mapping[str, Axes]
     walked: str                      # "time"
-    structure: str                   # A_t: "scalar", "diagonal" or "rank_one_correction"
 
 Declaration = Reduction | Scan
 
@@ -764,8 +793,9 @@ def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ... 
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;
-  - `linear_scan`: the affine monoid, compact WY with `triangular_inverse`, decay hoisting as exp of prefix
-    sums (the compensated prefix under accurate numerics), and a scan's adjoint;
+  - `linear_scan`: a token's algebra over its state and its affine forms; the chunk's identities, compact
+    WY, the state-space dual, a solve's inverse by doubling or its substitution, and a solve's linearity.
+    A scan's adjoint is its forms' derivative;
   - `error_free`: the compensated sum, the natural exponent through `two_product` and `2**k`, and an argmax
     anchor's split identity. Under accurate numerics, extraction keeps these wherever the hand-written form's
     error bound requires them.

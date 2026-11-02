@@ -265,6 +265,10 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
+    step_seconds: float | None = None
+    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
+    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
+    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
 
     @property
     def architecture(self) -> Architecture:
@@ -380,9 +384,11 @@ TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
+    # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
+    # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, triton_gemm_fusions=False),
+              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
@@ -397,7 +403,9 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False),
+              # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
+              # line; its first's 4.80 us lay 17% from it).
+              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -412,7 +420,8 @@ TARGETS = {target.generation: target for target in (
               clock_hz=1965e6, memory_bandwidth=8e12),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9),
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              step_seconds=3.68e-6),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
