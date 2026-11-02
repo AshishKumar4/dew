@@ -1236,8 +1236,10 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
     rates = [seconds for name, seconds in timings.get("rows", {}).items()
              if ":" in name and parsed_row(name)[0] == PYTHONS[-1] and parsed_row(name)[2] == COLLECT]
     rate = max(rates, default=COLLECT_SECONDS)
-    # No task holds none: armada cannot grade a row its entry names that its task never reports.
-    count = min(math.ceil(len(names) * rate / target), len(names))
+    # The files a task holds within the target, one where a file alone takes longer; and no task holds none:
+    # armada cannot grade a row its entry names that its task never reports.
+    each = max(math.floor(target / rate), 1)
+    count = math.ceil(len(names) / each)
     return [{"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1], "tests": " ".join(held),
              "split": COLLECT, "rows": [row(PYTHONS[-1], name, COLLECT) for name in held],
              "weight": len(held) * rate}

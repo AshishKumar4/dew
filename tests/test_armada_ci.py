@@ -107,11 +107,12 @@ def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowe
         (tmp_path / name).write_text("")
     monkeypatch.setattr(ci, "NEWEST_FILES", ())
     # A collect task's rows split its seconds evenly: these files last ran on a fast host and a slow one.
-    rates = {ci.row("3.14", name, ci.COLLECT): 5.0 if index % 2 else 1.0 for index, name in enumerate(names)}
+    rates = {ci.row("3.14", name, ci.COLLECT): 5.3 if index % 2 else 1.0 for index, name in enumerate(names)}
     collecting = [entry for entry in ci.plan(120.0, {"rows": rates}) if entry["split"] == ci.COLLECT]
     assert sorted(name for entry in collecting for name in entry["tests"].split()) == names
-    assert len(collecting) == math.ceil(len(names) * 5.0 / 120.0), [entry["weight"] for entry in collecting]
-    assert all(entry["weight"] == len(entry["tests"].split()) * 5.0 <= 120.0 for entry in collecting), [
+    # 22 files fit the target at 5.3 s each.
+    assert len(collecting) == math.ceil(len(names) / 22), [entry["weight"] for entry in collecting]
+    assert all(entry["weight"] == len(entry["tests"].split()) * 5.3 <= 120.0 for entry in collecting), [
         (len(entry["tests"].split()), entry["weight"]) for entry in collecting]
 
 
