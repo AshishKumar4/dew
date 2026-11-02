@@ -31,7 +31,8 @@ def dots(function, *args) -> int:
 
 JOINED_SEEDS = {("gate_up", jnp.float32, False): 8, ("gate_up", jnp.float32, True): 8,
                 ("gate_up", jnp.bfloat16, False): 8, ("gate_up", jnp.bfloat16, True): 8,
-                ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8}
+                ("delta_gates", jnp.float32): 8, ("delta_gates", jnp.bfloat16): 8, "promoted bias": 8,
+                "gate multiplier": 8}
 """Each joined row's declared draws against its projections apart (check 1), sized by `seeds_for` paired
 with the joined row on the CPU and an A100."""
 
@@ -238,3 +239,21 @@ def test_a_delta_nets_gates_joined_are_as_exact_as_apart_from_float64(dtype):
     assert_joined_as_exact("delta_gates", with_gradients(layer.apply), draw,
                            with_gradients(layer.clone(dtype=jnp.float64).apply),
                            "the delta net's gates joined", seeds=JOINED_SEEDS["delta_gates", dtype])
+
+
+def test_a_gate_multiplier_keeps_gate_and_up_joined():
+    """Falcon-H1's gate multiplier (`GatedMLP.gate_multiplier`) scales the gate half of the joined GEMM's
+    output as it scales the gate apart (ledger 3632): its row still joins gate and up, two dots where it
+    ran three, and its output and gradients lie within tests/reference_error.py's rule of the layer's with
+    them apart, on par from float64 over drawn inputs (check 1)."""
+    layer = GatedMLP(hidden_features=96, out_features=64, gate_multiplier=0.75)
+    params = layer.init(jax.random.key(4), jnp.zeros((2, 33, 64)))
+    draw = drawing(params, (2, 33, 64), jnp.float32)
+    x = draw(0)[1]
+    with row_joins("gate_up", joins=False):
+        assert dots(layer.apply, params, x) == 3
+    with row_joins("gate_up"):
+        assert dots(layer.apply, params, x) == 2
+    assert_joined_as_exact("gate_up", with_gradients(layer.apply), draw,
+                           with_gradients(layer.clone(dtype=jnp.float64).apply), "gate multiplier joined",
+                           seeds=JOINED_SEEDS["gate multiplier"])
