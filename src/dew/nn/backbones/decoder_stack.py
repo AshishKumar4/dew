@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
@@ -613,8 +614,11 @@ class BlockStage(nn.Module):
 
 
 def stack_layers(*trees):
-    """Layers' trees stacked on a new leading layer axis, a bank."""
-    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
+    """Layers' trees stacked on a new leading layer axis, a bank: a parameter its module boxed with its
+    axes (`nn.with_logical_partitioning`) keeps its box, which names the new axis none
+    (`meta.add_axis`), as a scan stacking it does (`metadata_params`)."""
+    stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
+    return meta.add_axis(stacked, 0, {nn.PARTITION_NAME: None})
 
 
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
@@ -756,8 +760,9 @@ class StackView:
 
     def stack(self, variables: Mapping[str, Mapping]) -> dict:
         inside = {}
-        # The run computes with the values as stored: a box's names describe a stored layer, not a stack.
-        for collection, tree in unboxed(variables).items():
+        # A box keeps its parameter's axes, the stacked layer axis named none (`stack_layers`): a draw's
+        # boxes are the draw's, which a run's second trace (`nn.map_variables` at init) does not redraw.
+        for collection, tree in variables.items():
             tree = dict(tree)
             if collection in self.banked:
                 inside[collection] = tree
