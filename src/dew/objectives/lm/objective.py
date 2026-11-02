@@ -107,13 +107,7 @@ from dew.objectives.base import (
     merge_totals,
     model_rngs,
 )
-from dew.objectives.lm.adaptation import (
-    CARRIED,
-    ChunkAdaptation,
-    _carried_start,
-    _carried_update,
-    adapted_scores,
-)
+from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
@@ -397,11 +391,6 @@ def _global_qk_max(qk) -> jax.Array | None:
     return jnp.max(jnp.stack(found)) if found else None
 
 
-_ROUTED = "routed"
-"""Where a run that carries its continuum level holds the router counts among its effects, beside what
-the level moved (`CARRIED`)."""
-
-
 class _Scored(NamedTuple):
     """One scoring of a batch (`LMObjective._scored_loss`): the loss's statistics and reports, the
     token scores they came from, and each token's share of the prediction's total, `[B, seq_len]`,
@@ -434,9 +423,7 @@ class Scores(NamedTuple):
     where `token_scores` was asked for the sums alone (`z_loss`): then only
     the totals carry a gradient. Otherwise they are None. `logits` is the
     `[B, seq_len, vocab]` logits the losses were scored from, where
-    `token_scores` was asked for them, else None. `moved` is how far a
-    continuum level that a run carries moved in context (`Adapted.moved`), else
-    None.
+    `token_scores` was asked for them, else None.
     """
 
     losses: jax.Array
@@ -452,7 +439,6 @@ class Scores(NamedTuple):
     total: jax.Array | None = None
     logits: jax.Array | None = None
     inspected: dict | None = None
-    moved: Mapping | None = None
 
 
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
@@ -558,18 +544,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return reduce_routed(self.balance, stats)
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        """`variables` with the router counts `balance` took applied, once per committed update, and what
-        a run that carries its continuum level carries on (`_carried_update`)."""
-        if not self._carries:
-            return apply_routed(self.balance, variables, effects)
-        routed = effects.get(_ROUTED)
-        return {CARRIED: _carried_update(variables[CARRIED], effects[CARRIED]),
-                **({} if routed is None else apply_routed(self.balance, variables, routed))}
-
-    @property
-    def _carries(self) -> bool:
-        """Whether a run of this objective carries its continuum level's steps (`ChunkAdaptation.carry`)."""
-        return self.adaptation is not None and self.adaptation.carry == "run"
+        """`variables` with the router counts `balance` took applied, once per committed update."""
+        return apply_routed(self.balance, variables, effects)
 
     def _missing_flops(self, model) -> str | None:
         """What the forward and training counts both lack, or None."""
@@ -874,7 +850,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if rows is not None:
             # A filled row's targets weigh nothing, so a fused head's sum counts each real row once.
             weights = jnp.where(rows[:, None] > 0, weights, 0)
-        total, (losses, predicted, log_z), whole, moved = self._head_scores(
+        total, (losses, predicted, log_z), whole = self._head_scores(
             params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
@@ -899,7 +875,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             depth_scores = self._depth_scores(params, states, targets, prepared, roles, losses.dtype, table,
                                               rows)
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
-                      whole, inspected, moved)
+                      whole, inspected)
 
     def _depth_scores(self, params, states, targets, prepared, roles, dtype, table, rows):
         """Each prediction depth's `(losses, weights, total)` from its states, depth d's targets the row's
@@ -924,21 +900,21 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """The head's scores of `targets` from final states `hidden`: the weighted sum where a fused
         head took it (`table`), each target's loss, top-1 column and log partition, and the whole
         logits where asked; through the continuum level stepped in context (`adaptation`), the
-        whole logits, the fused head or the tiled head; how far a carried level moved (`Adapted.moved`)."""
+        whole logits, the fused head or the tiled head."""
         if self.adaptation is not None:
             # The level steps window by window over these targets, weighted as the loss weighs them.
             adapted = adapted_scores(self.model, params, hidden, targets, weights,
                                      prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
                                      predict=predict, logits=logits)
-            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits, adapted.moved
+            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
         if logits:
             whole = model_logits(self.model, params, hidden)
-            return None, logits_cross_entropy(whole, targets, predict=predict), whole, None
+            return None, logits_cross_entropy(whole, targets, predict=predict), whole
         if table is not None:
             total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
                                             tile=self.head_tile, predict=predict)
-            return total, scores, None, None
-        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None, None
+            return total, scores, None
+        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -1289,14 +1265,6 @@ class LMObjective(TokenScorer):
         whole. The warm-up may start from a dense checkpoint that has no
         indexer yet, and a fresh init supplies exactly those weights.
         """
-        if self._carries and CARRIED not in tree:
-            # A run that carries its level starts with nothing carried.
-            # The level as the model reads it, its frozen leaves among it; the tree keeps its split.
-            level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)
-                     else None)
-            if level is None:
-                raise ValueError("the model has no continuum level to step in context")
-            tree = {**tree, CARRIED: _carried_start(level)}
         if self.indexer is not None:
             tree = thaw(tree)
             drawn = jax.eval_shape(self.fresh_variables, key, None)
@@ -1475,7 +1443,7 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict, rows=rows)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _ = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
@@ -1532,10 +1500,6 @@ class LMObjective(TokenScorer):
             statistics, effects, metrics = balance.compose(
                 params, prediction, routing or {}, batch, queries, prepared.token_fields)
             reported.update(metrics)
-        if self._carries:
-            # What a carried level moved, beside the router counts, which an update sums and carries on.
-            assert scores.moved is not None, "a carried level's scores hold how far it moved"
-            effects = {CARRIED: scores.moved, **({} if effects is None else {_ROUTED: effects})}
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:

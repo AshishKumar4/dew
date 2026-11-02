@@ -23,12 +23,6 @@ window open at it. The row is cut into blocks of `C` slots (`sequence_blocks`), 
 straddle where its start or padding falls inside one: a block's slots read the window open from the
 block before, the run's next window, or a new run's first, so the scan carries one window per row.
 A row with no padding and one document has every window a block, and its blocks read one level.
-
-A run that carries its level (`ChunkAdaptation.carry`, "run") keeps what its rows' steps moved it by:
-each row's documents step one level, its first window reading the level the run carried to it, and
-each committed update carries the mean over its rows of how far their windows moved the level, every
-window's step applied, into the `CARRIED` collection, which the run saves and resumes as it does its
-parameters. The next update's rows start from the trained level plus what is carried.
 """
 
 from __future__ import annotations
@@ -75,60 +69,30 @@ class ChunkAdaptation:
     An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused,
     as are a step of a kernel its product rounds and a step of `down` through an `up` that rounds its
     input or kernel (`Continuum._step_terms`), the loss piecewise constant in what steps.
-
-    `carry` says what a document's first window reads: "document", the level the run trains, each
-    document afresh, Titans' and TTT's reset; "run", the level the run carried, each row's documents
-    stepping one level in turn and each update carrying its rows' mean step on (module docstring),
-    Nested Learning's continuum memory kept across documents and steps.
     """
 
     window: int = 16
     rate: float = 0.01
     select: tuple[str, ...] = ()
     damped: bool = False
-    carry: str = "document"
 
     def __post_init__(self):
         if self.window < 1:
             raise ValueError(f"a window holds at least one token, not {self.window}")
         if not math.isfinite(self.rate) or self.rate < 0:
             raise ValueError(f"a window's step takes a finite rate of at least zero, not {self.rate}")
-        if self.carry not in ("document", "run"):
-            raise ValueError(f"a level carries across a 'document' or a 'run', not {self.carry!r}")
         object.__setattr__(self, "select", tuple(self.select))
-
-
-CARRIED = "carried"
-"""The collection holding what a run carries of its level's in-context steps (`ChunkAdaptation.carry`),
-the level's tree, zero where the run starts (`_carried_start`)."""
-
-
-def _carried_start(level) -> Mapping:
-    """What a run that carries its level holds at its start (`CARRIED`): nothing moved, the level's
-    tree in zeros."""
-    return jax.tree.map(jnp.zeros_like, level)
-
-
-def _carried_update(carried, moved: Mapping) -> Mapping:
-    """What a run carries after an update (`CARRIED`): `carried` plus the mean over its counted rows of
-    how far their steps moved the level, `moved` the rows' summed moves (`moves`) and their count
-    (`rows`), summed over the update's microbatches."""
-    rows = jnp.maximum(moved["rows"], 1)
-    return jax.tree.map(lambda held, move: held + (move / rows).astype(held.dtype), carried, moved["moves"])
 
 
 @dataclasses.dataclass(frozen=True)
 class Adapted:
     """What the adapted head scores a row's targets: each target's next-token `losses`, its top-1
-    column where asked (`predicted`), its log partition (`log_z`), and the whole logits where asked;
-    where the run carries its level, how far the rows' steps moved it (`moved`: the moves summed over the
-    rows that weigh anything, `moves`, and their count, `rows`), every window's step applied."""
+    column where asked (`predicted`), its log partition (`log_z`), and the whole logits where asked."""
 
     losses: jax.Array
     predicted: jax.Array | None
     log_z: jax.Array
     logits: jax.Array | None
-    moved: Mapping | None = None
 
 
 def _stepped_mask(level: Mapping, adaptation: ChunkAdaptation) -> Mapping:
@@ -269,8 +233,9 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     The model owns the level's place in its variables (`SteppedInContext`)."""
     from dew.objectives.lm.chunked import logits_cross_entropy
 
-    start = _start(model, variables, adaptation)
-    carries = adaptation.carry == "run"
+    start = model.in_context_level(variables) if isinstance(model, SteppedInContext) else None
+    if start is None:
+        raise ValueError("the model has no continuum level to step in context")
     steps = _stepped_mask(start, adaptation)
     rows, length = targets.shape
     window = adaptation.window
@@ -362,53 +327,25 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     # Before a row's first real token no run is open: run 0, window -1.
     first = (started, zeros, jnp.zeros((rows, _TERMS), energies.dtype), jnp.zeros((rows,), runs.dtype),
              jnp.full((rows,), -1, windows.dtype))
-    (level, partial, energy, _, _), (losses, top, log_z, whole) = jax.lax.scan(
+    _, (losses, top, log_z, whole) = jax.lax.scan(
         jax.checkpoint(block), first, inputs)
 
     def joined(value: jax.Array) -> jax.Array:
         """A scan's `[blocks, B, window, ...]` output as the row's `[B, S, ...]`."""
         return jnp.moveaxis(value, 0, 1).reshape(rows, blocks * window, *value.shape[3:])[:, :length]
 
-    # Each row's level with its open window's step applied, where the run carries it.
-    moved = _moved(stepped(level, partial, energy), started, weights) if carries else None
     return Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
-                   None if whole is None else joined(whole), moved)
+                   None if whole is None else joined(whole))
 
 
 def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation):
     """Where the rows' windows run (`window_keys`): whether a window can open inside a block (padding
     or several documents in a row), the weights with each padding slot's at nothing, and each slot's run
-    and window. A carried level steps through a row's documents in turn, one run a row."""
+    and window."""
     marked, documents = token_layout(fields)
     straddles = marked is not None or documents is not None
     valid = real_slots(fields, (rows, length)) if straddles else None
     if valid is not None:
         weights = jnp.where(valid, weights, 0)
-    documents = None if adaptation.carry == "run" else documents
     runs, windows = window_keys(valid, documents, rows, length, adaptation.window)
     return straddles, weights, runs, windows
-
-
-def _start(model: nn.Module, variables, adaptation: ChunkAdaptation) -> Mapping:
-    """The level a document's first window reads (`ChunkAdaptation.carry`): the trained level, plus what
-    the run carried of its steps on top (`CARRIED`), which its loss differentiates through as the start
-    it is."""
-    start = model.in_context_level(variables) if isinstance(model, SteppedInContext) else None
-    if start is None:
-        raise ValueError("the model has no continuum level to step in context")
-    if adaptation.carry != "run":
-        return start
-    if CARRIED not in variables:
-        raise ValueError(f"a run that carries its level holds what it carried in `{CARRIED}`, and these "
-                         "variables hold none: a state built for this objective (`LMObjective.init`)")
-    return jax.tree.map(lambda leaf, held: leaf + jax.lax.stop_gradient(held).astype(leaf.dtype),
-                        start, variables[CARRIED])
-
-
-def _moved(reached: Mapping, started: Mapping, weights: jax.Array) -> Mapping:
-    """How far the rows' steps moved the level (`Adapted.moved`): each row's `reached` less its
-    `started`, summed over the rows whose targets weigh anything, and their count."""
-    counted = jnp.sum(weights, axis=1) > 0
-    moves = jax.tree.map(lambda end, began: jnp.sum(jnp.where(
-        counted.reshape(-1, *[1] * (end.ndim - 1)), end - began, 0), axis=0), reached, started)
-    return jax.lax.stop_gradient({"moves": moves, "rows": jnp.sum(counted).astype(jnp.float32)})
