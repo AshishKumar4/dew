@@ -135,8 +135,10 @@ class Modulation(nn.Module):
 
     @nn.compact
     def __call__(self, conditioning):
+        # Its output, the pieces of the width, splits as an MLP's hidden width does.
         projected = modulation(conditioning, self.features, self.pieces, name="linear", bias=self.bias,
-                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision)
+                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision,
+                               kernel_axes=("embed", "mlp"))
         return jnp.split(projected, self.pieces, axis=-1)
 
 

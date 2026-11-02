@@ -39,7 +39,7 @@ from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, pro
 from dew.nn.norms import LayerNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared, logical_axes
 
 from ..mlp import GatedMLP
 from .joint import embedding, embedding_flops, layer_norm, modulate
@@ -245,7 +245,8 @@ class WanTransformer(nn.Module):
         # The source's `patch_embedding`; CLIP's vision tower holds a 2-D
         # kernel at that path, and one path holds one set of axes.
         tokens = Conv(self.features, patch, strides=patch, padding="VALID", name="patch_embedding_3d",
-                      **dense)(x)
+                      kernel_init=declared(nn.initializers.lecun_normal(), (None, None, None, None, "embed")),
+                      bias_init=declared(nn.initializers.zeros_init(), ("embed",)), **dense)(x)
         tokens = tokens.reshape(x.shape[0], -1, self.features)
         # `WanTimeTextImageEmbedding`: the time embedder in fp32, its output
         # in the model's dtype, and one projection of it into six pieces.
@@ -265,7 +266,7 @@ class WanTransformer(nn.Module):
         shift, scale = (table.astype(wide)[:, index] + embedded.astype(wide) for index in range(2))
         tokens = modulate(layer_norm(wide, self.eps)(tokens), shift, scale).astype(tokens.dtype)
         out = Dense(int(np.prod(patch)) * self.out_channels, name="proj_out", **dense,
-                    dot_general=float32_dot_general)(tokens)
+                    kernel_axes=("embed", None), dot_general=float32_dot_general)(tokens)
         return einops.rearrange(out.reshape(x.shape[0], *grid, *patch, self.out_channels),
                                 "b f h w pf ph pw c -> b (f pf) (h ph) (w pw) c")
 
