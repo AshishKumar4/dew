@@ -2032,12 +2032,14 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
 
 def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
-    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by."""
+    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
+    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
     from dew.decision.head import Head
     from dew.decision.model import DecisionModel
 
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
     return drawn_axes(lambda key: DecisionModel(backbone.model, from_record(Head, head)).initialize_head(
-        key, backbone.variables, jnp.zeros((1, 1), jnp.int32)))
+        key, shapes, jnp.zeros((1, 1), jnp.int32)))
 
 
 def _native_config(config: Mapping[str, object],
