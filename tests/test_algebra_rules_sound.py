@@ -58,7 +58,7 @@ class Inadmissible(Exception):
     """An instantiation a rule's conditions or its terms' shapes do not admit."""
 
 
-RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length"})
+RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
 ROUNDING_FACTS = frozenset({"plain", "exact_scale"})
 """The facts a dtype or power-of-two condition reads: rounding's too."""
@@ -610,7 +610,35 @@ def _power(expr, rule, powers: dict, evaluated: Evaluated) -> int:
         reduced = _inner(args[0])
         operand, axes = evaluated.value(reduced.args[0]), evaluated.value(reduced.args[2])
         return max(math.prod(np.shape(operand)[axis] for axis in axes) - 1, 0).bit_length()
+    if ref.ident.name == "contracted_length":
+        # The elements each output of the rule's contraction at these parameters sums: its left operand's
+        # contracted axes.
+        left = _contraction_left(rule, _inner(args[0]).name)
+        (contracting, _), _ = evaluated.value(args[0])["dimension_numbers"]
+        length = math.prod(np.shape(evaluated.value(left))[axis] for axis in contracting)
+        return max(length - 1, 0).bit_length()
     raise TypeError(ref.ident.name)
+
+
+def _contraction_left(rule, params: str):
+    """The left operand of a contraction in `rule`'s conditions taking the parameters bound to `params`."""
+    def found(expr):
+        inner = _inner(expr)
+        if not isinstance(inner, decl.CallDecl):
+            return None
+        if (isinstance(inner.callable, decl.MethodRef) and inner.callable.method_name == "dot"
+                and isinstance(_inner(inner.args[2]), decl.UnboundVarDecl)
+                and _inner(inner.args[2]).name == params):
+            return inner.args[0]
+        return next((left for arg in inner.args if (left := found(arg)) is not None), None)
+
+    for fact in rule.body:
+        exprs = (fact.typed_expr,) if isinstance(fact, decl.ExprFactDecl) else (
+            (fact.left, fact.right) if hasattr(fact, "left") else fact.exprs)
+        for expr in exprs:
+            if (left := found(expr)) is not None:
+                return left
+    raise KeyError(params)
 
 
 def _binding(rule, name: str):
