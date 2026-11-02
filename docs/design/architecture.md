@@ -35,7 +35,7 @@ from dew.objectives.base import Aux, Objective
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
-data = Memory({"x": x, "y": y}).shuffle(seed=0).repeat().batch(32)
+data = Memory({"x": x, "y": y}).shuffled(seed=0).repeat().batch(32)
 ```
 
 ```python
