@@ -97,7 +97,7 @@ class _Interpreter:
             closed = inner if isinstance(inner, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(inner, ())
             return self.run(closed.jaxpr, closed.consts, values)
         if name == "cond":
-            branch = params["branches"][int(values[0])]
+            branch = params["branches"][int(_governing(values[0], "a branch's index"))]
             return self.run(branch.jaxpr, branch.consts, values[1:])
         if name == "while":
             return self.loop(params, values)
@@ -118,7 +118,11 @@ class _Interpreter:
         body_consts = values[params["cond_nconsts"]:params["cond_nconsts"] + params["body_nconsts"]]
         carry = values[params["cond_nconsts"] + params["body_nconsts"]:]
         cond, body = params["cond_jaxpr"], params["body_jaxpr"]
-        while bool(self.run(cond.jaxpr, cond.consts, [*cond_consts, *carry])[0]):
+        def going(carry) -> bool:
+            [more] = self.run(cond.jaxpr, cond.consts, [*cond_consts, *carry])
+            return bool(_governing(more, "a loop's trips"))
+
+        while going(carry):
             carry = self.run(body.jaxpr, body.consts, [*body_consts, *carry])
         return carry
 
@@ -171,18 +175,29 @@ def _slot(ref, treedef, leaves) -> tuple:
     return (ref.name, None)
 
 
+def _governing(value, what: str):
+    """`value`, which governs which events a program has (`what`: a branch's index, a loop's trips, a wait's
+    parity, a predicate), refused where the checker leaves it unevaluated (a table's entry in global memory):
+    explored at a guess, the program would miss or invent events (row 3588)."""
+    if value is None or isinstance(value, Ref):
+        raise ValueError(f"{what} reads a value the checker does not evaluate (global memory, a tile's data)")
+    return value
+
+
 def _wait(self: _Interpreter, equation, values) -> list:
     tree = equation.params["transforms_treedef"]
     count = tree.num_leaves
     at = _slot(values[0], tree, values[1:1 + count])
-    parity = bool(np.asarray(values[1 + count])) if equation.params.get("has_parity") else None
+    parity = (bool(np.asarray(_governing(values[1 + count], "a wait's parity")))
+              if equation.params.get("has_parity") else None)
     return self.emit("wait", at, parity)
 
 
 def _arrive(self: _Interpreter, equation, values) -> list:
     tree = equation.params["transforms_treedef"]
     count = tree.num_leaves
-    if equation.params.get("has_user_predicate") and not bool(np.asarray(values[1 + count])):
+    if equation.params.get("has_user_predicate") and not bool(
+            np.asarray(_governing(values[1 + count], "an arrival's predicate"))):
         return []
     return self.emit("arrive", _slot(values[0], tree, values[1:1 + count]))
 
@@ -195,7 +210,8 @@ def _load(self: _Interpreter, equation, values) -> list:
     refs = values[:3] if params.get("has_barrier") else (*values[:2], None)
     leaves = values[len([ref for ref in refs if ref is not None]):]
     split = np.cumsum([0, *counts])
-    if params.get("has_user_predicate") and not bool(np.asarray(leaves[split[-1]])):
+    if params.get("has_user_predicate") and not bool(np.asarray(_governing(leaves[split[-1]],
+                                                                          "a load's predicate"))):
         return []
     destination = _slot(refs[1], trees[1], leaves[split[1]:split[2]])
     barrier = _slot(refs[2], trees[2], leaves[split[2]:split[3]]) if refs[2] is not None else ()
