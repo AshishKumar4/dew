@@ -11,6 +11,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
+from dew.nn.kernels.templates.attention_backward_algebra import backward_derived, derived_cotangents
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _param,
@@ -139,16 +140,16 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
         return coords.queries(read(x), s) if coords.keys_first else read(x)
 
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    if algebra.backward_derived(how, accurate=walk.accurate):
+    if backward_derived(how, accurate=walk.accurate):
         # Behind the switch, the tile's weights and cotangents the derived forms'
-        # (`algebra.derived_cotangents`).
+        # (`derived_cotangents`).
         tiles = {"logits": logits, "products": dp, "peak": read(peak), "total": read(total),
                  "anchor": read(anchor), "delta": read(delta)}
         if multiplier is not None:
             tiles["keep"] = multiplier
         if seen is not None:
             tiles["seen"] = seen
-        exponentials, weights, cotangents = algebra.derived_cotangents(
+        exponentials, weights, cotangents = derived_cotangents(
             bool(coords.keys_first), multiplier is not None, seen is not None).mapped(tiles)
         return exponentials, weights, cotangents, slopes, seen
     inverse_total = per_query(algebra.inverse(read(total)))

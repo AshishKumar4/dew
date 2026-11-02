@@ -20,7 +20,12 @@ from test_algebra_derive import shaped, walked
 
 from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn.kernels import decode_attention, generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_portable
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_backward_algebra,
+    attention_portable,
+)
 from dew.nn.precision import float32_einsum
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
@@ -236,7 +241,7 @@ def derived_backward(form: str, along: str):
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`)."""
-    forms = derive.derive(algebra.backward_declaration(scale=SCALE, walked=along),
+    forms = derive.derive(attention_backward_algebra.backward_declaration(scale=SCALE, walked=along),
                           accurate=False, saturation=SATURATION)
     seen = seen_of(form)
     rows_of = forward_rows(form)
@@ -364,7 +369,7 @@ def test_the_portable_mainloop_computes_attention_by_either_forms(form, call, de
 def test_the_portable_mainloop_differentiates_attention_by_either_forms(form, derived):
     """The plain-JAX mainloop's backward (`attention_portable.backward`) under the run's fast forms, its dQ
     walk over the keys and its dK and dV walks over the queries the hand-written forms or the derived ones
-    behind the switch (`dew.algebra.forms.derived`, `attention_algebra.derived_backward`), from the
+    behind the switch (`dew.algebra.forms.derived`, `attention_backward_algebra.derived_backward`), from the
     forward's residuals and its split D: the gradients on par with the reference's (check 1) either way."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 

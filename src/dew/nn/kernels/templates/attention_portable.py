@@ -33,6 +33,7 @@ from dew.nn.kernels.templates.attention import (
     shared_place,
     within,
 )
+from dew.nn.kernels.templates.attention_backward_algebra import backward_derived, derived_backward
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -392,7 +393,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return jax.lax.fori_loop(lo, hi, step, algebra.no_dq_sums(block_q, width, len(score_kinds)))
 
 
-        if algebra.backward_derived(how, accurate=accurate):
+        if backward_derived(how, accurate=accurate):
             found = _derived_dq(formed, q, do, q_pos, m, anchor, delta, prior, lo, hi, draw,
                                 hooked=score_mod is not None, score_kinds=score_kinds, summed=summed,
                                 prescale=prescale, grad_scale=grad_scale)
@@ -433,13 +434,13 @@ def _dq_outputs(dq, rows_out, chosen, written, kinds: tuple[Kind, ...], blocks: 
 def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, hooked: bool,
                 score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], prescale: float, grad_scale: float
                 ) -> algebra.DqSums:
-    """A dQ pass's sums by the derived forms behind the switch (`algebra.derived_backward`): dQ the walk's
-    over the keys `lo` to `hi` (`formed(j)` each key tile's coordinates, mask, keys, values, logits and hook
-    slopes, the dQ launch's), at the pass's D (`anchor`, `delta`) and denominator `total`, dQ at the call's
+    """A dQ pass's sums by the derived forms behind the switch (`derived_backward`): dQ the walk's over the
+    keys `lo` to `hi` (`formed(j)` each key tile's coordinates, mask, keys, values, logits and hook slopes,
+    the dQ launch's), at the pass's D (`anchor`, `delta`) and denominator `total`, dQ at the call's
     whole scale, its query the call's own (the launch's `q` is taken by the power of two `prescale`,
     `attention.prescale`: exactly undone); the row sums D's refinement and the hook's parameters read
     (`algebra.dq_rows`) from each tile's weights and cotangents the walk gives."""
-    forms = algebra.derived_backward(grad_scale, "keys", hooked, draw is not None)
+    forms = derived_backward(grad_scale, "keys", hooked, draw is not None)
     call_q = by_power(q, 1.0 / prescale)
 
     def tiles_at(j):
@@ -484,7 +485,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     start, end, query_ids, key_ids = spans
     ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
-    derived = algebra.backward_derived(how, accurate=accurate)
+    derived = backward_derived(how, accurate=accurate)
 
     def program(index):
         j, rest = index // (batch * heads), index % (batch * heads)
@@ -494,10 +495,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         kv_head = head // group
         k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
         v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
-        # Behind the switch, dK and dV the derived walk's over the query tiles (`algebra.derived_backward`),
+        # Behind the switch, dK and dV the derived walk's over the query tiles (`derived_backward`),
         # at the dQ launch's D and denominator; else this module's contributions. Either way each tile's
         # cotangents give the key and tile parameters' gradients (`hooked`).
-        forms = (algebra.derived_backward(grad_scale, "rows", score_mod is not None, draw is not None)
+        forms = (derived_backward(grad_scale, "rows", score_mod is not None, draw is not None)
                  if derived else None)
 
         def tile_at(i):
