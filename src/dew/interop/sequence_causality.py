@@ -14,7 +14,9 @@ walk holds no rule for (`_RULES`, `_ENTRYWISE`). Dew's causal attention (`CAUSAL
 query its own position's set and its keys' up to its own; attention under a visibility its caller
 states (`STATED_ATTENTION`) gives each position its own query's, key's and value's, the caller's
 visibility being the call's and not the source's; a computation Dew states is token by token
-(`TOKENWISE`) gives each token its own. Every set is an over-approximation: the walk may refuse a causal
+(`TOKENWISE`) gives each token its own. Each of these three holds for a call of a program Dew's own
+code bound under it (`attested`), identified as that very program and never by a name; a call of any
+other program is walked inside. Every set is an over-approximation: the walk may refuse a causal
 program, never admit a later read. A program is causal where every positional output's entry at a
 position reads no later one; another length's or another call's program may differ (a branch taken on
 the sequence's length), so each program a model runs is proven on its own."""
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -30,18 +33,38 @@ import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
 
-CAUSAL_ATTENTION = "dew_causal_attention"
-"""The name of the jitted call tier 3's attention runs in (`torchax_fallback._dew_attention`), causal over
-its keys by construction, its queries, keys and values `[B, S, H, D]`."""
+from dew.nn.nested import nested
 
-STATED_ATTENTION = "dew_stated_attention"
-"""The name of the jitted call tier 3's attention runs in under a visibility its caller states (a decision
-row's options, `torchax_fallback._Attending.visible`), its queries, keys and values `[B, S, H, D]`: which
-keys a query reads is the caller's, so the walk holds each position to its own."""
+CAUSAL_ATTENTION = "causal attention"
+"""The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal
+over its keys by construction, its queries, keys and values `[B, S, H, D]`."""
 
-TOKENWISE = "dew_tokenwise"
-"""The name of a jitted call Dew computes token by token (tier 3's experts' dispatch,
-`torchax_fallback.functional_experts`), whose outputs at a token read that token's inputs alone."""
+STATED_ATTENTION = "stated attention"
+"""The rule of a program tier 3's attention runs under a visibility its caller states (a decision row's
+options, `torchax_fallback._Attending.visible`; `attested`), its queries, keys and values `[B, S, H, D]`:
+which keys a query reads is the caller's, so the walk holds each position to its own."""
+
+TOKENWISE = "token-wise"
+"""The rule of a program Dew computes token by token (tier 3's experts' dispatch,
+`torchax_fallback.functional_experts`; `attested`), whose outputs at a token read that token's inputs
+alone."""
+
+_ATTESTED: weakref.WeakKeyDictionary[core.ClosedJaxpr, str] = weakref.WeakKeyDictionary()
+"""Each program Dew's own code bound under a rule (`attested`), by that rule: the walk reads a call by
+its rule where the call's program is one of these objects, as the program alone identifies what it
+computes; a name any program may take."""
+
+
+def attested[**P, R](function: Callable[P, R], rule: str) -> Callable[P, R]:
+    """`function`, which Dew states computes as `rule` (`CAUSAL_ATTENTION`, `STATED_ATTENTION` or
+    `TOKENWISE`) says, as a nested program (`dew.nn.nested.nested`) whose every staged call's program is
+    recorded as `rule`'s, so a walk of the enclosing program reads that call by the rule."""
+    assert rule in (CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE), rule
+
+    def record(program: core.ClosedJaxpr) -> None:
+        _ATTESTED[program] = rule
+
+    return nested(function, traced=record)
 
 CONCRETE = 1 << 20
 """The most entries of an integer value the walk evaluates while it walks (a gather's indices, a
@@ -234,12 +257,14 @@ def _combined(given: Sequence[Held], shape: tuple[int, ...]) -> Reads:
 
 def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
           operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
-    """A call of a program of its own: Dew's causal attention and its token-by-token computations by
-    their own rules, any other walked inside."""
-    name = eqn.params.get("name")
-    if name in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
-        return _attended(eqn, given, causal=name == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
-    if name == TOKENWISE and any(isinstance(value, Reads) for value in given):
+    """A call of a program of its own: a jit of a program Dew's code bound under a rule (`attested`) by
+    that rule, any other walked inside."""
+    program = eqn.params.get("jaxpr")
+    rule = (_ATTESTED.get(program) if eqn.primitive.name in ("jit", "pjit")
+            and isinstance(program, core.ClosedJaxpr) else None)
+    if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
+        return _attended(eqn, given, causal=rule == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
+    if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
         out = _shape(eqn.outvars[0])
         aligned = [value for value in given if isinstance(value, Reads)]
         if all(value.axis == 0 and len(value.masks) == out[0] for value in aligned):

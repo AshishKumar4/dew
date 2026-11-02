@@ -10,6 +10,7 @@ from collections.abc import Callable
 import jax
 from jax._src import core as jax_core
 from jax._src.interpreters import partial_eval
+from jax.extend import core
 
 __all__ = ["nested", "staged"]
 
@@ -22,14 +23,22 @@ def staged() -> bool:
     return any(isinstance(trace, partial_eval.DynamicJaxprTrace) for trace in stack)
 
 
-def nested[**P, R](function: Callable[P, R], **arguments) -> Callable[P, R]:
+def nested[**P, R](function: Callable[P, R], *, traced: Callable[[core.ClosedJaxpr], None] | None = None,
+                   **arguments) -> Callable[P, R]:
     """`function` as a nested program (module docstring), under `jax.jit`'s `arguments` (its static
     arguments): within a staging trace (`staged`), its jit, which the enclosing program compiles as its
-    own; outside any, `function` itself, run as Python or by the eager transformation around it."""
+    own; outside any, `function` itself, run as Python or by the eager transformation around it.
+    `traced`, where given, takes each staged call's program, the very one the enclosing program's call
+    holds (its jit's trace of the call's arguments, which the call then reuses): what identifies Dew's
+    own programs to a reader of the enclosing one (`dew.interop.sequence_causality.attested`)."""
     jitted = jax.jit(function, **arguments)
 
     @functools.wraps(function)
     def call(*args: P.args, **kwargs: P.kwargs) -> R:
-        return jitted(*args, **kwargs) if staged() else function(*args, **kwargs)
+        if not staged():
+            return function(*args, **kwargs)
+        if traced is not None:
+            traced(jitted.trace(*args, **kwargs).jaxpr)
+        return jitted(*args, **kwargs)
 
     return call

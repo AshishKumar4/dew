@@ -2,13 +2,15 @@
 probe (`dew.interop.sequence_causality`, ledger 1595): over small programs whose causality is known, traced
 at 11 and 13 tokens, it admits each one whose every output position reads no later input through the
 operations it composes, and refuses each one that reads a later position or that it cannot show reads
-none; a program that computes otherwise past a length is proven below it and refused above."""
+none; a program that computes otherwise past a length is proven below it and refused above. Dew's own
+attention and token-wise programs are read by their rules where Dew's code bound them (`attested`); a
+program merely named like one is walked inside."""
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, causality_refusal
+from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, attested, causality_refusal
 
 LENGTHS, D, VOCAB = (11, 13), 8, 50
 
@@ -34,6 +36,7 @@ def attention(q, k, v, causal: bool):
 
 
 def named(function, name):
+    """`function` jitted under the name of a call Dew's code binds, which identifies nothing."""
     function.__name__ = name
     return jax.jit(function)
 
@@ -65,9 +68,9 @@ ADMITTED = {
     "a right shift": lambda tokens: shifted_right(embedded(tokens)),
     "heads split and merged": lambda tokens: embedded(tokens).reshape(1, tokens.shape[1], 2, 4).transpose(
         0, 2, 1, 3).transpose(0, 2, 1, 3).reshape(1, tokens.shape[1], D),
-    "Dew's attention": lambda tokens: named(lambda q, k, v: attention(q, k, v, causal=True),
-                                            CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
-    "a token-wise call": lambda tokens: named(lambda x: jnp.sort(x, axis=-1), TOKENWISE)(
+    "Dew's attention": lambda tokens: attested(lambda q, k, v: attention(q, k, v, causal=True),
+                                               CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
+    "a token-wise call": lambda tokens: attested(lambda x: jnp.sort(x, axis=-1), TOKENWISE)(
         embedded(tokens)[0])[None],
     "layers scanned": lambda tokens: jax.lax.scan(lambda h, w: (jnp.cumsum(h @ w, axis=1), None),
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
@@ -86,10 +89,14 @@ REFUSED = {
                                                                 tokens.shape[1] - 1)],
     "plain attention": lambda tokens: attention(*(embedded(tokens),) * 3, causal=False),
     "masked attention outside Dew's": lambda tokens: attention(*(embedded(tokens),) * 3, causal=True),
+    "a left shift named as Dew's attention": lambda tokens: named(lambda q, k, v: shifted_left(v),
+                                                                  CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
+    "a left shift named token-wise": lambda tokens: named(lambda x: shifted_left(x[None])[0], TOKENWISE)(
+        embedded(tokens)[0])[None],
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
     "an operation with no rule": lambda tokens: jax.lax.linalg.tridiagonal_solve(
-        *(jnp.full((tokens.shape[1],), value) for value in (0.5, 2.0, 0.5)),
-        embedded(tokens)[0, :, :1])[None],
+        jnp.full((tokens.shape[1],), 0.5), jnp.full((tokens.shape[1],), 2.0),
+        jnp.full((tokens.shape[1],), 0.5), embedded(tokens)[0, :, :1])[None],
     "positions moved to the features' axis": lambda tokens: jnp.broadcast_to(
         embedded(tokens)[:, :, :1], (1, tokens.shape[1], tokens.shape[1])).transpose(0, 2, 1),
     "a reshape that transposes": lambda tokens: jax.lax.reshape(

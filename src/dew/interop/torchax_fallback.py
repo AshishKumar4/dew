@@ -55,14 +55,19 @@ from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
-from dew.interop.sequence_causality import CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE, causality_refusal
+from dew.interop.sequence_causality import (
+    CAUSAL_ATTENTION,
+    STATED_ATTENTION,
+    TOKENWISE,
+    attested,
+    causality_refusal,
+)
 from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
-from dew.nn.nested import nested
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
@@ -506,10 +511,10 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     dropping = {"dropout_rate": float(dropout) if drawn else 0.0, "deterministic": not drawn,
                 "dropout_rng": rng}
 
-    # Each path runs in a call of its own name, which a walk of the program's causality reads by its own
-    # rule (`sequence_causality`): the cached and the plain or packed paths causal over their keys by
-    # construction (`CAUSAL_ATTENTION`), a stated visibility the caller's (`STATED_ATTENTION`).
-    # Every array each reads is its argument, none a value of the enclosing trace.
+    # Each path runs as a program of its own, attested under the rule a walk of the program's causality
+    # reads it by (`sequence_causality.attested`): the cached and the plain or packed paths causal over
+    # their keys by construction (`CAUSAL_ATTENTION`), a stated visibility the caller's
+    # (`STATED_ATTENTION`). Every array each reads is its argument, none a value of the enclosing trace.
     def attend(q, k, v, *, places, segment_ids, valid, sinks, rng):
         del places, valid  # the documents hold the padding apart, as 0
         return scaled_dot_product_attention(
@@ -549,15 +554,14 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                                             mask=visible[:, None], softcap=softcap, sinks=sinks,
                                             **{**dropping, "dropout_rng": rng})
 
-    causal.__name__ = cached.__name__ = CAUSAL_ATTENTION
-    stated.__name__ = STATED_ATTENTION
     if call.cache is not None:
         held = call.cache.held.get(module.layer_idx)
         if held is None:
             # A cache being opened: its layer's keys and values give its shape, and nothing is held.
             held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
-        out, keys, values = nested(cached)(q, k, v, held["cached_key"], held["cached_value"],
-                                           call.cache.slots, call.cache.filled, sinks, rng)
+        out, keys, values = attested(cached, CAUSAL_ATTENTION)(q, k, v, held["cached_key"],
+                                                               held["cached_value"], call.cache.slots,
+                                                               call.cache.filled, sinks, rng)
         call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
@@ -568,9 +572,9 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                       else call.places)
             reach = windowed(places[:, :, None], call.key_places[:, None, :], window, causal=False)
             visible = visible & reach
-        out = nested(stated)(q, k, v, visible, sinks, rng)
+        out = attested(stated, STATED_ATTENTION)(q, k, v, visible, sinks, rng)
     else:
-        out = nested(causal)(q, k, v, call.documents, call.valid, sinks, rng)
+        out = attested(causal, CAUSAL_ATTENTION)(q, k, v, call.documents, call.valid, sinks, rng)
     return torch_view(out.astype(q.dtype)), None
 
 
@@ -778,10 +782,10 @@ def _functional_experts() -> type:
                 width = gate_up.shape[1] // 2
                 kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
                            jnp.swapaxes(jax_view(self.down_proj), 1, 2))
-            # A call of its own name, which a walk of the program's causality admits whole
+            # A program of its own, attested token by token to a walk of the program's causality
             # (`sequence_causality.TOKENWISE`): its dispatch sorts the tokens by expert, and each token's
             # output reads its own input alone.
-            return torch_view(nested(self.tokenwise)(x, index, weights, kernels))
+            return torch_view(attested(self.tokenwise, TOKENWISE)(x, index, weights, kernels))
 
         def tokenwise(self, x, index, weights, kernels):
             """Each token's experts, weighted and summed, its slots routed or identity."""
@@ -803,8 +807,6 @@ def _functional_experts() -> type:
             held = jnp.where(identity[..., None], x[:, None, :], slots)
             wide = at_least_fp32(x.dtype)
             return jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1).astype(x.dtype)
-
-        tokenwise.__name__ = TOKENWISE
 
     return FunctionalExperts
 
