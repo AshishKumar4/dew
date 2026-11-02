@@ -257,8 +257,8 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None,
-) -> Evaluation:
+            updates: int | jax.Array | None = None,
+            scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical

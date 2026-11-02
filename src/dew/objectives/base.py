@@ -993,7 +993,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
-            tree = held
+            # A store a stage-local run handed on is read on its stored layers, whatever this run keeps.
+            from dew.nn.backbones.decoder_stack import stored_layers
+
+            tree = stored_layers(self, held)
         elif held is None or self._held_parts:
             tree = self.fresh_variables(key, held)
         else:

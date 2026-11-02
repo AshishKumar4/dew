@@ -452,7 +452,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def staged(self, state: TrainState) -> TrainState:
         """`state` (`initial_state`'s, `stored`'s) held and placed as the step holds it, as `fit` starts."""
-        return self._staging.supplied(state, self.shardings)[0]
+        return self._staging.supplied(self._staging.received(self.objective, state), self.shardings)[0]
 
     def stored(self, state: TrainState) -> TrainState:
         """`state` with a stage-local run's layers back on `layers_N`, whole on every stage, every mirror
@@ -1615,7 +1615,8 @@ class Trainer(Generic[Loss, Effects]):
             # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
             # run reads its data afresh: a clock of examples starts at none consumed, a run on another clock
             # keeps none, and its schedules take the run's own form (`reclocked`).
-            initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
+            initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
+                initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)

@@ -123,11 +123,13 @@ def _stored(path: jax.tree_util.KeyPath, leaf: jax.Array) -> list[tuple[str, jax
     """Each stored layer a parameter's leaf holds, by its name (`parameter_name`) and its values: a
     stage-local run's stacked leaf its layers in its rows' order (`dew.nn.sharding.layers_of`), any other
     the leaf itself, so a path selects and reports a layer as it would with every layer whole."""
+    from dew.nn.backbones.decoder_stack import array_rows
+
     layers, stacked = layers_of(path)
     if not stacked:
         return [(parameter_name(path), leaf)]
-    rows = leaf.reshape((-1, *leaf.shape[stacked:]))
-    return [(parameter_name(layer), rows[index]) for index, layer in enumerate(layers)]
+    return [(parameter_name(layer), row)
+            for layer, row in zip(layers, array_rows(path, leaf, leaf.shape[:stacked]), strict=True)]
 
 
 @struct.dataclass

@@ -818,7 +818,11 @@ class Server:
         if progress is not None and (progress.updates is None) != (self.progress.updates is None):
             raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
                              "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
-        packed = pack_projections(normalized(variables, self._source_shapes), self._weight_groups)
+        # A stage-local run's state is read on its stored layers, as the served tree holds them.
+        from dew.nn.backbones.decoder_stack import stored_layers
+
+        packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
+                                  self._weight_groups)
         self.variables = reloaded(packed, self.variables)
         if progress is not None:
             self.progress = progress

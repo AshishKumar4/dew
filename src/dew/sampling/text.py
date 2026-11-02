@@ -939,10 +939,13 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 
     # dew.inference imports this module, so its packing is imported here.
     from dew.inference.projections import packed_in_call
+    from dew.nn.backbones.decoder_stack import stored_layers
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
-        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
-        return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
+        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`), a
+        # stage-local run's store cut onto its layers first (`pending`).
+        layered = stored_layers(model, params) if packing else params
+        return _generate(model, packed_in_call(layered, packing), inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy, progress)
 
     return checkify.checkify(run, errors=checkify.user_checks)(

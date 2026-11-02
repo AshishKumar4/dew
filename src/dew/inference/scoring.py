@@ -33,6 +33,7 @@ from dew.batch import Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.tasks import held
 from dew.nn.inputs import mesh_of
+from dew.nn.protocols import StagedStacks
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,12 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     """A task served by forward passes over its requests' rows (`ScoringServer`). It holds no weights
     of its own: the server holds them resident, and hands them to every pass, so a task and the weights
     it scores with are one pair the server swaps whole (`ScoringServer.reload`)."""
+
+    @property
+    def model(self) -> StagedStacks:
+        """The model whose weights the task's passes read, which names the layers a stage-local run's
+        store holds stacked (`ScoringServer.reload`, `stored_layers`)."""
+        ...
 
     def admit(self, request: Request) -> ScoringRequest[Row, Payload]:
         """`request` laid out as the rows the task's passes read; raises ValueError for a request it
@@ -261,7 +268,11 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         task with its own weights, as a task's calibration is fitted to the weights it came with.
         The tree must match the served one (`dew.inference.engine.normalized`), and its leaves are
         copied onto the served placement before the swap. Safe against a `step` on another thread."""
-        self._served = (task, reloaded(normalized(variables, self._source_shapes), self.variables))
+        # A stage-local run's state is read on its stored layers, as the served tree holds them.
+        from dew.nn.backbones.decoder_stack import stored_layers
+
+        self._served = (task, reloaded(normalized(stored_layers(task.model, variables), self._source_shapes),
+                                       self.variables))
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the task's pass traces under."""

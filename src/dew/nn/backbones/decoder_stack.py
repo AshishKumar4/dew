@@ -1172,28 +1172,21 @@ def stored_by_stage(variables: Mapping[str, Mapping]) -> tuple[str, ...]:
     return tuple(name for name, tree in variables.items() if 'stages' in tree)
 
 
-def held_stages(variables: Mapping[str, Mapping]) -> int:
-    """How many stages a stage-local store stacks its runs over (`stored_by_stage`): its stacked leaves'
-    leading dimension; one for a store on its layers."""
-    stacked = [leaf for tree in variables.values() if 'stages' in tree
-               for leaf in jax.tree.leaves(tree['stages'])]
-    return np.shape(stacked[0])[0] if stacked else 1
-
-
 def array_rows(path, leaf, shape: tuple[int, ...]) -> list:
-    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: its leading `shape` flattened."""
+    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: its leading `shape` flattened by
+    the leaf's own reshape, so a host array stays on the host and a device array where it is."""
     del path
-    return list(jnp.reshape(leaf, (-1, *jnp.shape(leaf)[len(shape):])))
+    return list(leaf.reshape((-1, *leaf.shape[len(shape):])))
 
 
-def _stage_count(tree) -> int:
+def stage_count(tree) -> int:
     """How many stages the first run `tree` holds stacked by stage (`stored_by_stage`) stacks over, one
     for a tree that holds none."""
     if not isinstance(tree, Mapping):
         return 1
     if 'stages' in tree and (leaves := jax.tree.leaves(tree['stages'])):
         return np.shape(leaves[0])[0]
-    return max((_stage_count(child) for child in tree.values()), default=1)
+    return max((stage_count(child) for child in tree.values()), default=1)
 
 
 def stored_layers(model, variables: Variables) -> Variables:
@@ -1202,7 +1195,7 @@ def stored_layers(model, variables: Variables) -> Variables:
     those `model` declares (`StagedStacks.stage_sites`), each cut back by the view it was stacked under
     (`StackView.layer_form`); variables that hold no such run are returned as they are. A model run
     reads the store as it is (`off_stages`)."""
-    stages = _stage_count(variables)
+    stages = stage_count(variables)
     if stages == 1 or not isinstance(model, StagedStacks):
         return variables
     stored = dict(variables)
@@ -1234,7 +1227,7 @@ def off_stages[M: nn.Module, **P, R](module: M, method: Callable[Concatenate[M, 
     model reads the one state its run holds, with no copy of it kept. None where `module` holds no such
     store, or the mesh in context pipelines it as stored."""
     staged = stored_by_stage(module.variables)
-    held = held_stages(module.variables)
+    held = stage_count(module.variables)
     if not staged or held == pipeline_stages():
         return None
     view = view_of(held)

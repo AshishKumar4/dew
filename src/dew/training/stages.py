@@ -176,6 +176,21 @@ class StageLocal:
         (`StackView.layer_form`)."""
         return _walked(tree, self.sites, lambda site, where, node: site.view.layer_form(node, cut))
 
+    def received(self, objective, state: TrainState) -> TrainState:
+        """`state`, one a run handed on (`fit`'s), read as this run's step starts from it: a run stacked
+        by stage over another count, or by a run where this one keeps every layer whole, back on its
+        stored layers (`objective`'s stage sites at the count it holds), every mirror alike; a state on
+        its layers, or stacked as this run stacks, as it is."""
+        from dew.nn.backbones.decoder_stack import stage_count
+
+        held = stage_count(state.variables)
+        if held == 1 or (self.sites and held == self.stages):
+            return state
+        shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype), state.variables)
+        sites = objective.stage_sites(shapes, held)
+        return self.state(state, lambda tree: _walked(
+            tree, sites, lambda site, where, node: site.view.layer_form(node, _layer_rows)))
+
     def holds(self, variables) -> bool:
         """Whether `variables` hold their runs stacked by stage."""
         staged: list[bool] = []
