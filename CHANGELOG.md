@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A layout that keeps the optimizer state or the EMA in pinned host memory (`Layout(host=...)`) now brings
+  it to the device a chunk at a time as the step commits: the leaves the commit reads together, under AdamW
+  one parameter's moments and average, each chunk stored back as soon as it is updated. It used to fetch the
+  whole state at once, and XLA held all of it beside the parameters and the gradient, so a whole
+  Qwen3.5-4B's AdamW step with its moments on the host never fit a GH200. The memory planner's derived
+  footprint counts what a commit stages.
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate bounds the window's curvature along the step from the
   head's bounds (`head_bounds`) and the activation's derivatives, so it never overshoots, and stays
