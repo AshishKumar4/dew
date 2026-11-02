@@ -364,8 +364,12 @@ so a level read in another's place shows."""
 
 CHAINED = decoder(continuum=CHAIN)
 
-CHAIN_SEEDS = {(1, 3): 8, (3, 6): 8, (6, 2): 8, "damped": 8}
+CHAIN_SEEDS = {(1, 3): 8, (3, 6): 8, (6, 2): 8}
 """Check 1's declared seeds for a chain's sites, by its levels' windows."""
+
+DAMPED_CHAIN_SEEDS = 8
+"""Check 1's declared seeds for a damped chain's site (`test_a_damped_chain_steps_each_level_as_the_literal_
+loop`)."""
 
 
 def chain_loop(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
@@ -523,7 +527,7 @@ def test_a_damped_chain_steps_each_level_as_the_literal_loop(kind):
         _, hidden, targets, weights = draw(seed, scale=0.5)
         return drawn_variables(seed, CHAINED, scale=0.5), hidden, targets, weights
 
-    site(dew, reference, chained_draw, 5.0, 0.5, 3, f"a damped chain over {kind}", CHAIN_SEEDS["damped"],
+    site(dew, reference, chained_draw, 5.0, 0.5, 3, f"a damped chain over {kind}", DAMPED_CHAIN_SEEDS,
          damped=True)
 
 
