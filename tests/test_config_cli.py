@@ -467,7 +467,8 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=None, epochs=2, log_every=1,
                               eval_every=None, checkpoint_every=None))
     prepared = run.prepare()
-    assert prepared.dataset.examples is not None and prepared.dataset.example_steps is None
+    # Bounded to the passes' 40 examples, whose steps its per-share order counts none of ahead.
+    assert prepared.dataset.examples == 40 and prepared.dataset.example_steps(40) is None
     assert prepared.objective.ema.progressed
 
 
