@@ -240,7 +240,9 @@ def test_an_index_whose_lease_waits_holds_no_other_index_back(tmp_path):
         finally:
             gate.released.set()
             waiting.join(60)
-    assert waited == [{"id": 0}]
+    # Released by the test, not timed out: a local read the remote lease held back would have waited for
+    # the gate's wait to run out, and passed late.
+    assert waited == [{"id": 0}] and gate.answered and all(gate.answered)
 
 
 def test_a_declared_offset_index_replaced_under_its_facts_is_refused_where_it_is_read():
@@ -364,11 +366,13 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
 
 @dataclasses.dataclass(frozen=True)
 class Gate:
-    """A path a server answers only once `released`, and whether a read has `asked` for it."""
+    """A path a server answers only once `released`, whether a read has `asked` for it, and whether each
+    answer waited for its release (`answered`) rather than for the wait to run out."""
 
     path: str
     asked: threading.Event = dataclasses.field(default_factory=threading.Event)
     released: threading.Event = dataclasses.field(default_factory=threading.Event)
+    answered: list[bool] = dataclasses.field(default_factory=list)
 
 
 @contextlib.contextmanager
@@ -384,7 +388,7 @@ def etagged_server(objects: dict[str, bytes], token: str | None = None, gate: Ga
         def do_GET(self):
             if gate is not None and self.path == gate.path:
                 gate.asked.set()
-                gate.released.wait(60)
+                gate.answered.append(gate.released.wait(60))
             if token is not None and self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_response(401)
                 self.end_headers()

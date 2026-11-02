@@ -48,7 +48,8 @@ export function editUrl(repoPath) {
 /** The commit date of a change to a repository file, the first that added it at its path where `first`, else
  * its last; undefined for a file git does not hold yet, or outside git. */
 function committed(repoPath, first) {
-	const flags = first ? ['--diff-filter=A'] : ['-1'];
+	// The add a rename carries the file's history past (`--follow`), so a renamed page keeps its date (review).
+	const flags = first ? ['--follow', '--diff-filter=A'] : ['-1'];
 	try {
 		const dates = execFileSync('git', ['log', ...flags, '--format=%cI', '--', repoPath], { cwd: repoRoot, encoding: 'utf8' }).trim();
 		return dates ? new Date(dates.split('\n').at(-1)) : undefined;
@@ -61,6 +62,15 @@ function committed(repoPath, first) {
 export const lastUpdated = (repoPath) => committed(repoPath, false);
 
 let whole;
+
+/** Overview page `slug` (sync-docs wrote its prose) with `items`, HTML, appended inside `open` and its closing
+ * tag, replacing what an earlier render appended; none appended where `items` is empty. */
+export async function listed(slug, open, items) {
+	const page = pageFile(slug);
+	const prose = (await readFile(page, 'utf8')).split(`\n\n${open}`)[0].trimEnd();
+	const close = `</${open.match(/^<(\w+)/)[1]}>`;
+	await writeFile(page, items.length ? `${prose}\n\n${open}${items.join('')}${close}\n` : `${prose}\n`);
+}
 
 /** When a tutorial or post was published: the commit date of the change that added its file at its path, or
  * undefined for one git does not hold yet. A listing of the newest reads it, so no date is written by hand. A
