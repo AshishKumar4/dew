@@ -1018,7 +1018,8 @@ ROUNDED = {
     "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), True),
     "checkpoint-down-both": (lambda: _checkpoint("continuum/down"), (), False),
     "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), True),
-    "qwix-tied": (lambda: _qwix("embed_tokens"), ("up",), True),
+    "qwix-tied": (lambda: _qwix("^$"), ("up",), True),
+    "qwix-lookup": (lambda: _qwix("embed_tokens"), ("up",), False),
     "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), True),
     "qwix-down-up": (lambda: _qwix("continuum/down"), ("up",), False),
     "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), True),
@@ -1032,11 +1033,13 @@ def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
     """A damped step's bounds hold where the maps it reads are linear in what it moves. A head map that
     rounds its input (a checkpoint's quantizer of `lm_head`'s or of a transform's `head_dense`'s input)
     makes the head piecewise constant in its states, and one Qwix quantizes (`lm_head`, a tied head's
-    `embed_tokens`) rounds its inputs or multiplies by its kernel rounded; a level map whose kernel
-    Qwix rounds makes the loss piecewise constant in that kernel, and an `up` that rounds its input makes
-    the level's output piecewise constant in `down`: each refused (ValueError). The rest runs, finite: a
-    trunk module's quantizer, `up` alone through its quantized input, both parts through a quantized
-    `down` input, and `up` alone where Qwix rounds `down`'s products."""
+    product in the model's own scope, `^$`) rounds its inputs or multiplies by its kernel rounded; a
+    level map whose kernel Qwix rounds makes the loss piecewise constant in that kernel, and an `up`
+    that rounds its input makes the level's output piecewise constant in `down`: each refused
+    (ValueError). The rest runs, finite: a
+    trunk module's quantizer, a Qwix rule over the embedding's lookup alone, `up` alone through its
+    quantized input, both parts through a quantized `down` input, and `up` alone where Qwix rounds
+    `down`'s products."""
     build, parts, refused = ROUNDED[case]
     objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
     variables = objective.init(jax.random.key(0))

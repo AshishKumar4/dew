@@ -1269,15 +1269,17 @@ class CausalTransformer(nn.Module):
         |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign; a transform N(phi(D s)), N a norm of gain g and
         epsilon e, has a Jacobian of at most |g| p1 |D| / sqrt e and a second derivative of at most
         |g| (6 p1^2 / e + p2 / sqrt e) |D|^2, p1, p2 phi's `SLOPES` (a norm's are |g| / sqrt e and 6 |g| / e).
-        A head map (`lm_head`, a tied head's `embed_tokens`, `project_out`, `head_dense`) that rounds its
-        input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel Qwix
-        rounds multiplies by a matrix these norms do not read: refused. nGPT's gains never meet a level
-        (`setup`)."""
-        heads = [*(["embed_tokens"] if self.tie_embeddings else ["lm_head"]),
+        A head map (`lm_head`, `project_out`, `head_dense`, or a tied head's product in the model's own
+        scope) that rounds its input (`nonlinear_input`) makes the head piecewise constant in its states,
+        and one whose kernel Qwix rounds multiplies by a matrix these norms do not read: refused. nGPT's
+        gains never meet a level (`setup`)."""
+        heads = [*([] if self.tie_embeddings else ["lm_head"]),
                  *([] if self.embedding_features is None else ["project_out"]),
                  *([] if self.head_transform is None else ["head_dense"])]
         rounded = [name for name in heads
                    if self.nonlinear_input(name) or quantized_products(self, name).weights]
+        tied = quantized_products(self) if self.tie_embeddings else None
+        rounded += ["the tied table's product"] if tied is not None and (tied.inputs or tied.weights) else []
         if rounded:
             raise ValueError(f"a damped step bounds the head's curvature and slope in its states, and the "
                              f"head's {rounded} round their inputs, making the head piecewise constant "
