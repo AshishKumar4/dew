@@ -774,17 +774,41 @@ def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_wh
     assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
 
 
-def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path):
-    """A run given `dumps` writes its compiles under that directory, a child process's too, and nothing where
-    it compiled nothing (`compiled_in`): the gate of a run of programs compiled ahead (ledger 2716)."""
+def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
+                                                                                           monkeypatch):
+    """A run given `dumps` writes its compiles under that directory, a child process's too from another
+    working directory, whatever the environment said of XLA's dumping (off, or filtered to no module), and
+    nothing where it compiled nothing (`compiled_in`); a directory dumps did not make is refused, never read
+    as empty: the gate of a run of programs compiled ahead (ledger 2716)."""
     import subprocess
     import sys
+    from pathlib import Path
 
     from dew.training.ahead import compiled_in, dumps
 
     child = "import jax; jax.jit(lambda x: x + 1)(1.0)"
-    compiling = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}], check=True)"
-    for name, script in (("compiles", compiling), ("computes", "import numpy; numpy.arange(8.0).sum()")):
-        environment = dumps(tmp_path / name, {**os.environ, "JAX_PLATFORMS": "cpu"})
-        subprocess.run([sys.executable, "-c", script], env=environment, check=True)
-    assert compiled_in(tmp_path / "compiles") and compiled_in(tmp_path / "computes") == []
+    elsewhere = f"[sys.executable, '-c', {child!r}], cwd='/', check=True"
+    compiling = f"import subprocess, sys; subprocess.run({elsewhere})"
+    monkeypatch.chdir(tmp_path)
+    given = (("off", "--xla_enable_dumping=false"), ("filtered", "--xla_dump_hlo_module_re=^never$"))
+    for name, flags in given:
+        environment = {**os.environ, "JAX_PLATFORMS": "cpu", "XLA_FLAGS": flags}
+        subprocess.run([sys.executable, "-c", compiling], env=dumps(Path(name), environment), check=True)
+        assert compiled_in(tmp_path / name), name
+    computing = dumps(Path("computes"), {**os.environ, "JAX_PLATFORMS": "cpu"})
+    subprocess.run([sys.executable, "-c", "import numpy; numpy.arange(8.0).sum()"], env=computing, check=True)
+    assert compiled_in(tmp_path / "computes") == []
+    with pytest.raises(FileNotFoundError):
+        compiled_in(tmp_path / "never-made")
+
+
+def test_a_flag_given_twice_is_read_by_its_order():
+    """XLA reads a flag given twice by its last value, so the two orders of one pair are two targets
+    (`computation_flags`, review)."""
+    from dew.training.ahead import computation_flags
+
+    first = "--xla_allow_excess_precision=false --xla_allow_excess_precision=true --xla_dump_to=/tmp/x"
+    second = "--xla_allow_excess_precision=true --xla_allow_excess_precision=false"
+    assert computation_flags(first) != computation_flags(second)
+    excess = "--xla_allow_excess_precision"
+    assert computation_flags(first) == (f"{excess}=false", f"{excess}=true")
