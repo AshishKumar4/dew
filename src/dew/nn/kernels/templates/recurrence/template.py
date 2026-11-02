@@ -311,9 +311,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return tiles
 
     def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
-        """Whether the call's gradient runs on `target`: its fast backward takes it (the delta rule, a decay a
-        head, 16-bit operands) and its launches hold at the call's derived tiles (`_backward_holds`), the
-        rule's gradient (`mosaic_rule`) refusing every other call."""
+        """Whether the call's gradient runs on `target`: its fast backward takes its form
+        (`mainloop_backward.fast_backward_form`: the delta rule with a decay a head or a key dimension, the
+        SSD's rated scan in bf16 under the fast forms, either in fp32 under the fast forms) and its launches
+        hold at the call's derived tiles (`_backward_holds`), the rule's gradient (`mosaic_rule`) refusing
+        every other call."""
         if generation.backend() == "cpu" and bundle(target) is None:
             target = self.launched()
         arguments = ba.arguments

@@ -622,7 +622,6 @@ class PortCase:
     decayed: bool = True
     bound: float | None = None
     per_key: bool = False
-    packed: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -731,9 +730,10 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
-                "a gradient the template's fast backward does not take: fp32 operands, no delta rule, a "
-                "decay a key dimension, or launches past the device's registers or shared memory at the "
-                "call's tiles (`mainloop_backward.backward_holds`)", row='ledger 1294'),
+                "a gradient the template's fast backward does not take (`mainloop_backward."
+                "fast_backward_form`): fp32 operands under the accurate forms, an fp16 call without the "
+                "delta rule, a decay a key dimension without it; or launches past the device's registers or "
+                "shared memory at the call's tiles (`mainloop_backward.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -866,8 +866,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
-                    packed=starts is not None)
+                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
@@ -1255,24 +1254,26 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
+    # Under the fast forms the skip in the template's own output and walk (`mainloop._output`, `_reverse`),
+    # as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it so and no
+    # epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's skip and cast
+    # took 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
+    # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
+    # (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
+    # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
+    # tile).
+    fast = fast_rounding()
+    operand = jnp.dtype(jnp.result_type(query, key, value))
+    fused = fast and hooks.skip and operand.itemsize == 2
+    narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
 
     def product_kernel(product: str) -> str:
         return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
-                           max_segments=max_segments, product=product)
+                           max_segments=max_segments, product=product, skip=skip if fused else None,
+                           wide=not narrow)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
-            # Under the fast forms the skip in the template's own output and walk (`mainloop._output`,
-            # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where the caller
-            # asks it so and no epilogue reads it after (`hooks.output`'s norm), else wide: added after, its
-            # fp32 output's skip and cast took 0.045 ms past an H100's launches, and its gradient's 0.094
-            # (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit
-            # values ungated (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts
-            # under the fast forms), the skip is added after.
-            fast = fast_rounding()
-            operand = jnp.dtype(jnp.result_type(query, key, value))
-            fused = fast and hooks.skip and operand.itemsize == 2
-            narrow = fused and hooks.output is None and jnp.dtype(dtype) == operand
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, max_segments=max_segments, scale=1.0,
                                        delta=False, wide=not narrow, rounded=fast)
@@ -1427,15 +1428,18 @@ def fast_rounding() -> bool:
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
-                max_segments: int | None = None, product: str = 'forward') -> str:
+                max_segments: int | None = None, product: str = 'forward', skip=None,
+                wide: bool = True) -> str:
     """The kernel the scan's selector (`SCAN`) gives a rated scan over these operands (`_rated_scan`'s:
     `value` the SSD's `x`, `key` its `B`, `query` its `C`) for `product` ('forward', 'training'), the
-    template's implementations bound to it, on the target (`generation`'s, an assumed one's within
+    template's implementations bound to it as the run calls it (its fused `skip`, None where added after,
+    and its output `wide` or in the operands' dtype), on the target (`generation`'s, an assumed one's within
     `assumed`), reported as its route."""
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=fast_rounding())
+                     max_segments=max_segments, scale=1.0, delta=False, wide=wide, rounded=fast_rounding(),
+                     skip=skip)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel
 
