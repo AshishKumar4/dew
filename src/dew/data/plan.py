@@ -445,20 +445,15 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     return earlier_plan(written, plan), iterator
 
 
-def read_alike_at_8(saved: Mapping[str, object]) -> bool:
-    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`): where its read is
-    not streamed, one reader reads it, no take reads its order (no `Limit` among its stages, its mixed
-    corpora's orders within it), or its takes are no bound in examples and no loading workers read them, a
-    corpus's own pool among them (`pools`). Otherwise (`read_otherwise_at_8`) it reads another order."""
-    return read_otherwise_at_8(saved) is None
-
-
 def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
-    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike
-    (`read_alike_at_8`). Version 7 read a take before its loading workers (a `.take`) on each of them, and
-    a run's bound in examples (its manifest's `MarkConsumed` step) whole on each of a pool's shares and their
-    workers; version 8 takes the one across them and deals the other to them. So a position 7 wrote of such
-    a read can go on only as 7 read it, which reads the bound once a reader: the over-read 8 ended."""
+    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike:
+    where its read is not streamed, one reader reads it, no take reads its order (no `Limit` among its stages,
+    its mixed corpora's orders within it), or its takes are no bound in examples and no loading workers read
+    them, a corpus's own pool among them (`pools`). Version 7 read a take before its loading workers (a
+    `.take`) on each of them, and a run's bound in examples (its manifest's `MarkConsumed` step) whole on each
+    of a pool's shares and their workers; version 8 takes the one across them and deals the other to them. So
+    a position 7 wrote of such a read can go on only as 7 read it, which reads the bound once a reader: the
+    over-read 8 ended."""
     order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
     readers = topology if isinstance(topology, Mapping) else {}
     pools = readers.get("pools", {})
@@ -485,7 +480,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
-    if saved.get("version") == 7 and plan.version == 8 and read_alike_at_8(saved):
+    if saved.get("version") == 7 and plan.version == 8 and read_otherwise_at_8(saved) is None:
         saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
@@ -739,8 +734,9 @@ class Plan:
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
                 f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; resume with the Dew "
-                "that wrote it, or go on from its weights as a new run that reads its data afresh: its "
-                "state restored (`Checkpoints.restore`) and given to `fit(state=)`"
+                "that wrote it, or go on from its weights as a new run that reads its data afresh: "
+                "`--pretrained <run directory>` on the command line or in run.json, or its state restored "
+                "(`Checkpoints.restore`) and given to `fit(state=)`"
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
