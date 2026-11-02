@@ -313,6 +313,9 @@ class WrapperFields(AudioFields):
     """The wrapper's media components Dew has no port of, by their tensors' prefix (past `model.`) to
     the reason: a load takes its language model alone (`text_only`), and a multimodal load refuses
     them by name."""
+    text_unprefixed: NotRequired[tuple[str, ...]]
+    """The prefixes (past `model.`) under which a release saved before transformers nested its language
+    model keeps that model's modules at the top (Qwen2.5-VL-7B's `model.layers.*`), routed into it."""
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -1082,6 +1085,11 @@ SHORT_CONV_LEAVES: Leaves = {
 """A gated short convolution layer's tensors (LFM2's and LFM3's), by their names past `model.layers.N.`,
 under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projections and its `[D, 1, K]`
 taps."""
+
+XIELU_LEAVES: Leaves = {f'mlp.act_fn.{name}': ('mlp', 'act_fn', name)
+                        for name in ('alpha_p', 'alpha_n', 'beta', 'eps')}
+"""An ungated feed-forward's xIELU (Apertus's), by its tensors' names past `model.layers.N.`: its two
+learned parameters and its two buffers (`dew.nn.activations.Xielu`), the buffers Dew's constants."""
 
 
 KDA_LEAVES: Leaves = {

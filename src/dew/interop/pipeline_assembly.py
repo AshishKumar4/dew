@@ -812,22 +812,10 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """
     if config.get("model_type") != "qwen3_vl":
         raise ValueError(f"Qwen-Image's text encoder is a qwen3_vl model, not {config.get('model_type')!r}")
-    text = dict(_records.record(config["text_config"], "text_config"))
+    text = dict(decoders.vlm_text(config, set()))
     if text.get("model_type") != "qwen3_vl_text":
         raise ValueError(f"A qwen3_vl text_config is qwen3_vl_text, not {text.get('model_type')!r}")
-    half = _records.integer(text["head_dim"], "head_dim") // 2
-    for key in ("rope_parameters", "rope_scaling"):
-        entry = text.get(key)
-        if isinstance(entry, Mapping):
-            entry = dict(entry)
-            section = _records.integers(entry.pop("mrope_section"), "mrope_section")
-            _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
-            if sum(section) != half:
-                raise ValueError(f"mrope_section {section} must cover the {half} channel pairs")
-            text[key] = entry
-    return {**text, "model_type": "qwen3",
-            "tie_word_embeddings": _records.boolean(config.get("tie_word_embeddings", False),
-                                                   "tie_word_embeddings")}
+    return {**decoders.plain_text_rope(text), "model_type": decoders.TEXT_FAMILIES["qwen3_vl_text"]}
 
 
 _TEXT_ENCODER = ("encoders", "conditioning", "text_encoder")

@@ -48,12 +48,18 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.distributed.placement import Layout, RefinesLayout
-from dew.nn import categorical
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
-from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.precision import (
+    ROUNDING_STREAM,
+    Numerics,
+    accumulated,
+    at_least_fp32,
+    compensated_sum,
+    weighted_total,
+)
 from dew.nn.progress import END, Progress, ReadsProgress
-from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
+from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters, StagedStacks
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -403,10 +409,6 @@ class Step:
         return self.step if self.committed is None else self.committed
 
 
-ROUNDING_STREAM = 0x726F756E
-"""What `training_rngs` folds its key with for the stochastic rounding stream."""
-
-
 def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
     """The RNG streams a model draws from `key` in a training pass: `dropout`,
     and `stochastic_rounding`, which a `dew.quantization.Quantization` with
@@ -531,11 +533,6 @@ class Prediction:
 
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
-
-UNREAD = "unread"
-"""The field of an inference record naming the parts of the run's tree its model does not read
-(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
-teacher and projections beside the student it saves."""
 
 
 def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
@@ -942,6 +939,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return ()
 
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
+        stage-local state is made from: the trainer keeps each stacked by stage on the stage's own
+        devices, its optimizer state and EMA with it (`dew.training.stages`). The default is the
+        `model` the objective holds, whose tree is the objective's own, as its model declares
+        them (`StagedStacks`); an objective that holds its networks in parts of its tree says
+        where each lies."""
+        model = vars(self).get("model")
+        return model.stage_sites(store, stages) if isinstance(model, StagedStacks) else ()
+
     @property
     def initializer(self) -> Initializer:
         """`init` as one value a JIT can take, with the held arrays as its arguments.
@@ -983,7 +990,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
-            tree = held
+            # A store a stage-local run handed on is read on its stored layers, whatever this run keeps.
+            from dew.nn.backbones.layer_names import stored_layers
+
+            tree = stored_layers(self, held)
         elif held is None or self._held_parts:
             tree = self.fresh_variables(key, held)
         else:
@@ -1655,14 +1665,6 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
-
-
-def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
-
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
-    """
-    return -categorical.cross_entropy(logits, tokens)
 
 
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (

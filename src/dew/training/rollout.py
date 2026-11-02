@@ -78,7 +78,8 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
 def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
                marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
                examples: int | None = None, closes: bool = False) -> tuple[Batch, bytes | None]:
-    """`batch` sampled through `rollout`, its host preparation `marked` and placed on `mesh`
+    """`batch` sampled through `rollout` from `state`, as the run holds it, which its policy reads off
+    the mesh (`decoder_stack.off_stages`), its host preparation `marked` and placed on `mesh`
     (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
     (`FitRun.held`); without a rollout, the batch as it is. In a run on the examples clock the
     batch it makes consumes the examples of the batches it read, its step's and each it drew further

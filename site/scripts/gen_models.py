@@ -60,6 +60,7 @@ DECODERS = {
     "qwen3_moe": ("Qwen3-MoE", "Mixture of experts"),
     "qwen2_moe": ("Qwen 2 MoE", "Mixture of experts"),
     "qwen3_5_moe_text": ("Qwen 3.5 MoE, text", "Mixture of experts"),
+    "qwen3_vl_moe_text": ("Qwen3-VL-MoE, text", "Mixture of experts"),
     "gpt_oss": ("gpt-oss", "Mixture of experts"),
     "llama4_text": ("Llama 4, text", "Mixture of experts"),
     "glm4_moe": ("GLM 4 MoE", "Mixture of experts"),
@@ -102,6 +103,10 @@ WRAPPERS = {
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
     "muse_glimmer": ("Muse Glimmer", "Images"),
     "lfm3_vl": ("LFM3-VL", "None yet: its language model alone (`text_only`)"),
+    "qwen2_vl": ("Qwen2-VL", "None yet: its language model alone (`text_only`)"),
+    "qwen2_5_vl": ("Qwen2.5-VL", "None yet: its language model alone (`text_only`)"),
+    "qwen3_vl": ("Qwen3-VL", "None yet: its language model alone (`text_only`)"),
+    "qwen3_vl_moe": ("Qwen3-VL-MoE", "None yet: its language model alone (`text_only`)"),
 }
 PIPELINES = {
     "StableDiffusionPipeline": ("Stable Diffusion", "Text to image"),

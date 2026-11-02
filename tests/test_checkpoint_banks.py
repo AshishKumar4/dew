@@ -13,7 +13,7 @@ from dew.data import Loading, Memory
 from dew.inference.banks import CheckpointBanks, bank_sites, banked, spread
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.backbones.layer_names import group_layers
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 

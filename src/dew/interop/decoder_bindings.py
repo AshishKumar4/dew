@@ -72,6 +72,10 @@ def reading_layout(name: str, reading: decoder_parts.Reading, config,
         # The tensor as stored, which `prepare` may have reshaped for the tree; one it made has none.
         return None if reading.stored is None else layout(name, reading.parts[0], reading.stored)
     parts = [layout(part.name, part, part.tensor) for part in reading.parts]
+    if all(part is None for part in parts):
+        # A packed tensor whose every part the decoder leaves unread (a prediction depth past the trunk,
+        # stored with fused experts) is kept whole, as an unpacked one none reads is (ledger 3141).
+        return None
     if any(part is None for part in parts):
         raise ValueError(f"packed tensor {name!r} has no parameter path")
     return reading.packing.layout(name, [part for part in parts if part is not None], config)

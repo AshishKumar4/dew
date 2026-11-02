@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from functools import cache
 from types import FunctionType, MethodType
@@ -271,6 +271,13 @@ def _read_stablelm_layer(view: PartView) -> Mapping[str, object]:
     return {'parallel_residual': parallel, 'shared_parallel_norm': parallel}
 
 
+def _read_sandwich_layer(view: PartView) -> Mapping[str, object]:
+    """GLM-4's layer: Gemma 2's sandwich, each sublayer's input and output normed (`sandwich_norms`),
+    its norms renamed onto Gemma 2's (`post_self_attn_layernorm` the attention's output norm,
+    `post_attention_layernorm` the feed-forward's input norm, `post_mlp_layernorm` its output norm)."""
+    return {'sandwich_norms': True}
+
+
 def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
     """OLMo 2's layer: each sublayer's output normed before it joins the residual, its input not
     (`sandwich_norms` without `pre_norms`, OLMo 3's)."""
@@ -312,17 +319,16 @@ def _read_lfm2_mlp(view: PartView) -> Mapping[str, object]:
 def _read_short_conv(view: PartView) -> Mapping[str, object]:
     """LFM2's gated short convolution (`dew.nn.mixers.short_conv.GatedShortConv`): `in_proj` to B, C and x,
     the depthwise causal convolution of B * x over `conv_kernel_size` taps, gated by C, and `out_proj`
-    back; a per-layer fact (`_with_convolutions`). Its `bias`, biasing all three, is `Ambiguous`."""
+    back; a per-layer fact (`_with_convolutions`). Its `bias` biases all three together, a left-padded
+    prompt's slots holding their bias product as its zeroed inputs do, its code masking no product
+    (`padding_holds_bias`); one biasing some of them alone is `Ambiguous`."""
     conv, width = view.conv, view.in_proj.in_features
     taps = int(view.conv_kernel_size)
     if (conv.groups != width or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)
             or view.in_proj.out_features != 3 * width):
         raise Ambiguous("the convolution is not one causal depthwise filter per channel over its taps")
-    if _biased(view.in_proj, view.out_proj, conv):
-        # Its padded slots, zeroed before `in_proj`, still convolve their bias terms into the next real
-        # tokens' history, which Dew's held convolution keeps empty.
-        raise Ambiguous("the convolution is biased, so its padded slots convolve their bias terms")
-    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': False}}}
+    biased = _biased(view.in_proj, view.out_proj, conv)
+    return {_LAYER: {'conv': {'conv_L_cache': taps, 'conv_bias': biased, 'padding_holds_bias': biased}}}
 
 
 def _read_mlp(view: PartView) -> Mapping[str, object]:
@@ -346,6 +352,33 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
     weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
                      'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_glm4_attention(view: PartView) -> Mapping[str, object]:
+    """GLM-4's attention: Llama's, its rotary turning adjacent pairs of the heads' rotated channels (its
+    `apply_rotary_pos_emb` repeats each angle over a pair and rotates `(x[2i], x[2i+1])` over the first
+    `rotary_dim` channels, the rest passed through) in the queries' dtype, which Dew's rotation, in at
+    least float32 rounded once, holds within that dtype's rounding; a per-layer fact
+    (`_with_attention_fields`)."""
+    return {**_read_attention(view), _LAYER: {'attention': {'rotary_pairs': 'adjacent'}}}
+
+
+def _read_fused_mlp(view: PartView) -> Mapping[str, object]:
+    """GLM-4's MLP: Llama's with the gate and up projections one Linear (`gate_up_proj`, the gate's rows
+    first, `chunk(2)`), read as the two (`KnownPart.split`)."""
+    fused = view.gate_up_proj
+    if fused.out_features % 2:
+        raise Ambiguous(f"the fused gate and up projection holds {fused.out_features} rows, which split into "
+                        "no equal gate and up halves, so no gated MLP of Dew's reads it")
+    return {'mlp': gated_activation(view.activation_fn), 'mlp_features': fused.out_features // 2,
+            'mlp_bias': _biased(fused, view.down_proj)}
+
+
+def _read_xielu_mlp(view: PartView) -> Mapping[str, object]:
+    """Apertus's MLP: ungated, `down_proj(act_fn(up_proj(x)))`, its activation xIELU with its learned
+    parameters (`dew.nn.activations.Xielu`, Dew's `mlp='xielu'`)."""
+    return {'mlp': 'xielu', 'mlp_features': view.up_proj.out_features,
+            'mlp_bias': _biased(view.up_proj, view.down_proj)}
 
 
 def _read_ernie_attention(view: PartView) -> Mapping[str, object]:
@@ -441,7 +474,9 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': bool(view.config.rope_interleave)}}}
+                'rope_interleave': bool(view.config.rope_interleave),
+                # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
+                'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
 
 def _read_shared_moe(view: PartView) -> Mapping[str, object]:
@@ -469,10 +504,11 @@ def _read_rms_norm(view: PartView) -> Mapping[str, object]:
 
 
 def _read_latent_norm(view: PartView) -> Mapping[str, object]:
-    """A latent attention's norm (Llama's RMSNorm): the latent mixer norms at the block norms' rounding
-    (`MLAMixer.build` passes the layer's), so it states that rounding, which the block norms' must agree
-    with; its epsilon the attention's reader holds to the mixer's own."""
-    return {'scale_after_cast': True, 'scale_offset': False}
+    """A latent attention's norm (Llama's RMSNorm, the one class the `latent_norm` role admits): its
+    rounding the latent mixer's own (`_read_latent_attention` states `latent_scale_after_cast` and
+    `latent_scale_offset` as this class computes), whatever the block norms' is (ledger 3114); its
+    epsilon the attention's reader holds to the mixer's own."""
+    return {}
 
 
 def _read_offset_norm(view: PartView) -> Mapping[str, object]:
@@ -548,6 +584,14 @@ class KnownPart:
     flat: tuple[str, ...] = ()
     """The parameters the source stores with leading unit axes that its leaf holds flat (ERNIE 4.5's
     `[1, experts]` correction bias), by the known class's names (`Assembly.flat`)."""
+    constants: tuple[str, ...] = ()
+    """The buffers its checkpoint stores that its code reads and no step trains (xIELU's `beta` and
+    `eps`), by the known class's names: each a constant of Dew's (`constants` collection,
+    `Assembly.constants`)."""
+    split: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    """The children whose weight holds several canonical projections concatenated on its output rows,
+    by the known class's attribute name, onto the projections in their order (GLM-4's `gate_up_proj`,
+    the gate's rows first): each reads as its parts (`_fused_linear`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -573,6 +617,8 @@ _HUNYUAN = 'transformers.models.hunyuan_v1_moe.modeling_hunyuan_v1_moe'
 _LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
+_GLM4 = 'transformers.models.glm4.modeling_glm4'
+_APERTUS = 'transformers.models.apertus.modeling_apertus'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -656,6 +702,28 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('layer', f'{_OLMO2}:Olmo2DecoderLayer',
               {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'post_attention_layernorm': ('norm',),
                'post_feedforward_layernorm': ('norm',)}, _read_output_normed_layer),
+    KnownPart('layer', f'{_GLM4}:Glm4DecoderLayer',
+              {**_LAYER_CHILDREN, 'post_self_attn_layernorm': ('norm',), 'post_mlp_layernorm': ('norm',)},
+              _read_sandwich_layer,
+              canonical={'post_self_attn_layernorm': 'post_attention_layernorm',
+                         'post_attention_layernorm': 'pre_feedforward_layernorm',
+                         'post_mlp_layernorm': 'post_feedforward_layernorm'}),
+    KnownPart('attention', f'{_GLM4}:Glm4Attention', _ATTENTION_CHILDREN, _read_glm4_attention),
+    KnownPart('layer', f'{_APERTUS}:ApertusDecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp',), 'attention_layernorm': ('norm',),
+               'feedforward_layernorm': ('norm',)}, _read_nothing,
+              canonical={'attention_layernorm': 'input_layernorm',
+                         'feedforward_layernorm': 'post_attention_layernorm'}),
+    KnownPart('attention', f'{_APERTUS}:ApertusAttention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
+    KnownPart('mlp', f'{_APERTUS}:ApertusMLP',
+              {'up_proj': ('linear',), 'down_proj': ('linear',), 'act_fn': ('xielu',)}, _read_xielu_mlp),
+    KnownPart('xielu', 'transformers.activations:XIELUActivation', {}, _read_nothing, ('alpha_p', 'alpha_n'),
+              constants=('beta', 'eps')),
+    KnownPart('mlp', f'{_GLM4}:Glm4MLP', {'gate_up_proj': ('linear',), 'down_proj': ('linear',)},
+              _read_fused_mlp, canonical={'gate_up_proj': ''},
+              split={'gate_up_proj': ('gate_proj', 'up_proj')}),
+    KnownPart('rotary', f'{_GLM4}:Glm4RotaryEmbedding', {}, _read_partial_rotary, whole=True),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -769,6 +837,8 @@ class Assembly:
     flat: frozenset[str] = frozenset()
     """The canonical names of the parameters the source stores with leading unit axes that their leaves
     hold flat (`KnownPart.flat`), which the family's `prepare` reads flat."""
+    constants: frozenset[str] = frozenset()
+    """The canonical names of the stored buffers Dew holds as constants (`KnownPart.constants`)."""
     depths: int = 0
     """The prediction depths the source's release stores past the trunk (its config's
     `num_nextn_predict_layers`: GLM-4.7-Flash's `model.layers.47.*`, HY-3's `.80.*`), which its own code
@@ -779,6 +849,15 @@ class Assembly:
         name, a part a fused tensor splits into (`_SPLIT`) by its own, one expert's tensor of a
         checkpoint stored per expert by its index and projection; None where no part holds it."""
         loaded, expert = self.loaded(name)
+        stem, marked, split = loaded.partition(f'.{_SPLIT}')
+        if marked and '.' in split:
+            # A part of a fused Linear's weight (`_fused_linear`): the canonical projection it is, under
+            # the canonical path its Linear's parameters read as.
+            held = self.names.get(stem)
+            projection, _, parameter = split.partition('.')
+            if held is None or parameter not in held[1]:
+                return None
+            return f'{held[0]}.{projection}.{held[1][parameter]}'
         module, _, parameter = loaded.rpartition('.')
         held = self.names.get(module)
         if held is None:
@@ -799,7 +878,8 @@ _PER_EXPERT = {'gate_up_proj': ('gate_proj', 'up_proj'), 'down_proj': ('down_pro
 holds it as, in the order the fused one concatenates them."""
 
 
-def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
+def _load_names(model: PreTrainedModel, inventory: Collection[str] | None
+                ) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
     """The name `model`'s load gives a stored tensor (`sources.load_names`: HY-3's `mlp.expert_bias` is its
     `mlp.e_score_correction_bias`), an expert's own tensor, `{experts}.{index}.{stored}.weight`, named as
     the fused tensor the load stacks it into, with its index and its canonical projection, the one at its
@@ -807,12 +887,15 @@ def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str,
     A merge is read only where it stacks experts on the first axis and concatenates its sources in
     `_PER_EXPERT`'s order on the second, as the fused tensor `_fused_experts` splits holds them; any other
     conversion's tensor keeps its stored name, which no part holds. A mapping that renames a key by
-    whether another is stored is `Ambiguous`: no read of one name tells it."""
+    whether another is stored reads the checkpoint's `inventory` (`sources.load_names`), and without one
+    is `Ambiguous`: no read of one name tells it."""
     from transformers.core_model_loading import Concatenate, MergeModulelist, WeightConverter
 
-    names = sources.load_names(model)
+    names = sources.load_names(model, inventory)
     if names is None:
-        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored")
+        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored, and no "
+                        "inventory of the checkpoint is given: pass the checkpoint's stored tensor names "
+                        "(`inventory`)")
     prefix = model.base_model_prefix
 
     def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
@@ -855,6 +938,7 @@ class _Assembler:
         self.packed: list[decoder_parts.Packed] = []
         self.dropouts: list[tuple[str, str]] = []
         self.flat: set[str] = set()
+        self.constants: set[str] = set()
 
     def state(self, fields: Mapping[str, object], where: str, layer: int | None) -> None:
         for key, value in fields.items():
@@ -889,14 +973,18 @@ class _Assembler:
             self.tables[table] = (f'{path}.{view.name("weight")}', view.weight)
         if part.role == 'experts':
             self.packed.extend(_fused_experts(path.rpartition('.')[2], view))
+        self.packed.extend(_fused_linear(path.rpartition('.')[2], view.name(known), halves)
+                           for known, halves in part.split.items())
         if part.role == 'attention':
             self.dropouts.append((path, view.name('attention_dropout')))
         held = {name for name, _ in module.named_parameters(recurse=False)}
         expected = {view.name(name): name for name in part.parameters}
         if held - set(expected):
             raise Ambiguous(f"{path} holds parameters {sorted(held - set(expected))} its code does not read")
-        stored = {view.name(name): known for name, known in part.state.items()
-                  if view.name(name) in dict(module.named_buffers(recurse=False))}
+        buffers = dict(module.named_buffers(recurse=False))
+        held_state = {**part.state, **{name: name for name in part.constants}}
+        stored = {view.name(name): known for name, known in held_state.items() if view.name(name) in buffers}
+        self.constants.update(f'{canonical}.{name}' for name in part.constants if view.name(name) in buffers)
         if held or stored:
             self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
         self.flat.update(f'{canonical}.{name}' for name in part.flat)
@@ -921,9 +1009,10 @@ class _Assembler:
         return part.role
 
 
-def assemble(model: PreTrainedModel) -> Assembly:
+def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -> Assembly:
     """`model`, a source's causal LM, assembled from known parts, or `Ambiguous` naming the module that
-    is not one."""
+    is not one; its stored names read as its load names them, over the checkpoint's `inventory` where
+    its conversion needs the whole of it (`_load_names`)."""
     assembler = _Assembler()
     assembler.walk(model, ('causal_lm',), '', '', None)
     (head, head_weight), (table, table_weight) = assembler.tables['head'], assembler.tables['embedding']
@@ -966,7 +1055,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
     depths = _records.integer(model.config.to_dict().get('num_nextn_predict_layers') or 0,
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat), depths)
+                    tuple(assembler.dropouts), _load_names(model, inventory), frozenset(assembler.flat),
+                    frozenset(assembler.constants), depths)
 
 
 def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, object]
@@ -1053,8 +1143,17 @@ def _fused_experts(module: str, view: PartView) -> tuple[decoder_parts.Packed, .
 
 
 _SPLIT = '~'
-"""The mark of a part a fused tensor splits into (`_fused_experts`), already canonical: no Python
-attribute holds it, so it names no stored parameter, whatever the source renames its own to."""
+"""The mark of a part a fused tensor splits into (`_fused_experts`, `_fused_linear`), already canonical:
+no Python attribute holds it, so it names no stored parameter, whatever the source renames its own to."""
+
+
+def _fused_linear(module: str, linear: str, projections: tuple[str, ...]) -> decoder_parts.Packed:
+    """The weight of `module`'s fused Linear `linear` (`KnownPart.split`) as its canonical `projections`,
+    concatenated on its output rows in their order: each part names the projection after the split mark,
+    its parameter after it (`Assembly.canonical`)."""
+    return decoder_parts.Packed(f'.{module}.{linear}.weight',
+                                tuple(f'.{module}.{linear}.{_SPLIT}{projection}.weight'
+                                      for projection in projections), 0)
 
 
 _STACKED_EXPERTS: decoder_parts.Leaves = {
@@ -1092,8 +1191,12 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
-        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES}
-        return decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES}
+        path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        if canonical in assembly.constants and path is not None:
+            # A buffer no step trains, held where Dew keeps constants (`KnownPart.constants`).
+            return ('constants', *path[1:])
+        return path
 
     def prepare(tensors: Mapping[str, Stored], _config: Mapping[str, object] | None = None
                 ) -> Mapping[str, Stored]:

@@ -99,7 +99,7 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
     """A store that banks a run of like layers holds one array per leaf for all of them, which
     layers quantized apart cannot share: the run stays the one the store holds, and its unlike
     rows are refused by name, rather than read as runs of their own the store does not hold."""
-    from dew.nn.backbones.layer_plan import group_name
+    from dew.nn.backbones.layer_names import group_name
 
     loaded, scanned, ids, variables = quantized_apart(case)
     params = dict(variables["params"])

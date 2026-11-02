@@ -1029,6 +1029,11 @@ class MLAMixer(MixerBase):
     """A causal dense layer reads each block of a call's `block_groups` whole (the standard kind's flag)."""
     bidirectional_images: bool = False
     """A causal dense layer reads each image of a call's `image_groups` whole."""
+    latent_scale_offset: bool | None = None
+    latent_scale_after_cast: bool | None = None
+    """The latent norms' rounding where it is not the layer's own (`MixerContext.scale_offset`,
+    `scale_after_cast`): DeepSeek V3's latents normed by Llama's RMSNorm beside a block of another's
+    (OLMo 2's scale-first norms); None follows the layer's."""
 
     @property
     def indexed(self) -> bool:
@@ -1068,8 +1073,9 @@ class MLAMixer(MixerBase):
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
             rope_scaling=ctx.rope_scaling,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
+            scale_offset=ctx.scale_offset if self.latent_scale_offset is None else self.latent_scale_offset,
+            scale_after_cast=(ctx.scale_after_cast if self.latent_scale_after_cast is None
+                              else self.latent_scale_after_cast),
             attention_bias=ctx.attention_bias,
             index_topk=None if ctx.kv_shared else self.index_topk,
             index_n_heads=None if ctx.kv_shared else self.index_n_heads,
