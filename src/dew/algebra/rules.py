@@ -113,11 +113,13 @@ def log2_of(size: i64Like) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
-def contracted_length(params: i64Like) -> i64: ...
-"""A contraction's (`Term.dot`'s, by its parameters' index) length's power of two, `ceil(log2(...))` of the
-elements each of its outputs sums: a rule that makes a contraction bounds its products' and its sum's
-magnitude by its operands' and this (`product_magnitude`). A contraction of no stated length (an operand of
-no known shape) has none, so a rule that asks it does not fire."""
+def contracted_length(product: Term) -> i64: ...
+"""A contraction's (`Term.dot`'s, by its term) length's power of two, `ceil(log2(...))` of the elements each
+of its outputs sums: a rule that makes a contraction bounds its products' and its sum's magnitude by its
+operands' and this (`product_magnitude`), read off the product it replaces, which contracts the same
+elements. Stated per product, not per parameters' index, which two products of different lengths share
+(row 3577). A contraction of no stated length (an operand of no known shape) has none, so a rule that asks it
+does not fire."""
 
 
 @function(merge=lambda old, new: old)
@@ -262,7 +264,7 @@ def _linear() -> Ruleset:
                                                var("replaced_length", i64))
         sets.append(rule(eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar),
                          exact_scale(a), plain(params), plain(multiplied), *facts, *dominated(power, "new"),
-                         eq(var("replaced_length", i64)).to(contracted_length(params)), *bounds,
+                         eq(var("replaced_length", i64)).to(contracted_length(x.dot(y, params))), *bounds,
                          *dominated(contracted, "replaced")).then(
             union(t).with_(made_of(new)), *made(new, power)))
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
@@ -271,8 +273,11 @@ def _linear() -> Ruleset:
     # shared one each under the program's reach.
     shared_bound = var("shared_bound", i64)
     shared_length = var("shared_length", i64)
-    factored = (eq(shared_bound).to(log2_bound(a)), eq(shared_length).to(contracted_length(multiplied)),
+    def factored(product: Term) -> tuple:
+        # The factored contraction contracts what `product`, one of the two it replaces, does.
+        return (eq(shared_bound).to(log2_bound(a)), eq(shared_length).to(contracted_length(product)),
                 *dominated(power + shared_bound + shared_length, "factored"))
+
     sets += [
         rule(eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
@@ -280,11 +285,11 @@ def _linear() -> Ruleset:
             union(t).with_(a.binary("mul", new, multiplied)), *made(new, power)),
         rule(eq(t).to(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-             *dominated(power, "new"), *factored).then(
+             *dominated(power, "new"), *factored(a.dot(x, multiplied))).then(
             union(t).with_(a.dot(new, multiplied)), *made(new, power)),
         rule(eq(t).to(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)),
              eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-             *dominated(power, "new"), *factored).then(
+             *dominated(power, "new"), *factored(x.dot(a, multiplied))).then(
             union(t).with_(new.dot(a, multiplied)), *made(new, power)),
     ]
     # A positive scale out of a maximum or a minimum: the scaled elements' order is the elements', so the

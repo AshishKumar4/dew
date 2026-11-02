@@ -103,13 +103,15 @@ def _carried():
             *rules.made(t, power)),
     ]
     # x @ (y @ z) as (x @ y) @ z, the state's product last: x @ y new, and its product with z, each under
-    # the program's reach (z's length the state's, `contracted_length`).
+    # the program's reach (the new outer product contracting y's columns, as y @ z does).
     facts, power = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
+    inner = var("inner", Vec[i64])
     outer = rules.product_magnitude(([], power), rules.magnitude(z, "z"), var("outer_length", i64))
     sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), rules.matrix_product(m), rules.matrix(x),
                      rules.matrix(y), rules.matrix(z), eq(reads(z)).to(one), *contracted, *facts,
                      *rules.dominated(power, "new"),
-                     eq(var("outer_length", i64)).to(rules.contracted_length(m)), *outer[0],
+                     eq(inner).to(shape(y)), eq(var("outer_length", i64)).to(rules.log2_of(inner[i64(1)])),
+                     *outer[0],
                      *rules.dominated(outer[1], "outer")).then(
         union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power)))
     for combined in ("add", "sub"):
@@ -125,11 +127,11 @@ def _carried():
         # x @ z +- y @ z as (x +- y) @ z: x +- y new, and its product with z, each under the reach.
         facts, power = rules.summed_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"))
         added = x.binary(combined, y, q)
-        product = rules.product_magnitude(([], power), rules.magnitude(z, "z2"), var("summed_length", i64))
+        # The new product contracting x's columns, as x @ z does (`contracted`).
+        product = rules.product_magnitude(([], power), rules.magnitude(z, "z2"), length)
         sets.append(rule(eq(t).to(x.dot(z, m).binary(combined, y.dot(z, m), q)), *plain,
                          eq(shape(x)).to(shape(y)), eq(reads(z)).to(one), *facts,
-                         *rules.dominated(power, "new"),
-                         eq(var("summed_length", i64)).to(rules.contracted_length(m)), *product[0],
+                         *rules.dominated(power, "new"), *contracted, *product[0],
                          *rules.dominated(product[1], "summed")).then(
             union(t).with_(added.dot(z, m)), *rules.made(added, power)))
     return ruleset(*sets, name="carried")
