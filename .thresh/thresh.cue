@@ -300,6 +300,8 @@ seams: gate: {
 	kind:    "shared-kernel"
 	purpose: "check 1 and its sizing judge every accuracy site in the suite"
 	paths:   ["tests/reference_error.py", "tests/float64_terms.py", "tests/one_draw.py"]
+	// Every change it makes: a watch on what decides a verdict lost the one useful tap of 8 (a change
+	// inside _site_terms, which names none of it on its own lines), 2026-11-02.
 	consult: ["the accuracy gate's maintainers (docs/design/testing.md)"]
 }
 
@@ -307,6 +309,12 @@ seams: suite: {
 	kind:    "shared-kernel"
 	purpose: "the suite's fixtures and its environment (tests/lane_environment.py) shape every test's run"
 	paths:   ["tests/conftest.py", "tests/lane_environment.py"]
+	// What every test computes under, as a change adds it: XLA's flags, JAX's numerics, the mesh, an autouse
+	// fixture. The harness's own plumbing (its cache, Hypothesis's directory, collection) is none of it (0 of 5
+	// verdicts useful, 2026-11-02).
+	watch: ["XLA_FLAGS", "--xla_", "MESH_DEVICES", "jax_enable_x64", "default_matmul_precision", "jax_default_prng",
+		"jax_threefry", "autouse"]
+	added:   true
 	consult: ["the suite's maintainers, as every test runs under them"]
 }
 
