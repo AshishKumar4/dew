@@ -31,7 +31,7 @@ causal_transformer	['params']['layers_0']['mlp']['down_proj']['kernel']	128x32	m
 causal_transformer	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer	['params']['layers_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer	['params']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer	['params']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 causal_transformer	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer	['params']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -44,7 +44,7 @@ causal_transformer:state	['ema']['params']['layers_0']['mlp']['down_proj']['kern
 causal_transformer:state	['ema']['params']['layers_0']['mlp']['gate_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['ema']['params']['layers_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['ema']['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer:state	['ema']['params']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer:state	['ema']['params']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer:state	['ema']['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 causal_transformer:state	['ema']['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer:state	['ema']['params']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -58,7 +58,7 @@ causal_transformer:state	['opt_state'][0].mu['layers_0']['mlp']['down_proj']['ke
 causal_transformer:state	['opt_state'][0].mu['layers_0']['mlp']['gate_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].mu['layers_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].mu['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer:state	['opt_state'][0].mu['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer:state	['opt_state'][0].mu['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer:state	['opt_state'][0].mu['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].mu['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer:state	['opt_state'][0].mu['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -71,16 +71,16 @@ causal_transformer:state	['opt_state'][0].nu['layers_0']['mlp']['down_proj']['ke
 causal_transformer:state	['opt_state'][0].nu['layers_0']['mlp']['gate_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].nu['layers_0']['self_attn']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 causal_transformer:state	['opt_state'][0].nu['norm']['scale']	32	-	('fsdp',)	device
-causal_transformer+deepseek-v4-tiny	['moe']['layers_0']['mlp']['gate']['tid2eid']	256x2	embed,exp	('fsdp', 'expert')	device
-causal_transformer+deepseek-v4-tiny	['moe']['layers_1']['mlp']['gate']['tid2eid']	256x2	embed,exp	('fsdp', 'expert')	device
-causal_transformer+deepseek-v4-tiny	['moe']['layers_2']['mlp']['gate']['tid2eid']	256x2	embed,exp	('fsdp', 'expert')	device
+causal_transformer+deepseek-v4-tiny	['moe']['layers_0']['mlp']['gate']['tid2eid']	256x2	.,.	()	device
+causal_transformer+deepseek-v4-tiny	['moe']['layers_1']['mlp']['gate']['tid2eid']	256x2	.,.	()	device
+causal_transformer+deepseek-v4-tiny	['moe']['layers_2']['mlp']['gate']['tid2eid']	256x2	.,.	()	device
 causal_transformer+deepseek-v4-tiny	['moe']['layers_3']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 causal_transformer+deepseek-v4-tiny	['moe']['layers_4']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 causal_transformer+deepseek-v4-tiny	['moe']['layers_5']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
@@ -342,7 +342,7 @@ causal_transformer+gemma3n	['params']['layers_0']['per_layer_input_gate']['kerne
 causal_transformer+gemma3n	['params']['layers_0']['per_layer_projection']['kernel']	8x32	mlp,embed	('tensor', 'fsdp')	device
 causal_transformer+gemma3n	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
 causal_transformer+gemma3n	['params']['layers_0']['post_per_layer_input_norm']['scale']	32	-	('fsdp',)	device
-causal_transformer+gemma3n	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+causal_transformer+gemma3n	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 causal_transformer+gemma3n	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+gemma3n	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+gemma3n	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -389,9 +389,9 @@ causal_transformer+gemma4_moe	['params']['layers_0']['moe']['experts_output_norm
 causal_transformer+gemma4_moe	['params']['layers_0']['moe']['mlp_branch_norm']['scale']	32	-	('fsdp',)	device
 causal_transformer+gemma4_moe	['params']['layers_0']['moe']['router']['per_expert_scale']	8	exp	()	device
 causal_transformer+gemma4_moe	['params']['layers_0']['moe']['router']['proj']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
-causal_transformer+gemma4_moe	['params']['layers_0']['moe']['router']['scale']	32	exp	('expert',)	device
+causal_transformer+gemma4_moe	['params']['layers_0']['moe']['router']['scale']	32	embed	('fsdp',)	device
 causal_transformer+gemma4_moe	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+gemma4_moe	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+causal_transformer+gemma4_moe	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 causal_transformer+gemma4_moe	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+gemma4_moe	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+gemma4_moe	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -411,9 +411,9 @@ causal_transformer+gemma4_moe	['params']['layers_1']['moe']['experts_output_norm
 causal_transformer+gemma4_moe	['params']['layers_1']['moe']['mlp_branch_norm']['scale']	32	-	('fsdp',)	device
 causal_transformer+gemma4_moe	['params']['layers_1']['moe']['router']['per_expert_scale']	8	exp	()	device
 causal_transformer+gemma4_moe	['params']['layers_1']['moe']['router']['proj']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
-causal_transformer+gemma4_moe	['params']['layers_1']['moe']['router']['scale']	32	exp	('expert',)	device
+causal_transformer+gemma4_moe	['params']['layers_1']['moe']['router']['scale']	32	embed	('fsdp',)	device
 causal_transformer+gemma4_moe	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+gemma4_moe	['params']['layers_1']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+gemma4_moe	['params']['layers_1']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+gemma4_moe	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+gemma4_moe	['params']['layers_1']['self_attn']['o_proj']['kernel']	64x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+gemma4_moe	['params']['layers_1']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -986,7 +986,7 @@ causal_transformer+moe	['params']['layers_0']['mlp']['down_proj']['kernel']	64x3
 causal_transformer+moe	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe	['params']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe	['params']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe	['params']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -998,7 +998,7 @@ causal_transformer+moe	['params']['layers_1']['mlp']['experts']['gate_proj']['ke
 causal_transformer+moe	['params']['layers_1']['mlp']['experts']['up_proj']['kernel']	8x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
 causal_transformer+moe	['params']['layers_1']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
 causal_transformer+moe	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe	['params']['layers_1']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe	['params']['layers_1']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe	['params']['layers_1']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1011,7 +1011,7 @@ causal_transformer+moe:state	['ema']['params']['layers_0']['mlp']['down_proj']['
 causal_transformer+moe:state	['ema']['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['ema']['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['ema']['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['ema']['params']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['ema']['params']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['ema']['params']['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['ema']['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['ema']['params']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1023,7 +1023,7 @@ causal_transformer+moe:state	['ema']['params']['layers_1']['mlp']['experts']['ga
 causal_transformer+moe:state	['ema']['params']['layers_1']['mlp']['experts']['up_proj']['kernel']	8x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
 causal_transformer+moe:state	['ema']['params']['layers_1']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
 causal_transformer+moe:state	['ema']['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['ema']['params']['layers_1']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['ema']['params']['layers_1']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['ema']['params']['layers_1']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['ema']['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['ema']['params']['layers_1']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1037,7 +1037,7 @@ causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['mlp']['down_proj']
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1049,7 +1049,7 @@ causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['mlp']['experts']['
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['mlp']['experts']['up_proj']['kernel']	8x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['opt_state'][0].mu['layers_1']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1062,7 +1062,7 @@ causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['mlp']['down_proj']
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1074,7 +1074,7 @@ causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['mlp']['experts']['
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['mlp']['experts']['up_proj']['kernel']	8x32x64	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['self_attn']['k_proj']['kernel']	32x16	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+moe:state	['opt_state'][0].nu['layers_1']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -1129,7 +1129,7 @@ causal_transformer+qwen35	['params']['layers_3']['mlp']['down_proj']['kernel']	6
 causal_transformer+qwen35	['params']['layers_3']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['layers_3']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['layers_3']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-causal_transformer+qwen35	['params']['layers_3']['self_attn']['k_norm']['scale']	8	index	()	device
+causal_transformer+qwen35	['params']['layers_3']['self_attn']['k_norm']['scale']	8	-	()	device
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['k_proj']['kernel']	32x8	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['o_proj']['kernel']	16x32	attention,embed	('tensor', 'fsdp')	device
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1296,7 +1296,7 @@ decoder+continuum	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp
 decoder+continuum	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-decoder+continuum	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+continuum	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+continuum	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+continuum	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1307,7 +1307,7 @@ decoder+continuum	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp
 decoder+continuum	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-decoder+continuum	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+continuum	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+continuum	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+continuum	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+continuum	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1326,7 +1326,7 @@ decoder+dex	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	(
 decoder+dex	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
 decoder+dex	['params']['layers_0']['self_attn']['dex_lambda']	-	()	()	device
 decoder+dex	['params']['layers_0']['self_attn']['dex_projection']	2x8x8	.,.,.	()	device
-decoder+dex	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+dex	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+dex	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+dex	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+dex	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1339,7 +1339,7 @@ decoder+dex	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	(
 decoder+dex	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
 decoder+dex	['params']['layers_1']['self_attn']['dex_lambda']	-	()	()	device
 decoder+dex	['params']['layers_1']['self_attn']['dex_projection']	2x8x8	.,.,.	()	device
-decoder+dex	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+dex	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+dex	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+dex	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+dex	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1366,7 +1366,7 @@ decoder+engram	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,em
 decoder+engram	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-decoder+engram	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+engram	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+engram	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+engram	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1383,7 +1383,7 @@ decoder+engram	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,em
 decoder+engram	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-decoder+engram	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+engram	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+engram	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+engram	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+engram	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1396,7 +1396,7 @@ decoder+value_experts	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32
 decoder+value_experts	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+value_experts	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 decoder+value_experts	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-decoder+value_experts	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+value_experts	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+value_experts	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+value_experts	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+value_experts	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1410,7 +1410,7 @@ decoder+value_experts	['params']['layers_1']['mlp']['gate']['kernel']	32x4	embed
 decoder+value_experts	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
 decoder+value_experts	['params']['layers_1']['self_attn']['experts']['v_proj']['kernel']	4x32x32	exp,embed,kv	('expert', 'fsdp', 'tensor')	device
 decoder+value_experts	['params']['layers_1']['self_attn']['experts']['v_router']['kernel']	32x4	-	('fsdp',)	device
-decoder+value_experts	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+decoder+value_experts	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 decoder+value_experts	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 decoder+value_experts	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 decoder+value_experts	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -1419,7 +1419,7 @@ decoder+value_experts	['params']['norm']['scale']	32	-	('fsdp',)	device
 deepseek_v4_dspark	['moe']['dspark_0']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 deepseek_v4_dspark	['moe']['dspark_1']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 deepseek_v4_dspark	['moe']['dspark_2']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
-deepseek_v4_dspark	['moe']['layers_0']['mlp']['gate']['tid2eid']	256x2	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['moe']['layers_0']['mlp']['gate']['tid2eid']	256x2	.,.	()	device
 deepseek_v4_dspark	['moe']['layers_1']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 deepseek_v4_dspark	['moe']['layers_2']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
 deepseek_v4_dspark	['moe']['layers_3']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
@@ -1681,7 +1681,7 @@ diffusion_gemma	['params']['text']['layers_0']['mlp']['down_proj']['kernel']	64x
 diffusion_gemma	['params']['text']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 diffusion_gemma	['params']['text']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 diffusion_gemma	['params']['text']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-diffusion_gemma	['params']['text']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+diffusion_gemma	['params']['text']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 diffusion_gemma	['params']['text']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 diffusion_gemma	['params']['text']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 diffusion_gemma	['params']['text']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
@@ -2088,7 +2088,7 @@ mixer:attention	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,e
 mixer:attention	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-mixer:attention	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+mixer:attention	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 mixer:attention	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 mixer:attention	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -2099,7 +2099,7 @@ mixer:attention	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,e
 mixer:attention	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-mixer:attention	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+mixer:attention	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 mixer:attention	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 mixer:attention	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 mixer:attention	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -2419,7 +2419,7 @@ mixer:qsa_attention	['params']['layers_0']['post_attention_layernorm']['scale']	
 mixer:qsa_attention	['params']['layers_0']['self_attn']['indexer']['index_qk_proj']['kernel']	32x48	-	(None, 'fsdp')	device
 mixer:qsa_attention	['params']['layers_0']['self_attn']['indexer']['k_layernorm']['scale']	16	-	('fsdp',)	device
 mixer:qsa_attention	['params']['layers_0']['self_attn']['indexer']['q_layernorm']['scale']	16	-	('fsdp',)	device
-mixer:qsa_attention	['params']['layers_0']['self_attn']['k_norm']['scale']	8	index	()	device
+mixer:qsa_attention	['params']['layers_0']['self_attn']['k_norm']['scale']	8	-	()	device
 mixer:qsa_attention	['params']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 mixer:qsa_attention	['params']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 mixer:qsa_attention	['params']['layers_0']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -2433,7 +2433,7 @@ mixer:qsa_attention	['params']['layers_1']['post_attention_layernorm']['scale']	
 mixer:qsa_attention	['params']['layers_1']['self_attn']['indexer']['index_qk_proj']['kernel']	32x48	-	(None, 'fsdp')	device
 mixer:qsa_attention	['params']['layers_1']['self_attn']['indexer']['k_layernorm']['scale']	16	-	('fsdp',)	device
 mixer:qsa_attention	['params']['layers_1']['self_attn']['indexer']['q_layernorm']['scale']	16	-	('fsdp',)	device
-mixer:qsa_attention	['params']['layers_1']['self_attn']['k_norm']['scale']	8	index	()	device
+mixer:qsa_attention	['params']['layers_1']['self_attn']['k_norm']['scale']	8	-	()	device
 mixer:qsa_attention	['params']['layers_1']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 mixer:qsa_attention	['params']['layers_1']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 mixer:qsa_attention	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
@@ -3012,7 +3012,7 @@ multimodal_transformer	['params']['language_model']['layers_0']['mlp']['down_pro
 multimodal_transformer	['params']['language_model']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 multimodal_transformer	['params']['language_model']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 multimodal_transformer	['params']['language_model']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
-multimodal_transformer	['params']['language_model']['layers_0']['self_attn']['k_norm']['scale']	16	index	('fsdp',)	device
+multimodal_transformer	['params']['language_model']['layers_0']['self_attn']['k_norm']['scale']	16	-	('fsdp',)	device
 multimodal_transformer	['params']['language_model']['layers_0']['self_attn']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
 multimodal_transformer	['params']['language_model']['layers_0']['self_attn']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 multimodal_transformer	['params']['language_model']['layers_0']['self_attn']['q_norm']['scale']	16	-	('fsdp',)	device
