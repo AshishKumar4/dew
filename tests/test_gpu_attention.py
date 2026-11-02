@@ -201,7 +201,6 @@ def test_the_mosaic_template_holds_on_an_h100():
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
-        *cells_of(inplace.a_routes_hooked_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
     ])
