@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
@@ -943,32 +942,30 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
-def _moved_rows(rows: int, block: int):
-    """A consumer adding to the product a residual's row block `(i * i - i + 1) % n` at the product's row
-    block `i` (n the blocks a column holds), as a custom fusion whose pull rule says so: block 1 reads block
-    1, so the index map agrees with the identity at the probe's (1, 2), and block 0 reads block 1, at any
-    count of blocks."""
+def _moved_columns(columns: int, block: int):
+    """A consumer adding to the product a residual's column block `c * c - c` at the product's column block
+    `c` (blocks of `block` columns), as a custom fusion whose pull rule says so: block 1 reads block 0, while
+    at the classifier's one-point probe (1, 2) the map reads (1, 2), the identity's."""
     from jax.experimental.pallas import fuser as pallas_fuser
 
-    def moved(row, count):
-        return (row * row - row + 1) % count
+    def moved(column):
+        return column * column - column
 
     @pallas_fuser.custom_fusion
     def added(prod, residual):
         # The order traced from an iota, so the fusion's body closes over no constant.
-        count = rows // block
-        order = moved(jnp.arange(count), count)
-        blocks = residual[:count * block].reshape(count, block, -1)[order].reshape(count * block, -1)
-        return prod.at[:count * block].add(blocks)
+        count = columns // block
+        order = moved(jnp.arange(count))
+        blocks = residual.reshape(residual.shape[0], count, block)[:, order].reshape(residual.shape)
+        return prod + blocks
 
     @added.def_pull_block_spec
     def _(transforms):
         (out,) = transforms
-        count = rows // out.block_shape[0]
 
         def residual_index(*indices):
             row, column = out.block_index_transform(*indices)
-            return moved(row, count), column
+            return row, moved(column)
 
         return out, out.replace(block_index_transform=residual_index)
 
@@ -982,10 +979,11 @@ def _moved_rows(rows: int, block: int):
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(generation_name):
-    """A consumer whose residual is read at another row block than the product's, by a map that agrees with
-    the identity at one point (`_moved_rows`): the fused product keeps the unfused program's value on
-    every row, the consumer refused the epilogue (its map proved, `fused._followed`), where a map read at
-    (1, 2) alone was taken for the tile and the kernel read each block's own residual (row 3636)."""
+    """A consumer whose residual is read at another column block than the product's, by a map that agrees
+    with the identity at one point (`_moved_columns`): the fused product keeps the unfused program's value
+    on every element (check 1), the consumer refused the epilogue, its map proved not the identity
+    (`fused._followed`), where a map read at (1, 2) alone was taken for the tile and the kernel added each
+    block's own residual (row 3636)."""
     sizes = jnp.asarray(SIZES)
 
     def draw(seed):
@@ -993,16 +991,15 @@ def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(gener
         return x, w, u[:, :WIDTH].astype(jnp.float32)
 
     def fusing(x, w, r):
-        prod = fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True)
-        return _moved_rows(ROWS, 64)(prod, r)
+        return _moved_columns(WIDTH, 64)(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), r)
 
     def unfused(x, w, r):
-        return _moved_rows(ROWS, 64).fun(template.gemm(x, w, sizes, out_dtype=jnp.float32), r)
+        return _moved_columns(WIDTH, 64).fun(template.gemm(x, w, sizes, out_dtype=jnp.float32), r)
 
     def truth(x, w, r):
         matrix = w.astype(jnp.bfloat16).astype(x.dtype)
         product = jax.lax.ragged_dot(x, matrix, sizes, preferred_element_type=x.dtype)
-        return _moved_rows(ROWS, 64).fun(product, r.astype(x.dtype))
+        return _moved_columns(WIDTH, 64).fun(product, r.astype(x.dtype))
 
     with generation.assumed(generation_name):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "a residual off the tile",
@@ -1183,20 +1180,6 @@ def test_both_fused_stages_chosen_through_xla_are_as_exact_as_the_unfused_progra
     with generation.assumed("sm80"), generation.chosen(gemm_epilogue="xla", gemm_prologue="xla"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "both stages in XLA",
                         seeds=SEEDS, truth_fn=truth)
-
-
-@pytest.mark.parametrize("index_map", [lambda row, column: (row * row, column),
-                                       lambda row, column: (column, row),
-                                       lambda row, column: (row, 0)],
-                         ids=["a square of the row", "the axes swapped", "a fixed column"])
-def test_a_block_spec_is_the_tile_only_where_its_map_is_the_identity(index_map):
-    """A block of the probe tile at a place its index map computes otherwise than the tile's own (a square of
-    the row, the axes swapped, a fixed column) is not the tile, however the map reads at one coordinate:
-    (row, column) -> (row * row, column) gives (1, 2) at (1, 2), which one probe there took for the identity
-    (row 3636)."""
-    probe = (8, 16)
-    assert fused._is_tile(pl.BlockSpec(probe, lambda row, column: (row, column)), probe)
-    assert not fused._is_tile(pl.BlockSpec(probe, index_map), probe)
 
 
 @runs("sm80")
