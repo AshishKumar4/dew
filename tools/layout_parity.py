@@ -443,9 +443,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                 if one_device:
                     _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
                 return state, shardings, position
-            shardings, _ = self._validated(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held))
-            return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
+            # Held as this layout's step holds it: a stage-local run's layers stacked by stage (`staged`).
+            state = self.staged(jax.tree.map(lambda leaf: leaf.copy(), held))
+            return state, jax.tree.map(lambda leaf: leaf.sharding, state), None
 
     # Devices the peak table does not name (a CPU's) measure no link, so no projection would spread
     # over them; the layouts state one fast enough that every projection that can spread does, as
@@ -514,17 +514,19 @@ trainer draws the same state from the same key, so later trainers copy it
 onto their mesh."""
 
 
-def _gradient(state) -> dict[str, NDArray]:
+def _gradient(trainer, state) -> dict[str, NDArray]:
     """The gradient the optimizer was handed, whole on every process, by leaf
-    name. A one-device reference's leaves are already whole where they are,
-    and gathering those would stack every process's copy."""
+    name, each layer of a stage-local run on its stored layers (`Trainer.stored`).
+    A one-device reference's leaves are already whole where they are, and
+    gathering those would stack every process's copy."""
     import jax
     import numpy as np
     from jax.experimental import multihost_utils
 
+    stored = trainer.stored(state)
     return {jax.tree_util.keystr(path): np.asarray(
         leaf if leaf.is_fully_addressable else multihost_utils.process_allgather(leaf, tiled=True))
-        for path, leaf in jax.tree_util.tree_flatten_with_path(state.opt_state[0]["gradient"])[0]}
+        for path, leaf in jax.tree_util.tree_flatten_with_path(stored.opt_state[0]["gradient"])[0]}
 
 
 def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = False,
@@ -537,7 +539,7 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
                 "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
-    return state, data, step, compiled
+    return state, data, step, compiled, trainer
 
 
 def replicated_share(case, objective, stages: int) -> float:
@@ -561,12 +563,13 @@ def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool
     """The losses of `steps` steps on the layout `fields` names (over the
     first `devices` devices, every device by default), step one's gradient
     gathered whole, and what the compiler says of the step."""
-    state, data, step, compiled = compiled_step(case, fields, batch, one_device=one_device, devices=devices)
+    state, data, step, compiled, trainer = compiled_step(case, fields, batch, one_device=one_device,
+                                                         devices=devices)
     losses, gradient = [], {}
     for _ in range(steps):
         state, loss, _, _, _, _ = step(state, data)
         losses.append(float(loss))
-        gradient = gradient or _gradient(state)
+        gradient = gradient or _gradient(trainer, state)
     return losses, gradient, compiled
 
 
@@ -721,7 +724,8 @@ class Arm:
         state, loss, metrics, *_ = self.step(self.fresh(self.initial), data)
         record, _ = taken_record(metrics)
         assert record is not None, "a recording trainer's step returns its record"
-        return Drawn(float(loss), _gradient(state), witnessed(_gathered(record), f"draw {seed}"))
+        return Drawn(float(loss), _gradient(self.trainer, state),
+                     witnessed(_gathered(record), f"draw {seed}"))
 
 
 RANDOM_PRIMITIVES = frozenset({"random_bits", "threefry2x32"})
@@ -1507,7 +1511,7 @@ def pooled(case, batches, pieces: int) -> list[tuple[float, dict[str, NDArray]]]
         for data in slices:
             state, loss, *_ = step(state, data)
             losses.append(float(loss))
-        results.append((float(np.mean(losses)), _gradient(state)))
+        results.append((float(np.mean(losses)), _gradient(trainer, state)))
     return results
 
 
@@ -1730,7 +1734,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             raise ValueError('residual orders require a CausalTransformer decoder')
         batch = bench.global_batch(case)
         with jax.enable_x64(new_val=False):
-            base, ref_data, ref_step, ref_compiled = compiled_step(reference, {}, batch, one_device=True)
+            base, ref_data, ref_step, ref_compiled, _ = compiled_step(reference, {}, batch, one_device=True)
             programs = {name: compiled_step(case, LAYOUTS[name], batch, devices=devices) for name in layouts}
         truth_step = anchor_program(reference, batch, base)
         anchor, wide = anchor_loss(reference, batch, base)
@@ -1776,17 +1780,19 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             saved = {'reference': np.asarray([ref_distances[path][-1] for path in keys]),
                      'truth_loss': np.asarray(truth_loss), 'leaves': np.asarray(keys),
                      'invariance': np.asarray(invariance[-1])}
-            for name, (template, data, step, _compiled) in programs.items():
-                shardings = jax.tree.map(lambda leaf: leaf.sharding, template)
-                state, loss, _, _, _, _ = step(ordered_state(template, order, shardings), data)
-                gradient = flat(state.opt_state[0]['gradient'], order)
+            for name, (template, data, step, _compiled, trainer) in programs.items():
+                # Permuted on its stored layers, as the reference is, and held as its step holds it.
+                stored = trainer.stored(template)
+                ordered = dataclasses.replace(stored, variables=permuted(stored.variables, order))
+                state, loss, _, _, _, _ = step(trainer.staged(ordered), data)
+                gradient = flat(trainer.stored(state).opt_state[0]['gradient'], order)
                 for path in truth:
                     layout_distances[name].setdefault(path, []).append(distance(gradient[path], truth[path]))
                 layout_distances[name].setdefault('@loss', []).append(abs(float(loss) - truth_loss))
                 saved[name] = np.asarray([layout_distances[name][path][-1] for path in keys])
             np.savez(model_out / f'order-{index:02}.npz', **saved)
             speak(f'[{model}] residual order {index + 1}/{ORDERS}, fp64 invariance {invariance[-1]:.3e}')
-        for name, (_, _, _, compiled) in programs.items():
+        for name, (_, _, _, compiled, _) in programs.items():
             row = {"model": model, "layout": name, "dtype": dtype, "orders": ORDERS,
                    "gate_proj_inventory": [path for path in ref_distances if 'gate_proj' in path],
                    "invariance_max": max(invariance),
