@@ -879,7 +879,7 @@ def test_an_euler_step_near_pure_noise_on_a_variance_preserving_schedule_rounds_
 
 def test_a_variance_exploding_euler_step_from_a_zero_snr_sigma_rounds_as_ddim():
     """An Euler step from a zero-SNR schedule's first sigma, 4096, down to 14.6 is DDIM's step,
-    x_0 + sigma_s (x - x_0) / sigma_t, to float32's rounding of its result: the source's x + derivative
+    x_0 + sigma_s (x - x_0) / sigma_t, to float32's rounding of its scale: the source's x + derivative
     dt cancels two terms of x's size there (x is 4e4) and keeps dt's rounding times the derivative, about
     270 times farther (ledger 3475). The source's increment is the step between near sigmas alone, where
     neither cancels (2 sigma_s >= sigma_t, the high-sigma walk of ledger 2541)."""
@@ -894,8 +894,10 @@ def test_a_variance_exploding_euler_step_from_a_zero_snr_sigma_rounds_as_ddim():
                                      (one, jnp.asarray(sigma_s)))[0], np.float64)
     wide = [np.asarray(value, np.float64) for value in (x, denoised, sigma_t, sigma_s)]
     exact = wide[1] + wide[3] * (wide[0] - wide[1]) / wide[2]
-    # Four roundings of the form, each at most half an ulp of the result; the source's sum keeps hundreds.
-    assert np.max(np.abs(stepped - exact) / np.spacing(np.abs(exact).astype(np.float32))) <= 4
+    # Four roundings of the form, each at most half an ulp of the step's scale; the source's sum keeps
+    # hundreds of them, x's rounding at 4e4.
+    scale = np.spacing(np.float32(np.max(np.abs(exact))))
+    assert np.max(np.abs(stepped - exact)) <= 4 * scale
 
 
 POSTERIOR_SEEDS = 8
