@@ -105,6 +105,7 @@ from check1_statistics import (
     log_sum,
     pooled_zero_rows,
     root_mean,
+    row_factor,
     shown,
 )
 from float64_terms import float64_terms
@@ -728,13 +729,10 @@ class _Draws:
     example_rows: list[list[np.ndarray | None]] | None = None
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
-    row_factor: float | None = None
-    """The worst-row rule's factor at every width where the draws are weighed (`_Weighed`: rows of unit
-    size, PARITY), else None for its factor by width (ROW_FACTOR, NARROW_FACTORS)."""
 
     def factor(self, index: int) -> float:
-        """The worst-row rule's factor for leaf `index` (`row_factor`)."""
-        return self.row_factor or NARROW_FACTORS.get(self.widths[index], ROW_FACTOR)
+        """The worst-row rule's factor for leaf `index`, by its rows' width (`row_factor`)."""
+        return row_factor(self.widths[index])
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
@@ -743,7 +741,7 @@ class _Draws:
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
                                     for field in ("mine", "theirs", "worst")),
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
-                      self.widths, examples, example_rows, self.row_factor)
+                      self.widths, examples, example_rows)
 
     def between(self, start: int, stop: int) -> "_Draws":
         """These draws' seeds `start` to `stop`, counted from their first."""
@@ -751,7 +749,7 @@ class _Draws:
         examples, example_rows = (None if getattr(self, field) is None else getattr(self, field)[cut]
                                   for field in ("examples", "example_rows"))
         return _Draws(self.names, self.mine[cut], self.theirs[cut], self.worst[cut], self.zero_rows[cut],
-                      self.finite[cut], self.widths, examples, example_rows, self.row_factor)
+                      self.finite[cut], self.widths, examples, example_rows)
 
     def of_examples(self, index: int) -> list[np.ndarray] | None:
         """Leaf `index`'s per-example log ratios a seed, or None where the site stacks none or a seed's
@@ -794,7 +792,7 @@ class _Draws:
         # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
         # one reference.
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & (library.finite | ~covered), self.widths, row_factor=self.row_factor)
+                      self.finite & (library.finite | ~covered), self.widths)
 
 
 SKETCH = 32
@@ -1144,18 +1142,32 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
 @dataclasses.dataclass(frozen=True)
 class _Weighed:
     """One truth's weighing for check 1's conditioning (`_Conditioning`): the `truth` on the host, the
-    reference program's rounding `scale` at its inputs (`rounding_scale`), each floating leaf's `unit`
-    roundoff, the reference's, applied to every arm alike, and the truth of zeros and unit sizes
+    reference program's rounding `scale` at its inputs (`rounding_scale`, each element's RMS displacement
+    under its program's roundings), applied to every arm alike, and the truth of zeros and unit sizes
     (`zeros`, `ones`) every weighed arm is held to."""
 
     truth: object
     scale: object
-    units: list
     zeros: object
     ones: object
     heavy: list | None = None
     """Each floating leaf's heavy elements (`_heavy`), a mask, None for a leaf of none: its residuals
     judged as a leaf of their own beside the light ones' (`classed`)."""
+
+    def widths(self) -> tuple[int, ...]:
+        """Each judged leaf's row width (`_Draws.widths`, `row_factor`), a class's the fewest of its values
+        any row holds, at least one: a heavy class of one value a row is a row of one."""
+        found = []
+        truths = jax.tree.leaves(self.truth)
+        for truth, mask in zip(truths, self.heavy or [None] * len(truths), strict=True):
+            width = int(np.shape(truth)[-1]) if np.ndim(truth) >= 2 else 0
+            if mask is None:
+                found.append(width)
+                continue
+            for counts in (np.sum(mask, axis=-1), np.sum(~mask, axis=-1)):
+                held = counts[counts > 0]
+                found.append(int(held.min()) if held.size else width)
+        return tuple(found)
 
     def classed(self, tree, masked: bool = True):
         """`tree`, of the truth's structure, each floating leaf with heavy elements (`heavy`) split into
@@ -1173,8 +1185,9 @@ class _Weighed:
 
     def weighed(self, tree, arm: str):
         """`tree`, an arm's outputs, each floating element e at its truth t and scale c read as its residual
-        (e - t) / (u c), u the reference's unit roundoff for the leaf, against a truth of zeros: its error
-        in units of the rounding the reference's program does there, every row of unit size (`ones`, the
+        (e - t) / c, c the element's RMS displacement under the reference program's roundings, against a
+        truth of zeros: its error in units of the rounding the reference's program does there, every row
+        of unit size (`ones`, the
         terms `_prepared` sizes rows by). Each leaf's shape is checked before any arithmetic. An element
         no rounding reaches (c = 0) is exact in the reference's program, and an arm not exact there fails,
         by name, as does an element whose scale is not finite, which no error can be read against."""
@@ -1186,9 +1199,10 @@ class _Weighed:
                 raise AssertionError(f"{arm}, {path}: its shape is {np.shape(leaf)}, the truth's "
                                      f"{np.shape(true)}")
         weighed = []
-        for path, leaf, true, scale, unit in zip(paths, leaves, jax.tree.leaves(self.truth),
-                                                 _scales(self.scale), self.units, strict=True):
-            if unit is None:
+        for path, leaf, true, scale in zip(paths, leaves, jax.tree.leaves(self.truth), _scales(self.scale),
+                                           strict=True):
+            if scale is None:
+                # A leaf of no float (an index, a count) is judged as it is.
                 weighed.append(leaf)
                 continue
             value, true, scale = (np.asarray(part, np.float64) for part in (leaf, true, scale))
@@ -1207,7 +1221,7 @@ class _Weighed:
                     f"{arm}, {path}{list(at)}: no rounding of the reference's program reaches it (its "
                     f"rounding scale is zero), and the arm is not exact: {value[at]!r} against "
                     f"{true[at]!r}")])
-            weighed.append(np.where(exact, 0.0, (value - true) / (unit * np.where(exact, 1.0, scale))))
+            weighed.append(np.where(exact, 0.0, (value - true) / np.where(exact, 1.0, scale)))
         return self.classed(structure.unflatten(weighed)), self.classed(self.zeros)
 
 
@@ -1280,15 +1294,11 @@ class _Conditioning:
                 scales = [rounding_scale(self.program.fn, *window, seed=seed)[1] for window in windows]
                 scale = jax.tree.map(lambda *each: None if each[0] is None else np.stack(each), *scales,
                                      is_leaf=lambda leaf: leaf is None)
-                shapes = jax.eval_shape(self.program.fn, *windows[0])
             else:
                 _, scale = rounding_scale(self.program, *inputs, seed=seed)
-                shapes = jax.eval_shape(self.program, *inputs)
-        units = [float(jnp.finfo(shape.dtype).eps) / 2 if jnp.issubdtype(shape.dtype, jnp.floating)
-                 else None for shape in jax.tree.leaves(shapes)]
         zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if _float_leaf(leaf) else leaf, truth)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if _float_leaf(leaf) else None, truth)
-        weighing = _Weighed(truth, scale, units, zeros, ones, self.heavy)
+        weighing = _Weighed(truth, scale, zeros, ones, self.heavy)
         return dataclasses.replace(weighing, ones=weighing.classed(ones, masked=False))
 
 
@@ -1378,8 +1388,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             judged = dew if weighed is None else weighed[id(truth)].classed(jax.device_get(dew))
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(judged)]
-            widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
-                                     for leaf in jax.tree.leaves(judged))
+            widths = widths or (tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
+                                      for leaf in jax.tree.leaves(judged)) if weighed is None
+                                else weighed[id(truth)].widths())
             # Dew's side read once for every reference (`_prepared`).
             prepared = _prepared(dew, truth, terms) if weighed is None else _prepared(
                 *weighed[id(truth)].weighed(dew, "Dew's arm"), weighed[id(truth)].ones)
@@ -1420,9 +1431,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
                     np.asarray(finite[at_arm]), widths, per_example[at_arm] if examples else None,
-                    per_example_rows[at_arm] if examples else None,
-                    # Weighed rows are of unit size at every width: the rule's factor is PARITY.
-                    None if conditioning is None else PARITY)
+                    per_example_rows[at_arm] if examples else None)
              for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
     return [first, *drawn[len(arms) - len(also):]] if also else first
@@ -1933,10 +1942,10 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     Only where it is still Inconclusive after its last stage, its budget spent, is it judged again over
     `conditioning` seeds,
     each element's error weighed by the reference program's own rounding there: each arm's element e read
-    as its residual (e - t) / (u c), t its truth, u the reference's unit roundoff for the leaf (every arm
-    the same u) and c the reference program's rounding scale at the draw's inputs (`rounding_scale`,
-    tests/rounding_bound.py: the root mean square of the element's rounding error where every rounding
-    of the program moves its value by a normal multiple of its bound), against a truth of zeros, every
+    as its residual (e - t) / c, t its truth and c the reference program's rounding scale at the draw's
+    inputs, the same for every arm (`rounding_scale`, tests/rounding_bound.py: the element's RMS
+    displacement where every rounding of the program moves its value by a normal multiple of its bound),
+    against a truth of zeros, every
     row of unit size, each grouped as its leaf groups it; that check must decide a pass. An element no
     rounding reaches (c = 0) must be exact in every arm. Where a computation amplifies its rounding
     unevenly (an inner step past its stable rate, where one row's rounding grows 10^4-fold), the

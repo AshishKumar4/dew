@@ -22,7 +22,7 @@ WEIGHED_SEEDS = 8
 """Check 1's declared seeds here, the unweighted check's and the weighed one's alike: over them and their
 REDRAW stage the unweighted check stays undecided on every arm below that its rows do not decide."""
 
-NULL_RUNS = 32
+NULL_RUNS = 64
 """The null control's runs: the reference against itself on disjoint draws, judged as a weighed site is."""
 
 NULL_WEIGHED_SEEDS = 64
@@ -97,7 +97,11 @@ def test_an_error_moved_onto_the_amplified_element_fails_decided():
     def moved(a, b, big):
         return jnp.concatenate([amplified(a, 2 * big), a[:, 1:] * b[:, 1:]], axis=-1)
 
-    failed(moved, "an error moved onto the amplified element")
+    failure = failed(moved, "an error moved onto the amplified element")
+    heavy = [finding for finding in failure.findings if finding.leaf.endswith("['heavy']")]
+    # A row of one heavy value is held by the gate's factor for one (NARROW_FACTORS): the pooled check
+    # decides.
+    assert heavy and {finding.rule for finding in heavy} == {"pooled"}
 
 
 def test_an_element_no_rounding_reaches_must_be_exact_in_every_arm():
