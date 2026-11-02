@@ -22,7 +22,7 @@ import dataclasses
 import functools
 import math
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple, Self
 
 import jax
@@ -170,9 +170,17 @@ raise their registers to that residency's share (`roles`)."""
 
 def checked(built: Callable, kernel: str, resident: int = 1) -> Callable:
     """The launch `built`, each call checked against the mesh it runs in (`per_shard`) and traced at its
-    residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own."""
+    residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own; and
+    refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
+    `stacked_zeros` makes one ref (row 3180)."""
     def launch(*operands):
         per_shard(kernel)
+        refs = [jax.typeof(operand) for operand in operands if _is_ref(operand)]
+        kinds = [(ref.shape, ref.dtype) for ref in refs]
+        if len(set(kinds)) < len(kinds):
+            raise ValueError(f"{kernel} adds into two refs of one shape and dtype ({kinds}): XLA may take "
+                             "their zeros for one value and pass one buffer for both (row 3180); stack them "
+                             "into one ref (`stacked_zeros`)")
         token = _RESIDENT.set(resident)
         try:
             return built(*operands)
@@ -180,6 +188,48 @@ def checked(built: Callable, kernel: str, resident: int = 1) -> Callable:
             _RESIDENT.reset(token)
 
     return launch
+
+
+def _is_ref(operand) -> bool:
+    """Whether a launch's operand is a ref it adds into in place (`jax.new_ref`'s)."""
+    return isinstance(jax.typeof(operand), state_types.AbstractRef)
+
+
+def stacked_groups(shapes: Sequence[tuple[int, ...]]) -> tuple[tuple[int, ...], ...]:
+    """The refs a launch adds into in place, one for each of `shapes`, grouped by shape, each group's indices
+    in order: a group is one ref, a leading axis of them (`stacked_zeros`)."""
+    grouped: dict[tuple[int, ...], list[int]] = {}
+    for index, shape in enumerate(shapes):
+        grouped.setdefault(tuple(shape), []).append(index)
+    return tuple(tuple(group) for group in grouped.values())
+
+
+def stacked_zeros(shapes: Sequence[tuple[int, ...]], groups: tuple[tuple[int, ...], ...]) -> list:
+    """Zeroed fp32 refs a launch adds into in place, one for each of `shapes`, a ref a group of one shape
+    (`stacked_groups`), a leading axis of them: two refs of equal zeros are one value to XLA, which a
+    dynamic-slice fusion wrapping the launch passes once for both aliased operands, so both were one buffer
+    (row 3180; `checked` refuses two such refs)."""
+    return [jax.new_ref(jnp.zeros((len(group), *shapes[group[0]]), jnp.float32)) for group in groups]
+
+
+def stacked_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
+    """Each stacked ref's member (`stacked_zeros`) as the launch's program reads it, in its shapes' order:
+    its place along its group's ref's leading axis."""
+    views: list = [None] * sum(map(len, groups))
+    for ref, group in zip(refs, groups, strict=True):
+        for place, index in enumerate(group):
+            views[index] = ref.at[place]
+    return views
+
+
+def stacked_read(refs, groups: tuple[tuple[int, ...], ...]) -> list[jax.Array]:
+    """Each stacked ref's member (`stacked_zeros`) after the launch, an array, in its shapes' order."""
+    found: list = [None] * sum(map(len, groups))
+    for ref, group in zip(refs, groups, strict=True):
+        stacked = jax.freeze(ref)
+        for place, index in enumerate(group):
+            found[index] = stacked[place]
+    return found
 
 
 @dataclasses.dataclass(frozen=True)

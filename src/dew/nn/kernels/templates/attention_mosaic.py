@@ -770,10 +770,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); otherwise (the accurate form, a hooked
         or dropping call, deterministic mode, `deterministic_ops_requested`, a width no fused launch holds,
-        a call over key spans, windows, documents or runs, whose one launch's dK and dV an H100 got wrong,
-        1.27 and 0.79 times their RMS from the two launches' and different on a rerun at a packed windowed
-        call of width 64, interpreted exact, ET-3171-BAND-h100, row 3171) two launches, the dQ launch then
-        the keys-first dK/dV one, in a fixed order."""
+        a call over key spans, windows, documents or runs, whose one launch is on par but the slower: row
+        3171's packed windowed call, 1 x 1024, 8 query heads over 2, its step 0.082 ms against the two
+        launches' 0.062 at width 64 and 0.106 against 0.073 at 128, ET-SPAN-h100, its dK and dV wrong there
+        before row 3180's fix) two launches, the dQ launch then the keys-first dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
