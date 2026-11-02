@@ -53,9 +53,10 @@ def tiny(**overrides):
 def test_a_key_multiplier_scales_the_keys_before_they_rotate_and_are_cached():
     """Falcon-H1's `key_multiplier` scales each key as projected, before its rotation and its cache
     (`MixerContext.key_multiplier`), so a narrow key keeps its source's range through the rotation: at a
-    power of two the cached keys are the unscaled model's times it, bit for bit (its keys unnormed, as
-    Falcon-H1's are, where a norm after it would undo it)."""
-    model = tiny(qk_norm=False)
+    power of two a layer's cached keys are the unscaled layer's times it, bit for bit (its keys unnormed,
+    as Falcon-H1's are, where a norm after it would undo it; one layer, whose input the multiplier has not
+    yet moved)."""
+    model = tiny(qk_norm=False, num_layers=1)
     ids = jax.random.randint(jax.random.key(7), (2, 5), 0, VOCAB)
     params = model.init(jax.random.key(8), ids)
 
@@ -65,7 +66,7 @@ def test_a_key_multiplier_scales_the_keys_before_they_rotate_and_are_cached():
         return [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(mutated["cache"])
                 if jax.tree_util.DictKey("cached_key") in path]
 
-    plain, scaled = cached_keys(model), cached_keys(tiny(qk_norm=False, key_multiplier=0.5))
+    plain, scaled = cached_keys(model), cached_keys(tiny(qk_norm=False, num_layers=1, key_multiplier=0.5))
     assert plain
     for unscaled, held in zip(plain, scaled, strict=True):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(unscaled) * 0.5)
