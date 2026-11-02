@@ -29,6 +29,7 @@ import optax
 from jax.core import ShapedArray
 
 from dew._records import JSON
+from dew.averaging import ema_update
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.devices import xla_flag
@@ -51,7 +52,8 @@ from dew.training.compiled_program import (
 )
 from dew.training.memory import judged
 from dew.training.narrow import forward_variables
-from dew.training.transaction import attempt_step
+from dew.training.staging import chunks, flattened
+from dew.training.transaction import COMMIT_FIELDS, attempt_step
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,11 +79,24 @@ class Footprint:
     """Whether `peak` is the program's as XLA's rules make it, else a bound from below
     (`bounded_below`): a step whose derived headroom is then an upper bound refuses on it soundly and
     admits on it provisionally, its compile deciding."""
+    staged: int = 0
+    """The bytes of the state's host-resident fields its commit holds on the device at once, beside the
+    whole gradient it reads (`staged_bytes`): none for a state the device holds."""
+
+    @property
+    def temporaries(self) -> int | None:
+        """The most the step holds at once beside its state: its gradient program's peak, or, where its
+        commit stages host-resident fields, its whole gradient and those where they are more. None where
+        `peak` is."""
+        if self.peak is None or not self.staged:
+            return self.peak
+        return max(self.peak, self.gradients + self.staged)
 
     def record(self) -> dict[str, JSON]:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
-                "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact}
+                "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact,
+                "staged": self.staged}
 
 
 class Peak(NamedTuple):
@@ -250,9 +265,6 @@ def consumed_where_made(optimizer: optax.GradientTransformation | None, state: T
     fetched behind one barrier over every gradient (`Transaction.past`), a window
     that replays its microbatches keeps their gradients for the replay, and an update that reads them
     together (clipping by the global norm) holds them all until it has read the last."""
-    def in_device(tree) -> bool:
-        return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
-
     if state.scale is not None or not in_device((state.opt_state, state.ema)):
         return False
     if window > 1:
@@ -282,6 +294,52 @@ def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> boo
     leaves = len(jax.tree.leaves(gradients))
     read = [frozenset([index]) if index < leaves else frozenset() for index in range(len(program.invars))]
     return all(len(leaves_read) <= 1 for leaves_read in gradients_read(program, read))
+
+
+def staged_bytes(optimizer: optax.GradientTransformation | None, state: TrainState, window: int) -> int:
+    """The bytes of `state`'s host-resident commit fields (`COMMIT_FIELDS`) its commit holds on the device
+    at once (`dew.training.staging`): the chunk it computes and the one it fetches as it stores the chunk
+    before, the two largest of those the optimizer's update and the average read together (`chunks`); or
+    the whole fields where the commit reads them at once, as a window of several microbatches commits under
+    a conditional, a dynamically scaled loss admits the commit on the whole committed state's finiteness,
+    and an update that solves its system reads the whole state. A device's share of each leaf."""
+    resting = {field: getattr(state, field) for field in COMMIT_FIELDS
+               if getattr(state, field) is not None and not in_device(getattr(state, field))}
+    whole = placed_bytes(list(resting.values()))
+    if (not resting or optimizer is None or window > 1 or state.scale is not None
+            or solves_equations(state)):
+        return whole
+    fields, structure = jax.tree.flatten(resting)
+    held = {field: getattr(state, field) for field in COMMIT_FIELDS if field not in resting}
+
+    def commit(fields, held, gradients, variables, progress):
+        current = {**held, **structure.unflatten(fields)}
+        extra = {"qk_stats": None, "progress": progress} if isinstance(
+            optimizer, optax.GradientTransformationExtraArgs) else {}
+        update, opt_state = optimizer.update(gradients, current["opt_state"], variables["params"], **extra)
+        moved = {**variables, "params": optax.apply_updates(variables["params"], update)}
+        return opt_state, None if current["ema"] is None else ema_update(current["ema"], moved, 0.5)
+
+    variables = abstract(state.variables)
+    traced = jax.make_jaxpr(commit)(abstract(fields), abstract(held), variables["params"], variables,
+                                    jax.ShapeDtypeStruct((), np.float32))
+    equations, _ = flattened(traced.jaxpr, traced.jaxpr.invars, traced.consts)
+    # Cut by the fields' whole bytes, as the commit cuts them (`staged`), each chunk held as a device's share.
+    cut, _, _ = chunks(equations, traced.jaxpr.invars[:len(fields)],
+                       [math.prod(leaf.shape) * leaf.dtype.itemsize for leaf in fields])
+    shares = sorted((placed_bytes([fields[index] for index in chunk]) for chunk in cut), reverse=True)
+    return min(whole, sum(shares[:2]))
+
+
+def abstract(tree):
+    """`tree`'s leaves as their shapes, dtypes and weak types alone, in no memory space of their own."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                          weak_type=jax.typeof(leaf).weak_type), tree)
+
+
+def in_device(tree) -> bool:
+    """Whether every leaf of `tree` is in device memory."""
+    return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
 
 
 def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
@@ -703,4 +761,5 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
-                     None if peak is None else peak.bytes, peak is None or peak.exact)
+                     None if peak is None else peak.bytes, peak is None or peak.exact,
+                     staged_bytes(optimizer, prepared, window))

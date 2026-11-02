@@ -313,16 +313,18 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
                      built: int = 0) -> int | None:
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
     `step_headroom` reads a compiled step's: its temporaries the derivation names, the most its gradient
-    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, in one block beside what
-    it holds (`Footprint.held`), twice where the allocator strands them; None where
+    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, or its commit's gradient
+    and the host-resident fields it stages where they are more (`Footprint.temporaries`), in one block
+    beside what it holds (`Footprint.held`), twice where the allocator strands them; None where
     the derivation names no peak or a device states no memory. The resident state is in use already,
     or, on a stated device, its arguments but the `built` bytes its first call builds, which `held`
     counts. What else XLA's buffer assignment and scheduling make of the program is no term of it
     (`dew.training.footprint`): a compile confirms, and a miss is the derivation's to fix."""
-    if footprint.peak is None:
+    temporaries = footprint.temporaries
+    if temporaries is None:
         return None
     resident = sum(footprint.resident.values()) - built
-    return admitted(devices, capacity, resident, footprint.held, footprint.peak)
+    return admitted(devices, capacity, resident, footprint.held, temporaries)
 
 
 def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int,
