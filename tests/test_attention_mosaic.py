@@ -206,13 +206,20 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
+ACCURATE_DECLINED = frozenset({"temperature", "softcap-sinks-alibi"})
+"""The score hooks (`SCORE_HOOKS`) under which an H100's Mosaic backward declines the accurate form for its
+registers, the route's next mainloop taking it (`_takes_backward`): a query's temperature, whose dQ spills at
+every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed sums beside the hook's three slopes and its
+mask); a softcap with sinks and ALiBi, whose dQ at 64 x 64, width 128, in two column halves, spilled 204 bytes
+at ptxas's 255 where its model held 254 (et-ceil), refused once a consumer's raise is at most
+`resources.RAISE_CEILING`'s 248."""
+
+
 def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
                     declined: bool) -> bool:
     """Whether the Mosaic backward takes a call of `query`'s and `key`'s shapes and dtype under `hooks` on the
     target in effect, checked against `declined`, the call one it declines for its registers
-    (`MosaicBackward.declined`'s resources, the route's next implementation's): the accurate form under a
-    query's temperature, whose dQ spills at every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed
-    sums beside the hook's three slopes and its mask)."""
+    (`MosaicBackward.declined`'s resources, the route's next implementation's: `ACCURATE_DECLINED`)."""
     query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
     residuals = _residuals(query.shape)
     op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
@@ -1457,7 +1464,7 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
         hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                  for value, kind in zip(params, kinds, strict=True)), initial)
         if _takes_backward(spans, q, kv, hooked, accurate=accurate,
-                           declined=accurate and "temperature" in SCORE_HOOKS[hooks]):
+                           declined=accurate and hooks in ACCURATE_DECLINED):
             jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
                 lowering_platforms=("cuda",))
 
