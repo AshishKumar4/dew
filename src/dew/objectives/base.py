@@ -54,7 +54,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import rows_taken
+from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -984,13 +984,26 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
             tree = held
-        elif held is None or self._held_parts:
-            tree = self.fresh_variables(key, held)
+        elif not held or self._held_parts:
+            # Nothing held, None or an empty tree (`parameter_axes`'s fresh draw), draws afresh.
+            tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
         tree = self.complete_variables(key, tree)
         return with_projected(tree, functools.partial(self.projected, updated=True))
+
+    def parameter_axes(self, initialized: Variables) -> dict[tuple[str, ...], LogicalAxes]:
+        """The logical axes the objective's modules declare on their parameters
+        (`nn.with_logical_partitioning`), by each parameter's path: those `initialized`, its init's tree,
+        boxes, and for a tree the objective
+        holds, loaded or restored, whose arrays carry none, those a fresh draw of its modules boxes, read
+        abstractly (`init` given an empty tree): the one translation of a held tree's axes."""
+        boxes = boxed_axes(initialized)
+        if self.held_variables() is None:
+            return boxes
+        drawn = jax.eval_shape(functools.partial(self.init, variables={}), jax.random.key(0))
+        return {**boxed_axes(drawn), **boxes}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.

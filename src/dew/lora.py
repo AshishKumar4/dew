@@ -86,7 +86,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, unboxed
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -210,6 +210,8 @@ class LoRA:
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
+        # A draw boxes the parameters its modules declare the axes of; the adapter reads their values.
+        variables = unboxed(variables)
         if fp8_base is not None:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -673,7 +675,7 @@ class _Branch:
             if target is None:
                 return kernel
             child = getattr(module, name)
-            a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
+            a, b = (unboxed(child.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
             return _updated(kernel, a, b, _scale(target, self.rslora))
         target = (_target_at(self.targets, root + module.path)
                   if context.method_name in ("__call__", "_linear") else None)
@@ -688,11 +690,17 @@ class _Branch:
             raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
-            a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
+            a, b = (unboxed(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
         else:
+            # Each factor declares its kernel's axes on its side of the rank, where its kernel declares them.
             kernel = module.get_variable("params", "kernel")
-            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), FACTOR_DTYPE)
-            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), FACTOR_DTYPE)
+            names = kernel.names if isinstance(kernel, nn.LogicallyPartitioned) else None
+            shape = unboxed(kernel).shape
+            sides = {"lora_A": (*shape[:len(axes)], target.rank), "lora_B": (target.rank, *shape[len(axes):])}
+            a, b = (module.param(factor, declared(init, None if names is None
+                                                  else factor_axes(names, factor, len(sides[factor]))),
+                                 sides[factor], FACTOR_DTYPE)
+                    for factor, init in zip(LOW_RANK_FACTORS, (INIT_A, INIT_B), strict=True))
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.

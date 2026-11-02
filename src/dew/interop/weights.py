@@ -12,6 +12,7 @@ from flax.traverse_util import flatten_dict
 
 from dew import _records
 from dew.interop.unread import Stored, equal, held, valued
+from dew.nn.sharding import unboxed
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -57,8 +58,9 @@ def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> N
         return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
-    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
-    check_shapes(shapes(dict(variables)).items(), expected)
+    # A module's draw boxes the parameters it declares the axes of; their shapes are their values'.
+    expected = shapes(unboxed(jax.eval_shape(module.init, jax.random.key(0), *inputs)))
+    check_shapes(shapes(unboxed(dict(variables))).items(), expected)
 
 
 AUTO = "auto"

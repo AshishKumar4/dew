@@ -34,7 +34,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
+from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import Handed
@@ -79,7 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, boxed_axes, measured_links, pipeline_microbatches
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, unboxed
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -404,11 +404,11 @@ class Trainer(Generic[Loss, Effects]):
         initialized = initializer(init_key)
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
-        self._boxed = boxed_axes(initialized)
+        self._boxed = self.objective.parameter_axes(initialized)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
+        params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -425,7 +425,8 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
+        # The optimizer reads the axes `parameter_axes` gave (`optim.declaring`), Muon's grouping among them.
+        ema, opt_state = self.objective.ema, self.optimizer.init(params["params"])
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -484,12 +485,6 @@ class Trainer(Generic[Loss, Effects]):
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
-    def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
-        """The optimizer's state of `params`, Muon's grouping reading the axes
-        modules boxed on them in `initialized`, every one of them: placement alone filters by its rules."""
-        with boxed(boxed_axes(initialized)):
-            return self.optimizer.init(params)
-
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
         modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
@@ -504,7 +499,8 @@ class Trainer(Generic[Loss, Effects]):
         unboxes: what `initial_state` last traced, else one abstract init, for
         a state the trainer did not build. A checkpoint records them for its restore."""
         if self._boxed is None:
-            self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
+            self._boxed = self.objective.parameter_axes(
+                jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
 
     @ruled

@@ -76,6 +76,7 @@ from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
+from dew.nn.sharding import unboxed
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -1633,6 +1634,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     place the weights with a mesh and layout before quantizing. Resident
     JAX parameters keep their placement through Qwix's operations.
     """
+    # A draw boxes the parameters its modules declare the axes of; Qwix quantizes their values.
+    variables = unboxed(variables)
     rules = _rules(spec, training=False)
     served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):
