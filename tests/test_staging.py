@@ -89,3 +89,35 @@ def test_a_staged_commit_is_the_whole_commit_and_rests_where_it_rested():
     assert all(np.array_equal(left, right) for left, right in zip(jax.tree.leaves(expected),
                                                                   jax.tree.leaves(found), strict=True))
     assert {leaf.sharding.memory_kind for leaf in jax.tree.leaves(found[0])} == {"pinned_host"}
+
+
+def rated() -> optax.GradientTransformation:
+    """Updates scaled by a rate its state holds as a weakly typed scalar, as `optax.inject_hyperparams`
+    holds a Python float's."""
+    def update(updates, state, params=None):
+        del params
+        return jax.tree.map(lambda leaf: leaf * state["rate"], updates), state
+    return optax.GradientTransformation(lambda params: {"rate": jnp.asarray(0.1)}, update)
+
+
+def test_a_staged_weakly_typed_scalar_scales_as_it_does_unstaged():
+    """A weakly typed rate in pinned host memory scales bfloat16 updates in bfloat16, staged as unstaged:
+    traced strongly typed, the staged commit promoted them to float32."""
+    optimizer = rated()
+    params = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), drawn(4))
+    state = optimizer.init(params)
+    device = jax.devices()[0]
+    host = SingleDeviceSharding(device, memory_kind="pinned_host")
+    resting, shardings = jax.device_put(state, host), jax.tree.map(lambda _: host, state)
+
+    def commit(state, gradients):
+        updates, new = optimizer.update(gradients, state)
+        return new, updates
+
+    whole = jax.jit(lambda resting, gradients: commit(
+        jax.device_put(resting, SingleDeviceSharding(device, memory_kind="device")), gradients))
+    chunked = jax.jit(lambda resting, gradients: staged(commit, resting, shardings, (gradients,), gradients))
+    (_, expected), (_, found) = whole(resting, params), chunked(resting, params)
+    assert [leaf.dtype for leaf in jax.tree.leaves(found)] == [jnp.bfloat16] * len(SHAPES)
+    assert all(np.array_equal(left, right) for left, right in zip(jax.tree.leaves(expected),
+                                                                  jax.tree.leaves(found), strict=True))

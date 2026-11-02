@@ -4,6 +4,8 @@ and 29.7 against 15.0 at one row twice. The walk reads the jaxpr and XLA compile
 to, and five terms the walk counted are not in that program. Each test states one, with the rule that
 removes it, on a program small enough to read."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -21,6 +23,7 @@ from dew.training import Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead, compile_only_gpus
 from dew.training.compiled_program import compiled
 from dew.training.footprint import (
+    Footprint,
     Workspace,
     consumed_where_made,
     gradient_peak,
@@ -269,6 +272,15 @@ def test_a_commit_over_host_resident_state_holds_two_of_its_chunks():
     assert staged_bytes(trainer.optimizer, state, 2) == whole
     resident = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=device)
     assert staged_bytes(resident.optimizer, resident.place()[0], 1) == 0
+
+
+def test_a_device_resident_steps_temporaries_are_its_gradient_programs_peak():
+    """A step whose state the device holds consumes each gradient where it is made, its derived peak below
+    its whole gradient, and stages nothing: its temporaries are that peak. One that stages host-resident
+    fields holds its whole gradient and them as it commits."""
+    streamed = Footprint(residuals=0, gradients=100, held=0, peak=60)
+    assert streamed.temporaries == 60
+    assert dataclasses.replace(streamed, staged=10).temporaries == 110
 
 
 def test_a_differentiated_checkpoint_keeps_its_operands_behind_its_barrier():
