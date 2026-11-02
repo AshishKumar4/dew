@@ -134,13 +134,10 @@ def _later(value: Reads, length: int) -> bool:
 
 def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
     """The programs `eqn` runs within it: a call's, a scan's or loop's body, a branch's."""
-    found = []
-    for value in eqn.params.values():
-        for program in value if isinstance(value, tuple | list) else (value,):
-            if isinstance(program, core.Jaxpr):
-                # A program holds its constants beside it on JAX 0.12, its `jaxpr` the program itself.
-                found.append(program.jaxpr)
-    return found
+    # A program holds its constants beside it on JAX 0.12, its `jaxpr` the program itself.
+    return [program.jaxpr for value in eqn.params.values()
+            for program in (value if isinstance(value, tuple | list) else (value,))
+            if isinstance(program, core.Jaxpr)]
 
 
 def _small_integer(value) -> bool:
