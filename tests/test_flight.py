@@ -9,6 +9,7 @@ cut short; and a batch of races restarts only the drones it is told to."""
 
 import collections
 import dataclasses
+import math
 from functools import partial
 
 import jax
@@ -361,18 +362,24 @@ def test_commands_carry_each_drones_throttle_rates_and_latency():
 
 
 def test_a_curriculum_varies_the_scenes_looks_for_its_share_of_episodes():
-    """Each of the scene's looks is drawn for a ramp's share of episodes and is the first otherwise: none at
-    no randomization, every one at full, and at a curriculum's first tenth some but far from half, each
-    drawn look the one full randomization draws from the same key."""
-    keys = jax.random.split(jax.random.key(4), 512)
-    def looks_at(ramp):
-        return np.asarray(jax.vmap(lambda key: drawn_camera(RACING, key, jnp.asarray(ramp)).look)(keys))
-
-    looks = {ramp: looks_at(ramp) for ramp in (0.0, 0.1, 1.0)}
-    drawn = looks[0.1] != 0
-    assert not looks[0.0].any() and (looks[1.0] != 0).mean() > 0.99
-    assert 0 < drawn.mean() < 0.5
-    np.testing.assert_array_equal(looks[0.1][drawn], looks[1.0][drawn])
+    """Each of the scene's four looks is drawn for a ramp's share of episodes, each on its own, and is the
+    first (0) otherwise; a drawn look is the one full randomization draws from the same key. Over 4096
+    episodes each look's count drawn (nonzero: a draw is 0 one time in 2^16) lies within 4.9 binomial
+    standard deviations of the ramp's expected count, which a count passes with odds under one in a
+    million; the ramp is traced, as a race's per-track level is."""
+    episodes = 4096
+    keys = jax.random.split(jax.random.key(4), episodes)
+    looked = jax.jit(jax.vmap(lambda key, ramp: drawn_camera(RACING, key, ramp).look, in_axes=(0, None)))
+    full = np.asarray(looked(keys, jnp.asarray(1.0)))
+    for ramp in (0.0, 0.1, 0.5, 1.0):
+        looks = np.asarray(looked(keys, jnp.asarray(ramp)))
+        drawn = looks != 0
+        share = ramp * (1 - 2.0 ** -16)
+        spread = 4.9 * math.sqrt(episodes * share * (1 - share))
+        fewest, most = math.ceil(episodes * share - spread), math.floor(episodes * share + spread)
+        counts = drawn.sum(axis=0).tolist()
+        assert all(fewest <= count <= most for count in counts), (ramp, counts, fewest, most)
+        np.testing.assert_array_equal(looks[drawn], full[drawn])
 
 
 def test_a_camera_is_hyperdrones_of_its_mounted_frame():
