@@ -99,6 +99,25 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
 
 
+def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_split(tmp_path, monkeypatch):
+    """A step whose plan is the remat ladder's top ('full') lists, past it, the sibling that keeps what
+    'minimal' saves in pinned host memory in place of recomputing it ('minimal_offloaded') at the plan's
+    split: as many device bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses
+    (row 1932). The run, which times nothing, is left at 'full'."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None, remat="full")
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, frontier=True)
+    plan = record(ahead.plan, "plan")
+    (sibling,) = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    assert plan["remat"] == remat_record(REMAT_POLICIES["full"])
+    assert sibling["remat"] == remat_record(REMAT_POLICIES["minimal_offloaded"])
+    assert sibling["fits"] is True and sibling["split"] == plan["split"]
+    assert trainer.plan == ahead.plan
+
+
 def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
     """A step compiled for compile-only GPUs takes autotuning off (`deviceless_options`), its programs' bytes
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
