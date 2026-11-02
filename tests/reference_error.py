@@ -1374,10 +1374,12 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 dew = dew_fn(*mine_at)
                 if not at and mine_at is ordered[0][0]:
                     _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
+            # The leaves judged: a weighed arm's split into its heavy and light classes (`_Weighed.classed`).
+            judged = dew if weighed is None else weighed[id(truth)].classed(jax.device_get(dew))
             names = names or [jax.tree_util.keystr(path)
-                              for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
+                              for path, _ in jax.tree_util.tree_leaves_with_path(judged)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
-                                     for leaf in jax.tree.leaves(dew))
+                                     for leaf in jax.tree.leaves(judged))
             # Dew's side read once for every reference (`_prepared`).
             prepared = _prepared(dew, truth, terms) if weighed is None else _prepared(
                 *weighed[id(truth)].weighed(dew, "Dew's arm"), weighed[id(truth)].ones)
