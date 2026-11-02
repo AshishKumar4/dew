@@ -148,6 +148,7 @@ class Objective()  [dew.objectives.base]
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
@@ -239,6 +240,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .model_tree(cls, variables: Variables) -> Variables  [classmethod]
   .model_variables(self, variables: Variables) -> Variables
   .optimizer(self, tx: optax.GradientTransformation) -> optax.GradientTransformation
+  .parameter_axes: cached property -> dict[tuple[str, ...], LogicalAxes]
   .pipeline(self, state: TrainState, *, ema: bool | None = None, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
