@@ -511,8 +511,8 @@ def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient
                     reason="composes the route's mainloops, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def an_fp16_call_on_an_h100_is_on_par(case):
-    """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
-    and backward compose two mainloops: on par with the reference path (check 1) whatever they run. A call
+    """fp16 on an H100, its Mosaic backward in two launches (row 3497: its parts scaled, each product
+    restored into its sums, `operands.Issuer.summed`): on par with the reference path (check 1). A call
     without sinks is judged a term at a time (`attention_terms`): a query that keeps one key has a dQ of
     zero in float64, which a D formed from the rounded output rounds to its own size (G14's H100 flow,
     gate-g14f-h100)."""
@@ -520,7 +520,7 @@ def an_fp16_call_on_an_h100_is_on_par(case):
     draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
-                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS,
+                    f"fp16 Mosaic forward and backward, {case}", seeds=SEEDS,
                     terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
 
 

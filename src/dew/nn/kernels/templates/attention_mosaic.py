@@ -608,6 +608,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
             # one LDSM's registers read by four HMMAs over three parts, 218 to 221 live at its peak).
             right = (2 * family.fragment_depth(block_k), width // config.columns * family.rhs_copies, dtype)
             fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right])
+        if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+            # fp16's parts scaled (`product.Scaled`): each part's product its own accumulator, restored and
+            # added into dQ's (`operands.Issuer.summed`), beside the cotangents and the part.
+            fragments.append([cotangents[0], cotangents[1], (block_q, width // config.columns, jnp.float32)])
         phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
         return phases + anchor + rows + vectors
     if config.shared_keys:
@@ -663,6 +667,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # ptxas's least 240 fell to 192).
         right = (queries, width // columns * family.rhs_copies, dtype)
         fragments.append([step[0], weights, weights, right])
+    if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+        # fp16's dV and dK parts scaled (`product.Scaled`): each product its own accumulator, restored and
+        # added into dV's or dK's (`operands.Issuer.summed`), beside the cotangents and the part.
+        fragments.append([step[0], weights, (block_k, max(width, value_width) // columns, jnp.float32)])
     phases = resources.live_registers(family, carried, step, pullback, *added, *fragments)
     return phases + statistics + vectors
 
@@ -730,9 +738,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                     or (config.shared_dq and config.block_q % dkv_family.rows == 0)))
                 or (config.staged_logits and not keys_first)):
             return False
-        if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
-            return False
         dtype = ba.arguments["query"].dtype
+        # The one launch stages its weights and score cotangents for its products (`mosaic.staged`), which
+        # fp16's scaled parts (`product.Scaled`) take no power of two back through: bf16 alone.
+        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16)
+        if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
+            return False
         family = bundle_of(config, dtype)
         if config.producer_dq and not config.shared_dq:
             # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).

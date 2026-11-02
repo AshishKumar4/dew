@@ -100,6 +100,12 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     factor, keyed_parts = keyed
     if factor is None:
         keyed_acc = issued_into(family, keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+    elif k_slot.dtype == jnp.float16:
+        # fp16's parts scaled (`product.Scaled`): the keyed sums rescaled by their row factor first, the
+        # tile's products then restored into them (`issued_into`).
+        keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
+                                             (), k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_acc, keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
         keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),

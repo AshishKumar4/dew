@@ -123,6 +123,15 @@ class WgmmaIssuer(mosaic.Issuer):
 
         return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
+    def added_into(self, acc, value: jax.Array, interpret: bool):
+        """`Family.added_into` for a warpgroup accumulator ref: its value read once its products are done,
+        `value` added, stored back (interpreted, a register value's sum, `summed`'s)."""
+        if interpret:
+            return super().added_into(acc, value, interpret)
+        plgpu.wgmma_wait(0)
+        acc[...] = acc[...] + value
+        return acc
+
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
             return self.register_products(scale(acc), parts, rhs, interpret)

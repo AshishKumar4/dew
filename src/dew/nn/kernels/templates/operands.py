@@ -125,8 +125,9 @@ class Issuer:
         products before and after it each summed in one. An operand may be a callable forming it then, where
         `shape`, the sum's, is given. A register left operand whose product takes it in registers (its buffers
         a count) is issued so (`Family.register_products`). `into`, an accumulator the walk carries (its home,
-        a warpgroup accumulator ref or a register array), takes every product in place and is returned, no
-        value read (a scaled operand takes none). A `product.Blocks` entry, a product a block of tiles in
+        a warpgroup accumulator ref or a register array), takes every unscaled product in place and is
+        returned, no value read; a scaled operand's product its own accumulator, restored and added into it
+        (`Family.added_into`). A `product.Blocks` entry, a product a block of tiles in
         memory, is issued as a loop over its blocks where the family's products read their operands from
         registers (`Family.operands_in_registers`, whose accumulator is a value the loop carries): unrolled,
         ptxas held every block's fragments at once, an A100's scores backward at keys and values 256 wide
@@ -186,8 +187,13 @@ class Issuer:
 
         if into is not None:
             into = group(into, alone=False)
-            if held:
-                raise ValueError("a carried accumulator takes no scaled operand's product (`into`)")
+            while held:
+                # A scaled product's own accumulator, restored, then the carried one's (fp16's parts: the
+                # carried accumulator rescaled in place would leave fp32's range at either end, its small
+                # entries subnormal under a large part's power or its large ones past it under a small's),
+                # the products in flight on the carried one done first (`Family.added_into`).
+                part = summed_group()
+                into = family.added_into(into, part, interpret)
             return into
         total = summed_group()
         while held:

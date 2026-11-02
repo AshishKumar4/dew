@@ -2304,6 +2304,14 @@ def value_weights(exponentials: jax.Array, weights: jax.Array, dtype, dropped: b
     return exponentials.astype(dtype).astype(jnp.float32)
 
 
+def value_parts(weights: jax.Array, dtype) -> Parts:
+    """A tensor-core mainloop's dV left operand, `pᵀ·dO` against the output cotangent as it is in shared
+    memory (FlashAttention's form, `value_operands`' bf16 one): the normalized weights narrowed, bf16's as is,
+    fp16's at a power of two of their tile's (`weights_parts`), which keeps a weight down to 2^-24 of the
+    tile's largest where fp16's least subnormal (about 6e-8) would drop a normalized one."""
+    return weights_parts(weights, dtype)
+
+
 def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first: bool = False) -> jax.Array:
     """Attention's math on a template's formed tiles, whole (theme A's declaration, `declaration`): each
     query's softmax over its `logits` (scaled, in the exponent's base, -inf at each key it does not see, as

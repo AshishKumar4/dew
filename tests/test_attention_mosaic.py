@@ -367,18 +367,18 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
                     value_width: int | None = None, spans: template.KeySpans | None = None,
-                    drop: bool = False, kept: template.Kept = template.Kept.SPLIT):
+                    drop: bool = False, kept: template.Kept = template.Kept.SPLIT, dtype=jnp.bfloat16):
     """The backward in the form `form` names (`_backward_form`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
     heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
     forward's residuals at its pick: this mainloop's, those `kept` names (its anchor's split sums, or
     `template.Kept.OUTPUT`'s output, check 1 then judging D's rounding a term at a time), or
     `residuals_from`'s (another mainloop's `forward`, as the route feeds the Triton mainloop's), with `drop`
-    under probability dropout (`_dropping`)."""
+    under probability dropout (`_dropping`), on operands of `dtype`."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     hooks = _dropping(shape) if drop else None
-    draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
+    draw = _drawn(shape, dtype, width, keys=keys, value_width=value_width)
     accurate, config = (False, config) if form is None else _backward_form(form)
     # Another mainloop's forward keeps its split sums (its `residuals` True).
     trained = (functools.partial(attention_mosaic.forward, residuals=kept) if residuals_from is None
@@ -1076,6 +1076,17 @@ def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
 def test_the_backward_is_on_par_interpreted(call, form):
     """The backward in every form under the interpreter, each at its width (`FORM_WIDTHS`)."""
     _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, width=FORM_WIDTHS.get(form, 128))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+@pytest.mark.parametrize("call", CALLS)
+def test_an_fp16_backward_is_on_par_interpreted(call, accurate):
+    """fp16's backward in two launches under the interpreter (row 3497): its weights' and score cotangents'
+    parts scaled (`product.Scaled`), each product its own accumulator restored into the carried dK, dV or
+    dQ (`operands.Issuer.summed`), on par with the reference (check 1)."""
+    _check_backward(call, SHAPES["interpreted"], form="accurate" if accurate else "default", interpret=True,
+                    dtype=jnp.float16)
 
 
 @INTERPRETS

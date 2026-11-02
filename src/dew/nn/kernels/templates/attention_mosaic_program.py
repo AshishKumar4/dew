@@ -240,8 +240,9 @@ class _Issuing(NamedTuple):
 def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
     """`acc` with each of `parts`' products with `rhs`, a tile in shared memory, issued into it in place
     (`operands.Issuer`'s carried accumulator), each part's left operand in registers and formed as it is
-    taken (`algebra.formed_parts`)."""
-    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1})
+    taken (`algebra.formed_parts`); an fp16 part's (`product.Scaled`) its own accumulator, restored by its
+    power of two (`algebra.power2`) and added in."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.power2)
     right = operands.Parts((rhs,), rhs.dtype)
     return issuer.summed((("part", part, right) for part in parts), into=acc)
 
@@ -327,8 +328,6 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
         # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
         # products do not take back (`mosaic.unscaled_part`).
         return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
-    if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
-        return Refusal('dtype', f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):

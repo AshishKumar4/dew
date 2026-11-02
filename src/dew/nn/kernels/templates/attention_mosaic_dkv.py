@@ -174,7 +174,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # dK's and dV's products against the program's share of the queries' and output cotangents' columns.
     (q0, q_share), (v0, v_share) = shares
     q_columns, do_columns = q_slot.at[:, pl.ds(q0, q_share)], do_slot.at[:, pl.ds(v0, v_share)]
-    dv_acc = issued_into(family, dv_acc, (narrowed,), do_columns, walk.interpret)
+    dv_acc = issued_into(family, dv_acc, narrowed if isinstance(narrowed, tuple) else (narrowed,), do_columns,
+                         walk.interpret)
     if not fused:
         # Each part formed as its product is issued (`algebra.formed_parts`).
         parts = algebra.formed_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
@@ -218,7 +219,10 @@ def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     if multiplier is not None:
         exponentials, weights = exponentials * multiplier, weights * multiplier
-    return algebra.value_weights(exponentials, weights, values, multiplier is not None), logits, pieces
+    if one_part:
+        # The fused launch stages them for dV's product (bf16 alone, `MosaicBackward.legal`).
+        return algebra.value_weights(exponentials, weights, values, multiplier is not None), logits, pieces
+    return algebra.value_parts(weights, values), logits, pieces
 
 
 def _joined(chunks: list, kinds: tuple[Kind, ...]) -> tuple:
