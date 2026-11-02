@@ -26,7 +26,7 @@ from dew.nn.moe import (
     renormalized_softmax,
 )
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared, logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -64,13 +64,15 @@ class GptOssExperts(nn.Module):
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         initializer = nn.initializers.variance_scaling(
             1.0, "fan_in", "truncated_normal", in_axis=-2, out_axis=-1, batch_axis=(0,))
-        gate_up = self.param("gate_up_proj", initializer,
+        gate_up = self.param("gate_up_proj", declared(initializer, FUSED_EXPERT_AXES["gate_up_proj"]),
                              (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size))
-        gate_bias = self.param("gate_up_proj_bias", nn.initializers.zeros,
+        gate_bias = self.param("gate_up_proj_bias",
+                               declared(nn.initializers.zeros, FUSED_EXPERT_AXES["gate_up_proj_bias"]),
                                (self.num_local_experts, 2 * self.intermediate_size))
-        down = self.param("down_proj", initializer,
+        down = self.param("down_proj", declared(initializer, FUSED_EXPERT_AXES["down_proj"]),
                           (self.num_local_experts, self.intermediate_size, self.hidden_size))
-        down_bias = self.param("down_proj_bias", nn.initializers.zeros,
+        down_bias = self.param("down_proj_bias",
+                               declared(nn.initializers.zeros, FUSED_EXPERT_AXES["down_proj_bias"]),
                                (self.num_local_experts, self.hidden_size))
         # Infer the shared compute dtype from every original operand, while
         # keeping master kernels uncast for the projection's derivative rule.
@@ -140,8 +142,8 @@ class GptOssMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
-        logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
-                           precision=self.precision, name="router", dot_general=float32_dot_general)(x)
+        logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype, kernel_axes=("embed", "exp"),
+                       precision=self.precision, name="router", dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
         return GptOssExperts(

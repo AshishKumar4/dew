@@ -79,7 +79,8 @@ class RoutedValues(nn.Module):
                              routed_scaling_factor=spec.scaling, expert_bias=spec.bias,
                              init_std=self.init_std, precision=self.precision, name='v_router')
         self.projection = ExpertLinear(num_experts=spec.experts, in_features=self.in_features,
-                                       features=self.features, init_std=self.init_std, name='v_proj')
+                                       features=self.features, init_std=self.init_std, name='v_proj',
+                                       kernel_axes=VALUE_EXPERT_AXES)
 
     def _project(self, tokens, sizes, _expert_ids, kernels, *, dtype):
         projected = expert_projection(tokens, kernels[0], sizes, dtype, self.mixture.implementation,

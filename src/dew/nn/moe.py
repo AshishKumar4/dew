@@ -227,6 +227,8 @@ class Router(nn.Module):
     rows a whole number of blocks long).
     """
     num_experts: int
+    kernel_axes: LogicalAxes | None = None
+    """Its kernel's logical axes, as its owner declares them where it makes it."""
     in_features: int
     top_k: int
     score_function: str = 'softmax'
@@ -301,10 +303,9 @@ class Router(nn.Module):
         # The kernel is the router's own parameter, not a nested Dense, so
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
-        # Its experts split as the experts they choose do.
         self.kernel = self.param(
             'kernel', declared(normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
-                               ("embed", "exp")), (self.in_features, self.num_experts), jnp.float32)
+                               self.kernel_axes), (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
                 EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
@@ -1078,7 +1079,8 @@ class SparseMLP(nn.Module):
                            block_experts=self.block_experts,
                            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
-                           precision=self.precision, name='gate')
+                           # Its experts split as the experts it chooses do.
+                           kernel_axes=("embed", "exp"), precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
