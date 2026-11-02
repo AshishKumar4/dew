@@ -326,8 +326,8 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     ids = jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=3457)["text"])
     np.testing.assert_array_equal(np.asarray(model.apply(dict(trained.variables), ids)),
                                   np.asarray(model.apply(dict(stored.variables), ids)))
-    generated = run.objective.pipeline(trained)([[1, 2]], 4, key=0).host()
-    assert np.asarray(generated.tokens).shape[0] == 1
+    generated = [run.objective.pipeline(held)([[1, 2]], 4, key=0).host() for held in (trained, stored)]
+    np.testing.assert_array_equal(np.asarray(generated[0].tokens), np.asarray(generated[1].tokens))
     assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,
                                                        state=trained).step) == STEPS + 1
 
@@ -547,3 +547,49 @@ def test_a_gauss_newton_run_keeps_every_layer_whole():
     from dew.gauss_newton import gauss_newton
 
     assert saving(functools.partial(trainer, decoder(), gauss_newton(damping=1e-3), STAGED, 8, ema=None)) == 0
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_stage_local_lora_fit_merges_and_saves_as_every_layer_whole(tmp_path):
+    """A LoRA fit over two stages, its state as the run holds it, merges and saves its adapter as the same
+    state with every layer whole does (ledger 3476): the readers by layer name read a stage-local store as
+    its stored layers, where they raised KeyError on its stacked runs."""
+    model = decoder()
+    base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+    run = trainer(adapter.model, LORA_OPTIMIZER, STAGED, 8, variables=adapter.variables)
+    trained = run.fit(stream(), steps=1, log_every=1)
+    held, whole = trained.variables, run.stored(trained).variables
+    merged = [on_host(adapter.merge(variables)) for variables in (held, whole)]
+    assert jax.tree.structure(merged[0]) == jax.tree.structure(merged[1])
+    for mine, theirs in zip(jax.tree.leaves(merged[0]), jax.tree.leaves(merged[1]), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+    written = []
+    for name, variables in (("held", held), ("whole", whole)):
+        adapter.save(variables, tmp_path / name)
+        written.append({path.name: path.read_bytes() for path in sorted((tmp_path / name).iterdir())})
+    assert written[0] == written[1]
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
+    """A rollout samples from the state a stage-local run holds, each layer on its own stage's devices,
+    with no copy of every layer on every stage (ledger 3477): its policy reads the store off the mesh as
+    its stored layers, choosing the tokens the same state with every layer whole chooses."""
+    model = decoder()
+    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    read = []
+
+    def rollout(state, batch, key):
+        stored = run.stored(state)
+        greedy = [np.argmax(np.asarray(model.apply(dict(variables), batch["text"])), axis=-1)
+                  for variables in (state.variables, stored.variables)]
+        read.append((all(bytes_on(state, device) < bytes_on(stored, device)
+                         for device in run.device_mesh.devices.flat), greedy))
+        return {**batch, "text": jnp.asarray(greedy[0], batch["text"].dtype)}
+
+    run.rollout = rollout
+    run.fit(stream(), steps=1, log_every=1)
+    ((spared, (held, whole)),) = read
+    assert spared
+    np.testing.assert_array_equal(held, whole)
