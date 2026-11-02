@@ -7,6 +7,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
+  them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
+  memory read that packs them as it holds them bounds the passes with its pack. A run bounded in
+  examples or epochs can shuffle the windows a concatenating pack or windows cut its examples across:
+  each example counts once every window holding a piece of it is drawn (this was refused), and windows
+  that overlap count each token at the last of them that holds it. A memory read that shuffles such
+  windows holds the bound before the layout, and each share lays out its own examples. A version 7
+  position that version 8 reads otherwise says why and how the run goes on.
 - `Residuals` no longer takes `damping`: it states its Gauss-Newton system where the run's optimizer asks
   (`Step.equations`), and Gauss-Newton is an optimizer, `dew.gauss_newton.gauss_newton(learning_rate,
   damping)` or `OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": ...})`. A config that

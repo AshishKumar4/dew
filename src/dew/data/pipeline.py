@@ -528,6 +528,15 @@ class Workers:
 @dataclasses.dataclass(frozen=True)
 class Limit:
     count: int
+    passes: int | None = None
+    """Where set, the limit is that many passes over the rows reaching it, which a memory read that holds
+    them counts as it holds them and sets `count` to (`dew.data.materialize`): a run of epochs's bound
+    (`dew.data.compile._bounded`), the stages the read ran stating the count it resolved to."""
+
+    def __repr__(self) -> str:
+        # A limit of a count is recorded as it always was, in a saved plan's order among them.
+        return f"Limit(count={self.count})" if self.passes is None else (
+            f"Limit(count={self.count}, passes={self.passes})")
 
 
 class DeviceStep:
