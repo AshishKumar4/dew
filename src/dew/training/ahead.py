@@ -125,7 +125,6 @@ def compile_only_tpus(topology: str) -> tuple:
     return tuple(topologies.get_topology_desc(topology, "tpu").devices)
 
 
-@functools.cache
 def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None,
                       multiprocessors: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
@@ -133,6 +132,13 @@ def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = No
     `multiprocessors` a build states where it states them (`built_target`). `capacity` states bytes per device
     to XLA's scheduler and rematerialization pass, not only Dew's admission check; absent it, XLA's target
     states zero rather than a hardware capacity."""
+    return _compile_only_gpus(generation, count, capacity, multiprocessors)
+
+
+@functools.cache
+def _compile_only_gpus(generation: str, count: int, capacity: int | None,
+                       multiprocessors: int | None) -> tuple:
+    """`compile_only_gpus`, one topology for each set of its arguments however a caller spells them."""
     config = target_config(built_target(generation, multiprocessors), capacity)
     topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
                                             topology=f"1x1x{count}")
