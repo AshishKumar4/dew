@@ -1135,7 +1135,7 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
                 exponentials=(CHUNK // algebra.SUB + 1) * CHUNK * width)
     staging, landing = _intra_staged(call, keys, system=system)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2), live=_taken(4), work=work,
+                   grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(4), work=work,
                    held=_intra_held(call, keys), staging=staging, landing=landing,
                    name="recurrence_intra_system" if system else "recurrence_intra",
                    # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
@@ -1238,6 +1238,9 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
             return rows.get("write"), None if call.per_key else (rows["gate"], rows["low"])
 
         def step(index, slots, carry, accumulators, loaded=None):
+            # Every slot waited for each step, the values' too, which the first step alone reads: a load no
+            # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
+            slots.acquire_all()
             found = read(slots) if streamed else loaded
             assert found is not None, "a family that streams no vectors loads them in the prologue"
             betas, prefix = found
@@ -1292,7 +1295,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     staging, landing = _weighted_staged(call, keyed)
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_weighted_streamed(call, keyed),
-                   stages=(1, 2) if call.per_key else 1, live=_taken(6),
+                   stages=1, live=_taken(6),
                    work=dataclasses.replace(work, span=steps), held=_weighted_held(call, keyed),
                    staging=staging, landing=landing,
                    # A key block's walk a program a tile; a decay a head's one step a tile, persistent.

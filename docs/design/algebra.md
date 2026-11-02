@@ -392,19 +392,14 @@ range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's co
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
 outside the language, has none. Each equation in the language composes its operands' bounds: sums take twice
 the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
-function (`tanh`, `sin`, `logistic` of a real operand) is 2, one power past the reals' 1 because no native
-implementation is certified within its range, a comparison or `sign` 1, a complex operand's sine
+function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`) is 1, a complex operand's sine
 or tangent none (`sin(pi/2 + 89j)` is 2.2e38), and a rounding to an integer (`floor`, `ceil`, `round`) its
 operand's or 1 (`ceil(2**-126)` is 1). Each bound is its output dtype's too: a boolean is at most 1 whatever
 made it (a tiny float converted is 1); an integer at most its dtype's range, within which a sum or a product
 wraps, and at that range for a bitwise operation and where an unsigned result may wrap from below zero
 (`uint32(0) - 1`, a negation, int32's -1 converted: `2**32 - 1`). A conversion keeps a value at most 0 only
 between signed dtypes. An exponential of an unbounded operand, or a quotient, has no
-bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one
-power past 1 (`ex2.approx`'s error is more than an ulp of 1). Every bound holds under its arithmetic's
-contract: IEEE rounding to nearest, a contraction's mode one that rounds each operand once (its real bound)
-or splits it into parts (bf16 x3 to x9, TF32 x3, `Precision.HIGH`: one more power), and none for a mode
-whose rounding no source states (FP8 fast accumulation).
+bound; an exponential of an operand at most 0 is at most 1.
 
 The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
 finite. A reordering is admitted only when every new intermediate it makes has a number bound under the
