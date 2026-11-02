@@ -41,7 +41,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.algebra.forms import derived_on
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
@@ -681,11 +680,9 @@ def keyed(product, gate, low, beta, column_gate, column_low):
     products `product` (`k k^T`) and its prefix halves and write gates as a row's vectors (`gate`, `low`,
     `beta`) and the halves as a column's (`column_gate`, `column_low`), where a mainloop's layouts keep the
     two apart. The decays are the compensated prefix's (`decayed`, a representation the template keeps);
-    behind the switch the tile's algebra over them is the derived forms' (`derived_tile`, `pairs_of`)."""
+    the tile's algebra over them is its declaration's derived forms (`derived_tile`, `pairs_of`)."""
     decays = decayed(gate, low, column_gate, column_low)
-    if derived_on():
-        return derived_tile("pairs").mapped({"products": product, "decays": decays, "scales": beta})
-    return pairs_of(product, decays, beta)
+    return derived_tile("pairs").mapped({"products": product, "decays": decays, "scales": beta})
 
 
 def pairs_of(products, decays, scales):
@@ -708,9 +705,9 @@ TILES = {"pairs": pairs_of, "scores": scores_of}
 
 @functools.cache
 def derived_tile(name: str):
-    """The derived forms of the tile declaration `name` (`TILES`, the fast class), the template's behind the
-    switch (`dew.algebra.forms.derived`): a mainloop forms the products and its compensated prefix's decays
-    (representations it keeps) and takes the tile's algebra over them from these forms."""
+    """The derived forms of the tile declaration `name` (`TILES`, the fast class), the template's: a mainloop
+    forms the products and its compensated prefix's decays (representations it keeps) and takes the tile's
+    algebra over them from these forms, the hand forms' own arithmetic in their order (FS-DERIVED-ID1/2)."""
     from dew.algebra import SATURATION, derive
     axes = {"products": ("rows", "columns"), "decays": ("rows", "columns"),
             "scales": ("rows",) if name == "pairs" else ("columns",)}
@@ -840,11 +837,9 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
-    # Behind the switch, the tile's algebra over its products and decays the derived forms' (`scores_of`).
-    if derived_on():
-        return derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales}).astype(
-            dtype)
-    return scores_of(scores, decay, scales).astype(dtype)
+    # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
+    return derived_tile("scores").mapped({"products": scores, "decays": decay, "scales": scales}).astype(
+        dtype)
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,

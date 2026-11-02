@@ -742,9 +742,9 @@ forms where the declarations state the walk:
   carries typed as every operand varies, its decays' prefix restarting at a token whose decay vanishes in
   its dtype (`_vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum
   holds its exponent: a prefix of -2**127 twice is -inf, one of -2**70 loses a later -1), a pair no decay
-  joins selected away before its decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
+  joins selected away before its decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from the derived forms of tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
-  prefix's decays.
+  prefix's decays, the one path: the derived forms are the hand-written ones' arithmetic, which they replace.
 
 The template's own forms run in three places:
 - the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
