@@ -17,6 +17,7 @@ directory, rung records and data cache of its own:
   the attention forms a run names on its command line reach its step (option_witness, ledger 2639).
 - A program on this GPU is admitted against the room its pool left outside XLA's pool (test_communicators).
 - A program loaded from the compilation cache is admitted from its kept communicators (test_communicators).
+- A staged commit holds two layers of host-resident moments at once (test_staging).
 """
 
 import dataclasses
@@ -27,6 +28,7 @@ import test_communicators as communicators
 import test_compile_ahead as compile_ahead
 import test_plan as plan
 import test_run_option_matrix as run_option_matrix
+import test_staging as staging
 import test_trainer as trainer
 import test_training_transactions as transactions
 from gpu_flow import Cell, cells_of, isolated, run_cells
@@ -85,6 +87,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(admitted, "admitted")),
         Cell("a program loaded from the compilation cache is admitted from its kept communicators",
              in_own(loaded, "loaded")),
+        Cell("a staged commit holds two layers of host-resident moments at once",
+             in_own(staging.a_staged_commit_holds_two_layers_of_host_resident_moments_at_once, "staged")),
         # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
         Cell("the attention forms a run names reach its step",
              in_own(option_witness.the_attention_forms_a_run_names_reach_its_step, "forms"),

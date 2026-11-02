@@ -945,15 +945,15 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None,
+    def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,
                    sampled: bool = False):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
-        state's fields `fetch` brings to the device only once its gradient is ready, and, `sampled`,
-        summarizes what the run inspects at its commit; or a custom step with no invented commit
-        telemetry, which reads it whole."""
+        state's fields `resting` places in host memory to the device only once its gradient is ready, a
+        chunk at a time (`Transaction.past`), and, `sampled`, summarizes what the run inspects at its
+        commit; or a custom step with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record, fetch=fetch, examples=self._examples,
+                               split=split, record=self.record, resting=resting, examples=self._examples,
                                inspection=self.inspection if sampled else None).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
@@ -1219,8 +1219,8 @@ class Trainer(Generic[Loss, Effects]):
         # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
         # from its start.
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
-        body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
-                               if late else None, sampled)
+        body = self._step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
+                               sampled)
         body = body if self.diloco is None else self.diloco.step(body, self.device_mesh, split)
         moving, frozen = apart(shardings)
 

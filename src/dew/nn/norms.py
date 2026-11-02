@@ -6,11 +6,12 @@ input's.
 """
 
 import functools
+import math
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype
 
@@ -208,6 +209,39 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     return x * inverse.astype(x.dtype)
 
 
+@struct.dataclass
+class NormBounds:
+    """Bounds on a norm's derivatives in its input (`dew.nn.protocols.BoundedNorm`), as a curvature bound
+    through the norm reads them (a damped in-context step's, `CausalTransformer.head_bounds`): `gain` the
+    largest |gain| its weight puts on a feature, `epsilon` its own, `group` the width each of its statistics
+    reads.
+
+    The norm is N(a) = g P a / r, r = sqrt(|P a|^2 / w + e) over each group of w features, P the identity
+    (an RMS norm) or the group's centering (a layer norm), a projection. Its Jacobian
+    g (I - P a (P a)^T / (w r^2)) P / r has a factor of norm at most 1, so it is at most |g| / r; its second
+    derivative's four terms are at most 1, 1, 1 and 3 times |g| / (sqrt w r^2), as |P a| / sqrt w <= r. Both
+    are block diagonal over the groups, so the bound is the groups' largest, at their least r."""
+
+    gain: jax.Array
+    epsilon: float = struct.field(pytree_node=False)
+    group: int = struct.field(pytree_node=False)
+
+    def at(self, floor: jax.Array, moved: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Bounds on the norm's Jacobian and second derivative, operator norms, over every input within
+        `moved` (its 2-norm) of an input whose spread (`BoundedNorm.spread`) is at least `floor`: the
+        spread is 1 / sqrt(w)-Lipschitz in the 2-norm, so there it is at least floor - moved / sqrt(w)."""
+        reached = jnp.maximum(floor - moved / math.sqrt(self.group), 0)
+        squared = jnp.square(reached) + self.epsilon
+        return self.gain / jnp.sqrt(squared), 6 * self.gain / (math.sqrt(self.group) * squared)
+
+
+def _centered_spread(x: jax.Array) -> jax.Array:
+    """Per row, the root mean square of `x` less its mean over the last axis, in at least fp32: what a
+    layer norm's statistic reads (`BoundedNorm.spread`)."""
+    wide = x.astype(at_least_fp32(x.dtype))
+    return jnp.sqrt(jnp.mean(jnp.square(wide - jnp.mean(wide, axis=-1, keepdims=True)), axis=-1))
+
+
 class RMSNorm(nn.Module):
     """Normalize the last axis by its root mean square, reducing in fp32 by default.
 
@@ -240,11 +274,20 @@ class RMSNorm(nn.Module):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
         return self.seam(x, axes=axes)[1]
 
-    def largest_gain(self) -> jax.Array:
-        """The largest gain the weight puts on the normalized input, over the features: |w|, or
-        |1 + w| stored as its offset (`scale_offset`); one without a weight. Read from the bound
-        norm, as a curvature bound through it reads it (`CausalTransformer.head_bounds`)."""
-        return _gain_of(self, offset=self.scale_offset)
+    def spread(self, x: jax.Array) -> jax.Array:
+        """Per row, the root mean square each of its statistics reads, the least over its groups, in at
+        least fp32 (`dew.nn.protocols.BoundedNorm`)."""
+        grouped = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], self.groups, -1)
+        return jnp.min(jnp.sqrt(jnp.mean(jnp.square(grouped), axis=-1)), axis=-1)
+
+    def derivative_bounds(self, width: int) -> NormBounds:
+        """Its derivative bounds over `width` features (`NormBounds`), its weight read from the bound norm:
+        |w|, or |1 + w| stored as its offset (`scale_offset`), one without a weight. An activation on the
+        norm adds derivatives these do not bound: refused."""
+        if self.activation is not None:
+            raise ValueError("a curvature bound through an RMS norm reads its derivatives, and this norm "
+                             "applies an activation after it, whose derivatives it does not bound")
+        return NormBounds(_gain_of(self, offset=self.scale_offset), self.epsilon, width // self.groups)
 
     @nn.compact
     def seam(self, x, branch=None, *, axes=None):
@@ -319,15 +362,24 @@ class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_sa
     (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
     and the module's name are flax's, so checkpoints and scopes move both ways."""
 
-    def largest_gain(self) -> jax.Array:
-        """The largest gain the weight puts on the normalized input, |w| over the features, one
-        without a weight (`RMSNorm.largest_gain`)."""
-        return _gain_of(self, offset=False)
+    def spread(self, x: jax.Array) -> jax.Array:
+        """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),
+        over the last axis it reduces; another reduction is refused."""
+        axes = (self.reduction_axes,) if isinstance(self.reduction_axes, int) else tuple(self.reduction_axes)
+        if tuple(axis % x.ndim for axis in axes) != (x.ndim - 1,):
+            raise ValueError("a layer norm's derivative bounds read its statistic over the last axis, and "
+                             f"this one reduces {self.reduction_axes}")
+        return _centered_spread(x)
+
+    def derivative_bounds(self, width: int) -> NormBounds:
+        """Its derivative bounds over `width` features (`NormBounds`), its weight |w| read from the bound
+        norm, one without a weight."""
+        return NormBounds(_gain_of(self, offset=False), self.epsilon, width)
 
 
 def _gain_of(norm: nn.Module, *, offset: bool) -> jax.Array:
     """The largest of `norm`'s weight's gains, |w| or |1 + w| where it stores its offset, one without a
-    weight (`RMSNorm.largest_gain`)."""
+    weight (`NormBounds.gain`)."""
     scale = norm.variables.get("params", {}).get("scale")
     if scale is None:
         return jnp.ones((), jnp.float32)
@@ -353,10 +405,14 @@ class OffsetLayerNorm(nn.Module):
             y = y + self.param("bias", nn.initializers.zeros, (x.shape[-1],), jnp.float32).astype(y.dtype)
         return y
 
-    def largest_gain(self) -> jax.Array:
-        """The largest gain the weight puts on the normalized input, |1 + w| over the features
-        (`RMSNorm.largest_gain`)."""
-        return _gain_of(self, offset=True)
+    def spread(self, x: jax.Array) -> jax.Array:
+        """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`)."""
+        return _centered_spread(x)
+
+    def derivative_bounds(self, width: int) -> NormBounds:
+        """Its derivative bounds over `width` features (`NormBounds`), its weight |1 + w| read from the
+        bound norm."""
+        return NormBounds(_gain_of(self, offset=True), self.epsilon, width)
 
 
 class GroupNorm(nn.Module):
