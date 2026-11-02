@@ -1530,7 +1530,6 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         rows.append(found)
         out.write_text(json.dumps({"rows": rows}))
 
-    code = 0
     # Each file in a pytest process of its own (`alone`), one after another: a file's record is what its own
     # process did, so it keys on the code its tests ran, never a taskmate's collection, tests or caches
     # (2026-11-01, ledger 3220: one process's record pooled every file's, and every row of a train reran).
@@ -1539,16 +1538,15 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             for each in found:
                 published(each)
             continue
-        code = max(code, tested(python, name, part, out.with_name(f"{out.name}.{index}"),
-                                deadline - (time.monotonic() - began), grace, common, started, published,
-                                coverage, whole=whole, release=release, container=container))
+        tested(python, name, part, out.with_name(f"{out.name}.{index}"), deadline - (time.monotonic() - began),
+               grace, common, started, published, coverage, whole=whole, release=release, container=container)
     out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
     if site and site["start"] is not None and any(found["exitCode"] for found in rows):
         return 1
-    return code
+    return 0
 
 
 def selection(tests: list[str], split: str, release: str = "") -> list[str]:
@@ -1626,11 +1624,11 @@ class Container:
 def tested(python: str, name: str, split: str, out: Path, deadline: float, grace: float, common: str,
            environ: Mapping[str, str], published: Callable[[dict], None], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           container: Container | None = None) -> int:
+           container: Container | None = None) -> None:
     """Test file `name` (in `split`'s group) run in a pytest process of its own (`alone`) under `environ`
     beside this process's, within `deadline` seconds (none left: red as its deadline cut it off, `file_row`),
     its row handed to `published` before its record goes to the cache, which can be slow (review: a slow
-    cache withheld the finished rows), and its exit returned. With `network`, the network-marked tests alone,
+    cache withheld the finished rows): the row carries its red, and the task's exit stays its own. With `network`, the network-marked tests alone,
     with the Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's.
     Its scratch logs are kept beside `out`.
 
@@ -1657,7 +1655,6 @@ def tested(python: str, name: str, split: str, out: Path, deadline: float, grace
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone.
         record(python, [found], alone_.log, common, network, alone_.opened, before)
-    return found["exitCode"] and 1
 
 
 def looked_up(python: str, tests: list[str], group: str, common: str,
