@@ -18,7 +18,7 @@ alone (`Split.carry`, `Split.emit`). The association reorders rounding.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -275,13 +275,36 @@ def _reads(term: Term, reading: set[int]) -> bool:
 
 
 def _free(form: Term, reading: set[int]) -> list[Term]:
-    """`form`'s largest terms that read none of the `reading` leaves, but its literals."""
-    if not _reads(form, reading):
-        return [] if get_callable_args(form, Term.literal) is not None else [form]
-    found = []
-    for constructor in terms.LANGUAGE:
-        if (args := get_callable_args(form, constructor)) is not None:
-            for arg in args:
-                if isinstance(arg, Term):
-                    found += _free(arg, reading)
-    return found
+    """`form`'s largest terms that read none of the `reading` leaves, but its literals, in its order: each
+    distinct term walked once, whether it reads them its operands' (a token loop's terms share their
+    subterms, and walking every path of them anew held an A10's chunk form past fifteen minutes)."""
+    operands: dict[Hashable, list[Term]] = {}
+    reads: dict[Hashable, bool] = {}
+    pending: list[tuple[Term, bool]] = [(form, False)]
+    while pending:
+        term, ready = pending.pop()
+        named = terms.key(term)
+        if ready:
+            leaf = get_callable_args(term, Term.leaf)
+            reads[named] = (leaf is not None and int(get_literal_value(leaf[0])) in reading) or any(
+                reads[terms.key(operand)] for operand in operands[named])
+            continue
+        if named in operands:
+            continue
+        operands[named] = [arg for constructor in terms.LANGUAGE
+                           if (args := get_callable_args(term, constructor)) is not None
+                           for arg in args if isinstance(arg, Term)]
+        pending.append((term, True))
+        pending.extend((operand, False) for operand in operands[named])
+    found: dict[Hashable, Term] = {}
+    walked, below = set(), [form]
+    while below:
+        term = below.pop()
+        if (named := terms.key(term)) in walked:
+            continue
+        walked.add(named)
+        if reads[named]:
+            below.extend(reversed(operands[named]))
+        elif get_callable_args(term, Term.literal) is None:
+            found.setdefault(named, term)
+    return list(found.values())
