@@ -49,7 +49,7 @@ TOKENWISE = "token-wise"
 `torchax_fallback.functional_experts`; `attested`), whose outputs at a token read that token's inputs
 alone."""
 
-_ATTESTED: weakref.WeakKeyDictionary[core.ClosedJaxpr, str] = weakref.WeakKeyDictionary()
+_ATTESTED: weakref.WeakKeyDictionary[core.Jaxpr, str] = weakref.WeakKeyDictionary()
 """Each program Dew's own code bound under a rule (`attested`), by that rule: the walk reads a call by
 its rule where the call's program is one of these objects, as the program alone identifies what it
 computes; a name any program may take."""
@@ -61,7 +61,7 @@ def attested[**P, R](function: Callable[P, R], rule: str) -> Callable[P, R]:
     recorded as `rule`'s, so a walk of the enclosing program reads that call by the rule."""
     assert rule in (CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE), rule
 
-    def record(program: core.ClosedJaxpr) -> None:
+    def record(program: core.Jaxpr) -> None:
         _ATTESTED[program] = rule
 
     return nested(function, traced=record)
@@ -92,7 +92,7 @@ type Held = Reads | None
 """What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
 
-def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int,
+def causality_refusal(closed: core.Jaxpr, tokens: int, length: int,
                       positional: Sequence[int]) -> str | None:
     """Why the program `closed` is not provably causal at `length` tokens (its input `tokens`, `[B, S]`,
     the sequence on axis 1), or None where each of its `positional` outputs (by index, each holding its
@@ -137,10 +137,9 @@ def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
     found = []
     for value in eqn.params.values():
         for program in value if isinstance(value, tuple | list) else (value,):
-            if isinstance(program, core.ClosedJaxpr):
+            if isinstance(program, core.Jaxpr):
+                # A program holds its constants beside it on JAX 0.12, its `jaxpr` the program itself.
                 found.append(program.jaxpr)
-            elif isinstance(program, core.Jaxpr):
-                found.append(program)
     return found
 
 
@@ -261,7 +260,7 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     that rule, any other walked inside."""
     program = eqn.params.get("jaxpr")
     rule = (_ATTESTED.get(program) if eqn.primitive.name in ("jit", "pjit")
-            and isinstance(program, core.ClosedJaxpr) else None)
+            and isinstance(program, core.Jaxpr) else None)
     if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
         return _attended(eqn, given, causal=rule == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
     if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
@@ -274,7 +273,7 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     inner = next(iter(_programs(eqn)), None)
     if inner is None:
         return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)
-    closed = next((value for value in eqn.params.values() if isinstance(value, core.ClosedJaxpr)), None)
+    closed = next((value for value in eqn.params.values() if isinstance(value, core.Jaxpr)), None)
     consts = [] if closed is None else [np.asarray(const) if _small_integer(const) else None
                                         for const in closed.consts]
     return walk.run(inner, given, operands, consts)
