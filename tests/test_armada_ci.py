@@ -1050,9 +1050,9 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     the file's record and the split plugin its collected tests alike, the marked tests one weight at
     the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
-    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the plan,
-    reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record to
-    share its fixture). A mark written
+    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
+    plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
+    to share its fixture). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
