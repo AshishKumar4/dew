@@ -135,8 +135,9 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
         logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
         fragments = _products(family, dtype, (rows, width, block, logits, False, True),
                               (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
-        # Its keys' magnitudes read from the value tile beside the logits (`Family.key_magnitudes`).
-        magnitudes = [logits[0], (columns, block, jnp.float32)]
+        # Its keys' magnitudes read from the value tile beside the logits (`Family.key_magnitudes`), in the
+        # values' dtype.
+        magnitudes = [logits[0], (columns, block, dtype)]
         live = resources.live_registers(family, carried, logits + sums, magnitudes, *fragments)
         return live <= family.registers(candidate.consumers)
 

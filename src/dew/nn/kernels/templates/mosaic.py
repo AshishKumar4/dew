@@ -1235,9 +1235,10 @@ class Issuer[Accumulator](abc.ABC):
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
         so the vector is in a column's layout (`column`, a logits tile's keys'), as `algebra.room` reads
-        it; no pass over the values outside the launch."""
+        it; no pass over the values outside the launch. In the values' own dtype until the reduction is
+        done (a magnitude's maximum is exact in any), so the tile holds half an fp32 tile's registers."""
         values = plgpu.load(tile.transpose((1, 0)), layout=self.layout, optimized=False)
-        return jnp.max(jnp.abs(values.astype(jnp.float32)), axis=0)
+        return jnp.max(jnp.abs(values), axis=0).astype(jnp.float32)
 
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
