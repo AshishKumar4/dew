@@ -49,3 +49,26 @@ def test_a_map_task_draws_and_a_judge_does_not(monkeypatch, tmp_path):
     monkeypatch.delenv(DRAWS)
     monkeypatch.setenv(POOL, str(tmp_path))
     assert not drawing()
+
+
+def test_a_map_task_records_how_long_it_took_to_reach_its_units_and_to_draw_them(monkeypatch, tmp_path):
+    """Beside its record, a map task writes the seconds from its process's start to its units' first (its
+    fixed cost: imports, collection, the site's setup and compiles) and those its units took, so a run's map
+    tasks say what of each was paid before any draw (Main, 2026-11-02: measure before cutting it)."""
+    import json
+    import time
+
+    monkeypatch.setenv(DRAWS, "0:2")
+    monkeypatch.setenv(RECORDS, str(tmp_path))
+
+    def slow(first, last):
+        time.sleep(0.3)
+        return list(range(first, last))
+
+    assert record_units("timed", slow)
+    [seconds] = [json.loads(path.read_text()) for path in tmp_path.glob("*.seconds.json")]
+    assert seconds["start"] == 0 and seconds["stop"] == 2
+    assert seconds["draws"] >= 0.3 and 0 < seconds["before"] < time.time()
+    monkeypatch.delenv(DRAWS)
+    monkeypatch.setenv(POOL, str(tmp_path))
+    assert [payload for _, _, payload in pooled_units("timed", 2)] == [[0, 1]]
