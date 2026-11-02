@@ -1314,12 +1314,12 @@ class CausalTransformer(LinearProducts):
             raise ValueError("this model has no continuum level")
         return chain_states(self.continuum_level, hidden, index)
 
-    def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0):
+    def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0, passed: bool = False):
         """What bounds a damped step of continuum level `index`'s `parts` at its states `hidden`
         (`Continuum.step_terms`), its maps' inputs as a checkpoint's quantizers round them."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return level_of(self.continuum_level, index).step_terms(hidden, parts, self._quantizer)
+        return level_of(self.continuum_level, index).step_terms(hidden, parts, self._quantizer, passed)
 
     def head_logits(self, x):
         """The fp32 head over states past the continuum levels (`continuum_states`), or final states."""

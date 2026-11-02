@@ -91,15 +91,16 @@ class Continuum(LinearProducts):
         """The level's output map, U, zero at its start: the feed-forward's `down_proj`, stored as `up`."""
         return self.mlp.down_proj
 
-    def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
-                   ) -> tuple[jax.Array, jax.Array, jax.Array, float, float, float]:
+    def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers, passed: bool = False
+                   ) -> LevelTerms:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
-        (`dew.objectives.lm.adaptation._damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
-        `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
-        for none), the Frobenius norm of the kernel `up` holds (`applied_kernel`, an adapter's update on it
-        included), at least its spectral norm, in at least fp32, and how much its product's rounding can grow
-        any kernel's norm (1 unrounded); and the activation's bounds p1, p2 on |act'| and |act''|
-        (`_SLOPES`).
+        (`dew.objectives.lm.adaptation`, `LevelTerms`): each state's |x|^2 and |f|^2, x and f = act(down(x))
+        as `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
+        for none), the Frobenius norms of the kernels `up` and `down` hold (`applied_kernel`, an adapter's
+        update on each included), at least their spectral norms, in at least fp32, and how much each
+        product's rounding can grow its kernel's norm (1 unrounded); and the activation's bounds p1, p2 on
+        |act'| and |act''| (`_SLOPES`). A level a stepped one's states pass through after it (`passed`) is
+        read for its Jacobian and second derivative in its input alone, `parts` empty.
 
         Where Qwix's quantization rounds a map's operands (`rounding_growth`), each norm here is the most its
         rounding grows it to, and a step follows Qwix's straight-through gradient: the bound holds for the
@@ -108,8 +109,15 @@ class Continuum(LinearProducts):
         as a linear map (`intercepted_nonlinear`: an adapter's dropout, a frozen FP8 product, a
         checkpoint's quantizer of its input, apart from the quantizer `quantizer` reads) is refused, as is
         one through an activation whose act'' no number bounds (ReLU's, a point mass at zero). A quantizer
-        of `down`'s input rounds the states, which no step moves."""
+        of `down`'s input rounds the states, which no step moves. A level `passed` through after a stepped
+        one bounds the curvature it adds through its maps' derivatives in its input, which a map a method
+        interceptor rounds, or an activation whose act'' no number bounds, makes unbounded: refused."""
         p1, p2 = _SLOPES[activation(self.level.activation)]
+        if passed and (p2 is None or any(intercepted_nonlinear(self, name) for name in ("down", "up"))):
+            raise ValueError("a damped step of a chain's level bounds its loss's curvature through the "
+                             "levels after it, and this one rounds a map's input through an interceptor or "
+                             "has an activation whose second derivative no number bounds (ReLU's), so its "
+                             "states' curvature is unbounded: step the chain undamped")
         if "down" in parts and p2 is None:
             raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                              "activation's second derivative, which a ReLU has none of (a point mass at "
@@ -122,7 +130,7 @@ class Continuum(LinearProducts):
                              "curvature bounds: select=('up',), or step it undamped")
         # Each map's operands as Qwix's rounding can grow them: its input's, then its kernel's.
         operands = self.dtype or x.dtype
-        down_input, _ = rounding_growth(self, "down", self.features, operands)
+        down_input, down_kernel = rounding_growth(self, "down", self.features, operands)
         up_input, up_kernel = rounding_growth(self, "up", self.level.hidden, operands)
 
         def read(value: jax.Array, layer: nn.Module) -> jax.Array:
@@ -130,10 +138,37 @@ class Continuum(LinearProducts):
             return (value if rounding is None else rounding.qdq(value)).astype(at_least_fp32(x.dtype))
 
         fed = up_input * read(activation(self.level.activation)(self.down(x)), self.up)
-        kernel = self.applied_kernel("up").astype(at_least_fp32(x.dtype))
-        return (jnp.sum(jnp.square(down_input * read(x, self.down)), axis=-1),
-                jnp.sum(jnp.square(fed), axis=-1), jnp.sqrt(jnp.sum(jnp.square(kernel))), up_kernel, p1,
-                p2 or 0.0)
+        return LevelTerms(jnp.sum(jnp.square(down_input * read(x, self.down)), axis=-1),
+                          jnp.sum(jnp.square(fed), axis=-1), _squared_norm(self.applied_kernel("up")) ** 0.5,
+                          _squared_norm(self.applied_kernel("down")) ** 0.5, up_kernel, down_kernel, p1,
+                          p2 or 0.0)
+
+
+@struct.dataclass
+class LevelTerms:
+    """What bounds a damped step through a level (`Continuum.step_terms`): each state's |x|^2 (`squares`)
+    and |f|^2 (`inputs`) as the level's maps multiply them, the Frobenius norms of the kernels `up` and
+    `down` hold, at least the spectral (`up`, `down`), how much their products' rounding can grow each
+    (`up_growth`, `down_growth`), and the activation's bounds p1, p2 on |act'| and |act''|. Through the
+    level y = x + U act(D x), its Jacobian in x is at most `jacobian()` and its second derivative
+    `bend()`."""
+
+    squares: jax.Array
+    inputs: jax.Array
+    up: jax.Array
+    down: jax.Array
+    up_growth: float = struct.field(pytree_node=False)
+    down_growth: float = struct.field(pytree_node=False)
+    p1: float = struct.field(pytree_node=False)
+    p2: float = struct.field(pytree_node=False)
+
+    def jacobian(self) -> jax.Array:
+        """1 + |U| p1 |D|, each kernel as its rounding can grow it."""
+        return 1 + self.up_growth * self.up * self.p1 * self.down_growth * self.down
+
+    def bend(self) -> jax.Array:
+        """|U| p2 |D|^2, each kernel as its rounding can grow it."""
+        return self.up_growth * self.up * self.p2 * jnp.square(self.down_growth * self.down)
 
 
 Levels = ContinuumLevel | tuple[ContinuumLevel, ...]
