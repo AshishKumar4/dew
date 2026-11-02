@@ -763,7 +763,10 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
-        options = self.required if self.xla_defaults else self.options(candidate)
+        # The compile-only policy (`deviceless_options`) is the search's, on the step's options as on
+        # `required`.
+        options = (self.required if self.xla_defaults
+                   else deviceless_options(self.mesh, self.options(candidate)))
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
         if ahead is not None:

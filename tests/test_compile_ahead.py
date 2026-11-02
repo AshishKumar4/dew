@@ -80,7 +80,9 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
-    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan."""
+    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. Its
+    step's options are its towers' own, so no probe compiles the half rung under XLA's defaults: the search
+    applies the compile-only policy (`deviceless_options`) to both alike (row 3506)."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
@@ -97,6 +99,7 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
              for entry in (plan, *frontier)]
     assert len(set(rungs)) == len(rungs)
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+    assert not any(probe["xla_defaults"] for probe in probes)
 
 
 def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):

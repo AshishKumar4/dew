@@ -165,7 +165,6 @@ from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
-    deviceless_options,
     first_run,
     head_tile_of,
     local_devices,
@@ -1080,8 +1079,8 @@ class Trainer(Generic[Loss, Effects]):
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
         search = FitSearch(
-            lower, lambda candidate: deviceless_options(mesh, step_options(
-                self.objective, candidate.micro, candidate.prepared.variables, mesh)),
+            lower, lambda candidate: step_options(
+                self.objective, candidate.micro, candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
