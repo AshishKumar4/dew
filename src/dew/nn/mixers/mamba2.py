@@ -169,7 +169,7 @@ class MambaRMSNormGated(nn.Module):
         weight, rounded = ((scale.astype(wide), None) if self.scale_wide
                            else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
         y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
-                         rounded=rounded).reshape(x.shape)
+                         rounded=rounded).reshape(y.shape)
         if self.gate_after:
             y = y.astype(wide) * nn.silu(gate.astype(wide))
         return y.astype(dtype)
