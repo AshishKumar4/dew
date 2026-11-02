@@ -34,6 +34,7 @@ from dew.rl.flight import (
     commanded,
     corners,
     developed,
+    drawn_camera,
     drawn_course,
     nearest,
     physics,
@@ -357,6 +358,21 @@ def test_commands_carry_each_drones_throttle_rates_and_latency():
         roundings = chain_roundings(jax.make_jaxpr(step)(race, jnp.asarray(actions[0])))
         assert_computes_the_oracle(np.stack(sent), expected, "the commands", roundings=roundings)
     assert set(np.unique(kept.delay)) == set(range(RACING.delays[0], RACING.delays[1] + 1))
+
+
+def test_a_curriculum_varies_the_scenes_looks_for_its_share_of_episodes():
+    """Each of the scene's looks is drawn for a ramp's share of episodes and is the first otherwise: none at
+    no randomization, every one at full, and at a curriculum's first tenth some but far from half, each
+    drawn look the one full randomization draws from the same key."""
+    keys = jax.random.split(jax.random.key(4), 512)
+    def looks_at(ramp):
+        return np.asarray(jax.vmap(lambda key: drawn_camera(RACING, key, jnp.asarray(ramp)).look)(keys))
+
+    looks = {ramp: looks_at(ramp) for ramp in (0.0, 0.1, 1.0)}
+    drawn = looks[0.1] != 0
+    assert not looks[0.0].any() and (looks[1.0] != 0).mean() > 0.99
+    assert 0 < drawn.mean() < 0.5
+    np.testing.assert_array_equal(looks[0.1][drawn], looks[1.0][drawn])
 
 
 def test_a_camera_is_hyperdrones_of_its_mounted_frame():
