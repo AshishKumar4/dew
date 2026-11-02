@@ -9,13 +9,19 @@ reads the level through its own state alone, so a window's gradient is the sum o
 equation 71's per-token term exactly. `U` starts at zero, so a model gains the level as the identity:
 its logits are the model's without it. The objective that steps it in context is
 `dew.objectives.lm.adaptation`; a plain one trains the level as any other parameters.
+
+Several levels make a chain (`continuum_chain`), the section's sequential continuum memory system,
+equation 70: y = MLP^(k)(... MLP^(1)(x)), each level read on the one before it and stepped at its own
+window and rate (`ChunkAdaptation.window`, `rate`), its start trained by the outer loss as every
+level's is (equation 73). Level `i` of a chain lives in its own scope, `continuum_{i}/continuum`
+(`ContinuumLink`).
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import flax.linen as nn
 import jax
@@ -126,6 +132,75 @@ class Continuum(LinearProducts):
         return (jnp.sum(jnp.square(down_input * read(x, self.down)), axis=-1),
                 jnp.sum(jnp.square(fed), axis=-1), jnp.sqrt(jnp.sum(jnp.square(kernel))), up_kernel, p1,
                 p2 or 0.0)
+
+
+Levels = ContinuumLevel | tuple[ContinuumLevel, ...]
+"""A model's continuum: one level, or a chain of them in the order they read the states."""
+
+
+def continuum_chain(continuum: Levels) -> tuple[ContinuumLevel, ...]:
+    """The levels of a model's `continuum`, in the order they read the states."""
+    return continuum if isinstance(continuum, tuple) else (continuum,)
+
+
+class ContinuumLink(nn.Module):
+    """Level `index` of a chain (`continuum_chain`) in a scope of its own, `continuum_{index}`: its
+    `Continuum`, named `continuum` there, so its maps take the level's declared axes."""
+
+    level: ContinuumLevel
+    features: int
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    def setup(self):
+        self.continuum = Continuum(self.level, self.features, dtype=self.dtype, precision=self.precision)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.continuum(x)
+
+
+def continuum_modules(continuum: Levels, features: int, dtype: Dtype | None, precision: PrecisionLike):
+    """The modules of a model's `continuum` (built in its `setup`): one level's `Continuum`, named
+    `continuum`, or a chain's `ContinuumLink`s, `continuum_0` on."""
+    if isinstance(continuum, ContinuumLevel):
+        return Continuum(continuum, features, dtype=dtype, precision=precision, name="continuum")
+    return tuple(ContinuumLink(level, features, dtype=dtype, precision=precision, name=f"continuum_{index}")
+                 for index, level in enumerate(continuum))
+
+
+def level_of(modules, index: int) -> Continuum:
+    """Level `index`'s `Continuum` among a model's continuum modules (`continuum_modules`)."""
+    if isinstance(modules, Continuum):
+        if index:
+            raise ValueError(f"this model has one continuum level, not a level {index}")
+        return modules
+    return modules[index].continuum
+
+
+def chain_states(modules, x: jax.Array, index: int | None = None) -> jax.Array:
+    """States `x` past every level of a model's continuum (`continuum_modules`) in turn, or past level
+    `index` alone."""
+    if index is not None:
+        return level_of(modules, index)(x)
+    for module in modules if isinstance(modules, tuple) else (modules,):
+        x = module(x)
+    return x
+
+
+def level_parameters(continuum: Levels, params: Mapping):
+    """A model's continuum levels' parameters in its `params`: one level's tree, or a chain's trees in
+    order (`ContinuumLink`)."""
+    if isinstance(continuum, ContinuumLevel):
+        return params["continuum"]
+    return tuple(params[f"continuum_{index}"]["continuum"] for index in range(len(continuum)))
+
+
+def with_level_parameters(continuum: Levels, params: Mapping, levels) -> dict:
+    """`params` holding `levels` as a model's continuum levels' parameters (`level_parameters`)."""
+    if isinstance(continuum, ContinuumLevel):
+        return {**params, "continuum": levels}
+    return {**params, **{f"continuum_{index}": {**params[f"continuum_{index}"], "continuum": level}
+                         for index, level in enumerate(levels)}}
 
 
 @struct.dataclass

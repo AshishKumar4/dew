@@ -49,7 +49,19 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel, HeadTerms, HeadTransform, _head_growth, _squared_norm
+from dew.nn.continuum import (
+    HeadTerms,
+    HeadTransform,
+    Levels,
+    _head_growth,
+    _squared_norm,
+    chain_states,
+    continuum_chain,
+    continuum_modules,
+    level_of,
+    level_parameters,
+    with_level_parameters,
+)
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.quantization import LinearProducts
@@ -381,11 +393,11 @@ class CausalTransformer(LinearProducts):
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
     mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
-    continuum: ContinuumLevel | None = None
-    """A continuum level on the final states before the head (`dew.nn.continuum`): parameters an
-    objective steps in context by its own loss (`LMObjective(adaptation=...)`), every head that
-    reads the states, `__call__`'s and each prediction depth's, reading the level first. It starts
-    as the identity. None gives the plain head."""
+    continuum: Levels | None = None
+    """A continuum level on the final states before the head, or a chain of them (`dew.nn.continuum`):
+    parameters an objective steps in context by its own loss (`LMObjective(adaptation=...)`), every head
+    that reads the states, `__call__`'s and each prediction depth's, reading the levels first. It
+    starts as the identity. None gives the plain head."""
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width; needs sharing
     causal: bool = True
     """Whether attention is causal. False gives full attention, the encoder that
@@ -774,9 +786,9 @@ class CausalTransformer(LinearProducts):
             sites['lm_head'] = (self.embedding_features or self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             sites['head_dense'] = (self.emb_features, self.emb_features)
-        if self.continuum is not None:
-            sites['continuum_down'] = (self.emb_features, self.continuum.hidden)
-            sites['continuum_up'] = (self.continuum.hidden, self.emb_features)
+        for index, level in enumerate(() if self.continuum is None else continuum_chain(self.continuum)):
+            sites[f'continuum_{index}_down'] = (self.emb_features, level.hidden)
+            sites[f'continuum_{index}_up'] = (level.hidden, self.emb_features)
         return sites
 
     @nn.nowrap
@@ -919,8 +931,8 @@ class CausalTransformer(LinearProducts):
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
-            self.continuum_level = Continuum(self.continuum, self.emb_features, dtype=self.dtype,
-                                             precision=self.precision, name='continuum')
+            self.continuum_level = continuum_modules(self.continuum, self.emb_features, self.dtype,
+                                                     self.precision)
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -1237,12 +1249,17 @@ class CausalTransformer(LinearProducts):
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with, the continuum
         level first where the model has one."""
-        return self.head_logits(x if self.continuum is None else self.continuum_level(x))
+        return self.head_logits(x if self.continuum is None else chain_states(self.continuum_level, x))
 
     @property
     def in_context(self) -> bool:
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
+
+    @property
+    def in_context_levels(self) -> int:
+        """The continuum levels the model holds, a chain's count (`SteppedInContext`)."""
+        return 0 if self.continuum is None else len(continuum_chain(self.continuum))
 
     def head_bounds(self, states) -> HeadTerms:
         """What bounds the curvature and the slope of a slot's cross entropy in the `states` `head_logits`
@@ -1277,26 +1294,27 @@ class CausalTransformer(LinearProducts):
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
-        return None if self.continuum is None else variables["params"]["continuum"]
+        return None if self.continuum is None else level_parameters(self.continuum, variables["params"])
 
     @nn.nowrap
     def with_in_context_level(self, variables, level):
         """`variables` holding `level` as the continuum level's parameters (`SteppedInContext`)."""
-        return {**variables, "params": {**variables["params"], "continuum": level}}
+        return {**variables, "params": with_level_parameters(self.continuum, variables["params"], level)}
 
-    def continuum_states(self, hidden):
-        """Final states `hidden` past the continuum level, the states its head reads (`head_logits`):
-        an objective that steps the level in context reads it with its own parameters here."""
+    def continuum_states(self, hidden, index: int | None = None):
+        """Final states `hidden` past the continuum levels, the states its head reads (`head_logits`), or
+        states past level `index` alone (`chain_states`): an objective that steps the levels in context
+        reads them with their own parameters here."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level(hidden)
+        return chain_states(self.continuum_level, hidden, index)
 
-    def level_terms(self, hidden, parts: tuple[str, ...]):
-        """What bounds a damped step of the continuum level's `parts` at final states `hidden`, its maps'
-        inputs as a checkpoint's quantizers round them (`Continuum.step_terms`, `SteppedInContext`)."""
+    def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0):
+        """What bounds a damped step of continuum level `index`'s `parts` at the states `hidden` it reads,
+        its maps' inputs as a checkpoint's quantizers round them (`Continuum.step_terms`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level.step_terms(hidden, parts, self._quantizer)
+        return level_of(self.continuum_level, index).step_terms(hidden, parts, self._quantizer)
 
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a

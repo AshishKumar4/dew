@@ -560,7 +560,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
         """`variables` with the router counts `balance` took applied, once per committed update, and what
         a run that carries its continuum level carries on (`_carried_update`)."""
-        if not self._carries:
+        if CARRIED not in effects:
             return apply_routed(self.balance, variables, effects)
         routed = effects.get(_ROUTED)
         return {CARRIED: _carried_update(variables[CARRIED], effects[CARRIED]),
@@ -1533,9 +1533,9 @@ class LMObjective(TokenScorer):
             statistics, effects, metrics = balance.compose(
                 params, prediction, routing or {}, batch, queries, prepared.token_fields)
             reported.update(metrics)
-        if self._carries:
-            # What a carried level moved, beside the router counts, which an update sums and carries on.
-            assert scores.moved is not None, "a carried level's scores hold how far it moved"
+        if scores.moved is not None:
+            # What a carried level moved (a run that carries it, `Adapted.moved`), beside the router counts,
+            # which an update sums and carries on.
             effects = {CARRIED: scores.moved, **({} if effects is None else {_ROUTED: effects})}
         if step.qk_stats:
             peak = _global_qk_max(qk)

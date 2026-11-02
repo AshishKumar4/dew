@@ -288,9 +288,11 @@ class ReadsClips(Protocol):
 class SteppedInContext(Protocol):
     """A model whose head reads parameters an objective steps in context, a window at a time
     (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
-    variables, None without a level; the tree with others in their place; and the two halves of the
-    head the steps run between, the level on final states (`continuum_states`) and the head past it
-    (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
+    variables, None without a level (a chain's levels' trees in order, `dew.nn.continuum`); the tree
+    with others in their place; and the two halves of the head the steps run between, the levels on
+    final states (`continuum_states`, each level alone by its index) and the head past them
+    (`head_logits`). Its owner keeps the levels' place in its tree, so an objective never reads it;
+    `in_context_levels` counts them.
     `in_context` says whether the model holds a level, and what a damped step's rate reads
     (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model at the states `head_logits`
     reads, what bounds the curvature and slope of a slot's loss in them (`HeadTerms`); `level_terms`, for
@@ -300,16 +302,19 @@ class SteppedInContext(Protocol):
     @property
     def in_context(self) -> bool: ...
 
+    @property
+    def in_context_levels(self) -> int: ...
+
     def head_bounds(self, states: jax.Array) -> HeadTerms: ...
 
-    def level_terms(self, states: jax.Array, parts: tuple[str, ...]
+    def level_terms(self, states: jax.Array, parts: tuple[str, ...], index: int = 0
                     ) -> tuple[jax.Array, jax.Array, jax.Array, float, float, float]: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
     def with_in_context_level(self, variables: VariableDict, level: VariableDict) -> VariableDict: ...
 
-    def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
+    def continuum_states(self, hidden: jax.Array, index: int | None = None) -> jax.Array: ...
 
     def head_logits(self, states: jax.Array) -> jax.Array: ...
 

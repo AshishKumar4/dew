@@ -111,8 +111,8 @@ def logits_flops(decoder: CausalTransformer, lengths) -> float:
     projections = decoder.projections()
     tied = (decoder.embedding_features or decoder.emb_features, decoder.vocab_size)
     count = projection_flops(lengths, *projections.get('lm_head', tied))
-    for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
-        if site in projections:
+    for site in projections:
+        if site in ('head_dense', 'project_out') or site.startswith('continuum_'):
             count += projection_flops(lengths, *projections[site])
     if decoder.head_transform is not None:
         count += gate_flops(decoder.norms, ('head_norm',), projections['head_dense'][1], lengths, routed=None)

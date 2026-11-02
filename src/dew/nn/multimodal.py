@@ -528,6 +528,11 @@ class MultimodalTransformer(DecoderWrapper):
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
 
+    @property
+    def in_context_levels(self) -> int:
+        """The decoder's continuum levels (`SteppedInContext`)."""
+        return self.language_model.in_context_levels
+
     def head_bounds(self, states):
         """What bounds the decoder's head's curvature and slope past its level at `states`
         (`SteppedInContext`)."""
@@ -545,14 +550,15 @@ class MultimodalTransformer(DecoderWrapper):
         held = self.language_model.with_in_context_level({"params": variables["params"][self.wraps]}, level)
         return {**variables, "params": {**variables["params"], self.wraps: held["params"]}}
 
-    def continuum_states(self, hidden):
-        """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
-        return self.language_model.continuum_states(hidden)
-
-    def level_terms(self, hidden, parts: tuple[str, ...]):
-        """What bounds a damped step of the decoder's level's `parts` at its final states
+    def continuum_states(self, hidden, index: int | None = None):
+        """The decoder's final states `hidden` past its continuum levels, or past level `index` alone
         (`SteppedInContext`)."""
-        return self.language_model.level_terms(hidden, parts)
+        return self.language_model.continuum_states(hidden, index)
+
+    def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0):
+        """What bounds a damped step of the decoder's level `index`'s `parts` at the states it reads
+        (`SteppedInContext`)."""
+        return self.language_model.level_terms(hidden, parts, index)
 
     def head_logits(self, states):
         """The decoder's head over states its continuum level already read (`SteppedInContext`)."""

@@ -34,6 +34,8 @@ parameters. The next update's rows start from the trained level plus what is car
 from __future__ import annotations
 
 import dataclasses
+import functools
+import itertools
 import math
 from collections.abc import Mapping
 
@@ -55,7 +57,9 @@ class ChunkAdaptation:
     `window` is equation 71's `C`, the tokens of a document between two steps; `rate` is its `eta`,
     each token's gradient weighted by it and by its target's weight, summed over the window, not
     averaged; `select` names the level's parts that step (`down`, `up`), every part where empty, the
-    others held at their trained values.
+    others held at their trained values. A chain of levels (`dew.nn.continuum`, section 7.1's
+    multi-frequency memory) takes one window and rate a level, in its order, or one for every level:
+    its windows, ordered, each divide the next, so a slower level's boundaries fall on a faster one's.
 
     `damped` steps the selected parts' kernels alone (`up`'s, `down`'s, or both, every part where
     `select` is empty; an adapter's factors on them hold) at a rate d with d <= rate / (1 + rate L(d)),
@@ -89,20 +93,44 @@ class ChunkAdaptation:
     Nested Learning's continuum memory kept across documents and steps.
     """
 
-    window: int = 16
-    rate: float = 0.01
+    window: int | tuple[int, ...] = 16
+    rate: float | tuple[float, ...] = 0.01
     select: tuple[str, ...] = ()
     damped: bool = False
     carry: str = "document"
 
     def __post_init__(self):
-        if self.window < 1:
+        windows = self.window if isinstance(self.window, tuple) else (self.window,)
+        rates = self.rate if isinstance(self.rate, tuple) else (self.rate,)
+        if any(window < 1 for window in windows):
             raise ValueError(f"a window holds at least one token, not {self.window}")
-        if not math.isfinite(self.rate) or self.rate < 0:
+        if any(not math.isfinite(rate) or rate < 0 for rate in rates):
             raise ValueError(f"a window's step takes a finite rate of at least zero, not {self.rate}")
+        ordered = sorted(windows)
+        if any(slower % faster for faster, slower in itertools.pairwise(ordered)):
+            raise ValueError(f"a chain's windows, ordered, each divide the next, so a slower level steps on "
+                             f"a faster one's boundary: not {self.window}")
         if self.carry not in ("document", "run"):
             raise ValueError(f"a level carries across a 'document' or a 'run', not {self.carry!r}")
         object.__setattr__(self, "select", tuple(self.select))
+
+    def windows(self, levels: int) -> tuple[int, ...]:
+        """Each of `levels` levels' window, a chain's in its order: `window`'s own, or one for all."""
+        return _each(self.window, levels, "window")
+
+    def rates(self, levels: int) -> tuple[float, ...]:
+        """Each of `levels` levels' rate, a chain's in its order: `rate`'s own, or one for all."""
+        return _each(self.rate, levels, "rate")
+
+
+def _each(value, levels: int, name: str) -> tuple:
+    """`value`, one for each of `levels` levels or one for all, as a tuple a level (`ChunkAdaptation`)."""
+    if not isinstance(value, tuple):
+        return (value,) * levels
+    if len(value) != levels:
+        raise ValueError(f"this model's continuum holds {levels} levels, and the adaptation names a {name} "
+                         f"for {len(value)}: one a level, or one for all")
+    return value
 
 
 CARRIED = "carried"
@@ -179,13 +207,20 @@ def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[
     belongs to, numbered from 1 along the row (a padding slot the run before it, 0 before any), and
     its window within the run, its document rank over `window` (`document_starts`,
     `document_ranks`, the row's readers' own; -1 before any)."""
+    runs, ranks = _run_ranks(valid, documents, rows, length)
+    return runs, jnp.where(runs > 0, ranks // window, -1)
+
+
+def _run_ranks(valid, documents, rows: int, length: int) -> tuple[jax.Array, jax.Array]:
+    """Each slot's run of its document's real tokens, numbered from 1 along the row (`window_keys`), and
+    its rank within its document (`document_ranks`)."""
     real = jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool)
     documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
                  else jnp.asarray(documents, jnp.int32))
     starts = document_starts(documents, real)
     # A row's first real token opens its first run, which `document_starts` leaves to what precedes.
     runs = prefix_sum(starts | (real & (prefix_sum(real, dtype=jnp.int32) == 1)), dtype=jnp.int32)
-    return jnp.asarray(runs), jnp.where(runs > 0, document_ranks(real, starts) // window, -1)
+    return jnp.asarray(runs), jnp.asarray(document_ranks(real, starts))
 
 
 def _distance(leaf: jax.Array, start: jax.Array) -> jax.Array:
@@ -284,7 +319,7 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
     head, norm, growth, p1, p2 = bounds
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(_TERMS))
     least, fed, longest = (sums[:, index] for index in range(_TERMS, _TERMS + 3))
-    rate = adaptation.rate
+    rate = adaptation.rates(1)[0]
     steps = {part: jnp.sqrt(jnp.sum(jnp.square(gradient[part]["kernel"].astype(jnp.float32)),
                                     axis=tuple(range(1, gradient[part]["kernel"].ndim))))
              for part in parts}
@@ -321,132 +356,228 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
 
 def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,
                    adaptation: ChunkAdaptation, *, predict: bool, logits: bool) -> Adapted:
-    """A row's targets scored through its continuum level stepped in context (module docstring):
+    """A row's targets scored through its continuum levels stepped in context (module docstring):
     `hidden` the final states `[B, S, features]`, `targets` `[B, S]`, `weights` each target's weight in
     the loss, and `fields` the rows' token fields, their documents and real slots read as every
     reader of rows reads them (`token_layout`, `real_slots`: a validity mask, and a packed row's
     document 0, are padding). A row's places (`positions`) move no window: each run counts its own.
-    The model owns the level's place in its variables (`SteppedInContext`)."""
-    from dew.objectives.lm.chunked import logits_cross_entropy
+    The model owns the levels' place in its variables (`SteppedInContext`).
 
+    A chain's levels (`dew.nn.continuum`) each step at their own window and rate (`ChunkAdaptation.
+    windows`, `rates`), equation 71 a level: a token reads every level at the version its own window of
+    that level opened with, and a window's gradient in its level is its tokens' own, each read through
+    the other levels as it read them (`_Chain`)."""
     start = _start(model, variables, adaptation)
-    carries = adaptation.carry == "run"
-    steps = _stepped_mask(start, adaptation)
+    names = _level_names(model, start)
+    starts = [start] if not names else [start[name] for name in names]
+    windows = adaptation.windows(len(starts))
+    if adaptation.damped and len(starts) > 1:
+        raise ValueError("a damped step bounds one level's curvature; this model's chain of "
+                         f"{len(starts)} levels steps undamped")
     rows, length = targets.shape
-    window = adaptation.window
-    straddles, weights, runs, windows = _laid_out(fields, weights, rows, length, adaptation)
-    *bounds, energies = _damping(model, variables, start, hidden, weights, adaptation)
-    parts = _damped_parts(start, adaptation)
-    blocks = -(-length // window)
+    block = min(windows)
+    straddles, weights, runs, keys = _laid_out(fields, weights, rows, length, adaptation, windows)
+    if adaptation.damped:
+        *bounds, energies = _damping(model, variables, starts[0], hidden, weights, adaptation)
+    else:
+        bounds, energies = None, jnp.zeros((rows, length, _TERMS + 3), jnp.float32)
+    chain = _Chain(model, variables, names, tuple(starts), adaptation, bounds, straddles, predict, rows)
+    blocks = -(-length // block)
     # The last block's slots past the row weigh nothing and belong to the row's last window.
-    edge = ((0, 0), (0, blocks * window - length))
-    inputs = (*(sequence_blocks(value, window, leading=True)
+    edge = ((0, 0), (0, blocks * block - length))
+    inputs = (*(sequence_blocks(value, block, leading=True)
                 for value in (hidden, targets, weights, energies)),
-              *(sequence_blocks(jnp.pad(key, edge, mode="edge"), window, leading=True)
-                for key in (runs, windows)))
-    def level_states(level, states) -> jax.Array:
-        return jnp.asarray(model.apply(model.with_in_context_level(variables, level), states,
-                                       method="continuum_states"))
+              sequence_blocks(jnp.pad(runs, edge, mode="edge"), block, leading=True),
+              tuple(sequence_blocks(jnp.pad(key, edge, mode="edge"), block, leading=True) for key in keys))
+    zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in chain.started)
+    # Before a row's first real token no run is open: run 0, window -1.
+    first = (chain.started, zeros, _gathered(jnp.zeros((rows, 1), bool), energies[:, :1]),
+             jnp.zeros((rows,), runs.dtype), tuple(jnp.full((rows,), -1, key.dtype) for key in keys))
+    (levels, partials, energy, _, _), (losses, top, log_z, whole) = jax.lax.scan(
+        jax.checkpoint(functools.partial(chain.block, logits=logits)), first, inputs)
 
-    def scored(levels, chosen, states, block_targets):
-        """Each slot's losses, its states read at its own of `levels` (`chosen`, per slot)."""
-        read = [jax.vmap(level_states)(level, states) for level in levels]
-        passed = read[0]
-        for index, alternative in enumerate(read[1:], start=1):
-            passed = jnp.where((chosen == index)[..., None], alternative, passed)
-        block_logits = jnp.asarray(model.apply(variables, passed, method="head_logits"))
-        losses, top, log_z = logits_cross_entropy(block_logits, block_targets, predict=predict)
+    def joined(value: jax.Array) -> jax.Array:
+        """A scan's `[blocks, B, block, ...]` output as the row's `[B, S, ...]`."""
+        return jnp.moveaxis(value, 0, 1).reshape(rows, blocks * block, *value.shape[3:])[:, :length]
+
+    moved = None
+    if adaptation.carry == "run":
+        # Each row's levels with their open windows' steps applied.
+        reached = [chain.stepped(index, level, partial, energy)
+                   for index, (level, partial) in enumerate(zip(levels, partials, strict=True))]
+        moved = _moved(chain.tree(reached), chain.tree(chain.started), weights)
+    return Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
+                   None if whole is None else joined(whole), moved)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Chain:
+    """The scan `adapted_scores` runs over a row's blocks of its least window, for a model's levels
+    `starts` (a chain's, by their `names`, or one level's). A level whose window closes inside a block
+    finishes its gradient over the block's slots before the boundary (its tail) at its open version, the
+    levels of smaller windows read there as their slots read them, as their boundaries fall on its own,
+    so the levels finish in order of their windows."""
+
+    model: nn.Module
+    variables: object
+    names: tuple[str, ...]
+    starts: tuple
+    adaptation: ChunkAdaptation
+    bounds: object
+    straddles: bool
+    predict: bool
+    rows: int
+
+    @functools.cached_property
+    def started(self) -> tuple:
+        return tuple(_rows(level, self.rows) for level in self.starts)
+
+    @functools.cached_property
+    def steps(self) -> tuple:
+        return tuple(_stepped_mask(level, self.adaptation) for level in self.starts)
+
+    def tree(self, levels):
+        """The model's level tree holding `levels`, one a level of the chain."""
+        return levels[0] if not self.names else dict(zip(self.names, levels, strict=True))
+
+    def level_states(self, index: int, level, states) -> jax.Array:
+        """`states` past level `index` at `level`."""
+        held = list(self.starts)
+        held[index] = level
+        tree = self.model.with_in_context_level(self.variables, self.tree(held))
+        return jnp.asarray(self.model.apply(tree, states, *([index] if self.names else []),
+                                            method="continuum_states"))
+
+    def scored(self, versions, chosen, states, block_targets):
+        """Each slot's losses, its states read through every level at its own of that level's
+        `versions` (`chosen`, per slot), in the chain's order."""
+        from dew.objectives.lm.chunked import logits_cross_entropy
+
+        passed = states
+        for index in range(len(self.starts)):
+            read = [jax.vmap(functools.partial(self.level_states, index))(version, passed)
+                    for version in versions[index]]
+            selected = read[0]
+            for at, alternative in enumerate(read[1:], start=1):
+                selected = jnp.where((chosen[index] == at)[..., None], alternative, selected)
+            passed = selected
+        block_logits = jnp.asarray(self.model.apply(self.variables, passed, method="head_logits"))
+        losses, top, log_z = logits_cross_entropy(block_logits, block_targets, predict=self.predict)
         return losses, (top, log_z, block_logits)
 
-    def stepped(level, gradient, energy):
-        """`level` stepped by its window's `gradient`, at the rate a damped step takes from the
-        window's summed terms `energy` and how far its kernels moved from the start (`_step_rate`),
-        one rate a row."""
+    def stepped(self, index: int, level, gradient, energy):
+        """Level `index` at `level` stepped by its window's `gradient` at its rate, or at the rate a damped
+        step takes from the window's summed terms `energy` and how far its kernels moved from the start
+        (`_step_rate`), one rate a row."""
         rate = None
-        if adaptation.damped:
-            moved = {part: _distance(level[part]["kernel"], started[part]["kernel"]) for part in parts}
-            rate = _step_rate(adaptation, parts, bounds, energy, moved, gradient)
+        if self.adaptation.damped:
+            parts = _damped_parts(self.starts[0], self.adaptation)
+            moved = {part: _distance(level[part]["kernel"], self.started[0][part]["kernel"])
+                     for part in parts}
+            rate = _step_rate(self.adaptation, parts, self.bounds, energy, moved, gradient)
+        plain = self.adaptation.rates(len(self.starts))[index]
 
         def step(leaf, grad, moves):
             if not moves:
                 return leaf
             if rate is None:
-                return leaf - adaptation.rate * grad
+                return leaf - plain * grad
             return leaf - rate.reshape(-1, *[1] * (leaf.ndim - 1)).astype(leaf.dtype) * grad
-        return jax.tree.map(step, level, gradient, steps)
+        return jax.tree.map(step, level, gradient, self.steps[index])
 
-    started = _rows(start, rows)
-
-    def block(carry, block_inputs):
-        level, partial, energy, run, place = carry
-        states, block_targets, block_weights, block_energies, block_runs, block_windows = block_inputs
+    def opened(self, carry, block_inputs):
+        """Each level's versions a block reads and each slot's choice among them, and each level's
+        window gradient closed at its tail (`_Chain`), with the damped window's terms closed with it."""
+        opens, partials, energy, run, places = carry
+        states, block_targets, block_weights, block_energies, block_runs, block_keys = block_inputs
+        count = len(self.starts)
+        versions, chosen, closed = [None] * count, [None] * count, [None] * count
+        closed_energy = energy
+        nothing = jnp.zeros_like(block_runs, jnp.int32)
+        if not self.straddles:
+            # One document a row and no padding: every level's windows open at blocks' starts.
+            for index in range(count):
+                opening = block_keys[index][:, 0] != places[index]
+                closed[index] = partials[index]
+                stepped = self.stepped(index, opens[index], partials[index], energy)
+                versions[index] = (_where(opening, stepped, opens[index]),)
+                chosen[index] = nothing
+            return versions, chosen, closed, closed_energy
         same = block_runs == run[:, None]
-        tail = same & (block_windows == place[:, None])
-        following = same & (block_windows == place[:, None] + 1)
-        if straddles:
+        windows = self.adaptation.windows(count)
+        for index in sorted(range(count), key=lambda at: windows[at]):
+            tail = same & (block_keys[index] == places[index][:, None])
+            following = same & (block_keys[index] == places[index][:, None] + 1)
+
             # The open window's tail, read at the window's own level, finishes its gradient.
-            def tail_loss(at):
-                losses, _ = scored((at,), jnp.zeros_like(tail, jnp.int32), states, block_targets)
+            def tail_loss(at, index=index, tail=tail):
+                held = [((opens[m],), nothing) if versions[m] is None else (versions[m], chosen[m])
+                        for m in range(count)]
+                held[index] = ((at,), nothing)
+                losses, _ = self.scored([version for version, _ in held], [which for _, which in held],
+                                        states, block_targets)
                 return jnp.sum(jnp.where(tail, block_weights * losses, 0.0))
-            closed = jax.tree.map(jnp.add, partial, jax.grad(tail_loss)(level))
-            closed_energy = _joined(energy, _gathered(tail, block_energies))
-            levels = (level, stepped(level, closed, closed_energy), started)
-            chosen = jnp.where(tail, 0, jnp.where(following, 1, 2))
-        else:
-            closed, closed_energy = partial, energy
-            levels = (stepped(level, closed, closed_energy),)
-            chosen = jnp.zeros_like(tail, jnp.int32)
-        last_run, last_place = block_runs[:, -1], block_windows[:, -1]
-        last = (block_runs == last_run[:, None]) & (block_windows == last_place[:, None])
+            closed[index] = jax.tree.map(jnp.add, partials[index], jax.grad(tail_loss)(opens[index]))
+            if self.adaptation.damped:
+                closed_energy = _joined(energy, _gathered(tail, block_energies))
+            stepped = self.stepped(index, opens[index], closed[index], closed_energy)
+            versions[index] = (opens[index], stepped, self.started[index])
+            chosen[index] = jnp.where(tail, 0, jnp.where(following, 1, 2))
+        return versions, chosen, closed, closed_energy
 
-        def last_loss(at):
-            losses, held = scored(at, chosen, states, block_targets)
-            return jnp.sum(jnp.where(last, block_weights * losses, 0.0)), (losses, held)
-
-        (_, (losses, (top, log_z, block_logits))), gradients = jax.value_and_grad(
-            last_loss, has_aux=True)(levels)
-        # The last slot's window, one level's slots, takes its gradient from that level alone.
-        reached = gradients[0]
-        for gradient in gradients[1:]:
-            reached = jax.tree.map(jnp.add, reached, gradient)
-        opened = levels[0]
-        for index, alternative in enumerate(levels[1:], start=1):
-            opened = _where(chosen[:, -1] == index, alternative, opened)
-        continuing = (last_run == run) & (last_place == place)
+    def block(self, carry, block_inputs, *, logits: bool):
+        """One block of the scan (`adapted_scores`): its losses, and each level's version, window gradient
+        and window carried to the next block."""
+        _, partials, energy, run, places = carry
+        states, block_targets, block_weights, block_energies, block_runs, block_keys = block_inputs
+        versions, chosen, closed, closed_energy = self.opened(carry, block_inputs)
+        last_run = block_runs[:, -1]
+        losses, pull, (top, log_z, block_logits) = jax.vjp(
+            lambda held: self.scored(held, chosen, states, block_targets), versions, has_aux=True)
+        opened, gradients, last_places, continuings = [], [], [], []
+        for index in range(len(self.starts)):
+            last_place = block_keys[index][:, -1]
+            last = (block_runs == last_run[:, None]) & (block_keys[index] == last_place[:, None])
+            # The last slot's window, one version's slots, takes its gradient from that version alone.
+            pulled = pull(jnp.where(last, block_weights, 0.0).astype(losses.dtype))[0][index]
+            reached = functools.reduce(lambda one, other: jax.tree.map(jnp.add, one, other), pulled)
+            level = versions[index][0]
+            for at, alternative in enumerate(versions[index][1:], start=1):
+                level = _where(chosen[index][:, -1] == at, alternative, level)
+            continuing = (last_run == run) & (last_place == places[index])
+            following = closed[index] if self.straddles else jax.tree.map(jnp.add, partials[index], reached)
+            opened.append(level)
+            gradients.append(_where(continuing, following, reached))
+            last_places.append(last_place)
+            continuings.append((last, continuing))
+        last, continuing = continuings[0]
         reached_energy = _gathered(last, block_energies)
-        carried = (opened, _where(continuing, closed, reached),
-                   jnp.where(continuing[:, None], closed_energy, reached_energy), last_run, last_place)
-        return carried, (losses, top, log_z, block_logits if logits else None)
-
-    zeros = jax.tree.map(jnp.zeros_like, started)
-    # Before a row's first real token no run is open: run 0, window -1.
-    first = (started, zeros, _gathered(jnp.zeros((rows, 1), bool), energies[:, :1]),
-             jnp.zeros((rows,), runs.dtype), jnp.full((rows,), -1, windows.dtype))
-    (level, partial, energy, _, _), (losses, top, log_z, whole) = jax.lax.scan(
-        jax.checkpoint(block), first, inputs)
-
-    def joined(value: jax.Array) -> jax.Array:
-        """A scan's `[blocks, B, window, ...]` output as the row's `[B, S, ...]`."""
-        return jnp.moveaxis(value, 0, 1).reshape(rows, blocks * window, *value.shape[3:])[:, :length]
-
-    # Each row's level with its open window's step applied, where the run carries it.
-    moved = _moved(stepped(level, partial, energy), started, weights) if carries else None
-    return Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
-                   None if whole is None else joined(whole), moved)
+        kept = closed_energy if self.straddles else _joined(energy, reached_energy)
+        state = (tuple(opened), tuple(gradients), jnp.where(continuing[:, None], kept, reached_energy),
+                 last_run, tuple(last_places))
+        return state, (losses, top, log_z, block_logits if logits else None)
 
 
-def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation):
+def _level_names(model: nn.Module, start) -> tuple[str, ...]:
+    """A chain's levels' names in its order (`SteppedInContext.in_context_levels`), none for one level."""
+    count = model.in_context_levels if isinstance(model, SteppedInContext) else 1
+    return () if count == 1 else tuple(f"continuum_{index}" for index in range(count))
+
+
+def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation,
+              windows: tuple[int, ...]):
     """Where the rows' windows run (`window_keys`): whether a window can open inside a block (padding
-    or several documents in a row), the weights with each padding slot's at nothing, and each slot's run
-    and window. A carried level steps through a row's documents in turn, one run a row."""
+    or several documents in a row), the weights with each padding slot's at nothing, each slot's run, and
+    its window of each level (`windows`). A carried level steps through a row's documents in turn, one
+    run a row."""
     marked, documents = token_layout(fields)
     straddles = marked is not None or documents is not None
     valid = real_slots(fields, (rows, length)) if straddles else None
     if valid is not None:
         weights = jnp.where(valid, weights, 0)
     documents = None if adaptation.carry == "run" else documents
-    runs, windows = window_keys(valid, documents, rows, length, adaptation.window)
-    return straddles, weights, runs, windows
+    runs, ranks = _run_ranks(valid, documents, rows, length)
+    return straddles, weights, runs, tuple(jnp.where(runs > 0, ranks // window, -1) for window in windows)
 
 
 def _start(model: nn.Module, variables, adaptation: ChunkAdaptation) -> Mapping:

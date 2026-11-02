@@ -357,6 +357,133 @@ def scan_as_equation_71(kind: str, window: int, rate: float, scale: float) -> No
          ADAPTATION_SEEDS[window, rate, scale])
 
 
+CHAIN = (ContinuumLevel(hidden=4), ContinuumLevel(hidden=6, activation="gelu_pytorch_tanh"))
+"""A two-level chain (`dew.nn.continuum.continuum_chain`), its levels of different widths and activations,
+so a level read in another's place shows."""
+
+CHAINED = decoder(continuum=CHAIN)
+
+CHAIN_SEEDS = {(1, 3): 8, (3, 6): 8, (6, 2): 8}
+"""Check 1's declared seeds for a chain's sites, by its levels' windows."""
+
+
+def chain_loop(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
+               truth: bool = False):
+    """Equation 71 read literally for each level of a chain (`dew.nn.continuum`), token by token along
+    each row: a run of a document's real tokens starts every level from its start; at the first real
+    token of a level's next window that level steps by its rate times the summed gradient of its window's
+    weighted next-token losses, each token's gradient in each level taken where it read every level, and
+    each token reads every level as its own windows left it, through the chain in its order. With
+    `truth`, the losses are `equation_71`'s float64 truth."""
+    start = model.in_context_level(variables)
+    names = sorted(start, key=lambda name: int(name.rsplit("_", 1)[1]))
+    windows, rates = adaptation.windows(len(names)), adaptation.rates(len(names))
+    rows, length = targets.shape
+    valid, documents = fields.get("attention_mask"), fields.get("segment_ids")
+    real = jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool)
+    if documents is not None:
+        real = real & (jnp.asarray(documents) != 0)
+    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
+                 else jnp.asarray(documents, jnp.int32))
+
+    def token_loss(levels, state, target):
+        held = model.with_in_context_level(variables, levels)
+        logits = model.apply(variables, model.apply(held, state[None], method="continuum_states"),
+                             method="head_logits")[0]
+        if truth:
+            others = jnp.where(jnp.arange(logits.shape[-1]) == target, 0, logits - logits[target])
+            return jax.nn.logsumexp(others)
+        return -jax.nn.log_softmax(logits)[target]
+
+    def choose(condition, first, second):
+        return jax.tree.map(lambda one, other: jnp.where(condition, one, other), first, second)
+
+    zeros = jax.tree.map(jnp.zeros_like, start)
+
+    def token(carry, slot):
+        levels, summed, count, opened, document, begun = carry
+        state, target, weight, here_real, here = slot
+        new_run = here_real & (~begun | (here != document))
+        levels, summed = choose(new_run, start, levels), choose(new_run, zeros, summed)
+        count, opened = jnp.where(new_run, 0, count), jnp.where(new_run, -1, opened)
+        document, begun = jnp.where(new_run, here, document), begun | new_run
+        windows_now = jnp.asarray([count // window for window in windows])
+        moved = here_real & (windows_now != opened) & (opened >= 0)
+        levels = {name: choose(moved[at], jax.tree.map(lambda leaf, grad, rate=rates[at]: leaf - rate * grad,
+                                                       levels[name], summed[name]), levels[name])
+                  for at, name in enumerate(names)}
+        summed = {name: choose(moved[at], zeros[name], summed[name]) for at, name in enumerate(names)}
+        opened = jnp.where(here_real, windows_now, opened)
+        loss, pull = jax.vjp(lambda at: token_loss(at, state, target), levels)
+        (gradient,) = pull(jnp.where(here_real, weight, 0).astype(loss.dtype))
+        summed = jax.tree.map(jnp.add, summed, gradient)
+        return (levels, summed, count + here_real, opened, document, begun), loss
+
+    def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
+        first = (start, zeros, jnp.int32(0), jnp.full((len(names),), -1, jnp.int32), jnp.int32(0),
+                 jnp.zeros((), bool))
+        _, losses = jax.lax.scan(token, first, (row_hidden, row_targets, row_weights, row_real,
+                                                row_documents))
+        return losses
+
+    return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+@pytest.mark.parametrize("windows", sorted(CHAIN_SEEDS), ids=lambda windows: "-".join(map(str, windows)))
+def test_a_chain_steps_each_level_as_equation_71_at_its_own_window(kind, windows):
+    """A chain's levels each step at their own window and rate (`ChunkAdaptation`'s per-level window and
+    rate, Nested Learning's multi-frequency memory, section 7.1), each target's loss on par with the
+    literal loop of every level (`chain_loop`, check 1): a faster level before a slower one, a slower
+    before a faster (6, 2), and a one-token level; over one document a row, packed rows and padded rows."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=windows, rate=(0.1, 0.05))
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(CHAINED, variables, hidden, targets, weights, fields, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(truth):
+        return lambda variables, hidden, targets, weights: chain_loop(
+            CHAINED, variables, hidden, targets, weights, fields, adaptation, truth=truth)
+
+    def chained_draw(seed: int):
+        _, hidden, targets, weights = draw(seed)
+        return drawn_variables(seed, CHAINED, scale=0.25), hidden, targets, weights
+
+    site(dew, reference, chained_draw, 0.1, 0.25, min(windows),
+         f"a chain at windows {windows} over {kind}", CHAIN_SEEDS[windows])
+
+
+def test_a_chain_starts_as_the_plain_head_and_steps_nothing_at_rate_zero():
+    """A chain's levels start as the identity, so its logits are the model's without them, and a chain
+    stepped at rate zero scores the targets as the level-free model does, bit for bit."""
+    variables = CHAINED.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))
+    plain = decoder(continuum=None)
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH)).astype(np.int32)
+    trunk = {**variables, "params": {name: value for name, value in variables["params"].items()
+                                      if not name.startswith("continuum_")}}
+    np.testing.assert_array_equal(np.asarray(CHAINED.apply(variables, tokens)),
+                                  np.asarray(plain.apply(trunk, tokens)))
+    stepped = LMObjective(CHAINED, LENGTH, adaptation=ChunkAdaptation(window=(2, 4), rate=0.0))
+    still = LMObjective(CHAINED, LENGTH)
+    rows = np.random.default_rng(1).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(stepped.token_scores(variables, rows).losses),
+                                  np.asarray(still.token_scores(variables, rows).losses))
+
+
+def test_a_chain_names_one_window_and_rate_a_level_its_windows_nested():
+    """A chain's windows, ordered, each divide the next (a slower level steps on a faster one's
+    boundary), and one window or rate a level, or one for all: else refused (ValueError)."""
+    with pytest.raises(ValueError, match="divide"):
+        ChunkAdaptation(window=(2, 3))
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    for adaptation in (ChunkAdaptation(window=(2, 4, 8)), ChunkAdaptation(window=2, rate=(0.1, 0.1, 0.1))):
+        objective = LMObjective(CHAINED, LENGTH, adaptation=adaptation)
+        with pytest.raises(ValueError, match="2 levels"):
+            objective.token_scores(objective.init(jax.random.key(0)), tokens)
+
+
 CARRY_SEEDS = 8
 """Check 1's declared seeds for a carried level's windows and its rows' mean step, each a draw."""
 
