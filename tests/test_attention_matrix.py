@@ -11,6 +11,8 @@ launches at the derivation's where it takes two, else (a call whose derivation t
 deterministic mode's) at the dK/dV launch on the layout whose consumers feed their rings (`FED`).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -99,28 +101,38 @@ def _backward_op(case: dict[str, str]):
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
-def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
-    """The backward config `case` pins (its launch form on the Mosaic mainloop, the module's docstring), or
-    None where another mainloop runs its backward; raises where the route serves no such form."""
+@functools.cache
+def _route(call: tuple[tuple[str, str], ...]):
+    """What the Mosaic backward does with a call (`case` but its launch): whether it declines it, and else the
+    config it derives and the two launches' pin (`FED`) where that is legal, under the call's generation."""
+    case = dict(call)
     with generation.assumed(case["generation"]):
         op, ba, target = _backward_op(case)
         if op.declined(ba, target) is not None:
-            if case["launch"] != "two":
-                raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
-            return None
-        derived = op.derived(ba, target)
-        if derived is None:
-            raise ValueError(f"the Mosaic backward derives no config for {case}")
-        if case["launch"] == "two":
-            config = derived if not derived.fused else attention_mosaic.BackwardTiles(
-                64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
-        elif derived.fused and derived.shared_keys == (case["launch"] == "shared-keys"):
-            config = derived
-        else:
-            config = None
-        if config is None or not op.legal(ba, config, target):
-            raise ValueError(f"the route serves no {case['launch']} launch for {case}")
-        return config
+            return True, None, None
+        two = attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2 if case["width"] == "256" else 1, **FED)
+        return False, op.derived(ba, target), two if op.legal(ba, two, target) else None
+
+
+def pin_of(case: dict[str, str]) -> attention_mosaic.BackwardTiles | None:
+    """The backward config `case` pins (its launch form on the Mosaic mainloop, the module's docstring), or
+    None where another mainloop runs its backward; raises where the route serves no such form."""
+    declined, derived, two = _route(tuple((axis, value) for axis, value in case.items() if axis != "launch"))
+    if declined:
+        if case["launch"] != "two":
+            raise ValueError(f"the Mosaic backward declines {case}: no form but another mainloop's")
+        return None
+    if derived is None:
+        raise ValueError(f"the Mosaic backward derives no config for {case}")
+    if case["launch"] == "two":
+        config = derived if not derived.fused else two
+    elif derived.fused and derived.shared_keys == (case["launch"] == "shared-keys"):
+        config = derived
+    else:
+        config = None
+    if config is None:
+        raise ValueError(f"the route serves no {case['launch']} launch for {case}")
+    return config
 
 
 def supported(case: dict[str, str]) -> bool:
