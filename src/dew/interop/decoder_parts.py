@@ -1086,6 +1086,11 @@ SHORT_CONV_LEAVES: Leaves = {
 under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projections and its `[D, 1, K]`
 taps."""
 
+XIELU_LEAVES: Leaves = {f'mlp.act_fn.{name}': ('mlp', 'act_fn', name)
+                        for name in ('alpha_p', 'alpha_n', 'beta', 'eps')}
+"""An ungated feed-forward's xIELU (Apertus's), by its tensors' names past `model.layers.N.`: its two
+learned parameters and its two buffers (`dew.nn.activations.Xielu`), the buffers Dew's constants."""
+
 
 KDA_LEAVES: Leaves = {
     'self_attn.A_log': ('self_attn', 'A_log'), 'self_attn.dt_bias': ('self_attn', 'dt_bias'),

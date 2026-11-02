@@ -1181,7 +1181,7 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
-        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES}
+        leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES}
         path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
         if canonical in assembly.constants and path is not None:
             # A buffer no step trains, held where Dew keeps constants (`KnownPart.constants`).
