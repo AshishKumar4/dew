@@ -204,21 +204,13 @@ def _weight(equation, name, params, inputs, value):
 
 
 def _scanned(params, inputs, taps, weights):
-    """A scan's outputs, its body run step by step as the program's own operations."""
-    body, length = params["jaxpr"], params["length"]
-    constants, carried = params["num_consts"], params["num_carry"]
-    fixed, carry, xs = inputs[:constants], inputs[constants:constants + carried], inputs[constants + carried:]
-    steps = range(length - 1, -1, -1) if params["reverse"] else range(length)
-    ys = []
-    for index in steps:
-        out = _run(body.jaxpr, body.consts, [*fixed, *carry, *(x[index] for x in xs)], taps, weights)
-        carry, made = out[:carried], out[carried:]
-        ys.append(made)
-    if params["reverse"]:
-        ys.reverse()
-    count = len(body.jaxpr.outvars) - carried
-    stacked = [jnp.stack([step[index] for step in ys]) if ys else
-               jnp.zeros((0, *body.jaxpr.outvars[carried + index].aval.shape),
-                         _wide(body.jaxpr.outvars[carried + index].aval.dtype))
-               for index in range(count)]
-    return [*carry, *stacked]
+    """A scan's outputs, its body run step by step as the program's own operations (`scanned_steps`)."""
+    from float64_terms import scanned_steps
+
+    body = params["jaxpr"]
+
+    def step(_, lanes):
+        outputs = _run(body.jaxpr, body.consts, [value for (value,) in lanes], taps, weights)
+        return [(value,) for value in outputs]
+
+    return [value for (value,) in scanned_steps(params, [(value,) for value in inputs], step, lanes=1)]
