@@ -191,7 +191,7 @@ delta net's packed output launch, one consumer at one program, spilled a 64-bit 
 none at any of 192 to 248 (FS-LT-OUTPUT-CAPS1, its PTX otherwise the same)."""
 
 
-def raised_registers(consumers: int, programs: int = 1) -> int:
+def raised_registers(consumers: int, programs: int = 1, producer: int = PRODUCER_REGISTERS) -> int:
     """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg),
     `programs` programs held by a multiprocessor at once: the program's launch pool at that residency less
     the producer's, shared among them in setmaxnreg's steps of 8 and at most `RAISE_CEILING` (one consumer's
@@ -199,9 +199,10 @@ def raised_registers(consumers: int, programs: int = 1) -> int:
     (`entry_registers`), which setmaxnreg moves between a program's warps and never past ("The total number
     of registers allocated to all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums
     302068): four consumers' 640 threads launch at 96 a thread, so they hold 104, where the multiprocessor's
-    share would ask 112 and wait for registers no warp gives back."""
+    share would ask 112 and wait for registers no warp gives back. The producer lowers to `producer` a thread
+    (`PRODUCER_REGISTERS`, a model's own where it states another, `RegisterModel.cap`)."""
     pool = entry_registers(consumers + 1, programs) * (consumers + 1) * THREADS
-    share = (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS)
+    share = (pool - producer * THREADS) // (consumers * THREADS)
     return min(RAISE_CEILING, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
@@ -373,7 +374,7 @@ class RegisterModel:
         if not self.producer:
             return entry_registers(self.consumers, programs)
         if honored:
-            return raised_registers(self.consumers, programs)
+            return raised_registers(self.consumers, programs, self.producer)
         return entry_registers(self.consumers + 1, programs)
 
     def record(self) -> dict:
