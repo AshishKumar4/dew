@@ -22,6 +22,7 @@ from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 from dew.nn.mla import MLAMixer
+from dew.nn.wrapping import DecoderWrapper
 from dew.sampling import Sampling
 
 TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_features": 64, "max_seq_len": 16}
@@ -295,7 +296,12 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
 
     from dew.batch import coordinates
 
-    model = source.model.clone(dtype=jnp.float64) if wide else source.model
+    model = source.model
+    if wide:
+        # A wrapper's dtype is its towers'; its decoder holds its own (`DecoderWrapper.wraps`).
+        model = model.clone(dtype=jnp.float64)
+        if isinstance(model, DecoderWrapper):
+            model = model.clone(**{model.wraps: getattr(model, model.wraps).clone(dtype=jnp.float64)})
     variables = widened(source.variables) if wide else source.variables
     if site == "packed":
         segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(DOCUMENTS)])
