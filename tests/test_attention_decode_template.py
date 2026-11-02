@@ -6,6 +6,8 @@ and a verify block of four, grouped heads, rows of their own lengths and starts,
 builders' inverse (`unpacked` of `packed`) and the work list's slices exactly covering each row's keys.
 """
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -14,7 +16,7 @@ from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_decode, attention_mosaic
+from dew.nn.kernels.templates import attention as template, attention_decode
 
 KEYS = 256
 SEEDS = 8
@@ -88,19 +90,33 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])
-def test_a_work_lists_slices_cover_each_rows_keys_once(slices):
-    """Each row's slices (`sliced`) are contiguous and cover its keys exactly once, every inner boundary a key
-    tile's, the padding rows seeing none."""
-    spans = _spans(1)
-    query = jnp.zeros((2, 1, 1, 16))
-    plan = attention_decode.Plan(attention_mosaic.Tiles(64, 64, 2, 1), rows=4, slices=slices)
-    _, item_spans, _ = attention_decode.sliced(query, spans, None, plan)
-    start = np.asarray(item_spans.start).reshape(2, slices, 4)
-    end = np.asarray(item_spans.end).reshape(2, slices, 4)
-    for row, (lo, hi) in enumerate(zip(STARTS, LENGTHS, strict=True)):
-        bounds = [(start[row, s, 0], end[row, s, 0]) for s in range(slices)]
-        assert bounds[0][0] == lo and bounds[-1][1] == hi
-        assert all(bounds[s][1] == bounds[s + 1][0] for s in range(slices - 1))
-        assert all(b % 64 == 0 for _, b in bounds[:-1] if lo < b < hi)
-        assert (start[row, :, 1:] == end[row, :, 1:]).all()
-
+def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
+    """Slices of a row's keys, each its output normalized, its maximum and its denominator, and a sink's
+    initial state, merged (`merged`): the row's softmax over every key and the sink at once, a slice of no
+    key adding nothing."""
+    rng = np.random.default_rng(0)
+    logits = rng.standard_normal((2, 3, 1, 40)) * 4.0
+    values = rng.standard_normal((2, 3, 1, 40, 8))
+    sink = rng.standard_normal((2, 1, 3))
+    cuts = np.linspace(0, 40, slices + 1).astype(int)
+    outs, maxima, totals = [], [], []
+    for lo, hi in itertools.pairwise(cuts):
+        part = logits[..., lo:hi]
+        peak = part.max(axis=-1) if hi > lo else np.full(part.shape[:-1], -np.inf)
+        weights = np.exp(part - peak[..., None]) if hi > lo else part
+        total = weights.sum(axis=-1)
+        summed = np.einsum("bqhk,bqhkd->bqhd", weights, values[..., lo:hi, :])
+        outs.append(summed / np.where(total > 0, total, 1)[..., None])
+        maxima.append(peak)
+        totals.append(total)
+    out = jnp.asarray(np.stack(outs, axis=1), jnp.float32)
+    maximum = jnp.asarray(np.transpose(np.stack(maxima, axis=1), (0, 3, 1, 2)), jnp.float32)
+    total = jnp.asarray(np.transpose(np.stack(totals, axis=1), (0, 3, 1, 2)), jnp.float32)
+    initial = template.Initial(jnp.asarray(sink, jnp.float32), jnp.ones(sink.shape, jnp.float32),
+                               jnp.zeros((*sink.shape, 8), jnp.float32))
+    found = attention_decode.merged(out, maximum, total, initial)
+    scores = np.concatenate([logits, np.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    weights /= weights.sum(axis=-1, keepdims=True)
+    expected = np.einsum("bqhk,bqhkd->bqhd", weights[..., :40], values)
+    np.testing.assert_allclose(found, expected, rtol=1e-5, atol=1e-6)

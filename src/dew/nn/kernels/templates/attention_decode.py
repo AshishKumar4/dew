@@ -8,13 +8,14 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   a step of one query position fills a tile with the group and reads each key tile once for all of it.
   The same builder takes a prefill call: a call's rows are its rows whatever their count (§5: GQA packing
   is structure, one builder for prefill and decode).
-- `sliced`: each row's keys cut into contiguous slices, each slice the rows' copy over its own keys and
-  its own work item, as many items as the GPU holds at once (`slices`: the derived config's resident
-  programs a multiprocessor, from its registers and its shared memory, times the multiprocessors; no
-  fitted table), so one row's long cache fills the GPU.
+- `plan`: each query tile's keys cut into contiguous slices, each slice a program of its own on the
+  template forward's grid (`MosaicForward.splits`), as many as the GPU holds at once (the derived
+  config's resident programs a multiprocessor, from its registers and its shared memory, times the
+  multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
 - `merged`: the slices' softmax states, each its output normalized in fp32, its maximum and its
-  denominator, combined in slice order (the algebra's merge in natural units: each slice's output weighed
-  by its mass at the largest maximum), one sum a row, deterministic.
+  denominator, combined in slice order with the call's initial state (a sink, `Initial`) as one more
+  (the algebra's merge in natural units: each state's output weighed by its mass at the largest
+  maximum), one sum a row, deterministic.
 
 No arithmetic of its own past the merge: the walk, the hooks and the guards are the template forward's.
 """
@@ -89,93 +90,53 @@ def unpacked(out: jax.Array, heads: int) -> jax.Array:
 
 @dataclasses.dataclass(frozen=True)
 class Plan:
-    """A decode step's work list as the derivation shapes it: the forward's config (`attention_mosaic.Tiles`),
-    the rows a work item holds (a program's, `consumers · block_q`, so no program's consumers walk two
-    items' keys) and the slices each row's keys are cut into."""
+    """A decode step's work list as the derivation shapes it: the forward's config (`attention_mosaic.Tiles`)
+    and the slices each query tile's keys are cut into (`MosaicForward.splits`)."""
 
     config: attention_mosaic.Tiles
-    rows: int
     slices: int
 
 
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
-         scale: float | None, natural: bool, target: generation.GpuTarget) -> Plan:
-    """The work list of a packed call (`packed`) on `target`: the forward's derived config for one slice's
-    rows, and slices opened until the items fill the multiprocessors at the config's residency
+         scale: float | None, target: generation.GpuTarget) -> Plan:
+    """The work list of a packed call (`packed`) on `target`: the forward's derived config, and slices
+    opened until the programs fill the multiprocessors at the config's residency
     (`resources.resident_programs`, its registers; its shared memory's), each at least a key tile."""
-    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
+    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=True,
                                               out_dtype=jnp.float32, masked=True)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
     if config is None:
-        raise NotImplementedError(f"the template's forward derives no config for the decode step on {target}")
+        raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
     family = bundle_of(config, query.dtype)
     resident = resources.resident_programs(family, config.consumers, op.registers(ba, config), target)
     if target.shared_limit:
         resident = min(resident, max(1, target.shared_limit // op.staged_bytes(ba, config, target)))
-    rows = config.consumers * config.block_q
-    items = query.shape[0] * query.shape[2] * math.ceil(query.shape[1] / rows)
-    wanted = math.ceil((target.multiprocessors or 1) * resident / items)
-    return Plan(config, rows, max(1, min(wanted, math.ceil(key.shape[1] / config.block_k))))
+    tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
+    programs = query.shape[0] * query.shape[2] * tiles
+    wanted = math.ceil((target.multiprocessors or 1) * resident / programs)
+    return Plan(config, max(1, min(wanted, math.ceil(key.shape[1] / config.block_k))))
 
 
-def sliced(query: jax.Array, spans: KeySpans, initial: Initial | None, plan: Plan
-           ) -> tuple[jax.Array, KeySpans, Initial | None]:
-    """A packed call's work list (`Plan`): its rows padded to whole items and copied once a slice, each copy
-    seeing its slice of its row's keys, contiguous and as long as the others but for rounding, its first
-    a key tile's boundary (so no two slices read one tile); the initial state the first slice's alone (a
-    sink counted once), the others' empty."""
-    rows = query.shape[1]
-    padded = math.ceil(rows / plan.rows) * plan.rows
-    query = jnp.pad(query, ((0, 0), (0, padded - rows), (0, 0), (0, 0)))
-    query = jnp.tile(query, (1, plan.slices, 1, 1))
-    tile = plan.config.block_k
-    start, end = spans.start, jnp.maximum(spans.end, spans.start)
-    length = end - start
-
-    def bound(s):
-        if s == 0:
-            return start
-        if s == plan.slices:
-            return end
-        cut = start + (length * s) // plan.slices
-        return jnp.clip((cut // tile) * tile, start, end)
-
-    def rows_of(x, fill):
-        return jnp.pad(x, ((0, 0), (0, padded - rows)), constant_values=fill)
-
-    starts = jnp.concatenate([rows_of(bound(s), 0) for s in range(plan.slices)], axis=1)
-    ends = jnp.concatenate([rows_of(bound(s + 1), 0) for s in range(plan.slices)], axis=1)
-    ids = None if spans.query_ids is None else jnp.tile(rows_of(spans.query_ids, 0), (1, plan.slices))
-    spans = KeySpans(starts, ends, ids, spans.key_ids, spans.keys, "spans")
+def merged(out: jax.Array, maximum: jax.Array, total: jax.Array, initial: Initial | None = None) -> jax.Array:
+    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima and denominators
+    `[B, KV, S, Q]` (natural), and the call's `initial` state `[B, KV, Q]` (its sums `acc` unnormalized),
+    merged into the rows' output `[B, Q, KV, Dv]` fp32: each state's output weighed by its mass at the
+    rows' largest maximum, summed slice by slice then the initial state, over the summed mass; a state of no
+    mass adds nothing, and a row of none is zero, as the reference's."""
+    # The states along axis 1: `[B, S, Q, KV]` each, their outputs `[B, S, Q, KV, Dv]`.
+    maxima, totals = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
     if initial is not None:
-        def first(x, fill):
-            widths = ((0, 0), (0, 0), (0, padded - rows)) + ((0, 0),) * (x.ndim - 3)
-            own = jnp.pad(x, widths, constant_values=fill)
-            rest = jnp.full((*own.shape[:2], own.shape[2] * (plan.slices - 1), *own.shape[3:]), fill,
-                            own.dtype)
-            return jnp.concatenate([own, rest], axis=2)
-
-        initial = Initial(first(initial.m, -jnp.inf), first(initial.total, 0.0), first(initial.acc, 0.0))
-    return query, spans, initial
-
-
-def merged(out: jax.Array, maximum: jax.Array, total: jax.Array, slices: int, rows: int) -> jax.Array:
-    """The slices' outputs `out` `[B, S·Rp, KV, Dv]` (fp32, each normalized), maxima and denominators
-    `[B, KV, S·Rp]` (natural) merged into the rows' output `[B, R, KV, Dv]` fp32: each slice's output
-    weighed by its mass at the rows' largest maximum, summed in slice order, over the summed mass; a slice
-    of no key (no mass) adds nothing, and a row no slice of which saw a key is zero, as the reference's."""
-    batch, items, kv_heads, width = out.shape
-    padded = items // slices
-    out = out.reshape(batch, slices, padded, kv_heads, width)[:, :, :rows]
-    maximum = maximum.reshape(batch, kv_heads, slices, padded)[..., :rows]
-    total = total.reshape(batch, kv_heads, slices, padded)[..., :rows]
-    seen = total > 0
-    maximum = jnp.where(seen, maximum, -jnp.inf)
-    top = jnp.max(maximum, axis=2, keepdims=True)
-    weight = jnp.where(seen, total * jnp.exp(maximum - jnp.where(jnp.isfinite(top), top, 0.0)), 0.0)
-    weight = jnp.transpose(weight, (0, 2, 3, 1))[..., None]
-    summed, mass = jnp.sum(weight * out, axis=1), jnp.sum(weight, axis=1)
+        held = initial.total > 0
+        own = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
+        out = jnp.concatenate([out, jnp.swapaxes(own, 1, 2)[:, None]], axis=1)
+        maxima = jnp.concatenate([maxima, jnp.swapaxes(initial.m, 1, 2)[:, None]], axis=1)
+        totals = jnp.concatenate([totals, jnp.swapaxes(initial.total, 1, 2)[:, None]], axis=1)
+    seen = totals > 0
+    maxima = jnp.where(seen, maxima, -jnp.inf)
+    top = jnp.max(maxima, axis=1, keepdims=True)
+    weight = jnp.where(seen, totals * jnp.exp(maxima - jnp.where(jnp.isfinite(top), top, 0.0)), 0.0)
+    summed, mass = jnp.sum(weight[..., None] * out, axis=1), jnp.sum(weight, axis=1)[..., None]
     return jnp.where(mass > 0, summed / jnp.where(mass > 0, mass, 1.0), 0.0)
 
 
@@ -194,26 +155,22 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
            scale: float | None = None, interpret: bool = False) -> jax.Array:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]`, the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
-    `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), cut into
-    the derived work list (`plan`, `sliced`), walked by the template's forward in fp32 with its rows
-    (`attention_mosaic.forward`), merged (`merged`) and unpacked. Its logits natural, so the guard runs as a
-    launch over its live rows with no branch read on the host (`MosaicForward.masked`, row 1978)."""
-    natural = True
+    `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
+    sliced over the derived work list (`plan`) on the template's forward in fp32 with its rows
+    (`attention_mosaic.forward`'s `splits`), merged with the initial state (`merged`) and unpacked. Its
+    logits natural, so the guard runs as a launch over its live rows with no branch read on the host
+    (`MosaicForward.masked`, row 1978)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
                                   "hook or dropout (`packable`)")
     heads, kv_heads = query.shape[2], key.shape[2]
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
-    row_hooks = dataclasses.replace(hooks, initial=initial)
-    work = plan(rows, key, value, row_spans, row_hooks, scale=scale, natural=natural,
-                target=generation.gpu_target())
-    items, item_spans, item_initial = sliced(rows, row_spans, initial, work)
+    walked = dataclasses.replace(hooks, initial=None)
+    work = plan(rows, key, value, row_spans, walked, scale=scale, target=generation.gpu_target())
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
-        out, maximum, total, *_ = attention_mosaic.forward(
-            items, key, value, item_spans, dataclasses.replace(hooks, initial=item_initial), scale=scale,
-            natural=natural, residuals=Kept.OUTPUT, interpret=interpret, out_dtype=jnp.float32, masked=True)
-    units = _natural_units(rows, row_spans, row_hooks, scale=scale, natural=natural)
-    out = merged(out, maximum * units, total, work.slices, rows.shape[1])
-    return unpacked(out, heads).astype(query.dtype)
-
+        out, maximum, total = attention_mosaic.forward(
+            rows, key, value, row_spans, walked, scale=scale, natural=True, residuals=Kept.OUTPUT,
+            interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices)[:3]
+    units = _natural_units(rows, row_spans, walked, scale=scale, natural=True)
+    return unpacked(merged(out, maximum * units, total, initial), heads).astype(query.dtype)
