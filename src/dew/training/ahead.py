@@ -418,7 +418,8 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None, *, frontier: bool = False) -> AheadOfTime:
+                                   capacity: int | None = None, *, frontier: bool = False,
+                                   plan: JSON = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -428,7 +429,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
     every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
     among (the module's docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
-    than measured. Profiling, tuning and rollout require execution and are refused."""
+    than measured. `plan`, a plan an earlier search found (an `AheadOfTime`'s or a run's `plan` record),
+    starts the search at its rung and split, compiled first, so a search resumed from it skips the
+    compiles that found it, and a frontier is read above it alone. Profiling, tuning and rollout require
+    execution and are refused."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
@@ -466,7 +470,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     # for it nor writes one (`dew.cache.uncached`).
     with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
-        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
+        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier,
+                                         plan)
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
