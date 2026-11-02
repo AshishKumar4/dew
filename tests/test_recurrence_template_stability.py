@@ -36,7 +36,7 @@ from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cot
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
 from dew.nn.kernels.templates import bundles
-from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+from dew.nn.kernels.templates.recurrence import mainloop, template
 
 pytestmark = pytest.mark.kernel
 
@@ -77,7 +77,7 @@ def fast_backward(operands: Chunk) -> bool:
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
                                  operands.beta, operands.state, operands.starts, bound=HOOKS.inverse_bound)
     tiles = template.MOSAIC.derived(bound, target)
-    return mainloop_backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
+    return template.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
                                    family=mainloop.family_of() or bundles.INTERPRETED, target=target,
                                    starts=operands.starts)

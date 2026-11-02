@@ -733,7 +733,7 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 "a gradient the template's fast backward does not take (`mainloop_backward."
                 "fast_backward_form`): fp32 operands under the accurate forms, an fp16 call without the "
                 "delta rule, a decay a key dimension without it; or launches past the device's registers or "
-                "shared memory at the call's tiles (`mainloop_backward.backward_holds`)", row='ledger 1294'),
+                "shared memory at the call's tiles (`template.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -1057,7 +1057,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
     `bundles.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
     (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`mainloop_backward.backward_holds`); it takes no other call's, which raises NotImplementedError as the
+    (`template.backward_holds`); it takes no other call's, which raises NotImplementedError as the
     gradient is traced: the delta rule's selector gives a training call it refuses another kernel
     (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it (ledger
     1926: no kernel falls back inside itself). Its states and output launches take `tiles` (`mainloop.Tiles`,
@@ -1086,7 +1086,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
            "ranged": template.ranged(dtype, delta, bound)}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4)
-            and mainloop_backward.backward_holds(
+            and template.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 target=template.Mosaic.launched(), starts=starts,
                 max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"],

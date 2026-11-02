@@ -1,9 +1,8 @@
 """The recurrence mainloop's training pass on its machinery (`mainloop`): the fast backward's launches
-(`gradients`, fla's DAG of the delta rule and, without it, mamba_ssm's rounding of Mamba2's SSD), the forms
-and devices they take (`fast_backward_form`, `backward_holds`), and the plan of a call's launches, forward
-and backward (`planned`, `holds`), from which the template derives its tiles."""
+(`gradients`, fla's DAG of the delta rule and, without it, mamba_ssm's rounding of Mamba2's SSD) and the
+forms they take (`fast_backward_form`). The plan of a call's launches, forward and backward, is the
+template's (`template.planned`, `template.backward_holds`)."""
 
-import contextlib
 import dataclasses
 import functools
 from collections.abc import Sequence
@@ -19,9 +18,7 @@ from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    _PLANNED,
     CHUNK,
-    Launch,
     Tiles,
     _allocated,
     _block_stored,
@@ -54,51 +51,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _vector_views,
     _views,
     _walk_stores,
-    kept_forward,
     whole_blocks,
 )
-
-
-def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
-            max_segments: int | None = None, delta: bool = True, backward: bool = False,
-            floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False, wide: bool = False, ranged: bool = False, skip=None) -> tuple[Launch, ...]:
-    """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
-    `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
-    planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
-    (`_kernel`); with `backward`, the fast backward's too (`gradients`). A `wide` call's output lands in
-    fp32 (`forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
-    (204800 bytes against 188544 on an H100's compile, the resource gate's). A `skip` (`[HV]`, its shape)
-    fused into the output and reverse walk is planned with them: its reverse walk holds a tile more."""
-    found: list[Launch] = []
-
-    def run(q, k, v, g, beta, h0, starts, skip):
-        token = _PLANNED.set(found)
-        try:
-            out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
-                                                       max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded, wide=wide, ranged=ranged,
-                                                       skip=skip)
-            if backward:
-                gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
-                          max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
-                          floor=floor, rounded=rounded, ranged=ranged, skip=skip)
-        finally:
-            _PLANNED.reset(token)
-
-    with contextlib.nullcontext() if target is None else generation.assumed(target):
-        jax.eval_shape(run, q, k, v, g, beta, h0, starts, skip)
-    return tuple(found)
-
-
-def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
-    """Whether each of `launches` fits a block of `shared` bytes, its consumer threads hold their registers
-    (`Launch.registers` within `Family.registers` at its consumer roles, of the bundle it issues by,
-    `Launch.family`, `family` where it names none) and a multiprocessor holds a program of it
-    (`Launch.resident`): a generated launch spills nothing."""
-    return all(launch.shared <= shared and launch.resident > 0
-               and launch.registers <= (launch.family or family).registers(launch.consumers)
-               for launch in launches)
 
 
 def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
@@ -115,25 +69,6 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     if per_key:
         return delta
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
-
-
-def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family,
-                   target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, floor: float | None = None, rounded: bool = False,
-                   ranged: bool = False, skip=None) -> bool:
-    """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
-    `tiles` on `target`, planned there and within its block's shared memory (`holds`); where they do not, the
-    rule's gradient is the portable math's. Planned on the device's own target off a GPU, an interpreted
-    call's states launch held no program at the interpreted target's shared budget (`Launch.resident`)."""
-    shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v, g, beta, h0,
-                                                                                    starts, skip)]
-    *operands, starts, skip = shapes
-    forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target, skip=skip)
-    both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target,
-                   skip=skip)
-    return holds(both[len(forward):], family, generation.shared_budget(target))
 
 
 def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
