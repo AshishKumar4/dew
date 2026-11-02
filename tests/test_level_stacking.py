@@ -15,11 +15,12 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.adaptation import ChunkAdaptation
 from dew.objectives.lm.stacking import stacked_scores
 
-VOCAB, FEATURES, LENGTH, ROWS = 16, 8, 12, 4
+VOCAB, FEATURES, LENGTH, ROWS = 16, 16, 12, 4
 
-STACKED = CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=2, num_heads=2, head_dim=4,
-                            mlp_features=16, max_seq_len=32, attention_impl="xla")
-"""A two-layer test decoder, its feed-forward blocks the levels."""
+STACKED = CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=2, num_heads=2,
+                            head_dim=16, mlp_features=16, max_seq_len=32, attention_impl="xla")
+"""A two-layer test decoder, its feed-forward blocks the levels: its heads 16 wide, so a query or key
+norm's gradient, one sum over every token the draw holds, has 16 elements a draw for check 1 to pool."""
 
 TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
 """The decoder in float64 on the reference kernel: the loops' truth."""
