@@ -97,14 +97,13 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     # Each chunk's call: none where no row's chunk holds a slot, else the least width its longest holds.
     calls = jnp.where(spans > 0, jnp.searchsorted(jnp.asarray(widths), spans) + 1, 0)
 
-    reads = _Reads(model, variables, view, layout, rowed, blocks, wide, train, rngs, predict, logits)
+    reads = _Reads(model, variables, view, layout, rowed, blocks, train, rngs, predict, logits)
     branches = [reads.called(chunk)] if blocks is None else [reads.skipped, *map(reads.called, widths)]
 
-    @jax.checkpoint
-    def chunk_call(levels, caches, block):
+    def chunk_call(levels, caches, block, written):
         # A row of blocks reads each chunk at its own width (`calls`).
-        return branches[0](levels, caches, block) if blocks is None else jax.lax.switch(
-            block["call"], branches, levels, caches, block)
+        return branches[0](levels, caches, block, written) if blocks is None else jax.lax.switch(
+            block["call"], branches, levels, caches, block, written)
 
     def chunk_step(carry, block):
         opens, partials, caches, written = carry
@@ -117,18 +116,18 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
             moved = stepped(name, opens[name], partials[name], rates[at])
             levels[name] = jax.tree.map(lambda one, other, now=opened[name]: jnp.where(now, one, other),
                                         moved, opens[name])
-        outputs, caches, gradients = chunk_call(levels, caches, block)
+        written, caches, gradients = chunk_call(levels, caches, block, written)
         partials = {name: jax.tree.map(
             lambda grad, held, now=opened[name]: jnp.where(now, grad, held + grad), gradients[name],
             partials[name]) for name in names}
-        # Each row's outputs at their slots, past its chunk's last overwritten by the chunks after it.
-        written = jax.tree.map(lambda buffer, value: _placed(buffer, value, block["first"]), written, outputs)
         return (levels, partials, caches, written), None
 
     chunked = {"index": jnp.arange(chunks), "first": bounds[:, :-1].T, "last": bounds[:, 1:].T, "call": calls}
     caches = _rows(cache, rows)
     first = jax.tree.map(lambda leaf: leaf[0], chunked)
-    shapes, _, _ = jax.eval_shape(reads.called(wide), started, caches, first)
+    shapes, _, _ = jax.eval_shape(reads.scored(chunk), started, caches, first)
+    # Each row's outputs at their slots: a call writes its own width from its chunk's first, the slots
+    # past its chunk's last overwritten by the chunks after it.
     written = jax.tree.map(lambda shape: jnp.zeros((rows, padded + wide, *shape.shape[2:]), shape.dtype),
                            shapes)
     zeros = jax.tree.map(jnp.zeros_like, started)
@@ -148,7 +147,7 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
 class _Reads:
     """What a chunk's call through the decoder reads (`stacked_scores`): the decoder and its `variables`,
     their store (`view`), the rows' padded `layout`, token fields (`rowed`) and `blocks` (None for none),
-    the widest call (`wide`), and the call's own options."""
+    and the call's own options."""
 
     model: nn.Module
     variables: Mapping
@@ -156,7 +155,6 @@ class _Reads:
     layout: Coordinates
     rowed: Mapping
     blocks: jax.Array | None
-    wide: int
     train: bool
     rngs: object
     predict: bool
@@ -172,10 +170,10 @@ class _Reads:
             block_groups=None if row_blocks is None else row_blocks[None])
         return states[0], chunk_logits[0], mutated["cache"]
 
-    def called(self, width: int):
-        """A chunk's call, each row's `width` slots from its first (`bounds`), those past its last invalid:
-        its final states, scores and logits `wide` slots wide, the caches past it and its loss's gradient in
-        every level, the chunks before it fixed in the cache."""
+    def scored(self, width: int):
+        """A chunk's call, each row's `width` slots from its first (`bounds`), those past its last invalid,
+        rematerialized for the outer gradient: its final states, scores and logits, the caches past it and
+        its loss's gradient in every level, the chunks before it fixed in the cache."""
         from dew.objectives.lm.chunked import logits_cross_entropy
 
         def chunk_loss(levels, caches, block):
@@ -193,18 +191,30 @@ class _Reads:
             outputs = (losses, top, log_z, chunk_logits if self.logits else None, states)
             return jnp.sum(counted * losses), (outputs, moved)
 
+        @jax.checkpoint
         def call(levels, caches, block):
             (_, (outputs, caches)), gradients = jax.value_and_grad(
                 functools.partial(chunk_loss, caches=caches, block=block), has_aux=True)(levels)
-            return jax.tree.map(lambda value: _widened(value, self.wide), outputs), caches, gradients
+            return outputs, caches, gradients
         return call
 
-    def skipped(self, levels, caches, block):
+    def called(self, width: int):
+        """`scored(width)` with its outputs written into the row's buffers `written` at each row's chunk's
+        slots, `width` of them from its first."""
+        scored = self.scored(width)
+
+        def call(levels, caches, block, written):
+            outputs, caches, gradients = scored(levels, caches, block)
+            return jax.tree.map(lambda buffer, value: _placed(buffer, value, block["first"]), written,
+                                outputs), caches, gradients
+        return call
+
+    @staticmethod
+    def skipped(levels, caches, block, written):
         """A chunk no row's holds a slot of, a longer block's chunk having read it whole: no call, nothing
-        cached and no gradient in any level."""
-        outputs, _, gradients = jax.eval_shape(self.called(self.wide), levels, caches, block)
-        zeros = functools.partial(jax.tree.map, lambda shape: jnp.zeros(shape.shape, shape.dtype))
-        return zeros(outputs), caches, zeros(gradients)
+        written or cached, and no gradient in any level."""
+        del block
+        return written, caches, jax.tree.map(jnp.zeros_like, levels)
 
 
 def _chunk_bounds(blocks: jax.Array | None, rows: int, chunk: int, chunks: int) -> jax.Array:
@@ -236,11 +246,6 @@ def _cut(leaf: jax.Array, first: jax.Array, width: int, fill=0) -> jax.Array:
     """Each row's `width` slots of `leaf` `[B, S, ...]` from its `first` `[B]`, past the row's end `fill`."""
     leaf = jnp.pad(leaf, ((0, 0), (0, width), *((0, 0),) * (leaf.ndim - 2)), constant_values=fill)
     return jax.vmap(lambda row, at: jax.lax.dynamic_slice_in_dim(row, at, width))(leaf, first)
-
-
-def _widened(value: jax.Array, width: int) -> jax.Array:
-    """`value` `[B, W, ...]` padded with zeros to `width` slots."""
-    return jnp.pad(value, ((0, 0), (0, width - value.shape[1]), *((0, 0),) * (value.ndim - 2)))
 
 
 def _placed(buffer: jax.Array, value: jax.Array, first: jax.Array) -> jax.Array:
