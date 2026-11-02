@@ -1041,14 +1041,15 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int, pages: Pages | None = None) -> PaddedCall:
+                block: int, pages: Pages | None = None, *, query_block: int | None = None) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
-    whole `block`s (a backend's largest tile), its head widths at powers of two. A paged call's (`pages`)
-    `key` and `value` are its pools `[KV, P, size, D]`, flattened, padded in their widths alone: its keys
-    are its table's slots, whole blocks where its page is."""
+    whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two. A
+    paged call's (`pages`) `key` and `value` are its pools `[KV, P, size, D]`, flattened, padded in their
+    widths alone: its keys are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
     keys, value_width = (key.shape[1] if pages is None else pages.keys), value.shape[-1]
-    padded_q, padded_k = whole(max(queries, 1), block), whole(max(keys, 1), block)
+    padded_q, padded_k = whole(max(queries, 1), query_block or block), whole(max(keys, 1), block)
     padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
     if pages is not None and keys % block:
         raise ValueError(f"a paged call's {keys} slots are no whole number of {block}-key blocks")

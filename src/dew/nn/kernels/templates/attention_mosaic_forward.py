@@ -190,7 +190,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
-        pages=pages)
+        pages=pages, inference=True)
     table = None if pages is None else (pages.table, pages.size)
 
     def whole_rows(live: jax.Array) -> jax.Array:
@@ -437,9 +437,11 @@ def _widened(array: jax.Array, width: int) -> jax.Array:
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-              scale: float, natural: bool, tiles: Tiles, family: mosaic.Family, pages: Pages | None = None):
-    """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`)
-    and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
+              scale: float, natural: bool, tiles: Tiles, family: mosaic.Family, pages: Pages | None = None,
+              inference: bool = False):
+    """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`;
+    an `inference` walk's queries to its query blocks alone, which every launch of it divides: a decode
+    step's four rows padded to 128 took 21 of B128's 795 us at 4096 keys, ET-DECODE7-h100) and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
     sums where its values can overflow them, the fold its logits' reach, `algebra.walked_launches`) and the
     arrays its programs read beside the operands (`_Spans`, `_Hooked`), and the power of two its plain
     launch took into its scale (1 where none, `_rewalked`). A call it takes none of is refused (`refused`,
@@ -456,7 +458,8 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     power, scale = prescale(query.dtype, query.shape[3], scale)
     folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
     taken = power if folding and spans.form != "spans" else 1.0
-    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles), pages)
+    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles), pages,
+                       query_block=tiles.consumers * tiles.block_q if inference else None)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
