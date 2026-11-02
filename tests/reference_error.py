@@ -1187,11 +1187,17 @@ class _Conditioning:
         return weighed
 
     def of(self, truth, inputs, seed) -> _Weighed:
-        """The weighing of `truth`, the truth of `inputs`, at the draw `seed`."""
+        """The weighing of `truth`, the truth of `inputs`, at the draw `seed`: a window loop's program
+        (`over_windows`) weighed window by window, as it runs, its scales stacked."""
         from rounding_bound import rounding_scale
 
         truth = jax.device_get(truth)
-        _, scale = rounding_scale(self.program, *inputs, seed=seed)
+        if isinstance(self.program, _Windowed):
+            scale = stacked_on_host([
+                rounding_scale(self.program.fn, *jax.tree.map(lambda leaf, at=index: leaf[at], inputs),
+                               seed=seed)[1] for index in range(_window_count(inputs))])
+        else:
+            _, scale = rounding_scale(self.program, *inputs, seed=seed)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if _floating(np.asarray(leaf).dtype)
                             else leaf, truth)
         return _Weighed(truth, scale, ones)
