@@ -47,15 +47,19 @@ def release_cache(tmp_path, monkeypatch) -> Path:
     return snapshot
 
 
-def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
-    """A load and a save write every tensor the release stores under its own name, bit for bit."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+@pytest.mark.parametrize('fixture', [TINY, VL], ids=['decoder', 'wrapper'])
+def test_a_saved_source_writes_the_releases_tensors_back(tmp_path, fixture):
+    """A load and a save write every tensor the release stores under its own name, bit for bit, and its
+    config's model type: LFM3's decoder, and LFM3-VL's wrapper, its trunk's, projector's and decoder's."""
+    loaded = Pretrained.load(fixture, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'saved')
-    stored = load_file(TINY / 'model.safetensors')
+    stored = load_file(fixture / 'model.safetensors')
     written = load_file(tmp_path / 'saved' / 'model.safetensors')
     assert sorted(written) == sorted(stored)
     for name, tensor in stored.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+    model_type = json.loads((fixture / 'config.json').read_text())['model_type']
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == model_type
 
 
 @pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
@@ -207,19 +211,6 @@ def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
     np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)), expected)
 
 
-def test_an_lfm3_vl_wrapper_saves_the_releases_tensors_back(tmp_path):
-    """A load and a save of LFM3-VL's wrapper write every tensor the release stores, its trunk's,
-    projector's and decoder's, under its own name, bit for bit, and its config's model type."""
-    loaded = Pretrained.load(VL, dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path / 'saved')
-    stored = load_file(VL / 'model.safetensors')
-    written = load_file(tmp_path / 'saved' / 'model.safetensors')
-    assert sorted(written) == sorted(stored)
-    for name, tensor in stored.items():
-        np.testing.assert_array_equal(written[name], tensor, err_msg=name)
-    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == 'lfm3_vl'
-
-
 @pytest.mark.network
 def test_the_released_lfm3_vl_and_d1_headers_load_whole_or_refuse_d1s_attention():
     """LiquidAI/LFM3-VL-2B loads whole, its trunk, projector and language model, from its safetensors
@@ -311,11 +302,16 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
     at f83d2b0), which a load that trusts the source's code runs (`trust_remote_code`, `Processor`): over a
     prompt with an image, and one with a video sampled at its own rate, Dew's processor gives the release
     processor's tokens, and each image's or video frame's patch vectors and grid where its placeholders
-    read them, the placeholders in text order reading their media's merge blocks in order."""
+    read them, the placeholders in text order reading their media's merge blocks in order. So does the
+    processor a run reloads from its recorded source (`load_processor`), which keeps the load's trust,
+    and the processor of the bundle's save, which writes the processor's own modules beside it."""
     import shutil
 
     from tool_support import run_from
     from transformers import AutoProcessor
+
+    from dew.inference.tasks import recorded_processor
+    from dew.interop.pretrained import load_processor
 
     source = tmp_path / 'source'
     shutil.copytree(VL, source)
@@ -324,6 +320,10 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
             shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference', trust_remote_code=True)
     release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
+    loaded.save(tmp_path / 'saved')
+    saved = AutoProcessor.from_pretrained(str(tmp_path / 'saved'), trust_remote_code=True,
+                                          local_files_only=True)
+    reloaded = load_processor(recorded_processor(loaded.processor), loaded.model)
     config = json.loads((VL / 'config.json').read_text())
     rng = np.random.default_rng(0x2067)
     image = rng.integers(0, 256, (24, 40, 3), dtype=np.uint8)
@@ -333,8 +333,16 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
                                ('w5 <|video|> w9', {'videos': [video], 'video_metadata': metadata},
                                 config['video_token_id'])):
         theirs = release(text=[text], return_tensors='np', **media)
+        written = saved(text=[text], return_tensors='np', **media)
+        assert sorted(written) == sorted(theirs)
+        for name, value in theirs.items():
+            np.testing.assert_array_equal(written[name], value, err_msg=name)
         ours = loaded.processor(text, **media)
         np.testing.assert_array_equal(np.asarray(ours.tokens), theirs['input_ids'])
+        again = reloaded(text, **media)
+        np.testing.assert_array_equal(np.asarray(again.tokens), theirs['input_ids'])
+        np.testing.assert_array_equal(np.asarray(again.conditioning['pixel_values']),
+                                      np.asarray(ours.conditioning['pixel_values']))
         kind = 'image' if 'images' in media else 'video'
         pixels = theirs['pixel_values' if kind == 'image' else 'pixel_values_videos']
         frames, height, width = (int(side) for side in theirs[f'{kind}_grid_thw'][0])
@@ -351,3 +359,18 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
         held = theirs['input_ids'][0] == token
         assert held.sum() == frames * height * width // 4 and np.all(indices[~held] == -1)
         assert np.all(np.diff(indices[held]) > 0)
+
+
+def test_a_sources_record_keeps_whether_its_load_runs_its_code():
+    """A source's record (`SourceReference`), which a run keeps for its processor, keeps whether its load
+    ran the source's own code (`remote_code`), as a processor reloaded from it runs it again
+    (`load_processor`); a record written before the field reads as not trusted."""
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record, to_record
+
+    trusted = SourceReference('LiquidAI/LFM3-VL-2B', 'f83d2b0a2296aaa277f394990a9b8b949ddf9691',
+                              remote_code=True)
+    assert from_record(SourceReference, to_record(trusted, SourceReference)) == trusted
+    record = to_record(trusted, SourceReference)
+    earlier = {key: value for key, value in record.items() if key != 'remote_code'}
+    assert from_record(SourceReference, earlier) == SourceReference(trusted.name, trusted.revision)

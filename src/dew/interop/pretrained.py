@@ -520,7 +520,8 @@ class Pretrained:
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
-            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
+            sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
+            selected, fallback,
             modeling_overrides)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
@@ -1263,8 +1264,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference,
-                      remote_code: bool = False) -> Processor | None:
+                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference
+                      ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
     Only a media source, a wrapper whose config names towers beside its
@@ -1279,7 +1280,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
     files from its directory and keeps the wrapper's translated `record`, and runs
-    the source's own processor code where the load ran its code (`remote_code`).
+    the source's own processor code where the load ran its code
+    (`SourceReference.remote_code`).
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -1294,7 +1296,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
         return Processor(tokenizer, config, record if media else {}, model.vocab_size,
                          source=source if media or gguf_path is None else None,
-                         directory=directory if media else None, remote_code=media and remote_code)
+                         directory=directory if media else None)
     return None
 
 
@@ -1308,6 +1310,9 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     the native component's config, as it does for the initial load.
     """
     directory = source.metadata()
+    if source.remote_code:
+        # The source's own modules beside its files, as its load ran them (`sources.remote_code`).
+        sources.remote_code(source.name, sources.snapshot(source.name, source.revision, weights=False))
     description = _composite_description(directory)
     component = None if description is None else description.backbone
     if component is None:
@@ -1464,14 +1469,29 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
+def _processor_code(directory: Path) -> dict[str, object]:
+    """The `auto_map` entries a source's processor files name its own code by (LFM3-VL's processor and
+    its image and video processors, each file's own and its components'), the files `Processor` saves
+    beside a bundle (`Processor.save_pretrained`) and its tokenizer's."""
+    named: dict[str, object] = {}
+    for path in sorted({*directory.glob("*processor*.json"), *directory.glob("tokenizer_config.json")}):
+        record = json.loads(path.read_text())
+        for section in (record, *(value for value in record.values() if isinstance(value, Mapping))):
+            if isinstance(section.get("auto_map"), Mapping):
+                named.update(section["auto_map"])
+    return named
+
+
 def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
                reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
-    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
-    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
-    source, beside the config the load read (`reference`, its component folder), at the metadata
-    snapshot's commit (`root`), never run."""
-    auto_map = config.get("auto_map")
-    if not isinstance(auto_map, Mapping):
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config or its
+    processor's files name it (`auto_map`, `_processor_code`): in the snapshot a verification from parts
+    ran it from, or, of a natively mapped source, beside the config the load read (`reference`, its
+    component folder), at the metadata snapshot's commit (`root`), never run."""
+    model_code = config.get("auto_map")
+    auto_map = {**_processor_code(reference.directory(root)),
+                **(model_code if isinstance(model_code, Mapping) else {})}
+    if not auto_map:
         return None
     if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
         return decoder_parts.SourceCode(remote, None, auto_map)
@@ -2270,8 +2290,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     if component is None and commit is not None:
         resolved_commit = root.name
     source = replace(source, revision=resolved_commit)
-    processor = source_processor(directory, config, record, model, gguf_path, source=source,
-                                 remote_code=remote is not None)
+    processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = read_generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in
