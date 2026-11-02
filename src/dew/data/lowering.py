@@ -55,6 +55,7 @@ from dew.data.analysis import (
     ends,
 )
 from dew.data.cache import _Mapped
+from dew.data.completion import Completed, Numbered, cuts, reach, released
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
@@ -439,8 +440,40 @@ def _chained(
 
 def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
-    examples marks each where its bound is (`examples_bound`), so every row after it holds a count."""
-    return examples_bound(pipeline.stages) is not None
+    examples marks each where its bound is (`examples_bound`), among its stages or those a memory read ran
+    as it held its rows (`_written`), so every row after it holds a count."""
+    source = pipeline.source
+    stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
+    return examples_bound(stages) is not None
+
+
+def _completes(pipeline: Pipeline, at: int) -> bool:
+    """Whether a shuffle at `at` in `pipeline` draws windows holding pieces of the examples a run bounded in
+    examples counts (`_consumes`): a layout before it lays them across windows (`cuts`), among its
+    stages or those a memory read ran as it held its rows (`_written`), so each count waits for its
+    example's every window (`dew.data.completion`)."""
+    source = pipeline.source
+    before = pipeline.stages[:at]
+    laid = before if isinstance(source, (Mixture, Phases)) else _written(source, before)
+    return _consumes(pipeline) and cuts(laid)
+
+
+def _reach(pipeline: Pipeline, at: int) -> int | None:
+    """How far back from a count a shuffle at `at` in `pipeline` finds its example's first window
+    (`completion.reach`): from the last layout that cut its examples across windows, where the shuffle draws
+    them in that layout's order; None where a shuffle before it drew them, or a step after the layout may
+    make several rows of a window, so a count waits for every window before its own."""
+    stages = pipeline.stages[:at]
+    laid = max((index for index, stage in enumerate(stages) if cuts((stage,))), default=None)
+    if laid is None:
+        return None
+    layout = stages[laid]
+    after = stages[laid + 1:]
+    if any(isinstance(stage, Shuffle) for stage in after) or not isinstance(layout, (Pack, Windows)):
+        return None
+    reaching = reach(layout)
+    expands = any(isinstance(stage, (FlatMap, MapBatch, Native)) for stage in after)
+    return None if reaching and expands else reaching
 
 
 def _bound(pipeline: Pipeline, at: int) -> int:
@@ -1860,6 +1893,14 @@ class _Build:
         if isinstance(stage, Repeat):
             certain = not any(_drops(written) for written in pipeline.stages[:at])
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
+        if isinstance(stage, Shuffle) and _completes(pipeline, at):
+            # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
+            units = Numbered(_as_iter(rows, self.loading), reach=_reach(pipeline, at))
+            if self.read == "memory":
+                return released(units, stage.window, stage.seed)
+            if stage.window is not None:
+                drawn = gx.WindowShuffleIterDataset(units, window_size=stage.window, seed=stage.seed)
+                return Completed(drawn)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:

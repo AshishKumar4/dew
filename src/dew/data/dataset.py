@@ -735,6 +735,15 @@ class Loader:
     """The records the training read is bounded to before they are packed (`compile`'s
     `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
     not bounded."""
+    pass_examples: int | None = None
+    """The source examples one pass of a training read with no record count holds (`records` None: an
+    objective makes rows of them, or a pack lays them out, after the order, or a filter cuts it per share),
+    as its read states them (`dew.data.compile._pass_examples`): an epoch of it; None where nothing
+    states them, or the read has a record count."""
+    epochs: int | None = None
+    """The epochs a training read with no record count is bounded to, `examples` their passes over its
+    source examples (`pass_examples`), as a run of that many reads it (`dew.data.compile.fitted`); None
+    for a read bounded otherwise or not at all."""
     bound_ends: bool = True
     """Whether a read bounded in `examples` ends where its bound does, having read every one: no take or
     slice after the bound ends it first, which a run on the examples clock refuses
@@ -765,10 +774,10 @@ class Loader:
         """
         if self.records is None:
             raise ValueError(
-                "epochs need a dataset with a record count, and this one streams without one: online "
-                "packing or a filter over an indexed or streamed read cuts its order per share. Read it "
-                "whole first (.read('memory')), read a published packing generation by index, or give "
-                "the run length in steps or tokens"
+                "epochs need a dataset with a record count or a count of the source examples a pass holds "
+                "(`pass_examples`), and this one streams without either: a filter or a step of the caller's "
+                "before its packing or its objective's rows cuts its order per share. Read it whole first "
+                "(.read('memory')), or give the run length in steps, examples or tokens"
             )
         records = epochs * self.records
         steps = self._steps(records, window)

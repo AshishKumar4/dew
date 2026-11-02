@@ -3,9 +3,9 @@
 A page's blocks run in order in one fresh interpreter on CPU, in an empty
 working directory, so a block may use what the blocks above it built, and a
 block whose call no longer matches the code fails here. A block that cannot
-run in CI says why just above it: `<!-- not run: needs a GPU -->`. The design
-records and research notes (docs/design, docs/research) sketch code rather
-than instruct, and are not run.
+run in CI says why just above it: `<!-- not run: needs a GPU -->`. The pages
+run are those the site shows a reader (its manifest): the design records and
+research notes it keeps in the repository sketch code rather than instruct.
 """
 
 import os
@@ -16,10 +16,13 @@ from pathlib import Path
 
 import pytest
 from lane_environment import outside_suite
+from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
-RECORDS = ("design", "research")
+# The pages the site shows a reader (its manifest, `gen_api.shown`): the architecture page among them,
+# though it sits with the design records (review, train 456).
+SHOWN = load("gen_api", "site/scripts").shown(ROOT)
 BLOCK = re.compile(r"^(?:<!-- not run: (?P<reason>.+?) -->\n)?```python\n(?P<code>.*?)^```", re.S | re.M)
 
 
@@ -31,7 +34,7 @@ def blocks(page: Path) -> list[tuple[int, str, str | None]]:
 
 
 PAGES = [page.relative_to(DOCS).as_posix() for page in sorted(DOCS.rglob("*.md"))
-         if page.relative_to(DOCS).parts[0] not in RECORDS and blocks(page)
+         if SHOWN(page.relative_to(ROOT).as_posix()) and blocks(page)
          and page.relative_to(DOCS).as_posix() not in {
              "from-flaxdiff.md", "guides/decision-models.md", "guides/multi-node.md", "recipes.md"}]
 

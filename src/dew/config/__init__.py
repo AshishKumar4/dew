@@ -87,6 +87,7 @@ from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
+from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns
 from dew.training.diloco import DiLoCo
 from dew.training.display import TrainingDisplay
@@ -789,11 +790,11 @@ class TrainerConfig:
         # A window the run ends inside is never committed, as the trainer counts its updates.
         return None if steps is None else steps // trainer.accumulation
 
-    def eval_interval(self, dataset: Loader) -> int | str | None:
+    def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Loader) -> int | str | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | str | Counted | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -802,10 +803,14 @@ class TrainerConfig:
             return value
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | None:
-        """Steps for `epoch`; steps, a share of the run (which `fit` resolves) or None as given."""
+    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | Counted | None:
+        """Steps for `epoch`, or the source examples a pass holds where the run reads its epochs as
+        passes over them (`Loader.epochs`, `Loader.pass_examples`); steps, a share of the run (which `fit`
+        resolves) or None as given."""
         if value is None or isinstance(value, int) or is_share(value):
             return value
+        if dataset.steps_per_epoch is None and dataset.epochs is not None and dataset.pass_examples:
+            return Counted(dataset.pass_examples, "examples")
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
@@ -1691,9 +1696,10 @@ class RunConfig:
                                ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
-        them, so its length is read off the loader this returns."""
+        them, or to `trainer.epochs` passes over its source examples where its read has no record count,
+        so its length is read off the loader this returns."""
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples)
+                      examples=self.trainer.examples, epochs=self.trainer.epochs)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -1920,7 +1926,7 @@ class RunConfig:
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
-                    examples=trainer.examples if steps is None else None,
+                    examples=dataset.examples if steps is None else None,
                     eval_every=trainer.eval_interval(dataset),
                     checkpoint_every=trainer.checkpoint_interval(dataset),
                     checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
@@ -1960,7 +1966,8 @@ class RunConfig:
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it (`viewed`).
+            return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None)
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,
@@ -1977,7 +1984,9 @@ class RunConfig:
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
         with generation.run_precision(run.trainer.precision):
-            batch = first_step_batch(trainer, loader, steps, run.trainer.examples if steps is None else None)
+            # The run's bound in examples as its data was compiled to it: its `examples`, or its `epochs`'
+            # passes over a read with no record count (`fitted`).
+            batch = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)
             return inspected(trainer, batch, steps=steps)
 
     def inspected(self) -> dict[str, float]:

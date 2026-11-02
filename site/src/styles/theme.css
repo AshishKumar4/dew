@@ -526,6 +526,73 @@ header.header {
 	overflow: hidden;
 }
 
+/* A list of tutorials and posts, newest first, each its kind and date over its title and line: the landing's
+   latest and the posts overview. */
+
+.latest-list {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
+	gap: 0.75rem;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.latest-list li {
+	margin: 0;
+}
+
+.latest-link {
+	display: grid;
+	grid-template-rows: auto auto 1fr;
+	gap: 0.45rem;
+	height: 100%;
+	padding: 1.05rem 1.1rem;
+	border: 1px solid var(--dew-rule);
+	border-radius: 0.6rem;
+	background: var(--dew-surface);
+	color: var(--sl-color-white);
+	text-decoration: none;
+	transition: border-color 150ms ease;
+}
+
+.latest-link:hover {
+	border-color: color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+	color: var(--sl-color-white);
+}
+
+.latest-meta {
+	display: flex;
+	justify-content: space-between;
+	gap: 0.75rem;
+	font: 500 0.7rem var(--__sl-font-mono);
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dew-muted);
+}
+
+.latest-meta > span:first-child {
+	color: var(--dew-accent-text);
+}
+
+.latest-title {
+	font-weight: 600;
+	font-size: 1rem;
+	line-height: 1.35;
+	letter-spacing: -0.01em;
+}
+
+.latest-text {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	overflow: hidden;
+	font-size: 0.85rem;
+	line-height: 1.5;
+	color: var(--sl-color-gray-2);
+}
+
 /* API reference pages. */
 
 .api-meta {
