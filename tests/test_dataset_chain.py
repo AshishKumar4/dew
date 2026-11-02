@@ -781,13 +781,13 @@ class ThirdQuestionRefused:
 
 
 def _members_asked(read: str) -> Dataset:
-    """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike, each
-    record's `id % 3 + 1` questions refused at the third (`Questioned`, `ThirdQuestionRefused`) after the
-    mix, as `read` reads them."""
+    """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike (a
+    stream's mix shuffled), each record's `id % 3 + 1` questions refused at the third (`Questioned`,
+    `ThirdQuestionRefused`) after the mix, as `read` reads them."""
     corpora = [Memory([{"id": np.int32(start + index)} for index in range(12)], shard_rows=4).named(name)
                for name, start in (("left", 1), ("right", 101))]
     chain = mix(corpora)
-    return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain.shuffle(seed=5)).batch(2)
+    return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain).batch(2)
 
 
 def _member_counts(batches, statistics) -> dict[str, tuple[int, int, int, int]]:

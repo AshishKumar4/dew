@@ -371,6 +371,29 @@ def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_
     assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
 
 
+@pytest.mark.parametrize("layout", ["concat", "overlap", "windows"])
+def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutting_them_are_drawn(layout):
+    """Two named corpora of the twelve documents (`_pieces`, the right's tokens offset by 100,000), mixed
+    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`): each
+    member's rows (data/rows) are its documents every token of which the read delivered, which a window
+    can hold pieces of two members' documents (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = _SPLIT[layout]
+    corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+               .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+    loader = compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+    drawn = _drawn(loader, 0, 1)
+    statistics = loader.statistics()
+    seen = sum((tokens for tokens, _ in drawn), collections.Counter())
+    for name, offset in (("left", 0), ("right", 100_000)):
+        whole = sum(all(seen[offset + 1000 * (index + 1) + token] for token in range(length))
+                    for index, length in enumerate(_LENGTHS))
+        assert statistics[f"data/rows/{name}"] == whole, name
+    assert sum(examples for _, examples in drawn) == sum(statistics[f"data/rows/{name}"]
+                                                          for name in ("left", "right"))
+
+
 @pytest.mark.parametrize("layout", ["concat", "held"])
 def test_a_shuffle_of_windows_cutting_documents_resumes_its_counts_where_it_saved_them(layout):
     """A bounded read of a concatenating pack shuffled after, read as a stream or held by a memory read, its

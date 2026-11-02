@@ -491,7 +491,8 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
     iterator = filled(iterator)
     steps = record(plan.manifest.semantic(), "data manifest").get("steps", [])
     names = [record(step, "manifest step").get("name") for step in (steps if isinstance(steps, list) else [])]
-    if (plan.lowering != "per-share" or not plan.members or "dew.data.pipeline.MarkConsumed" not in names):
+    mixed = plan.order.get("members")
+    if plan.lowering != "per-share" or not mixed or "dew.data.pipeline.MarkConsumed" not in names:
         return iterator
     batch = "dew.data.pipeline.BatchStage"
     batched = names.index(batch) if batch in names else len(names)
