@@ -17,6 +17,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import safetensors.numpy as safetensors_numpy
+from lane_environment import without_flags
 from interop_support import tiny_config
 
 from dew.interop import hf_decoders, sources
@@ -133,8 +134,7 @@ expected = jax.jit(norm.apply)(variables, stored)
 actual = jax.jit(lambda a, b: norm.apply(variables, a + b))(a, b)
 np.testing.assert_array_equal(actual, expected)
 """
-    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                     if not flag.startswith("--xla_allow_excess_precision"))
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_allow_excess_precision")
     result = subprocess.run([sys.executable, "-c", script, str(source)], capture_output=True, text=True,
                             env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=90)
     assert result.returncode == 0, result.stderr[-4000:]
@@ -182,8 +182,7 @@ expected = jax.jit(norm.apply)(variables,stored)
 actual = jax.jit(lambda a,b: norm.apply(variables,a+b))(a,b)
 np.testing.assert_array_equal(actual,expected)
 """
-    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                     if not flag.startswith("--xla_allow_excess_precision"))
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_allow_excess_precision")
     result = subprocess.run(
         [sys.executable, "-c", script, str(source), entry],
         capture_output=True,

@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from lane_environment import without_flags
 from affine_run import Replaying
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -508,8 +509,7 @@ def test_a_process_sharing_its_gpu_measures_no_site(monkeypatch):
     from dew import cache
 
     variables = decoder().init(jax.random.key(0), ids())
-    flags = " ".join(flag for flag in keeping_picks().split()
-                     if not flag.startswith(READ_ONLY.split("=")[0]))
+    flags = without_flags(keeping_picks(), READ_ONLY.split("=")[0])
     monkeypatch.setenv("XLA_FLAGS", flags)
     assert cache.measures_picks()
     monkeypatch.setenv("XLA_FLAGS", f"{flags} {READ_ONLY}")
