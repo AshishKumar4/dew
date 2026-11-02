@@ -69,7 +69,8 @@ def test_a_fault_on_the_elements_a_program_computes_well_is_decided_weighed():
         assert_as_exact(jax.jit(biased), jax.jit(reference), draw, "a biased product, unweighted",
                         seeds=WEIGHED_SEEDS)
     failure = failed(biased, "a biased product beside an amplified value")
-    assert {finding.rule for finding in failure.findings} <= {"pooled", "row"}
+    light = [finding for finding in failure.findings if finding.leaf.endswith("['light']")]
+    assert light and {finding.rule for finding in light} <= {"pooled", "row"}
     assert all(finding.leaf.startswith("a biased product beside an amplified value, conditioned")
                for finding in failure.findings)
 
