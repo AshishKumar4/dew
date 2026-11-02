@@ -34,13 +34,20 @@ class Choice:
     candidates: tuple[Candidate, ...]
 
 
+VARIANTS = 4
+"""The forms of each root the enumeration proposes (`EGraph.extract_multiple`), each beside the other roots'
+cheapest, with the cheapest and the most stable extractions."""
+
+
 def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accurate: bool,
            saturation: program.Saturation, admits: Callable[[Callable, Callable], bool]) -> Choice:
-    """`function`'s form chosen for operands of `operands`' shapes and dtypes: the cheapest candidate the gate
-    admits (`admits(candidate, reference)`, whether `candidate` is as exact as `reference` from the float64
-    truth): under default numerics against the form as written; under the accurate numerics
-    (`precision="accurate"`) against every other candidate, so a choice is never less accurate than any form
-    proposed, the form as written among them."""
+    """`function`'s form chosen for operands of `operands`' shapes and dtypes: its candidates proposed in
+    order of price (the form as written, the cheapest and the most stable extractions, and each root's
+    forms beside the others' cheapest, `VARIANTS`, each distinct one priced as a whole, `_priced`), and the
+    first the gate admits chosen (`admits(candidate, reference)`, whether `candidate` is as exact as
+    `reference` from the float64 truth; docs/design/algebra.md §1.5, §6.5): under default numerics against
+    the form as written, so one is always admitted; under the accurate numerics (`precision="accurate"`)
+    against every other candidate, so a choice is never less accurate than any form proposed."""
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
     region = terms.region(closed)
     graph, bundle, roots = program.graphed(region)
@@ -49,17 +56,28 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     _, written_seconds = graph.extract(bundle, include_cost=True, cost_model=timed, extractor="greedy-dag")
     program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation)
     tree = jax.tree.structure(shaped)
-    candidates = [Candidate("as written", written_seconds.value, function)]
-    for name, model in (("cheapest", timed), ("stable", cost.stable(region, cost.fused(facts)))):
-        chosen, _ = program.extracted(graph, bundle, model)
+    cheapest, _ = program.extracted(graph, bundle, timed)
+    proposed = {"cheapest": cheapest,
+                "stable": program.extracted(graph, bundle, cost.stable(region, cost.fused(facts)))[0]}
+    for index, variants in enumerate(graph.extract_multiple(list(roots), VARIANTS)):
+        for number, form in enumerate(variants):
+            proposed[f"root {index}'s form {number}"] = [*cheapest[:index], form, *cheapest[index + 1:]]
+    written = Candidate("as written", written_seconds.value, function)
+    candidates, seen = [written], set()
+    for name, chosen in proposed.items():
+        if (key := tuple(map(terms.key, chosen))) in seen:
+            continue
+        seen.add(key)
         candidates.append(Candidate(name, _priced(region, chosen, timed),
                                     _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen,
                                                                             strict=True)), tree)))
-    references = candidates if accurate else candidates[:1]
-    admitted = [candidate for candidate in candidates
-                if all(candidate is reference or admits(candidate.function, reference.function)
-                       for reference in references)]
-    return Choice(min(admitted, key=lambda candidate: candidate.seconds), tuple(candidates))
+    candidates.sort(key=lambda candidate: candidate.seconds)
+    references = candidates if accurate else [written]
+    for candidate in candidates:
+        if all(candidate is reference or admits(candidate.function, reference.function)
+               for reference in references):
+            return Choice(candidate, tuple(candidates))
+    raise ValueError("no candidate is as exact as every other: the gate admits none")
 
 
 def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[cost.Seconds]) -> float:
