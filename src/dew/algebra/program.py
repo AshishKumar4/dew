@@ -14,7 +14,7 @@ import inspect
 import math
 import time
 import weakref
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -107,23 +107,70 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
         # rewrite; where the run's numerics admit saturation aids alone (`Rules.aid`: the accurate forms'
         # commutativity), the pass would leave the program as it is.
         accurate = generation.numerics().forms == "accurate"
-        if (not ALGEBRA.value.on or jax_config.disable_jit.value
-                or all(sets.aid for sets in rules.admitted(accurate))):
+        if not _rewriting(accurate) or jax_config.disable_jit.value:
             return fn(*args, **kwargs)
-        statics = {number % len(args) for number in numbers if -len(args) <= number < len(args)}
+        statics = _statics(args, numbers)
         fixed = {name: value for name, value in kwargs.items() if name in names}
-        dynamic = [arg for number, arg in enumerate(args) if number not in statics]
+        dynamic, named = _dynamic(args, kwargs, numbers, names)
 
         def bound(dynamic_args, dynamic_kwargs):
             given = iter(dynamic_args)
             whole = [args[number] if number in statics else next(given) for number in range(len(args))]
             return fn(*whole, **fixed, **dynamic_kwargs)
 
-        named = {name: value for name, value in kwargs.items() if name not in names}
         closed, shaped = jax.make_jaxpr(bound, return_shape=True)(dynamic, named)
         done = rewrite(closed, jax.tree.leaves((dynamic, named)), accurate=accurate, saturation=saturation)
         return jax.tree.unflatten(jax.tree.structure(shaped), done)
     return run
+
+
+def program_of(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
+    """`closed`, a jit's own trace of a program, its bodies and its own math rewritten where the switch is on
+    (`passes`, `rewrite`'s walks): `closed` itself where no rule changes it, so the trace jit made lowers as
+    it is, never staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of
+    its compile). The pass's whole seconds, its walks among them, recorded (`report.record_pass`)."""
+    accurate = generation.numerics().forms == "accurate"
+    if not _rewriting(accurate):
+        return closed
+    began = time.perf_counter()
+    made = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+    kernel_report.record_pass(time.perf_counter() - began)
+    return made
+
+
+def replaying(closed: jcore.Jaxpr, structure, numbers: Iterable[int],
+              names: Iterable[str]) -> Callable:
+    """A function of a program's arguments computing `closed` (its rewritten program, `program_of`) over its
+    dynamic ones (`_dynamic`, as jit reads them), its outputs in `structure`: what a jit of it traces is
+    `closed`'s program."""
+    numbers, names = tuple(numbers), frozenset(names)
+
+    def run(*args, **kwargs):
+        dynamic, named = _dynamic(args, kwargs, numbers, names)
+        return jax.tree.unflatten(structure, eval_jaxpr(closed.jaxpr, closed.consts,
+                                                        *jax.tree.leaves((dynamic, named))))
+    return run
+
+
+def _rewriting(accurate: bool) -> bool:
+    """Whether the pass rewrites here: the switch on, and the run's numerics admitting a set past saturation
+    aids (`Rules.aid`: the accurate forms' commutativity), where the pass would leave a program as it is."""
+    return ALGEBRA.value.on and not all(sets.aid for sets in rules.admitted(accurate))
+
+
+def _statics(args: tuple, numbers: Iterable[int]) -> set[int]:
+    """The positions among `args` the static `numbers` name, one from the end where negative, as jit reads
+    them."""
+    return {number % len(args) for number in numbers if -len(args) <= number < len(args)}
+
+
+def _dynamic(args: tuple, kwargs: Mapping, numbers: Iterable[int],
+             names: Iterable[str]) -> tuple[list, dict]:
+    """A call's dynamic arguments, positional and named, its static ones (`numbers`, `names`) dropped: the
+    values jit traces over, in its order."""
+    statics, names = _statics(args, numbers), frozenset(names)
+    return ([arg for number, arg in enumerate(args) if number not in statics],
+            {name: value for name, value in kwargs.items() if name not in names})
 
 
 def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> list:

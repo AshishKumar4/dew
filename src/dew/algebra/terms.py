@@ -484,7 +484,9 @@ def _typed(dtypes: dict, magnitudes: dict, term: Term, atom, magnitude: Magnitud
 def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
     parameters JAX binds it with by default, read from JAX's own trace of them."""
-    scalar = jnp.ones((), jnp.float32)
+    # An abstract scalar: the pass reads a jit's trace after it is made, where a process compiling for a
+    # device it does not hold (a compile-only GPU) places no array.
+    scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
                                        jnp.log1p(a), jnp.expm1(a)))(scalar)
     return {equation.primitive.name: (equation.primitive, dict(equation.params))
