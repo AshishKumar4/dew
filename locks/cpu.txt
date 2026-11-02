@@ -340,7 +340,9 @@ e2b==2.55.1
     # via dewml (pyproject.toml)
 e2b-dockerfile-utils==0.1.0
     # via e2b
-egglog==14.0.0
+egglog==14.0.0 ; sys_platform != 'linux'
+    # via dewml (pyproject.toml)
+egglog==14.0.0.post1 ; sys_platform == 'linux'
     # via dewml (pyproject.toml)
 einops==0.8.2
     # via
@@ -1339,7 +1341,7 @@ pywin32==312 ; sys_platform == 'win32'
     #   mcp
 pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
     # via keyring
-pywinpty==3.0.5 ; os_name == 'nt' and sys_platform != 'darwin'
+pywinpty==3.0.5 ; os_name == 'nt' and sys_platform != 'darwin' and sys_platform != 'linux'
     # via
     #   jupyter-server
     #   jupyter-server-terminals
