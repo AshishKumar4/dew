@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import grain.python as grain
 import numpy as np
@@ -12,6 +13,7 @@ import pytest
 from data_support import Questioned, WideDraw
 from sampling_gate import assert_draws_as_declared
 
+from dew.batch import EXAMPLES_CONSUMED
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
@@ -776,6 +778,109 @@ class ThirdQuestionRefused:
 
     def __call__(self, row):
         return Rejected("third question") if int(row["question"]) == 2 else row
+
+
+def _members_asked(read: str) -> Dataset:
+    """Two corpora named left and right, 12 records each (ids 1 to 12 and 101 to 112), mixed alike, each
+    record's `id % 3 + 1` questions refused at the third (`Questioned`, `ThirdQuestionRefused`) after the
+    mix, as `read` reads them."""
+    corpora = [Memory([{"id": np.int32(start + index)} for index in range(12)], shard_rows=4).named(name)
+               for name, start in (("left", 1), ("right", 101))]
+    chain = mix(corpora)
+    return (chain.shuffle(seed=5, window=8) if read == "streamed" else chain.shuffle(seed=5)).batch(2)
+
+
+def _member_counts(batches, statistics) -> dict[str, tuple[int, int, int, int]]:
+    """Each member's examples read, the rows its counters say it delivered and refused, and the examples
+    whose last row was refused, by the ids of the rows its batches delivered: every record delivers its
+    first question, so the records read are the ids delivered, those of three questions refused at the
+    third."""
+    seen = {int(identity) for batch in batches for identity in np.asarray(batch["id"])}
+    counts = {}
+    for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
+        read = {identity for identity in members if identity in seen}
+        refused = sum(identity % 3 == 2 for identity in read)
+        counts[name] = (len(read), statistics.get(f"data/rows/{name}", 0),
+                        statistics.get(f"data/rejected/{name}/third question", 0), refused)
+    return counts
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered(read, workers):
+    """A mixture of two named corpora read bounded to 18 of their records, through an objective's questions
+    and a step after the mix that refuses each record's third question: each member's rows (data/rows) are
+    its own source examples whose last rows were delivered, and its rejections the third questions refused
+    of its own records, under its name, so its rows and the examples it counts refused are the records it
+    read; no refusal is the mixture's (row 3312)."""
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+    data = compile(_members_asked(read), objective=objective, read=read,
+                   loading=dataclasses.replace(READ, workers=workers), examples=18)
+    stream = data.train(DataPartition())
+    try:
+        batches = list(stream)
+        statistics = data.statistics()
+    finally:
+        stream.close()
+    counts = _member_counts(batches, statistics)
+    for name, (examples, rows, rejected, refused) in counts.items():
+        assert (rows, rejected) == (examples - refused, refused), name
+    assert sum(examples for examples, *_ in counts.values()) == 18
+    assert not [name for name in statistics if name.startswith("data/rejected/mixture")]
+
+
+def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_counts_them():
+    """The read of `test_a_bounded_mixture_counts_each_members_examples_where_its_rows_are_delivered`,
+    streamed, its position saved after three batches: restored, it delivers the batches the uninterrupted
+    read does after them and ends with its members' counts (row 3312)."""
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+
+    def read():
+        return compile(_members_asked("streamed"), objective=objective, read="streamed", loading=READ,
+                       examples=18)
+
+    whole = read()
+    stream = whole.train(DataPartition())
+    batches = [next(stream) for _ in range(3)]
+    state = stream.get_state()
+    after = list(stream)
+    stream.close()
+    expected = whole.statistics()
+    resumed = read()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    again = list(restored)
+    restored.close()
+    assert [np.asarray(batch["id"]).tolist() for batch in again] == [
+        np.asarray(batch["id"]).tolist() for batch in after]
+    statistics = resumed.statistics()
+    assert {name: value for name, value in statistics.items() if name.startswith("data/r")} == {
+        name: value for name, value in expected.items() if name.startswith("data/r")}
+    assert _member_counts([*batches, *after], expected) == _member_counts([*batches, *again], statistics)
+
+
+def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock():
+    """The streamed read of the resume test above, its position saved after three batches by main
+    87e6e0965, before a mixture's members were counted where their rows are delivered
+    (tests/fixtures/bounded_mixture_position.json): restored, it delivers the batches that read did after
+    them, the read's 18 source examples consumed in all, and counts each member on from what its draws
+    counted, the examples it read since counted where they are delivered (row 3312)."""
+    fixture = Path(__file__).with_name("fixtures") / "bounded_mixture_position.json"
+    recorded = json.loads(fixture.read_text())
+    objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
+    data = compile(_members_asked("streamed"), objective=objective, read="streamed", loading=READ,
+                   examples=18)
+    stream = data.train(DataPartition())
+    stream.set_state(recorded["state"].encode())
+    after = list(stream)
+    stream.close()
+    assert [np.asarray(batch["id"]).tolist() for batch in after] == recorded["after_ids"]
+    consumed = sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in after)
+    before = sum(sum(held) for _, held in recorded["before"])
+    assert before + consumed == 18
+    statistics = data.statistics()
+    assert {f"data/rows/{name}" for name in ("left", "right")} <= set(statistics)
+    assert sum(statistics[f"data/rows/{name}"] for name in ("left", "right")) >= consumed
 
 
 def _asked(read: str, *, shuffled: bool = True) -> Dataset:

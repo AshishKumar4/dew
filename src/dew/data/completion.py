@@ -25,7 +25,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, integers, listed, record
+from dew._records import integer, integers, json_value, listed, record
 from dew.batch import Batch
 from dew.data.pipeline import (
     CONSUMED,
@@ -195,7 +195,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
         self._floor = integer(state["floor"], "the units all drawn")
         self._drawn = set(integers(state["drawn"], "the units drawn"))
         self._held, self._waiting, self._floored = {}, {}, []
-        for entry in listed(state["held"], "held counts", what="a list of held counts"):
+        for entry in listed(state["held"], "held counts", read=json_value, what="a list of held counts"):
             match entry:
                 case [unit, since, consumed, refused, dict(split)]:
                     pairs = {member: integers(held, "a held member's counts")
