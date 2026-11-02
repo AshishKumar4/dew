@@ -706,7 +706,7 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
     (`algebra.seen`)."""
     if spec.form != "spans":
         return None
-    blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key.shape[1]),
+    blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows),
                        block_q, block_k)
     start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
     return _Spans(start, end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo, blocks.q_hi,

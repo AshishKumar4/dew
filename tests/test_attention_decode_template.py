@@ -78,6 +78,43 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
                     f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
 
+PAGE = 128
+"""A paged cache's keys a page: whole key tiles of the derived decode launch's."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["one-query", "verify-four"])
+def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call):
+    """A decode step over a paged cache (`attention.Pages`: pools `[KV, P, page, D]`, each row's pages in an
+    order of its own, some the other row's neighbours), read by the template where its table maps each key
+    tile, on par with the reference path over the cache gathered dense (check 1)."""
+    positions, heads, kv_heads = CALLS[call]
+    spans = _spans(positions)
+    per_row = KEYS // PAGE
+    table = jnp.asarray([[3, 0], [1, 2]], jnp.int32)[:, :per_row]
+    pages = template.Pages(table, PAGE)
+
+    def gathered(pool):
+        # [KV, P, page, D] at each row's pages: [B, K, KV, D].
+        rows = pool[:, table]
+        return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(len(LENGTHS), KEYS, kv_heads, pool.shape[-1])
+
+    def ours(query, key_pool, value_pool):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key_pool, value_pool, spans, interpret=True, pages=pages)
+
+    def reference(query, key_pool, value_pool):
+        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), jnp.bfloat16)
+        pools = (jax.random.normal(stream, (kv_heads, 4, PAGE, 64), jnp.bfloat16) for stream in streams[1:])
+        return query, *pools
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call}", seeds=SEEDS)
+
+
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     """A key head's group of query heads as its rows (`packed`) and back (`unpacked`): the query as it was,
     each packed row's keys its query's."""
