@@ -27,15 +27,15 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
 import dataclasses
 import functools
 
+import attention_inplace_operands as inplace
+import attention_matrix as matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import test_attention_accurate_form as accurate_form
 import test_attention_dropout as dropout
-import test_attention_inplace_operands as inplace
 import test_attention_masked_rows as masked_rows
-import test_attention_matrix as matrix
 import test_attention_mosaic as mosaic
 import test_attention_route as route
 import test_attention_stability as stability
@@ -201,5 +201,6 @@ def test_the_mosaic_template_holds_on_an_h100():
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_routes_hooked_backward_is_on_par_on_an_h100, "sm90"),
+        *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
     ])
 

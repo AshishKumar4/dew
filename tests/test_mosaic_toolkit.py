@@ -260,3 +260,28 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
     assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
     assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
     assert past is None
+
+
+def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
+    """Two zeroed refs of one shape and dtype a launch adds into in place are one value to XLA, which a
+    dynamic-slice fusion wrapping the launch passes once for both (row 3180): `mosaic.checked` refuses the
+    launch where it traces them, and takes them stacked into one ref (`stacked_zeros`), each read back."""
+    launched = mosaic.checked(lambda *operands: None, "probe")
+    shapes = [(2, 3), (2, 3), (4,)]
+
+    def apart():
+        launched(*(jax.new_ref(jnp.zeros(shape, jnp.float32)) for shape in shapes))
+
+    with pytest.raises(ValueError, match="two refs of one shape"):
+        jax.jit(apart).trace()
+
+    groups = mosaic.stacked_groups(shapes)
+
+    def stacked():
+        refs = mosaic.stacked_zeros(shapes, groups)
+        launched(*refs)
+        return mosaic.stacked_read(refs, groups)
+
+    read = jax.jit(stacked)()
+    assert groups == ((0, 1), (2,))
+    assert [array.shape for array in read] == shapes

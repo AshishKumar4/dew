@@ -35,16 +35,23 @@ HEADS = {"mha": (8, 8), "gqa-8-2": (8, 2), "gqa-8-4": (8, 4)}
 """Query heads over key heads, by the `heads` axis's value."""
 BIAS = {"key-bias": template.Kind.KEY, "tile-bias": template.Kind.TILE}
 """The kind of the two parameters a bias hook adds, `s + a + 2 b`."""
+
+
+@functools.cache
+def _masked(mask: str):
+    """A call's spans under `mask`, and the keys each query keeps."""
+    segments = (np.repeat(np.arange(DOCUMENTS, dtype=np.int32), LENGTH // DOCUMENTS)[None]
+                if mask == "documents" else None)
+    causal = mask != "full"
+    spans = template.spans(LENGTH, LENGTH, 1, causal=causal,
+                           segment_ids=None if segments is None else jnp.asarray(segments))
+    return spans, kept(LENGTH, LENGTH, causal=causal, segment_ids=segments)
+
+
 def _case(case: dict[str, str]):
-    """`case`'s call: its operands' shapes and dtype, its spans and the keys they keep, and its hook."""
+    """`case`'s call: its operands' shapes and dtype, its spans and the keys they keep."""
     heads, kv_heads = HEADS[case["heads"]]
-    width = int(case["width"])
-    segments = (jnp.repeat(jnp.arange(DOCUMENTS, dtype=jnp.int32), LENGTH // DOCUMENTS)[None]
-                if case["mask"] == "documents" else None)
-    causal = case["mask"] != "full"
-    spans = template.spans(LENGTH, LENGTH, 1, causal=causal, segment_ids=segments)
-    keep = kept(LENGTH, LENGTH, causal=causal, segment_ids=None if segments is None else np.asarray(segments))
-    return heads, kv_heads, width, jnp.dtype(case["dtype"]), spans, keep
+    return heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"]), *_masked(case["mask"])
 
 
 def _hooks(case: dict[str, str], params: tuple) -> template.Hooks | None:
@@ -100,11 +107,11 @@ def _backward_op(case: dict[str, str]):
     key = jnp.zeros((1, LENGTH, kv_heads, width), dtype)
     params = tuple(jnp.zeros(_param_shape(BIAS[case["hook"]], heads), jnp.float32) for _ in range(2)
                    ) if case["hook"] in BIAS else ()
+    residuals = _residuals(query.shape)
     natural, accurate = _form(case)
     natural = attention_mosaic.NATURAL if natural is None else natural
-    op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query,
-                                               _residuals(query.shape), scale=None, natural=natural,
-                                               accurate=accurate)
+    op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query, residuals,
+                                               scale=None, natural=natural, accurate=accurate)
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
@@ -162,8 +169,11 @@ def _step(case: dict[str, str], spans, *, reference: bool):
         def attended(query, key, value, *params):
             hooks = _hooks(case, params)
             if reference:
-                return template.reference(query, key, value, spans, hooks)
-            return attention_route.attend(query, key, value, spans, hooks, natural=natural, accurate=accurate)
+                out = template.reference(query, key, value, spans, hooks)
+            else:
+                out = attention_route.attend(query, key, value, spans, hooks, natural=natural,
+                                             accurate=accurate)
+            return jnp.asarray(out)
 
         out, pull = jax.vjp(attended, query, key, value, *params)
         return (out, *pull(dout.astype(out.dtype)))
@@ -189,29 +199,30 @@ def _drawn(case: dict[str, str]):
 
 
 CASES = (
-    ('sm90', '64', 'mha', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
-    ('sm90', '128', 'gqa-8-2', 'full', 'key-bias', 'two', 'float16', 'accurate'),
-    ('sm80', '256', 'gqa-8-4', 'documents', 'tile-bias', 'two', 'bfloat16', 'fast'),
-    ('sm80', '64', 'mha', 'causal', 'softcap', 'two', 'float16', 'accurate'),
-    ('sm90', '256', 'gqa-8-2', 'full', 'plain', 'shared-keys', 'bfloat16', 'fast'),
-    ('sm90', '128', 'gqa-8-4', 'documents', 'plain', 'two', 'float16', 'accurate'),
-    ('sm80', '128', 'mha', 'causal', 'key-bias', 'two', 'bfloat16', 'fast'),
-    ('sm90', '256', 'mha', 'causal', 'tile-bias', 'two', 'float16', 'accurate'),
-    ('sm90', '64', 'gqa-8-2', 'documents', 'softcap', 'two', 'bfloat16', 'fast'),
-    ('sm80', '64', 'gqa-8-2', 'full', 'tile-bias', 'two', 'bfloat16', 'accurate'),
-    ('sm90', '64', 'gqa-8-4', 'causal', 'key-bias', 'two', 'float16', 'fast'),
-    ('sm90', '128', 'gqa-8-4', 'full', 'plain', 'one', 'bfloat16', 'fast'),
-    ('sm90', '128', 'mha', 'full', 'softcap', 'two', 'bfloat16', 'fast'),
-    ('sm90', '256', 'mha', 'documents', 'key-bias', 'two', 'bfloat16', 'fast'),
-    ('sm90', '64', 'gqa-8-2', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '256', 'gqa-8-4', 'causal', 'plain', 'two', 'float32', 'fast'),
+    ('sm80', '64', 'mha', 'full', 'key-bias', 'two', 'bfloat16', 'accurate'),
+    ('sm90', '128', 'gqa-8-2', 'documents', 'tile-bias', 'two', 'float16', 'accurate'),
+    ('sm90', '64', 'gqa-8-2', 'full', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm80', '128', 'mha', 'causal', 'softcap', 'two', 'float16', 'fast'),
+    ('sm80', '64', 'gqa-8-4', 'documents', 'softcap', 'two', 'float32', 'accurate'),
     ('sm90', '256', 'mha', 'causal', 'plain', 'shared-keys', 'bfloat16', 'fast'),
-    ('sm90', '256', 'gqa-8-4', 'causal', 'softcap', 'two', 'bfloat16', 'fast'),
-    ('sm90', '128', 'mha', 'causal', 'tile-bias', 'two', 'bfloat16', 'fast'),
+    ('sm80', '256', 'gqa-8-2', 'causal', 'key-bias', 'two', 'float16', 'accurate'),
+    ('sm90', '128', 'gqa-8-4', 'full', 'key-bias', 'two', 'float32', 'fast'),
+    ('sm80', '256', 'mha', 'documents', 'tile-bias', 'two', 'bfloat16', 'fast'),
+    ('sm90', '64', 'gqa-8-4', 'causal', 'tile-bias', 'two', 'float16', 'fast'),
+    ('sm90', '128', 'gqa-8-4', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '256', 'gqa-8-2', 'full', 'softcap', 'two', 'bfloat16', 'fast'),
+    ('sm80', '64', 'mha', 'full', 'plain', 'two', 'float16', 'accurate'),
+    ('sm90', '64', 'mha', 'full', 'tile-bias', 'two', 'float32', 'fast'),
+    ('sm90', '64', 'gqa-8-2', 'documents', 'plain', 'two', 'float32', 'fast'),
+    ('sm90', '256', 'gqa-8-2', 'full', 'plain', 'shared-keys', 'bfloat16', 'fast'),
+    ('sm90', '64', 'mha', 'causal', 'plain', 'one', 'bfloat16', 'fast'),
+    ('sm90', '64', 'mha', 'documents', 'key-bias', 'two', 'bfloat16', 'fast'),
     ('sm90', '256', 'gqa-8-4', 'causal', 'plain', 'shared-keys', 'bfloat16', 'fast'),
-    ('sm80', '64', 'mha', 'causal', 'plain', 'two', 'bfloat16', 'fast'),
 )
-"""The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
-(`kernel_matrix.covering("attention")`, regenerated where the axes or the route's support change)."""
+"""The cells' cases, each its axis values in `AXES`' order: the cases ledger rows name and every pair of axis
+values the route serves (`kernel_matrix.covering("attention")`, regenerated where the axes or the route's
+support change)."""
 
 
 @cell("attention", covers=lambda case: dict(zip(AXES["attention"], case, strict=True)))
@@ -224,10 +235,11 @@ def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     named = dict(zip(AXES["attention"], case, strict=True))
     heads, _, _, _, spans, keep = _case(named)
     config = pin_of(named)
-    pins = {attention_mosaic.MosaicBackward: config} if config is not None else {}
 
     def ours(*operands):
-        with tuning.pinned(pins):
+        if config is None:
+            return _step(named, spans, reference=False)(*operands)
+        with tuning.pinned({attention_mosaic.MosaicBackward: config}):
             return _step(named, spans, reference=False)(*operands)
 
     terms = terms_of(keep, heads, kind=BIAS.get(named["hook"]),
