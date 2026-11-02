@@ -522,6 +522,17 @@ class KVStore:
             scale = None if scale is None else self._gathered(scale)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
+    def _absolute(self, table: jax.Array) -> jax.Array:
+        """A grouped pool's table `[rows, pages a row]` indexing the whole pool: each group's rows' pages
+        past the start of the group's part (`grouped`), as a kernel over one pool reads them; an ungrouped
+        pool's as it is."""
+        groups = self.layout.groups
+        if groups == 1:
+            return table
+        part = self._get(self.payloads[0][0]).shape[1] // groups
+        starts = jnp.arange(table.shape[0], dtype=table.dtype) // (table.shape[0] // groups) * part
+        return table + starts[:, None]
+
     def _gathered(self, pool: jax.Array) -> jax.Array:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
@@ -579,7 +590,7 @@ class KVStore:
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
-        arrays = (query, pools[0], pools[-1], lengths, self._get(TABLE),
+        arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
                   *given, *sunk)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
@@ -680,9 +691,6 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('quantized', lambda case: not case.quantized,
                 "the template's decode reads 16-bit pages; a quantized pool is read through the gather",
                 row='ledger 3624'),
-    Requirement('groups', lambda case: case.groups == 1,
-                "a grouped pool keeps each group's pages where they are, which the gather reads",
-                row='ledger 3624'),
     Requirement('dtype', lambda case: case.dtype == case.pool and case.pool in (jnp.bfloat16, jnp.float16),
                 lambda case: f"the template's decode reads a 16-bit query over pages of its dtype, not "
                              f"{case.dtype} over {case.pool}", row='ledger 3624'),
@@ -698,7 +706,8 @@ TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
 )
 """The attention template's decode over the pages (`attention_decode.attend`'s `table`): a GPU's paged
 step where Dew's Pallas kernel turns the pool down (its values narrower than its keys, a 16-bit query of
-fp16), its derivatives at every order the gathered attention's (`template_paged`)."""
+fp16, a pool split into groups, read through its table's pages past each group's part's start,
+`KVStore._absolute`), its derivatives at every order the gathered attention's (`template_paged`)."""
 
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
