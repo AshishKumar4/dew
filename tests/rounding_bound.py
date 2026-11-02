@@ -183,7 +183,8 @@ def _narrows(equation, inputs) -> bool:
         return False
     if not jnp.issubdtype(source, jnp.floating):
         value = inputs[0]
-        if not isinstance(value, jax.core.Tracer) and np.any(np.abs(np.asarray(value, np.float64)) >= 2 ** 24):
+        concrete = not isinstance(value, jax.core.Tracer)
+        if concrete and np.any(np.abs(np.asarray(value, np.float64)) >= 2 ** 24):
             raise ValueError("an integer of 2^24 or more converts to float32 with rounding the bound does "
                              "not weigh")
         return False
