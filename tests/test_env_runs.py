@@ -265,6 +265,22 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped_and_keeps_what_it_trai
         run.override({"trainer.steps": 8, **trained}).prepare().train("stopped")
 
 
+def test_a_dreamer_run_resumed_in_a_later_phase_trains_on_and_at_another_horizon_is_refused(tmp_path):
+    """A DreamerV3 run trained to its second update and resumed under its name in a later phase of its
+    training, drawing longer windows at a lower entropy (SkyDreamer's last phases), trains on to its fourth:
+    the rollout and the entropy are how it learns. Resumed again at another horizon, which says what its
+    critic estimates, it is refused."""
+    run = student(tmp_path, 2)
+    run.prepare().train("phased")
+    later = dataclasses.replace(
+        run, rollout=RolloutConfig("dreamer", {"batch": 8, "length": 16, "train_ratio": 16.0, "prefill": 16,
+                                               "capacity": 64}),
+        objective=ObjectiveConfig(DREAMER_V3, {"entropy": 1e-5}))
+    assert int(later.override({"trainer.steps": 4}).prepare().train("phased").step) == 4
+    with pytest.raises(ValueError):
+        later.override({"trainer.steps": 6, "objective.horizon": 100.0}).prepare().train("phased")
+
+
 @pytest.fixture(scope="module")
 def saved_teacher(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("teacher")
