@@ -728,35 +728,63 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
 
 
 def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_target(tmp_path):
-    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`) are the programs
-    loaded after saving, each an executable this host's CPU is no target of: loading them here is refused,
-    naming the GPU kind it is not (ledger 2716: an H100 node loads what a CPU host built, and runs it
-    alone)."""
+    """Named programs compiled ahead for a GPU this CPU host lacks (`compile_programs`), one of them reading
+    no argument, are the programs loaded after saving, each an executable this host's CPU is no target of:
+    loading them here is refused, naming the GPU kind it is not (ledger 2716: an H100 node loads what a CPU
+    host built, and runs it alone)."""
     from dew.training.ahead import AheadPrograms, BuildTarget, compile_programs
 
     square = jax.ShapeDtypeStruct((128, 128), jnp.float32)
     built = compile_programs({"dot": (lambda x, y: x @ y, [square, square]),
-                              "scaled": (lambda x: 2 * x, [square])}, "sm90")
-    assert set(built.programs) == {"dot", "scaled"}
+                              "iota": (lambda: jnp.arange(8.0), [])}, "sm90")
+    assert set(built.programs) == {"dot", "iota"}
     assert (built.target.generation, built.target.devices) == ("sm90", 1)
     built.save(tmp_path / "programs.dew-aot")
     loaded = AheadPrograms.load(tmp_path / "programs.dew-aot")
     assert loaded == built
     with pytest.raises(ValueError, match="device_kind"):
         loaded.loaded()
-    assert built.target.differences(BuildTarget.of(jax.devices()))
+    here = BuildTarget.of(jax.devices())
+    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "device_kind"]
 
 
-def test_a_process_held_to_loaded_programs_refuses_a_compile_and_runs_what_was_compiled():
-    """Within `executable_only`, a function jitted anew fails rather than compiles, and an executable compiled
-    before runs; past it, jitting compiles again (ledger 2716: a node measuring programs compiled ahead fails
-    where one is missing)."""
+def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
+    """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
+    compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
+    the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
+    missing)."""
+    import threading
+
     from dew.training.ahead import ExecutableOnly, executable_only
 
     x = jnp.arange(8.0)
     compiled = jax.jit(lambda value: value * 3).lower(x).compile()
+    traced = jax.jit(lambda value: value * 5).trace(x)
+    lowered = jax.jit(lambda value: value * 7).lower(x)
+    elsewhere = []
     with executable_only():
         assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
-        with pytest.raises(ExecutableOnly):
-            jax.jit(lambda value: value + 1)(x)
+        for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
+            with pytest.raises(ExecutableOnly):
+                step()
+        thread = threading.Thread(target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
+        thread.start()
+        thread.join()
+    assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
     assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+
+
+def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path):
+    """A run given `dumps` writes its compiles under that directory, a child process's too, and nothing where
+    it compiled nothing (`compiled_in`): the gate of a run of programs compiled ahead (ledger 2716)."""
+    import subprocess
+    import sys
+
+    from dew.training.ahead import compiled_in, dumps
+
+    child = "import jax; jax.jit(lambda x: x + 1)(1.0)"
+    compiling = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {child!r}], check=True)"
+    for name, script in (("compiles", compiling), ("computes", "import numpy; numpy.arange(8.0).sum()")):
+        environment = dumps(tmp_path / name, {**os.environ, "JAX_PLATFORMS": "cpu"})
+        subprocess.run([sys.executable, "-c", script], env=environment, check=True)
+    assert compiled_in(tmp_path / "compiles") and compiled_in(tmp_path / "computes") == []
