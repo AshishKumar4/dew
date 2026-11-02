@@ -83,13 +83,7 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
         cotangent = cotangent.astype(jnp.bfloat16)
 
     def paged(query, key, value, sinks):
-        # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here, its
-        # derivatives' gathered attention on xla, which this host runs.
-        on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla", decode="xla"))
-        with contextlib.ExitStack() as stack:
-            for context in on_gpu if kernel == "template_paged" else ():
-                stack.enter_context(context)
-            return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
+        return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
 
     def plain(query, key, value, sinks):
         # Each row's pages in its table's order, `[rows, keys, key heads, D]`, each key head read by two
@@ -102,5 +96,12 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
         weights = jax.nn.softmax(jnp.concatenate([logits, sunk], axis=-1), axis=-1)[..., :-1]
         return jnp.einsum("rhk,rkhd->rhd", weights, values)
 
-    assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge}",
-                    truth_fn=plain, plain_fn=plain)
+    # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here, its
+    # derivatives' gathered attention on xla, which this host runs: over every order's tracing, whose rules
+    # trace past the call's own.
+    on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla", decode="xla"))
+    with contextlib.ExitStack() as stack:
+        for context in on_gpu if kernel == "template_paged" else ():
+            stack.enter_context(context)
+        assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge}",
+                        truth_fn=plain, plain_fn=plain)
