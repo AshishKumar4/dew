@@ -90,7 +90,7 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
 ], ids=["private cache size", "public compile count"])
 def test_a_read_of_jaxs_private_cache_size_is_reported(lint, body, reported, tmp_path):
     """SLOP021: a jitted function's private `_cache_size` is read nowhere; its compiles are counted
-    through the public compile event (`dew.telemetry.instrumentation.Compiles`)."""
+    through the public compile event (`dew.telemetry.compiles.Compiles`)."""
     assert reported_in_tests(lint, tmp_path, body, "SLOP021") is reported
 
 

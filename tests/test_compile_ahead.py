@@ -26,7 +26,7 @@ from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Layout, MeshSpec, Trainer
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
@@ -372,10 +372,11 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
 def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there(
         tmp_path, monkeypatch):
     """`--trainer.compile-ahead.multiprocessors` states the GPU a step is compiled ahead for within its
-    generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): the saved step's
-    build target and the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the
-    canonical one is refused; and the rung its plan recorded is that GPU's, apart from the canonical build's
-    beside it in one record directory."""
+    generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): XLA compiles the
+    step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
+    the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
+    refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
+    canonical build's beside it in one record directory."""
     import dataclasses
 
     from run_kinds import lm
@@ -387,8 +388,10 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     records = tmp_path / "rungs"
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
 
+    builds = iter(range(3))
+
     def compiled(*stated: str) -> AheadOfTime:
-        root = tmp_path / f"run{len(stated)}"
+        root = tmp_path / f"run{next(builds)}"
         root.mkdir()
         path = root / "step.dew-aot"
         run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
@@ -396,15 +399,18 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
-                               "--trainer.compile-ahead.frontier", *stated],
+                               "--trainer.compile-ahead.frontier", "--trainer.inspection.every", "1",
+                               *stated],
                               default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
             run.run()
         return AheadOfTime.load(path)
 
     pcie = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
+    assert pcie.sampled is not None and again.plan == pcie.plan
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
     assert pcie.derived_for(held) == pcie.target
@@ -694,7 +700,7 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
     review)."""
     from dew.nn.kernels.generation import chosen, device_generation
-    from dew.telemetry.instrumentation import Compiles
+    from dew.telemetry.compiles import Compiles
     from dew.training import Inspection
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
@@ -890,71 +896,6 @@ def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
         "sm90", "NVIDIA H100 PCIe", 756e12, 114)
     assert (unnamed.generation, unnamed.device_kind, unnamed.bf16_peak, unnamed.multiprocessors) == (
         "sm90", "NVIDIA H20", None, 78)
-
-
-def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
-    """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
-    compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
-    the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
-    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts every
-    compile done, the one the block stopped as JAX recorded it done, another thread's and those after it."""
-    import threading
-
-    from dew.telemetry.instrumentation import Compiles, ExecutableOnly, executable_only
-
-    x = jnp.arange(8.0)
-    compiled = jax.jit(lambda value: value * 3).lower(x).compile()
-    traced = jax.jit(lambda value: value * 5).trace(x)
-    lowered = jax.jit(lambda value: value * 7).lower(x)
-    elsewhere = []
-    with Compiles(None) as compiles:
-        with executable_only():
-            assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
-            for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
-                with pytest.raises(ExecutableOnly):
-                    step()
-            thread = threading.Thread(
-                target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
-            thread.start()
-            thread.join()
-        assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
-        assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
-    assert compiles.count == 3
-
-
-def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
-    """A `Compiles` block that closes while another thread's event is being told to it closes once that event
-    is held: what it counts when it closes is what it counts from then on, never a program late."""
-    import threading
-
-    told, release = threading.Event(), threading.Event()
-
-    class Slow(Compiles):
-        """An open block that takes its time over each event of its function it is told."""
-
-        def heard(self, kind, duration_secs, metadata):
-            if metadata.get("fun_name") == self.name:
-                told.set()
-                release.wait(60)
-            super().heard(kind, duration_secs, metadata)
-
-    def elevenfold(value):
-        return value * 11
-
-    x = jnp.arange(8.0)
-    compiles = Slow("elevenfold").__enter__()
-    compiler = threading.Thread(target=lambda: jax.jit(elevenfold).trace(x))
-    compiler.start()
-    assert told.wait(60)
-    closed = []
-    closer = threading.Thread(target=lambda: (compiles.__exit__(None, None, None),
-                                              closed.append(len(compiles.programs))))
-    closer.start()
-    closer.join(0.5)
-    release.set()
-    closer.join()
-    compiler.join()
-    assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
 
 
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,

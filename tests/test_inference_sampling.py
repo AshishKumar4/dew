@@ -22,7 +22,7 @@ from dew.inference import TextGeneration, tasks
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling
 from dew.sampling.text import generate
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 
 
 @pytest.fixture

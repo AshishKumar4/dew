@@ -15,7 +15,7 @@ from test_plan import LIMIT, free, needs, one_device
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import MeshSpec, Trainer
 from dew.training.planning import PlanRefused
 

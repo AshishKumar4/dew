@@ -9,7 +9,7 @@ loop is an implicit transfer, and a device-to-host one also waits on every
 step dispatched before it, so the host stops running ahead of the device.
 
 `steady_state` checks both over a block. It counts the programs JAX traces
-and compiles inside it (`dew.telemetry.instrumentation.Compiles`, over
+and compiles inside it (`dew.telemetry.compiles.Compiles`, over
 jax.monitoring's `/jax/core/compile` events; a persistent-cache hit still
 counts as a compile), and runs it under
 `jax.transfer_guard("disallow")`, which refuses implicit transfers and lets
@@ -32,7 +32,7 @@ from collections.abc import Iterator, Sequence
 
 import jax
 
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 
 
 @contextlib.contextmanager

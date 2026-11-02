@@ -1,6 +1,6 @@
 """Step FLOP measurement, MFU accounting and the persistent compilation cache's counts; the programs a jitted
 function needs (`Compiles`) and the processes held to loaded programs (`executable_only`) are
-`dew.telemetry.compiles`', named here too.
+`dew.telemetry.compiles`'.
 
 The FLOP count is read off the optimized HLO, not out of XLA's
 `cost_analysis()`. Cost analysis reports only the operations the compiler can
@@ -25,11 +25,6 @@ import jax
 import numpy as np
 
 from dew.nn.kernels.generation import gpu_target
-# JAX's compile events and the blocks that hear them, which callers name from here as well.
-from dew.telemetry.compiles import Compiles as Compiles
-from dew.telemetry.compiles import ExecutableOnly as ExecutableOnly
-from dew.telemetry.compiles import Program as Program
-from dew.telemetry.compiles import executable_only as executable_only
 from dew.telemetry.trace import collective
 
 _cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}

@@ -378,7 +378,7 @@ def test_autoencoders_of_one_module_share_its_programs():
     """An autoencoder's encode and decode are the process's programs over its module
     (`dew.nn.kernels.options.program`): a second load of one module encodes and decodes with no compile
     of its own, and its frames come back bit for bit as the first's."""
-    from dew.telemetry.instrumentation import Compiles
+    from dew.telemetry.compiles import Compiles
 
     first, second = tiny_vae(), tiny_vae()
     frames = jax.random.uniform(jax.random.key(1), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0)

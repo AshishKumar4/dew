@@ -30,7 +30,7 @@ import sys
 from dew.training.ahead import compile_programs
 from ahead_programs import programs
 
-compile_programs(programs(sys.argv[1]), sys.argv[1]).save(sys.argv[2])
+compile_programs(programs(sys.argv[1]), sys.argv[1], int(sys.argv[3])).save(sys.argv[2])
 """
 RUN = """
 import pickle
@@ -39,7 +39,7 @@ import sys
 import jax
 import numpy as np
 
-from dew.telemetry.instrumentation import executable_only
+from dew.telemetry.compiles import executable_only
 from dew.training.ahead import AheadPrograms
 
 loaded = AheadPrograms.load(sys.argv[1]).loaded()
@@ -114,7 +114,9 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
     # Built where no GPU is visible, as a CPU host builds them.
-    build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot")]
+    # For this GPU: its generation and its own multiprocessors.
+    build = [sys.executable, str(tmp_path / "build.py"), generation, str(tmp_path / "programs.dew-aot"),
+             str(own.multiprocessors)]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     arrays = {name: [np.asarray(array) for array in drawn] for name, drawn in arguments(generation).items()}
     (tmp_path / "arguments.pkl").write_bytes(pickle.dumps(arrays))
@@ -138,9 +140,9 @@ def test_a_step_compiled_ahead_for_this_gpu_trains_here_and_is_refused_where_xla
     """A trainer's step compiled ahead for this GPU's generation and saved trains from it in a fresh process
     of this environment, and a fresh process whose XLA computes otherwise is refused by the trainer's loader,
     naming the flag: the one rule every loader holds (row 3606)."""
-    generation = BuildTarget.of(jax.devices()[:1]).generation
+    own = BuildTarget.of(jax.devices()[:1])
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    target = MeshSpec().build(compile_only_gpus(generation, 1))
+    target = MeshSpec().build(compile_only_gpus(own.generation, 1, multiprocessors=own.multiprocessors))
     compile_ahead(fine_tune(target, xla=True), batch).save(tmp_path / "step.dew-aot")
     (tmp_path / "train.py").write_text(TRAIN)
     environment = environment_of(tmp_path)

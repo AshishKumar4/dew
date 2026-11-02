@@ -582,9 +582,8 @@ class AheadTarget:
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        target = None if ":" in self.generation else built_target(self.generation, self.multiprocessors)
         ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples), self.capacity,
-                              frontier=self.frontier, target=target)
+                              frontier=self.frontier)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -646,8 +645,7 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None, *, frontier: bool = False,
-                                   target: GpuTarget | None = None) -> AheadOfTime:
+                                   capacity: int | None = None, *, frontier: bool = False) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -657,10 +655,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
     every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
     among (the module's docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
-    than measured. `target` is the GPU of the generation the mesh's compile-only GPUs were built for
-    (`built_target`; `compile_only_gpus`' multiprocessors), the generation's own where None: what the step's
-    launches derive for and what it records. Profiling, tuning and rollout require execution and are
-    refused."""
+    than measured. The GPU it compiles for is the one the mesh's compile-only GPUs state, as XLA compiles
+    over them: their generation and multiprocessors (`compile_only_gpus`' `multiprocessors`, `built_target`),
+    which the step's launches derive for and it records. Profiling, tuning and rollout require execution and
+    are refused."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
@@ -677,10 +675,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          f"{sorted({device.device_kind for device in devices})}")
     (generation,) = generations
     on_tpus = platforms == {"tpu"}
-    if target is not None and (on_tpus or target.generation != generation):
-        raise ValueError(f"the stated target {target.device_kind} ({target.generation}) is no GPU of this "
-                         f"mesh's {generation}")
-    stated = None if on_tpus else target or built_target(generation)
+    # The GPU XLA compiles for, as its compile-only devices state it.
+    stated = None if on_tpus else built_target(generation, devices[0].core_count)
     if capacity is not None and on_tpus:
         raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
                          "capacity")
@@ -690,9 +686,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
-        # The GPU the caller stated (`target`), as its devices were built: the generation's own where none.
-        devices = compile_only_gpus(generation, len(devices), capacity,
-                                    None if target is None else target.multiprocessors)
+        devices = compile_only_gpus(generation, len(devices), capacity, stated.multiprocessors)
         trainer.mesh = trainer.device_mesh = trainer.state_mesh = jax.sharding.Mesh(
             np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()

@@ -26,7 +26,7 @@ from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
 ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
