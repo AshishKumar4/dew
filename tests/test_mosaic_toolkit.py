@@ -411,3 +411,26 @@ def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
         with generation.assumed(name):
             found = resources.plan([launch], family, generation.gpu_target())
         assert found is not None and found[0].programs == most, name
+
+
+def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_flight():
+    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer shaped as the 27B gated
+    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers): one program five deep, 184
+    KiB in flight, where its most programs, two one deep, held 74 KiB and slowed its walk
+    (`resources.hidden`); a launch of one stage, 64 KiB at 128 registers, its most programs, three (their
+    75 KiB shares and 136-register raises hold it, four's 56 KiB and 104 do not), thrice one's bytes in
+    flight."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    def launch(fixed: int, step: int, registers: int, most: int) -> resources.Launch:
+        def scope(stages: int) -> resources.Scope:
+            return resources.Scope(program=(plgpu.SMEM((fixed + stages * step,), jnp.uint8),))
+
+        return resources.Launch(scope, consumers=1, registers=registers, floor=1, most=most)
+
+    with generation.assumed("sm90"):
+        family, target = bundles.of("sm90", jnp.bfloat16), generation.gpu_target()
+        (states,) = resources.plan([launch(42016, 36912, 96, 8)], family, target)
+        (single,) = resources.plan([launch(65536, 0, 128, 1)], family, target)
+    assert (states.programs, states.stages) == (1, 5)
+    assert (single.programs, single.stages) == (3, 1)
