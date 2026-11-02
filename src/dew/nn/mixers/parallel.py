@@ -46,9 +46,11 @@ class ParallelMixers(nn.Module):
 
     @property
     def reads(self) -> frozenset[str]:
-        """The `MIXING` fields any branch reads (`dew.nn.backbones.decoder_block.ReadsMixing`): the call
-        carries each of them to every branch, and a branch reads only its own."""
-        return frozenset().union(*(mixer.reads for mixer in self.mixers if isinstance(mixer, ReadsMixing)))
+        """The `MIXING` fields every branch reads (`dew.nn.backbones.decoder_block.ReadsMixing`; one that
+        declares none reads none): the call carries each to every branch, so a field one branch would not
+        read is one the block refuses, rather than a restriction that branch would drop."""
+        return frozenset.intersection(*(mixer.reads if isinstance(mixer, ReadsMixing) else frozenset()
+                                        for mixer in self.mixers))
 
     @property
     def reads_train(self) -> bool:
@@ -87,9 +89,10 @@ class ParallelMixers(nn.Module):
 class ParallelMixer(MixerBase):
     """Several mixer kinds side by side in one layer (`ParallelMixers`), each `ParallelBranch` its own
     mixer under its name, at the layer's geometry: a parallel hybrid, Falcon-H1's Mamba-2 beside its
-    attention. What a branch keeps or refuses, the layer keeps or refuses: its cache, its remat marks,
-    its mixed serving step, its generation. A branch that routes experts or computes by its layer's
-    index is refused, as the layer replays one routing record and hands its depth to one mixer."""
+    attention. What a branch keeps, reads or refuses, the layer keeps, reads or refuses: its cache, its
+    layer's index (`reads_depth`, which the call hands every branch), its remat marks, its mixed serving
+    step, its generation. A branch that routes experts is refused, as the layer replays one routing
+    record, for its feed-forward."""
 
     branches: tuple[ParallelBranch, ...] = ()
 
@@ -97,11 +100,10 @@ class ParallelMixer(MixerBase):
         names = [branch.name for branch in self.branches]
         if len(names) < 2 or len(set(names)) != len(names):
             raise ValueError(f"a parallel mixer runs two or more branches of distinct names, got {names}")
-        for branch in self.branches:
-            if isinstance(branch.mixer, ParallelMixer) or branch.mixer.reads_depth:
-                raise ValueError(f"branch {branch.name!r} runs {type(branch.mixer).__name__}, which nests "
-                                 "branches or computes by its layer's index; give each branch a mixer of one "
-                                 "kind that reads no depth")
+
+    @property
+    def reads_depth(self) -> bool:
+        return any(branch.mixer.reads_depth for branch in self.branches)
 
     @property
     def keeps_triton_gemm(self) -> bool:

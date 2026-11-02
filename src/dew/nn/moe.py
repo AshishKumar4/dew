@@ -246,6 +246,10 @@ class Router(nn.Module):
     """The least a renormalization divides the chosen weights by (ERNIE 4.5's `moe_norm_min`, which
     clamps their sum from below where a biased selection picks weights that sum to less): above 0, the
     chosen weights divide by `max(sum + weight_sum_epsilon, weight_sum_min)`, a softmax's too."""
+    excluded_group_score: float | None = None
+    """What an expert outside a token's best groups is chosen by (`expert_groups`): None for nothing, never
+    chosen, or the score its reference fills in, DeepSeek V3's and A.X-K2's 0.0 (`masked_fill(..., 0.0)`,
+    modeling_axk2.py:340), which a best group's experts biased below zero rank under."""
     logit_softcap: float | None = None
     """Where set, the cap `c` of each gate logit, `tanh(logit / c) * c` before its scores, in float32 as
     the logits are (Laguna's `moe_router_logit_softcapping`, modeling_laguna.py:174-175); every reader of
@@ -368,7 +372,8 @@ class Router(nn.Module):
             raise ValueError("only a hash router reads the token ids")
         selection = self.selection(scores, media, blocks)
         if self.expert_groups > 1:
-            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+            fill = -jnp.inf if self.excluded_group_score is None else self.excluded_group_score
+            selection = jnp.where(self.group_mask(selection), selection, fill)
         _, indices = jax.lax.top_k(selection, self.top_k)
         return indices
 
@@ -1036,6 +1041,7 @@ class SparseMLP(nn.Module):
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
     weight_sum_min: float = 0.0
     router_softcap: float | None = None
+    excluded_group_score: float | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
@@ -1085,7 +1091,8 @@ class SparseMLP(nn.Module):
                            routing_block=self.routing_block,
                            block_experts=self.block_experts,
                            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
-                           logit_softcap=self.router_softcap, hash_vocab=self.hash_vocab,
+                           logit_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
+                           hash_vocab=self.hash_vocab,
                            init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features

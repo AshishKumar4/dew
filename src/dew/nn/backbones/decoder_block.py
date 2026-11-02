@@ -70,6 +70,9 @@ class NormSpec:
     gated_layers: Literal['every', 'routed'] = 'every'
 
 
+PRE_NORMS = ('input_layernorm', 'post_attention_layernorm')
+"""The norms before a block's sublayers, which a norm's gate may scale (`NormSpec.gate_rank`)."""
+
 NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
               'post_per_layer_input_norm', 'embedding_layernorm', 'norm', 'head_norm')
 """The decoder's norms a `NormSpec` may change, by the module name each is built under."""
@@ -90,6 +93,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
         eps = epsilon if spec.eps is None else spec.eps
+        if spec.gate_rank is not None and name not in PRE_NORMS:
+            raise ValueError(f"{name} takes no gate: a gated norm is a pre-norm, one of {PRE_NORMS}")
         gated = spec.gate_rank is not None and (spec.gated_layers == 'every' or routed)
         if kind == 'rms':
             norm = functools.partial(
@@ -163,7 +168,8 @@ class Mixture:
     adds to their sum (`moe.WEIGHT_SUM_EPSILON`, DeepSeek's; LFM2-MoE's 1e-6),
     and `weight_sum_min` the least it divides by (ERNIE 4.5's `moe_norm_min`,
     `Router.weight_sum_min`). `router_softcap` caps the gate logits (Laguna's,
-    `Router.logit_softcap`).
+    `Router.logit_softcap`), and `excluded_group_score` is what an expert outside
+    a token's best groups is chosen by (`Router.excluded_group_score`).
     """
 
     experts: int
@@ -180,6 +186,7 @@ class Mixture:
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
     weight_sum_min: float = 0.0
     router_softcap: float | None = None
+    excluded_group_score: float | None = None
     routing_block: int | None = None
     block_experts: int | None = None
     scale_inputs: bool = False
@@ -241,7 +248,7 @@ class Mixture:
                 or self.bias_in_weights or self.routing_block is not None
                 or self.scale_inputs or self.shared_features or self.latent_features is not None
                 or self.weight_sum_epsilon != WEIGHT_SUM_EPSILON or self.weight_sum_min
-                or self.router_softcap is not None):
+                or self.router_softcap is not None or self.excluded_group_score is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
                 "score function, scaling, groups, balancing bias, routing blocks, input scaling, "
@@ -294,7 +301,8 @@ class Mixture:
                                          'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
                                          'latent_features', 'latent_norm', 'media_bias',
-                                         'weight_sum_epsilon', 'weight_sum_min', 'router_softcap')
+                                         'weight_sum_epsilon', 'weight_sum_min', 'router_softcap',
+                                         'excluded_group_score')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:
@@ -322,7 +330,8 @@ class Mixture:
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
             weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
-            router_softcap=self.router_softcap, media_bias=self.media_bias, routing_block=self.routing_block,
+            router_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
+            media_bias=self.media_bias, routing_block=self.routing_block,
             block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
             shared=None if not self.shared_features else functools.partial(
@@ -698,6 +707,17 @@ class DecoderBlock(nn.Module):
             'per_layer_projection': (self.per_layer_input_dim, self.emb_features)}
 
     @nn.nowrap
+    def _pre_norms(self) -> tuple[str, ...]:
+        """The pre-norms (`PRE_NORMS`) the block builds: the mixer's where its wiring norms the stream and
+        the layer norms its attention's input, the feed-forward's where it has one that no norm shared
+        with the mixer reads."""
+        normed = self.wiring.pre_norms or self.wiring.residual_norms
+        return tuple(site for site, built in (
+            ('input_layernorm', normed and self.attention_norm),
+            ('post_attention_layernorm', normed and self.feedforward is not None
+             and not self.wiring.shared_parallel_norm)) if built)
+
+    @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
         if self.engram is not None:
             raise MissingFlopsCount("DecoderBlock needs its memory-extension geometry")
@@ -706,11 +726,10 @@ class DecoderBlock(nn.Module):
             if factory is not None:
                 count += counter(factory(parent=None), lengths)
         count += sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-        # A gated norm's gate maps the width down to its rank and back (`dew.nn.norms.NormGate`).
-        for site, spec in (self.norms or {}).items():
-            built = site == 'input_layernorm' or (site == 'post_attention_layernorm'
-                                                  and self.feedforward is not None)
-            if built and spec.gate_rank is not None and (spec.gated_layers == 'every' or self.routed):
+        # A gated pre-norm's gate maps the width down to its rank and back (`dew.nn.norms.NormGate`).
+        for site in self._pre_norms():
+            spec = (self.norms or {}).get(site, NormSpec())
+            if spec.gate_rank is not None and (spec.gated_layers == 'every' or self.routed):
                 count += 2 * projection_flops(lengths, self.emb_features, spec.gate_rank)
         if self.laurel_rank is not None:
             count += LaurelBlock(self.emb_features, self.laurel_rank, parent=None).model_flops(lengths)
@@ -758,11 +777,11 @@ class DecoderBlock(nn.Module):
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        normed = self.wiring.pre_norms or self.wiring.residual_norms
-        if normed and self.attention_norm:
+        built = self._pre_norms()
+        if 'input_layernorm' in built:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if normed and self.feedforward is not None and not self.wiring.shared_parallel_norm:
+        if 'post_attention_layernorm' in built:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.wiring.residual_norms and (self.hyper_connections is not None or self.altup is not None
                                            or self.residual_site is not None or self.laurel_rank is not None

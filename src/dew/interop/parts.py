@@ -135,6 +135,9 @@ def _rope(config, *, partial: bool = False) -> Mapping[str, object]:
 # Readers: each takes the part's view and returns the CausalTransformer fields its code states. A
 # field several parts state must agree (`assemble`); per-layer facts go under `_LAYER`.
 _LAYER = '_layer'
+_SITE = '_site'
+"""A per-layer fact of the module a part sits under in its layer (`model.layers.N.<site>`), filed under that
+site's canonical name (`_Assembler.sites`): A.X-K2's gated norms, each its own site's."""
 
 
 def _read_causal_lm(view: PartView) -> Mapping[str, object]:
@@ -620,12 +623,14 @@ def _read_lfm2_moe_router(view: PartView) -> Mapping[str, object]:
 
 def _read_grouped_router(view: PartView) -> Mapping[str, object]:
     """DeepSeek V3's router (GLM-4.7-Flash's): sigmoid scores in float32 plus its correction bias,
-    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best),
-    weighted by score, renormalized where `norm_topk_prob`, times `routed_scaling_factor`."""
+    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best), an
+    expert outside them by 0.0 (`excluded_group_score`), weighted by score, renormalized where
+    `norm_topk_prob`, times `routed_scaling_factor`."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
                      'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
                      'scaling': float(view.routed_scaling_factor), 'bias': True,
-                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group)}}
+                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group),
+                     'excluded_group_score': 0.0}}
 
 
 def _read_latent_attention(view: PartView) -> Mapping[str, object]:
@@ -663,36 +668,24 @@ def _read_indexer_norm(view: PartView) -> Mapping[str, object]:
     return {}
 
 
-def _read_gated_norm_layer(view: PartView) -> Mapping[str, object]:
-    """A.X-K2's layer: Llama's, its norms each an RMS norm or one gated by a low-rank map of its own output
-    (AXK2GatedRMSNorm, its gate `mlp`): before its attention on every layer, before its feed-forward on its
-    routed layers alone; a per-layer fact of each gated norm's rank (`_with_norm_gates`)."""
-    gates = {}
-    for site in ('input_layernorm', 'post_attention_layernorm'):
-        children = dict(getattr(view, site).named_children())
-        if 'mlp' in children:
-            gates[site] = int(children['mlp'].fc1.out_features)
-    return {_LAYER: {'norm_gates': gates}} if gates else {}
-
-
 def _read_norm_gate(view: PartView) -> Mapping[str, object]:
-    """A gated norm's gate (AXK2GateMLP): `fc2(silu(fc1(y)))`, unbiased (`dew.nn.norms.NormGate`)."""
+    """A gated norm's gate (AXK2GateMLP, under AXK2GatedRMSNorm): `fc2(silu(fc1(y)))`, unbiased
+    (`dew.nn.norms.NormGate`); a fact of its norm's site, its rank (`_with_norm_gates`)."""
     import torch
 
     if not isinstance(view.activation_fn, torch.nn.SiLU) or _biased(view.fc1, view.fc2):
         raise Ambiguous("the norm's gate is not an unbiased silu map")
-    return {}
+    return {_SITE: {'gate_rank': int(view.fc1.out_features)}}
 
 
 def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
     """A.X-K2's router: DeepSeek V3's (`_read_grouped_router`), which chooses within groups only where its
     config states `n_group`."""
-    grouped = view.num_group is not None
+    if view.num_group is not None:
+        return _read_grouped_router(view)
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
                      'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
-                     'scaling': float(view.routed_scaling_factor), 'bias': True,
-                     'groups': int(view.num_group) if grouped else 1,
-                     'groups_per_token': int(view.topk_group) if grouped else 1}}
+                     'scaling': float(view.routed_scaling_factor), 'bias': True}}
 
 
 def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, object]:
@@ -866,8 +859,11 @@ _AXK2 = 'transformers.models.axk2.modeling_axk2'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
-_LAYER_CHILDREN: Children = {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'input_layernorm': ('norm',),
-                             'post_attention_layernorm': ('norm',)}
+_LAYER_CHILDREN: Children = {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
+                             **dict.fromkeys(('input_layernorm', 'post_attention_layernorm'),
+                                             ('norm', 'gated_block_norm'))}
+"""A Llama-shaped layer's children: its norms plain, or gated by a low-rank map of their own output
+(A.X-K2's, whose layer computes Llama's)."""
 _ATTENTION_CHILDREN: Children = dict.fromkeys(('q_proj', 'k_proj', 'v_proj', 'o_proj'), ('linear',))
 _SHARED_MOE_CHILDREN: Children = {'gate': ('router',), 'experts': ('experts',), 'shared_experts': ('shared',)}
 _LATENT_CHILDREN: Children = {
@@ -876,13 +872,6 @@ _LATENT_CHILDREN: Children = {
     **dict.fromkeys(('q_a_layernorm', 'kv_a_layernorm'), ('latent_norm',))}
 
 KNOWN: tuple[KnownPart, ...] = (
-    # Ahead of Llama's layer, whose forward this one's computes alike: it reads either's norms, plain or
-    # gated.
-    KnownPart('layer', f'{_AXK2}:AXK2DecoderLayer',
-              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
-               **dict.fromkeys(('input_layernorm', 'post_attention_layernorm'),
-                               ('norm', 'gated_block_norm'))},
-              _read_gated_norm_layer),
     KnownPart('causal_lm', f'{_LLAMA}:LlamaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
     KnownPart('causal_lm', f'{_MIXTRAL}:MixtralForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
@@ -1252,6 +1241,8 @@ def _load_names(model: PreTrainedModel, inventory: Collection[str] | None
 class _Assembler:
     def __init__(self, config: PretrainedConfig):
         self.config = config
+        self.layer_paths: dict[int, str] = {}
+        self.sites: dict[int, dict[str, dict[str, object]]] = {}
         self.fields: dict[str, object] = {}
         self.layers: dict[int, dict[str, object]] = {}
         self.names: dict[str, tuple[str, Mapping[str, str]]] = {}
@@ -1261,12 +1252,17 @@ class _Assembler:
         self.flat: set[str] = set()
         self.constants: set[str] = set()
 
-    def state(self, fields: Mapping[str, object], where: str, layer: int | None) -> None:
+    def state(self, fields: Mapping[str, object], where: str, layer: int | None, canonical: str) -> None:
         for key, value in fields.items():
-            if key == _LAYER:
+            if key in (_LAYER, _SITE):
                 if layer is None:
-                    raise Ambiguous(f"{where} routes outside a layer")
-                self.layers.setdefault(layer, {}).update(_records.record(value, _LAYER))
+                    raise Ambiguous(f"{where} states a layer's fact outside a layer")
+                if key == _LAYER:
+                    self.layers.setdefault(layer, {}).update(_records.record(value, _LAYER))
+                else:
+                    site = canonical.removeprefix(f'{self.layer_paths[layer]}.').partition('.')[0]
+                    held = self.sites.setdefault(layer, {}).setdefault(site, {})
+                    held.update(_records.record(value, _SITE))
             elif key in self.fields and self.fields[key] != value:
                 raise Ambiguous(f"{where} states {key}={value!r} where another part states "
                                 f"{self.fields[key]!r}")
@@ -1283,11 +1279,12 @@ class _Assembler:
             if not isinstance(module, torch.nn.ModuleList):
                 raise Ambiguous(f"{path} holds its layers in a {type(module).__name__}")
             for index, child in enumerate(module):
+                self.layer_paths[index] = f'{canonical}.{index}'
                 self.walk(child, ('layer',), f'{path}.{index}', f'{canonical}.{index}', index)
             return 'layers'
         part, renaming = identify(module, roles)
         view = PartView(module, renaming, self.config)
-        self.state(part.read(view), path or type(module).__name__, layer)
+        self.state(part.read(view), path or type(module).__name__, layer, canonical)
         # The head is tied where it is the table's own parameter, as the source holds it.
         if part.role == 'embedding' or (part.role == 'linear' and canonical == 'lm_head'):
             table = 'embedding' if part.role == 'embedding' else 'head'
@@ -1373,8 +1370,7 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads', 'parallel',
-                                              'norm_gates')))
+                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads', 'parallel')))
                   for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
@@ -1384,7 +1380,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
         # state them (DeepSeek's routing, HY-3's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
                                                 'groups', 'groups_per_token', 'weight_sum_epsilon',
-                                                'weight_sum_min', 'router_softcap') if key in mixture}
+                                                'weight_sum_min', 'router_softcap', 'excluded_group_score')
+                  if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
@@ -1393,8 +1390,9 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
         fields.setdefault('mlp_features', width)
     heads = {layer: facts['heads'] for layer, facts in assembler.layers.items() if 'heads' in facts}
     fields.update(_with_head_counts(fields, heads))
-    gates = {layer: facts['norm_gates'] for layer, facts in assembler.layers.items() if 'norm_gates' in facts}
-    fields.update(_with_norm_gates(fields, gates, routed))
+    gates = {layer: {site: stated['gate_rank'] for site, stated in sites.items() if 'gate_rank' in stated}
+             for layer, sites in assembler.sites.items()}
+    fields.update(_with_norm_gates(fields, {layer: held for layer, held in gates.items() if held}, routed))
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")

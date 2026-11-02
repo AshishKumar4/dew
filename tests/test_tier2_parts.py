@@ -16,7 +16,6 @@ import pytest
 import torch
 from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
 from reference_error import as_given, assert_as_exact
-from selection_margins import stable_top_k
 
 from dew.interop import Pretrained, parts
 from dew.interop.verify import VerifiedMapping, scatter_weights, verify_mapping
@@ -535,7 +534,7 @@ BUILT_IN = {
     "axk2": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8, "num_experts_per_tok": 2,
              "n_shared_experts": 1, "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
              "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "n_group": 2, "topk_group": 1,
-             "routed_scaling_factor": 1.8, "index_n_heads": 4, "index_head_dim": 16, "index_topk": 6,
+             "routed_scaling_factor": 1.8, "index_n_heads": 16, "index_head_dim": 16, "index_topk": 6,
              "gated_norm_rank": 4,
              "rope_parameters": {"rope_type": "yarn", "rope_theta": 10000.0, "factor": 2.0, "beta_fast": 32.0,
                                  "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0,
@@ -543,7 +542,7 @@ BUILT_IN = {
     "axk2-ungrouped": {"model_type": "axk2", "head_dim": None, "num_key_value_heads": 4,
                        "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 1,
                        "moe_intermediate_size": 32, "q_lora_rank": 24, "kv_lora_rank": 16,
-                       "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "index_n_heads": 4,
+                       "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16, "index_n_heads": 16,
                        "index_head_dim": 16, "index_topk": 6, "gated_norm_rank": 4},
     "laguna-per-channel": {"model_type": "laguna", "gating": "per-element",
                            "layer_types": ["sliding_attention", "full_attention"] * 2,
@@ -723,12 +722,13 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
 
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
-    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case)
-    # A lightning indexer's top-k ends in ties of keys it scores zero, which the reference breaks as Dew.
-    with stable_top_k():
-        assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                        torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
-                        truth_fn=torch_logits(wide, float64))
+    # The references select by torch's top-k, which breaks no tie as Dew's does: a draw a tie decides is
+    # none that clears.
+    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case,
+                               stable=False)
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
+                    truth_fn=torch_logits(wide, float64))
 
 
 LAGUNA_XS = {
