@@ -504,7 +504,7 @@ def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lo
     params = variables["params"]
     placed = muon_partition(params)
     shapes = {jax.tree_util.keystr(path): leaf.shape
-              for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
+              for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(params))}
     sizes = {path: math.prod(shape) for path, shape in shapes.items()}
     hidden = {path for path, shape in shapes.items()
               if len(shape) == 2 and "embed_tokens" not in path and "lm_head" not in path}
