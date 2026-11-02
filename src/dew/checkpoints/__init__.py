@@ -184,13 +184,32 @@ def is_uri(path: str) -> bool:
     return '://' in path
 
 
+REPLICA_SLICE_BYTES = 1 << 20
+"""The least a replica writes of a replicated array under replica-parallel saving (Orbax's
+`min_slice_bytes_for_replica_parallel`): a slice below it costs its device a slice program's dispatch,
+its first at a shape a compile, more than its share of the copy saves (a MiB moves in some 40 us over
+PCIe 4), so one replica writes such an array whole. A cell over eight CPU devices saved 30 s of its 119
+(the rCM UNet's, 11-02)."""
+
+
+def _registry() -> ocp.type_handlers.TypeHandlerRegistry:
+    """Orbax's standard type handlers, its arrays' split across replicas only into slices of at least
+    `REPLICA_SLICE_BYTES`."""
+    arrays = ocp.type_handlers.ArrayHandler(min_slice_bytes_for_replica_parallel=REPLICA_SLICE_BYTES)
+    return ocp.type_handlers.create_type_handler_registry(
+        *((kind, ocp.type_handlers.get_type_handler(kind)) for kind in ocp.type_handlers.supported_types()
+          if kind is not jax.Array), (jax.Array, arrays))
+
+
 def _handler(**options) -> ocp.PyTreeCheckpointHandler:
     """Orbax's pytree handler as every save of Dew's takes it: moving its arrays to pinned host memory
     with an explicit copy before it reads them, on every backend whose devices have that memory (a
     CPU's do, as a GPU's), which Orbax leaves to GPUs by default. Its implicit read instead would be
     refused under a steady state's transfer guard (tests/steady_state.py), which Dew's JAX build holds
-    a CPU array's reads to as a GPU's."""
-    return ocp.PyTreeCheckpointHandler(enable_pinned_host_transfer=True, **options)
+    a CPU array's reads to as a GPU's. Its arrays split across replicas only into slices worth it
+    (`_registry`), unless `options` name a registry of their own."""
+    return ocp.PyTreeCheckpointHandler(enable_pinned_host_transfer=True,
+                                       **{"type_handler_registry": _registry(), **options})
 
 
 ORDERED_DIRECTORIES = AsyncOptions(create_directories_asynchronously=False)
