@@ -109,7 +109,7 @@ def label_scores(token_scores: Callable, prompts: Sequence[Sequence[int]], label
 
 def label_accuracy(scores, answers: Sequence[int]) -> float:
     """The share of prompts whose highest-scoring label (`label_scores`) is their answer, by index."""
-    scores, answers = np.asarray(scores), np.asarray(answers)
-    if scores.shape[0] != answers.shape[0]:
-        raise ValueError(f"one answer a prompt: {scores.shape[0]} prompts, {answers.shape[0]} answers")
-    return float(np.mean(np.argmax(scores, axis=1) == answers))
+    held, chosen = np.asarray(scores), np.asarray(answers)
+    if held.shape[0] != chosen.shape[0]:
+        raise ValueError(f"one answer a prompt: {held.shape[0]} prompts, {chosen.shape[0]} answers")
+    return float(np.mean(np.argmax(held, axis=1) == chosen))
