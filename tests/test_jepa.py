@@ -483,7 +483,8 @@ def test_a_run_bounded_in_examples_averages_its_target_by_the_momentum_at_its_pr
     pictures = np.asarray(images(batch=16), np.uint8)
     rows = Memory([{"image": picture, "label": np.int32(index % 4)}
                    for index, picture in enumerate(pictures)])
-    state = trainer.fit(rows.batch(8), examples=16, log_every=1, checkpoint_final=False)
+    # Streamed, so no plan counts its steps ahead and the run reads its progress off its examples clock.
+    state = trainer.fit(rows.read("streamed").batch(8), examples=16, log_every=1, checkpoint_final=False)
     assert int(state.updates) == 2
     live = jax.tree.leaves(state.variables["params"]["context_encoder"])
     target = jax.tree.leaves(state.ema["params"]["context_encoder"])
