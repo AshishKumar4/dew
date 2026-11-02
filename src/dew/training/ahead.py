@@ -294,7 +294,9 @@ class AheadOfTime:
         return self.loaded()
 
 
-PHASE_FLAGS = ("--xla_dump", "--xla_gpu_dump", "--xla_gpu_load_autotune_results",
+DUMP_FLAGS = ("--xla_dump", "--xla_enable_dumping", "--xla_gpu_dump")
+"""XLA_FLAGS that decide whether and what XLA dumps, which `dumps` sets for a run alone."""
+PHASE_FLAGS = (*DUMP_FLAGS, "--xla_gpu_load_autotune_results",
                "--xla_gpu_require_complete_aot_autotune_results", "--xla_gpu_per_fusion_autotune_cache_dir")
 """XLA_FLAGS of one phase's own (where a run dumps, what a build loads), which compute nothing a program
 does."""
@@ -302,9 +304,10 @@ does."""
 
 def computation_flags(flags: str | None = None) -> tuple[str, ...]:
     """The XLA flags, `XLA_FLAGS` by default, that decide what a program computes (Dew's rounding and
-    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in one order."""
+    division, dew/__init__.py, among them): every one but a phase's own (`PHASE_FLAGS`), in their order, as
+    XLA reads a flag given twice by its last value."""
     given = os.environ.get("XLA_FLAGS", "") if flags is None else flags
-    return tuple(sorted(flag for flag in given.split() if not flag.startswith(PHASE_FLAGS)))
+    return tuple(flag for flag in given.split() if not flag.startswith(PHASE_FLAGS))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,19 +450,34 @@ def executable_only() -> Iterator[None]:
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
-    """`environment` for a run whose every compile, in it or any process it starts, its compilers write under
-    `directory`: XLA's (`--xla_dump_to`) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin
-    compile writes nothing of XLA's). A run of programs compiled ahead leaves both empty (`compiled_in`)."""
+    """`environment` for a run whose every compile, in it or any process it starts from any directory, its
+    compilers write under `directory`: XLA's (`--xla_dump_to`, dumping on and unfiltered, whatever the
+    environment said of it) and Mosaic GPU's own (`MOSAIC_GPU_DUMP_TO`, whose PTX-to-cubin compile writes
+    nothing of XLA's). A run of programs compiled ahead leaves both empty (`compiled_in`). Refused where
+    either cannot be written, as a compiler that cannot write its dump compiles on."""
+    root = directory.resolve()
     for part in ("xla", "mosaic"):
-        (directory / part).mkdir(parents=True, exist_ok=True)
-    flags = environment.get("XLA_FLAGS", "")
-    return {**environment, "XLA_FLAGS": f"{flags} --xla_dump_to={directory / 'xla'}".strip(),
-            "MOSAIC_GPU_DUMP_TO": str(directory / "mosaic")}
+        (root / part).mkdir(parents=True, exist_ok=True)
+        if not os.access(root / part, os.W_OK | os.X_OK):
+            raise PermissionError(f"{root / part} cannot be written, where a run's compiles go")
+    given = environment.get("XLA_FLAGS", "").split()
+    flags = [flag for flag in given if not flag.startswith(DUMP_FLAGS)]
+    kept = {name: value for name, value in environment.items() if not name.startswith("MOSAIC_GPU_DUMP")}
+    dumping = [*flags, "--xla_enable_dumping=true", f"--xla_dump_to={root / 'xla'}"]
+    return {**kept, "XLA_FLAGS": " ".join(dumping), "MOSAIC_GPU_DUMP_TO": str(root / "mosaic")}
 
 
 def compiled_in(directory: Path) -> list[Path]:
-    """What the compilers of a run given `dumps(directory, ...)` wrote: none where nothing compiled."""
-    return sorted(path for path in directory.rglob("*") if path.is_file())
+    """What the compilers of a run given `dumps(directory, ...)` wrote: none where nothing compiled. Refused
+    where `directory` is not one `dumps` made, or cannot be read, never read as empty."""
+    root = directory.resolve()
+    if missing := [part for part in ("xla", "mosaic") if not (root / part).is_dir()]:
+        raise FileNotFoundError(f"{root} holds no {', '.join(missing)} dump directory: dumps made none here")
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    return sorted(Path(top) / name for top, _, names in os.walk(root, onerror=unreadable) for name in names)
 
 
 @contextlib.contextmanager
