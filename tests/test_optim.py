@@ -22,7 +22,7 @@ from flax import linen as nn
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
-from optim_support import LR, decoder_params, drawn_tree
+from optim_support import LR, decoder_draw, decoder_params, drawn_axes, drawn_tree
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -35,7 +35,7 @@ from sharded import collectives
 from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
 from torch_layout import node
 
-from dew.batch import coordinates
+from dew.batch import coordinates, unboxed
 from dew.gauss_newton import RowEquations
 from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -84,10 +84,23 @@ def test_cosine_uses_its_explicit_horizon_when_the_run_has_no_step_cap():
         Cosine(peak_value=1.0, warmup_steps=2).schedule(None)
 
 
-def dit_params():
+def dit_draw():
+    """A small DiT's init, its parameters in the boxes its modules declare their axes in."""
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                       mlp_ratio=1)
-    return nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,))))
+    return model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
+
+
+def dit_params():
+    return unboxed(dit_draw())
+
+
+@pytest.fixture(autouse=True)
+def axes_of_the_drawn_trees():
+    """The axes the decoder and the DiT these tests step were drawn in, which Dew's Muon reads from the
+    run's table as a trainer holds it."""
+    with drawn_axes(decoder_draw(), dit_draw()):
+        yield
 
 
 def muon_solver(forms: str = "accurate", optimizer: str = "muon", **kwargs):
@@ -500,11 +513,14 @@ def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lo
 
     config = json.loads((FIXTURES / "hf" / "qwen35-0.8b" / "config.json").read_text())["text_config"]
     model = models.build("causal_transformer", {**translate_config(config), "dtype": "float32"})
-    variables = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
+    drawn = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
+    variables = unboxed(drawn)
     params = variables["params"]
-    placed = muon_partition(params)
+    with drawn_axes(drawn):
+        placed = muon_partition(params)
+        state = jax.eval_shape(OptimConfig(optimizer="muon", learning_rate=1e-3).build(4).init, variables)
     shapes = {jax.tree_util.keystr(path): leaf.shape
-              for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(params))}
+              for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
     sizes = {path: math.prod(shape) for path, shape in shapes.items()}
     hidden = {path for path, shape in shapes.items()
               if len(shape) == 2 and "embed_tokens" not in path and "lm_head" not in path}
@@ -513,7 +529,6 @@ def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lo
     assert sum(sizes[path] for path in hidden) / total > 0.5
     convolutions = [reason for path, reason in placed.items() if "conv1d" in path and len(shapes[path]) == 3]
     assert convolutions and all(reason.startswith("adamw: a per-channel filter") for reason in convolutions)
-    state = jax.eval_shape(OptimConfig(optimizer="muon", learning_rate=1e-3).build(4).init, variables)
     assert jax.tree.leaves(state)
 
 
@@ -563,14 +578,16 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
     loss curve is the only place it would show.
     """
     experts, embed, mlp = 3, 8, 16
-    params = {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
-        'kernel': jnp.zeros((experts, embed, mlp))}}}}}}
+    drawn = {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
+        'kernel': nn.LogicallyPartitioned(jnp.zeros((experts, embed, mlp)), ('exp', 'embed', 'mlp'))}}}}}}
+    params = unboxed(drawn)
     path = ('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel')
-    spec = node(muon_weight_dimension_numbers(params), path)
-    assert spec.reduction_axis == (1,) and spec.output_axis == (2,)
+    with drawn_axes(drawn):
+        spec = node(muon_weight_dimension_numbers(params), path)
+        assert spec.reduction_axis == (1,) and spec.output_axis == (2,)
 
-    assert_updates_as(muon_solver(), ExpertByExpert(optax.contrib.muon(LR)), params, [path],
-                      "an expert stack, one expert at a time")
+        assert_updates_as(muon_solver(), ExpertByExpert(optax.contrib.muon(LR)), params, [path],
+                          "an expert stack, one expert at a time")
 
 
 class ExpertByExpert(typing.NamedTuple):
@@ -648,13 +665,15 @@ def test_the_router_gate_takes_the_adamw_update():
     router on AdamW along with the embeddings and the head. The same axis
     name leads the expert kernels, where it stacks matrices, so position is
     what tells the two apart."""
-    params = {'params': {'layers_0': {'mlp': {'gate': {
-        'kernel': jnp.zeros((8, 4))}}}}}
+    drawn = {'params': {'layers_0': {'mlp': {'gate': {
+        'kernel': nn.LogicallyPartitioned(jnp.zeros((8, 4)), ('embed', 'exp'))}}}}}
+    params = unboxed(drawn)
     path = ('params', 'layers_0', 'mlp', 'gate', 'kernel')
-    assert node(muon_weight_dimension_numbers(params), path) is None
+    with drawn_axes(drawn):
+        assert node(muon_weight_dimension_numbers(params), path) is None
 
-    assert_updates_as(muon_solver(), optax.adamw(LR, nesterov=True, weight_decay=0.0), params, [path],
-                      "the router gate")
+        assert_updates_as(muon_solver(), optax.adamw(LR, nesterov=True, weight_decay=0.0), params, [path],
+                          "the router gate")
 
 
 # --------------------------------------------------------------------------
