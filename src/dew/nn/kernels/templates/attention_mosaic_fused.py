@@ -98,7 +98,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
             dq_ref, dkv_ref, *refs = refs
-            dk_ref, dv_ref = dkv_ref.at[0], dkv_ref.at[1]
+            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], ((0, 1),))
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
         k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
