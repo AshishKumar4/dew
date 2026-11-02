@@ -216,7 +216,9 @@ def plain_text_rope(text: Mapping[str, object]) -> dict:
             section = _records.integers(entry.pop("mrope_section"), "mrope_section")
             _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
             if sum(section) != head_dim // 2:
-                raise ValueError(f"mrope_section {section} must cover the {head_dim // 2} channel pairs")
+                raise ValueError(f"mrope_section {section} covers {sum(section)} channel pairs, not the "
+                                 f"{head_dim // 2} each head rotates: pass a config whose mrope_section "
+                                 f"sums to {head_dim // 2}")
             if entry.get("type") == "mrope":
                 entry["type"] = "default"
             if entry.get("rope_type") == "mrope":

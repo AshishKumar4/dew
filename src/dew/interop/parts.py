@@ -367,7 +367,8 @@ def _read_fused_mlp(view: PartView) -> Mapping[str, object]:
     first, `chunk(2)`), read as the two (`KnownPart.split`)."""
     fused = view.gate_up_proj
     if fused.out_features % 2:
-        raise Ambiguous("the fused gate and up projection holds an odd number of rows")
+        raise Ambiguous(f"the fused gate and up projection holds {fused.out_features} rows, which split into "
+                        "no equal gate and up halves, so no gated MLP of Dew's reads it")
     return {'mlp': gated_activation(view.activation_fn), 'mlp_features': fused.out_features // 2,
             'mlp_bias': _biased(fused, view.down_proj)}
 
@@ -892,7 +893,8 @@ def _load_names(model: PreTrainedModel, inventory: Collection[str] | None
     names = sources.load_names(model, inventory)
     if names is None:
         raise Ambiguous("its checkpoint conversion renames a key by whether another is stored, and no "
-                        "inventory of the checkpoint is given")
+                        "inventory of the checkpoint is given: pass the checkpoint's stored tensor names "
+                        "(`inventory`)")
     prefix = model.base_model_prefix
 
     def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
