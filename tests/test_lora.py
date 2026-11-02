@@ -45,7 +45,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
-from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
+from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path, unboxed
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -198,6 +198,22 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
     for before, after in zip(*leaves[FROZEN], strict=True):
         np.testing.assert_array_equal(before, after)
     assert all(np.any(before != after) for before, after in zip(*leaves["params"], strict=True))
+
+
+def test_an_adapter_whose_targets_differ_along_a_scanned_run_draws_its_model_afresh(decoder):
+    """A model an adapter targets unlike along a run of like layers, a factor pair of its own a layer
+    (ranks a module or a layer apart, a module adapted in some layers alone), draws its every parameter
+    afresh as its scanned forward reads them: its draw keeps those layers apart, as the forward keeps a
+    held tree's apart by its leaves (`StackView.layer_structures`), where it drew the run under one scan
+    that stacks one pair over all of them and refused it."""
+    adapter = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0)
+    first = next(path for path in adapter.targets if "layers_0" in path)
+    targets = {**adapter.targets, first: Target(rank=4, alpha=8.0)}
+    differing = Adapter.bound(decoder.model, adapter.variables, targets, adapter.rslora, adapter.dropout,
+                              adapter.layouts)
+    drawn = unboxed(jax.eval_shape(differing.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+    ranks = {path: np.shape(_subtree(drawn, (*path, "lora_A")))[-1] for path in targets}
+    assert ranks == {path: target.rank for path, target in targets.items()}
 
 
 def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, reference, tmp_path):
