@@ -702,6 +702,22 @@ def test_the_settings_a_pytest_a_test_runs_in_its_process_reads_are_the_tests_in
     assert reused() == [False]
 
 
+def test_the_registrations_a_conftests_configure_reads_are_every_files_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A conftest's own pytest_configure reading the marker registrations (`config.getini("markers")`) makes them
+    an input of the files it configures (review: a conftest's hook ran before the recorder's, and its read went
+    unseen), so a registration it needs reruns them when it changes."""
+    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "conftest.py": "def pytest_configure(config):\n"
+                       "    assert any('tidy' in line for line in config.getini('markers'))\n",
+        "test_plain.py": "def test_plain():\n    pass\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
 def test_a_marker_a_helper_looks_up_and_no_test_carries_is_its_importers_input(
         ci, tmp_path, monkeypatch, cache_worker):
     """A marker a helper looks up but never applies is its importer's input (review of the reuse-keys head):

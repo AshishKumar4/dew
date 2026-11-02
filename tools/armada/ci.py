@@ -1511,46 +1511,33 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     container = Container(fresh=fresh)
     common = shared(python)
     names, kept = kept_of(tests)
-    whole_files = {name: at for (name, group), at in kept.items() if not group}
-    groups = [(name, group, at) for (name, group), at in kept.items() if group]
-    # Every row the cache holds, the whole files' and the kept groups', looked up from one reading before any
-    # file runs: a run may change the checkout a later lookup would read (review).
+    # One row a file the task runs whole (in `split`) or a kept group, in order, each with where its green run
+    # is kept (None for a file it runs with nothing kept), run by one loop with one cutoff (review).
+    entries = [(name, split, kept.get((name, ""))) for name in names] + [
+        (name, group, at) for (name, group), at in kept.items() if group]
+    # Every row the cache holds looked up from one reading before any file runs: a run may change the checkout
+    # a later lookup would read (review).
     reading = Reading()
-    found = looked_up(python, names, split, common, whole_files, cache, release, reading)
-    held = {(name, group): looked_up(python, [name], group, common, {name: at}, cache, release, reading)
-            for name, group, at in groups}
-    # The files run in what the lookups left of the deadline, as each group after them does (review).
-    left = deadline - (time.monotonic() - began)
-    code = tested(python, names, split, out, left, cache, grace, common, started, coverage, whole=whole,
-                  release=release, kept=whole_files, container=container, found=found)
+    held = [looked_up(python, [name], part, common, {name: at} if at else {}, cache, release, reading)
+            for name, part, at in entries]
+    rows, code = [], 0
+    for index, ((name, part, at), found) in enumerate(zip(entries, held, strict=True)):
+        if found:
+            rows += found
+            continue
+        # A row past the deadline is not run: red as its deadline cut it off (`tested`, `file_row`).
+        piece = out.with_name(f"{out.name}.{index}")
+        left = deadline - (time.monotonic() - began)
+        code = max(code, tested(python, [name], part, piece, left, cache, grace, common, started, coverage,
+                                whole=whole, release=release, kept={name: at} if at else {},
+                                container=container, found=[]))
+        rows += json.loads(piece.read_text())["rows"]
+    out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
     site = SITE.fullmatch(split)
-    if site and site["start"] is not None and any(found["exitCode"]
-                                                  for found in json.loads(out.read_text())["rows"]):
+    if site and site["start"] is not None and any(found["exitCode"] for found in rows):
         return 1
-    if not groups:
-        return code
-    rows = json.loads(out.read_text())["rows"]
-    for index, (name, group, at) in enumerate(groups, start=1):
-        remaining = deadline - (time.monotonic() - began)
-        if held[(name, group)]:
-            rows += held[(name, group)]
-            continue
-        if remaining <= 0:
-            # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
-            # as a row its task's deadline cut off is (review).
-            rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
-                         "output": f"{INTERRUPTED} of {deadline:.0f} s before this group was read or run",
-                         "tests": {}, "ynn_switched": [], "cells": {},
-                         "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
-            continue
-        part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, remaining, cache, grace, common, started,
-                                coverage, whole=whole, release=release, kept={name: at},
-                                container=container, found=[]))
-        rows += json.loads(part.read_text())["rows"]
-    out.write_text(json.dumps({"rows": rows}))
     return code
 
 

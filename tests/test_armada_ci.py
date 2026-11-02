@@ -1958,7 +1958,6 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
         (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
     outputs = [row["output"] for row in rows]
-    assert all("before this group was read or run" in output for output in outputs[1:]), outputs
     assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False], outputs
     # Every group was looked up before the first ran.
     assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
@@ -2092,7 +2091,7 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
-def test_a_kept_task_reuses_each_files_own_row_where_files_run_the_same_code_and_names_every_file_once(
+def test_a_kept_task_reuses_each_files_own_row_where_files_share_one_key_and_names_every_file_once(
         ci, tmp_path, monkeypatch, cache_worker):
     """Files whose runs execute the same code, each importing the others and collecting one shared test, keep
     a row each: a kept task reuses each file's own green row (`green_key`), runs none of them again, and names
@@ -2106,16 +2105,18 @@ def test_a_kept_task_reuses_each_files_own_row_where_files_run_the_same_code_and
         others = "".join(f"import test_{other}\n" for other in "abc" if other != name)
         return head + others + "from shared_case import test_shared\n"
 
+    # Each run also reads the three files whole, so each key covers the same files (`inputs`): one key.
     shared = ("from pathlib import Path\ndef test_shared(request):\n"
+              "    assert all(Path(f'tests/test_{n}.py').read_text() for n in 'abc')\n"
               "    with Path('runs-' + request.module.__name__[-1]).open('a') as runs: runs.write('x')\n")
     written(tmp_path, {"shared_case.py": shared, **{f"test_{name}.py": body(name) for name in "abc"}})
     armada_task(ci, monkeypatch, verdict)
-    # Each ran first in a fresh container, so each keeps a key; a key covers its own file whole (`inputs`), so
-    # the three differ though their runs executed the same code.
+    # Each ran first in a fresh container, so each keeps a key, and each read and ran the same files: one key,
+    # whose rows a kept task still tells apart by their place (`green_key`).
     common = ci.shared("3.12")
     keys = [ci.recorded(ci.record_key("3.12", f"3.12:tests/test_{name}.py", ci.device_class(), common),
                         "token")["key"] for name in "abc"]
-    assert None not in keys and len(set(keys)) == 3, keys
+    assert None not in keys and len(set(keys)) == 1, keys
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
