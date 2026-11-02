@@ -23,7 +23,8 @@ WEIGHED_SEEDS = 8
 REDRAW stage the unweighted check stays undecided on every arm below that its rows do not decide."""
 
 NULL_RUNS = 64
-"""The null control's runs: the reference against itself on disjoint draws, judged as a weighed site is."""
+"""The null control's runs: the reference against its reformulation on the same draws, judged as a weighed
+site is."""
 
 CONDITIONED_SEEDS = 64
 """The weighed check's declared seeds here: its heavy class holds one value a draw, so the reference against
@@ -119,12 +120,17 @@ def test_an_element_no_rounding_reaches_must_be_exact_in_every_arm():
     failed(nudged, "a copy nudged", against=copied)
 
 
-def test_the_weighed_check_passes_the_reference_against_itself():
-    """The null control: the reference against itself on disjoint draws, judged as a weighed site is,
-    passes every one of `NULL_RUNS` runs, each verdict naming the check that decided it, its false-failure
-    rate bounded by `null_rate_bound`."""
-    verdicts = null_runs(jax.jit(reference), draw, "the reference against itself, weighed",
-                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=CONDITIONED_SEEDS)
+def test_the_weighed_check_passes_the_reference_against_its_reformulation():
+    """The null control, judged as a weighed site is (paired, as the corner sites run): the reference
+    against its own math reformulated, the amplified element cancelled the other way and the products'
+    operands swapped, on the same draws, passes every one of `NULL_RUNS` runs, each verdict naming the
+    check that decided it, its false-failure rate bounded by `null_rate_bound`."""
+    def reformulated(a, b, big):
+        return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
+
+    verdicts = null_runs(jax.jit(reference), draw, "the reference against its reformulation, weighed",
+                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, dew_fn=jax.jit(reformulated), paired=True,
+                         conditioning=CONDITIONED_SEEDS)
     reds = sum(not verdict.startswith("pass") for verdict, _, _ in verdicts)
     assert reds == 0, (reds, null_rate_bound(reds, NULL_RUNS), verdicts)
 
