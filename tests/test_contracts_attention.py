@@ -83,8 +83,12 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
         cotangent = cotangent.astype(jnp.bfloat16)
 
     def paged(query, key, value, sinks):
-        # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here.
-        with generation.assumed("sm90") if kernel == "template_paged" else contextlib.nullcontext():
+        # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here, its
+        # derivatives' gathered attention on xla, which this host runs.
+        on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla"))
+        with contextlib.ExitStack() as stack:
+            for context in on_gpu if kernel == "template_paged" else ():
+                stack.enter_context(context)
             return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
 
     def plain(query, key, value, sinks):
