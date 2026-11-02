@@ -177,6 +177,11 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             for name, tokens in held.items()
         }
+        # A mixture member that joined since (`member_fields`) holds none of the tokens held.
+        length = len(next(iter(self._held.values()), ()))
+        for name in self._windows.fields:
+            if counted(name) and name not in self._held and CONSUMED in self._held:
+                self._held[name] = np.zeros(length, self._held[CONSUMED].dtype)
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
