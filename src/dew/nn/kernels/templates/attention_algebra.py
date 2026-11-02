@@ -79,9 +79,11 @@ class Forward:
     rewalk, `unfolded`), the call's query count `queries` where a mainloop walks query rows past it
     without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
     tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does),
-    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), and the
+    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), the
     power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
-    is the call's scale over."""
+    is the call's scale over, and the keys a launch's walk reaches where past the call's though they are
+    whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
+    it; None where none does)."""
 
     form: str
     keys: int
@@ -95,6 +97,7 @@ class Forward:
     queries: int | None = None
     compensated: bool = False
     prescale: float = 1.0
+    walked_keys: int | None = None
 
     @property
     def raw(self) -> bool:
@@ -845,7 +848,7 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     predicate, forward and backward; None where each sees every key. A spans call's intervals, the union
     of its runs' where it has them, and, with documents, ids (its mainloops give each tile its queries'
     intervals and both blocks' ids); a causal call's diagonal; the call's keys, where a tile reaches past
-    them: no walk visits a tile wholly past them, so a call whose keys are whole tiles reads no padding;
+    them or a launch's walk reaches a tile wholly past them (`Forward.walked_keys`: a common walk's holder);
     and, where the spec names them, its queries (a padding row sees no key, so a score hook's derivative
     there, undefined at its padded parameters, reaches no reduction over the rows)."""
     visible = None
@@ -857,8 +860,8 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
         visible = _keys_before(coords, coords.q_pos + 1)
-    if spec.form != "spans" and spec.keys % coords.key_count(like):
-        # A tile past the call's last key reads padding.
+    if spec.form != "spans" and (spec.keys % coords.key_count(like) or spec.walked_keys is not None):
+        # A tile past the call's last key reads padding, a holder of a common walk wholly past it too.
         past = _keys_before(coords, spec.keys)
         visible = past if visible is None else visible & past
     if spec.form != "spans" and spec.queries is not None:

@@ -181,16 +181,20 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
         return affine, (exponent, *values)
 
+    # A walk's decay carried in its exponents' accumulation (`parts`' float32 at least; a float64 state's,
+    # float64).
+    carried = at_least_fp32(jnp.dtype(dtype))
+
     def init(shapes):
         del shapes
-        return jnp.zeros((shape[0],), jnp.float32), jnp.zeros(shape, dtype)
+        return jnp.zeros((shape[0],), carried), jnp.zeros(shape, dtype)
 
     splits: dict = {}
 
     def prepare(chunk):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
-        natural = _scanned(exponent)[-1] * (math.log(2.0) if affine.base2 else 1.0)
+        natural = _walked(exponent, affine.base2)
         B, _, s, C, _, _ = values
         # The solve's inverse reads no state: an operand of the chunk's function, prepared with the rest.
         lower = _inverse_of(decays, B, s, C) if affine.corrections else jnp.zeros((B.shape[0],) * 2, B.dtype)
@@ -209,7 +213,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         decay, h = state
         natural, values = prepared.values
         (leaving,) = prepared.split.carry(values, h)
-        return decay + natural, leaving
+        return _held(decay + natural.astype(decay.dtype)), leaving
 
     def mapped(prepared, state):
         (outputs,) = prepared.split.emit(prepared.values[1], state[1])
@@ -222,7 +226,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
         if corrects != [False]:
             raise Refused("a merge of walks whose tokens correct the state, or before any chunk was read")
         (decay_a, h_a), (decay_b, h_b) = a, b
-        return decay_a + decay_b, jnp.exp(decay_b)[:, None] * h_a + h_b
+        return _held(decay_a + decay_b), jnp.exp(decay_b)[:, None] * h_a + h_b
 
     def finish(state, operands):
         del operands
@@ -740,6 +744,21 @@ def _vanishing(dtype, base2: bool) -> float:
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
+def _walked(exponents, base2: bool) -> jax.Array:
+    """A chunk's whole decay in natural units, per key, as a walk's state carries it (`Derived.step`,
+    `merge`): its exponents' compensated sum, or its dtype's vanished decay where a token's decay vanishes
+    (`_vanishing`; two of -2**127 summed are -inf, and its residual NaN)."""
+    vanished = exponents <= _vanishing(exponents.dtype, base2)
+    live = _scanned(jnp.where(vanished, 0.0, exponents))[-1] * (math.log(2.0) if base2 else 1.0)
+    return _held(jnp.where(jnp.any(vanished, axis=0), _vanishing(exponents.dtype, base2=False), live))
+
+
+def _held(decay: jax.Array) -> jax.Array:
+    """A walk's decay in natural units held from below at its dtype's vanished one (`_vanishing`): zero
+    there, and a walk's sums of vanished chunks finite."""
+    return jnp.maximum(decay, jnp.asarray(_vanishing(decay.dtype, base2=False), decay.dtype))
+
+
 def _decays_value(exponents, base2: bool) -> _Decays:
     """The decays (`_Decays`) of a chunk's tokens' exponents, each from the compensated prefix of its
     segment: a token whose exponent vanishes (`_vanishing`, its decay and every decay through it zero) ends
@@ -755,9 +774,14 @@ def _decays_value(exponents, base2: bool) -> _Decays:
     # A span holds a vanished token where its ends lie in two segments, or its start in the first's.
     joined = below & (segments[:, None] == segments[None, :])
     started, ending = segments == 0, segments == segments[-1]
-    return _Decays(entering=jnp.where(started, _exp(base2, high + low), 0.0),
-                   to_last=jnp.where(ending, _exp(base2, (high[-1] - high) + (low[-1] - low)), 0.0),
-                   whole=jnp.where(started[-1], _exp(base2, high[-1] + low[-1]), 0.0),
+    # Each exponent masked before its exponential, as each span's: one across a vanished token is no sum
+    # of a live span's (`exp(100)` unselected is infinite, its derivative's zero times it NaN).
+    return _Decays(entering=jnp.where(started, _exp(base2, jnp.where(started, high + low, 0.0)), 0.0),
+                   to_last=jnp.where(ending, _exp(base2, jnp.where(ending,
+                                                                   (high[-1] - high) + (low[-1] - low), 0.0)),
+                                     0.0),
+                   whole=jnp.where(started[-1], _exp(base2, jnp.where(started[-1], high[-1] + low[-1], 0.0)),
+                                   0.0),
                    between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), 0.0))
 
 

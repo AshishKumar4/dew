@@ -1336,9 +1336,8 @@ def architecture_pass_figure():
     label = ("The compile-time algebra pass. The traced jaxpr's arithmetic becomes terms, the rest opaque "
              "leaves; windows form around each head a rule can cheapen, and each cluster of them saturates "
              "under facts and the identities, linear and joined rule sets within a budget; egglog's greedy "
-             "DAG extraction picks each form by its price in seconds, or XLA's cost analysis of the window "
-             "where only rewrites XLA makes itself reach a root; a region's forms go in only where it "
-             "costs less, and the outer jit lowers the result for XLA.")
+             "DAG extraction picks each form by its price in seconds; a region's forms go in only where "
+             "it costs less, and the outer jit lowers the result for XLA.")
     parts = [
         ("traced jaxpr", ["the whole step,", "backward included"], "plain", (16, 16, 170, 81)),
         ("terms", ["language equations become terms;", "the rest stay opaque"], "dew", (204, 16, 260, 81)),
@@ -1346,7 +1345,7 @@ def architecture_pass_figure():
          (482, 16, 262, 81)),
         ("saturate", ["each cluster its own e-graph:", "identities, linear, joined"], "dew",
          (16, 137, 240, 81)),
-        ("extract", ["greedy DAG, priced by cost.fused", "(XLA's own for its rewrites)"], "dew",
+        ("extract", ["greedy DAG, priced by cost.fused", "a shared value counted once"], "dew",
          (274, 137, 220, 81)),
         ("splice", ["a region's forms, where the", "region costs less"], "dew", (512, 137, 232, 81)),
         ("outer jit lowers → XLA", [], "plain", (512, 259, 232, 54)),

@@ -541,14 +541,16 @@ class Extraction:
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
     takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, the longest
     unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
-- Where a rewrite is one XLA makes itself (`Rules.xla`: commutativity, which its HloCSE ignores; the sums'
-  linearity, which its multi-output fusion matches), the model does not decide its profit: the pass takes it
-  only where XLA's own cost analysis of the compiled window is lower with it (`program.xla_priced`). Which
-  forms those are is a root's provenance, not the matches a saturation counted: a region saturates under
-  XLA's sets first, its e-graph kept (egglog's `push`), and where a form is taken, a root whose form XLA's sets
-  alone reach (`Rewrite.xla_own`) is XLA's to decide, whatever else the window rewrites. A pass whose admitted
-  sets are all XLA's (the accurate numerics') does not run. The e-graph decides for the algebra XLA does not
-  derive (distribution, factoring through contractions, scale folds).
+- Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
+  condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
+  and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
+  range facts admit them. A study of the pinned pipeline (an H100's and the CPU's optimized programs with the
+  pass off and on) informs the cost model and conditions nothing: XLA's programs keep every
+  rewrite the reordering sets made where they fired (a tensor factor's `a x + a y`, a shared product
+  operand's `a@x + a@y` and `x@a + y@a`, a laid factor out of a sum, two sums joined), and its
+  `AlgebraicSimplifier::HandleAdd` factored `a c + b c` itself by a power-of-two constant. Commutativity
+  only aids saturation (`Rules.aid`), changing no program on its own, so a pass whose admitted sets are all
+  aids (the accurate numerics') does not run.
 - The pass saturates and extracts each window cluster in an e-graph of its own (§6.7); two clusters whose
   union passes `CLUSTER` stay apart though they share an equation, and a value both yield takes the first's
   form. One e-graph of a program's every window grew its extraction with the program: a gemma3n training

@@ -13,6 +13,7 @@ import functools
 import inspect
 import math
 import time
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 
 import jax
@@ -63,14 +64,11 @@ class AlgebraReport:
 @dataclasses.dataclass(frozen=True)
 class Rewrite:
     """A region's terms (`terms.region`), each root's cheapest form by its key (`terms.key`; `picked`, empty
-    where none is cheaper than the region as traced), the report of the rewrite that chose them, and the roots
-    (by key) whose form XLA's own rewrites alone reach (`xla_own`, `Rules.xla`), which XLA's cost analysis
-    decides."""
+    where none is cheaper than the region as traced), and the report of the rewrite that chose them."""
 
     region: terms.Region
     picked: Mapping[Hashable, terms.Term]
     report: AlgebraReport
-    xla_own: frozenset[Hashable] = frozenset()
 
 
 @contextlib.contextmanager
@@ -105,11 +103,11 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     @functools.wraps(fn)
     def run(*args, **kwargs):
         # Under `jax.disable_jit` a program runs as Python, its values concrete, so nothing is traced to
-        # rewrite; where the run's numerics admit XLA's own rewrites alone (`Rules.xla`: the accurate forms'
-        # commutativity, which XLA's HloCSE ignores already), the pass would leave the program as it is.
+        # rewrite; where the run's numerics admit saturation aids alone (`Rules.aid`: the accurate forms'
+        # commutativity), the pass would leave the program as it is.
         accurate = generation.numerics().forms == "accurate"
         if (not ALGEBRA.value.on or jax_config.disable_jit.value
-                or all(sets.xla for sets in rules.admitted(accurate))):
+                or all(sets.aid for sets in rules.admitted(accurate))):
             return fn(*args, **kwargs)
         statics = {number % len(args) for number in numbers if -len(args) <= number < len(args)}
         fixed = {name: value for name, value in kwargs.items() if name in names}
@@ -169,20 +167,13 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
              made_by: Mapping[jcore.Var, jcore.JaxprEqn], taken: Mapping[int, list]) -> dict[int, list]:
     """The equations each value `window` yields (`yielded`, as the program names them) is made by in its
     cheapest form (`done`), by the id of the program's equation they stand in for (`made_by`): a value another
-    window's form made already (`taken`) kept as that one made it. A form XLA's own rewrites alone reach
-    (`Rewrite.xla_own`) is taken only where XLA's cost analysis of the compiled window is lower with it
-    (`xla_priced`), whatever else the window rewrites."""
+    window's form made already (`taken`) kept as that one made it."""
     leaves = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype, weak_type=var.aval.weak_type)
               for var in window.invars if isinstance(var.aval, ShapedArray)]
     if len(leaves) != len(window.invars):
         return {}
-    in_window: dict = {var: equation for equation in window.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
-    # The same forms in the window's own names, which XLA's cost analysis compiles alone.
-    own: dict[int, list[jcore.JaxprEqn]] = {}
-    xla_own: set[int] = set()
-    own_xla: set[int] = set()
-    for out, mine, root in zip(yielded, window.outvars, done.region.outputs, strict=True):
+    for out, root in zip(yielded, done.region.outputs, strict=True):
         form = None if root is None else done.picked.get(terms.key(root))
         made_at = id(made_by[out])
         if form is None or terms.key(form) == terms.key(root) or made_at in taken or made_at in spliced:
@@ -193,42 +184,15 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
         if traced.consts or not isinstance(made, jcore.Var) or made in traced.jaxpr.invars or (
                 traced.out_avals[0].strip_weak_type() != out.aval.strip_weak_type()):
             continue
-        inputs = dict(zip(traced.jaxpr.invars, window.invars, strict=True))
-        for named, made_as, key in ((spliced, out, id(made_by[out])), (own, mine, id(in_window[mine]))):
-            renamed = {**inputs, made: made_as}
-            def renaming(atom, renamed=renamed):
-                return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
+        renamed = {**dict(zip(traced.jaxpr.invars, window.invars, strict=True)), made: out}
 
-            named[key] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
-                                           outvars=[renaming(var) for var in equation.outvars])
-                          for equation in traced.jaxpr.eqns]
-        if terms.key(root) in done.xla_own:
-            xla_own.add(id(made_by[out]))
-            own_xla.add(id(in_window[mine]))
-    if not xla_own:
-        return spliced
+        def renaming(atom, renamed=renamed):
+            return atom if isinstance(atom, jcore.Literal) else renamed.get(atom, atom)
 
-    def splicing(chosen) -> jcore.Jaxpr:
-        return _live(window.replace(eqns=[made for equation in window.eqns
-                                          for made in (own[id(equation)] if id(equation) in chosen
-                                                       else [equation])]))
-
-    if cost.cheaper(xla_priced(splicing(own)), xla_priced(splicing(own.keys() - own_xla))):
-        return spliced
-    return {key: value for key, value in spliced.items() if key not in xla_own}
-
-
-def xla_priced(jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr) -> cost.Seconds:
-    """`jaxpr`'s price by XLA's own cost analysis of its compiled program (its FLOPs, transcendentals and
-    bytes accessed) at the pass's device's rates (`cost.Fused`): the price of a rewrite XLA would match
-    itself, which the e-graph's model cannot see XLA's fusion of."""
-    closed = jaxpr if isinstance(jaxpr, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(jaxpr, ())
-    avals = list(closed.in_avals)
-    analysis = jax.jit(jcore.jaxpr_as_fun(closed)).lower(*avals).compile().cost_analysis()
-    analysis = (analysis[0] if isinstance(analysis, list) else analysis) or {}
-    work = cost.Work(operations=analysis.get("flops", 0.0), exponentials=analysis.get("transcendentals", 0.0),
-                     device_bytes=analysis.get("bytes accessed", 0.0))
-    return cost.Seconds(work, cost.fused(cost.target()))
+        spliced[made_at] = [equation.replace(invars=[renaming(atom) for atom in equation.invars],
+                                             outvars=[renaming(var) for var in equation.outvars])
+                            for equation in traced.jaxpr.eqns]
+    return spliced
 
 
 def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -310,12 +274,11 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
 
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
     """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
-    the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), with the roots
-    whose form XLA's own sets alone reach (`Rewrite.xla_own`: the region saturated under them first) and the
-    report of the rewrite. A region no reordering may touch (`rules.reorderable`) builds no e-graph. The
-    saturated graph's forms are extracted first; only where one differs from its root are the region as
-    traced and XLA's sets' forms extracted too, each from the graph as it stood (egglog's `push`, `pop`): a
-    region whose forms are its roots' (commutativity's alone) takes one extraction."""
+    the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), and the report
+    of the rewrite. A region no reordering may touch (`rules.reorderable`) builds no e-graph. The saturated
+    graph's forms are extracted first; only where one differs from its root is the region as traced
+    extracted too, from the graph as it stood (egglog's `push`, `pop`): a region whose forms are its roots'
+    (commutativity's alone) takes one extraction."""
     began = time.perf_counter()
     region = terms.region(closed)
     admitted = rules.admitted(accurate)
@@ -326,40 +289,22 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
                                seconds=time.perf_counter() - began)
         return Rewrite(region, {}, report)
     priced = cost.model(region, cost.fused(cost.target()))
-    own = tuple(sets for sets in admitted if sets.xla)
     graph, bundle, roots = graphed(region)
-    graph.push()
-    first = saturate(graph, region, own, saturation) if own and len(own) < len(admitted) else None
     graph.push()
     saturated = saturate(graph, region, admitted, saturation)
     nodes = node_count(graph)
     forms, after = extracted(graph, bundle, priced)
-    changed = [terms.key(root) for root, form in zip(roots, forms, strict=True)
-               if terms.key(form) != terms.key(root)]
-    graph.pop()
-    theirs = None
-    if changed and first is not None and any(count for name, count in first.fired.items()
-                                             if rules.RULES[name].rounding != "exact"):
-        # The forms XLA's own sets alone reach, from the graph they saturated (an exact set's alone,
-        # commutativity's, leave every price as it was).
-        theirs, _ = extracted(graph, bundle, priced)
+    changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
     graph.pop()
     before = after
     if changed:
         _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
     picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
               if changed and cost.cheaper(after, before) else {})
-    if theirs is not None:
-        xla_own = frozenset(terms.key(root) for root, form, xla_form in zip(roots, forms, theirs, strict=True)
-                            if terms.key(form) == terms.key(xla_form) != terms.key(root))
-    else:
-        xla_own = frozenset(changed) if own and first is None else frozenset()
-    if first is not None:
-        saturated = saturated.after(first)
     report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
                            saturated.iterations, nodes, saturated.limited, before.value, after.value,
                            time.perf_counter() - began)
-    return Rewrite(region, picked, report, xla_own)
+    return Rewrite(region, picked, report)
 
 
 def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]:
@@ -466,12 +411,6 @@ class Saturated:
     iterations: int
     limited: bool
 
-    def after(self, first: Saturated) -> Saturated:
-        """This saturation and `first`, which ran before it on the same graph, as one."""
-        fired = {name: count + first.fired.get(name, 0) for name, count in self.fired.items()}
-        return Saturated(fired, self.limits, first.iterations + self.iterations,
-                         first.limited or self.limited)
-
 
 def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
              saturation: Saturation, facts: Schedule | None = None) -> Saturated:
@@ -517,32 +456,58 @@ a scan, a loop, a conditional, a checkpoint, and a custom derivative's primal ca
 
 def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`jaxpr`, its constants kept, with each body (`BODIES`) of its equations rewritten, the equation itself
-    kept."""
-    equations = [equation.replace(params={name: _body(value, accurate, saturation)
-                                          for name, value in equation.params.items()})
-                 if equation.primitive.name in BODIES else equation for equation in jaxpr.eqns]
-    return jaxpr.replace(eqns=equations)
+    kept: `jaxpr` itself, and each equation itself, where no body changes. A program's identity is what
+    JAX shares its lowering by: every call site of one jitted function holds one body, lowered once (one
+    function of the module, its kernels compiled once), so a pass that rebuilt an unchanged body at each
+    call site lowered and compiled every layer's apart (a Qwen3.5-4B training step's compile 52 to 487
+    seconds on an H100, nothing rewritten)."""
+    changed = False
+    equations = []
+    for equation in jaxpr.eqns:
+        if equation.primitive.name in BODIES:
+            params = {name: _body(value, accurate, saturation) for name, value in equation.params.items()}
+            if any(params[name] is not value for name, value in equation.params.items()):
+                equation = equation.replace(params=params)
+                changed = True
+        equations.append(equation)
+    return jaxpr.replace(eqns=equations) if changed else jaxpr
 
 
 def _body(value, accurate: bool, saturation: Saturation):
-    """A body parameter rewritten: a jaxpr's program, each of a conditional's branches; any other parameter,
-    and a body whose constants it does not hold, as it is."""
+    """A body parameter rewritten: a jaxpr's program, each of a conditional's branches (the tuple itself
+    where none changes); any other parameter, and a body whose constants it does not hold, as it is."""
     if isinstance(value, jcore.Jaxpr):
         return _closed(value, accurate, saturation)
     if isinstance(value, tuple) and value and all(isinstance(branch, jcore.Jaxpr) for branch in value):
-        return tuple(_closed(branch, accurate, saturation) for branch in value)
+        branches = tuple(_closed(branch, accurate, saturation) for branch in value)
+        return value if all(new is old for new, old in zip(branches, value, strict=True)) else branches
     return value
 
 
+_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, dict[Hashable, jcore.Jaxpr | None]] = (
+    weakref.WeakKeyDictionary())
+"""Each body's rewrites (`_closed`) by what a rewrite read (the numerics' forms, the saturation, the
+switch's target), held while the body lives: every call site of one body, and every retrace that holds it
+(JAX's tracing cache gives a function's one body), takes one rewritten object, which JAX lowers once. A body
+nothing changes holds None, not itself, which would keep it alive."""
+
+
 def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
-    """A body's program rewritten, over the same inputs, weak types included, and the same outputs; a body
-    whose constants another holds (an open jaxpr), or whose rewrite would hold constants it did not, or that
-    reads a value of no shape, as it is."""
+    """A body's program rewritten, over the same inputs, weak types included, and the same outputs, the same
+    object for every call site and retrace of one body (`_REWRITTEN`), the body itself where nothing
+    changes; a body whose constants another holds (an open jaxpr), or that reads a value of no shape, as it
+    is."""
     if len(closed.consts) != len(closed.constvars):
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
-    return _windowed(_within(closed, accurate, saturation), accurate, saturation)
+    rewrites = _REWRITTEN.setdefault(closed, {})
+    key = (accurate, saturation, ALGEBRA.value.target)
+    if key not in rewrites:
+        made = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+        rewrites[key] = None if made is closed else made
+    made = rewrites[key]
+    return closed if made is None else made
 
 
 def _power_of_two(value) -> bool:

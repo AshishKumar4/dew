@@ -697,11 +697,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             raise NotImplementedError(reason)
         # The call's query count where the launch pads past it (`algebra.Forward.queries`).
         queries = start.shape[1]
-        padded = _padded(queries, key.shape[1], config)[0] > queries
-        # The form and geometry; the launch takes the scale and the query's power `gradients` gives it.
+        padded_queries, padded_keys = _padded(queries, key.shape[1], config)
+        # The form and geometry; the launch takes the scale and the query's power `gradients` gives it. Its
+        # walks reach the padded keys (a common walk's holder wholly past the call's, `seen`).
         spec = algebra.Forward(spans.form, spans.keys, ids=query_ids is not None, scale=self.scale,
                                score_mod=self.score_mod, natural=self.natural, initial=initial is not None,
-                               queries=queries if padded else None)
+                               queries=queries if padded_queries > queries else None,
+                               walked_keys=padded_keys if padded_keys > spans.keys else None)
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret, drop=drop)
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,

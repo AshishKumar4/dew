@@ -832,7 +832,9 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
         def one(carried, chunk):
             return forms.step(carried, chunk), carried
 
-        decayed = varying_like(jnp.zeros((width,), jnp.float32), *jax.tree.leaves(operands))
+        # The walk's decay in the forms' own carry dtype (`Derived.init`'s, the state's float32 at least).
+        empty = forms.init({})[0]
+        decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
         carried, entering = jax.lax.scan(one, (decayed, h), prepared)
         outputs = jax.vmap(forms.mapped)(prepared, entering)
         return outputs.reshape(-1, columns), carried[1]

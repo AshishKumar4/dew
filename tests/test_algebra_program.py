@@ -3,9 +3,11 @@ the resident training step jit their function rewritten, under the switch the ga
 the bodies of nested programs, scans, loops, conditionals and checkpoints are rewritten in place; products
 (`dot_general`) are terms the rules read; and each rewrite is recorded in the one kernel report."""
 
+import gc
 import os
 import subprocess
 import sys
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -366,3 +368,20 @@ def test_a_body_shared_by_its_call_sites_stays_shared():
     off, on, again = shared(on=False), shared(on=True), shared(on=True)
     assert (len(on[0]), on[1]) == (len(off[0]), off[1]) == (1, 2)
     assert again[0] == on[0]
+
+
+def test_the_pass_holds_no_body_past_its_life():
+    """A body the pass read and left as it is goes with the program that held it: the pass's record of a
+    body's rewrites holds the body weakly and never the body itself, so a process tracing many programs
+    (a rollout pool retracing a length at a time) keeps none it dropped."""
+    x, w = rows(0, (8, 8), (8, 8))
+    with algebra.passes(on=True):
+        closed = jax.make_jaxpr(algebra.rewritten(lambda x, w: jnp.sum(_layer(x, w))))(x, w)
+    [body] = [equation.params["jaxpr"] for equation in closed.jaxpr.eqns
+              if equation.primitive.name in ("pjit", "jit")]
+    held = weakref.ref(body)
+    del closed, body
+    jax.clear_caches()
+    gc.collect()
+    assert held() is None
+

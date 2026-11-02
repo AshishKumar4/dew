@@ -160,11 +160,11 @@ class Rules:
     """Whether it runs at dev time alone, where each candidate's error is measured before it is taken
     (`dew.algebra.error.choose`): a set whose forms are chosen for their accuracy, at a cost the program pass
     would never pay."""
-    xla: bool = False
-    """Whether XLA derives the set's rewrites itself: its HloCSE ignores a commutative operation's operand
-    order, its multi-output fusion reads two sibling reductions' inputs once. A pass whose admitted sets are
-    all XLA's is skipped (`program.rewritten`); a rewrite only XLA's sets fired is taken only where XLA's own
-    cost analysis of the compiled candidate is lower (`program._windowed`)."""
+    aid: bool = False
+    """Whether the set only aids the others' saturation and changes no program on its own (commutativity,
+    whose operand orders XLA's HloCSE reads alike): a pass whose admitted sets are all aids does not run
+    (`program.rewritten`). Every other set's rewrite applies wherever the cost model prices it cheaper, with
+    no condition on XLA (docs/design/algebra.md §6.5)."""
 
 
 def _facts() -> Ruleset:
@@ -303,8 +303,7 @@ def _joined() -> Ruleset:
     operands' dtype (`plain`), where the new sum of terms and the new reduction of it, its length's power
     (`sum_length`) above them, are each under the program's reach (`dominated`): `sum(x) + sum(y)` may be
     finite where `sum(x + y)` is not (float32's `x = [2**126, 2**126]` and
-    `y = [2**126 - 2**102, 2**126 - 2**103]`).
-    A rewrite XLA's multi-output fusion matches itself (it reads the sibling reductions' inputs once)."""
+    `y = [2**126 - 2**102, 2**126 - 2**103]`)."""
     x, y, t = vars_("x y t", Term)
     axes = var("axes", Vec[i64])
     params, added = vars_("params added", i64)
@@ -340,11 +339,11 @@ def register(rules: Rules) -> None:
     RULES[rules.name] = rules
 
 
-register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", xla=True))
+register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", aid=True))
 register(Rules("stable", "bounded", _stable(), dev=True,
                receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba"))
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
-register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md §1; ledger 1308", xla=True))
+register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md §1; ledger 1308"))
 
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),

@@ -266,7 +266,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
             name = equation.primitive.name
             source = equation.invars[0]
             held = isinstance(source, jcore.Var) and source in nonpositive
-            if name in KEEPING_SIGN and held and _keeps_sign(source, out):
+            if name in KEEPING_SIGN and held and (name != "convert_element_type" or _keeps_sign(source, out)):
                 nonpositive.add(out)
             exponentiated = name in ("exp", "exp2") and held
             _typed(dtypes, magnitudes, term, out, UNIT if exponentiated else _bounded(equation, operands))
@@ -305,18 +305,23 @@ BITWISE = frozenset({"and", "or", "xor", "not"})
 `not(-2**31)` is `2**31 - 1`)."""
 UNIT = 0
 KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
-"""The language's equations whose output is at most 0 where their operand is, between signed dtypes
-(`_keeps_sign`: a negative value converted to a boolean is true, to an unsigned integer positive)."""
-
-
-def _signed(dtype) -> bool:
-    """Whether `dtype` holds negative values: a float's or a signed integer's."""
-    return jnp.issubdtype(dtype, jnp.floating) or jnp.issubdtype(dtype, jnp.signedinteger)
+"""The language's equations whose output is at most 0 where their operand is, a conversion where it keeps
+the sign (`_keeps_sign`)."""
 
 
 def _keeps_sign(source, out) -> bool:
-    """Whether a value of `source`'s dtype at most 0 stays at most 0 as `out`'s: both signed (`_signed`)."""
-    return all(isinstance(atom.aval, ShapedArray) and _signed(atom.aval.dtype) for atom in (source, out))
+    """Whether a value of `source`'s dtype at most 0 stays at most 0 as `out`'s: a conversion that keeps
+    every nonpositive value's sign (a float's to a float, an integer's to a float, a signed integer's to a
+    signed one at least as wide), or any other equation `KEEPING_SIGN` names. A negative value converted to
+    a boolean is true, to an unsigned integer positive, to a narrower signed one wraps (int32's -200 is int8's
+    56), and a float's to an integer may pass its range."""
+    if not all(isinstance(atom.aval, ShapedArray) for atom in (source, out)):
+        return False
+    given, made = np.dtype(source.aval.dtype), np.dtype(out.aval.dtype)
+    if jnp.issubdtype(made, jnp.floating):
+        return jnp.issubdtype(given, jnp.floating) or jnp.issubdtype(given, jnp.signedinteger)
+    return (jnp.issubdtype(given, jnp.signedinteger) and jnp.issubdtype(made, jnp.signedinteger)
+            and made.itemsize >= given.itemsize)
 
 
 def _integer_range(dtype) -> Magnitude:
@@ -356,7 +361,27 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magn
 
 def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magnitude | None:
     """`_bounded`'s bound as the real arithmetic on the operands' bounds proves it (a float's, or an
-    integer's before its dtype wraps it)."""
+    integer's before its dtype wraps it), each operand `|x| <= 2**a` (`y`'s `2**b`). Each rule's reason
+    over the box of its operands, and its float rounding's slack (a float rounds to nearest, monotone, so a
+    result whose exact value is under a representable power of two `2**c` rounds to at most it: the
+    rules whose bound is such a power spend no slack):
+    - a comparison, `is_finite`, `sign`: at most 1 by its definition;
+    - `tanh`, `logistic`, `sin`, `cos`, `erf` of a real operand: at most 1 everywhere (XLA's rounds within
+      it), unbounded over a complex one;
+    - `add`, `sub`: `|x +- y| <= 2**a + 2**b <= 2**(max(a, b) + 1)`, monotone in each operand;
+    - `mul`: `|x y| <= 2**(a + b)`, bilinear, its extreme at the box's corners;
+    - `max`, `min`, a selection, `neg`, `abs`, a conversion, a layout change, a maximum or minimum along an
+      axis: no larger than an operand (`abs` least at its critical point 0, largest at a corner);
+    - `floor`, `ceil`, `round`: at most `max(2**a, 1)` (`ceil(2**-126)` is 1);
+    - `square`, `integer_pow` of `y >= 1`: `|x|**y <= 2**(y a)`, monotone in `|x|` (an even power least at
+      its critical point 0);
+    - `exp`, `exp2` of `|x| <= 2**a <= 64`: at most `e**(2**a)`, `2**(2**a log2 e)`, bounded by the power
+      above its floor: one power of slack for XLA's rounding (float16's `exp2(4)` is 16.02);
+    - a sum along axes of `n` elements: each term's range summed, `n 2**a <= 2**(a + ceil(log2 n))`
+      (separable; each partial sum rounds under the power, a float of under `2**p` terms exactly, more
+      rounding back to it);
+    - a contraction of `n` terms: `n 2**(a + b)`, a sum of bilinear terms, separable alike.
+    Any other equation proves none (a quotient, a logarithm, a power of a float exponent)."""
     name = equation.primitive.name
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
@@ -385,8 +410,9 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     if name == "integer_pow" and equation.params["y"] >= 1:
         return equation.params["y"] * given[0]
     if name in ("exp", "exp2") and given[0] <= 6:
-        # An exponential of a value under 64: under 2**(64 log2(e)).
-        return math.ceil(2 ** given[0] * (math.log2(math.e) if name == "exp" else 1.0))
+        # An exponential of a value under 64: under 2**(64 log2(e)), a power above the exact one's floor, as
+        # XLA's rounds (float16's exp2(4) is 16.02).
+        return math.floor(2 ** given[0] * (math.log2(math.e) if name == "exp" else 1.0)) + 1
     if name == "reduce_sum":
         shape = _shape(equation.invars[0])
         return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))

@@ -54,7 +54,6 @@ import inspect
 import json
 import logging
 import os
-import sys
 import threading
 import time
 import types
@@ -398,8 +397,58 @@ def reading() -> Iterator[None]:
         _READING.reset(token)
 
 
-_TRACED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Each hook object's traced keys while it lives (`KernelOp.identified`), by the op and field tracing it."""
+_TRACED: dict[Hashable, tuple[tuple[weakref.ref, ...], str | None]] = {}
+"""Each hook's traced key (`KernelOp.identified`) by the op, field and configuration tracing it and its
+callables' identities (`_held_key`), beside weak references to those callables: an entry leaves with the
+first of them collected, and a lookup whose references no longer reach its callables (an identity a new
+object took) is none."""
+
+
+def _held_key(value, leaves: list) -> Hashable:
+    """`value` as `_TRACED` keys it: a frozen dataclass that holds its fields alone (`_by_fields`: a hook
+    rebuilt each call, a softcap's `Capped`) by its class's identity (appended to `leaves`) and its fields'
+    keys; any other callable by its identity (appended to `leaves`: what a closure or a callable object
+    reads need not be in its parts); a tuple's, a list's and a dataclass's parts in turn (a launch's hooks
+    bundle, rebuilt each bind around one retained callable); any other value as it hashes (a static's own
+    contract, as `jax.jit` reads it). `TypeError` for a value no hash holds."""
+    if _by_fields(value):
+        leaves.append(type(value))
+        return "fields", id(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves))
+                                                for field in dataclasses.fields(value))
+    if callable(value):
+        leaves.append(value)
+        return "callable", id(value)
+    if isinstance(value, (tuple, list)):
+        return type(value).__name__, tuple(_held_key(part, leaves) for part in value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _named(type(value)), tuple((field.name, _held_key(getattr(value, field.name), leaves))
+                                          for field in dataclasses.fields(value))
+    hash(value)
+    return type(value).__qualname__, value
+
+
+def _by_fields(value) -> bool:
+    """Whether `value` is a frozen dataclass whose call reads its class's code and its fields alone: no
+    `__post_init__` (which may set an attribute from an init-only value) and no attribute but its fields."""
+    kind = type(value)
+    if not dataclasses.is_dataclass(value) or isinstance(value, type) or not kind.__dataclass_params__.frozen:
+        return False
+    if any("__post_init__" in vars(base) for base in kind.__mro__):
+        return False
+    try:
+        held = set(vars(value))
+    except TypeError:
+        # A slotted dataclass holds its fields alone.
+        return True
+    return held <= {field.name for field in dataclasses.fields(value)}
+
+
+def _context() -> Hashable:
+    """The trace's configuration a hook's program reads beside its code: its random bits' construction, its
+    products' default precision, its arrays' width and promotion."""
+    config = jax.config
+    return (config.jax_threefry_partitionable, str(config.jax_default_matmul_precision),
+            config.jax_enable_x64, config.jax_numpy_dtype_promotion, config.jax_numpy_rank_promotion)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -553,33 +602,38 @@ class KernelOp(tokamax.Op):
 
     def identified(self, name: str, value: Callable | str | None) -> str | None:
         """The hook field or argument `name`'s value as a launch's identity reads it every launch, tuning or
-        not (`report._identity`: its kernels' names, its refusals): by its parts where they tell what it
-        computes (`described`), tracing nothing, else what it computes (`traced`), traced once for each of
-        its objects this process keeps alive (`_TRACED`: a model's layers share their hooks). A key already
-        as it is."""
+        not (`report._identity`: its kernels' names, its refusals): what it computes (`traced`), traced
+        once for each of its callable objects while they live, at this op's layouts and under the trace's
+        configuration (`_TRACED`, `_held_key`: a model's layers share their hooks, and a launch's identity
+        traces none of them again). A key already as it is.
+
+        The invariant: two hooks share an identity only where they lower to one program, the same equations
+        and constants, under one configuration: the identity is the program's own digest (`program`), held
+        for the objects it was traced from, never a description of them (a callable's parts need not say
+        what its call reads)."""
         if value is None or isinstance(value, str):
             return self.traced(name, value)
         try:
-            parts = described(value)
-        except _Undescribed:
-            return self._traced_once(name, value)
-        return "described:" + hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
-
-    def _traced_once(self, name: str, value: Callable) -> str | None:
-        """`traced`, kept for `value`'s object while it lives, by this op's other fields and `name` (the
-        layouts the template traces it at)."""
-        try:
-            held = _TRACED.setdefault(value, {})
-            place = (type(self), name, tuple((field.name, getattr(self, field.name))
-                                             for field in dataclasses.fields(self)
-                                             if field.name not in (*self.HOOKS, "config", "vjp")))
+            leaves: list = []
+            place = (type(self), name, _context(), _held_key(value, leaves),
+                     tuple((field.name, getattr(self, field.name)) for field in dataclasses.fields(self)
+                           if field.name not in (*self.HOOKS, "config", "vjp")))
             hash(place)
         except TypeError:
-            # An object no weak reference or hash holds: traced each time.
+            # A part no hash holds (an array): traced each time.
             return self.traced(name, value)
-        if place not in held:
-            held[place] = self.traced(name, value)
-        return held[place]
+        found = _TRACED.get(place)
+        if found is not None and all(ref() is leaf for ref, leaf in zip(found[0], leaves, strict=True)):
+            return found[1]
+        key = self.traced(name, value)
+        try:
+            refs = tuple(weakref.ref(leaf, lambda _, place=place: _TRACED.pop(place, None))
+                         for leaf in leaves)
+        except TypeError:
+            # A callable no weak reference holds: traced each time.
+            return key
+        _TRACED[place] = (refs, key)
+        return key
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
@@ -680,8 +734,8 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
             if isinstance(constant, jax.core.Tracer):
                 update("traced", constant.shape, str(constant.dtype))
             else:
-                value = np.asarray(constant)
-                update("constant", value.shape, str(value.dtype))
+                value = _host(constant)
+                update("constant", str(jnp.asarray(constant).dtype), value.shape, str(value.dtype))
                 digest.update(np.ascontiguousarray(value).tobytes())
 
     def walk(jaxpr: jax_core.Jaxpr) -> None:
@@ -720,6 +774,14 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     return "traced:" + digest.hexdigest()[:16]
 
 
+def _host(value) -> np.ndarray:
+    """An array constant's values on the host, as `program` reads them: a typed random key by its key data
+    (its dtype names its implementation; no key converts to NumPy itself)."""
+    if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jax.dtypes.prng_key):
+        return np.asarray(jax.random.key_data(value))
+    return np.asarray(value)
+
+
 def _parameter(value) -> Hashable:
     """An equation's parameter as `program`'s digest reads it, the same in every process: a number or a
     string as it is, a sequence's and a set's parts in order (a set's sorted by their own, which a process's
@@ -736,59 +798,13 @@ def _parameter(value) -> Hashable:
         return "mapping", tuple(sorted(((_parameter(key), _parameter(part)) for key, part in value.items()),
                                        key=repr))
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
-        array = np.asarray(value)
-        return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()[:16]
+        array = _host(value)
+        return ("array", str(value.dtype), array.shape, str(array.dtype),
+                hashlib.sha256(array.tobytes()).hexdigest()[:16])
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
     text = repr(value)
     return type(value).__qualname__, None if " at 0x" in text else text
-
-
-class _Undescribed(Exception):
-    """A part `described` says nothing of without running it."""
-
-
-def _located_value(value: type | types.FunctionType) -> bool:
-    """Whether `value` is the object its module holds under its own qualified name (a module-level function
-    or class): one name says what it is in every process of a checkout."""
-    module = sys.modules.get(value.__module__)
-    name = value.__qualname__
-    return module is not None and "." not in name and vars(module).get(name) is value
-
-
-def described(value: object, within: frozenset[int] = frozenset()) -> Hashable:
-    """What `value` computes, told by its parts without running it, each tagged with its kind: a number, a
-    string or bytes, a dtype, an enumeration's member; an array by its shape, dtype and bytes (a traced one,
-    data the compiled launch reads, by its shape and dtype); a tuple's, a list's and a partial's parts; a
-    module-level function or class by its name (`_located_value`) and a dataclass of one by its fields.
-    `_Undescribed` for anything else (a closure, a local function or class, a callable object, a container
-    reaching itself again, `within`): what its call reads is not in its parts, so it is traced (`program`)."""
-    if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
-        return type(value).__name__, value
-    if isinstance(value, enum.Enum):
-        return "enum", _named(type(value)), value.name
-    if isinstance(value, np.dtype):
-        return "dtype", str(value)
-    if isinstance(value, jax.core.Tracer):
-        return "traced", value.shape, str(value.dtype)
-    if isinstance(value, (np.ndarray, jax.Array, np.generic)):
-        array = np.asarray(value)
-        return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()
-    if id(value) in within:
-        raise _Undescribed(f"a {type(value).__qualname__} reaches itself")
-    within = within | {id(value)}
-    if isinstance(value, (tuple, list)):
-        return type(value).__name__, tuple(described(part, within) for part in value)
-    if isinstance(value, functools.partial):
-        return ("partial", described(value.func, within), described(value.args, within),
-                described(tuple(sorted(value.keywords.items())), within))
-    if isinstance(value, (type, types.FunctionType)) and _located_value(value):
-        return "named", value.__module__, value.__qualname__
-    if dataclasses.is_dataclass(value) and not isinstance(value, type) and _located_value(type(value)):
-        fields = tuple((field.name, described(getattr(value, field.name), within))
-                       for field in dataclasses.fields(value))
-        return "dataclass", _named(type(value)), fields
-    raise _Undescribed(f"a {type(value).__qualname__} says nothing of what it computes but by running it")
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:

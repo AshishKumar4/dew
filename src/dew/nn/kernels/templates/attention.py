@@ -1219,8 +1219,12 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
     power, scale = prescale(query.dtype, width, scale)
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
+    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it, none at
+    # a query a score hook leaves seeing no key (its denominator 0, its output the reference's zero), whose
+    # weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`).
     dout = dout.astype(query.dtype)
+    if hooks.score_mod is not None:
+        dout = jnp.where(jnp.swapaxes(residuals[1], 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:

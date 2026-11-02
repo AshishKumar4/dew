@@ -1604,7 +1604,7 @@ def _output_swizzle(call: _Call, bv: int, staging: tuple, landing: dict) -> int:
     thread's registers fit (`_output_held`, beside its addresses into its `staging` and `landing` tiles),
     halved down to the narrowest Mosaic stages; the narrowest where none fits, which the launch then refuses.
     Nemotron-H 4B's SSD output held a bf16 key block's whole 64-column depth at 128 bytes, 255 registers
-    and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (ssd80, row 2943)."""
+    and a spill on an A100; at 64 bytes, 32 columns, it compiled within them (row 2943)."""
     family = call.family
     swizzle = mosaic.widest_swizzle(call.given.stored, call.width)
     while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
