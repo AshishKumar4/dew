@@ -96,6 +96,7 @@ def admitted(tmp_path_factory):
     return records, trainer, ahead
 
 
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
@@ -106,6 +107,7 @@ def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admit
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
 
 
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_fewer_microbatches(
         admitted, monkeypatch):
     """With its frontier asked, a step compiled ahead on GPUs whose memory its plan needs several

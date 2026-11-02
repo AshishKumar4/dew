@@ -475,6 +475,7 @@ def _joint_runs(tmp_path):
             "asked": {"team": team, "urgent": urgent}, "directory": tmp_path}
 
 
+@pytest.mark.shared_setup("joint_runs")
 def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
     """A joint-head release is a whole task to fine-tune (`joint_runs`): its runs stop where they were
     asked, every row read whole, its head moved, and the saved run loads back as a task with identical
@@ -496,6 +497,7 @@ def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
+@pytest.mark.shared_setup("joint_runs")
 def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
     """Two runs of a joint-head release (`joint_runs`) average into one task, its temperatures refit on
     held-out answers (`Decide.averaged`), which saves to a directory of its own and reloads through
