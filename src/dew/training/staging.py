@@ -69,37 +69,31 @@ def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], siz
     group and a `CHUNKS`th of the fields' bytes. A scalar is no chunk's: it comes to the device first."""
     grouped = {index for index, field in enumerate(fields)
                if isinstance(field.aval, ShapedArray) and field.aval.shape}
-    parent = list(range(len(fields)))
-
-    def root(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
+    # Each leaf's group: the leaves some operation read together with it, through every one between.
+    together = {index: frozenset({index}) for index in grouped}
     reads: dict[jcore.Var, frozenset[int]] = {fields[index]: frozenset({index}) for index in grouped}
     taking = []
     for equation in equations:
         read = frozenset(grouped) if equation.effects else frozenset().union(
             *(reads.get(value, frozenset()) for value in equation.invars if computed(value)))
-        for index in read:
-            parent[root(index)] = root(min(read))
+        if len(read) > 1:
+            joined = frozenset().union(*(together[index] for index in read))
+            together.update(dict.fromkeys(joined, joined))
         if read:
             reads.update(dict.fromkeys(equation.outvars, read))
         taking.append(read)
-    groups: dict[int, list[int]] = {}
-    for index in sorted(grouped):
-        groups.setdefault(root(index), []).append(index)
-    weights = {group: sum(sizes[index] for index in members) for group, members in groups.items()}
-    budget = max([*weights.values(), math.ceil(sum(sizes) / CHUNKS)])
+    groups = sorted(set(together.values()), key=min)
+    budget = max([*(sum(sizes[index] for index in group) for group in groups),
+                  math.ceil(sum(sizes) / CHUNKS)])
     cut: list[list[int]] = []
     filled = 0
-    for group, members in groups.items():
-        if not cut or filled + weights[group] > budget:
+    for group in groups:
+        weight = sum(sizes[index] for index in group)
+        if not cut or filled + weight > budget:
             cut.append([])
             filled = 0
-        cut[-1].extend(members)
-        filled += weights[group]
+        cut[-1].extend(sorted(group))
+        filled += weight
     return cut, taking, reads
 
 
