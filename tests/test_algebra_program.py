@@ -95,6 +95,50 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
                     f"a static count passed {pass_n}", seeds=16)
 
 
+def test_a_program_no_rule_changes_is_staged_once():
+    """An outer program (`options.program`) whose math no rule changes (an opaque equation beside an unbounded
+    sum), lowered with the pass on: each of its equations staged once, by jit's own trace, which lowers as it
+    is (`program.program_of`), where the pass's replay of its traced program staged each again (a Dory-4B
+    training step's 1.8 seconds of compile, nothing rewritten)."""
+    from jax.extend import core as jex_core
+    from jax.interpreters import mlir
+
+    staged = []
+
+    class Counted(jex_core.Primitive):
+        def bind(self, *args, **params):
+            staged.append(args)
+            return super().bind(*args, **params)
+
+    counted = Counted("counted_staging")
+    counted.def_impl(lambda x: x)
+    counted.def_abstract_eval(lambda x: x)
+    mlir.register_lowering(counted, lambda ctx, x: [x])
+
+    def step(x):
+        return counted.bind(x) + x
+
+    with report.refusals():
+        options.program(step).lower(jnp.ones((4, 8), jnp.float32))
+    assert len(staged) == 1
+
+
+@pytest.mark.parametrize("fn", [
+    lambda x, y: jnp.tanh(x) * 2.0 + jnp.tanh(x) * 3.0,
+    lambda x, y: x * 2.0 + x * 4.0,
+    lambda x, y: x * 2.0 + y,
+    lambda x, y: jnp.dot(x, y) + x,
+    lambda x, y: jnp.exp(x) + y * y,
+], ids=["bounded", "scaled twice", "scaled once", "unbounded product", "unbounded exponential"])
+def test_a_windows_structure_decides_reordering_as_its_terms_do(fn):
+    """Whether a rule may reorder a program (`rules.reorderable`) read off its structure alone
+    (`terms.Skeleton`, the pass's first read of every window) as off its egglog terms: a bounded value, one
+    value scaled by literals twice, and the program's own unbounded math each decided alike."""
+    closed = jax.make_jaxpr(fn)(*rows(1, (16, 16), (16, 16)))
+    assert (algebra.rules.reorderable(terms.region(closed, forms=terms.Skeleton))
+            == algebra.rules.reorderable(terms.region(closed)))
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)

@@ -23,7 +23,6 @@ from egglog import (
     birewrite,
     eq,
     function,
-    get_callable_args,
     i64,
     i64Like,
     rewrite,
@@ -411,20 +410,22 @@ def reorderable(region: terms.Region) -> bool:
     needs a bounded term other than a literal, or two literals one value is multiplied by, whose sum
     distributivity takes (`a * 2 + a * 4` as `a * 6`). A program's own math over its unbounded values (most
     of a training step's: a gemma3n step's 2879 regions each fired commutativity alone) admits none, and is
-    left as traced."""
-    literals = {terms.key(Term.literal(i64(index))) for index in range(len(region.literals))}
+    left as traced. It reads the region's records alone, so a window's structure (`terms.Skeleton`) decides it
+    before its terms are built."""
+    literals = region.literal_keys
     if any(bound is not None and named not in literals for named, bound in region.magnitudes.items()):
         return True
     scaled: set = set()
     for term, _ in region.shapes:
-        args = get_callable_args(term, Term.binary)
-        if args is None or terms.text(args[1]) != "mul":
+        found = terms.binary_of(term)
+        if found is None or found[0] != "mul":
             continue
-        for operand, other in ((args[0], args[2]), (args[2], args[0])):
-            if terms.key(other) in literals:
-                if terms.key(operand) in scaled:
+        _, left, right = found
+        for operand, other in ((left, right), (right, left)):
+            if other in literals:
+                if operand in scaled:
                     return True
-                scaled.add(terms.key(operand))
+                scaled.add(operand)
     return False
 
 

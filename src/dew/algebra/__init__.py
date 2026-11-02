@@ -22,6 +22,9 @@ SATURATION = Saturation(growth=64, depth=4)
 """The limits the engine runs at until they are measured (§6.6)."""
 rewritten = functools.partial(program.rewritten, saturation=SATURATION)
 """`program.rewritten` at `SATURATION`: a function with its program rewritten."""
+program_of = functools.partial(program.program_of, saturation=SATURATION)
+"""`program.program_of` at `SATURATION`: a jit's own trace of a program, rewritten."""
 
 __all__ = ["SATURATION", "AlgebraReport", "Derived", "Reduction", "Refused", "Rewrite", "Saturation", "Scan",
-           "cost", "derive", "error", "forms", "passes", "program", "rewritten", "rules", "scan", "terms"]
+           "cost", "derive", "error", "forms", "passes", "program", "program_of", "rewritten", "rules",
+           "scan", "terms"]

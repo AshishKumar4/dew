@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -108,19 +109,73 @@ class Term(Expr):
     def finished(self) -> Term: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class Skeleton:
+    """A term's structure without its egglog expression: `Term`'s constructors over plain tuples, equal
+    exactly where the terms are (`region`'s `forms`). What the pass reads of a window to decide whether a rule
+    may fire in it (`rules.reorderable`), at a fraction of its terms' cost: a Dory-4B training step's 1018
+    windows, every one refused, spent most of the pass building their terms (FS-OVERHEAD-DORY-ON-P3)."""
+
+    form: tuple
+
+    @classmethod
+    def leaf(cls, index: int) -> Skeleton:
+        return cls(("leaf", index))
+
+    @classmethod
+    def literal(cls, index: int) -> Skeleton:
+        return cls(("literal", index))
+
+    def binary(self, name: str, other: Skeleton, params: int) -> Skeleton:
+        return Skeleton(("binary", self.form, name, other.form, params))
+
+    def compare(self, name: str, other: Skeleton, params: int) -> Skeleton:
+        return Skeleton(("compare", self.form, name, other.form, params))
+
+    def unary(self, name: str, params: int) -> Skeleton:
+        return Skeleton(("unary", self.form, name, params))
+
+    def select(self, false: Skeleton, true: Skeleton) -> Skeleton:
+        return Skeleton(("select", self.form, false.form, true.form))
+
+    def convert(self, params: int) -> Skeleton:
+        return Skeleton(("convert", self.form, params))
+
+    def shaped(self, name: str, params: int) -> Skeleton:
+        return Skeleton(("shaped", self.form, name, params))
+
+    def reduce(self, monoid: str, axes: Vec[i64], params: int) -> Skeleton:
+        # The reduced axes are among the parameters `params` indexes.
+        del axes
+        return Skeleton(("reduce", self.form, monoid, params))
+
+    def dot(self, other: Skeleton, params: int) -> Skeleton:
+        return Skeleton(("dot", self.form, other.form, params))
+
+
+def binary_of(term: Term | Skeleton) -> tuple[str, Hashable, Hashable] | None:
+    """A binary term's operation name and its operands' keys (`key`), None where `term` is no binary: an
+    egglog term's or a skeleton's alike."""
+    if isinstance(term, Skeleton):
+        return (term.form[2], term.form[1], term.form[3]) if term.form[0] == "binary" else None
+    if (args := get_callable_args(term, Term.binary)) is None:
+        return None
+    return text(args[1]), key(args[0]), key(args[2])
+
+
 @dataclasses.dataclass
-class Opaque:
+class Opaque[Node: (Term, Skeleton)]:
     """An equation outside the language: its inputs' terms (None for a literal, kept in `literals`) and the
     leaves of its outputs."""
 
     equation: jcore.JaxprEqn
-    inputs: list[Term | None]
+    inputs: list[Node | None]
     literals: list[object]
     outputs: list[int]
 
 
 @dataclasses.dataclass
-class Region:
+class Region[Node: (Term, Skeleton)]:
     """A jaxpr held as terms: the count of its leaves (the inputs and constants first, then the outputs of the
     equations outside the language), those equations in program order (`opaque`), each output's term (None
     for a literal output, kept in `literal_outputs`), the parameters terms refer to by index (`params`: a
@@ -132,12 +187,12 @@ class Region:
     operand's, a quotient's)."""
 
     leaves: int
-    opaque: list[Opaque]
-    outputs: list[Term | None]
+    opaque: list[Opaque[Node]]
+    outputs: list[Node | None]
     literal_outputs: list
     params: list[tuple[jcore.Primitive, Mapping]]
     literals: list
-    shapes: list[tuple[Term, tuple[int, ...]]]
+    shapes: list[tuple[Node, tuple[int, ...]]]
     depth: int
     equations: int
     stock: Mapping[str, int]
@@ -145,6 +200,8 @@ class Region:
     magnitudes: Mapping[Hashable, Magnitude | None]
     products: dict[int, tuple[np.dtype | None, ...]] = dataclasses.field(default_factory=dict)
     """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
+    literal_keys: frozenset[Hashable] = frozenset()
+    """Each literal's term's key (`literals`' terms)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -152,30 +209,32 @@ class Region:
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
 
-    def shape(self, term: Term) -> tuple[int, ...]:
+    def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
         terms carry (`shapes`, `extents` by `key`)."""
         return self.extents[key(term)]
 
-    def shaped(self, term: Term, extent: tuple[int, ...]) -> None:
+    def shaped(self, term: Node, extent: tuple[int, ...]) -> None:
         """`term`, a term a derivation adds (a literal of its own), held at `extent`."""
         self.shapes.append((term, extent))
         self.extents.setdefault(key(term), extent)
 
-    def roots(self) -> list[Term]:
+    def roots(self) -> list[Node]:
         """The terms extraction chooses forms for: each output and each input of an equation outside the
         language, once each, in program order."""
-        seen: dict[Hashable, Term] = {}
+        seen: dict[Hashable, Node] = {}
         for term in [*(term for opaque in self.opaque for term in opaque.inputs), *self.outputs]:
             if term is not None:
                 seen.setdefault(key(term), term)
         return list(seen.values())
 
 
-def key(term: Expr) -> Hashable:
+def key(term: Expr | Skeleton) -> Hashable:
     """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
     are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
-    step's pass)."""
+    step's pass); a skeleton's form (`Skeleton`)."""
+    if isinstance(term, Skeleton):
+        return term.form
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
@@ -205,17 +264,42 @@ NOTHING = -(2 ** 20)
 """A zero's magnitude: under every other."""
 
 
-def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]] | None = None) -> Region:
+type Ranges = Mapping[int, float | tuple[float, float]] | None
+"""Declared ranges by input index (`region`'s): a bound on an input's magnitude, or an interval."""
+
+
+@overload
+def region(closed: jcore.Jaxpr, ranges: Ranges = None) -> Region[Term]:
+    ...
+
+
+@overload
+def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
+           forms: type[Skeleton]) -> Region[Skeleton]:
+    ...
+
+
+def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
+           forms: type[Term] | type[Skeleton] = Term) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
-    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms. Each term's
+    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms, each of `forms`
+    (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
     magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index, the
     constants apart: a bound on its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its
     exponential by 1; an input with none is unbounded) and its equations'."""
+    if forms is Skeleton:
+        return _region(closed, ranges, Skeleton)
+    return _region(closed, ranges, Term)
+
+
+def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
+                                    forms: type[Node]) -> Region[Node]:
+    """`region`'s terms, each of `forms`."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
     indexed: dict[tuple[str, str, tuple | None], int] = {}
     literals: list = []
-    shapes: list[tuple[Term, tuple[int, ...]]] = []
+    shapes: list[tuple[Node, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
 
     products: dict[int, tuple[np.dtype | None, ...]] = {}
@@ -230,7 +314,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
                 products[indexed[key]] = operands
         return indexed[key]
 
-    env: dict[jcore.Var, Term] = {}
+    env: dict[jcore.Var, Node] = {}
     dtypes: dict[Hashable, np.dtype] = {}
     magnitudes: dict[Hashable, Magnitude | None] = {}
     leaves = 0
@@ -242,15 +326,15 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
     nonpositive = {var for index, var in enumerate(jaxpr.invars)
                    if isinstance(interval := declared.get(index), tuple) and interval[1] <= 0}
     for var, magnitude in zip([*jaxpr.constvars, *jaxpr.invars], given, strict=True):
-        env[var] = Term.leaf(leaves)
+        env[var] = forms.leaf(leaves)
         shapes.append((env[var], _shape(var)))
         _typed(dtypes, magnitudes, env[var], var, magnitude)
         leaves += 1
 
-    def read(atom) -> Term:
+    def read(atom) -> Node:
         if isinstance(atom, jcore.Literal):
             literals.append(atom.val)
-            term = Term.literal(len(literals) - 1)
+            term = forms.literal(len(literals) - 1)
             shapes.append((term, _shape(atom)))
             _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
             return term
@@ -299,7 +383,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
             continue
         outputs = []
         for var in equation.outvars:
-            env[var] = Term.leaf(leaves)
+            env[var] = forms.leaf(leaves)
             shapes.append((env[var], _shape(var)))
             # An equation outside the language bounds nothing.
             _typed(dtypes, magnitudes, env[var], var, None)
@@ -313,7 +397,8 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
     literal_outputs = [atom.val if isinstance(atom, jcore.Literal) else None for atom in jaxpr.outvars]
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
-                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products)
+                  max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))))
 
 
 BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf"})
@@ -472,7 +557,7 @@ def _declared(declared: float | tuple[float, float] | None) -> Magnitude | None:
     return _log2(largest) if math.isfinite(largest) else None
 
 
-def _typed(dtypes: dict, magnitudes: dict, term: Term, atom, magnitude: Magnitude | None) -> None:
+def _typed(dtypes: dict, magnitudes: dict, term: Term | Skeleton, atom, magnitude: Magnitude | None) -> None:
     """`term`'s dtype (`atom`'s) and its magnitude, the first where one term names two values."""
     named = key(term)
     if isinstance(atom.aval, ShapedArray):
@@ -484,7 +569,9 @@ def _typed(dtypes: dict, magnitudes: dict, term: Term, atom, magnitude: Magnitud
 def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     """The primitives a stable rule writes where the program held none (`rules.stock`), each at the
     parameters JAX binds it with by default, read from JAX's own trace of them."""
-    scalar = jnp.ones((), jnp.float32)
+    # An abstract scalar: the pass reads a jit's trace after it is made, where a process compiling for a
+    # device it does not hold (a compile-only GPU) places no array.
+    scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
                                        jnp.log1p(a), jnp.expm1(a)))(scalar)
     return {equation.primitive.name: (equation.primitive, dict(equation.params))
@@ -520,7 +607,8 @@ def _shape(atom) -> tuple[int, ...]:
     return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
 
 
-def _term(equation: jcore.JaxprEqn, read: Callable, param: Callable) -> Term | None:
+def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., Node],
+                                   param: Callable) -> Node | None:
     """`equation` as a term over its inputs' (`read`), or None where it is outside the language."""
     name, primitive = equation.primitive.name, equation.primitive
     if len(equation.outvars) != 1:

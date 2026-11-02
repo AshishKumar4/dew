@@ -214,7 +214,7 @@ class Operand(NamedTuple):
     load: Callable[[], jax.Array]
 
 
-def evaluator(region: terms.Region, leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
+def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
               product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None) -> Callable[[terms.Term], jax.Array]:
     """The values of a region's forms, each term once however many forms read it: its leaves the given

@@ -94,6 +94,8 @@ class _Registry:
     missed: list["Miss"] = dataclasses.field(default_factory=list)
     rewritten: list = dataclasses.field(default_factory=list)
     """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
+    passes: list[float] = dataclasses.field(default_factory=list)
+    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
 
 
 _PROCESS = _Registry()
@@ -248,6 +250,19 @@ def record_rewrite(made) -> None:
     misses, as each program traces."""
     with _GUARD:
         _registry().rewritten.append(made)
+
+
+def record_pass(seconds: float) -> None:
+    """Record one program's whole algebra pass, its seconds (`dew.algebra.program.program_of`)."""
+    with _GUARD:
+        _registry().passes.append(seconds)
+
+
+def passes() -> tuple[float, ...]:
+    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`): its
+    regions' (`rewrites`) and its walks of the program around them."""
+    with _GUARD:
+        return tuple(_registry().passes)
 
 
 def rewrites() -> tuple:
