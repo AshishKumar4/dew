@@ -207,6 +207,25 @@ def test_a_rule_whose_left_side_heads_at_a_reduction_or_a_contraction_gets_a_win
     assert program._windows(closed.jaxpr)
 
 
+def test_derived_forms_trace_under_each_manual_mesh_they_meet():
+    """A tile's derived forms (`recurrence_algebra.derived_tile`, cached for the process) traced under a
+    manual mesh of two devices, then of one: each trace binds its literals under its own mesh, the forms
+    derived per trace context (`derive.derive`'s), where forms cached from the first bound its literals'
+    avals, mesh and all, under the second and the trace refused (`For primitive gt, context mesh ... should
+    match the aval mesh`; test_lowering's sharded recurrences, red at e82eab19a)."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.kernels import recurrence_algebra
+
+    tile = jax.ShapeDtypeStruct((4, 4), jnp.float32)
+    scale = jax.ShapeDtypeStruct((4,), jnp.float32)
+    for devices in (2, 1):
+        mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Manual,))
+        with jax.sharding.use_abstract_mesh(mesh):
+            jax.make_jaxpr(lambda p, d, s: recurrence_algebra.derived_tile("pairs").mapped(
+                {"products": p, "decays": d, "scales": s}))(tile, tile, scale)
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
