@@ -84,17 +84,23 @@ def record_units(label: str, payload: Callable[[int, int], object]) -> bool:
         raise ValueError(f"{label}: a map task ({DRAWS}={span}) writes its records to {RECORDS}, which is "
                          f"unset")
     site = site_id(label)
-    began = time.time()
+    # The process's start is on the wall clock; the draws' seconds on one that only moves forward.
+    began, drawing = time.time(), time.perf_counter()
     found = payload(start, stop)
-    seconds = {"site": site, "start": start, "stop": stop,
-               "before": began - psutil.Process().create_time(), "draws": time.time() - began}
+    seconds = {"site": site, "start": start, "stop": stop, "draws": time.perf_counter() - drawing,
+               "before": began - psutil.Process().create_time()}
     path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.with_suffix(".seconds.json").write_text(json.dumps(seconds))
-    written = path.with_name(path.name + ".partial")
-    written.write_bytes(pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
-    written.rename(path)
+    _published(path.with_suffix(".seconds.json"), json.dumps(seconds).encode())
+    _published(path, pickle.dumps({"site": site, "start": start, "stop": stop, "payload": found}))
     return True
+
+
+def _published(path: Path, data: bytes) -> None:
+    """`data` at `path` whole: written beside it, then moved into place, so no reader sees part of it."""
+    written = path.with_name(path.name + ".partial")
+    written.write_bytes(data)
+    written.rename(path)
 
 
 def pooled_units(label: str, units: int | None = None) -> list[tuple[int, int, object]] | None:
