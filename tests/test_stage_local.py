@@ -8,6 +8,8 @@ stacked leaf whole is refused by name, naming the replicated layout that takes i
 parity with one device is the pipeline's (ledger 3369), whatever its state's storage."""
 
 import dataclasses
+import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -222,9 +224,12 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
     return run
 
 
-def stacks_by_stage(validation) -> bool:
-    """Whether the state a run's validation reads holds a pipelined run stacked by stage."""
-    return any("stages/" in path for path in validation.leaves)
+def saving(make: Callable[..., Trainer]) -> int:
+    """What a stage-local run spares each device against the same run with every layer whole on every
+    stage (`Layout.stage_local`): the most a device holds of the state each places, as its validation
+    reads it, one less the other; none for a run that keeps every layer whole."""
+    held = [max(make(stage_local=local).validate(steps=1).device_bytes.values()) for local in (False, True)]
+    return held[0] - held[1]
 
 
 SEEDS = 8
@@ -238,8 +243,8 @@ def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
     FP32 Nesterov direction apart from its layers', one ulp that Newton-Schulz's BF16 cast can round apart
     (row 861's MuonClip, seed 1)."""
     given = None if variables is None else variables(0)
-    banked = trainer(model, optimizer, STAGED, 8, variables=given)
-    assert stacks_by_stage(banked.validate(steps=STEPS)), "the decoder's run splits over two stages"
+    assert saving(functools.partial(trainer, model, optimizer, STAGED, 8, variables=given)) > 0, \
+        "the decoder's run splits over two stages"
     initial = initials(model, optimizer, variables)
     local, replicated = (stepped(model, optimizer, STAGED, 8, initial, variables=given, stage_local=held)
                          for held in (True, False))
@@ -303,7 +308,9 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
     observe = Observe(STEPS, lambda state: (state.variables, state.opt_state, state.ema))
     trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
-    assert "stages" in trained.variables["params"]
+    # No copy of every layer on every stage: each device holds less of fit's state than of every layer whole.
+    assert all(bytes_on(trained, device) < bytes_on(run.stored(trained), device)
+               for device in run.device_mesh.devices.flat)
     observed, returned = observe.values[-1][1], on_host((trained.variables, trained.opt_state, trained.ema))
     assert jax.tree.structure(observed) == jax.tree.structure(returned)
     for mine, theirs in zip(jax.tree.leaves(observed), jax.tree.leaves(returned), strict=True):
@@ -355,9 +362,9 @@ def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
 @pytest.mark.parametrize("kind", ["decision", "ppo"])
 def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_local(kind):
     """A decision's headed model keeps its backbone's run stacked by stage, each device its own stage's
-    layers, as an LM's decoder does, and PPO its policy's and its critic's (ledger 3440): the state placed
-    over two stages holds each decoder's run as one leaf a stage, where they held every layer whole on
-    every stage, silently."""
+    layers, as an LM's decoder does, and PPO its policy's and its critic's (ledger 3440): over two stages
+    each device is spared what each decoder's run spares it as an LM's decoder, where they held every
+    layer whole on every stage, silently."""
     from dew.data.text import ByteTokenizer
     from dew.decision import DecisionObjective, Specials, StateFirstLayout
     from dew.objectives.rl.ppo import PPOObjective, ValueHead
@@ -366,17 +373,19 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
         objective = DecisionObjective(decoder(vocab_size=260, max_seq_len=32), tokenizer=ByteTokenizer(),
                                       specials=Specials(None, 10, 0, "\x00", 255),
                                       layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
-        decoders = {("backbone",)}
+        decoders = [decoder(vocab_size=260, max_seq_len=32)]
     else:
         objective = PPOObjective(decoder(), SEQ, critic=ValueHead(decoder()))
-        decoders = {("policy",), ("critic", "backbone")}
-    run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
-                  layout=Layout(min_shard=TINY_SHARD), tracker=None)
-    state, _, _ = run.place()
-    # Each parameter's path by its keys: the params are dicts throughout.
-    paths = [[entry.key for entry in path]
-             for path, _ in jax.tree_util.tree_leaves_with_path(state.variables["params"])]
-    assert {tuple(keys[:keys.index("stages")]) for keys in paths if "stages" in keys} == decoders
+        decoders = [decoder(), decoder()]
+
+    def run(stage_local: bool) -> Trainer:
+        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
+                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+
+    # Each decoder's run alone, an LM's without an average, as a lower bound of what it spares.
+    alone = sum(saving(functools.partial(trainer, model, optax.adam(1e-3), STAGED, 8, ema=None))
+                for model in decoders)
+    assert alone > 0 and saving(run) >= alone
 
 
 @pytest.mark.mesh(devices=8)
@@ -403,7 +412,6 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path / "whole")))
     alone.validate(steps=3)
     placed, _, _ = alone.place()
-    assert "stages" not in placed.variables["params"]
     for name in ("variables", "opt_state", "ema"):
         restored, held = jax.device_get(getattr(placed, name)), getattr(written, name)
         assert jax.tree.structure(restored) == jax.tree.structure(held), name
@@ -420,11 +428,11 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     only its own code knows is exact short of each layer a leaf of its own, which one program can hold on
     every stage alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
-    assert stacks_by_stage(trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).validate(steps=1))
+    assert saving(functools.partial(trainer, model, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
     for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
-        fitted = trainer(model, given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1)
-        assert int(fitted.step) == 1 and "stages" not in fitted.variables["params"]
+        assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
+        assert int(trainer(model, given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1).step) == 1
 
 
 @pytest.mark.mesh(devices=8)
@@ -457,11 +465,13 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
     stage-local run would stack apart from the outer state's: a DiLoCo run over a stage axis keeps every
     pipelined layer whole on every stage, its outer and inner states alike, so its checkpoint holds each
     layer as one device's would."""
-    run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
-                  key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
-                  layout=Layout(min_shard=TINY_SHARD), diloco=DiLoCo(every=2, rate=0.7, momentum=0.9),
-                  tracker=None)
-    assert not stacks_by_stage(run.validate(steps=2))
+    def run(stage_local: bool) -> Trainer:
+        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
+                       key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
+                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
+                       diloco=DiLoCo(every=2, rate=0.7, momentum=0.9), tracker=None)
+
+    assert saving(run) == 0
 
 
 @pytest.mark.mesh(devices=8)
@@ -506,5 +516,34 @@ def test_m3_given_dimension_numbers_keeps_every_layer_whole_and_trains():
                            optax.scale_by_learning_rate(1e-2)),
          "adam": optax.adam(1e-2)},
         lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params)))
-    fitted = trainer(decoder(), given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1)
-    assert int(fitted.step) == 1 and "stages" not in fitted.variables["params"]
+    assert saving(functools.partial(trainer, decoder(), given, STAGED, 8, ema=None)) == 0
+    assert int(trainer(decoder(), given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1).step) == 1
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_distillation_runs_student_keeps_its_run_stage_local():
+    """A distillation run over two stages keeps its student's decoder run stacked by stage, each device
+    spared what the student spares it as an LM's decoder (ledger 3460), where it kept every layer whole
+    and only logged."""
+    from dew.objectives.distillation import DistillationObjective
+
+    student, teacher = decoder(), decoder()
+
+    def run(stage_local: bool) -> Trainer:
+        objective = DistillationObjective(LMObjective(student, SEQ, ema_decay=None),
+                                          LMObjective(teacher, SEQ, ema_decay=None))
+        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
+                       layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
+
+    alone = saving(functools.partial(trainer, student, optax.adam(1e-3), STAGED, 8, ema=None))
+    assert saving(run) == alone > 0
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_gauss_newton_run_keeps_every_layer_whole():
+    """Gauss-Newton forms its update's system over every parameter on each device, which holds each layer
+    whole whatever the storage: its run over two stages keeps every layer whole on every stage, as its
+    docs say, its empty state read as the transform it is (ledger 3463), where it went stage-local."""
+    from dew.gauss_newton import gauss_newton
+
+    assert saving(functools.partial(trainer, decoder(), gauss_newton(damping=1e-3), STAGED, 8, ema=None)) == 0
