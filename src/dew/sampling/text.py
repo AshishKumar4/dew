@@ -939,7 +939,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 
     # dew.inference imports this module, so its packing is imported here.
     from dew.inference.projections import packed_in_call
-    from dew.nn.backbones.decoder_stack import stored_layers
+    from dew.nn.backbones.layer_names import stored_layers
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
         # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`), a

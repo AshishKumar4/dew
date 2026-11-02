@@ -123,7 +123,7 @@ def _stored(path: jax.tree_util.KeyPath, leaf: jax.Array) -> list[tuple[str, jax
     """Each stored layer a parameter's leaf holds, by its name (`parameter_name`) and its values: a
     stage-local run's stacked leaf its layers in its rows' order (`dew.nn.sharding.layers_of`), any other
     the leaf itself, so a path selects and reports a layer as it would with every layer whole."""
-    from dew.nn.backbones.decoder_stack import array_rows
+    from dew.nn.backbones.layer_names import array_rows
 
     layers, stacked = layers_of(path)
     if not stacked:

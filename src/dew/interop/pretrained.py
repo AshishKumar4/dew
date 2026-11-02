@@ -674,7 +674,7 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.inference.projections import unpacked
-        from dew.nn.backbones.decoder_stack import stored_layers
+        from dew.nn.backbones.layer_names import stored_layers
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
@@ -995,7 +995,7 @@ class PretrainedPipeline(Pretrained):
         `adapter.save` writes the factors alone.
         """
         from dew.interop import diffusion
-        from dew.nn.backbones.decoder_stack import stored_layers
+        from dew.nn.backbones.layer_names import stored_layers
 
         self._quantization()
         self._text_encoder("a saved pipeline writes it back")

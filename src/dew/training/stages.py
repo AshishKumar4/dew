@@ -101,8 +101,8 @@ def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
 
 
 def _layer_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
-    """`decoder_stack.array_rows`, imported where a run is cut, as `_stacked_rows` is."""
-    from dew.nn.backbones.decoder_stack import array_rows
+    """`layer_names.array_rows`, imported where a run is cut, as `_stacked_rows` is."""
+    from dew.nn.backbones.layer_names import array_rows
 
     return array_rows(path, leaf, shape)
 
@@ -181,7 +181,7 @@ class StageLocal:
         by stage over another count, or by a run where this one keeps every layer whole, back on its
         stored layers (`objective`'s stage sites at the count it holds), every mirror alike; a state on
         its layers, or stacked as this run stacks, as it is."""
-        from dew.nn.backbones.decoder_stack import stage_count
+        from dew.nn.backbones.layer_names import stage_count
 
         held = stage_count(state.variables)
         if held == 1 or (self.sites and held == self.stages):

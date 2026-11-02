@@ -269,7 +269,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         The tree must match the served one (`dew.inference.engine.normalized`), and its leaves are
         copied onto the served placement before the swap. Safe against a `step` on another thread."""
         # A stage-local run's state is read on its stored layers, as the served tree holds them.
-        from dew.nn.backbones.decoder_stack import stored_layers
+        from dew.nn.backbones.layer_names import stored_layers
 
         self._served = (task, reloaded(normalized(stored_layers(task.model, variables), self._source_shapes),
                                        self.variables))

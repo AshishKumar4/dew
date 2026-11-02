@@ -819,7 +819,7 @@ class Server:
             raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
                              "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
         # A stage-local run's state is read on its stored layers, as the served tree holds them.
-        from dew.nn.backbones.decoder_stack import stored_layers
+        from dew.nn.backbones.layer_names import stored_layers
 
         packed = pack_projections(normalized(stored_layers(self.model, variables), self._source_shapes),
                                   self._weight_groups)

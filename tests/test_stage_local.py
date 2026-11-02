@@ -610,7 +610,7 @@ def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
     serves (ledger 3488), where it refused the stage form; a host copy is cut on the host (ledger 3489)."""
     from dew.inference import NativeRolloutServer, TextGeneration
     from dew.inference.serving import Server
-    from dew.nn.backbones.decoder_stack import stored_layers
+    from dew.nn.backbones.layer_names import stored_layers
     from dew.sampling import Sampling
 
     model = decoder(max_seq_len=64)

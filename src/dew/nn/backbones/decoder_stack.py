@@ -34,7 +34,7 @@ from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
-from .layer_names import group_layers, group_name
+from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
 
 Block = Callable[[int, str], DecoderBlock]
@@ -1171,50 +1171,6 @@ def part_stage_sites(name: str, module, store: Variables, stages: int) -> tuple[
 def stored_by_stage(variables: Mapping[str, Mapping]) -> tuple[str, ...]:
     """The collections of a stack's `variables` that hold its run stacked by stage (`StackView.staged`)."""
     return tuple(name for name, tree in variables.items() if 'stages' in tree)
-
-
-def array_rows(path, leaf, shape: tuple[int, ...]) -> list:
-    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: its leading `shape` flattened by
-    the leaf's own reshape, so a host array stays on the host and a device array where it is."""
-    del path
-    return list(leaf.reshape((-1, *leaf.shape[len(shape):])))
-
-
-def stage_count(tree) -> int:
-    """How many stages the first run `tree` holds stacked by stage (`stored_by_stage`) stacks over, one
-    for a tree that holds none."""
-    if not isinstance(tree, Mapping):
-        return 1
-    if 'stages' in tree and (leaves := jax.tree.leaves(tree['stages'])):
-        return np.shape(leaves[0])[0]
-    return max((stage_count(child) for child in tree.values()), default=1)
-
-
-def stored_layers(model, variables: Variables) -> Variables:
-    """`variables` with every run a stage-local store stacks by stage on its stored layers (`layers_N`),
-    each whole, as a reader by layer name reads them: an export, an adapter's merge or save. The runs are
-    those `model` declares (`StagedStacks.stage_sites`), each cut back by the view it was stacked under
-    (`StackView.layer_form`); variables that hold no such run are returned as they are. A model run
-    reads the store as it is (`off_stages`)."""
-    stages = stage_count(variables)
-    if stages == 1 or not isinstance(model, StagedStacks):
-        return variables
-    stored = dict(variables)
-    for site in model.stage_sites(variables, stages):
-        def layered(node, view=site.view):
-            held = isinstance(node, Mapping) and 'stages' in node
-            return view.layer_form(node, array_rows) if held else node
-        stored = {name: _at(tree, site.namespace, layered) for name, tree in stored.items()}
-    return stored
-
-
-def _at(tree, namespace: tuple[str, ...], convert):
-    """`tree` with its node at `namespace` converted, where it holds one."""
-    if not namespace:
-        return convert(tree)
-    if not isinstance(tree, Mapping) or namespace[0] not in tree:
-        return tree
-    return {**tree, namespace[0]: _at(tree[namespace[0]], namespace[1:], convert)}
 
 
 def off_stages[M: nn.Module, **P, R](module: M, method: Callable[Concatenate[M, P], R],

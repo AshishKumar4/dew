@@ -257,7 +257,7 @@ def pending(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ..
     tree, a live objective's, packs inside its compiled call (`packed_in_call`). A stage-local run's
     store, which the call cuts onto its layers first (`stored_layers`), is compared as that cut, by
     its shapes alone: the call lays the packed leaves out."""
-    from dew.nn.backbones.decoder_stack import stage_count, stored_layers
+    from dew.nn.backbones.layer_names import stage_count, stored_layers
 
     variables = unfreeze(dict(variables))
     if stage_count(variables) > 1:
