@@ -15,7 +15,6 @@ from attention_oracle import attention_terms, exact_attention, float64_weights
 from model_support import as_stepped
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FEWEST_SEEDS, assert_as_exact, assert_fp32_reduction_bound
-from whole_suite import timed
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
@@ -177,15 +176,14 @@ DECODE_HOOKS = {"sinks": {"sinks": True}, "softcap": {"softcap": True},
 SINK_CASES = [(dtype, hooks, natural, splits) for dtype in ("bfloat16", "float32") for hooks in DECODE_HOOKS
               for natural in ("fold", "natural") for splits in decode_attention.SPLITS]
 """The hooked decode cases, `(dtype, hooks, form, slice count)`, by name."""
-PAST_TARGET = {"sinks and softcap": {("float32", "both", "natural", 32): 137,
-                                     ("float32", "both", "fold", 32): 126}}
-"""The cases past a group's 120 s target, each its seconds on armada in a verdict on main 495ef4e0e: the
-whole suite's run holds them (`whole_suite.timed`), every other case runs each train."""
+LONG_SINK_CASES = [("float32", "both", "natural", 32), ("float32", "both", "fold", 32)]
+"""The hooked cases past two minutes in one process (137 and 126 s on armada in a verdict on main 495ef4e0e),
+their check 1's draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
 
 
 @pytest.mark.parametrize(("dtype", "hooks", "natural", "splits"),
-                         timed(PAST_TARGET, "sinks and softcap", SINK_CASES),
-                         ids=["-".join(map(str, case)) for case in SINK_CASES])
+                         [case for case in SINK_CASES if case not in LONG_SINK_CASES],
+                         ids=["-".join(map(str, case)) for case in SINK_CASES if case not in LONG_SINK_CASES])
 def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks, natural, splits):
     """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
     (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
@@ -196,6 +194,21 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     both forms of the exponent, the fold and the accurate one (`natural`); each slice count held to
     check 1 over fresh draws of the case's shapes (`grouped_draw`), a slice count a case (row 2195's CI: the
     six together took 153 s of a CPU task)."""
+    _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits)
+
+
+@pytest.mark.parametrize(("dtype", "hooks", "natural", "splits"), LONG_SINK_CASES,
+                         ids=["-".join(map(str, case)) for case in LONG_SINK_CASES])
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_decode_kernel_applies_sinks_and_a_softcap_at_its_long_configs(dtype, hooks, natural, splits):
+    """`test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config` at its long cases
+    (`LONG_SINK_CASES`), their draws in map tasks of 4."""
+    _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits)
+
+
+def _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits):
+    """A hooked decode case's check 1
+    (`test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config`)."""
     from dew.nn.attention import reference_attention
     from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import tuning
