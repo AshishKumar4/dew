@@ -475,8 +475,8 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_by_its_derived_forms_is_on_par_interpreted(call, form):
     """The fast backward, each of its launches' tile weights and score cotangents the derived forms behind the
-    switch (`dew.algebra.forms.derived`, `attention_algebra.derived_cotangents`: queries first and keys
-    first), under Mosaic GPU's interpreter: the gradients on par with the reference (check 1), as the
+    switch (`dew.algebra.forms.derived`, `attention_backward_algebra.derived_cotangents`: queries first and
+    keys first), under Mosaic GPU's interpreter: the gradients on par with the reference (check 1), as the
     hand-written forms' are (`test_the_backward_is_on_par_interpreted`)."""
     with algebra_forms.derived():
         _check_backward(call, SHAPES["interpreted"], form=form, interpret=True,
@@ -1700,15 +1700,14 @@ beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT], ids=["inference", "training"])
-def test_an_a100_forward_counts_its_lowerings_reduction_scratch(dtype, kept, monkeypatch):
-    """The receipt's D256 forward at its pinned tiles: the model includes Mosaic's reduction reservation
-    and both barriers, exactly the 166928 bytes lowering asks for, past the A100's 166912-byte limit.
-    mma.sync is qualified only in this test; the corrected derivation chooses no oversized launch."""
+def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, kept):
+    """An A100's D256 forward (the receipt's: 1024 causal queries, 8 heads over 4) at 64 by 64 two stages
+    deep on mma.sync, inference and the 16-bit training path's: the model counts exactly the shared bytes
+    its lowering asks for, the reductions' scratch and both barriers included, past the A100's limit, so no
+    derivation that reads the model takes it."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    monkeypatch.setattr(attention_mosaic_program, "QUALIFIED",
-                        attention_mosaic_program.QUALIFIED | {"mma.sync"})
     queries, width = 1024, 256
     spans = template.spans(queries, queries, 1, causal=True)
     with generation.assumed("sm80"):
@@ -1721,13 +1720,9 @@ def test_an_a100_forward_counts_its_lowerings_reduction_scratch(dtype, kept, mon
                                         relaunch_consumers=1, relaunch_columns=128)
         target = generation.gpu_target()
         shared = op.staged_bytes(ba, config, target)
-        assert shared == 166928
-        assert shared > target.shared_limit
-        # Lower the fixed config directly: the corrected planner rightly refuses to select it.
         (found,) = compile_mosaic_kernels([KernelCase("forward", lambda: op.lowering(ba, config))], "sm80")
-        assert "it does not lower:" in found.get("error", ""), found
-        assert f"smem_bytes={shared} > max_smem_bytes={target.shared_limit}" in found["error"], found
-        assert op.derived(ba, target) is None
+        assert found["shared"] == shared
+        assert shared > target.shared_limit
 
 
 def _forward_kernels(op, ba, config) -> dict:
