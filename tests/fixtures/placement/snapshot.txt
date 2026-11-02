@@ -1136,6 +1136,158 @@ causal_transformer+qwen35	['params']['layers_3']['self_attn']['q_norm']['scale']
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['layers_3']['self_attn']['v_proj']['kernel']	32x8	embed,kv	('fsdp', 'tensor')	device
 causal_transformer+qwen35	['params']['norm']['scale']	32	-	('fsdp',)	device
+clip	['params']['text_model']['final_layer_norm']['bias']	8	-	()	device
+clip	['params']['text_model']['final_layer_norm']['scale']	8	-	()	device
+clip	['params']['text_model']['layers_0']['input_layernorm']['bias']	8	-	()	device
+clip	['params']['text_model']['layers_0']['input_layernorm']['scale']	8	-	()	device
+clip	['params']['text_model']['layers_0']['mlp']['down_proj']['bias']	8	embed	()	device
+clip	['params']['text_model']['layers_0']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip	['params']['text_model']['layers_0']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip	['params']['text_model']['layers_0']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_0']['post_attention_layernorm']['bias']	8	-	()	device
+clip	['params']['text_model']['layers_0']['post_attention_layernorm']['scale']	8	-	()	device
+clip	['params']['text_model']['layers_0']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip	['params']['text_model']['layers_0']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_0']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip	['params']['text_model']['layers_0']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip	['params']['text_model']['layers_0']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip	['params']['text_model']['layers_0']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_0']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip	['params']['text_model']['layers_0']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_1']['input_layernorm']['bias']	8	-	()	device
+clip	['params']['text_model']['layers_1']['input_layernorm']['scale']	8	-	()	device
+clip	['params']['text_model']['layers_1']['mlp']['down_proj']['bias']	8	embed	()	device
+clip	['params']['text_model']['layers_1']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip	['params']['text_model']['layers_1']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip	['params']['text_model']['layers_1']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_1']['post_attention_layernorm']['bias']	8	-	()	device
+clip	['params']['text_model']['layers_1']['post_attention_layernorm']['scale']	8	-	()	device
+clip	['params']['text_model']['layers_1']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip	['params']['text_model']['layers_1']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_1']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip	['params']['text_model']['layers_1']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip	['params']['text_model']['layers_1']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip	['params']['text_model']['layers_1']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip	['params']['text_model']['layers_1']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip	['params']['text_model']['layers_1']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['text_model']['position_embedding']['embedding']	8x8	.,embed	(None, 'fsdp')	device
+clip	['params']['text_model']['token_embedding']['embedding']	16x8	vocab,embed	(('fsdp', 'tensor'),)	device
+clip	['params']['text_projection']['kernel']	8x4	embed,output	('fsdp',)	device
+clip	['params']['vision_model']['blocks_0']['input_layernorm']['bias']	8	-	()	device
+clip	['params']['vision_model']['blocks_0']['input_layernorm']['scale']	8	-	()	device
+clip	['params']['vision_model']['blocks_0']['mlp']['down_proj']['bias']	8	embed	()	device
+clip	['params']['vision_model']['blocks_0']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip	['params']['vision_model']['blocks_0']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip	['params']['vision_model']['blocks_0']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_0']['post_attention_layernorm']['bias']	8	-	()	device
+clip	['params']['vision_model']['blocks_0']['post_attention_layernorm']['scale']	8	-	()	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip	['params']['vision_model']['blocks_0']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_1']['input_layernorm']['bias']	8	-	()	device
+clip	['params']['vision_model']['blocks_1']['input_layernorm']['scale']	8	-	()	device
+clip	['params']['vision_model']['blocks_1']['mlp']['down_proj']['bias']	8	embed	()	device
+clip	['params']['vision_model']['blocks_1']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip	['params']['vision_model']['blocks_1']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip	['params']['vision_model']['blocks_1']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_1']['post_attention_layernorm']['bias']	8	-	()	device
+clip	['params']['vision_model']['blocks_1']['post_attention_layernorm']['scale']	8	-	()	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip	['params']['vision_model']['blocks_1']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip	['params']['vision_model']['class_token']	8	-	()	device
+clip	['params']['vision_model']['patch_embed']['kernel']	2x2x3x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+clip	['params']['vision_model']['position_table']['embedding']	5x8	.,embed	(None, 'fsdp')	device
+clip	['params']['vision_model']['post_norm']['bias']	8	-	()	device
+clip	['params']['vision_model']['post_norm']['scale']	8	-	()	device
+clip	['params']['vision_model']['pre_norm']['bias']	8	-	()	device
+clip	['params']['vision_model']['pre_norm']['scale']	8	-	()	device
+clip	['params']['visual_projection']['kernel']	8x4	embed,output	('fsdp',)	device
+clip_text	['params']['final_layer_norm']['bias']	8	-	()	device
+clip_text	['params']['final_layer_norm']['scale']	8	-	()	device
+clip_text	['params']['layers_0']['input_layernorm']['bias']	8	-	()	device
+clip_text	['params']['layers_0']['input_layernorm']['scale']	8	-	()	device
+clip_text	['params']['layers_0']['mlp']['down_proj']['bias']	8	embed	()	device
+clip_text	['params']['layers_0']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip_text	['params']['layers_0']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip_text	['params']['layers_0']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip_text	['params']['layers_0']['post_attention_layernorm']['bias']	8	-	()	device
+clip_text	['params']['layers_0']['post_attention_layernorm']['scale']	8	-	()	device
+clip_text	['params']['layers_0']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip_text	['params']['layers_0']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_text	['params']['layers_0']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip_text	['params']['layers_0']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip_text	['params']['layers_0']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip_text	['params']['layers_0']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip_text	['params']['layers_0']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip_text	['params']['layers_0']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_text	['params']['layers_1']['input_layernorm']['bias']	8	-	()	device
+clip_text	['params']['layers_1']['input_layernorm']['scale']	8	-	()	device
+clip_text	['params']['layers_1']['mlp']['down_proj']['bias']	8	embed	()	device
+clip_text	['params']['layers_1']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip_text	['params']['layers_1']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip_text	['params']['layers_1']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip_text	['params']['layers_1']['post_attention_layernorm']['bias']	8	-	()	device
+clip_text	['params']['layers_1']['post_attention_layernorm']['scale']	8	-	()	device
+clip_text	['params']['layers_1']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip_text	['params']['layers_1']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_text	['params']['layers_1']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip_text	['params']['layers_1']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip_text	['params']['layers_1']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip_text	['params']['layers_1']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip_text	['params']['layers_1']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip_text	['params']['layers_1']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_text	['params']['position_embedding']['embedding']	8x8	.,embed	(None, 'fsdp')	device
+clip_text	['params']['token_embedding']['embedding']	16x8	vocab,embed	(('fsdp', 'tensor'),)	device
+clip_vision	['params']['blocks_0']['input_layernorm']['bias']	8	-	()	device
+clip_vision	['params']['blocks_0']['input_layernorm']['scale']	8	-	()	device
+clip_vision	['params']['blocks_0']['mlp']['down_proj']['bias']	8	embed	()	device
+clip_vision	['params']['blocks_0']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip_vision	['params']['blocks_0']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip_vision	['params']['blocks_0']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_0']['post_attention_layernorm']['bias']	8	-	()	device
+clip_vision	['params']['blocks_0']['post_attention_layernorm']['scale']	8	-	()	device
+clip_vision	['params']['blocks_0']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip_vision	['params']['blocks_0']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_0']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip_vision	['params']['blocks_0']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip_vision	['params']['blocks_0']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip_vision	['params']['blocks_0']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_0']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip_vision	['params']['blocks_0']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_1']['input_layernorm']['bias']	8	-	()	device
+clip_vision	['params']['blocks_1']['input_layernorm']['scale']	8	-	()	device
+clip_vision	['params']['blocks_1']['mlp']['down_proj']['bias']	8	embed	()	device
+clip_vision	['params']['blocks_1']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+clip_vision	['params']['blocks_1']['mlp']['up_proj']['bias']	16	mlp	('tensor',)	device
+clip_vision	['params']['blocks_1']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_1']['post_attention_layernorm']['bias']	8	-	()	device
+clip_vision	['params']['blocks_1']['post_attention_layernorm']['scale']	8	-	()	device
+clip_vision	['params']['blocks_1']['self_attn']['k_proj']['bias']	8	kv	()	device
+clip_vision	['params']['blocks_1']['self_attn']['k_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_1']['self_attn']['o_proj']['bias']	8	embed	()	device
+clip_vision	['params']['blocks_1']['self_attn']['o_proj']['kernel']	8x8	attention,embed	('tensor', 'fsdp')	device
+clip_vision	['params']['blocks_1']['self_attn']['q_proj']['bias']	8	heads	()	device
+clip_vision	['params']['blocks_1']['self_attn']['q_proj']['kernel']	8x8	embed,heads	('fsdp', 'tensor')	device
+clip_vision	['params']['blocks_1']['self_attn']['v_proj']['bias']	8	kv	()	device
+clip_vision	['params']['blocks_1']['self_attn']['v_proj']['kernel']	8x8	embed,kv	('fsdp', 'tensor')	device
+clip_vision	['params']['class_token']	8	-	()	device
+clip_vision	['params']['patch_embed']['kernel']	2x2x3x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+clip_vision	['params']['position_table']['embedding']	5x8	.,embed	(None, 'fsdp')	device
+clip_vision	['params']['post_norm']['bias']	8	-	()	device
+clip_vision	['params']['post_norm']['scale']	8	-	()	device
+clip_vision	['params']['pre_norm']['bias']	8	-	()	device
+clip_vision	['params']['pre_norm']['scale']	8	-	()	device
 decoder+continuum	['params']['continuum']['down']['kernel']	32x4	embed,mlp	('fsdp', 'tensor')	device
 decoder+continuum	['params']['continuum']['up']['kernel']	4x32	mlp,embed	('tensor', 'fsdp')	device
 decoder+continuum	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
@@ -1264,6 +1416,261 @@ decoder+value_experts	['params']['layers_1']['self_attn']['o_proj']['kernel']	32
 decoder+value_experts	['params']['layers_1']['self_attn']['q_norm']['scale']	8	-	()	device
 decoder+value_experts	['params']['layers_1']['self_attn']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 decoder+value_experts	['params']['norm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['moe']['dspark_0']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['dspark_1']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['dspark_2']['block']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['layers_0']['mlp']['gate']['tid2eid']	256x2	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['moe']['layers_1']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['layers_2']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['layers_3']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['layers_4']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['moe']['layers_5']['mlp']['gate']['e_score_correction_bias']	8	exp	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_0']['block']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['dspark_0']['main_norm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_0']['main_proj']['kernel']	96x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_1']['block']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['dspark_2']['block']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['confidence']['kernel']	40x1	.,.	()	device
+deepseek_v4_dspark	['params']['dspark_2']['hc_head']['hc_base']	2	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['hc_head']['hc_fn']	2x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['dspark_2']['hc_head']['hc_scale']	1	-	()	device
+deepseek_v4_dspark	['params']['dspark_2']['markov_embed']	256x8	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['markov_head']	256x8	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['dspark_2']['norm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['embed_tokens']['embedding']	256x32	vocab,embed	(('fsdp', 'tensor'),)	device
+deepseek_v4_dspark	['params']['hc_head']['hc_base']	2	-	()	device
+deepseek_v4_dspark	['params']['hc_head']['hc_fn']	2x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['hc_head']['hc_scale']	1	-	()	device
+deepseek_v4_dspark	['params']['layers_0']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_0']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_0']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_0']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_0']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_0']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_0']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['layers_1']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_1']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_1']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_1']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_1']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_1']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_1']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['gate_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['gate_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['kv_norm']['scale']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['position_bias']	4x16	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['q_b_proj']['kernel']	8x16	qlora,index	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['indexer']['scorer']['weights_proj']['kernel']	32x2	embed,index	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['kv_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['compressor']['position_bias']	4x32	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_2']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['layers_3']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_3']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_3']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_3']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_3']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['compressor']['gate_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['compressor']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['compressor']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['compressor']['position_bias']	8x16	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_3']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['gate_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['gate_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['kv_norm']['scale']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['position_bias']	4x16	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['q_b_proj']['kernel']	8x16	qlora,index	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['indexer']['scorer']['weights_proj']['kernel']	32x2	embed,index	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['kv_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['compressor']['position_bias']	4x32	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_4']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['layers_5']['attn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_5']['attn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_5']['attn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_5']['ffn_hc']['base']	8	-	()	device
+deepseek_v4_dspark	['params']['layers_5']['ffn_hc']['fn']	8x64	-	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_5']['ffn_hc']['scale']	3	-	()	device
+deepseek_v4_dspark	['params']['layers_5']['input_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['experts']['down_proj']['kernel']	8x16x32	exp,mlp,embed	('expert', 'tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['experts']['gate_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['experts']['up_proj']['kernel']	8x32x16	exp,embed,mlp	('expert', 'fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['gate']['kernel']	32x8	embed,exp	('fsdp', 'expert')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['shared_experts']['down_proj']['kernel']	16x32	mlp,embed	('tensor', 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['shared_experts']['gate_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['mlp']['shared_experts']['up_proj']['kernel']	32x16	embed,mlp	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['kv_norm']['scale']	16	-	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['kv_proj']['kernel']	32x16	embed,.	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['o_a_proj']['kernel']	2x32x8	.,attention,.	(None, 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['o_b_proj']['kernel']	16x32	.,embed	(None, 'fsdp')	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['q_a_norm']['scale']	8	qlora	()	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['q_a_proj']['kernel']	32x8	embed,qlora	('fsdp',)	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['q_b_proj']['kernel']	8x64	qlora,attention	('fsdp', 'tensor')	device
+deepseek_v4_dspark	['params']['layers_5']['self_attn']['sinks']	4	-	()	device
+deepseek_v4_dspark	['params']['lm_head']['kernel']	32x256	embed,vocab	(None, ('fsdp', 'tensor'))	device
+deepseek_v4_dspark	['params']['norm']['scale']	32	-	('fsdp',)	device
 diffusion_gemma	['params']['self_conditioning']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
 diffusion_gemma	['params']['self_conditioning']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 diffusion_gemma	['params']['self_conditioning']['pre_norm']['scale']	32	-	('fsdp',)	device
@@ -2051,6 +2458,554 @@ mixer:short_conv	['params']['layers_1']['self_attn']['conv']['weight']	32x1x3	-	
 mixer:short_conv	['params']['layers_1']['self_attn']['in_proj']['kernel']	32x96	embed,linear	('fsdp',)	device
 mixer:short_conv	['params']['layers_1']['self_attn']['out_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
 mixer:short_conv	['params']['norm']['scale']	32	-	('fsdp',)	device
+mobilenet_v5	['params']['conv_stem']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['conv_stem']['conv']['bias']	8	embed	()	device
+mobilenet_v5	['params']['conv_stem']['conv']['kernel']	3x3x3x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['msfa']['ffn']['pw_exp']['bn']['scale']	80	mlp	('tensor',)	device
+mobilenet_v5	['params']['msfa']['ffn']['pw_exp']['conv']['kernel']	1x1x40x80	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['msfa']['ffn']['pw_proj']['bn']['scale']	2048	embed	('fsdp',)	device
+mobilenet_v5	['params']['msfa']['ffn']['pw_proj']['conv']['kernel']	1x1x80x2048	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['msfa']['norm']['scale']	2048	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_0']['blocks_0']['bn1']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_0']['blocks_0']['bn2']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_0']['blocks_0']['conv_exp']['kernel']	3x3x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_0']['blocks_0']['conv_pwl']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_0']['blocks_1']['bn1']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_0']['blocks_1']['bn2']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_0']['blocks_1']['conv_exp']['kernel']	3x3x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_0']['blocks_1']['conv_pwl']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_0']['blocks_2']['bn1']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_0']['blocks_2']['bn2']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_0']['blocks_2']['conv_exp']['kernel']	3x3x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_0']['blocks_2']['conv_pwl']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['dw_mid']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['dw_mid']['conv']['kernel']	5x5x1x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['dw_start']['conv']['kernel']	3x3x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['layer_scale']['gamma']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['pw_exp']['conv']['kernel']	1x1x8x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['pw_proj']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_0']['pw_proj']['conv']['kernel']	1x1x48x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['dw_start']['conv']['kernel']	5x5x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['layer_scale']['gamma']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['pw_exp']['conv']['kernel']	1x1x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['pw_proj']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_1']['pw_proj']['conv']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['dw_start']['conv']['kernel']	3x3x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['layer_scale']['gamma']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['pw_exp']['conv']['kernel']	1x1x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['pw_proj']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_2']['pw_proj']['conv']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['dw_start']['conv']['kernel']	5x5x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['layer_scale']['gamma']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['pw_exp']['conv']['kernel']	1x1x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['pw_proj']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_3']['pw_proj']['conv']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['dw_start']['conv']['kernel']	3x3x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['layer_scale']['gamma']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['pw_exp']['conv']['kernel']	1x1x8x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['pw_proj']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_1']['blocks_4']['pw_proj']['conv']['kernel']	1x1x32x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['dw_mid']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['dw_mid']['conv']['kernel']	5x5x1x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['dw_start']['bn']['scale']	8	embed	()	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['dw_start']['conv']['kernel']	5x5x1x8	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['pw_exp']['conv']['kernel']	1x1x8x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_0']['pw_proj']['conv']['kernel']	1x1x48x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_1']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_10']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_10']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_10']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_10']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_10']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_11']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_12']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_12']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_12']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_12']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_12']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_13']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_14']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_14']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_14']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_14']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_14']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_15']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_16']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_16']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_16']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_16']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_16']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_17']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_18']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_18']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_18']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_18']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_18']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_19']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_2']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_20']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_20']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_20']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_20']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_20']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_21']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_22']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_22']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_22']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_22']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_22']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_23']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_24']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_24']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_24']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_24']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_24']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_25']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_26']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_26']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_26']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_26']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_26']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_27']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_28']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_28']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_28']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_28']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_28']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_29']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_3']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_30']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_30']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_30']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_30']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_30']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_31']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_32']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_32']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_32']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_32']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_32']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_33']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_34']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_34']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_34']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_34']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_34']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_35']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_36']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_36']['pw_exp']['bn']['scale']	32	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_36']['pw_exp']['conv']['kernel']	1x1x16x32	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_36']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_36']['pw_proj']['conv']['kernel']	1x1x32x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_4']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_5']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_6']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['pw_exp']['bn']['scale']	64	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['pw_exp']['conv']['kernel']	1x1x16x64	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_7']['pw_proj']['conv']['kernel']	1x1x64x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_8']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_8']['pw_exp']['bn']['scale']	16	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_2']['blocks_8']['pw_exp']['conv']['kernel']	1x1x16x16	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_2']['blocks_8']['pw_proj']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_8']['pw_proj']['conv']['kernel']	1x1x16x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['key']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['key']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['key']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['output']['proj']['kernel']	1x1x768x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['query']['proj']['kernel']	1x1x16x768	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['value']['down_conv']['kernel']	3x3x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['value']['norm']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['attn']['value']['proj']['kernel']	1x1x16x64	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['layer_scale']['gamma']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_2']['blocks_9']['norm']['scale']	16	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['dw_mid']['bn']['scale']	96	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['dw_mid']['conv']['kernel']	5x5x1x96	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['dw_start']['bn']['scale']	16	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['dw_start']['conv']['kernel']	5x5x1x16	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['pw_exp']['bn']['scale']	96	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['pw_exp']['conv']['kernel']	1x1x16x96	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_0']['pw_proj']['conv']['kernel']	1x1x96x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_1']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_10']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_10']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_10']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_10']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_10']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_11']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_12']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_12']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_12']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_12']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_12']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_13']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_14']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_14']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_14']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_14']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_14']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_15']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_16']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_16']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_16']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_16']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_16']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_17']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_18']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_18']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_18']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_18']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_18']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_19']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_2']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_2']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_2']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_2']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_2']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_20']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_20']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_20']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_20']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_20']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_21']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_22']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_22']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_22']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_22']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_22']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_23']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_24']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_24']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_24']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_24']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_24']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_25']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_26']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_26']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_26']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_26']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_26']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_27']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_28']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_28']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_28']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_28']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_28']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_29']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_3']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_30']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_30']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_30']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_30']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_30']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_31']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_32']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_32']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_32']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_32']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_32']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_33']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_34']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_34']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_34']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_34']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_34']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_35']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_36']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_36']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_36']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_36']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_36']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_37']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_38']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_38']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_38']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_38']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_38']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_4']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_4']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_4']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_4']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_4']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_5']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_6']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_6']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_6']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_6']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_6']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_7']['norm']['scale']	24	-	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_8']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_8']['pw_exp']['bn']['scale']	48	mlp	('tensor',)	device
+mobilenet_v5	['params']['stages_3']['blocks_8']['pw_exp']['conv']['kernel']	1x1x24x48	.,.,.,mlp	(None, None, None, 'tensor')	device
+mobilenet_v5	['params']['stages_3']['blocks_8']['pw_proj']['bn']['scale']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_8']['pw_proj']['conv']['kernel']	1x1x48x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['attn']['key']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['attn']['output']['proj']['kernel']	1x1x1536x24	.,.,.,embed	(None, None, None, 'fsdp')	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['attn']['query']['proj']['kernel']	1x1x24x1536	.,.,.,heads	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['attn']['value']['proj']['kernel']	1x1x24x96	.,.,.,kv	(None, None, None, ('fsdp', 'tensor'))	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['layer_scale']['gamma']	24	embed	('fsdp',)	device
+mobilenet_v5	['params']['stages_3']['blocks_9']['norm']['scale']	24	-	('fsdp',)	device
 multimodal_transformer	['params']['language_model']['embed_tokens']['embedding']	32x32	vocab,embed	(('fsdp', 'tensor'),)	device
 multimodal_transformer	['params']['language_model']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
 multimodal_transformer	['params']['language_model']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
@@ -2277,6 +3232,25 @@ simple_udit	['params']['up_block_0']['mlp']['up_proj']['bias']	128	mlp	('tensor'
 simple_udit	['params']['up_block_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 simple_udit	['params']['up_dense_0']['bias']	32	-	('fsdp',)	device
 simple_udit	['params']['up_dense_0']['kernel']	64x32	-	('fsdp',)	device
+t5_encoder	['params']['embed_tokens']['embedding']	16x8	vocab,embed	(('fsdp', 'tensor'),)	device
+t5_encoder	['params']['final_layer_norm']['scale']	8	-	()	device
+t5_encoder	['params']['layers_0']['input_layernorm']['scale']	8	-	()	device
+t5_encoder	['params']['layers_0']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+t5_encoder	['params']['layers_0']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_0']['post_attention_layernorm']['scale']	8	-	()	device
+t5_encoder	['params']['layers_0']['self_attn']['k_proj']['kernel']	8x12	embed,kv	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_0']['self_attn']['o_proj']['kernel']	12x8	attention,embed	('tensor', 'fsdp')	device
+t5_encoder	['params']['layers_0']['self_attn']['q_proj']['kernel']	8x12	embed,heads	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_0']['self_attn']['v_proj']['kernel']	8x12	embed,kv	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_1']['input_layernorm']['scale']	8	-	()	device
+t5_encoder	['params']['layers_1']['mlp']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
+t5_encoder	['params']['layers_1']['mlp']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_1']['post_attention_layernorm']['scale']	8	-	()	device
+t5_encoder	['params']['layers_1']['self_attn']['k_proj']['kernel']	8x12	embed,kv	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_1']['self_attn']['o_proj']['kernel']	12x8	attention,embed	('tensor', 'fsdp')	device
+t5_encoder	['params']['layers_1']['self_attn']['q_proj']['kernel']	8x12	embed,heads	('fsdp', 'tensor')	device
+t5_encoder	['params']['layers_1']['self_attn']['v_proj']['kernel']	8x12	embed,kv	('fsdp', 'tensor')	device
+t5_encoder	['params']['relative_attention_bias_0']['embedding']	32x2	-	('fsdp',)	device
 unet	['constants']['FourierEmbedding_0']['frequencies']	16	-	('fsdp',)	device
 unet	['params']['Conv_0']['bias']	8	-	()	device
 unet	['params']['Conv_0']['kernel']	3x3x3x8	-	(None, None, None, 'fsdp')	device
