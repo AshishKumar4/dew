@@ -716,8 +716,9 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
 @dataclasses.dataclass(frozen=True)
 class _Program[T: (Tiles, BackwardTiles)]:
     """A program's static geometry: its family's bundle, its tiles, the call's key tiles (`steps`), the slots
-    a stream holds, its key count, whether it is causal, and its query count (`algebra.Forward.queries`; a
-    tile holding padding rows is never whole)."""
+    a stream holds, its key count, whether it is causal, its query count (`algebra.Forward.queries`; a
+    tile holding padding rows is never whole) and the slices each query tile's keys are cut into (`splits`:
+    a split-KV launch's, each slice a program of its own on the grid's query-tile axis, `split`)."""
 
     family: mosaic.Family
     tiles: T
@@ -726,6 +727,11 @@ class _Program[T: (Tiles, BackwardTiles)]:
     keys: int
     causal: bool
     queries: int | None = None
+    splits: int = 1
+
+    def split(self):
+        """This program's slice of its query tile's keys (`splits`), 0 of one."""
+        return lax.rem(lax.axis_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -739,6 +745,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order."""
         index = lax.axis_index("q_tiles")
+        if self.splits > 1:
+            index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index
 
     def __post_init__(self):
@@ -771,7 +779,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
             walked = self.walked(first)
             # A block holding padding rows is whole nowhere: its padding sees no key (`algebra.seen`).
             count = jnp.where(self.padded(first), 0, self.whole(first, walked))
-            return jnp.int32(0), walked, lambda index: index < count
+            return *self._sliced(jnp.int32(0), walked), lambda index: index < count
         block = lax.div(first, self.tiles.block_q)
         full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
 
@@ -782,7 +790,15 @@ class _Program[T: (Tiles, BackwardTiles)]:
             doc = spans.query_doc[row, block]
             return inside & (doc != 0) & (doc == spans.key_doc[row, index])
 
-        return spans.lo[row, block], spans.hi[row, block], whole
+        return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
+
+    def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
+        """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
+        query tile's tiles, as long as the others but for rounding, partition them; its whole range of one."""
+        if self.splits == 1:
+            return lo, hi
+        split, count = self.split(), hi - lo
+        return lo + lax.div(count * split, self.splits), lo + lax.div(count * (split + 1), self.splits)
 
     def readers(self, k_first, q_steps: int, spans: _Spans | None, row):
         """The query tiles reading a key block from `k_first`, `[lo, hi)` of the call's `q_steps`, and
