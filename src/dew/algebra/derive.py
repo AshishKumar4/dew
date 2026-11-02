@@ -786,18 +786,23 @@ def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
 
 
 def _opaque_locals(graph: EGraph, region: terms.Region) -> list[Term]:
-    """The outputs of equations outside the language (`terms.Opaque`) over local, unwalked inputs alone: local
-    themselves; an equation outside the language over a walked value is refused, its axis unknown."""
+    """The outputs of equations outside the language (`terms.Opaque`), each over local, unwalked inputs alone:
+    local themselves, in program order, so an equation over an earlier one's outputs reads them as local. An
+    equation outside the language over a value the walk reads is refused: over a walked value its axis is
+    unknown, and over one a walked reduction gave (a total's `log2`) no form computes it from the walk's
+    state, where evaluating it from the operands would read them whole."""
     found = []
     for opaque in region.opaque:
         inputs = [term for term in opaque.inputs if term is not None]
+        name = opaque.equation.primitive.name
         if any(_walked(graph, term) for term in inputs):
-            raise Refused(f"{opaque.equation.primitive.name}: an equation outside the language over a walked "
-                          "value")
-        if all(_holds(graph, local(term)) and _holds(graph, unwalked(term)) for term in inputs):
-            for leaf in opaque.outputs:
-                found.append(Term.leaf(i64(leaf)))
-                graph.register(unwalked(Term.leaf(i64(leaf))))
+            raise Refused(f"{name}: an equation outside the language over a walked value")
+        if not all(_holds(graph, local(term)) and _holds(graph, unwalked(term)) for term in inputs):
+            raise Refused(f"{name}: an equation outside the language over a value a walked reduction gave")
+        for leaf in opaque.outputs:
+            found.append(Term.leaf(i64(leaf)))
+            graph.register(local(Term.leaf(i64(leaf))), unwalked(Term.leaf(i64(leaf))))
+        graph.run(WALKING.saturate())
     return found
 
 

@@ -26,9 +26,9 @@ from dew.nn.precision import PROTECTED
 
 BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter", "and",
                     "or", "xor"})
-UNARY = frozenset({"neg", "exp", "exp2", "log", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign", "tanh",
-                   "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor", "ceil",
-                   "round", "is_finite", "not"})
+UNARY = frozenset({"neg", "exp", "exp2", "log", "log2", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign",
+                   "tanh", "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor",
+                   "ceil", "round", "is_finite", "not"})
 COMPARISONS = frozenset({"lt", "le", "eq", "ne", "ge", "gt"})
 REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
 SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
