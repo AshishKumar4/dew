@@ -709,12 +709,26 @@ def test_the_registrations_a_conftests_configure_reads_are_every_files_input(
     read went unseen), so a registration it needs reruns them when it changes."""
     project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = [\"tidy: {}\"]\n"
     (tmp_path / "pyproject.toml").write_text(project.format("a tidy test"))
+    # The conftest's hook asks to run first too, as the recorder's would: no order of hooks hides its read.
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "conftest.py": "def pytest_configure(config):\n"
+        "conftest.py": "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_configure(config):\n"
                        "    assert any('tidy' in line for line in config.getini('markers'))\n",
         "test_plain.py": "def test_plain():\n    pass\n"}, {})
     assert reused() == [True]
     (tmp_path / "pyproject.toml").write_text(project.format("a tidier test"))
+    assert reused() == [False]
+
+
+def test_a_marker_registered_in_a_string_setting_is_its_users_input(ci, tmp_path, monkeypatch, cache_worker):
+    """A marker registered in pytest's settings as one string of lines, as pytest also takes them, is the
+    input of each file that uses it, read as pytest reads the string (review: the string was read a character
+    at a time, so a registration's removal went unseen and a strict collection's failure was reused green)."""
+    project = "[project]\nname = 'x'\n\n[tool.pytest.ini_options]\nmarkers = \"\"\"\n{}\n\"\"\"\n"
+    (tmp_path / "pyproject.toml").write_text(project.format("tidy: a tidy test\nslow: a slow test"))
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_tidy.py": "import pytest\n@pytest.mark.tidy\ndef test_tidy():\n    pass\n"}, {})
+    assert reused() == [True]
+    (tmp_path / "pyproject.toml").write_text(project.format("slow: a slow test"))
     assert reused() == [False]
 
 

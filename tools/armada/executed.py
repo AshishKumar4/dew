@@ -140,16 +140,15 @@ def marks_watched() -> None:
     pytest.MarkGenerator.__getattr__ = looking
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_configure(config):
-    """First of every plugin's and conftest's (review: a conftest's own pytest_configure, registered later,
-    ran before it, and its read of the registrations went unseen). A test's or a conftest's read of every
-    registration (`config.getini("markers")`), its owner's input: pytest's own reads of them, at configure and
-    at a mark's first use, are none. And each marker a lookup
-    asks for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input
-    whether any test then carries it or not (review: a helper evaluating an unregistered marker it never
-    applies fails its importers' collection once the registration goes). Its settings read, a pytest that
-    configures after it in this process (a test's `pytest.main`) is another session (`lifetime.settled`)."""
+def pytest_cmdline_main(config):
+    """The recorder's watches set before pytest configures anything (review: a configure hook, tryfirst or
+    not, of a conftest registered after this plugin ran first, and its read of the registrations went unseen):
+    a test's or a conftest's read of every registration (`config.getini("markers")`), its owner's input,
+    pytest's own reads of them, at configure and at a mark's first use, none. And each marker a lookup asks
+    for (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input whether
+    any test then carries it or not (review: a helper evaluating an unregistered marker it never applies fails
+    its importers' collection once the registration goes). Its settings read, a pytest that configures after
+    it in this process (a test's `pytest.main`) is another session (`lifetime.settled`)."""
     lifetime.settled()
     marks_watched()
     getini = config.getini

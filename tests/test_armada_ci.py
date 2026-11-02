@@ -2032,6 +2032,34 @@ def test_a_kept_task_whose_lookups_spend_its_deadline_starts_no_file_and_returns
     assert rows["3.12:tests/test_c.py#1/3"]["exitCode"] == 0
 
 
+def test_a_kept_tasks_finished_rows_are_in_its_verdict_while_a_slow_cache_holds_their_records(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A kept task's verdict holds each row it has run as soon as it is run, while the row's record is still
+    on its way to a slow cache, so a task cut off then reports the rows it finished (review: the rows came to
+    the verdict only once every record was written)."""
+    url, _, _ = cache_worker
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    written(tmp_path, {f"test_{name}.py": f"def test_{name}():\n    pass\n" for name in "ab"})
+    cached(monkeypatch, slowed(url, 4.0))
+    at = "@GenuineIntel-6-143:0000"
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12",
+                                      f"--tests=tests/test_a.py{at} tests/test_b.py{at}", f"--out={verdict}",
+                                      "--cache=on", "--deadline=600"])
+    monkeypatch.setenv("ARMADA_FRESH", "1")
+    task = threading.Thread(target=ci.main, daemon=True)
+    task.start()
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        text = verdict.read_text() if verdict.is_file() else ""
+        names = [row["name"] for row in json.loads(text)["rows"]] if text else []
+        if names == ["3.12:tests/test_a.py", "3.12:tests/test_b.py"] and task.is_alive():
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("the task's verdict never held both rows while it was still writing records")
+    task.join(120)
+
+
 def test_in_a_fresh_task_of_several_misses_only_the_first_row_run_keeps_its_key(
         ci, tmp_path, monkeypatch, cache_worker):
     """A fresh container's task whose whole file and two kept groups all miss runs the three, and only the
