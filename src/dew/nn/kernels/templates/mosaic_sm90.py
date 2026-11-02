@@ -127,7 +127,7 @@ class WgmmaIssuer(mosaic.Issuer):
         """`Family.added_into` for a warpgroup accumulator ref: its value read once its products are done,
         `value` added, stored back (interpreted, a register value's sum, `summed`'s)."""
         if interpret:
-            return super().added_into(acc, value, interpret)
+            return acc + self.as_tile(value)
         plgpu.wgmma_wait(0)
         acc[...] = acc[...] + value
         return acc

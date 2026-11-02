@@ -299,6 +299,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         return self.register_products(scale(acc), parts, rhs, interpret)
 
+    def added_into(self, acc: jax.Array, value: jax.Array, interpret: bool) -> jax.Array:
+        """`Issuer.added_into` for a register accumulator: its sum with `value`, in the accumulator's
+        layout."""
+        del interpret
+        return acc + self.as_tile(value)
+
     def settled(self, pending: int = 0) -> None:
         del pending
 

@@ -1101,11 +1101,10 @@ class Issuer[Accumulator](abc.ABC):
         del interpret
         return issue(self.zeros(shape))
 
+    @abc.abstractmethod
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
         """The accumulator `acc` a walk carries with `value` (fp32, its shape, a scaled product restored,
-        `operands.Issuer.summed`) added in: a register accumulator's sum, in the accumulator's layout."""
-        del interpret
-        return acc + self.as_tile(value)
+        `operands.Issuer.summed`) added in."""
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple[jax.Array, ...]:
         """Register accumulators of `shapes` as a walk starts: their `initial` values, zero where None."""
