@@ -2448,14 +2448,14 @@ def test_a_version_7_streamed_plan_of_two_shares_reads_as_8s_where_8_reads_its_t
     it, or no loading workers read it, a member's own pool among them, and it is no bound in examples (its
     manifest's steps hold no `MarkConsumed`); a take read by workers, or a bound, 8 deals otherwise (row
     3350's review)."""
-    from dew.data.plan import read_alike_at_8
+    from dew.data.plan import read_otherwise_at_8
 
     steps = [{"identity": "Map(step=MarkConsumed())"}] if bounded else []
     member = {"read": "streamed", "stages": ["Limit(count=5)"] if taken else ["Map(step=Shout())"]}
     saved = {"version": 7, "order": {"read": "streamed", "corpora": [member, member]},
              "members": {"0": "a", "1": "b"}, "manifest": {"steps": steps},
              "topology": {"shares": 2, "share": 0, "workers": workers, "pools": pools}}
-    assert read_alike_at_8(saved) is alike
+    assert (read_otherwise_at_8(saved) is None) is alike
 
 
 @pytest.mark.parametrize("kind", ["plain", "take", "bound"])

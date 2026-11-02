@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, json_value, record, set_added, without_removed
+from dew._records import ADDED, JSON, integer, json_value, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -442,23 +442,117 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
 
     if written.get("version") == 7:
         iterator = counted(iterator)
+    if integer(saved.get("counters", 1), "a position's counters format") < COUNTERS:
+        iterator = _by_member(iterator, plan)
     return earlier_plan(written, plan), iterator
 
 
-def read_alike_at_8(saved: Mapping[str, object]) -> bool:
-    """Whether version 8 reads a version 7 data plan's order as 7 did (`earlier_plan`): where its read is
-    not streamed, one reader reads it, no take reads its order (no `Limit` among its stages, its mixed
-    corpora's orders within it), or its takes are no bound in examples and no loading workers read them, a
-    corpus's own pool among them (`pools`). Otherwise (`read_otherwise_at_8`) it reads another order."""
-    return read_otherwise_at_8(saved) is None
+COUNTERS = 2
+"""The format of a per-share position's counters (`dew.data.readers`): 2 counts a mixture a run bounds in
+examples by member where its rows are delivered (row 3312), which a position of an earlier format, holding
+no `counters`, does not (`_by_member`)."""
+
+_PLACED = frozenset({"dew.data.pipeline.Shuffle", "dew.data.pipeline.Repeat", "dew.data.pipeline.Limit",
+                     "dew.data.pipeline.Slice"})
+"""Steps after a batch with positions of their own around the rows (`_by_member`); a map of batches, a
+prefetch or the workers hold none."""
+
+
+def _by_member(iterator: JSON, plan: Plan) -> JSON:
+    """A per-share position of the counters' format 1 as format 2 holds it (`COUNTERS`). Each counter holds
+    its members' counts, none (the members of a mixture's counter past its mix count afresh), as does each
+    held count of a completion (`dew.data.completion`). A mixture a run bounds in examples counts its
+    members where its rows are delivered, a counter of its own above the rows, which counts each member
+    afresh from the resume (its draws counted each example as the mix drew it, a refused one too), and its
+    layouts say which document each token is of (`DOCUMENT`): the tokens a causal window held are of no
+    document, and a pack's remainder, which it reads again, is cut as its counts are. What a position held
+    in flight by member, it held as no member's: the examples a counter, a window or a completion held count
+    in the run's total and on its clock as they did, and complete no member's; a document a pack or a draw
+    reads again completes its member's."""
+    from dew.data.mixing import COUNTER, CorpusCounts
+    from dew.data.pipeline import CONSUMED, DOCUMENT
+
+    def filled(branch: JSON) -> JSON:
+        match branch:
+            case list():
+                return [filled(child) for child in branch]
+            case dict():
+                node = {name: filled(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node.get(COUNTER):
+            case {"consecutive": _} as counter if "members" not in counter:
+                node[COUNTER] = {**counter, "members": {}}
+        match node:
+            case {"parent": _, "floor": _, "drawn": _, "held": list(held)}:
+                node["held"] = [[*entry, {}] if isinstance(entry, list) and len(entry) == 4 else entry
+                                for entry in held]
+        return node
+
+    iterator = filled(iterator)
+    steps = record(plan.manifest.semantic(), "data manifest").get("steps", [])
+    names = [record(step, "manifest step").get("name") for step in (steps if isinstance(steps, list) else [])]
+    mixed = plan.order.get("members")
+    if plan.lowering != "per-share" or not mixed or "dew.data.pipeline.MarkConsumed" not in names:
+        return iterator
+    batch = "dew.data.pipeline.BatchStage"
+    batched = names.index(batch) if batch in names else len(names)
+    if any(name in _PLACED for name in names[batched + 1:]):
+        raise ValueError(
+            "this run's mixture is bounded in examples and its position was saved before Dew counted a "
+            "mixture's members where their rows are delivered, under a shuffle, repeat or take of batches, "
+            "whose position the translation does not place the members' counter beneath; resume with the Dew "
+            "that wrote it, or go on from its weights as a new run (`--pretrained <run directory>`)")
+
+    def laid(branch: JSON) -> JSON:
+        """The mixture's layouts past its mix, each document a token is of (`DOCUMENT`): none of the tokens
+        a causal window held, a pack's remainder cut as its counts; the members' own beneath the mix as
+        they were."""
+        match branch:
+            case {"parents": dict(), "index": _}:
+                return branch
+            case list():
+                return [laid(child) for child in branch]
+            case dict():
+                node = {name: laid(child) for name, child in branch.items()}
+            case _:
+                return branch
+        match node:
+            case {"windows": _, "rule": _} if "documents" not in node:
+                node["documents"] = 1
+            case {"parent": _, "skip": _, "credited": _, "held": {**held}} if (
+                    CONSUMED in held and DOCUMENT not in held):
+                tokens = record(held[CONSUMED], "held counts").get("tokens", [])
+                none: list[JSON] = [0] * (len(tokens) if isinstance(tokens, list) else 0)
+                node["held"] = {**held, DOCUMENT: {"dtype": "<i8", "tokens": none}}
+                node["documents"] = {}
+            case {"remainder_slices": {**slices}} if CONSUMED in slices and DOCUMENT not in slices:
+                node["remainder_slices"] = {**slices, DOCUMENT: slices[CONSUMED]}
+        return node
+
+    def counter(rows: JSON) -> JSON:
+        """`rows`, the mixture's rows as format 1 saved them, beneath its members' counter, which counts
+        each member afresh: its draws counted each example as the mix drew it, a refused one too."""
+        own = json_value(CorpusCounts("mixture", "mixture", rows=False).state(), "mixture counts")
+        node: dict[str, JSON] = {"corpus": "mixture", "label": "mixture", "counts": own, "rows": False,
+                                 "consecutive": 0, "warned": False, "consumed": 0, "members": {}}
+        return {"parent": laid(rows), COUNTER: node}
+
+    match iterator:
+        case {"workers_state": {**workers}} as pooled:
+            return {**pooled, "workers_state": {name: counter(state) for name, state in workers.items()}}
+    return counter(iterator)
 
 
 def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
-    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike
-    (`read_alike_at_8`). Version 7 read a take before its loading workers (a `.take`) on each of them, and
-    a run's bound in examples (its manifest's `MarkConsumed` step) whole on each of a pool's shares and their
-    workers; version 8 takes the one across them and deals the other to them. So a position 7 wrote of such
-    a read can go on only as 7 read it, which reads the bound once a reader: the over-read 8 ended."""
+    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike:
+    where its read is not streamed, one reader reads it, no take reads its order (no `Limit` among its stages,
+    its mixed corpora's orders within it), or its takes are no bound in examples and no loading workers read
+    them, a corpus's own pool among them (`pools`). Version 7 read a take before its loading workers (a
+    `.take`) on each of them, and a run's bound in examples (its manifest's `MarkConsumed` step) whole on each
+    of a pool's shares and their workers; version 8 takes the one across them and deals the other to them. So
+    a position 7 wrote of such a read can go on only as 7 read it, which reads the bound once a reader: the
+    over-read 8 ended."""
     order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
     readers = topology if isinstance(topology, Mapping) else {}
     pools = readers.get("pools", {})
@@ -485,7 +579,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
     the saved and current manifests' sources are numbered as their derived facts number them. Carried to
     1.0 (ledger 1552)."""
-    if saved.get("version") == 7 and plan.version == 8 and read_alike_at_8(saved):
+    if saved.get("version") == 7 and plan.version == 8 and read_otherwise_at_8(saved) is None:
         saved = {**saved, "version": 8}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
@@ -739,8 +833,9 @@ class Plan:
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
                 f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; resume with the Dew "
-                "that wrote it, or go on from its weights as a new run that reads its data afresh: its "
-                "state restored (`Checkpoints.restore`) and given to `fit(state=)`"
+                "that wrote it, or go on from its weights as a new run that reads its data afresh: "
+                "`--pretrained <run directory>` on the command line or in run.json, or its state restored "
+                "(`Checkpoints.restore`) and given to `fit(state=)`"
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(

@@ -12,7 +12,7 @@ import types
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import jax
 import numpy as np
@@ -42,7 +42,10 @@ from dew.distributed.batches import (
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Counted
-from dew.training.tracker import write_artifact
+from dew.training.tracker import Tracker, write_artifact
+
+if TYPE_CHECKING:
+    from dew.training.display import TrainingDisplay
 
 
 @dataclass(frozen=True)
@@ -243,6 +246,22 @@ class Evaluation:
         return {**self.scores,
                 f"evaluation/counts/{self.split}/coordinated_batches": float(self.coordinated_batches),
                 f"evaluation/counts/{self.split}/records": float(self.records), **share, **clocked}
+
+    def report(self, display: TrainingDisplay, tracker: Tracker | None) -> None:
+        """Print this evaluation on rank zero (`display`) and log its previews and scores there to `tracker`,
+        every process agreeing it was reported."""
+        def report() -> None:
+            if jax.process_index() != 0:
+                return
+            display.evaluation(self)
+            if tracker is not None:
+                for artifact in self.previews:
+                    tracker.artifact(artifact, self.step)
+                scalars = self.scalars
+                if scalars:
+                    tracker.log(scalars, self.step)
+
+        agreed("evaluation reporting", report)
 
     def branched(self) -> Evaluation:
         """This evaluation as a cooldown branch's: its split and every score named under `COOLDOWN`."""

@@ -46,8 +46,10 @@ else:
     _cache = default_compilation_cache_dir()
     if _cache:
         # A worker that keeps bundles of the shared cache below writes a directory of its own, so the
-        # programs a bundle gains are that worker's whole writes, not another's half-written one.
-        if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
+        # programs a bundle gains are that worker's whole writes, not another's half-written one; with no
+        # shared cache the workers share one, each reading what another compiled (2026-11-02: a URL with no
+        # token gave 16 workers 16 caches, 33 s a case against 4).
+        if os.environ.get("PYTEST_XDIST_WORKER") and remote_cache.requested():
             _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
         # The processes its tests start (a checker run as a script, a CLI) compile into the same cache under
