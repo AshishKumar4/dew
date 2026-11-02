@@ -72,8 +72,9 @@ def rounding_bound(fn, *args, batch: int = 64):
 
         @jax.jit
         def sensitivities(basis):
-            _, pull = jax.vjp(tapped, zeros)
-            (cotangents,) = jax.vmap(pull)(basis)
+            # The tapped program linearized at no tap and transposed, each output a reverse pass.
+            _, tangent = jax.linearize(tapped, zeros)
+            (cotangents,) = jax.vmap(jax.linear_transpose(tangent, zeros))(basis)
             # A rounding no output reads has no cotangent.
             return sum(jnp.sum(jnp.abs(cotangent) * magnitude, axis=tuple(range(1, cotangent.ndim)))
                        for cotangent, magnitude in zip(cotangents, magnitudes, strict=True)
