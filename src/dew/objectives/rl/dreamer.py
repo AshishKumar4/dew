@@ -28,6 +28,7 @@ import functools
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import jax
@@ -803,10 +804,13 @@ class DreamerV3Objective(Objective[Ratio]):
 class Saved(TypedDict):
     """What a `DreamerRollout` carries between calls, as a checkpoint holds it (`DreamerRollout.saved`):
     the environment steps it took and those of them its prefills took (each two 32-bit words, `_words`),
-    and with a checkpointed replay its environments, replay and returns."""
+    where it owes its updates from (`paced`: the updates and the steps owed for them, an update's replayed
+    steps and the train ratio's float64 bits, each two words) and with a checkpointed replay its
+    environments, replay and returns."""
 
     taken: np.ndarray
     prefilled: np.ndarray
+    paced: NotRequired[np.ndarray]
     carry: NotRequired[Carry]
     replay: NotRequired[ReplayBuffer]
     returns: NotRequired[jax.Array]
@@ -879,6 +883,7 @@ class DreamerRollout:
     _prefilled: int = field(default=0, init=False, repr=False)
     _restored: bool = field(default=False, init=False, repr=False)
     _paced: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _recorded: tuple[int, int, int, float] | None = field(default=None, init=False, repr=False)
     _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
     _driven: DrivenSimulator | None = field(default=None, init=False, repr=False)
 
@@ -922,16 +927,21 @@ class DreamerRollout:
         live = self._live
         if live is None:
             return None
-        taken, prefilled = _words(self._taken), _words(self._prefilled)
-        if not self.checkpointed_replay:
-            return Saved(taken=taken, prefilled=prefilled)
-        return Saved(taken=taken, prefilled=prefilled, carry=live.carry, replay=live.replay,
-                     returns=live.returns)
+        counts = Saved(taken=_words(self._taken), prefilled=_words(self._prefilled))
+        # Where it owes from, or where the checkpoint it was restored from did, before its first call.
+        paced = self._recorded if self._paced is None else (*self._paced, self.batch * self.length,
+                                                             self.train_ratio)
+        if paced is not None:
+            since, owed, windows, ratio = paced
+            counts["paced"] = np.stack([_words(since), _words(owed), _words(windows), _words(_bits(ratio))])
+        if self.checkpointed_replay:
+            counts.update(carry=live.carry, replay=live.replay, returns=live.returns)
+        return counts
 
     def saved_shapes(self) -> Mapping[str, object]:
         """`saved`'s leaves' shapes and dtypes, before any call."""
         counted = jax.ShapeDtypeStruct((2,), np.uint32)
-        taken = {"taken": counted, "prefilled": counted}
+        taken = {"taken": counted, "prefilled": counted, "paced": jax.ShapeDtypeStruct((4, 2), np.uint32)}
         env = self.env
         if not self.checkpointed_replay or isinstance(env, Simulator):
             return taken
@@ -949,7 +959,10 @@ class DreamerRollout:
         """The rollout carrying on from a `saved` tree: owing the steps after those it had taken, and with
         `checkpointed_replay` from its replay and its environments as they stood."""
         self._taken, self._prefilled, self._restored = _count(tree["taken"]), _count(tree["prefilled"]), True
-        self._paced = None
+        self._paced, self._recorded = None, None
+        if "paced" in tree:
+            since, owed, windows, bits = (_count(words) for words in np.asarray(tree["paced"]))
+            self._recorded = (since, owed, windows, _ratio(bits))
         if "replay" in tree and "carry" in tree and "returns" in tree:
             self._live = _Live(tree["carry"], tree["replay"], tree["returns"])
 
@@ -1057,7 +1070,7 @@ class DreamerRollout:
         live = self._started(variables, act_key) if self._live is None else self._live
         envs = live.returns.shape[0]
         if self._paced is None:
-            self._paced = (updates, self._anchored(updates, envs))
+            self._paced = self._anchored(updates, envs)
         due = max(self._owed(updates + 1, envs) - (self._taken - self._prefilled), 0)
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
@@ -1066,33 +1079,43 @@ class DreamerRollout:
         # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
         return self._drawn(sample_key)
 
-    def _anchored(self, updates: int, envs: int) -> int:
-        """The steps owed for the `updates` committed where the rollout goes on from, of those it has taken:
-        between those taken and those less one update's (taken for an update not yet committed, in an
-        accumulation window or one the trainer rejected), its own pace's (`_whole`), as the run that took
-        them owes them at that pace; outside them, the nearest, as a run going on at another pace (a later
-        phase's longer windows) owes from there."""
+    def _anchored(self, updates: int, envs: int) -> tuple[int, int]:
+        """Where the rollout owes its updates from (`_owed`), at its first call with `updates` committed: the
+        updates and the steps owed for them. Restored, its checkpoint's anchor where it goes on at the pace
+        that saved it, so the steps it took for an update not yet committed (in an accumulation window, or
+        one the trainer rejected) stand paid; at another pace (a later phase's longer windows), the steps
+        that pace owed for `updates`, from which this one owes the updates after them. A checkpoint that
+        holds no anchor (an earlier Dew's, its run at one pace) has its pace's steps for `updates` within
+        one update of those taken, else the nearest. Begun afresh, or mid way without its state, it owes
+        from the steps it has."""
         taken = self._taken - self._prefilled
-        owed = self._whole(updates, envs)
-        return min(max(owed, taken - (self._whole(updates + 1, envs) - owed)), taken)
+        windows = self.batch * self.length
+        if self._recorded is not None:
+            since, owed, saved_windows, ratio = self._recorded
+            if (saved_windows, ratio) == (windows, self.train_ratio):
+                return since, owed
+            return updates, owed + _whole(updates, saved_windows, ratio, envs) - _whole(
+                since, saved_windows, ratio, envs)
+        if not self._restored:
+            return updates, taken
+        owed = _whole(updates, windows, self.train_ratio, envs)
+        step = _whole(updates + 1, windows, self.train_ratio, envs) - owed
+        return updates, min(max(owed, taken - step), taken)
 
     def _owed(self, updates: int, envs: int) -> int:
         """The environment steps owed for `updates` updates over `envs` environments stepped together: those
-        owed where the rollout went on from (`_anchored`), and from there the steps of its updates at its
+        owed where the rollout owes from (`_anchored`), and from there the steps of its updates at its
         pace (`_whole`)."""
         assert self._paced is not None
         since, owed = self._paced
-        return owed + self._whole(updates, envs) - self._whole(since, envs)
-
-    def _whole(self, updates: int, envs: int) -> int:
-        """The steps `updates` updates train on at the rollout's pace (`_paced_steps`), in whole steps of
-        every one of `envs` environments, as a run at that pace from the start takes them."""
-        return envs * -(-self._paced_steps(updates) // envs)
+        windows = self.batch * self.length
+        return owed + _whole(updates, windows, self.train_ratio, envs) - _whole(
+            since, windows, self.train_ratio, envs)
 
     def _paced_steps(self, updates: int) -> int:
         """The environment steps `updates` updates train on at the rollout's batch, length and train ratio,
         rounded up."""
-        return math.ceil(updates * self.batch * self.length / self.train_ratio)
+        return _whole(updates, self.batch * self.length, self.train_ratio, 1)
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -1101,13 +1124,14 @@ class DreamerRollout:
         that advance it, so the run's is copied aside first, at the replay's size again for the branch; a
         begun `Simulator` keeps its own environments (`DrivenSimulator.branch`)."""
         kept = (None if self._live is None else jax.tree.map(jnp.copy, self._live), self._taken,
-                self._prefilled, self._restored, self._paced, self._ended)
+                self._prefilled, self._restored, self._paced, self._recorded, self._ended)
         driven = self._driven if self._live is not None else None
         try:
             with contextlib.nullcontext() if driven is None else driven.branch():
                 yield
         finally:
-            self._live, self._taken, self._prefilled, self._restored, self._paced, self._ended = kept
+            (self._live, self._taken, self._prefilled, self._restored, self._paced, self._recorded,
+             self._ended) = kept
 
     def sample(self, key: jax.Array) -> Batch:
         """`batch` windows of `length` steps drawn from the replay as an update draws them, fetched to the
@@ -1141,6 +1165,22 @@ def _count(words) -> int:
     """The count `_words` wrote."""
     high, low = (int(word) for word in np.asarray(words, np.uint64))
     return high << 32 | low
+
+
+def _bits(ratio: float) -> int:
+    """A train ratio's float64 bits, which `_words` keeps exactly (`_ratio`)."""
+    return int(np.asarray(ratio, np.float64).view(np.uint64))
+
+
+def _ratio(bits: int) -> float:
+    """The train ratio `_bits` wrote."""
+    return float(np.asarray(bits, np.uint64).view(np.float64))
+
+
+def _whole(updates: int, windows: int, ratio: float, envs: int) -> int:
+    """The environment steps `updates` updates of `windows` replayed steps each train on at the train
+    `ratio`, exactly, rounded up to whole steps of every one of `envs` environments stepped together."""
+    return envs * math.ceil(Fraction(updates * windows) / (Fraction(ratio) * envs))
 
 
 @struct.dataclass

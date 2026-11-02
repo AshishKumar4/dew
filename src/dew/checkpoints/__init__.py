@@ -1968,7 +1968,9 @@ class Checkpoints:
         metadata = _item_metadata(self._step_metadata(step, local=from_local))
         if 'rollout' not in metadata:
             return None
-        wanted = {'rollout': dict(template)}
+        # A step saved before the rollout held a key holds the rest, which the rollout reads without it.
+        held = metadata['rollout']
+        wanted = {'rollout': {key: value for key, value in template.items() if key in held}}
         _refuse_reshaped(wanted, metadata, self.source(step))
         checkpointer = self._open_local() if from_local else self._open()
         restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
