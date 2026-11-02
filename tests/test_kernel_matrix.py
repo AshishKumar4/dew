@@ -1,7 +1,8 @@
-"""Each template kernel family's check-1 matrix (tests/kernel_matrix.py) covers every pair of axis values its route
-serves, and nothing it does not: main's GPU tier runs its cells after a publish that reaches the kernels (Main,
-2026-11-02, after the attention dK escape, where the tier had no GQA width-128 backward cell). A family whose axes,
-or whose route's support, change fails here until its cases are regenerated (`kernel_matrix.covering`)."""
+"""Each template kernel family's check-1 matrix (tests/kernel_matrix.py) covers every pair of axis values its
+route serves, and nothing it does not: main's GPU tier runs its cells after a publish that reaches the kernels
+(Main, 2026-11-02, after the attention dK escape, where the tier had no GQA width-128 backward cell). A family
+whose axes, or whose route's support, change fails here until its cases are regenerated
+(`kernel_matrix.covering`)."""
 
 import ast
 import itertools
@@ -30,8 +31,8 @@ def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_no
     assert not unserved, f"{family}'s cells cover combinations its route does not serve: {unserved}"
     held = set().union(*(pairs(combination) for _, combination in cells))
     missing = {frozenset(pair) for pair in kernel_matrix.supported_pairs(family)} - held
-    assert not missing, (f"{len(missing)} pairs of {family}'s axis values its route serves are in no cell, e.g. "
-                         f"{sorted(sorted(pair) for pair in missing)[:10]}: regenerate its cases from "
+    assert not missing, (f"{len(missing)} pairs of {family}'s axis values its route serves are in no cell, "
+                         f"e.g. {sorted(sorted(pair) for pair in missing)[:10]}: regenerate its cases from "
                          f"kernel_matrix.covering({family!r})")
 
 
