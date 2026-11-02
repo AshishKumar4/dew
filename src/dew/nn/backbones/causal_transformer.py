@@ -104,7 +104,7 @@ from ..precision import (
 from ..progress import Progress
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, logical_axes, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
@@ -141,6 +141,18 @@ _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
 _FINAL = "final_residual"
 """The collection the forward sows its stack's output into (`layer_state`)."""
+
+
+DECODER_AXES: dict[str, LogicalAxes] = {
+    "embed_tokens": ("vocab", "embed"),
+    "embed_positions": (None, "embed"),
+    "lm_head": ("embed", "vocab"),
+    "head_bias": ("vocab",),
+    "embed_tokens_per_layer": ("vocab", None),
+    "per_layer_model_projection": ("embed", "mlp"),
+}
+"""The logical axes of the decoder's own parameters outside its layers, by name, as it declares them where
+it makes them."""
 
 
 @logical_axes({
@@ -867,11 +879,13 @@ class CausalTransformer(nn.Module):
             # hidden_size_per_layer_input slice per layer.
             self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
-                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx)
+                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx,
+                embedding_init=declared(TokenEmbedding.embedding_init,
+                                        DECODER_AXES['embed_tokens_per_layer']))
             self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
-                dtype=self.dtype, precision=self.precision,
-                name='per_layer_model_projection', dot_general=float32_dot_general)
+                dtype=self.dtype, precision=self.precision, name='per_layer_model_projection',
+                dot_general=float32_dot_general, kernel_axes=DECODER_AXES['per_layer_model_projection'])
             self.per_layer_projection_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
@@ -932,7 +946,7 @@ class CausalTransformer(nn.Module):
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
-                name='lm_head', **normal_kernel(self.initializer_range))
+                kernel_axes=DECODER_AXES['lm_head'], name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
             self.continuum_level = Continuum(self.continuum, dtype=self.dtype, precision=self.precision,
                                              name='continuum')
@@ -946,7 +960,8 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
-                'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
+                'head_bias', declared(nn.initializers.zeros_init(), DECODER_AXES['head_bias']),
+                (self.vocab_size,), jnp.float32)
 
     @nn.nowrap
     def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
@@ -2117,8 +2132,9 @@ class CausalTransformer(nn.Module):
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
             dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
-            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                            else nn.initializers.normal(self.initializer_range)))
+            embedding_init=declared(TokenEmbedding.embedding_init if self.initializer_range is None
+                                    else nn.initializers.normal(self.initializer_range),
+                                    DECODER_AXES['embed_tokens']))
         if self.embedding_features is not None:
             projection = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                            **normal_kernel(self.initializer_range))
@@ -2135,8 +2151,9 @@ class CausalTransformer(nn.Module):
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
-                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                                else nn.initializers.normal(self.initializer_range)))
+                embedding_init=declared(TokenEmbedding.embedding_init if self.initializer_range is None
+                                        else nn.initializers.normal(self.initializer_range),
+                                        DECODER_AXES['embed_positions']))
             self.decode_cursor = DecodeCursor()
 
     def _final_norm(self):

@@ -77,18 +77,19 @@ TRAINED = ("causal_transformer", "causal_transformer+moe")
 """The cases whose trainer's state is recorded too: its Adam moments and EMA beside its parameters."""
 
 
-def _axes(variables) -> dict[str, tuple]:
-    """Each leaf's declared logical axes, as the layout reads them, by its key path."""
+def _axes(variables, table=None) -> dict[str, tuple]:
+    """Each leaf's declared logical axes, as the layout reads them, by its key path: those `variables`
+    box, or the run's `table` (`Objective.parameter_axes`) for a state that mirrors them."""
     rules = Layout().axis_rules
     declared = declarations(variables)
-    with boxed(ruled_boxes(boxed_axes(variables), rules)):
+    with boxed(ruled_boxes(boxed_axes(variables) if table is None else table, rules)):
         return {jax.tree_util.keystr(path): declared_axes(path, leaf.ndim, declared)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(variables))}
 
 
-def _lines(name: str, tree, placement) -> list[str]:
+def _lines(name: str, tree, placement, table=None) -> list[str]:
     """`tree`'s leaves placed as `placement` places them, a line each (`COLUMNS`)."""
-    axes = _axes(tree)
+    axes = _axes(tree, table)
     lines = []
     for (path, leaf), sharding in zip(jax.tree_util.tree_leaves_with_path(nn.unbox(tree)),
                                       jax.tree.leaves(placement), strict=True):
@@ -114,5 +115,5 @@ def snapshot(name: str, build) -> list[str]:
         state = jax.eval_shape(trainer.initial_state)
         placed = trainer.shardings(state)
         lines += _lines(f"{name}:state", {"opt_state": state.opt_state, "ema": state.ema},
-                        {"opt_state": placed.opt_state, "ema": placed.ema})
+                        {"opt_state": placed.opt_state, "ema": placed.ema}, trainer.objective.parameter_axes)
     return lines
