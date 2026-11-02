@@ -201,28 +201,25 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         shaped = live.reshape(*live.shape[:2], splits, -1)
         return jnp.broadcast_to(jnp.any(shaped, axis=2, keepdims=True), shaped.shape).reshape(live.shape)
 
+    def walked_blocks(live: jax.Array, block_q: int) -> jax.Array:
+        # A masked launch's query blocks a live row of which any head holds, `[B, Qp // block_q]` int32
+        # (`_launch`'s `walks`): its other programs load and write nothing.
+        live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
+        return jnp.any(live_rows.reshape(live_rows.shape[0], -1, block_q), axis=-1).astype(jnp.int32)
+
     def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False
                ) -> tuple[tuple, jax.Array, jax.Array]:
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        walked_call = call
         if live is not None:
             live = whole_rows(live)
-            if masked:
-                # A masked launch's rows past its live ones see no key, so their programs walk none: a query
-                # row's keys walked where any of its heads' rows is live, `[B, Qp]` (a call's runs,
-                # `[B, R, Qp]`, alike). A spans call's block map counts blocks of the launch's own key tile.
-                live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
-                live_rows = live_rows[:, None] if call.end.ndim == 3 else live_rows
-                walked_call = dataclasses.replace(call, end=jnp.where(live_rows, call.end, call.start))
         if live is None or not form.headroom:
             # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
             # blocks' outputs side by side, their rows' statistics alike; an output hook of a row's whole
             # output in XLA past them, as the guarded launch's. A masked rewalk of sums that cannot overflow
-            # (`algebra.walked_launches`' fold) walks its live rows so, unguarded.
-            if walked_call is not call:
-                at_spans = _spans_of(spec, walked_call, at.block_q, at.block_k)
+            # (`algebra.walked_launches`' fold) walks its live rows' blocks so, unguarded.
+            walks = None if live is None else walked_blocks(live, at.block_q)
             blocks = _column_blocks(v, hooked, at.columns)
             split = len(blocks) > 1 and hooks.output_mod is not None
             launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
@@ -230,7 +227,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                 family=family, training=False, interpret=interpret,
                                 counted=form.natural == spec.natural and not again, kept=again,
                                 finishes=rows, columns=first, splits=splits, table=table,
-                                out_dtype=jnp.float32 if split else out_dtype, masked=walked_call is not call)
+                                out_dtype=jnp.float32 if split else out_dtype, walks=walks)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
@@ -242,7 +239,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
-        guarded_spans = _spans_of(spec, walked_call, guarded.block_q, guarded.block_k)
+        guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
+        walks = walked_blocks(live, guarded.block_q) if masked else None
         # A masked launch's rows its own whole, their finished maxima and denominators beside their output
         # (`kept`): a fold's natural rewalk's are its rows' own, in its units.
         finishes = rows and masked
@@ -258,7 +256,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                 tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
                 splits=splits, table=table, out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
-                masked=masked)
+                walks=walks)
             blocks.append(block)
             # Every block's rows alike: its logits are the row's whole.
             finished = finished or tuple(block_rows)
@@ -767,7 +765,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
             kept: bool = False, finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
-            masked: bool = False):
+            walks: jax.Array | None = None):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -786,8 +784,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     `table` (a paged call's page table and its keys a page, `attention.Pages`), `key` and `value` are its
     pools flattened, `[KV, P·size, D]`, and a step's key tile is read where the table maps it. With
     `column_width`, it walks `value`'s columns `columns` to `columns + column_width` where they lie, its
-    output that block's. A `masked` launch (`algebra.walked_launches`') walks only the rows its spans leave
-    keys: a program whose query blocks have none loads and writes nothing, its outputs there unread.
+    output that block's. With `walks` (a masked launch's, `algebra.walked_launches`': `[B, Qp // block_q]`
+    int32, nonzero at a query block holding a row it walks), a program none of whose query blocks it names
+    loads and writes nothing, its outputs there unread.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
@@ -796,23 +795,24 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
-    return _launched(query, key, value, (spans, hooked, guard, anchors, None if table is None else table[0]),
+    return _launched(query, key, value,
+                     (spans, hooked, guard, anchors, None if table is None else table[0], walks),
                      hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
                      counted=counted, finishes=finishes, target=generation.gpu_target(),
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_block=None if column_width is None else (columns, column_width), masked=masked)
+                     column_block=None if column_width is None else (columns, column_width))
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_block", "masked"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_block"))
 def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_block: tuple[int, int] | None = None, masked: bool = False):
+              column_block: tuple[int, int] | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -848,7 +848,7 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         written, refs = refs[:len(out_type)], refs[len(out_type):]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if peaks or (reuse and not training) else (stages[0], stages[1:])
-        spans_of, hooked_of, guard_of, anchors_of, table_of = treedef.unflatten(read)
+        spans_of, hooked_of, guard_of, anchors_of, table_of, walks_of = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         named = {"keys": k_ref} if peaks else {"keys": k_ref, "values": v_ref}
         views = (_views_of(named, row, lax.div(head, group)) if page is None
@@ -864,6 +864,15 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
                               for index in range(consumers)])
 
         turn = functools.partial(family.turn, schedule, consumers)
+
+        def run(role):
+            # Both roles of a masked launch's program skip where none of its consumers' query blocks walks
+            # (`walks`): its producer would wait for releases no consumer gives.
+            if walks_of is None:
+                role()
+                return
+            blocks = [lax.div(pair_first + other * block_q, block_q) for other in range(consumers)]
+            pl.when(functools.reduce(jnp.logical_or, [walks_of[row, block] != 0 for block in blocks]))(role)
 
         def consumer(index):
             first = pair_first + index * block_q
@@ -894,17 +903,10 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
                 q_smem.at[index], q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, views,
                 turn, streamed, first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)),
                 hooks=hooks, residuals=residuals, anchors=anchors_of, interpret=interpret, finished=finished)
-            if not masked:
-                walk()
-                return
-            # A masked launch's program walks where a block of its consumers' has a live row, every key
-            # range of theirs non-empty (a slice's may be empty): the program's blocks' unsliced ranges.
-            blocks = [lax.div(pair_first + other * block_q, block_q) for other in range(consumers)]
-            pl.when(functools.reduce(jnp.logical_or, [spans_of.lo[row, block] < spans_of.hi[row, block]
-                                                      for block in blocks]))(walk)
+            run(walk)
 
         def producer():
-            family.stream(streams, views, *streamed)
+            run(lambda: family.stream(streams, views, *streamed))
 
         family.roles(consumers, consumer, producer)
 
