@@ -883,7 +883,11 @@ def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_
     for name, members in (("left", range(1, 13)), ("right", range(101, 113))):
         assert statistics[f"data/rows/{name}"] == sum(identity in since and identity % 3 != 2
                                                       for identity in members), name
-    assert not [name for name in statistics if name.startswith("data/rejected/mixture")]
+    # The refusals it counted under the mixture before it was saved stay its own; none since.
+    from dew.data.mixing import state_counts
+
+    before = state_counts(json.loads(recorded["state"])["iterator"])["mixture"].rejected["third question"]
+    assert statistics["data/rejected/mixture/third question"] == before
 
 
 def _asked(read: str, *, shuffled: bool = True) -> Dataset:
