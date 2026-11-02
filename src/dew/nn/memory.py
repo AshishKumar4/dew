@@ -25,8 +25,9 @@ network reads exactly as its W_0 does.
 
 Two computations give the one function. A row of one document runs chunk by chunk: its real tokens
 compacted to the front (`valid_order`), each chunk's gradients one `vmap` at the chunk's start, the
-momentum and retention across the chunk one associative scan of their affine steps, and the chunk's
-readouts one `vmap` over its states. A packed row, and a cached call, run token by token (`_stepped`),
+momentum and retention across the chunk their affine steps composed between each pair of its tokens
+(one associative scan of 2 x 2 scalars, `_transfers`) and each state one sum of the updates they carry,
+and the chunk's readouts one `vmap` over its states. A packed row, and a cached call, run token by token (`_stepped`),
 which is the definition. The state is the network's parameters, a traced carry. Each head's network
 is this layer's child (`head_0`, ...), whose parameters are its W_0, and every application runs that
 child at its own scope over the weights the step holds, read-only (`_substituted`), so the layer
@@ -100,7 +101,7 @@ from dew.quantization import (
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .mlp import GatedMLP
 from .norms import LayerNorm
-from .precision import at_least_fp32, l2norm
+from .precision import at_least_fp32, exact_float32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save
@@ -723,10 +724,21 @@ class InContextMemory(LinearProducts):
         gradient = jax.vmap(jax.vmap(functools.partial(self._step, head), in_axes=(None, 0, 0, 0)))(
             state, step.key[:, :, index], step.value[:, :, index], keys)
         update = jax.tree.map(lambda g: -_lead(theta, g) * g, gradient)
-        composed, offsets = jax.lax.associative_scan(_composed, (matrices, (update, update)), axis=1)
-        moment = jax.tree.map(lambda s0, bs: _scaled(composed[..., 0, 0], s0) + bs, momentum, offsets[0])
-        states = jax.tree.map(lambda s0, w0, bw: _scaled(composed[..., 1, 0], s0)
-                              + _scaled(composed[..., 1, 1], w0) + bw, momentum, state, offsets[1])
+        # IEEE products: the recurrence's state carries each one's rounding through the document.
+        precision = exact_float32(self.precision)
+        transfer = _transfers(matrices, precision)
+        # Each token's steps from the chunk's start, M_t ... M_0, and the weights each token's own
+        # update (u_s on both S and W) reaches S and W with at each later token.
+        composed = jnp.einsum("btij,bjk->btik", transfer[:, :, 0], matrices[:, 0], precision=precision)
+        reaching = transfer.sum(-1)
+
+        def reached(row: int, leaf: jax.Array) -> jax.Array:
+            return jnp.einsum("bts,bs...->bt...", reaching[..., row], leaf, precision=precision)
+
+        moment = jax.tree.map(lambda s0, u: _scaled(composed[..., 0, 0], s0) + reached(0, u), momentum,
+                              update)
+        states = jax.tree.map(lambda s0, w0, u: _scaled(composed[..., 1, 0], s0)
+                              + _scaled(composed[..., 1, 1], w0) + reached(1, u), momentum, state, update)
         # Each token reads its own state, or with commit per chunk the state the chunk entered.
         read, mapped = (states, 0) if self.commit == "token" else (state, None)
         reads = jax.vmap(jax.vmap(functools.partial(self._read, head), in_axes=(mapped, 0, 0)))(
@@ -917,19 +929,23 @@ def _scaled(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
     return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - 1)) * leaf[:, None]
 
 
-def _composed(first: tuple, second: tuple) -> tuple:
-    """Two affine steps of (S, W) as one, the first applied first: `(M2 M1, M2 b1 + b2)`."""
-    matrix_1, (s_1, w_1) = first
-    matrix_2, (s_2, w_2) = second
-    matrix = jnp.einsum("...ij,...jk->...ik", matrix_2, matrix_1)
-
-    def weigh(row: int, column: int, leaf: jax.Array) -> jax.Array:
-        scalars = matrix_2[..., row, column]
-        return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - scalars.ndim)) * leaf
-
-    s = jax.tree.map(lambda s1, w1, s2: weigh(0, 0, s1) + weigh(0, 1, w1) + s2, s_1, w_1, s_2)
-    w = jax.tree.map(lambda s1, w1, w2: weigh(1, 0, s1) + weigh(1, 1, w1) + w2, s_1, w_1, w_2)
-    return matrix, (s, w)
+def _transfers(matrices: jax.Array, precision: PrecisionLike) -> jax.Array:
+    """A chunk's affine steps of (S, W) `[B, C, 2, 2]` composed between each pair of its tokens,
+    `[B, C, C, 2, 2]`: at (t, s) the steps after token s through token t, `M_t ... M_{s+1}`, the identity
+    where t is s and zero where t comes before s. Each token's state is its chunk's start carried
+    through `M_t ... M_0` plus every update so far carried through the steps after it, each a product of
+    the 2 x 2 scalars alone, so the leaves are summed once per token (`_chunk_head`) and the program holds
+    one sum per leaf whatever the chunk."""
+    length = matrices.shape[1]
+    after = jnp.arange(length)[:, None] > jnp.arange(length)[None, :]
+    # At (t, s), token t's step where it comes after s, else the identity: their running product along t
+    # is M_t ... M_{s+1} from s on.
+    steps = jnp.where(after[None, :, :, None, None], matrices[:, :, None], jnp.eye(2, dtype=matrices.dtype))
+    products = jax.lax.associative_scan(
+        lambda first, second: jnp.einsum("...ij,...jk->...ik", second, first, precision=precision), steps,
+        axis=1)
+    reached = jnp.arange(length)[:, None] >= jnp.arange(length)[None, :]
+    return jnp.where(reached[None, :, :, None, None], products, 0)
 
 
 __all__ = ["CARRY", "Gate", "InContextMemory", "LinearMemory", "MLPMemory", "Objective",
