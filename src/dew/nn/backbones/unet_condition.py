@@ -19,7 +19,14 @@ from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.norms import GroupNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
-from .decoder_stack import DecoderBank, block_sites, nested_sites, pipelined_blocks, pipelines
+from .decoder_stack import (
+    DecoderBank,
+    block_sites,
+    blocks_off_stages,
+    nested_sites,
+    pipelined_blocks,
+    pipelines,
+)
 from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
@@ -87,6 +94,9 @@ class _SpatialAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x, context):
+        stored = blocks_off_stages(self, type(self).__call__, self.block_prefixes, self.stage.depth)
+        if stored is not None:
+            return stored(self, x, context)
         residual = x
         x = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         batch, height, width, channels = x.shape

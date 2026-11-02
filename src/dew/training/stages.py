@@ -290,9 +290,8 @@ class StageLocal:
 
     def stored(self, state: TrainState) -> TrainState:
         """`state` in its stored form, every field that holds or mirrors the variables with each layer whole
-        on every stage (`whole`), as one device's run holds it: what a trainer hands its user, which a fit
-        takes back, a checkpoint saves and a model outside the mesh reads. It holds what storing every
-        layer on every stage would."""
+        on every stage (`whole`), as one device's run holds it (`Trainer.stored`). It holds what storing
+        every layer on every stage would."""
         return self.state(state, self.whole)
 
     def refuse_unpipelined(self, schedule: Schedule, objective) -> None:

@@ -337,8 +337,7 @@ class Trainer(Generic[Loss, Effects]):
         # The plan of the last compiled step: its split, the rows of its
         # microbatch and every compile its search made (`Probe`).
         self.plan: JSON = None
-        # The check that the last compiled step fits (`memory_record`), and whether a step compiled
-        # since has yet to run once.
+        # The check that the last compiled step fits (`memory_record`), and whether a step since has run.
         self.memory: JSON = None
         self._unproven = False
         # The last validation of the state between steps (`validate`): as placed, then as each step holds it.
@@ -347,9 +346,8 @@ class Trainer(Generic[Loss, Effects]):
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
         self._fresh_compile_state(links)
-        # The microbatches a step's batch is read in, once decided (`split`,
-        # 1 where `whole`, a pooling state's window, or the first plan), which
-        # cut every batch the run reads (`_rows`, read off `fit`'s data).
+        # The microbatches a step's batch is read in, once decided (`split`, 1 where `whole`, a pooling
+        # state's window, or the first plan): they cut every batch the run reads (`_rows`).
         self._split: int | None = 1 if whole is not None else split
         self._rows: tuple[int, ...] | None = None
         # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
@@ -371,8 +369,7 @@ class Trainer(Generic[Loss, Effects]):
         self._narrow, self._xla_defaults = True, False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
-        # The axes the objective's modules box on their own parameters, as the
-        # last trace of `initial_state` saw them (`_boxed_axes`).
+        # The axes the objective's modules box on their own parameters, as `initial_state` last saw them.
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found the objective: its modules,
@@ -395,11 +392,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def initial_state(self, initializer: Initializer | None = None,
                       key: int | jax.Array | None = None) -> TrainState:
-        """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`).
-        It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
-
-        It holds every layer of a pipelined run whole, as a model outside the mesh reads them; a stage-local
-        run's step holds them stacked by stage (`_staged_start`).
+        """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`),
+        every layer whole, which a stage-local step stacks by stage (`_staged_start`). It is pure, so `fit`
+        traces it once for its shapes and once, sharded, for its values.
 
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
@@ -455,10 +450,18 @@ class Trainer(Generic[Loss, Effects]):
             deferred=waiting(opt_state))
         return state if not self.diloco else self.diloco.started(state, self.device_mesh)
 
+    def staged(self, state: TrainState) -> TrainState:
+        """`state` (`initial_state`'s, `stored`'s) held and placed as the step holds it, as `fit` starts."""
+        return self._staging.supplied(state, self.shardings)[0]
+
+    def stored(self, state: TrainState) -> TrainState:
+        """`state` with a stage-local run's layers back on `layers_N`, whole on every stage, every mirror
+        alike: for a reader by layer name (an export), at the cost of every layer on every device."""
+        return self._staging.stored(state)
+
     def _staged_start(self, initializer: Initializer | None = None, key: int | jax.Array | None = None
                       ) -> TrainState:
-        """`initial_state` as the step holds it: each pipelined run of a stage-local state stacked by stage,
-        its optimizer state and EMA with it."""
+        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`staged`)."""
         return self._staging.state(self.initial_state(initializer, key), self._staging.staged)
 
     @property
@@ -509,9 +512,8 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def _staging(self) -> StageLocal:
-        """Where the step keeps each pipelined run stacked by stage (`dew.training.stages`), as the objective
-        declares it and its optimizer reads it (`StageLocal.of`); none for a CPU-owned state, which streams
-        its stack's banks, nor a DiLoCo run, whose groups' copies stack on their own axis."""
+        """Where the step keeps each pipelined run stacked by stage (`StageLocal.of`); none for a CPU-owned
+        state, which streams its stack's banks, nor a DiLoCo run, whose groups' copies stack apart."""
         built = self._config is not None and self._config.optimizer in STACKED_OPTIMIZERS
         return StageLocal.of(self.objective, self.device_mesh, optimizer=None if built else self.optimizer,
                              local=self.layout.stage_local and self.diloco is None and not self.host_master)
@@ -1322,7 +1324,7 @@ class Trainer(Generic[Loss, Effects]):
         cooldowns: Cooldowns | None = None,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says;
-        return the state in its stored form, every layer of a stage-local run whole on every stage.
+        return the state as the run holds it, which its model reads off the mesh (`off_stages`).
 
         `resume="auto"` continues the checkpointer's latest checkpoint where it holds one and otherwise
         starts afresh; "require" refuses to start afresh, for a job that must continue, and "never" refuses
@@ -1390,8 +1392,8 @@ class Trainer(Generic[Loss, Effects]):
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state, resume)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
             trained = dataclasses.replace(trained, compute=None)
-            # Whether this fit trained or found the run complete, and inside
-            # the lifecycle, so a selection that fails is the run's outcome.
+            # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
+            # that fails is the run's outcome.
             if restore_best and run.preempted is None:
                 trained = self._best_model(trained, run)
         finally:
@@ -1401,7 +1403,7 @@ class Trainer(Generic[Loss, Effects]):
                 raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
-        return self._staging.stored(trained)
+        return trained
 
     def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
@@ -1716,7 +1718,7 @@ class Trainer(Generic[Loss, Effects]):
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if plan.observe:
-            plan.observe.opened(current, state, complete=complete, view=self._staging.stored)
+            plan.observe.opened(current, state, complete=complete)
         if complete:
             return state, shardings, True
 

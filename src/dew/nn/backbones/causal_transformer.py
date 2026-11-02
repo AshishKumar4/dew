@@ -129,6 +129,7 @@ from .decoder_stack import (
     StageSplit,
     banked_collections,
     microbatch_count,
+    off_stages,
     on_host,
     run_pipeline,
     run_stack,
@@ -1782,6 +1783,9 @@ class CausalTransformer(nn.Module):
         `residual_in_fp32` the stream enters widened, so every sublayer's output
         adds to it in fp32 whichever loop runs.
         """
+        if (stored := off_stages(self, type(self).stack, self.stage_view)) is not None:
+            return stored(self, x, train=train, decode=decode, per_layer_input=per_layer_input,
+                          attention_metadata=attention_metadata, span=span)
         if self.residual_in_fp32 and isinstance(x, Carried):
             x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
         elif self.residual_in_fp32:

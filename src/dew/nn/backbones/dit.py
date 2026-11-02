@@ -15,7 +15,7 @@ from ..flops import MissingFlopsCount, counted_flops, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scatter import gather_positions
-from .decoder_stack import DecoderBank, block_sites, pipelined_blocks, pipelines
+from .decoder_stack import DecoderBank, block_sites, blocks_off_stages, pipelined_blocks, pipelines
 
 
 def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.Array:
@@ -118,6 +118,9 @@ class SimpleDiT(_DiTStackOptions):
         return block(parent=None) if counted else block()
 
     def __call__(self, x, temb, textcontext=None, train: bool = False, duration=None):
+        stored = blocks_off_stages(self, type(self).__call__, self.block_prefixes, len(self.kinds()))
+        if stored is not None:
+            return stored(self, x, temb, textcontext, train, duration)
         _, H, W, _ = x.shape
         x_seq, inv_idx = self.embed(x)
         cond_emb = self.conditioning(temb, textcontext, duration)

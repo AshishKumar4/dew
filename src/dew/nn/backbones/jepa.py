@@ -46,7 +46,14 @@ from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_
 from ..norms import LayerNorm
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
-from .decoder_stack import DecoderBank, block_sites, nested_sites, pipelined_blocks, pipelines
+from .decoder_stack import (
+    DecoderBank,
+    block_sites,
+    blocks_off_stages,
+    nested_sites,
+    pipelined_blocks,
+    pipelines,
+)
 
 
 class TokenStack(_JepaStackOptions):
@@ -97,6 +104,9 @@ class TokenStack(_JepaStackOptions):
         """The blocks over `tokens`, as a pipeline over the stage axis where the mesh in context
         has one that splits them (`pipelines`)."""
         kinds = self.kinds()
+        stored = blocks_off_stages(self, type(self).__call__, self.block_prefixes, len(kinds))
+        if stored is not None:
+            return stored(self, tokens, freqs_cis, train)
         if pipelines(self, kinds):
             return pipelined_blocks(self, self.block_prefixes, len(kinds), tokens,
                                     lambda index: self._block(index, kinds[index]),
@@ -178,6 +188,9 @@ class FactorizedTokenStack(_JepaStackOptions):
         """The layers over a clip's `[B, T, N, F]` tokens, as a pipeline over the stage axis where
         the mesh in context has one that splits them (`pipelines`)."""
         kinds = self.kinds()
+        stored = blocks_off_stages(self, type(self).__call__, self.block_prefixes, len(kinds))
+        if stored is not None:
+            return stored(self, tokens, train)
         if pipelines(self, kinds):
             return pipelined_blocks(self, self.block_prefixes, len(kinds), tokens,
                                     lambda index: self._layer(index, kinds[index]),

@@ -11,9 +11,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   of each run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run, and every rule
   of Dew's optimizers reads a stacked leaf as its stored layers. An LM's decoder, a decision's backbone,
   PPO's policy and critic, a DiT's, a JEPA's and a UNet level's stacks are stage-local; an objective that
-  declares no stack logs that its run keeps every layer whole. `fit` returns, an `Observe` reads and
-  `initial_state` builds the state with every layer whole, as a model outside the mesh reads it. A
-  checkpoint holds every layer as one device's would and resumes onto any stage count.
+  declares no stack logs that its run keeps every layer whole. `fit` returns and an `Observe` reads the
+  state as the run holds it, which the model reads off the mesh as its stored layers; `Trainer.stored`
+  and `Trainer.staged` convert between that state and every layer whole. A checkpoint holds every layer
+  as one device's would and resumes onto any stage count.
   `Layout(stage_local=False)` keeps every layer whole on every stage, as does a run whose optax
   transformation may read a parameter whole, a Gauss-Newton run and a DiLoCo run.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays

@@ -16,7 +16,7 @@ import functools
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import NamedTuple
+from typing import Concatenate, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -1137,6 +1137,13 @@ def _block_view(prefixes: tuple[str, ...], count: int, stages: int) -> StackView
     return StackView(tuple((index, 1) for index in range(count // stages)), stages=stages, prefixes=prefixes)
 
 
+def blocks_off_stages[M: nn.Module, **P, R](module: M, method: Callable[Concatenate[M, P], R],
+                                            prefixes: tuple[str, ...], count: int
+                                            ) -> Callable[Concatenate[M, P], R] | None:
+    """`off_stages` for a stack of `count` like blocks stored under `prefixes` (`pipelined_blocks`)."""
+    return off_stages(module, method, functools.partial(_block_view, prefixes, count))
+
+
 def block_sites(namespace: tuple[str, ...], prefixes: tuple[str, ...], kinds: Sequence,
                 stages: int) -> tuple[DecoderBank, ...]:
     """Where a stack of like blocks of `kinds` stored under `prefixes` at `namespace` keeps the run a
@@ -1163,6 +1170,48 @@ def part_stage_sites(name: str, module, store: Variables, stages: int) -> tuple[
 def stored_by_stage(variables: Mapping[str, Mapping]) -> tuple[str, ...]:
     """The collections of a stack's `variables` that hold its run stacked by stage (`StackView.staged`)."""
     return tuple(name for name, tree in variables.items() if 'stages' in tree)
+
+
+def held_stages(variables: Mapping[str, Mapping]) -> int:
+    """How many stages a stage-local store stacks its runs over (`stored_by_stage`): its stacked leaves'
+    leading dimension; one for a store on its layers."""
+    stacked = [leaf for tree in variables.values() if 'stages' in tree
+               for leaf in jax.tree.leaves(tree['stages'])]
+    return np.shape(stacked[0])[0] if stacked else 1
+
+
+def _array_rows(path, leaf, shape: tuple[int, ...]) -> list:
+    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: its leading `shape` flattened."""
+    del path
+    return list(jnp.reshape(leaf, (-1, *jnp.shape(leaf)[len(shape):])))
+
+
+def off_stages[M: nn.Module, **P, R](module: M, method: Callable[Concatenate[M, P], R],
+                                     view_of: Callable[[int], StackView]
+                                     ) -> Callable[Concatenate[M, P], R] | None:
+    """`method`, one of `module`'s, reading a stage-local store (`stored_by_stage`), its runs stacked by
+    stage as a pipeline over its stage axis trains them, as the stored layers they stack: where no mesh
+    in context runs them over as many stages (a model off its training mesh, a generation from the
+    state `fit` returns), each run's rows are cut back onto its layers on the way in (`StackView.
+    layer_form`, by the `view_of(held)` it was stacked under) and stacked again on the way out, so the
+    model reads the one state its run holds, with no copy of it kept. None where `module` holds no such
+    store, or the mesh in context pipelines it as stored."""
+    staged = stored_by_stage(module.variables)
+    held = held_stages(module.variables)
+    if not staged or held == pipeline_stages():
+        return None
+    view = view_of(held)
+
+    def layered(variables):
+        return {name: view.layer_form(tree, _array_rows) if name in staged else tree
+                for name, tree in variables.items()}
+
+    def stacked(variables):
+        return {name: view.stage_form(name, tree, stacked_rows) if name in staged else tree
+                for name, tree in variables.items()}
+
+    return nn.map_variables(method, mapped_collections=True, trans_in_fn=layered, trans_out_fn=stacked,
+                            init=False, mutable=True)
 
 
 def pipelined_blocks(module: nn.Module, prefixes: tuple[str, ...], count: int, x: jax.Array,
