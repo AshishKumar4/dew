@@ -15,7 +15,7 @@ import logging
 import re
 import struct
 import threading
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator
 
 import jax
 import tokamax
@@ -29,7 +29,17 @@ from dew.nn.kernels import generation
 
 SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
-which names no kernel."""
+which names no kernel (`shared_asked`)."""
+
+
+def shared_asked(error: BaseException) -> int | None:
+    """The shared bytes a Triton kernel of a program XLA refused asked past a block, or None where `error`
+    is not that refusal: the one reading of XLA's text (`kept`, `tuning`'s fitting, the compile-only
+    harness)."""
+    asked = SHARED_REFUSED.search(str(error))
+    return None if asked is None else int(asked.group(1))
+
+
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
@@ -341,10 +351,10 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     try:
         executable, spilling = _compiled_reported(lowered, options)
     except jax.errors.JaxRuntimeError as error:
-        asked = SHARED_REFUSED.search(str(error))
+        asked = shared_asked(error)
         if asked is None:
             raise
-        return _unblocked(lowered, options, relower, int(asked.group(1)), error)
+        return _unblocked(lowered, options, relower, asked, error)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
@@ -371,11 +381,12 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
-    """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled with
-    its asking Triton launches' configs refused (`stepped_down`'s search over the launches the program's
-    Triton kernels name, `kernel_of`, their launches' digests), as a spill refuses one (`kept`). Each kept
-    launch's miss is recorded and logged at the bytes its refusal removed; none compiling, the refusal
-    stands, each a miss not stepped."""
+    """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled once
+    more with every one of its Triton launches' configs refused at once (each its next derived config, as a
+    spill refuses one, `kept`): XLA's refusal names no kernel, and a search for the asking launch would
+    compile the whole program a launch at a time (row 3584). Each launch's miss is recorded and logged at
+    the bytes asked; where the relowered program is refused again, or a derivation finds no config left
+    (`Exhausted`), the refusal stands, each a miss not stepped."""
     from dew.training._lowering import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
@@ -385,86 +396,21 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         launch = None if call.kind != "triton" or digest is None else traced(digest)
         if launch is not None:
             tried.setdefault((launch.identity, launch.config), (kernel, launch))
-
-    def compiling(entries: list) -> tuple[_Registry, tuple[jax.stages.Compiled, list]]:
-        with _proposing([(refusal, kernel) for refusal, kernel, _ in entries]) as proposal:
-            return proposal, _compiled_reported(relower(), options)
-
-    found = stepped_down(tried, asked, compiling)
-    if found is None:
+    try:
+        with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
+            replacement, spilling = _compiled_reported(relower(), options)
+    except (Exhausted, jax.errors.JaxRuntimeError) as again:
+        if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
+            raise
         for kernel, launch in tried.values():
             _missed_block(kernel, launch, asked, stepped=False)
-        raise error
-    (proposal, (replacement, spilling)), kept = found
+        raise error from again
     _commit(proposal)
-    for refusal, (kernel, launch), removed in kept:
+    for refusal, (kernel, launch) in tried.items():
         _record(refusal, None, frozenset({kernel}))
-        _missed_block(kernel, launch, removed, stepped=True)
+        _missed_block(kernel, launch, asked, stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
-
-
-def stepped_down[T](tried: Mapping[tuple[str, Hashable], tuple[str, Launch]], asked: int,
-                    compiling: Callable[[list], T]) -> tuple[T, list] | None:
-    """The search `_unblocked` makes for the launches of `tried` (each refusal, its launch's identity and
-    config, by its kernel and launch) whose refusals compile a program XLA refused for asking `asked` shared
-    bytes past a block: `compiling(entries)` compiles with each `(refusal, kernel, launch)` of `entries`
-    refused, raising XLA's refusal or `Exhausted`. Each launch is tried in turn, refused beside those kept so
-    far: one whose refusal compiles the program ends the search; one whose refusal leaves XLA asking other
-    bytes asked those (another launch asks the rest), so it is kept and the rest tried again. One whose
-    refusal changes nothing asked nothing past the block, or as many bytes as another launch still asks (two
-    call shapes' launches deriving one tile): where no launch's refusal alone changes what XLA asks, each
-    is held in turn beside the rest, and once the program compiles, each held one is dropped where it
-    compiles without it. Returns the compile and each refusal kept with its launch and the bytes asked
-    before it, or None where none compiles."""
-    # Each refusal kept: its launch, the bytes asked before it, and whether its refusal changed them.
-    kept: list[tuple[tuple[str, Hashable], tuple[str, Launch], int, bool]] = []
-    pending, asking, holding = dict(tried), asked, False
-
-    def compiled(entries):
-        return compiling([(refusal, kernel, launch) for refusal, (kernel, launch), *_ in entries])
-
-    def refused(error: Exception) -> int:
-        left = SHARED_REFUSED.search(str(error))
-        if left is None:
-            raise error
-        return int(left.group(1))
-
-    while pending:
-        progressed = False
-        for refusal, held in list(pending.items()):
-            entry = (refusal, held, asking, True)
-            try:
-                program = compiled([*kept, entry])
-            except Exhausted:
-                del pending[refusal]
-                continue
-            except jax.errors.JaxRuntimeError as again:
-                left = refused(again)
-                if left != asking or holding:
-                    kept.append((refusal, held, asking, left != asking))
-                    del pending[refusal]
-                    asking, progressed = left, True
-                continue
-            needed = [*kept, entry]
-            for other in [*kept]:
-                if other[3]:
-                    continue
-                # A held refusal the program compiles without asked nothing past the block.
-                try:
-                    program = compiled([each for each in needed if each is not other])
-                except Exhausted:
-                    continue
-                except jax.errors.JaxRuntimeError as again:
-                    refused(again)
-                    continue
-                needed.remove(other)
-            return program, [(refusal, held, removed) for refusal, held, removed, _ in needed]
-        if not progressed:
-            if holding:
-                break
-            holding = True
-    return None
 
 
 def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:

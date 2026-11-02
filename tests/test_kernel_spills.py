@@ -9,7 +9,6 @@ import gc
 import os
 import time
 import weakref
-from collections.abc import Hashable
 
 import flax.linen as nn
 import jax
@@ -510,27 +509,3 @@ def test_a_program_under_an_eager_transformation_compiles_under_its_own_options(
             called()
     enclosing = owned_program(lambda x: unknown(x) + 1.0)
     np.testing.assert_array_equal(np.asarray(enclosing(rows)), np.full((2, 3), 3.0))
-
-
-
-def test_two_launches_asking_one_size_past_a_block_both_step_down():
-    """A program whose two Triton launches each ask the same shared bytes past a block, as two call shapes'
-    launches deriving one tile do: XLA's refusal names no launch, and stepping either down alone leaves it
-    asking those bytes for the other. The search (`report.stepped_down`) compiles the program with both
-    stepped down, each kept at the bytes asked; a third launch, which asks nothing past the block, is not.
-    Its compile is XLA's stand-in: it refuses 200000 bytes while either asking launch keeps its config."""
-    launches: dict[tuple[str, Hashable], tuple[str, report.Launch]] = {
-        (name, 0): (name, report.Launch(name, "op", 0)) for name in ("first", "second", "third")}
-    asking = {("first", 0), ("second", 0)}
-
-    def compiling(entries):
-        if asking <= {refusal for refusal, _, _ in entries}:
-            return "the program"
-        raise jax.errors.JaxRuntimeError("Shared memory size limit exceeded: requested 200000")
-
-    found = report.stepped_down(launches, 200000, compiling)
-    assert found is not None
-    compiled, kept = found
-    assert compiled == "the program"
-    assert {refusal for refusal, _, _ in kept} == asking
-    assert {removed for _, _, removed in kept} == {200000}

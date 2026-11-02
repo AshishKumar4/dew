@@ -878,9 +878,9 @@ def _resource_exhausted(error: Exception) -> bool:
     the driver refuses the launch (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES, which XLA passes on as an
     INTERNAL error naming it). Any other failure, device memory's included, is the kernel's or the
     tuner's, and propagates."""
-    message = str(error)
-    return (message.startswith("RESOURCE_EXHAUSTED: Shared memory size limit exceeded")
-            or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
+    from dew.nn.kernels.templates.report import shared_asked
+
+    return shared_asked(error) is not None or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in str(error)
 
 
 def materialized(op: KernelOp, ba: tokamax.BoundArguments):

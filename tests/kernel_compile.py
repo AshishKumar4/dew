@@ -37,9 +37,6 @@ from dew.nn.kernels.templates import report, resources
 from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
-REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
-"""XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
-
 MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
 """Mosaic GPU's refusal, as it lowers, of a kernel whose shared memory a block of the GPU does not hold."""
 
@@ -265,11 +262,11 @@ def _compiled(case, generation: str, record: dict,
             with printing as printed:
                 executable = lowered.compile(compiler_options={"xla_dump_to": dump})
         except jax.errors.JaxRuntimeError as error:
-            refused = REFUSED.search(str(error))
-            if refused is None:
+            asked = report.shared_asked(error)
+            if asked is None:
                 record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
             else:
-                record["shared"] = int(refused.group(1))
+                record["shared"] = asked
             return None
         if directory is not None:
             record["binaries"] = [dataclasses.asdict(found) for found in report.binaries(executable)]

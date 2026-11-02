@@ -776,8 +776,9 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
     block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
     naming no kernel, where its launches ask more shared memory than the GPU's 99 KB block; the run's
-    compile (`report.kept`) refuses each launch whose refusal moves what XLA asks, each derivation takes its
-    next config, and the program compiles, every miss recorded stepped and its launch's config refused."""
+    compile (`report.kept`) refuses every Triton launch's config at once, each derivation takes its next
+    config, and the program compiles on its one recompile (row 3584), every miss recorded stepped and its
+    launch's config refused."""
     import dataclasses
 
     import kernel_compile
