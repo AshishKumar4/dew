@@ -372,6 +372,13 @@ def _read_fused_mlp(view: PartView) -> Mapping[str, object]:
             'mlp_bias': _biased(fused, view.down_proj)}
 
 
+def _read_xielu_mlp(view: PartView) -> Mapping[str, object]:
+    """Apertus's MLP: ungated, `down_proj(act_fn(up_proj(x)))`, its activation xIELU with its learned
+    parameters (`dew.nn.activations.Xielu`, Dew's `mlp='xielu'`)."""
+    return {'mlp': 'xielu', 'mlp_features': view.up_proj.out_features,
+            'mlp_bias': _biased(view.up_proj, view.down_proj)}
+
+
 def _read_ernie_attention(view: PartView) -> Mapping[str, object]:
     """ERNIE 4.5's attention: Llama's, its rotary turning adjacent pairs of each head (its
     `apply_rotary_pos_emb` repeats each angle over a pair and rotates `(x[2i], x[2i+1])`, in float32,
@@ -572,6 +579,10 @@ class KnownPart:
     flat: tuple[str, ...] = ()
     """The parameters the source stores with leading unit axes that its leaf holds flat (ERNIE 4.5's
     `[1, experts]` correction bias), by the known class's names (`Assembly.flat`)."""
+    constants: tuple[str, ...] = ()
+    """The buffers its checkpoint stores that its code reads and no step trains (xIELU's `beta` and
+    `eps`), by the known class's names: each a constant of Dew's (`constants` collection,
+    `Assembly.constants`)."""
     split: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """The children whose weight holds several canonical projections concatenated on its output rows,
     by the known class's attribute name, onto the projections in their order (GLM-4's `gate_up_proj`,
@@ -602,6 +613,7 @@ _LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 _GLM4 = 'transformers.models.glm4.modeling_glm4'
+_APERTUS = 'transformers.models.apertus.modeling_apertus'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -692,6 +704,17 @@ KNOWN: tuple[KnownPart, ...] = (
                          'post_attention_layernorm': 'pre_feedforward_layernorm',
                          'post_mlp_layernorm': 'post_feedforward_layernorm'}),
     KnownPart('attention', f'{_GLM4}:Glm4Attention', _ATTENTION_CHILDREN, _read_glm4_attention),
+    KnownPart('layer', f'{_APERTUS}:ApertusDecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp',), 'attention_layernorm': ('norm',),
+               'feedforward_layernorm': ('norm',)}, _read_nothing,
+              canonical={'attention_layernorm': 'input_layernorm',
+                         'feedforward_layernorm': 'post_attention_layernorm'}),
+    KnownPart('attention', f'{_APERTUS}:ApertusAttention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
+    KnownPart('mlp', f'{_APERTUS}:ApertusMLP',
+              {'up_proj': ('linear',), 'down_proj': ('linear',), 'act_fn': ('xielu',)}, _read_xielu_mlp),
+    KnownPart('xielu', 'transformers.activations:XIELUActivation', {}, _read_nothing, ('alpha_p', 'alpha_n'),
+              constants=('beta', 'eps')),
     KnownPart('mlp', f'{_GLM4}:Glm4MLP', {'gate_up_proj': ('linear',), 'down_proj': ('linear',)},
               _read_fused_mlp, canonical={'gate_up_proj': ''},
               split={'gate_up_proj': ('gate_proj', 'up_proj')}),
@@ -809,6 +832,8 @@ class Assembly:
     flat: frozenset[str] = frozenset()
     """The canonical names of the parameters the source stores with leading unit axes that their leaves
     hold flat (`KnownPart.flat`), which the family's `prepare` reads flat."""
+    constants: frozenset[str] = frozenset()
+    """The canonical names of the stored buffers Dew holds as constants (`KnownPart.constants`)."""
     depths: int = 0
     """The prediction depths the source's release stores past the trunk (its config's
     `num_nextn_predict_layers`: GLM-4.7-Flash's `model.layers.47.*`, HY-3's `.80.*`), which its own code
@@ -904,6 +929,7 @@ class _Assembler:
         self.packed: list[decoder_parts.Packed] = []
         self.dropouts: list[tuple[str, str]] = []
         self.flat: set[str] = set()
+        self.constants: set[str] = set()
 
     def state(self, fields: Mapping[str, object], where: str, layer: int | None) -> None:
         for key, value in fields.items():
@@ -946,8 +972,10 @@ class _Assembler:
         expected = {view.name(name): name for name in part.parameters}
         if held - set(expected):
             raise Ambiguous(f"{path} holds parameters {sorted(held - set(expected))} its code does not read")
-        stored = {view.name(name): known for name, known in part.state.items()
-                  if view.name(name) in dict(module.named_buffers(recurse=False))}
+        buffers = dict(module.named_buffers(recurse=False))
+        held_state = {**part.state, **{name: name for name in part.constants}}
+        stored = {view.name(name): known for name, known in held_state.items() if view.name(name) in buffers}
+        self.constants.update(f'{canonical}.{name}' for name in part.constants if view.name(name) in buffers)
         if held or stored:
             self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
         self.flat.update(f'{canonical}.{name}' for name in part.flat)
@@ -1017,7 +1045,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
     depths = _records.integer(model.config.to_dict().get('num_nextn_predict_layers') or 0,
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat), depths)
+                    tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat),
+                    frozenset(assembler.constants), depths)
 
 
 def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, object]
@@ -1153,7 +1182,11 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
         leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES}
-        return decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        if canonical in assembly.constants and path is not None:
+            # A buffer no step trains, held where Dew keeps constants (`KnownPart.constants`).
+            return ('constants', *path[1:])
+        return path
 
     def prepare(tensors: Mapping[str, Stored], _config: Mapping[str, object] | None = None
                 ) -> Mapping[str, Stored]:

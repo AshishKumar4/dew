@@ -28,6 +28,7 @@ import functools
 import math
 from collections.abc import Callable
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
@@ -97,6 +98,40 @@ UNGATED: dict[str, Activation] = {
     'gelu': gelu_tanh, 'gelu_exact': gelu_exact_torch, 'relu': jax.nn.relu, 'relu2': relu2,
     'quick_gelu': quick_gelu, 'silu': silu}
 """The activations an ungated feed-forward takes, by Dew's names."""
+
+
+XIELU = 'xielu'
+"""The ungated feed-forward's learned activation (`Xielu`), by the name a decoder's `mlp` gives it."""
+
+
+class Xielu(nn.Module):
+    """Apertus's xIELU (transformers' `XIELUActivation`, arXiv 2411.13010): `alpha_p * x**2 + beta * x` for
+    a positive input, `(expm1(min(x, eps)) - x) * alpha_n + beta * x` otherwise, where `alpha_p` is the
+    softplus of its learned `alpha_p` and `alpha_n` is `beta` plus the softplus of its own, each a `[1]`
+    parameter, computed in the input's dtype as the reference's Python form computes it. `beta` and `eps`
+    are the reference's buffers, which its checkpoint stores and no step trains: Dew holds them as
+    constants (`constants` collection), their defaults the reference's."""
+    alpha_p_init: float = 0.8
+    alpha_n_init: float = 0.8
+    beta: float = 0.5
+    eps: float = -1e-6
+    param_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        def inverse_softplus(value: float):
+            return lambda key, shape, dtype: jnp.full(shape, math.log(math.expm1(value)), dtype)
+
+        alpha_p = self.param('alpha_p', inverse_softplus(self.alpha_p_init), (1,), self.param_dtype)
+        alpha_n = self.param('alpha_n', inverse_softplus(self.alpha_n_init - self.beta), (1,),
+                             self.param_dtype)
+        beta = self.variable('constants', 'beta', lambda: jnp.asarray(self.beta, self.param_dtype)).value
+        eps = self.variable('constants', 'eps', lambda: jnp.asarray(self.eps, self.param_dtype)).value
+        alpha_p, alpha_n, beta, eps = (value.astype(x.dtype) for value in (alpha_p, alpha_n, beta, eps))
+        alpha_p = jax.nn.softplus(alpha_p)
+        alpha_n = beta + jax.nn.softplus(alpha_n)
+        return jnp.where(x > 0, alpha_p * x * x + beta * x,
+                         (jnp.expm1(jnp.minimum(x, eps)) - x) * alpha_n + beta * x)
 
 
 def ungated_activation(name: str, x: jax.Array) -> jax.Array:
