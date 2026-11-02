@@ -641,7 +641,7 @@ BOUND_SEEDS, BOUND_ROWS = 8, 8
 (`assert_within_rounding`)."""
 
 
-def assert_within_rounding(dew, reference, drawn, seeds: int, label: str) -> None:
+def assert_within_rounding(dew, reference, drawn, seeds, label: str) -> None:
     """Where the inner step diverges, the claim check 1 cannot pool (ledger 1714): each of Dew's float32
     outputs, draw by draw and element by element, within its own program's rounding bound of the math.
     A program's float32 result moves from its float64 value by at most u32 kappa to first order, kappa
@@ -655,7 +655,8 @@ def assert_within_rounding(dew, reference, drawn, seeds: int, label: str) -> Non
     single, double = 2.0 ** -24, 2.0 ** -53
     # The seeds' draws stacked, each program mapped over them: one program a site, each draw's own
     # elements its own outputs.
-    arguments = jax.tree.map(lambda *leaves: np.stack(leaves), *(drawn(seed) for seed in range(seeds)))
+    seeds = range(seeds) if isinstance(seeds, int) else seeds
+    arguments = jax.tree.map(lambda *leaves: np.stack(leaves), *(drawn(seed) for seed in seeds))
     ours = jax.tree.map(np.asarray, jax.jit(jax.vmap(dew))(*arguments))
     _, kappa = rounding_bound(jax.vmap(dew), *arguments)
     truth, theirs = rounding_bound(jax.vmap(reference), *arguments)
@@ -667,8 +668,8 @@ def assert_within_rounding(dew, reference, drawn, seeds: int, label: str) -> Non
         assert np.all(np.isfinite(got)), f"{label}, {path}: not finite"
         worst = np.unravel_index(np.argmax(error - bound), error.shape) if error.size else ()
         assert np.all(error <= bound), (
-            f"{label}, seed {worst[0] if worst else 0}, {path}{list(worst[1:])}: {error[worst]:.3e} past its "
-            f"rounding bound {bound[worst]:.3e}")
+            f"{label}, seed {seeds[worst[0]] if worst else 0}, {path}{list(worst[1:])}: {error[worst]:.3e} "
+            f"past its rounding bound {bound[worst]:.3e}")
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
@@ -693,8 +694,9 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_within_its_roundi
                            f"the one-token window at the corner over {kind}")
 
 
+@pytest.mark.parametrize("half", [0, 1], ids=["first-draws", "last-draws"])
 @pytest.mark.parametrize("kind", LAYOUTS)
-def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding(kind):
+def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding(kind, half):
     """The outer loss's gradient through the windows' steps at the corner, 0.5 N(0, 1) weights stepped
     by a half every three tokens, rate times curvature past 2 (`CORNER_WINDOWS`), where check 1's pooled
     ratio does not resolve: each leaf within Dew's rounding bound of the literal loop's float64 truth
@@ -719,7 +721,9 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding
         return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation,
                                              truth=True))
 
-    assert_within_rounding(differentiated(dew), differentiated(reference), gradient_draw, BOUND_SEEDS,
+    # Each half of the draws its own test, each within CI's time.
+    draws = range(half * BOUND_SEEDS // 2, (half + 1) * BOUND_SEEDS // 2)
+    assert_within_rounding(differentiated(dew), differentiated(reference), gradient_draw, draws,
                            f"the outer gradient at the corner over {kind}")
 
 
