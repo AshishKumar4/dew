@@ -49,13 +49,13 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel, head_loss_bounds, squared_norm
+from dew.nn.continuum import Continuum, ContinuumLevel, _head_loss_bounds, _squared_norm
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.quantization import quantized_products
 from dew.registry import from_record, read_arguments
 
-from ..activations import SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
+from ..activations import _SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
@@ -1265,7 +1265,7 @@ class CausalTransformer(nn.Module):
 
     def head_bounds(self) -> tuple[jax.Array, jax.Array]:
         """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states
-        `head_logits` reads (`dew.nn.continuum.head_loss_bounds`, `SteppedInContext`), from the bound model's
+        `head_logits` reads (`dew.nn.continuum._head_loss_bounds`, `SteppedInContext`), from the bound model's
         rows (`vocabulary_rows`, an adapter applied), softcap and transform. A head map (`lm_head`,
         `project_out`, `head_dense`, or a tied head's product in the model's own scope) that rounds its
         input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel
@@ -1283,9 +1283,9 @@ class CausalTransformer(nn.Module):
                              f"curvature bounds, or their kernels, a matrix these bounds do not read: step "
                              f"it undamped")
         transform = None if self.head_transform is None else (
-            SLOPES[UNGATED[self.head_transform]], squared_norm(self.applied_kernel("head_dense")),
-            self.head_norm.largest_gain(), self.head_norm.epsilon)
-        return head_loss_bounds(squared_norm(jnp.asarray(self.vocabulary_rows())), self.final_logit_softcap,
+            _SLOPES[UNGATED[self.head_transform]], _squared_norm(self.applied_kernel("head_dense")),
+            self.head_norm._largest_gain(), self.head_norm.epsilon)
+        return _head_loss_bounds(_squared_norm(jnp.asarray(self.vocabulary_rows())), self.final_logit_softcap,
                                 transform)
 
     @nn.nowrap
@@ -1307,10 +1307,10 @@ class CausalTransformer(nn.Module):
 
     def level_terms(self, hidden, parts: tuple[str, ...]):
         """What bounds a damped step of the continuum level's `parts` at final states `hidden`, its maps'
-        inputs as a checkpoint's quantizers round them (`Continuum.step_terms`, `SteppedInContext`)."""
+        inputs as a checkpoint's quantizers round them (`Continuum._step_terms`, `SteppedInContext`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level.step_terms(hidden, parts, self._quantizer)
+        return self.continuum_level._step_terms(hidden, parts, self._quantizer)
 
     def head_logits(self, x):
         """The fp32 head over states the continuum level already read (`continuum_states`), or a

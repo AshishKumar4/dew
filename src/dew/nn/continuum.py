@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.activations import SLOPES, activation
+from dew.nn.activations import _SLOPES, activation
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32
@@ -95,14 +95,14 @@ class Continuum(nn.Module):
         forward)."""
         return quantized_products(self, name).inputs
 
-    def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
+    def _step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
         (`dew.objectives.lm.adaptation.damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
         `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
         for none), the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`, an adapter's
         update on it included), at least its spectral norm, in at least fp32; and the activation's bounds
-        p1, p2 on |act'| and |act''| (`SLOPES`).
+        p1, p2 on |act'| and |act''| (`_SLOPES`).
 
         A map whose product rounds its kernel (Qwix's quantized weights) makes the loss piecewise constant
         in that kernel, and an `up` that computes other than the linear map of its input by its kernel
@@ -111,7 +111,7 @@ class Continuum(nn.Module):
         a step there, refused, as is a step of `down` through an activation whose act'' no number bounds
         (ReLU's, a point mass at zero). A quantizer of `down`'s input rounds the states, which no step
         moves."""
-        p1, p2 = SLOPES[activation(self.level.activation)]
+        p1, p2 = _SLOPES[activation(self.level.activation)]
         if "down" in parts and p2 is None:
             raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                              "activation's second derivative, which a ReLU has none of (a point mass at "
@@ -138,14 +138,14 @@ class Continuum(nn.Module):
                 jnp.sqrt(jnp.sum(jnp.square(kernel))), p1, p2 or 0.0)
 
 
-def head_loss_bounds(table: jax.Array, softcap: float | None = None, transform: tuple | None = None
+def _head_loss_bounds(table: jax.Array, softcap: float | None = None, transform: tuple | None = None
                      ) -> tuple[jax.Array, jax.Array]:
     """Bounds over every state on the curvature and the slope of a slot's cross entropy in the states a
     head reads, `table` the squared Frobenius norm |A|^2 of its rows A, at least the spectral: an affine
     head's are |A|^2 / 2 and sqrt 2 |A| (the cross entropy's Hessian in the logits is at most 1/2, its
     gradient p - y at most sqrt 2); a logit `softcap` c tanh(u / c), of slope at most 1, adds
     |A|^2 4 / (3 sqrt 3 c) of curvature, of either sign; a `transform` N(phi(D s)) before A, given as
-    ((p1, p2), |D|^2, g, e) with N a norm of largest gain g and epsilon e and p1, p2 phi's `SLOPES`, has a
+    ((p1, p2), |D|^2, g, e) with N a norm of largest gain g and epsilon e and p1, p2 phi's `_SLOPES`, has a
     Jacobian of at most |g| p1 |D| / sqrt e and a second derivative of at most
     |g| (6 p1^2 / e + p2 / sqrt e) |D|^2 (a norm's are |g| / sqrt e and 6 |g| / e). Constants of the step,
     not differentiated (`dew.objectives.lm.adaptation.damping`)."""
@@ -160,6 +160,6 @@ def head_loss_bounds(table: jax.Array, softcap: float | None = None, transform: 
     return jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope)
 
 
-def squared_norm(value: jax.Array) -> jax.Array:
+def _squared_norm(value: jax.Array) -> jax.Array:
     """The sum of `value`'s squares, in at least fp32: a matrix's squared Frobenius norm."""
     return jnp.sum(jnp.square(value.astype(at_least_fp32(value.dtype))))

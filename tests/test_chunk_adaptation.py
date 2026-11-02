@@ -19,7 +19,7 @@ from affine_run import Replaying, dataset
 from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
-from dew.nn.activations import HIDDEN_ACT, SLOPES
+from dew.nn.activations import HIDDEN_ACT, _SLOPES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
@@ -172,7 +172,7 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
 
     table = jax.lax.stop_gradient(jnp.sum(jnp.square(params["embed_tokens"]["embedding"])))
     curvature, slope = table / 2, jnp.sqrt(2 * table)
-    p1, p2 = SLOPES[HIDDEN_ACT[LEVEL.activation]]
+    p1, p2 = _SLOPES[HIDDEN_ACT[LEVEL.activation]]
     parts = [name for name in ("down", "up") if not adaptation.select or name in adaptation.select]
     output = jax.lax.stop_gradient(jnp.sqrt(jnp.sum(jnp.square(start["up"]["kernel"]))))
 
@@ -380,10 +380,10 @@ def test_a_carried_level_steps_through_a_rows_documents_as_equation_71_reads_the
 
 @pytest.mark.parametrize("kind", LAYOUTS)
 def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
-    """What an update carries on (`carried_update`) is what was carried plus the mean, over the rows
+    """What an update carries on (`_carried_update`) is what was carried plus the mean, over the rows
     whose targets weigh anything, of how far each row's windows moved the level, its last window's step
     applied: on par with the literal loop's rows' final levels (check 1), over every layout."""
-    from dew.objectives.lm.adaptation import carried_update
+    from dew.objectives.lm.adaptation import _carried_update
 
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=3, rate=0.1, carry="run")
@@ -391,7 +391,7 @@ def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
     def dew(variables, hidden, targets, weights):
         moved = adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
                                predict=False, logits=False).moved
-        return carried_update(variables[CARRIED], moved)
+        return _carried_update(variables[CARRIED], moved)
 
     def reference(truth):
         def carried(variables, hidden, targets, weights):
@@ -582,7 +582,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
     input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
     overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
-    from dew.objectives.lm.adaptation import damping, step_rate
+    from dew.objectives.lm.adaptation import _damping, _step_rate
 
     model, transform = DAMPED_HEADS[head]
     _, hidden, targets, weights = draw(0, scale=0.5)
@@ -604,9 +604,9 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
 
     kernels = {part: level[part]["kernel"] for part in parts}
     gradient = jax.grad(loss)(kernels, variables, states, weighed)
-    *bounds, terms = damping(model, variables, level, states, weighed, adaptation)
+    *bounds, terms = _damping(model, variables, level, states, weighed, adaptation)
     moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
-    damped = float(step_rate(adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
+    damped = float(_step_rate(adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
@@ -938,10 +938,10 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
         np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
 
 
-@pytest.mark.parametrize("act", sorted(SLOPES, key=lambda function: function.__name__),
+@pytest.mark.parametrize("act", sorted(_SLOPES, key=lambda function: function.__name__),
                          ids=lambda function: function.__name__)
 def test_each_activations_slopes_bound_its_derivatives(act):
-    """Each activation's `SLOPES` bound its |act'| and |act''| over the reals: each is its float64 maximum
+    """Each activation's `_SLOPES` bound its |act'| and |act''| over the reals: each is its float64 maximum
     over [-40, 40] on a grid of step 2e-5, past which every one is flat, plus half the step times the
     next derivative's maximum there (every real lies within half a step of the grid), rounded up at the
     seventh decimal; a ReLU's act'' is a point mass, no number (None)."""
@@ -954,7 +954,7 @@ def test_each_activations_slopes_bound_its_derivatives(act):
     def bound(peak: float, next_peak: float) -> float:
         return math.ceil((peak + step / 2 * next_peak) * 10 ** 7) / 10 ** 7
 
-    p1, p2 = SLOPES[act]
+    p1, p2 = _SLOPES[act]
     assert p1 == bound(first, second)
     if p2 is None:
         assert act is jax.nn.relu

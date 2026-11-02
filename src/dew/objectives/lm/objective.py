@@ -111,8 +111,8 @@ from dew.objectives.lm.adaptation import (
     CARRIED,
     ChunkAdaptation,
     adapted_scores,
-    carried_start,
-    carried_update,
+    _carried_start,
+    _carried_update,
 )
 from dew.objectives.lm.chunked import (
     final_read,
@@ -397,7 +397,7 @@ def _global_qk_max(qk) -> jax.Array | None:
     return jnp.max(jnp.stack(found)) if found else None
 
 
-ROUTED = "routed"
+_ROUTED = "routed"
 """Where a run that carries its continuum level holds the router counts among its effects, beside what
 the level moved (`CARRIED`)."""
 
@@ -559,11 +559,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
         """`variables` with the router counts `balance` took applied, once per committed update, and what
-        a run that carries its continuum level carries on (`carried_update`)."""
+        a run that carries its continuum level carries on (`_carried_update`)."""
         if not self._carries:
             return apply_routed(self.balance, variables, effects)
-        routed = effects.get(ROUTED)
-        return {CARRIED: carried_update(variables[CARRIED], effects[CARRIED]),
+        routed = effects.get(_ROUTED)
+        return {CARRIED: _carried_update(variables[CARRIED], effects[CARRIED]),
                 **({} if routed is None else apply_routed(self.balance, variables, routed))}
 
     @property
@@ -1296,7 +1296,7 @@ class LMObjective(TokenScorer):
                      else None)
             if level is None:
                 raise ValueError("the model has no continuum level to step in context")
-            tree = {**tree, CARRIED: carried_start(level)}
+            tree = {**tree, CARRIED: _carried_start(level)}
         if self.indexer is not None:
             tree = thaw(tree)
             drawn = jax.eval_shape(self.fresh_variables, key, None)
@@ -1535,7 +1535,7 @@ class LMObjective(TokenScorer):
         if self._carries:
             # What a carried level moved, beside the router counts, which an update sums and carries on.
             assert scores.moved is not None, "a carried level's scores hold how far it moved"
-            effects = {CARRIED: scores.moved, **({} if effects is None else {ROUTED: effects})}
+            effects = {CARRIED: scores.moved, **({} if effects is None else {_ROUTED: effects})}
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:

@@ -101,7 +101,7 @@ UNGATED: dict[str, Activation] = {
 """The activations an ungated feed-forward takes, by Dew's names."""
 
 
-SLOPES: dict[Activation, tuple[float, float | None]] = {
+_SLOPES: dict[Activation, tuple[float, float | None]] = {
     gelu_exact: (1.1289122, 0.7978924), gelu_exact_torch: (1.1289122, 0.7978924),
     gelu_tanh: (1.1290011, 0.7978924), quick_gelu: (1.0998479, 0.851009), silu: (1.0998444, 0.5000031),
     jax.nn.relu: (1.0, None)}

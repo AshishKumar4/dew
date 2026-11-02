@@ -240,11 +240,11 @@ class RMSNorm(nn.Module):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
         return self.seam(x, axes=axes)[1]
 
-    def largest_gain(self) -> jax.Array:
+    def _largest_gain(self) -> jax.Array:
         """The largest gain the weight puts on the normalized input, over the features: |w|, or
         |1 + w| stored as its offset (`scale_offset`); one without a weight. Read from the bound
         norm, as a curvature bound through it reads it (`CausalTransformer.head_bounds`)."""
-        return _largest_gain(self, offset=self.scale_offset)
+        return _gain_of(self, offset=self.scale_offset)
 
     @nn.compact
     def seam(self, x, branch=None, *, axes=None):
@@ -284,15 +284,15 @@ class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_sa
     (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
     and the module's name are flax's, so checkpoints and scopes move both ways."""
 
-    def largest_gain(self) -> jax.Array:
+    def _largest_gain(self) -> jax.Array:
         """The largest gain the weight puts on the normalized input, |w| over the features, one
-        without a weight (`RMSNorm.largest_gain`)."""
-        return _largest_gain(self, offset=False)
+        without a weight (`RMSNorm._largest_gain`)."""
+        return _gain_of(self, offset=False)
 
 
-def _largest_gain(norm: nn.Module, *, offset: bool) -> jax.Array:
+def _gain_of(norm: nn.Module, *, offset: bool) -> jax.Array:
     """The largest of `norm`'s weight's gains, |w| or |1 + w| where it stores its offset, one without a
-    weight (`RMSNorm.largest_gain`)."""
+    weight (`RMSNorm._largest_gain`)."""
     scale = norm.variables.get("params", {}).get("scale")
     if scale is None:
         return jnp.ones((), jnp.float32)
@@ -318,10 +318,10 @@ class OffsetLayerNorm(nn.Module):
             y = y + self.param("bias", nn.initializers.zeros, (x.shape[-1],), jnp.float32).astype(y.dtype)
         return y
 
-    def largest_gain(self) -> jax.Array:
+    def _largest_gain(self) -> jax.Array:
         """The largest gain the weight puts on the normalized input, |1 + w| over the features
-        (`RMSNorm.largest_gain`)."""
-        return _largest_gain(self, offset=True)
+        (`RMSNorm._largest_gain`)."""
+        return _gain_of(self, offset=True)
 
 
 class GroupNorm(nn.Module):
