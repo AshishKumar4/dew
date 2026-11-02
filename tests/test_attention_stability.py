@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 from attention_oracle import exact_attention
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -858,17 +858,27 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None:
+def assert_finite(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
     """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever
-    the reference's is."""
+    the reference's is, but where the float64 truth (`truth_fn` on the inputs widened) rounds past the
+    leaf's dtype: a reference computing in the call's 16-bit dtype is finite where its own rounding moved
+    a value back under the largest (fp16's written-out attention at `logits near 1e4`: a key gradient of
+    -45376 whose truth is -68612, FS-F16-DK1), and a value past the largest rounds to infinity."""
     for seed in range(seeds):
         inputs = draw(seed)
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        for (path, mine), theirs in zip(found, jax.tree.leaves(reference_fn(*inputs)), strict=True):
-            mine, theirs = (np.asarray(leaf, np.float32) for leaf in (mine, theirs))
-            lost = np.isfinite(theirs) & ~np.isfinite(mine)
+        truth = None
+        for index, ((path, mine), theirs) in enumerate(zip(found, jax.tree.leaves(reference_fn(*inputs)),
+                                                           strict=True)):
+            lost = np.isfinite(np.asarray(theirs, np.float32)) & ~np.isfinite(np.asarray(mine, np.float32))
+            if lost.any():
+                if truth is None:
+                    with jax.enable_x64(new_val=True):
+                        truth = jax.tree.leaves(truth_fn(*widened(inputs)))
+                lost &= np.isfinite(np.asarray(truth[index], np.float64).astype(mine.dtype))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
-                                    "values not finite where the reference's are")
+                                    "values not finite where the reference's are and the truth's round "
+                                    "finite")
 
 
 GPU_ONLY = {
@@ -918,9 +928,10 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
+    truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, reference, draw, label, seeds=seeds)
+    assert_finite(differentiated, reference, truth, draw, label, seeds=seeds)
     _held_empty(family, differentiated(*draw(0)), label)
 
 
@@ -980,8 +991,8 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
 
     reference = as_given(jax.jit(with_gradients(_reference(family_of, anchored=False))))
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
-    assert_finite(unsplit, reference, _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}",
-                  seeds=seeds)
+    assert_finite(unsplit, reference, with_gradients(_reference(family_of, anchored=True)),
+                  _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}", seeds=seeds)
 
 
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
@@ -1156,8 +1167,8 @@ def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     guards its sums' headroom in either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
-    assert_finite(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
-                  f"decode default {family.dtype}", seeds=seeds)
+    assert_finite(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))),
+                  _reference(family, anchored=True), forward, f"decode default {family.dtype}", seeds=seeds)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
