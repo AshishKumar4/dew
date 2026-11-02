@@ -68,7 +68,7 @@ from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
+from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.norms import unweighted_rmsnorm
@@ -136,6 +136,24 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
     return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
+
+
+def decoded_ssd(x, dt, A, B, C, D, state=None, starts=None):
+    """`recurrent_ssd` for one decode token through the recurrence's decode step (`linear.decode_step`):
+    the step kernel where the decode selector gives it (`linear.DELTA_DECODE`), the state read and
+    written once, else the portable step. Operands and results as `recurrent_ssd`'s."""
+    work = at_least_fp32(jnp.result_type(x, B, C))
+    x, dt, B, C = (jnp.asarray(t[:, 0], work) for t in (x, dt, B, C))
+    batch, heads, head_dim = x.shape
+    if state is None:
+        state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
+    # The SSD's memory is `[P, N]`, values by keys: the step's `[N, P]` transposed.
+    held = jnp.swapaxes(jnp.asarray(state, work), -1, -2)
+    if starts is not None:
+        held = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], jnp.zeros((), work), held)
+    out, final = decode_step(SSD, held, C, B, x, None, dt, None, rate=jnp.asarray(A, work),
+                             skip=jnp.asarray(D, work))
+    return out[:, None], jnp.swapaxes(final, -1, -2)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -336,7 +354,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
     if length == 1 and axis is None:
-        out, final = recurrent_ssd(xs, step, A, B, C, D, held, starts)
+        out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
         out, final = chunk_ssd(xs, step, A, B, C, D, held, chunk_size, starts=starts)
     if axis is not None:
