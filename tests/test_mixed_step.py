@@ -124,9 +124,9 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
             cache = prefilled(model, params)
             admitted = Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]),
                                 continuing=continuing, tables=tables_of(cache, [3, 0]) if paged else None)
-            # An H100's choices, its norms' and feed-forwards' Pallas kernels aside (this host interprets the
-            # attention template's alone).
-            with generation.assumed("sm90"), generation.chosen(rms_norm="xla", swiglu="xla"):
+            # An H100's choices, its norms', feed-forwards' and decode rows' Pallas kernels aside (this host
+            # interprets the attention template's alone).
+            with generation.assumed("sm90"), generation.chosen(rms_norm="xla", swiglu="xla", decode="xla"):
                 return model.apply({**params, "cache": cache}, tokens, picked, decode=True, mutable=["cache"],
                                    coordinates=coordinates(valid.shape, valid=valid), admitted=admitted,
                                    method=CausalTransformer.states_and_logits_at)[0][1]
