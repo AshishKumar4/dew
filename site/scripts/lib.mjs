@@ -145,7 +145,7 @@ async function inlineFigure(paragraph, sourcePath) {
 		return svg.replace(/ aria-label="[^"]*"/, '').replace('<svg ', `<svg aria-label="${label}" `);
 	};
 	const narrow = file.replace(/\.svg$/, '-narrow.svg');
-	if (!existsSync(narrow)) return `<div class="nb-figure">${await inline(file)}</div>`;
+	return `<div class="nb-figure">${await inline(file)}</div>`;
 	return `<div class="nb-figure nb-figure-pair"><div class="nb-figure-wide">${await inline(file)}</div><div class="nb-figure-narrow">${await inline(narrow)}</div></div>`;
 }
 
