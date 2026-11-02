@@ -894,7 +894,7 @@ def test_a_variance_exploding_euler_step_from_a_zero_snr_sigma_rounds_as_ddim():
                                      (one, jnp.asarray(sigma_s)))[0], np.float64)
     wide = [np.asarray(value, np.float64) for value in (x, denoised, sigma_t, sigma_s)]
     exact = wide[1] + wide[3] * (wide[0] - wide[1]) / wide[2]
-    # Four roundings of the form, each at most half an ulp of the result, where the source's sum keeps hundreds.
+    # Four roundings of the form, each at most half an ulp of the result; the source's sum keeps hundreds.
     assert np.max(np.abs(stepped - exact) / np.spacing(np.abs(exact).astype(np.float32))) <= 4
 
 
