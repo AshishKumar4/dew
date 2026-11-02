@@ -153,13 +153,13 @@ def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
     """The natural form of the call as the template's forward takes it (`attention_mosaic_forward._prepared`):
-    the units its finished rows' maxima are in (`algebra.finished_rows`: natural from the fold, its rewalk's,
-    `algebra.unfolded`), which its merge takes."""
+    the units its finished rows' maxima are in (`algebra.finished_rows`: natural from the fold and from the
+    fast form a score hook keeps, its rewalk's, `algebra.unfolded`), which its merge takes."""
     power, factor = prescale(query.dtype, query.shape[3], scale)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
                            score_mod=hooks.score_mod, natural=False, initial=hooks.initial is not None,
                            prescale=power)
-    return algebra.unfolded(spec) if spec.base2 else spec
+    return spec if spec.natural else algebra.unfolded(spec)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
