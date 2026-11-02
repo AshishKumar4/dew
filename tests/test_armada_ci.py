@@ -1050,7 +1050,9 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     the file's record and the split plugin its collected tests alike, the marked tests one weight at
     the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
-    yet stays at its own place, as the plan, reading the record, cuts as the task does. A mark written
+    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
+    plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
+    to share its fixture). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1067,7 +1069,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     assert all(row["exitCode"] == 0 for row in rows)
     together, alone = [nodes[0], nodes[2]], [nodes[1]]
     assert {row["name"]: sorted(row["tests"]) for row in rows} == {
-        "3.12:tests/test_shared.py#1/2": together, "3.12:tests/test_shared.py#2/2": [*alone, nodes[3]]}
+        "3.12:tests/test_shared.py#1/2": [*together, nodes[3]], "3.12:tests/test_shared.py#2/2": alone}
     assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
     for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
