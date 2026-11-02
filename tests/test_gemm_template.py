@@ -884,7 +884,9 @@ def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name)
 
     def plain(x, w, b, wide=jnp.float32):
         def loss(b):
-            product = jax.lax.ragged_dot(x.astype(wide), w.astype(wide), sizes, preferred_element_type=wide)
+            # The matrix in the rows' dtype, as the template multiplies it.
+            matrix = w.astype(x.dtype).astype(wide)
+            product = jax.lax.ragged_dot(x.astype(wide), matrix, sizes, preferred_element_type=wide)
             out = product + jnp.repeat(b.astype(wide), sizes, axis=0, total_repeat_length=ROWS)
             return jnp.sum(out[:ROUTED] ** 2), out
         (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
