@@ -170,53 +170,46 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
     return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
-RAISES_HONORED = True
-"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg): Dew's
-JAX build from 0.12.0.1.post43 compiles each kernel whole in its PJRT plugin (Mosaic GPU's nvJitLink off,
-jax-ml/jax f365a65e3a, issue 42094), so a raise holds; the stock PJRT plugin compiled relocatably, where
-ptxas ignores it (C7504; SAMECOMPILE1-h100: two consumers' attention dK/dV spilled 504 bytes at 168
-registers where a whole-program compile holds its 232). A program launches with its raises' pool: a
-one-consumer launch raised to the whole multiprocessor's share held one program where its 127 registers had
-held two (Nemotron-H 30B's SSD query/key launch, 161 us at two, 216 to 226 at one, FS-WHY3-h100), so a raise
-is its residency's share (`raised_registers`)."""
+RAISES_HONORED = False
+"""Whether the GPU's compile of a Mosaic GPU kernel honors its warpgroups' register raises (setmaxnreg). It
+does not today: jaxlib's Mosaic GPU compiles each kernel's PTX through nvJitLink wherever it is installed
+(jaxlib/mosaic/gpu/target.cc, NvJitLinkMode::kAuto; the pip wheels without libnvptxcompiler), which
+compiles it relocatably, and ptxas ignores setmaxnreg there (C7504): every warpgroup of a program holds its
+entry's registers (`entry_registers`). SAMECOMPILE1-h100: two consumers' attention dK/dV spilled 504 bytes
+at 168 registers where a whole-program compile holds its 232."""
 
 
-def entry_registers(warpgroups: int, programs: int = 1) -> int:
-    """The registers a thread of a program of `warpgroups` warpgroups launches with, `programs` of it held by
-    a multiprocessor at once: their threads' share of its 64K in the allocator's steps of 8, at most 255
-    (168 at three warpgroups and one program, 128 at two warpgroups and two)."""
-    share = cost.REGISTERS // (programs * warpgroups * THREADS)
-    return min(255, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
+def entry_registers(warpgroups: int) -> int:
+    """The registers a thread of a program of `warpgroups` warpgroups launches with: its threads' share of
+    the multiprocessor's 64K in the allocator's steps of 8, at most 255 (168 at three warpgroups)."""
+    return min(255, cost.REGISTERS // (warpgroups * THREADS) // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
-def raised_registers(consumers: int, programs: int = 1) -> int:
-    """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg),
-    `programs` programs held by a multiprocessor at once: the program's launch pool at that residency less
-    the producer's, shared among them in setmaxnreg's steps of 8 and at most its 256 (one consumer's 256 at
-    one program and 232 at two; two consumers' 232 at one, JAX's warp-specialized pipeline's
-    `_compute_registers(40, 2)`). The pool is what the program launches with (`entry_registers`), which
-    setmaxnreg moves between a program's warps and never past ("The total number of registers allocated to
-    all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640
-    threads launch at 96 a thread, so they hold 104, where the multiprocessor's share would ask 112 and wait
-    for registers no warp gives back."""
-    pool = entry_registers(consumers + 1, programs) * (consumers + 1) * THREADS
+def raised_registers(consumers: int) -> int:
+    """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg): the
+    program's launch pool less the producer's, shared among them in setmaxnreg's steps of 8 and at most its
+    256 (two consumers' 232, JAX's warp-specialized pipeline's `_compute_registers(40, 2)`). The pool is what
+    the program launches with (`entry_registers`), which setmaxnreg moves between a program's warps and
+    never past ("The total number of registers allocated to all warps in the CTA cannot exceed the initial
+    CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they hold 104,
+    where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
+    pool = entry_registers(consumers + 1) * (consumers + 1) * THREADS
     share = (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS)
     return min(256, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
-def consumer_registers(consumers: int, programs: int = 1) -> int:
-    """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
-    multiprocessor: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
-    program's entry's otherwise."""
-    return (raised_registers(consumers, programs) if RAISES_HONORED
-            else entry_registers(consumers + 1, programs))
+def consumer_registers(consumers: int) -> int:
+    """The registers a thread of each of `consumers` consumer warpgroups holds: its raise
+    (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its program's entry's
+    otherwise."""
+    return raised_registers(consumers) if RAISES_HONORED else entry_registers(consumers + 1)
 
 
-def producer_registers(consumers: int, programs: int = 1) -> int:
-    """The registers a thread of a program's producer beside `consumers` consumer warpgroups holds, `programs`
-    programs a multiprocessor: its lowered `PRODUCER_REGISTERS` where the GPU's compile honors the program's
-    raises, its entry's otherwise."""
-    return PRODUCER_REGISTERS if RAISES_HONORED else entry_registers(consumers + 1, programs)
+def producer_registers(consumers: int) -> int:
+    """The registers a thread of a program's producer beside `consumers` consumer warpgroups holds: its
+    lowered `PRODUCER_REGISTERS` where the GPU's compile honors the program's raises, its entry's
+    otherwise."""
+    return PRODUCER_REGISTERS if RAISES_HONORED else entry_registers(consumers + 1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,26 +298,11 @@ def _register_allocation(registers: int, consumers: int, producer: int, step: in
     return (consumers * consumed + produced) * THREADS
 
 
-RESIDENT_PROGRAMS = 16
-"""The most programs of one warpgroup a multiprocessor holds at once: its 2048 resident threads' (sm80 to
-sm100), the bound `register_programs` searches from."""
-
-
-def register_programs(family: "Family", consumers: int, registers: int | None = None) -> int:
-    """The most programs of a launch of `consumers` consumer roles a multiprocessor's registers hold at once,
-    each consumer thread holding `registers` (None: the family's budget at one program, `Family.registers`):
-    the most at whose share (`Family.registers` at that residency, a raise's where the family's roles raise)
-    its consumers hold them, beside its producer's where its layout has one. A launch's own need sets its
-    residency: two programs of a one-consumer launch at 127 registers ran its walk 1.35 times as fast as one
-    (FS-WHY3-h100)."""
-    warpgroups = family.warpgroups(consumers)
-    need = family.registers(consumers) if registers is None else registers
-    for programs in range(RESIDENT_PROGRAMS // warpgroups, 0, -1):
-        producer = producer_registers(consumers, programs) if warpgroups > consumers else 0
-        if need <= family.registers(consumers, programs) and programs * _register_allocation(
-                need, consumers, producer, family.register_step) <= cost.REGISTERS:
-            return programs
-    return 0
+def register_programs(family: "Family", consumers: int) -> int:
+    """Programs held by the family's role allocations, including the producer where it has one."""
+    producer = producer_registers(consumers) if family.warpgroups(consumers) > consumers else 0
+    allocated = _register_allocation(family.registers(consumers), consumers, producer, family.register_step)
+    return cost.REGISTERS // allocated
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,10 +345,9 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
                    shared: int | None = None, target: "GpuTarget | None" = None,
                    tmem: int = 0) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
-    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), and the most
-    programs a multiprocessor holds of it at those registers (`register_programs`), as its plan's."""
+    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`)."""
     warpgroups = family.warpgroups(consumers)
-    most = register_programs(family, consumers, registers)
+    most = register_programs(family, consumers)
     if target is not None:
         from dew.nn.kernels import generation
 
@@ -431,8 +408,7 @@ def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
 def plan(launches, family: "Family", target, *, programs: int | None = None) -> tuple[LaunchPlan, ...] | None:
     """Each of `launches`' plan on `target` (a GPU's, or the one a CPU process states), or None where any
     launch holds at no plan: within its family's registers (`Family.registers`), the most programs a
-    multiprocessor's registers hold of it at its own registers (`Family.programs`; `programs` where the
-    caller fixes the residency, which its registers must hold)
+    multiprocessor holds of it (`Family.programs`, or `programs` where the caller fixes the residency)
     whose share of its shared memory (`program_shared`) holds the launch at its `floor`, then the deepest
     ring that share holds at that residency, so stages never trade away a program. Each launch plans at
     its own residency and depth; a template's legality is that every launch holds."""
@@ -452,8 +428,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     for launch in launches:
         if launch.registers > family.registers(launch.consumers):
             return None
-        most = family.programs(launch.consumers, launch.registers)
-        residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
+        residencies = range(family.programs(launch.consumers), 0, -1) if programs is None else (programs,)
         found = None
         for held in residencies:
             share = program_shared(block, held)
