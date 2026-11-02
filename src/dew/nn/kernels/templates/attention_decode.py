@@ -105,7 +105,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
     whole step took 13)."""
-    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=True,
+    op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=jnp.float32, masked=True, pages=pages)
     ba = op.bind(*args, residuals=Kept.OUTPUT, interpret=False)
     config = op.derived(ba, target)
@@ -126,13 +126,13 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
 def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
            initial: Initial | None = None) -> jax.Array:
-    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in `spec`'s units,
-    `algebra.finished_rows`') and denominators `[B, KV, S, Q]`, and the call's `initial` state `[B, KV, Q]`
-    (its sums `acc` unnormalized) merged by the algebra's fold over states (`algebra.merged`, then
-    `finish`): the rows' output `[B, Q, KV, Dv]` fp32. Each state enters as its normalized output and its
-    mass, its denominator folded into its maximum (`m + log(total)`), so no output multiplied back by its
-    denominator passes fp32's largest; a state of no mass adds nothing, and a row of none is zero, as the
-    reference's."""
+    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in natural `spec`'s
+    units, `algebra.finished_rows`', a fold's `algebra.unfolded`) and denominators `[B, KV, S, Q]`, and the
+    call's `initial` state `[B, KV, Q]` (its sums `acc` unnormalized) merged by the algebra's fold over
+    states (`algebra.merged`, then `finish`): the rows' output `[B, Q, KV, Dv]` fp32. Each state enters as
+    its normalized output and its mass, its denominator folded into its maximum (`m + log(total)`), so no
+    output multiplied back by its denominator passes fp32's largest; a state of no mass adds nothing, and a
+    row of none is zero, as the reference's."""
     if not spec.natural:
         raise ValueError("the template's decode merges natural states")
     m, mass = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
@@ -152,12 +152,14 @@ def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax
 
 
 def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
-    """The call's natural form as the template's forward takes it (`attention_mosaic_forward._prepared`):
-    the units its finished rows' maxima are in (`algebra.finished_rows`), which its merge takes."""
+    """The natural form of the call as the template's forward takes it (`attention_mosaic_forward._prepared`):
+    the units its finished rows' maxima are in (`algebra.finished_rows`: natural from the fold, its rewalk's,
+    `algebra.unfolded`), which its merge takes."""
     power, factor = prescale(query.dtype, query.shape[3], scale)
-    return algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
-                           score_mod=hooks.score_mod, natural=True, initial=hooks.initial is not None,
+    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
+                           score_mod=hooks.score_mod, natural=False, initial=hooks.initial is not None,
                            prescale=power)
+    return algebra.unfolded(spec) if spec.base2 else spec
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
@@ -168,7 +170,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward in fp32 with its rows
     (`attention_mosaic.forward`'s `splits`), merged with the initial state (`merged`) and unpacked. Its
-    logits natural, so the guard runs as a launch over its live rows with no branch read on the host
+    logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks
+    walked again natural in one more launch over those rows alone, with no branch read on the host
     (`MosaicForward.masked`, row 1978)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
@@ -180,7 +183,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     work = plan(rows, key, value, row_spans, walked, scale=scale, target=generation.gpu_target(), pages=pages)
     with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
         out, maximum, total = attention_mosaic.forward(
-            rows, key, value, row_spans, walked, scale=scale, natural=True, residuals=Kept.OUTPUT,
+            rows, key, value, row_spans, walked, scale=scale, natural=False, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, pages=pages)[:3]
     if work.slices == 1:
         # One slice's launch gives its rows without a slices axis (`_plain_forward`).

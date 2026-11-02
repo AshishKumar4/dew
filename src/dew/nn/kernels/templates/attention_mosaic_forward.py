@@ -186,10 +186,23 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        if live is None:
+        walked_call = call
+        if live is not None:
+            live = whole_rows(live)
+            if masked:
+                # A masked launch's rows past its live ones see no key, so their programs walk none: a query
+                # row's keys walked where any of its heads' rows is live, `[B, Qp]` (a call's runs,
+                # `[B, R, Qp]`, alike). A spans call's block map counts blocks of the launch's own key tile.
+                live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
+                live_rows = live_rows[:, None] if call.end.ndim == 3 else live_rows
+                walked_call = dataclasses.replace(call, end=jnp.where(live_rows, call.end, call.start))
+        if live is None or not form.headroom:
             # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
             # blocks' outputs side by side, their rows' statistics alike; an output hook of a row's whole
-            # output in XLA past them, as the guarded launch's.
+            # output in XLA past them, as the guarded launch's. A masked rewalk of sums that cannot overflow
+            # (`algebra.walked_launches`' fold) walks its live rows so, unguarded.
+            if walked_call is not call:
+                at_spans = _spans_of(spec, walked_call, at.block_q, at.block_k)
             blocks = _column_blocks(v, hooked, at.columns)
             split = len(blocks) > 1 and hooks.output_mod is not None
             launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
@@ -204,42 +217,43 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                 out_dtype or q.dtype, split)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
-        live = whole_rows(live)
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1])
         hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
-        # A spans call's block map counts blocks of the launch's own key tile; a masked guard's (`masked`)
-        # rows past its live ones see no key, so their programs walk none.
-        walked_call = call
-        if masked:
-            # A query row's keys walked where any of its heads' rows is live, `[B, Qp]` (a call's runs,
-            # `[B, R, Qp]`, alike).
-            live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
-            live_rows = live_rows[:, None] if call.end.ndim == 3 else live_rows
-            walked_call = dataclasses.replace(call, end=jnp.where(live_rows, call.end, call.start))
         guarded_spans = _spans_of(spec, walked_call, guarded.block_q, guarded.block_k)
-        blocks = []
+        # A masked launch's rows its own whole, their finished maxima and denominators beside their output
+        # (`kept`): a fold's natural rewalk's are its rows' own, in its units.
+        finishes = rows and masked
+        blocks, finished = [], ()
         # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
         # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
         # Each block reads its columns of the values where they lie (`_launch`'s `column_width`), no copy of
         # them, and their magnitudes from the tiles it walks (`Family.key_magnitudes`).
         for first, columns, held in _column_blocks(v, hooked, unit, whole=False):
             guard = _Guard(live.astype(jnp.int32))
-            blocks.append(_launch(q, k, v, guarded_spans, held._replace(output=()), guard, spec=form,
-                                  hooks=_unhooked(hooks), tiles=guarded, family=family, training=False,
-                                  interpret=interpret, columns=first, splits=splits, table=table,
-                                  out_dtype=jnp.float32 if hooked_blocks else out_dtype,
-                                  column_width=columns.shape[-1] if first is not None else None)[1])
+            _, block, *block_rows = _launch(
+                q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
+                tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
+                splits=splits, table=table, out_dtype=jnp.float32 if hooked_blocks else out_dtype,
+                finishes=finishes, column_width=columns.shape[-1] if first is not None else None)
+            blocks.append(block)
+            # Every block's rows alike: its logits are the row's whole.
+            finished = finished or tuple(block_rows)
         out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, out_dtype or q.dtype,
                             hooked_blocks)
-        # Its output alone: `walked_launches` reads the plain launch's maxima and overflows, and `kept` its
-        # finished rows.
-        return (out,), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+        # `walked_launches` reads the plain launch's maxima and overflows.
+        return (out, *finished), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
     def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
-        return (jnp.where(jnp.swapaxes(whole_rows(live), 1, 2)[..., None], guarded[0], plain[0]), *plain[1:])
+        # The rewalk's outputs at its rows (its output, and a masked launch's finished rows), the plain
+        # launch's elsewhere and past them.
+        live = whole_rows(live)
+        taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
+                 *(jnp.where(live, mine, theirs)
+                   for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
+        return (*taken, *plain[len(guarded):])
 
     out, *finished = algebra.walked_launches(spec, launch, kept, masked=masked)
     if splits > 1:

@@ -437,14 +437,20 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
 
 
 def reach_of(maxima: jax.Array, *, unseen: bool) -> jax.Array:
-    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): their largest magnitude,
-    and one whose maximum the fold took past fp32's largest, or to no number, past every reach, so the call
-    walks again natural, where its logits are finite (a product near fp32's largest before a small scale,
-    times log2(e)). A -inf maximum is a row that saw no key, none, where a row may see none (`unseen`, a
-    'spans' call); elsewhere every row sees a key, so it is a row whose products all passed fp32 below zero,
-    past every reach (`attention_mosaic_forward._prepared`'s raw products)."""
-    reached = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
-    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached) if unseen else reached)
+    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): the largest of their
+    reaches (`reached`)."""
+    return jnp.max(reached(maxima, unseen=unseen))
+
+
+def reached(maxima: jax.Array, *, unseen: bool) -> jax.Array:
+    """How far each of a folded walk's row `maxima` reaches: its magnitude, and one whose maximum the fold
+    took past fp32's largest, or to no number, past every reach, so the row walks again natural, where its
+    logits are finite (a product near fp32's largest before a small scale, times log2(e)). A -inf maximum is
+    a row that saw no key, none, where a row may see none (`unseen`, a 'spans' call); elsewhere every row
+    sees a key, so it is a row whose products all passed fp32 below zero, past every reach
+    (`attention_mosaic_forward._prepared`'s raw products)."""
+    reach = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
+    return jnp.where(maxima == -jnp.inf, 0.0, reach) if unseen else reach
 
 
 type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
@@ -465,18 +471,27 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     passes `FOLD_REACH` folded, guarded as the call's form is; under headroom, the rows whose weighted values
     overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks.
 
-    `masked` (a natural spans call's, whose launch walks only its live rows' keys, every other row's none:
-    `launch(form, live)`'s program over its rows' spans) takes the guarded launch every time, no branch: a
+    `masked` (a spans call's, whose launch walks only its live rows' keys, every other row's none:
+    `launch(form, live)`'s program over its rows' spans) takes one more launch every time, no branch: a
     branch's predicate is read on the host before its launch may run, a decode step's round trip (row 1978:
-    0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue."""
-    if masked and spec.base2:
-        raise ValueError("a masked guard takes the natural form, whose launch has no fold to rewalk")
+    0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue. It walks
+    in the natural form (`unfolded`) the rows the fold's reach passes `FOLD_REACH` a row (`reached`) and
+    those whose weighted values overflowed, guarded as that form is, and `kept` takes each of its outputs
+    (its rows' finished maxima and denominators too) at those rows: the fold's plain launch costs its
+    exponential's two instructions an element where the natural form's costs about sixty
+    (ET-DECSASS-h100, ET-FOLDED-h100: Qwen3-8B's decode at 32 rows of 32768 keys, 1.35 ms folded against
+    2.11 natural, the H100's bandwidth floor 1.28)."""
+    if masked:
+        outputs, maxima, over = launch(spec, None)
+        if spec.base2:
+            # A padded query's maximum is -inf, a row that reads nothing, as is a slice's row of no keys.
+            live = (reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH) | over
+            return kept(live, launch(unfolded(spec), live)[0], outputs)
+        return kept(over, launch(spec, over)[0], outputs) if spec.headroom else outputs
 
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
             return outputs
-        if masked:
-            return kept(over, launch(form, over)[0], outputs)
         # The rows kept plain read from the plain launch run again inside the rare branch (`again`), so the
         # plain launch's outputs reach one branch alone, whose result their buffer then is: read by both,
         # XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047 ms of
