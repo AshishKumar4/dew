@@ -45,6 +45,7 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
+    deviceless_options,
     head_fused_of,
     head_tile_of,
     local_devices,
@@ -774,7 +775,8 @@ class FitSearch[LossT, EffectsT]:
         (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
         must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
         measure."""
-        options = self.required if self.xla_defaults else self.options(candidate)
+        rung = self.required if self.xla_defaults else self.options(candidate)
+        options = deviceless_options(self.mesh, rung)
         taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
         if ahead is not None:
@@ -862,8 +864,9 @@ class FitSearch[LossT, EffectsT]:
             self.lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
-        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
-        if not self.xla_defaults and self.chosen != self.required:
+        # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89). Both
+        # are compared as the target compiles them (`deviceless_options`).
+        if not self.xla_defaults and self.chosen != deviceless_options(self.mesh, self.required):
             self.xla_defaults = True
             return True
         self.xla_defaults = False
