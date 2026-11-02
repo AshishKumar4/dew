@@ -39,16 +39,19 @@ from dew.nn.mla import MultiHeadLatentAttention
 
 if TYPE_CHECKING:
     import torch
-    from transformers import PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModel
 
 
 # --- the instances, read through the known names --------------------------------------------------
 
 class PartView:
-    """A source module read by the known class's attribute names (`Renaming.attributes`)."""
+    """A source module read by the known class's attribute names (`Renaming.attributes`), beside the
+    config of the causal LM it is part of (`source_config`), which a part whose code reads its values
+    through its model rather than holding them reads (Falcon-H1's mixer, whose model builds its in
+    projection's multipliers from `ssm_multipliers`)."""
 
-    def __init__(self, module: torch.nn.Module, renaming: Renaming):
-        self.module, self.renaming = module, renaming
+    def __init__(self, module: torch.nn.Module, renaming: Renaming, source_config: PretrainedConfig):
+        self.module, self.renaming, self.source_config = module, renaming, source_config
 
     def name(self, known: str) -> str:
         return self.renaming.attributes.get(known, known)
@@ -457,17 +460,12 @@ def _read_sectioned_mamba2(view: PartView) -> Mapping[str, object]:
     if (view.activation != 'silu' or conv.groups != width or conv.in_channels != width
             or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)):
         raise Ambiguous("the convolution is not one causal depthwise filter per channel activated by silu")
-    vector = view.mup_vector.reshape(-1)
-    sections, start = [], 0
-    for size in (inner, inner, groups * state, groups * state, heads):
-        section = vector[start:start + size]
-        if section.numel() != size or not bool((section == section[0]).all()):
-            raise Ambiguous("its in projection's multipliers are not one factor a section of z, x, B, C "
-                            "and dt")
-        sections.append(float(section[0]))
-        start += size
-    if start != vector.numel():
-        raise Ambiguous("its in projection's multipliers run past its sections")
+    # Its `mup_vector`, a buffer its model builds from the config's five `ssm_multipliers`, one a
+    # section (`compute_mup_vector`), read off that config: an unloaded model's buffers hold no values.
+    sections = _records.numbers(list(view.source_config.ssm_multipliers), 'ssm_multipliers')
+    if len(sections) != 5:
+        raise Ambiguous(f"its ssm_multipliers {sections} are not one factor a section of z, x, B, C "
+                        "and dt")
     use_bias = view.in_proj.bias is not None
     fields: dict[str, object] = {
         'num_heads': heads, 'head_dim': head_dim, 'state_size': state, 'n_groups': groups,
@@ -876,6 +874,13 @@ _LATENT_CHILDREN: Children = {
     **dict.fromkeys(('q_a_layernorm', 'kv_a_layernorm'), ('latent_norm',))}
 
 KNOWN: tuple[KnownPart, ...] = (
+    # Ahead of Llama's layer, whose forward this one's computes alike: it reads either's norms, plain or
+    # gated.
+    KnownPart('layer', f'{_AXK2}:AXK2DecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
+               **dict.fromkeys(('input_layernorm', 'post_attention_layernorm'),
+                               ('norm', 'gated_block_norm'))},
+              _read_gated_norm_layer),
     KnownPart('causal_lm', f'{_LLAMA}:LlamaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
     KnownPart('causal_lm', f'{_MIXTRAL}:MixtralForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
@@ -979,11 +984,6 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('router', f'{_LAGUNA}:LagunaTopKRouter', {}, _read_laguna_router,
               ('weight', 'e_score_correction_bias')),
     KnownPart('model', f'{_AXK2}:AXK2Model', _MODEL_CHILDREN, _read_llama_model),
-    KnownPart('layer', f'{_AXK2}:AXK2DecoderLayer',
-              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
-               **dict.fromkeys(('input_layernorm', 'post_attention_layernorm'),
-                               ('norm', 'gated_block_norm'))},
-              _read_gated_norm_layer),
     KnownPart('attention', f'{_AXK2}:AXK2Attention',
               {**dict.fromkeys(('q_a_proj', 'q_gate_proj', 'kv_a_proj_with_mqa', 'kv_b_proj', 'o_proj'),
                                ('linear',)),
@@ -1248,7 +1248,8 @@ def _load_names(model: PreTrainedModel, inventory: Collection[str] | None
 
 
 class _Assembler:
-    def __init__(self):
+    def __init__(self, config: PretrainedConfig):
+        self.config = config
         self.fields: dict[str, object] = {}
         self.layers: dict[int, dict[str, object]] = {}
         self.names: dict[str, tuple[str, Mapping[str, str]]] = {}
@@ -1283,7 +1284,7 @@ class _Assembler:
                 self.walk(child, ('layer',), f'{path}.{index}', f'{canonical}.{index}', index)
             return 'layers'
         part, renaming = identify(module, roles)
-        view = PartView(module, renaming)
+        view = PartView(module, renaming, self.config)
         self.state(part.read(view), path or type(module).__name__, layer)
         # The head is tied where it is the table's own parameter, as the source holds it.
         if part.role == 'embedding' or (part.role == 'linear' and canonical == 'lm_head'):
@@ -1363,7 +1364,7 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     """`model`, a source's causal LM, assembled from known parts, or `Ambiguous` naming the module that
     is not one; its stored names read as its load names them, over the checkpoint's `inventory` where
     its conversion needs the whole of it (`_load_names`)."""
-    assembler = _Assembler()
+    assembler = _Assembler(model.config)
     assembler.walk(model, ('causal_lm',), '', '', None)
     (head, head_weight), (table, table_weight) = assembler.tables['head'], assembler.tables['embedding']
     fields = {**assembler.fields, 'tie_embeddings': head_weight is table_weight}
