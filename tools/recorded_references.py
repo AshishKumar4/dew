@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
 from reference_error import (
+    FEWEST_SEEDS,
     REDRAW,
     SIZING_FROM,
     as_given,
@@ -87,7 +88,7 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
 
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
-                summary: bool = False, dew=None) -> dict[str, np.ndarray]:
+                summary: bool = False, dew=None, start: int = FEWEST_SEEDS) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. With no proxy, the recorded reference alone
@@ -104,12 +105,13 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     own outputs on a seed's inputs, the recorded reference confirms the count paired, as check 1's
     verdict pairs it (`seeds_for`'s `dew_fn`), for a site whose errors are heavy-tailed across draws
     alike in both arms (a lognormal training sigma), where the reference compared with itself on other
-    draws never resolves."""
+    draws never resolves. A site whose GPU paired sizing needs more seeds than the recording CPU's
+    declares that count through `start`: the recording confirms it here and keeps its whole redraw."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
     planned = (0 if proxy is None else
-               seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
+               seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label, start=start,
                          truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
     print(f"{label}: starting with {planned} seeds", flush=True)
     # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
@@ -133,6 +135,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     ensure((1 + REDRAW) * planned)
     # The recorded reference is read by index from the host's records, as given.
     confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
+                          start=start,
                           truth_fn=lambda index, inputs: records[int(index)][2],
                           dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
