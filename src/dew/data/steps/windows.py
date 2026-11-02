@@ -13,7 +13,7 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew._records import integer, integers, record
+from dew._records import integer, integers, json_value, record
 from dew.batch import Batch
 from dew.data.pipeline import ACCOUNTS, CONSUMED, DOCUMENT, Documents, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
@@ -188,7 +188,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             for name, tokens in held.items()
         }
         if self._documents is not None:
-            self._documents.restore(state["documents"])
+            self._documents.restore(json_value(state["documents"], "held documents"))
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
