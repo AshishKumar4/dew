@@ -227,13 +227,42 @@ def _weight(equation, name, params, inputs, value):
 
 
 def _scanned(params, inputs, taps, weights):
-    """A scan's outputs, its body run step by step as the program's own operations (`scanned_steps`)."""
-    from float64_terms import scanned_steps
+    """A scan's outputs, its body run as the program's own operations: step by step where its roundings
+    are weighed (`scanned_steps`), each body rounding's weights stacked over the steps; as a scan where
+    they are tapped, each body rounding's taps stacked alike, so the tapped program keeps its loop."""
+    from float64_terms import scan_groups, scanned_steps
 
     body = params["jaxpr"]
+    if taps is None:
+        steps: dict[int, list] = {}
 
-    def step(_, lanes):
-        outputs = _run(body.jaxpr, body.consts, [value for (value,) in lanes], taps, weights)
-        return [(value,) for value in outputs]
+        def step(index, lanes):
+            steps[index] = []
+            outputs = _run(body.jaxpr, body.consts, [value for (value,) in lanes], None, steps[index])
+            return [(value,) for value in outputs]
 
-    return [value for (value,) in scanned_steps(params, [(value,) for value in inputs], step, lanes=1)]
+        walked = [value for (value,) in scanned_steps(params, [(value,) for value in inputs], step, lanes=1)]
+        if steps:
+            ordered = [steps[index] for index in range(params["length"])]
+            weights.extend(jnp.stack(column) for column in zip(*ordered, strict=True))
+        return walked
+    constants, carries = scan_groups(params, len(inputs))
+    fixed, carry, xs = inputs[:constants], inputs[constants:constants + carries], inputs[constants + carries:]
+    count = _taps_of(body.jaxpr, body.consts, [*fixed, *carry, *(x[0] for x in xs)])
+    stacked = [next(taps) for _ in range(count)]
+
+    def looped(held, sliced):
+        step_inputs, step_taps = sliced
+        outputs = _run(body.jaxpr, body.consts, [*fixed, *held, *step_inputs], iter(step_taps), None)
+        return outputs[:carries], outputs[carries:]
+
+    carry, ys = jax.lax.scan(looped, list(carry), (list(xs), stacked), length=params["length"],
+                             reverse=params["reverse"])
+    return [*carry, *ys]
+
+
+def _taps_of(jaxpr, consts, args) -> int:
+    """How many roundings one pass of `jaxpr` taps (`_run`), read from its shapes alone."""
+    weights: list = []
+    jax.eval_shape(lambda *given: _run(jaxpr, consts, list(given), None, weights), *args)
+    return len(weights)

@@ -71,9 +71,10 @@ three, past gradient descent's 2 (the configurations below it peak at 1.64), and
 by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its paired ratio to narrow
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
-documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): ledger 1714 holds their
-end-to-end contracts open, and the one-token window's error each window adds is held from the level
-the window starts at (`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
+documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): their sites hold each
+element within its program's rounding bound instead (`assert_within_rounding`, ledger 1714), and the
+one-token window's error each window adds is held from the level the window starts at
+(`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
 
 
 def corner(rate: float, scale: float, window: int, damped: bool = False) -> bool:
@@ -692,6 +693,23 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_within_its_roundi
 
     assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=BOUND_ROWS), BOUND_SEEDS,
                            f"the one-token window at the corner over {kind}")
+
+
+def test_the_corner_bound_holds_no_rate_a_thousandth_off():
+    """The corner's bound has teeth: Dew's one-token window stepped at a rate a thousandth past the
+    reference's falls outside its rounding bound at the corner (`assert_within_rounding`), two draws."""
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+    off = ChunkAdaptation(window=1, rate=0.5 * (1 + 2 ** -10))
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, off, predict=False,
+                              logits=False).losses
+
+    def reference(variables, hidden, targets, weights):
+        return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation, truth=True)
+
+    with pytest.raises(AssertionError, match="past its rounding bound"):
+        assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=BOUND_ROWS), 2, "a rate off")
 
 
 @pytest.mark.parametrize("half", [0, 1], ids=["first-draws", "last-draws"])
