@@ -6,6 +6,7 @@ and tools/joint_checkpoint_reference.py wrote the fixtures from its code."""
 import base64
 import io
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -177,12 +178,14 @@ def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
     same fp32 backbone states, over every question of every case."""
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
+    # Dew's head compiled, as a served task's pass runs it.
+    head = jax.jit(loaded.model.apply)
     found, reference, truth, terms = [], [], [], []
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
         for case, (_, row) in laid_out(tokenizer).items():
             inputs = DecisionInputs.collate([row], 0)
             given = (loaded.variables, states[case][None], inputs, table)
-            scores = loaded.model.apply(*given)
+            scores = head(*given)
             _, summed = float64_forward(loaded.model, *given)
             for slot, laid in enumerate(row.questions):
                 key = f"{case}/{laid.name}"
@@ -443,19 +446,27 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
                 ("how much is pro", "sales", "false"), ("refund please", "billing", "false"))
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
-    # Training pads every row to the layout's max_len; the release serves up to 16384.
+    # Training pads every row to the layout's max_len, which holds every row whole; the release serves up
+    # to 16384. The runs score no split, which nothing here reads.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=1024))
-    data = decision_rows(examples, 8, examples, objective=objective.data())
+                                  layout=JointLayout(max_len=768))
+    data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
-    runs, states = [], []
-    for index, steps in enumerate((2, 1)):
-        run = tmp_path / f"run{index}"
-        checkpoints = Checkpoints(str(run), keep=1)
-        states.append(Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
-            data, steps=steps, log_every=100, checkpoint_every=steps))
-        checkpoints.wait()
-        runs.append(str(run))
+    # Two runs, of two steps and of one: the one-step run is the two-step run's directory as it stood
+    # after its first step, which the run then resumes from, its step compiled once for both.
+    runs = [tmp_path / "run0", tmp_path / "run1"]
+    checkpoints = Checkpoints(str(runs[0]), keep=1)
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
+    first = trainer.fit(data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    shutil.copytree(runs[0], runs[1])
+    states = [trainer.fit(data, steps=2, log_every=100, checkpoint_every=1), first]
+    checkpoints.wait()
+    runs = [str(run) for run in runs]
+    assert int(states[0].step) == 2 and int(states[1].step) == 1
+    stated = data.statistics()
+    assert not [name for name in stated if name.startswith(("data/rejected/", "data/cut"))]
+    assert all(value == 0 for name, value in stated.items() if name.startswith("data/truncated/"))
     before = jax.tree.leaves(start["params"]["head"])
     after = jax.tree.leaves(states[0].variables["params"]["head"])
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
