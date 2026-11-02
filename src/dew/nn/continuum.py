@@ -108,14 +108,16 @@ class Continuum(LinearProducts):
             raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                              "activation's second derivative, which a ReLU has none of (a point mass at "
                              "zero), so no rate bounds it there: select=('up',), or a smooth activation")
-        if "down" in parts and quantizer(self.up) is None and intercepted_nonlinear(self, "up"):
+        # `up`'s checkpoint quantizer is read exactly here (`read`); any other interceptor's rounding not.
+        if "down" in parts and intercepted_nonlinear(self, "up", input_scales=False):
             raise ValueError("a damped step of the level's `down` bounds the loss's curvature through the "
                              "map `up` applies to f = act(D x), and this call computes `up` other than as a "
                              "linear map of f (an adapter's dropout or a frozen FP8 product), which no "
                              "curvature bounds: select=('up',), or step it undamped")
         # Each map's operands as Qwix's rounding can grow them: its input's, then its kernel's.
-        down_input, _ = rounding_growth(self, "down", self.features)
-        up_input, up_kernel = rounding_growth(self, "up", self.level.hidden)
+        operands = self.dtype or x.dtype
+        down_input, _ = rounding_growth(self, "down", self.features, operands)
+        up_input, up_kernel = rounding_growth(self, "up", self.level.hidden, operands)
 
         def read(value: jax.Array, layer: nn.Module) -> jax.Array:
             rounding = quantizer(layer)
@@ -178,9 +180,10 @@ class HeadTerms:
         return jnp.square(jacobian) * self.curvature + self.slope * bent, jacobian * self.slope
 
 
-def _head_growth(model: LinearProducts, maps: dict[str | None, int]) -> dict[str | None, float]:
+def _head_growth(model: LinearProducts, maps: dict[str | None, int], dtype) -> dict[str | None, float]:
     """How much Qwix's rounding can grow each head map's kernel's norm (`rounding_growth`), `maps` each map's
-    contraction by its submodule's name (None for a tied table's product in the model's own scope). A map
+    contraction by its submodule's name (None for a tied table's product in the model's own scope), its
+    operands of the model's compute `dtype`. A map
     a method interceptor computes other than as a linear map of its input (`intercepted_nonlinear`: a
     checkpoint's quantizer of its input, a frozen FP8 product, an adapter's dropout) makes the head
     piecewise constant in its states, whose gradient no Lipschitz bound holds: refused."""
@@ -189,7 +192,7 @@ def _head_growth(model: LinearProducts, maps: dict[str | None, int]) -> dict[str
         raise ValueError(f"a damped step bounds the head's curvature in its states, and the head's "
                          f"{rounded} round their inputs, making it piecewise constant there, which no "
                          f"curvature bounds: step it undamped")
-    return {name: rounding_growth(model, name, contraction)[1] for name, contraction in maps.items()}
+    return {name: rounding_growth(model, name, contraction, dtype)[1] for name, contraction in maps.items()}
 
 
 def _squared_norm(value: jax.Array) -> jax.Array:

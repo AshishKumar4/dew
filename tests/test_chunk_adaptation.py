@@ -914,12 +914,22 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
 
 
-def _qwix(pattern: str, calibration: str = "absmax", **options) -> CausalTransformer:
+def _qwix(pattern: str, calibration: str = "absmax", bwd_qtype: str | None = None, **options
+          ) -> CausalTransformer:
     """The test decoder built with `options`, its products at modules `pattern` selects trained in int8
-    (Qwix's quantization) under the weight `calibration`."""
+    (Qwix's quantization) under the weight `calibration`, their backward quantized to `bwd_qtype`."""
     from dew.quantization import Quantization
 
-    return Quantization(patterns=(pattern,), calibration=calibration).apply(decoder(**options))
+    return Quantization(patterns=(pattern,), calibration=calibration, bwd_qtype=bwd_qtype).apply(
+        decoder(**options))
+
+
+def _frozen(site: str, frozen: str) -> CausalTransformer:
+    """The test decoder computing under a checkpoint's FP8 quantizer of `site`'s input and a frozen FP8
+    product at `frozen`."""
+    from dew.quantization import InputQuantization
+
+    return InputQuantization(format="modelopt", sites=((site, "fp8"),), frozen_fp8=(frozen,)).apply(decoder())
 
 
 ROUNDED = {
@@ -939,6 +949,8 @@ ROUNDED = {
     "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), False),
     "qwix-clipped": (lambda: _qwix("continuum/up", "absmax,0.8"), ("up",), False),
     "qwix-rms": (lambda: _qwix("continuum/up", "rms,3"), ("up",), True),
+    "qwix-backward": (lambda: _qwix("continuum/up", bwd_qtype="int8"), ("up",), True),
+    "frozen-up-down": (lambda: _frozen("continuum/up", "continuum/up"), ("down",), True),
 }
 """Models whose head or level rounds a product, the parts a damped step steps through them, and whether
 it is refused (`test_a_damped_step_bounds_what_rounds_where_it_steps`)."""
@@ -949,7 +961,10 @@ def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
     """A damped step's bounds read each map's operands as its rounding leaves them. A head map that
     rounds its input through a method interceptor (a checkpoint's quantizer of `lm_head`'s or of a
     transform's `head_dense`'s input) makes the head piecewise constant in its states: refused
-    (ValueError), as is a weight calibration of Qwix's whose clip no bound reads (`rms,3`). The rest
+    (ValueError), as is a weight calibration of Qwix's whose clip no bound reads (`rms,3`), a Qwix rule
+    that rounds the backward, whose gradient a step follows (`bwd_qtype`), and a step of `down` through an
+    `up` that multiplies in frozen FP8 beside its checkpoint quantizer, which the bound does not read.
+    The rest
     runs, finite: a trunk module's quantizer; a level map's checkpoint quantizer, its rounded input read
     exactly; and Qwix's quantization of every product, of the head's, the tied table's in the model's
     own scope (`^$`), the embedding's lookup alone, the level's either map, and under a clipped absmax,
@@ -966,6 +981,17 @@ def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
             objective.token_scores(variables, tokens)
     else:
         assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+
+
+def test_qwixs_unit_scale_bounds_a_float16_operands_growth_by_two():
+    """Qwix takes a scale below sqrt of float16's least normal number as 1, where a value of a half or
+    more rounds to as much as twice itself (`rounding_growth`): a float16 level's `up` kernel grows by 2
+    in its damped step's terms, a float32 level's by Qwix's int8 step alone."""
+    _, hidden, _, _ = draw(0, scale=0.5)
+    for dtype, grown in ((jnp.float16, 2.0), (jnp.float32, 1 + math.sqrt(4) / 255)):
+        model = _qwix("continuum/up", dtype=dtype)
+        terms = model.apply(drawn_variables(0, model), hidden.astype(dtype), ("up",), method="level_terms")
+        assert terms[3] == grown, dtype
 
 
 def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
