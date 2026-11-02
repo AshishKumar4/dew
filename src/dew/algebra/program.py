@@ -452,9 +452,9 @@ def _products(region: terms.Region) -> list:
         literal = terms.Term.literal(i64(index))
         if _power_of_two(value):
             facts.append(rules.exact_scale(literal))
-        if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value > 0:
+        if np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value > 0:
             facts.append(rules.positive_scale(literal))
-        if np.ndim(value) == 0 and np.issubdtype(np.asarray(value).dtype, np.inexact) and value == 1:
+        if np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value == 1:
             facts.append(rules.unit(literal))
     return facts
 
@@ -570,8 +570,9 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
 
 
 def _power_of_two(value) -> bool:
-    """Whether a literal is a scalar power of two, a multiply by which rounds nothing."""
-    if np.ndim(value) != 0 or not np.issubdtype(np.asarray(value).dtype, np.floating):
+    """Whether a literal is a scalar power of two, a multiply by which rounds nothing: a float's of any dtype,
+    ml_dtypes' (bfloat16, float8) among them, which numpy's own type tree does not place among its floats."""
+    if np.ndim(value) != 0 or not jnp.issubdtype(np.asarray(value).dtype, jnp.floating):
         return False
     mantissa, _ = np.frexp(float(value))
     return mantissa in (0.5, -0.5)
