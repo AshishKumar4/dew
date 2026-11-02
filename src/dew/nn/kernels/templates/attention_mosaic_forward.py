@@ -145,7 +145,8 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False):
+                   scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
+                   out_dtype=None):
     """`MosaicForward`'s launch without residuals, at `tiles`, under the default's guards over whole launches
     (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a block of the family's swizzled value
     columns at a time: its walk carries its shifted and unshifted sums and forms both tiles' products a step
@@ -178,11 +179,12 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                 spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
                                 counted=form.natural == spec.natural and not again, kept=again,
-                                finishes=rows, columns=first, out_dtype=jnp.float32 if split else None)
+                                finishes=rows, columns=first,
+                                out_dtype=jnp.float32 if split else out_dtype)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
-                                q.dtype, split)
+                                out_dtype or q.dtype, split)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
@@ -200,8 +202,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             blocks.append(_launch(q, k, columns, guarded_spans, held._replace(output=()), guard, spec=form,
                                   hooks=_unhooked(hooks), tiles=guarded, family=family, training=False,
                                   interpret=interpret, columns=first,
-                                  out_dtype=jnp.float32 if hooked_blocks else None)[1])
-        out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, q.dtype, hooked_blocks)
+                                  out_dtype=jnp.float32 if hooked_blocks else out_dtype)[1])
+        out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, out_dtype or q.dtype,
+                            hooked_blocks)
         # Its output alone: `walked_launches` reads the plain launch's maxima and overflows, and `kept` its
         # finished rows.
         return (out,), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)

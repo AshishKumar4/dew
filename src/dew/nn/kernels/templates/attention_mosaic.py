@@ -226,6 +226,9 @@ class MosaicForward(_Mainloop[Tiles]):
     output_kinds: tuple[Kind, ...] = ()
     output_dtypes: tuple[str, ...] = ()
     output_width: int = TRACED_TILE
+    out_dtype: str | None = None
+    """The inference walk's output dtype, the query's where None: fp32 for a split launch's slices, which a
+    merge takes (`attention_decode`)."""
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, *, residuals: Kept, interpret: bool, config: Tiles,
@@ -243,7 +246,7 @@ class MosaicForward(_Mainloop[Tiles]):
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                                      **form), None
+                                      out_dtype=self.out_dtype, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -352,9 +355,10 @@ class MosaicForward(_Mainloop[Tiles]):
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
         value_width = config.columns or value_width
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
+        out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
-                                           min(config.stages, steps))
+                                           min(config.stages, steps), out_dtype=out_dtype)
         return resources.shared_bytes(family, _scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod)))
 
@@ -490,7 +494,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
-            interpret: bool = False):
+            interpret: bool = False, out_dtype=None):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -500,8 +504,10 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     inference walk, which keeps its output for the backward's D in place of an anchor (`output_split`,
     `takes_output_residuals`). `natural` keeps the logits natural
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
-    family `generation.assumed` names."""
-    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    family `generation.assumed` names; `out_dtype` the inference walk's output's (`MosaicForward.out_dtype`).
+    """
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
+                             out_dtype=out_dtype)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -515,7 +521,7 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
-                  scale: float | None, natural: bool) -> tuple[MosaicForward, tuple]:
+                  scale: float | None, natural: bool, out_dtype=None) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -525,7 +531,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
-                       scale=logit_scale(query.shape[3], scale), natural=natural)
+                       scale=logit_scale(query.shape[3], scale), natural=natural,
+                       out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop)
@@ -555,6 +562,48 @@ key (`attention_mosaic_scores._scores`): row vectors a fused launch's queries fi
 (`_backward_registers`); column vectors keys first, one at a time."""
 
 
+def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
+                  products: list, held: list, vectors: int, *, accurate: bool, slopes: int) -> int:
+    """`_backward_registers`' dQ consumer's: its dQ sums (and the accurate form's keyed sums) carried, its
+    per-query rows, a step's two products, then its score cotangents, one part of them at a time, its
+    hook's parameters beside its pullback (`held`) and its products' fragments where they read registers."""
+    block_q, block_k = config.block_q, config.block_k
+    logits = (block_q, block_k, jnp.float32)
+    # dQ's anchor select priced as its SASS holds it (`_anchor_registers`), within the family's held
+    # scalars where they are a measured whole (`Family.scalars_whole`); its hook's parameters and
+    # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
+    # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
+    anchor = _anchor_registers(family, block_q, block_k) if not family.scalars_whole else 0
+    products = products[:2]
+    pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
+    carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
+    cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
+    # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
+    # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
+    # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
+    rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
+    # Its products' fragments where they read registers (`_products`): the logits', the output
+    # cotangents' beside them, and dQ's of the score cotangents in registers.
+    fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
+                          (block_q, value_width, block_k, [logits] * 2, False, True),
+                          (block_q, block_k, width // config.columns, cotangents[1:], True, False),
+                          narrow=config.narrow)
+    if accurate and family.operands_in_registers:
+        # The accurate form's parts (`algebra.formed_parts`) issued against one right operand, the keys,
+        # whose fragments its family loads once and holds across them, two of its depth's loads ahead,
+        # beside the cotangents, the keyed sums' weights fp32 and the part (an A100's dQ at 64 x 64:
+        # one LDSM's registers read by four HMMAs over three parts, 218 to 221 live at its peak).
+        right = (2 * family.fragment_depth(block_k), width // config.columns * family.rhs_copies, dtype)
+        fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right])
+    if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+        # fp16's parts scaled (`product.Scaled`): each part's product its own accumulator, restored and
+        # added into dQ's (`operands.Issuer.summed`), beside the cotangents and both parts, formed first.
+        fragments.append([cotangents[0], cotangents[1], cotangents[1],
+                          (block_q, width // config.columns, jnp.float32)])
+    phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
+    return phases + anchor + rows + vectors
+
+
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool, split: bool = False, params: tuple = (),
                         slopes: int = 0) -> int:
@@ -582,39 +631,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [logits] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [logits] * slopes
     if dq:
-        # dQ's anchor select priced as its SASS holds it (`_anchor_registers`), within the family's held
-        # scalars where they are a measured whole (`Family.scalars_whole`); its hook's parameters and
-        # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
-        # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
-        anchor = _anchor_registers(family, block_q, block_k) if not family.scalars_whole else 0
-        products = products[:2]
-        pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
-        carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
-        cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
-        # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
-        # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
-        # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
-        rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
-        # Its products' fragments where they read registers (`_products`): the logits', the output
-        # cotangents' beside them, and dQ's of the score cotangents in registers.
-        fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
-                              (block_q, value_width, block_k, [logits] * 2, False, True),
-                              (block_q, block_k, width // config.columns, cotangents[1:], True, False),
-                              narrow=config.narrow)
-        if accurate and family.operands_in_registers:
-            # The accurate form's parts (`algebra.formed_parts`) issued against one right operand, the keys,
-            # whose fragments its family loads once and holds across them, two of its depth's loads ahead,
-            # beside the cotangents, the keyed sums' weights fp32 and the part (an A100's dQ at 64 x 64:
-            # one LDSM's registers read by four HMMAs over three parts, 218 to 221 live at its peak).
-            right = (2 * family.fragment_depth(block_k), width // config.columns * family.rhs_copies, dtype)
-            fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right])
-        if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
-            # fp16's parts scaled (`product.Scaled`): each part's product its own accumulator, restored and
-            # added into dQ's (`operands.Issuer.summed`), beside the cotangents and both parts, formed first.
-            fragments.append([cotangents[0], cotangents[1], cotangents[1],
-                              (block_q, width // config.columns, jnp.float32)])
-        phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
-        return phases + anchor + rows + vectors
+        return _dq_registers(family, config, width, value_width, dtype, products, held, vectors,
+                             accurate=accurate, slopes=slopes)
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
