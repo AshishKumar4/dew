@@ -75,6 +75,24 @@ def test_the_accurate_policy_takes_the_log_sum_exp_fold_whose_error_its_written_
     assert default.chosen.seconds == min(candidate.seconds for candidate in admitted)
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_the_candidates_are_proposed_cheapest_first_and_the_first_admitted_chosen(accurate):
+    """The softmax through its log-sum-exp: its candidates, each root's forms enumerated beside the
+    cheapest and the most stable extractions, come in order of price, and the chosen is the first the gate
+    admits in that order (docs/design/algebra.md §6.5), where three fixed proposals came as written first."""
+    admits = gate(softmax_with_lse, logits)
+    choice = choose(softmax_with_lse, OPERANDS * 3, accurate=accurate, saturation=algebra.SATURATION,
+                    admits=admits)
+    prices = [candidate.seconds for candidate in choice.candidates]
+    assert prices == sorted(prices)
+    references = choice.candidates if accurate else [
+        next(candidate for candidate in choice.candidates if candidate.name == "as written")]
+    first = next(candidate for candidate in choice.candidates
+                 if all(candidate is reference or admits(candidate.function, reference.function)
+                        for reference in references))
+    assert choice.chosen is first
+
+
 @pytest.mark.parametrize("target", [None, "v5e"], ids=["here", "a TPU"])
 @pytest.mark.parametrize(("function", "stable"), [
     (lambda x: jnp.log(1.0 + x), "log1p"), (lambda x: jnp.exp(x) - 1.0, "expm1")])
