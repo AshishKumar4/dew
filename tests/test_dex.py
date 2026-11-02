@@ -148,6 +148,8 @@ def loads(trains: str = "all", dtype: str = "float32"):
 def moved_draw(variables, value_dim: int):
     """A draw of the extended decoder's variables with lambda and the projections moved off their start,
     beside a row of tokens and a cotangent on its logits."""
+    variables = nn.unbox(variables)
+
     def draw(seed):
         rng = np.random.default_rng([0xDEC, seed])
         flat = flatten_dict(variables["params"])
