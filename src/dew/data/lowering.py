@@ -1834,13 +1834,13 @@ class _Build:
         each member's here (`counted_members`)."""
         if self.global_order:
             return rows
-        if members := self.counted_members(pipeline):
-            # Its members' counts, whatever the mixture counts of its own (a step of Grain's after the mix).
-            return Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline), rows=False,
-                            members=members, credits=True)
         if counting:
-            return Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
                             rows=examples or _counts_rows(pipeline, len(pipeline.stages)), examples=examples)
+        if members := self.counted_members(pipeline):
+            # Its members' counts, beside what the mixture counts of its own (behind a step of Grain's).
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline), rows=False,
+                            members=members, credits=True)
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:

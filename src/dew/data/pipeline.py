@@ -122,11 +122,13 @@ class Documents:
     def restore(self, saved: JSON) -> None:
         """Hold the documents a saved position held (`saved`) again."""
         for document, entry in record(saved, "held documents").items():
+            if not document.isdecimal():
+                raise ValueError(f"a held document's id is a whole number, got {document!r}")
             match entry:
                 case [member, {**members}] if member is None or isinstance(member, str):
                     examples = {str(key): integer(count, "a held document's examples")
                                 for key, count in members.items()}
-                    self.held[integer(document, "a held document")] = (member, examples)
+                    self.held[int(document)] = (member, examples)
                 case _:
                     raise ValueError(f"a held document is its member and examples by member, got {entry!r}")
 

@@ -422,6 +422,39 @@ def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutti
         assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
 
 
+@pytest.mark.parametrize("layout", ["strided", "concat"])
+def test_a_bounded_mixtures_member_counts_resume_while_a_layout_holds_a_document(layout):
+    """The mixed read of the test above, its windows 2 tokens apart or packed, its position saved after two
+    batches while its layout holds pieces of a document: restored, it delivers the batches and counts each
+    member as the uninterrupted read does (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = _SPLIT[layout]
+
+    def loader():
+        corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+                   .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+        return compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+
+    def rest(stream):
+        held = [np.asarray(batch["id"]).tolist() for batch in stream]
+        stream.close()
+        return held
+
+    whole = loader()
+    stream = whole.train(DataPartition())
+    for _ in range(2):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    resumed = loader()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert {name: value for name, value in resumed.statistics().items() if name.startswith("data/rows/")} == {
+        name: value for name, value in whole.statistics().items() if name.startswith("data/rows/")}
+
+
 @pytest.mark.parametrize("layout", ["concat", "held"])
 def test_a_shuffle_of_windows_cutting_documents_resumes_its_counts_where_it_saved_them(layout):
     """A bounded read of a concatenating pack shuffled after, read as a stream or held by a memory read, its

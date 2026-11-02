@@ -879,17 +879,19 @@ def test_a_bounded_mixtures_member_counts_resume_as_the_uninterrupted_read_count
     assert _member_counts([*batches, *after], expected) == _member_counts([*batches, *again], statistics)
 
 
-def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock():
-    """The streamed read of the resume test above, its position saved after three batches by main
-    87e6e0965, before a mixture's members were counted where their rows are delivered
-    (tests/fixtures/bounded_mixture_position.json): restored, it delivers the batches that read did after
-    them, each consuming the source examples it did there, and counts each member afresh from the resume,
-    its examples counted where they are delivered (row 3312)."""
-    fixture = Path(__file__).with_name("fixtures") / "bounded_mixture_position.json"
-    recorded = json.loads(fixture.read_text())
+@pytest.mark.parametrize("native", [False, True])
+def test_a_bounded_mixtures_position_saved_before_its_members_counts_resumes_on_its_clock(native):
+    """The streamed read of the resume test above, behind a Grain step of the mixture's own that keeps
+    every row or not, its position saved after three batches by main 87e6e0965, before a mixture's members
+    were counted where their rows are delivered (tests/fixtures/bounded_mixture_position.json,
+    bounded_native_mixture_position.json): restored, it delivers the batches that read did after them, each
+    consuming the source examples it did there, and counts each member afresh from the resume, its examples
+    counted where they are delivered (row 3312)."""
+    name = "bounded_native_mixture_position.json" if native else "bounded_mixture_position.json"
+    recorded = json.loads((Path(__file__).with_name("fixtures") / name).read_text())
     objective = ObjectiveData(train=(Questioned(), ThirdQuestionRefused()))
-    data = compile(_members_asked("streamed"), objective=objective, read="streamed", loading=READ,
-                   examples=18)
+    data = compile(_members_asked("streamed", native=native), objective=objective, read="streamed",
+                   loading=READ, examples=18)
     stream = data.train(DataPartition())
     stream.set_state(recorded["state"].encode())
     after = list(stream)
