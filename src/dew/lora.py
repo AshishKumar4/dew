@@ -86,7 +86,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS, LogicalAxes, boxed_axes, declared, factor_axes, unboxed
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, unboxed
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -210,23 +210,24 @@ class LoRA:
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
+        # A draw boxes the parameters its modules declare the axes of; the adapter reads their values.
+        variables = unboxed(variables)
         if fp8_base is not None:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
         if self.source is not None:
             return self._imported(self.source, model, variables, layouts, scaling, base)
-        # The source keeps the axes its modules boxed; the adapter reads its values.
-        source, variables = variables, unboxed(thaw(variables))
+        source, variables = variables, thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         targets: dict[Path, Target] = {}
         leaves: dict = {}
-        keys, boxes = jax.random.split(request_key(key), len(bound)), boxed_axes(source)
+        keys = jax.random.split(request_key(key), len(bound))
         for name, factor_key in zip(sorted(bound), keys, strict=True):
             factors = _factors(name, bound[name], variables, self.rank)
             shape_a, shape_b = factors.shapes(self.rank)
             targets[factors.module] = Target(self.rank, scaling)
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, FACTOR_DTYPE),
-                            INIT_B(factor_key, shape_b, FACTOR_DTYPE), boxes)
+                            INIT_B(factor_key, shape_b, FACTOR_DTYPE))
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
         return Adapter.bound(model, overlay(source, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
@@ -1005,15 +1006,10 @@ class _Factors:
         return (*self.kernel_shape[:self.contracted], rank), (rank, *self.kernel_shape[self.contracted:])
 
 
-def _insert_factors(leaves: dict, module: Path, a, b, boxes: Mapping[Path, LogicalAxes]) -> None:
-    """Write one target's two factor leaves into `leaves`, under `FACTORS`, stored as `FACTOR_DTYPE`, each
-    declaring the axes its kernel declares on its side of the rank (`factor_axes`), where `boxes`, the
-    source's boxed axes (`boxed_axes`), hold the kernel's."""
-    kernel = boxes.get((*module, "kernel"))
+def _insert_factors(leaves: dict, module: Path, a, b) -> None:
+    """Write one target's two factor leaves into `leaves`, under `FACTORS`, stored as `FACTOR_DTYPE`."""
     for name, value in zip(FACTORS, (a, b), strict=True):
-        stored = jnp.asarray(value, FACTOR_DTYPE)
-        _insert(leaves, (*module, name), stored if kernel is None
-                else nn.LogicallyPartitioned(stored, factor_axes(kernel, name, stored.ndim)))
+        _insert(leaves, (*module, name), jnp.asarray(value, FACTOR_DTYPE))
 
 
 def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -> _Factors:
@@ -1269,8 +1265,8 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
            entries: Sequence[_Entry], base: AdapterBase | None = None) -> Adapter:
     """Build the adapter the entries describe, its factors restored into the model's tree, which
     keeps training what it trained where it came split (`freeze`)."""
-    source, variables = variables, unboxed(thaw(variables))
-    components, boxes = _components(layouts), boxed_axes(source)
+    source, variables = variables, thaw(variables)
+    components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
         raise ValueError(
@@ -1309,7 +1305,7 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         targets[factors.module] = Target(rank, entry.config.alpha_of(relative))
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
-                        factors.b.restore(entry.b, shape_b), boxes)
+                        factors.b.restore(entry.b, shape_b))
     return Adapter.bound(model, overlay(source, leaves), targets, rslora, dropout, bound, bases)
 
 

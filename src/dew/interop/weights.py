@@ -11,9 +11,8 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew.batch import Variables
 from dew.interop.unread import Stored, equal, held, valued
-from dew.nn.sharding import boxed_like, unboxed
+from dew.nn.sharding import unboxed
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -52,18 +51,16 @@ def check_shapes[PathT](loaded: Iterable[tuple[PathT, tuple[int, ...]]],
             f"unexpected {unexpected}, mismatched {sorted(mismatched)}")
 
 
-def check_tree(variables: Variables, module: nn.Module, *inputs) -> dict[str, Variables]:
+def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
     """Check every collection against the module's abstract initialization, without another
-    copy of its parameters, and return `variables` with each parameter in the box of axes its module
-    declares (`boxed_like`), as a draw returns it. Inputs may be arrays or jax.ShapeDtypeStruct values."""
+    copy of its parameters. Inputs may be arrays or jax.ShapeDtypeStruct values."""
     def shapes(tree) -> dict[str, tuple[int, ...]]:
         return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
     # A module's draw boxes the parameters it declares the axes of; their shapes are their values'.
-    drawn = jax.eval_shape(module.init, jax.random.key(0), *inputs)
-    check_shapes(shapes(unboxed(dict(variables))).items(), shapes(unboxed(drawn)))
-    return {name: boxed_like(drawn.get(name, {}), tree) for name, tree in variables.items()}
+    expected = shapes(unboxed(jax.eval_shape(module.init, jax.random.key(0), *inputs)))
+    check_shapes(shapes(unboxed(dict(variables))).items(), expected)
 
 
 AUTO = "auto"

@@ -22,7 +22,6 @@ from flax.traverse_util import flatten_dict
 
 from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
-from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
@@ -2129,8 +2128,7 @@ def every_layer_windowed(fields: CausalTransformer) -> bool:
                for layer in fields.layer_types or ('full_attention',))
 
 
-def check_decoder_tree(variables: Variables, model) -> dict[str, Variables]:
+def check_decoder_tree(variables: Mapping[str, object], model) -> None:
     """`check_tree` against a decoder or its media wrapper, whose `init` reads one row of token ids
-    (a wrapper's conditioners then build the smallest media their towers take): `variables` with the axes
-    the model's modules declare boxed on them."""
-    return check_tree(variables, model, np.zeros((1, 2), np.int32))
+    (a wrapper's conditioners then build the smallest media their towers take)."""
+    check_tree(variables, model, np.zeros((1, 2), np.int32))

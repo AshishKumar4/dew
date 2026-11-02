@@ -311,9 +311,9 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     if not isinstance(context, TextContext):
         raise TypeError(f"{clip} encodes to {type(context).__name__}, not a TextContext")
     factor = vae.downscale_factor
-    empty = TextContext(jnp.zeros(context.hidden.shape), jnp.ones(context.mask.shape, jnp.int32))
-    variables = check_tree(variables, model, jnp.zeros((1, height // factor, width // factor,
-                                                        vae.latent_channels)), jnp.zeros((1,)), empty)
+    check_tree(variables, model,
+               jnp.zeros((1, height // factor, width // factor, vae.latent_channels)), jnp.zeros((1,)),
+               TextContext(jnp.zeros(context.hidden.shape), jnp.ones(context.mask.shape, jnp.int32)))
 
     inputs = InputSpec(sample=Field("image", (height, width, channels)), conditions={keyword: condition})
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
