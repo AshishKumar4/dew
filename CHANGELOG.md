@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Tutorial 13 trains a first-person racing drone from its camera alone with SkyDreamer's recipe (DreamerV3
+  with an informed world model), by collective thrust and body rates, and flies it against the untrained
+  policy from the same starts. A SkyDreamer race takes a level of randomization per track (`SkyRace.ramp`, one
+  level or a tuple in `Sky.tracks`' order), and a curriculum draws each of the scene's looks for its ramp's
+  share of episodes (`dew.rl.flight.drawn_camera`). An environment run resumed under its name may change its
+  rollout, and any run the settings its objective declares (`Objective.resumable`; DreamerV3's `entropy`), so
+  a later phase of training resumes at longer windows and a lower entropy; a Dreamer rollout's checkpoint
+  holds where it owes its updates from and its pace, and a step saved before it held them restores the rest.
+  DreamerV3's two-hot, latent and continue losses are `dew.nn.categorical`'s and optax's.
 - Dreamer 4's world model trains as a run over video, the run kind `world_model`
   (`dew.config.world_model.WorldModelRunConfig`): a tokenizer stage, then a dynamics stage over a saved
   tokenizer run, which no record could hold (`TokenizerConfig`, `--tokenizer.run DIR --tokenizer.step N`:
