@@ -1052,7 +1052,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
     yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
     plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
-    to share its fixture). A mark written
+    to share its fixture); its setup's group keeps the place of its first recorded test, where the plan has
+    it, though the new test comes first. A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1072,6 +1073,24 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_shared.py#1/2": [*together, nodes[3]], "3.12:tests/test_shared.py#2/2": alone}
     assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
+    # Recorded b, a, c, each its own group; a new test sorted before b shares a's setup: it rides with a,
+    # whose group keeps a's place, so each task runs the recorded tests the plan gave it.
+    (tmp_path / "tests/test_order.py").write_text(
+        "import pytest\n" + "".join(("@pytest.mark.shared_setup('a')\n" if name in ("0new", "2a") else "")
+                                      + f"def test_{name}():\n    pass\n"
+                                      for name in ("0new", "1b", "2a", "3c")))
+    order = {name: f"tests/test_order.py::test_{name}" for name in ("0new", "1b", "2a", "3c")}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**dict.fromkeys(nodes[:3], 200.0), **{order[name]: 290.0 for name in ("1b", "2a", "3c")}}))
+    commit(tmp_path, "a file whose new test shares a later test's setup")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert all(row["exitCode"] == 0 for row in rows)
+    assert {row["name"]: sorted(row["tests"]) for row in rows if "test_order" in row["name"]} == {
+        "3.12:tests/test_order.py#1/3": [order["1b"]],
+        "3.12:tests/test_order.py#2/3": [order["0new"], order["2a"]],
+        "3.12:tests/test_order.py#3/3": [order["3c"]]}
+    assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
+        [order["1b"]], [order["2a"]], [order["3c"]]]
     for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
                       "@pytest.mark.shared_setup(NAME)\n"):
         (tmp_path / "tests/test_refused.py").write_text(
