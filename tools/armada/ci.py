@@ -264,9 +264,6 @@ def registered(name: str) -> bytes:
         return b"missing"
     lines = tomllib.loads(Path("pyproject.toml").read_text()).get("tool", {}).get("pytest", {}).get(
         "ini_options", {}).get("markers", [])
-    # The setting as pytest reads it: a list of lines, or one string of them, its blank lines none (review).
-    if isinstance(lines, str):
-        lines = [line.strip() for line in lines.splitlines() if line.strip()]
     found = [line for line in lines if name == "*" or line.split(":")[0].split("(")[0].strip() == name]
     return hashlib.sha256("\n".join(found).encode()).digest() if found else b"missing"
 
@@ -1528,14 +1525,12 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         if found:
             rows += found
             continue
-        # A row past the deadline is not run: red as its deadline cut it off (`tested`, `file_row`). Each row
-        # is published to `out` beside the rows before it as it is written, before its record goes to the
-        # cache, which can be slow (`tested`'s `ahead`; review: a slow cache withheld the finished rows).
+        # A row past the deadline is not run: red as its deadline cut it off (`tested`, `file_row`).
         piece = out.with_name(f"{out.name}.{index}")
         left = deadline - (time.monotonic() - began)
         code = max(code, tested(python, [name], part, piece, left, cache, grace, common, started, coverage,
                                 whole=whole, release=release, kept={name: at} if at else {},
-                                container=container, found=[], ahead=(out, rows)))
+                                container=container, found=[]))
         rows += json.loads(piece.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
@@ -1622,7 +1617,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
            kept: Mapping[str, tuple[str, str]] | None = None, container: Container | None = None,
-           found: list[dict] | None = None, ahead: tuple[Path, list[dict]] | None = None) -> int:
+           found: list[dict] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
@@ -1634,8 +1629,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     every run (Main, 2026-11-01). A run not kept so is still recorded, keyed by nothing, for what the GPU
     tier and lane read of it (its reads of the backend, its peak). A reused row runs nothing, so every row the
     cache holds is reused first: `found`, where the caller looked them up before any of its calls ran a file
-    (`task`). With `ahead`, a caller's verdict and the rows it holds before these: each row is published there
-    too as it is written, before its record goes to the cache (`task`)."""
+    (`task`)."""
     began = time.monotonic()
     container = Container() if container is None else container
     group = split or (f"{RELEASE}{release}" if release else "")
@@ -1664,8 +1658,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         rows.append(file_row(python, name, group, site, alone_, deadline))
         # The verdict first, so no cache write that waits on the Worker keeps it from armada.
         out.write_text(json.dumps({"rows": rows}))
-        if ahead is not None:
-            ahead[0].write_text(json.dumps({"rows": [*ahead[1], *rows]}))
         if alone_ is None:
             continue
         if coverage is None and not release:
