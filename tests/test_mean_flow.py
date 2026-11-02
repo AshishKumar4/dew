@@ -10,6 +10,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from lane_environment import without_deterministic_ops
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
@@ -172,13 +173,12 @@ def meanflow_trains_through_a_fused_attention_kernel():
     (`agrees_with_xla`), and so does one through cuDNN's, which XLA cannot run under that flag
     (openxla/xla#46500), in a process of its own whose XLA starts without it."""
     agrees_with_xla("triton")
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith("--xla_gpu_deterministic_ops")]
+    flags = without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
     script = "import test_mean_flow; test_mean_flow.agrees_with_xla('cudnn')"
     # This checkout's Dew, ahead of any the environment installs.
     source = str(Path(__file__).resolve().parents[1] / "src")
     path = os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH"))))
     done = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parent,
                           capture_output=True, text=True, timeout=900,
-                          env={**os.environ, "XLA_FLAGS": " ".join(flags), "PYTHONPATH": path})
+                          env={**os.environ, "XLA_FLAGS": flags, "PYTHONPATH": path})
     assert done.returncode == 0, done.stderr[-4000:]

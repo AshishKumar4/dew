@@ -11,12 +11,13 @@ import itertools
 import json
 import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from lane_environment import without_flag
+from lane_environment import without_flags
 from model_support import TINY_DECODER
 from token_support import token_rows
 
@@ -74,21 +75,62 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
+NEEDING_MICROBATCHES = 700_000
+"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches."""
+
+
+@pytest.fixture(scope="module")
+def admitted(tmp_path_factory):
+    """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
+    compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
+    trainer and its `AheadOfTime`, admitted once for the module."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    records = tmp_path_factory.mktemp("rungs")
+    with pytest.MonkeyPatch.context() as patch:
+        # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        patch.setenv("DEW_RUNG_RECORDS", str(records))
+        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
+    return records, trainer, ahead
+
+
+@pytest.mark.shared_setup("admitted")
+def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
+    """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
+    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
+    _, trainer, ahead = admitted
+    plan = record(ahead.plan, "plan")
+    probes = listed(plan["probes"], "probes", read=record, what="probes")
+    assert plan["split"] > 1 and len(probes) > 1 and probes[-1]["fits"] is True
+    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+
+
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_fewer_microbatches(
-        tmp_path, monkeypatch):
+        admitted, monkeypatch):
     """With its frontier asked, a step compiled ahead on GPUs whose memory its plan needs several
     microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
-    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan."""
+    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. Its
+    search starts at the plan admitted before it (`admitted`), kept beside the compilation cache, as a run
+    after another starts at its recorded plan: that plan's compile alone, the frontier read above it."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    records, _, earlier = admitted
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=700_000, frontier=True)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES,
+                          frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
+    admitted_plan = record(earlier.plan, "admitted plan")
+    assert {name: plan[name] for name in rung} == {name: admitted_plan[name] for name in rung}
+    assert len(probes) == 1
     splits = [plan["split"], *(entry["split"] for entry in frontier)]
     assert len(frontier) >= 2 and all(entry["fits"] is True for entry in frontier)
     assert all(isinstance(more, int) and isinstance(fewer, int) and fewer < more
@@ -104,10 +146,13 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
     its autotuner would still compile every candidate it cannot time. A run's own XLA_FLAGS setting, and a
     mesh of devices that run, keep the options as given."""
+    from dew.nn.kernels.options import compiler_options
     from dew.training.ahead import compile_only_gpus
     from dew.training.memory import deviceless_options
+    from dew.training.planning import FitSearch
 
-    monkeypatch.setenv("XLA_FLAGS", without_flag(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level"))
+    monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
+                                                  "--xla_gpu_autotune_level"))
     deviceless = MeshSpec().build(compile_only_gpus("sm90", 1))
     assert deviceless_options(deviceless, None) == {"xla_gpu_autotune_level": 0}
     assert deviceless_options(deviceless, {"xla_gpu_enable_triton_gemm": False}) == {
@@ -115,6 +160,15 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     running = MeshSpec().build(jax.devices()[:1])
     assert deviceless_options(running, {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
+    # The fit search alone applies the policy, to the step's options and its towers' alike (row 3506): a
+    # step whose options are its towers' own compiles as the half rung of XLA's defaults does, one program.
+    objective = fine_tune(deviceless, split=None).objective
+    search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
+                       objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
+                       resumed=None, capacity=2**30)
+    assert search.compiled_options(None) == search.required == deviceless_options(
+        deviceless, compiler_options(*objective.towers()) or None)
+    assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
     assert deviceless_options(deviceless, None) is None
 
