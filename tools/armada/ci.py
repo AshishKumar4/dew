@@ -1441,13 +1441,21 @@ def pytest_command(run: list[str], tests: list[str], split: str, release: str) -
 
 def site_environment(site: re.Match | None) -> dict[str, str]:
     """What a check-1 site's own task runs its test under (`site`, its group's match of `SITE`): a map task
-    draws its seeds into its artifacts, and its judge pools every map task's from its inputs; nothing for any
-    other group."""
+    draws its seeds into its artifacts, and its judge pools every map task's from its inputs, its ask for its
+    later map tasks (LATER) none before it runs; nothing for any other group."""
     if site is None:
         return {}
     if site["start"] is None:
+        # A judge's ask for its later map tasks (`ask_later`) is its own run's alone.
+        later_file().unlink(missing_ok=True)
         return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file())}
     return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+
+
+def asked(site: re.Match | None) -> dict[str, bool]:
+    """A row's ask for more, where its task is a check-1 site's judge that asked for its later map tasks
+    (`ask_later`): armada runs them and it judges again (its `more`); nothing else."""
+    return {"more": True} if site and site["start"] is None and later_file().is_file() else {}
 
 
 def later_file() -> Path:
@@ -1522,9 +1530,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    # A judge's ask for its later map tasks is its own run's alone.
-    if site and site["start"] is None:
-        later_file().unlink(missing_ok=True)
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
     if network:
@@ -1602,10 +1607,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause,
-                     # A judge that asked for its later map tasks (`ask_later`): armada runs them and it
-                     # judges again.
-                     **({"more": True} if site and site["start"] is None and later_file().is_file() else {})})
+                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs

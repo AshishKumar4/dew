@@ -386,6 +386,18 @@ def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: 
             assert entry_task(ci, monkeypatch, entry, out, inputs=inputs) == 0
 
 
+def replanned_once_its_draws_change(ci, tmp_path: Path) -> list[dict]:
+    """The site's file kept whole by the plan after its cached run, its site among it, none of its tasks
+    run; then, a module only its draws ran (src/draws.py) changed, its site planned again and the file's
+    own row kept: the entries the plan then runs."""
+    kept, ran = planned_now(ci)
+    assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
+    (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
+    kept, ran = planned_now(ci)
+    assert kept == {("tests/test_site.py", "")}
+    return ran
+
+
 def planned_now(ci) -> tuple[set[tuple[str, str]], list[dict]]:
     """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
     entries = list(planned(ci).values())
@@ -403,11 +415,7 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     row, which never ran it, stays kept."""
     run_cached(ci, tmp_path, monkeypatch, cache_worker, site, later=True)
     assert runs(tmp_path) == [1, 3, 1]
-    kept, ran = planned_now(ci)
-    assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
-    (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
-    kept, ran = planned_now(ci)
-    assert kept == {("tests/test_site.py", "")}
+    ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
@@ -423,11 +431,7 @@ def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_nev
     run_cached(ci, tmp_path, monkeypatch, cache_worker,
                SITE.replace("held[-1][1] == 20", "held[-1][1] == 4"), later=False)
     assert runs(tmp_path) == [1, 1, 1]
-    kept, ran = planned_now(ci)
-    assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
-    (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
-    kept, ran = planned_now(ci)
-    assert kept == {("tests/test_site.py", "")}
+    ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     assert len(again["after"]) == 3 and len(ran) == 4
 
