@@ -138,7 +138,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import compiler_options, program as outer_program
-from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
@@ -656,10 +656,14 @@ class Server:
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
             entries = rows.states * self.groups
-            states = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jax.device_put(jnp.zeros((entries, *leaf.shape[1:]), leaf.dtype),
-                                                  leaf.sharding) if row_state(path) else None,
-                self.cache)
+
+            def store(path, leaf):
+                # Each entry where a slot's row is: a run's bank holds its layers first (`row_axis`).
+                axis = row_axis(path)
+                return jax.device_put(jnp.zeros((*leaf.shape[:axis], entries, *leaf.shape[axis + 1:]),
+                                                leaf.dtype), leaf.sharding) if row_state(path) else None
+
+            states = jax.tree_util.tree_map_with_path(store, self.cache)
             self._states = states
             self._restored, self._captured = state_programs(formats, states)
 
