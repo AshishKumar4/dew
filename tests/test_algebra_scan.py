@@ -355,6 +355,29 @@ def test_a_chunks_decay_gradient_reads_no_pair_of_its_future():
         assert np.isfinite(value) and np.all(np.isfinite(gradient)), fn.__name__
 
 
+@pytest.mark.parametrize("tokens", [2, 256])
+def test_a_chunk_of_any_finite_nonpositive_decays_stays_finite(tokens):
+    """The gated delta rule's chunk whose log decays are each -2^127 (a decay of zero), its keys, values and
+    write gates unit, over two tokens, and over 256 of zero operands under declared unit keys and gates
+    (whose solve's inverse bound, 17^255, passes float64's range): the token scan is finite, and so is the
+    derived chunk, its decays' prefix held finite (`scan.FLOOR`) and its derivation unbounded where its bound
+    passes the range."""
+    ranges = {"k": 1.0, "beta": 1.0, "g": (-np.inf, 0.0)}
+    declared = scan.Scan(gated_delta, gated_readout, GATED, walked="time", state=((KEY, VALUE), jnp.float32),
+                         ranges=ranges)
+    forms = scan.derive_scan(declared, saturation=SATURATION)
+    ones = 1.0 if tokens == 2 else 0.0
+    chunk = {"q": jnp.full((tokens, KEY), ones / 4), "k": jnp.full((tokens, KEY), ones / 4),
+             "v": jnp.full((tokens, VALUE), ones), "g": jnp.full((tokens,), -(2.0 ** 127)),
+             "beta": jnp.full((tokens,), ones)}
+    h, expected = jnp.zeros((KEY, VALUE)), []
+    for index in range(tokens):
+        token = [chunk[name][index] for name in GATED]
+        expected.append(gated_readout(h := gated_delta(h, *token), *token))
+    assert np.all(np.isfinite(np.asarray(expected)))
+    assert np.all(np.isfinite(np.asarray(forms.mapped(forms.prepare(chunk), forms.init({})))))
+
+
 def _primitives(jaxpr):
     """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
     derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""

@@ -184,7 +184,7 @@ A device that needs a formulation the set lacks gets it added to the algebra onc
 
 A hook is a traced JAX callable plus typed parameters (HEAD, QUERY, KEY, TILE, ROW, OUTPUT). Its backward is `jax.vjp` of the callable, traced inside the backward kernel: Flex's joint graph, done by JAX. Its parameter cotangents are the algebra's per-kind reductions, each owned by one scan (§3). A hook that needs a cross-tile reduction is algebra, not a hook.
 
-**Hook identity is what it computes.** A hook is a plain JAX callable traced into the kernel, so its identity is its traced program: a fingerprint of the jaxpr at a fixed tile, its side operands' layouts and dtypes, and the hook's axes and output dtypes (`tuning.program`; `grouped_matmul._GroupedLaunch.traced`, `attention.hook_program`, which adds a differentiated hook's pullback). That fingerprint keys compiles and the opt-in tuner's stored picks, never the function object, so two calls whose hooks compute the same thing share a pick, and a hook that computes something else never takes another's.
+**Hook identity is what it computes.** A hook is a plain JAX callable traced into the kernel. Every launch names its kernels and keys its refusals by the hook's parts, which tell what it computes without running it (`tuning.KernelOp.identified`, `tuning.described`: a function's code, constants, defaults and closure; a partial's, a dataclass's and a custom derivative's parts; an array's bytes), so a launch traces nothing to name itself; only a part that says nothing of what it computes (a callable object) is traced. The opt-in tuner's stored picks key on the traced program: a structural fingerprint of the jaxpr at a fixed tile (each equation's primitive, operands, parameters and types, never its printed form), its side operands' layouts and dtypes, and the hook's axes and output dtypes (`tuning.program`; `grouped_matmul._GroupedLaunch.traced`, `attention.hook_program`, which adds a differentiated hook's pullback), so picks persist across checkouts for hooks that compute the same thing, and a hook that computes something else never takes another's.
 
 **Load contract per kind.** On sm90, loads belong to the producer warpgroup:
 - KEY and TILE ride the K stream's ring;
@@ -417,7 +417,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 - **Sharding.** Kernels run per shard inside `shard_map` (`tests/sharded.py`'s contract). Context parallelism is attention's `merge` and recurrence's `compose`. Expert parallelism is GEMM's group metadata per shard.
 - **Remat.** Which residuals are saved and in what dtype belongs to the algebra (lse, D, w, u, h). The saved-or-recomputed choice for recurrence's w, u and h is a choice-layer bit. Fusion changes which named residuals exist (`decoder_block.MLP_RESIDUALS`: 'gate_proj', 'up_proj', 'down_proj'), so each fused path declares the names it saves, and the remat policies read them, not today's fixed list.
-- **Compile.** Hooks are keyed by their traced programs. Every static form, hook and configuration is a compile, so the derivation's shape facts are bucketed where a config would otherwise change with every size. Compile seconds are recorded beside step time.
+- **Compile.** Hooks are keyed by their parts, the tuner's picks by their traced programs. Every static form, hook and configuration is a compile, so the derivation's shape facts are bucketed where a config would otherwise change with every size. Compile seconds are recorded beside step time.
 
 ## 11. How it gets built
 

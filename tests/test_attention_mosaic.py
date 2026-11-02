@@ -495,12 +495,14 @@ def test_a_dropping_backward_by_its_derived_forms_is_on_par_interpreted(call):
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_the_forward_by_its_derived_forms_is_on_par_interpreted(call):
-    """The forward, the base-2 fold, its walk's step, merge and finish the derived forms behind the switch
-    (`dew.algebra.forms.derived`, `attention_algebra.derived_forms`), its weighted values' sums in the
-    mainloop's accumulator (`Keys.accumulate`), under Mosaic GPU's interpreter: on par with the reference
-    (check 1), as the hand-written forms are (`test_the_forward_is_on_par_interpreted`)."""
-    with algebra_forms.derived():
-        _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True)
+    """The forward over fp16 operands (a plain walk, of no headroom guard or compensation, which the derived
+    forms serve) under the run's fast forms, the base-2 fold, its walk's step, merge and finish the derived
+    forms behind the switch (`dew.algebra.forms.derived`, `attention_algebra.derived_forms`), its weighted
+    values' sums in the mainloop's accumulator (`Keys.accumulate`), under Mosaic GPU's interpreter: on par
+    with the reference (check 1), as the hand-written forms are (`test_the_forward_is_on_par_interpreted`)."""
+    fast = dataclasses.replace(generation.numerics(), forms="fast")
+    with generation.run_precision(fast), algebra_forms.derived():
+        _check_forward(call, jnp.float16, SHAPES["interpreted"], natural=False, interpret=True)
 
 
 @INTERPRETS

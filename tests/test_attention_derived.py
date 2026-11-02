@@ -422,3 +422,55 @@ def test_a_fresh_processs_training_forward_finishes_by_the_derived_forms():
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert done.returncode == 0, done.stderr[-3000:]
     assert done.stdout.strip().splitlines()[-1] == "True"
+
+
+def tempered(s, q_pos, k_pos, temperature):
+    """A score hook dividing each query's logits by its temperature, a query parameter."""
+    del q_pos, k_pos
+    return s / temperature
+
+
+def test_a_derived_backward_masks_its_hook_cotangents_where_padding_reads_no_key():
+    """One fp32 query and key under a query temperature of 1, padded to an 8-row tile: a padded query's
+    temperature is zero (`attention._padded`), its hook derivative not finite, and its logits unseen. Under
+    the derived backward the real gradients are finite, as the reference's and the hand-written backward's
+    are, each tile's cotangents masked before their products (`pulled`)."""
+    rng = np.random.default_rng(0)
+    query, key, value, dout = (jnp.asarray(rng.standard_normal((1, 1, 1, 8)), jnp.float32) for _ in range(4))
+    spans = template.spans(1, 1, 1)
+    temperature = template.Param(jnp.ones((1, 1, 1), jnp.float32), template.Kind.QUERY)
+    hooks = template.Hooks(score_mod=tempered, score_params=(temperature,))
+    with fast(derived=True):
+        grads = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=8, block_k=8,
+                                            pad=8)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(grads))
+
+
+def test_a_split_decodes_states_merge_and_finish_by_the_derived_forms():
+    """A split decode's slices' states (`[rows, splits, queries, heads]`, `decode_attention._combined`) of an
+    fp16 call under the run's fast forms, merged and finished by the derived forms over every row whatever
+    the states' leading axes: on par with the hand-written forms' against float64's merge (check 1)."""
+    from dew.nn.kernels import decode_attention
+
+    spec = decode_attention._spec(0.25, 1.0, None, natural=False, dtype=jnp.float16, sinks=False)
+
+    def states(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((2, 3, 4, 2, 16)), jnp.float32),
+                jnp.asarray(rng.standard_normal((2, 3, 4, 2)), jnp.float32),
+                jnp.asarray(rng.uniform(0.5, 2.0, (2, 3, 4, 2)), jnp.float32))
+
+    def combined(*, derived: bool):
+        def run(sums, peaks, totals):
+            with fast(derived):
+                return decode_attention._combined(spec, sums, peaks, totals, axis=1)
+        return run
+
+    def exact(sums, peaks, totals):
+        # Base 2: the fold's logits (`spec.base2`).
+        weights = jnp.exp2(peaks - jnp.max(peaks, axis=1, keepdims=True))
+        return (jnp.sum(weights[..., None] * sums, axis=1)
+                / jnp.sum(weights * totals, axis=1)[..., None])
+
+    assert_as_exact(jax.jit(combined(derived=True)), jax.jit(combined(derived=False)), states,
+                    "a split decode's combine", seeds=16, truth_fn=exact)

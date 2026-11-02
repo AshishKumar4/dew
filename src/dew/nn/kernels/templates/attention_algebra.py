@@ -2359,21 +2359,35 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     return Partial(**dict(zip(fields, stepped, strict=True)))
 
 
+def _rows(state: Partial) -> Partial:
+    """`state` with its leading axes and its rows one axis of rows (`acc` `[rows, Dv]`, `m` and `total`
+    `[rows]`): each row's softmax is its own, so a merge or a finish of a split decode's states
+    (`[..., splits, ..., bq]`, `decode_attention._combined`) is the declaration's over all their rows."""
+    return state._replace(acc=state.acc.reshape(-1, state.acc.shape[-1]), m=state.m.reshape(-1),
+                          total=state.total.reshape(-1))
+
+
 def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
-    """`merge` by the derived forms (`_stated`'s)."""
-    key, shapes = _stated(spec, first)
+    """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
+    (`_rows`)."""
+    flat = _rows(first)
+    key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
-    merged = derived_forms(*key).merge(tuple(getattr(first, field) for field in fields),
-                                       tuple(getattr(second, field) for field in fields), shapes=shapes)
-    return Partial(**dict(zip(fields, merged, strict=True)))
+    other = _rows(second)
+    merged = derived_forms(*key).merge(tuple(getattr(flat, field) for field in fields),
+                                       tuple(getattr(other, field) for field in fields), shapes=shapes)
+    return Partial(**{field: value.reshape(getattr(first, field).shape)
+                      for field, value in zip(fields, merged, strict=True)})
 
 
 def _derived_output(spec: Forward, state: Partial) -> jax.Array:
     """`finish`'s output before its hook by the derived forms (`_stated`'s): the weighted values over their
-    total, zero for a query that saw nothing."""
-    key, shapes = _stated(spec, state)
+    total, zero for a query that saw nothing, over the state's rows whatever its leading axes (`_rows`)."""
+    flat = _rows(state)
+    key, shapes = _stated(spec, flat)
     fields = _slotted(key, shapes)
-    return derived_forms(*key).finish(tuple(getattr(state, field) for field in fields), shapes=shapes)
+    finished = derived_forms(*key).finish(tuple(getattr(flat, field) for field in fields), shapes=shapes)
+    return finished.reshape(state.acc.shape)
 
 
 def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, *, keys_first: bool = False):
@@ -2408,21 +2422,22 @@ def derived_cotangents(keys_first: bool, dropped: bool) -> derive.Derived:
                          saturation=SATURATION)
 
 
-def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, slope=None, keep=None, *,
-                      scale: float):
+def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, slope=None, seen=None,
+                      keep=None, *, scale: float):
     """Attention's gradients from its residuals, whole (theme A's backward declaration,
     `backward_declaration`): each tile's weights and score cotangents (`softmax_cotangents`) with
     `dP = dO Vᵀ`, the cotangents through the score hook by its `slope` (its derivative, `scored`) where a hook
-    reads the logits, and the queries', keys' and values' gradients their products at `scale` (dV from the
-    dropped unnormalized weights against `dO / T`, `value_operands`' order), each product Dew's
-    (`float32_einsum`). Returns dQ, dK, dV, and each tile's unnormalized weights and score cotangents, which
-    the template's hook parameters and D's refinement read (`pulled`, `dq_rows`)."""
+    reads the logits, masked where the tile's queries do not see its keys (`seen`, `pulled`: a padded query's
+    hook derivative need not be finite), and the queries', keys' and values' gradients their products at
+    `scale` (dV from the dropped unnormalized weights against `dO / T`, `value_operands`' order), each product
+    Dew's (`float32_einsum`). Returns dQ, dK, dV, and each tile's unnormalized weights and score cotangents,
+    which the template's hook parameters and D's refinement read (`pulled`, `dq_rows`)."""
     products = float32_einsum("qd,kd->qk", dout, values, preferred_element_type=jnp.float32)
     e, _, ds = softmax_cotangents(logits, products, peak, total, anchor, delta, keep)
     over = 1.0 / jnp.where(total == 0, 1.0, total)
     # The cotangents at the scale before their products, the reference's order: two keys of 2**127 whose
     # cotangents' quarter cancels in the product overflow it unscaled.
-    scaled = (ds if slope is None else ds * slope) * scale
+    scaled = (ds if slope is None else pulled(ds, (slope,), seen, ())[0]) * scale
     dropped = e if keep is None else e * keep
     return (float32_einsum("qk,kd->qd", scaled, k), float32_einsum("qk,qd->kd", scaled, q),
             float32_einsum("qk,qd->kd", dropped, dout * over[:, None]), e, ds)
@@ -2450,11 +2465,12 @@ def backward_declaration(*, scale: float, walked: str, hooked: bool = False, dro
     """Attention's backward as theme A's declaration (`softmax_gradients`), walked over its key tiles
     (`walked="keys"`, queries first: dQ the walk's sum, dK and dV each tile's own) or its query tiles
     (`"rows"`, keys first: dK and dV the walk's sums, dQ each tile's own), from the forward's natural
-    residual rows and its D, its hook's slopes an operand where a score hook reads the logits and its dropout
-    multipliers where the call drops."""
+    residual rows and its D, its hook's slopes and the tile's mask operands where a score hook reads the
+    logits and its dropout multipliers where the call drops."""
     tile = ("rows", "keys")
     axes = {"logits": tile, "q": ("rows", "width"), "k": ("keys", "width"), "values": ("keys", "values"),
             "dout": ("rows", "values"), "peak": ("rows",), "total": ("rows",), "anchor": ("rows",),
-            "delta": ("rows",), **({"slope": tile} if hooked else {}), **({"keep": tile} if dropped else {})}
+            "delta": ("rows",), **({"slope": tile, "seen": tile} if hooked else {}),
+            **({"keep": tile} if dropped else {})}
     return derive.Reduction(functools.partial(softmax_gradients, scale=scale), axes, walked=walked,
                             exponent="e")

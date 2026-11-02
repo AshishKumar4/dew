@@ -303,6 +303,35 @@ def test_a_complex_functions_bound_is_none_of_a_real_ones():
     assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
 
 
+def test_a_rounded_values_bound_is_at_least_one():
+    """`ceil` of a value declared under 2^-126 is 1: a walk's sum of such ceilings times 3e38, each scaled by
+    its row's half, is finite, and the walk keeps the scale inside its sum (bible §6), where a bound of the
+    operand's would take it out, the two ceilings' sum past float32's largest."""
+    tile = {"s": jnp.full((2,), 0.5, jnp.float32), "x": jnp.full((2, 2), 2.0 ** -126, jnp.float32)}
+
+    def scaled(s, x):
+        return jnp.sum(s[:, None] * (jnp.ceil(x) * jnp.float32(3e38)), axis=1)
+
+    declaration = derive.Reduction(scaled, {"s": ("rows",), "x": ("rows", "keys")}, walked="keys",
+                                   exponent="e", ranges={"x": 2.0 ** -126})
+    assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
+def test_an_integer_bitwise_values_bound_is_its_dtypes():
+    """int32's `not(-2^31)` is `2^31 - 1`, no boolean's 1: a walk's sum of four such, converted and times
+    2^95, each scaled by its row's quarter, is finite, and the walk keeps the scale inside its sum (bible
+    §6), where a bound of 1 would take it out, the four terms' sum past float32's largest."""
+    tile = {"s": jnp.full((2,), 0.25, jnp.float32), "x": jnp.full((2, 4), -(2 ** 31), jnp.int32)}
+
+    def scaled(s, x):
+        converted = jnp.bitwise_not(x).astype(jnp.float32)
+        return jnp.sum(s[:, None] * (converted * jnp.float32(2.0 ** 95)), axis=1)
+
+    declaration = derive.Reduction(scaled, {"s": ("rows",), "x": ("rows", "keys")}, walked="keys",
+                                   exponent="e")
+    assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
 def test_a_walks_finish_is_its_own_whatever_walk_came_before():
     """A sum returned in its operand's dtype, walked over bfloat16 tiles and then over float32 ones, whose
     states are alike (a float32 sum each, as JAX sums a narrow value): each walk's finish its own forms', the

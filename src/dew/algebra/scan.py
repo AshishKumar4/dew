@@ -295,7 +295,9 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
         keys = math.prod(np.shape(region.literal_outputs[0]) if B is None else region.shape(B))
         entry = bounded[tokens_at["s"]] * bounded[tokens_at["C"]] * bounded[tokens_at["B"]] * keys
     if entry is not None:
-        bounded[DECAYS] = (1.0 + entry) ** max(chunk_size - 1, 0)
+        # No bound where it passes float64's range (16 unit keys over 256 tokens: 17**255).
+        power = max(chunk_size - 1, 0) * math.log2(1.0 + entry)
+        bounded[DECAYS] = math.inf if power >= 1024 else 2.0 ** power
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
@@ -718,8 +720,15 @@ def _decays(exponents, base2: bool) -> _Decays:
     return _decays_of(exponents, base2)
 
 
+FLOOR = -(2.0 ** 100)
+"""The least exponent a chunk's decays sum (`_decays_value`): below it a token's decay, and every decay
+through it, is zero in fp32 whatever the other tokens' (each at most `log(float32 max)`, or the token scan is
+not finite), so an exponent held at it is exact, its derivative zero as the decay's, and a chunk's prefix of
+under 2**27 tokens stays finite (two of -2**127 summed are -inf, whose differences are NaN)."""
+
+
 def _decays_value(exponents, base2: bool) -> _Decays:
-    high, low = _compensated(exponents)
+    high, low = _compensated(jnp.maximum(exponents, FLOOR))
     count = exponents.shape[0]
     below = (jnp.arange(count)[:, None] >= jnp.arange(count)[None, :])[:, :, None]
     gaps = (high[:, None] - high[None, :]) + (low[:, None] - low[None, :])

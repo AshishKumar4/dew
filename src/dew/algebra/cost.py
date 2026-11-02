@@ -13,6 +13,7 @@ import math
 import re
 from typing import Protocol
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args, get_literal_value
@@ -118,9 +119,18 @@ _ALGORITHM = re.compile(r"(BF16|F16|TF32)_\1_F32(?:_X(\d))?")
 
 def _mode(precision, dtypes: set) -> tuple[str, int]:
     """The mode a product of operands of `dtypes` at `precision` multiplies in, and its passes: its dot
-    algorithm's where it names one of the tensor cores' (its passes, an X3's three), 16-bit operands' 16-bit
-    mode, fp32 operands' TF32 at the default precision (the product declaration's, `product.declared`) and
-    IEEE fp32 above it; any other operand's on the CUDA cores."""
+    algorithm's where it names one of the tensor cores' (its passes, an X3's three), by its preset's name
+    or, a `jax.lax.DotAlgorithm` (which JAX names no preset), by its fields (16-bit precision types, its
+    primitive operations), as JAX lowers both to one algorithm; 16-bit operands' 16-bit mode, fp32
+    operands' TF32 at the default precision (the product declaration's, `product.declared`) and IEEE fp32
+    above it; any other operand's on the CUDA cores."""
+    written = precision if isinstance(precision, tuple) else (precision,)
+    for algorithm in written:
+        if isinstance(algorithm, jax.lax.DotAlgorithm):
+            narrow = {jnp.dtype(algorithm.lhs_precision_type), jnp.dtype(algorithm.rhs_precision_type)}
+            if narrow <= {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)}:
+                return "16bit", algorithm.num_primitive_operations
+            return "fp32", algorithm.num_primitive_operations
     for name in precision_names(precision):
         if (found := _ALGORITHM.fullmatch(name)) is not None:
             return ("tf32" if found.group(1) == "TF32" else "16bit"), int(found.group(2) or 1)

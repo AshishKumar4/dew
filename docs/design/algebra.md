@@ -388,8 +388,10 @@ range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's co
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
 outside the language, has none. Each equation in the language composes its operands' bounds: sums take twice
 the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
-function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`) is 1, a complex operand's sine
-or tangent none (`sin(pi/2 + 89j)` is 2.2e38). An exponential of an unbounded operand, or a quotient, has no
+function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`, a boolean's bitwise operation)
+is 1, a complex operand's sine or tangent none (`sin(pi/2 + 89j)` is 2.2e38), an integer's bitwise operation
+its dtype's range (int32's `not(-2**31)` is `2**31 - 1`), and a rounding to an integer (`floor`, `ceil`,
+`round`) its operand's or 1 (`ceil(2**-126)` is 1). An exponential of an unbounded operand, or a quotient, has no
 bound; an exponential of an operand at most 0 is at most 1.
 
 The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
@@ -403,7 +405,8 @@ intermediates' bounds from its operands' (`rules.log2_bound`) and states them fo
 (`rules.sum_length`): `sum(x) + sum(y)` of `x = [2**126, 2**126]` and `y = [2**126 - 2**102, 2**126 - 2**103]`
 is float32's largest, while `sum(x + y)` overflows. A scan's solve inverse, a prepared operand, is bounded by
 `(1 + a)^(C - 1)` over a chunk of `C` tokens, `a` an overlap's bound: the corrections' elementwise bounds'
-product times the keys' count it contracts (two tokens of 16 unit keys overlap by 16).
+product times the keys' count it contracts (two tokens of 16 unit keys overlap by 16), or a declared overlap
+(unit-norm keys under a write gate at most `b`: `b`); a bound past float64's range is none.
 
 So `a*x + a*y -> a*(x + y)` fires only where `x` and `y` carry declared ranges that keep their sum under what
 the program reaches. The delta rule's carry does not distribute its solve over `U - W h`, which is fla's WY
@@ -542,8 +545,9 @@ class Extraction:
   alone reach (`Rewrite.xla_own`) is XLA's to decide, whatever else the window rewrites. A pass whose admitted
   sets are all XLA's (the accurate numerics') does not run. The e-graph decides for the algebra XLA does not
   derive (distribution, factoring through contractions, scale folds).
-- The pass saturates and extracts each window cluster in an e-graph of its own (§6.7): clusters share no
-  equation. One e-graph of a program's every window grew its extraction with the program: a gemma3n training
+- The pass saturates and extracts each window cluster in an e-graph of its own (§6.7); two clusters whose
+  union passes `CLUSTER` stay apart though they share an equation, and a value both yield takes the first's
+  form. One e-graph of a program's every window grew its extraction with the program: a gemma3n training
   step's took past 500 seconds, 14 million cost additions in one extraction. A term keys a dictionary by its
   declaration (`terms.key`), not its text, which egglog formats through black at about a millisecond a term.
 - Extraction for a template's interface prices candidates through the tile walk; the compile-time pass prices
@@ -670,17 +674,21 @@ forms where the declarations state the walk:
   the forms they read by the walk's tiles (`Derived.merge`, `finish`: a state's values alone name no walk, a
   bf16 walk's fp32 sums being an fp32 walk's too); the attention state's merge and finish read the same
   forms at any keys a tile or values' dtype, so the template names its base's walk at the state's rows and
-  width (`attention_algebra._stated`), whatever walk came before.
+  width (`attention_algebra._stated`), whatever walk came before, over every row of states of any leading
+  axes (a split decode's, `_rows`).
 - The attention backward. The plain-JAX mainloop walks dQ over the keys and dK and dV over the queries by
   the backward declaration's forms, each launch's tile reader and hook gradients shared with its
-  hand-written algebra; its dP sums in fp32 and its cotangents take the scale before their products, the
-  reference's order. Every Mosaic backward launch takes its tiles' weights and score cotangents from the
+  hand-written algebra; its dP sums in fp32, its cotangents through a hook are masked where the tile's
+  queries see no key (`pulled`: a padded query's hook derivative need not be finite), and they take the
+  scale before their products, the reference's order. Every Mosaic backward launch takes its tiles' weights and score cotangents from the
   tile declaration (`softmax_cotangents`) over its own products. Both cover hooks' slopes, dropout, the
   first pass's D and initial states.
 - The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
   (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
   `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
-  carries typed as its operands vary. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
+  carries typed as every operand varies, its decays' exponents held at `scan.FLOOR` (a decay of zero
+  there in fp32: two tokens' -2**127 summed are -inf), a pair no decay joins selected away before its
+  decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
   prefix's decays.
 

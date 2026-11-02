@@ -146,11 +146,12 @@ of another read from outside it."""
 
 def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`jaxpr` with the values its windows yield (`_windows`) computed in their cheapest forms, where those
-    are cheaper than the windows as traced: each cluster saturated in an e-graph of its own (clusters share no
-    equation, so none shares a form with another; one e-graph of every window's terms grew its extraction
-    with the program, past 500 seconds a gemma3n training step's), each cheaper value's form traced and
-    spliced in where its equation stood, the rest of the program kept as traced, so a body is never traced
-    again."""
+    are cheaper than the windows as traced: each cluster saturated in an e-graph of its own (one e-graph of
+    every window's terms grew its extraction with the program, past 500 seconds a gemma3n training step's),
+    each cheaper value's form traced and spliced in where its equation stood, the rest of the program kept as
+    traced, so a body is never traced again. Two clusters whose union passes `CLUSTER` stay apart though they
+    share an equation: a value both yield is made by the first's form (`_splices`' `taken`), each form
+    writing the value it replaces under its own name, so readers of either read one value."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     for window, yielded in _windows(jaxpr):

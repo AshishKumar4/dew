@@ -131,21 +131,25 @@ class Miss:
 
 def _identity(op, arguments: tokamax.BoundArguments) -> str:
     """A launch's identity apart from its config, the same in every process: its op as its picks name it
-    (`tuning.KernelOp.keyed`) and its arguments exactly, its arrays by their own shapes and dtypes (no
-    key's bucket: two launches a key shares compile two kernels) and its hooks by what they compute
-    (`traced`), and the target capacities that size its generated program. Clock rates are not code inputs
+    (`tuning._identity`) and its arguments exactly, its arrays by their own shapes and dtypes (no key's
+    bucket: two launches a key shares compile two kernels), its hooks, the op's and its arguments', by what
+    they compute as their parts tell it (`tuning.KernelOp.identified`: every launch reads it, so it traces
+    nothing), and the target capacities that size its generated program. Clock rates are not code inputs
     once its config is chosen: an attached device and its compile-only target may report different rates
     while emitting exactly that config."""
     def described(name, value):
         if name in op.HOOKS:
-            return op.traced(name, value)
+            return op.identified(name, value)
         return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
                             and hasattr(leaf, "shape") else leaf, value)
     target = generation.gpu_target()
     hardware = ((generation.device_generation(),) if target is None else
                 (target.generation, target.multiprocessors, target.shared_limit))
+    # The tuner imports this module: read at a call.
+    from dew.nn.kernels import tuning
+
     operands = tuple((name, described(name, value)) for name, value in sorted(arguments.arguments.items()))
-    return repr((hardware, op.keyed(arguments).op, operands))
+    return repr((hardware, tuning._identity(op, traced=False), operands))
 
 
 def _digest(text: str) -> str:

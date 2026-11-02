@@ -11,6 +11,7 @@ import pytest
 import tokamax
 
 from dew.nn.kernels import norm_swiglu, tuning
+from dew.nn.kernels.templates import report
 
 
 def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
@@ -179,6 +180,46 @@ def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
         keys = [tuning.program(factory(jnp.asarray([value])), TILE) for value in (True, False, True)]
         assert keys[0] != keys[1]
         assert keys[0] == keys[2]
+
+
+def test_a_launchs_identity_reads_its_hooks_without_running_them():
+    """A launch's identity (`KernelOp.identified`, every launch's, tuning or not) reads its hooks' parts and
+    runs none: a hook that raises when run keys alike to its equal (a closure over an equal value), and apart
+    from one over another value, one of another body, another on its line, and hooks whose fields differ."""
+    def raising(scale):
+        def hook(tile):
+            raise AssertionError(f"a launch's identity ran its hook at {scale}")
+        return hook
+
+    def other(scale):
+        def hook(tile):
+            raise ValueError(f"a launch's identity ran its hook at {scale}")
+        return hook
+
+    op = _HookedKernel()
+    first = op.identified("prologue", raising(2.0))
+    assert first == op.identified("prologue", raising(2.0))
+    assert str(first).startswith("described:")
+    doubled, tripled = lambda tile: tile * 2, lambda tile: tile * 3
+    for apart in (raising(5.0), other(2.0), doubled):
+        assert op.identified("prologue", apart) != first
+    assert op.identified("prologue", doubled) != op.identified("prologue", tripled)
+
+    def recursive(depth):
+        def walk(tile, steps=depth):
+            return tile if steps == 0 else walk(tile, steps - 1)
+        return walk
+
+    # A local function its own closure reaches again.
+    assert op.identified("prologue", recursive(2)) == op.identified("prologue", recursive(2))
+    assert op.identified("prologue", recursive(2)) != op.identified("prologue", recursive(3))
+    # A launch's whole identity, its kernels' names (`report.launching`), reads an argument's hooks alike:
+    # apart where a hook's value or another field differs.
+    hooked = _HookedKernel(prologue=raising(2.0))
+    named = report._identity(hooked, hooked.bind(TILE, _Hooks(raising(3.0), (0,))))
+    assert named == report._identity(hooked, hooked.bind(TILE, _Hooks(raising(3.0), (0,))))
+    for changed in (_Hooks(raising(4.0), (0,)), _Hooks(raising(3.0), (1,))):
+        assert named != report._identity(hooked, hooked.bind(TILE, changed))
 
 
 def _scaled_hook(tile):

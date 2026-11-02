@@ -545,6 +545,19 @@ class KernelOp(tokamax.Op):
         naming `HOOKS` defines it."""
         raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
+    def identified(self, name: str, value: Callable | str | None) -> str | None:
+        """The hook field or argument `name`'s value as a launch's identity reads it every launch, tuning or
+        not (`report._identity`: its kernels' names, its refusals): by its parts where they tell what it
+        computes (`described`), tracing nothing, else what it computes (`traced`). A key already as it
+        is."""
+        if value is None or isinstance(value, str):
+            return self.traced(name, value)
+        try:
+            parts = described(value)
+        except _Undescribed:
+            return self.traced(name, value)
+        return "described:" + hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
         call's arrays, making this launch's kernels alone, and their abstract values; compiled, not
@@ -626,44 +639,142 @@ def holdable(value: Hashable | jax.Array) -> bool:
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
-    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's printed form
-    (its primitives, shapes, dtypes and literals) and of the values of the arrays it closes over, the
-    same in every process, so every process keys a launch alike and takes process 0's config
-    (`_settle`). A captured array that is itself traced (a value of the enclosing computation) is data
-    the compiled launch reads, so it keys by its shape and dtype alone."""
+    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's structure (each
+    equation's primitive, operands in binding order, parameters and output types, a nested jaxpr's alike) and
+    of the values of the arrays it closes over, the same in every process, so every process keys a launch
+    alike and takes process 0's config (`_settle`). Never its printed form: JAX's printer took a launch's
+    hooks seconds a step (the class of the algebra pass's printed terms). A captured array that is itself
+    traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
+    and dtype alone."""
     closed = jax.make_jaxpr(function)(*arguments)
-    digest = hashlib.sha256(str(closed).encode())
+    digest = hashlib.sha256()
+
+    def update(*parts) -> None:
+        digest.update(repr(parts).encode())
 
     def constants(values) -> None:
         for constant in values:
             if isinstance(constant, jax.core.Tracer):
-                digest.update(repr((constant.shape, str(constant.dtype))).encode())
+                update("traced", constant.shape, str(constant.dtype))
             else:
                 value = np.asarray(constant)
-                digest.update(repr((value.shape, str(value.dtype))).encode())
+                update("constant", value.shape, str(value.dtype))
                 digest.update(np.ascontiguousarray(value).tobytes())
 
-    def nested(jaxpr) -> None:
-        # A nested computation's own constants (a jitted helper's, a branch's), in program order.
+    def walk(jaxpr: jax_core.Jaxpr) -> None:
+        names: dict[jax_core.Var, int] = {}
+
+        def bound(var: jax_core.Var) -> int:
+            return names.setdefault(var, len(names))
+
+        def atom(value) -> Hashable:
+            if isinstance(value, jax_core.Literal):
+                return "literal", str(value.aval), _parameter(value.val)
+            return bound(value)
+
+        update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
-            for parameter in equation.params.values():
+            update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
+                   tuple((bound(var), str(var.aval)) for var in equation.outvars))
+            for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
                     if isinstance(inner, jax_core.Jaxpr):
+                        update("nested", name)
                         constants(inner.consts)
-                        nested(inner)
+                        walk(inner)
+                    else:
+                        update(name, _parameter(inner))
+        update("outputs", *(atom(value) for value in jaxpr.outvars))
 
     constants(closed.consts)
-    nested(closed.jaxpr)
+    walk(closed.jaxpr)
     return "traced:" + digest.hexdigest()[:16]
 
 
-def _identity(op: tokamax.Op) -> tokamax.Op:
-    """`op` as its picks name it: without the config, the vjp and the device
-    check a call sets, its hook fields by what they compute (`KernelOp.traced`)."""
-    fields = {field.name: field for field in dataclasses.fields(op)}
-    hooks = ({name: op.traced(name, getattr(op, name)) for name in op.HOOKS if name in fields}
-             if isinstance(op, KernelOp) else {})
+def _parameter(value) -> Hashable:
+    """An equation's parameter as `program`'s digest reads it: a number, a string or a tuple of them as it
+    is, an array by its shape, dtype and bytes' digest, a function by its module and name, any other object
+    by its type and its representation, less a memory address (which no two processes share)."""
+    if value is None or isinstance(value, (bool, int, float, complex, str)):
+        return value
+    if isinstance(value, (tuple, list)):
+        return tuple(_parameter(part) for part in value)
+    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
+        array = np.asarray(value)
+        return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()[:16]
+    if isinstance(value, types.FunctionType):
+        return "function", value.__module__, value.__qualname__
+    text = repr(value)
+    return type(value).__qualname__, None if " at 0x" in text else text
+
+
+class _Undescribed(Exception):
+    """A part `described` says nothing of without running it."""
+
+
+def described(value: object, within: frozenset[int] = frozenset()) -> Hashable:
+    """What `value` computes, told by its parts without running it: a number, a string, a dtype, a class or
+    an enumeration's member as it is; an array by its shape, dtype and bytes (a traced one, data the
+    compiled launch reads, by its shape and dtype); a tuple, a partial, a dataclass's fields and a custom
+    derivative's functions, each part described in turn; a function by its code (its bytecode, constants and
+    the names it reads, each global a number or string reads at its value), defaults and closure.
+    `_Undescribed` where a part is an object of no described parts (a callable object, `jnp.add`'s among
+    them, may read an array its call holds). A function its own closure reaches again (a recursive local
+    function, `within`) is named by its place alone there."""
+    if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
+        return value
+    if isinstance(value, enum.Enum):
+        return _named(type(value)), value.name
+    if isinstance(value, type):
+        return _named(value)
+    if isinstance(value, np.dtype):
+        return str(value)
+    if isinstance(value, jax.core.Tracer):
+        return "traced", value.shape, str(value.dtype)
+    if isinstance(value, (np.ndarray, jax.Array, np.generic)):
+        array = np.asarray(value)
+        return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()
+    if isinstance(value, (tuple, list)):
+        return tuple(described(part, within) for part in value)
+    if isinstance(value, functools.partial):
+        return ("partial", described(value.func, within), described(value.args, within),
+                described(tuple(sorted(value.keywords.items())), within))
+    if isinstance(value, types.CodeType):
+        return "code", value.co_code, described(value.co_consts, within), value.co_names, value.co_varnames
+    if isinstance(value, types.FunctionType):
+        if id(value) in within:
+            return "again", value.__module__, value.__qualname__
+        within = within | {id(value)}
+        try:
+            cells = tuple(cell.cell_contents for cell in value.__closure__ or ())
+        except ValueError as empty:
+            raise _Undescribed(f"{value.__qualname__} closes over an unset name") from empty
+        plain = tuple((name, value.__globals__[name]) for name in value.__code__.co_names
+                      if isinstance(value.__globals__.get(name), (bool, int, float, complex, str)))
+        keywords = tuple(sorted((value.__kwdefaults__ or {}).items()))
+        return ("function", value.__module__, value.__qualname__, described(value.__code__, within), plain,
+                described(value.__defaults__ or (), within), described(keywords, within),
+                described(cells, within))
+    if isinstance(value, (jax.custom_vjp, jax.custom_jvp)):
+        parts = [getattr(value, name, None) for name in ("fun", "fwd", "bwd", "jvp", "nondiff_argnums")]
+        return _named(type(value)), described(parts, within)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _named(type(value)), tuple((field.name, described(getattr(value, field.name), within))
+                                          for field in dataclasses.fields(value))
+    raise _Undescribed(f"{type(value).__qualname__} says nothing of what it computes but by running it")
+
+
+def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
+    """`op` as its picks name it: without the config, the vjp and the device check a call sets, its hook
+    fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
+    picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
+    (`KernelOp.identified`, `report._identity`), tracing nothing."""
+    if not isinstance(op, KernelOp):
+        return op.replace(config=None, vjp=None, bypass_device_check=False)
+    fields = {field.name for field in dataclasses.fields(op)}
+    read = op.traced if traced else op.identified
+    hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
     return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 

@@ -295,9 +295,14 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
 BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf"})
 """The language's functions whose magnitude is at most 1 over a real operand of any magnitude (over a complex
 one, `sin(pi/2 + 89j)` is 2.2e38: unbounded)."""
-KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min", "floor",
-                               "ceil", "round"}) | SHAPES
+KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
 """The language's equations whose output is no larger in magnitude than their operand's."""
+INTEGRAL = frozenset({"floor", "ceil", "round"})
+"""The language's equations rounding to an integer: no larger in magnitude than their operand's or 1, an
+integer bounding any value it bounds (`ceil(2**-126)` is 1)."""
+BITWISE = frozenset({"and", "or", "xor", "not"})
+"""The language's bitwise equations: a boolean's at most 1, an integer's any value of its dtype (int32's
+`not(-2**31)` is `2**31 - 1`)."""
 UNIT = 0
 KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
 """The language's equations whose output is at most 0 where their operand is."""
@@ -309,8 +314,17 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magn
     name = equation.primitive.name
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
-    if (name in COMPARISONS or name in ("and", "or", "xor", "not", "is_finite", "sign")
-            or (name in BOUNDED and real)):
+    if name in BITWISE:
+        aval = equation.outvars[0].aval
+        if not isinstance(aval, ShapedArray):
+            return None
+        dtype = np.dtype(aval.dtype)
+        if dtype == np.bool_:
+            return UNIT
+        # A signed integer of `bits` bits is at most 2**(bits - 1) in magnitude, an unsigned one 2**bits.
+        integers = jnp.iinfo(dtype)
+        return integers.bits - (integers.min < 0)
+    if name in COMPARISONS or name in ("is_finite", "sign") or (name in BOUNDED and real):
         return UNIT
     if any(bound is None for bound in operands):
         return None
@@ -325,6 +339,8 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magn
         return max(given[1:])
     if name in KEEPING_MAGNITUDE:
         return given[0]
+    if name in INTEGRAL:
+        return max(given[0], UNIT)
     if name == "square":
         return 2 * given[0]
     if name == "integer_pow" and equation.params["y"] >= 1:
