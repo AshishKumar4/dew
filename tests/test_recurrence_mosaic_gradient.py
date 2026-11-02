@@ -103,18 +103,20 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[256], set(DRAWN_APART[256])))
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+@pytest.mark.check1_shards(seeds=256, per_task=80)
 def test_a_long_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
     """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 256 recorded seeds
-    (`DRAWN_APART`), their draws in map tasks of 64."""
+    (`DRAWN_APART`), their draws in map tasks of 80 (70 s at their 0.9 s a seed): the 64 a task first marked
+    planned 1020 map tasks over the run's Pythons, past armada's 1000 a judges' job (`ci.MAX_INPUTS`)."""
     _holds_check_1(case, dtype, remat)
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[128], set(DRAWN_APART[128])))
-@pytest.mark.check1_shards(seeds=128, per_task=12)
+@pytest.mark.check1_shards(seeds=128, per_task=15)
 def test_a_long_key_decay_or_fp32_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
     """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 128 recorded seeds, a
-    decay a key dimension's and an fp32 call's (`DRAWN_APART`), their draws in map tasks of 12."""
+    decay a key dimension's and an fp32 call's (`DRAWN_APART`), their draws in map tasks of 15 (77 s at the
+    fp32 call's 5.1 s a seed; 12 a task planned past armada's 1000, as the test above's 64)."""
     _holds_check_1(case, dtype, remat)
 
 
