@@ -342,7 +342,9 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
         batch, length, _ = x.shape
         capacity = m.max_seq_len
         place = down_projection(x, (m.q_lora_rank or 0) + m.kv_lora_rank + m.qk_rope_head_dim)
-        queries, q_resid = m._queries(x, place)
+        queries, q_resid, gate = m._queries(x, place)
+        # What the output gate reads, as the block's call hands it on (`_output`).
+        gating = x if gate is None else gate
         latent, rot = m._latents(x, place)
         q_pass, q_rot = jnp.split(queries, [m.qk_nope_head_dim], axis=-1)
         q_rot, rot, freqs_cos, freqs_sin = m._rotated(q_rot, rot, jnp.arange(length))
@@ -376,7 +378,7 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
             written = (slots <= step).reshape((1, capacity) + (1,) * (held[0].ndim - 2))
             first, second = (jnp.where(written, part, 0) for part in held)
             key, value = (first, second) if m.sparse else m._expand(first, second)
-            outputs.append(m._attend(query[:, step:step + 1], key, value, x[:, step:step + 1],
+            outputs.append(m._attend(query[:, step:step + 1], key, value, gating[:, step:step + 1],
                                      visible[:, None, step:step + 1], m.attention_impl))
         return jnp.concatenate(outputs, axis=1)
 
