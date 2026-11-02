@@ -54,7 +54,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import rows_taken
+from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken, unboxed
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -984,13 +984,34 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
             tree = held
-        elif held is None or self._held_parts:
-            tree = self.fresh_variables(key, held)
+        elif not held or self._held_parts:
+            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so.
+            tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
         tree = self.complete_variables(key, tree)
         return with_projected(tree, functools.partial(self.projected, updated=True))
+
+    @functools.cached_property
+    def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """The logical axes the objective's modules declare on the parameters they make
+        (`nn.with_logical_partitioning`), by each parameter's path from its collection: one table, read
+        off a fresh draw of every module traced for its shapes alone (`init` given an empty tree under
+        `jax.eval_shape`), which placement, the optimizer and a checkpoint read for a drawn tree and a
+        held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
+        refused by its path: its axes would name another parameter's dimensions."""
+        drawn = jax.eval_shape(functools.partial(self.init, variables={}), jax.random.key(0))
+        held = self.held_variables()
+        if held is not None and "params" in held:
+            shapes = {jax.tree_util.keystr(path): np.shape(leaf)
+                      for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(held))):
+                name = jax.tree_util.keystr(path)
+                if name in shapes and shapes[name] != np.shape(leaf):
+                    raise ValueError(f"the held {name} is {np.shape(leaf)}, where the objective's modules "
+                                     f"make it {shapes[name]}")
+        return boxed_axes(drawn)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.

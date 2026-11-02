@@ -46,10 +46,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import FrozenDict, meta
+from flax.core import meta
 from flax.typing import Initializer
 
-from dew.batch import Variables
+from dew.batch import FROZEN
 from dew.mesh import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -591,22 +591,6 @@ def unboxed(tree):
     return jax.tree.map(value, tree, is_leaf=is_boxed)
 
 
-def boxed_like(template: Variables, values: Variables) -> Variables:
-    """`values`, a tree of `template`'s structure read from elsewhere (a checkpoint's arrays), each leaf in
-    the box `template`'s leaf at its path has (a draw's, `jax.eval_shape(module.init, ...)`), so it carries
-    the axes its module declares; a leaf `template` leaves unboxed, or one `values` boxed already, stays as
-    it is. The one translation of a tree that never passed through its module's init: a loaded tree. It is
-    walked by key, so a tree keeps its own container (a FrozenDict, a dict) whatever the draw's is."""
-    kept = dict(values)
-    for name, value in values.items():
-        box = template.get(name)
-        if isinstance(box, meta.AxisMetadata) and not isinstance(value, meta.AxisMetadata):
-            kept[name] = box.replace_boxed(value)
-        elif isinstance(box, Mapping) and isinstance(value, Mapping):
-            kept[name] = boxed_like(box, value)
-    return FrozenDict(kept) if isinstance(values, FrozenDict) else kept
-
-
 def rows_boxed(boxed, value):
     """`value`, cut from `boxed`'s value along its leading axes (a stacked run's row), in `boxed`'s box
     with the names of the axes it keeps: a box a scan stacked (`metadata_params`) handed back a row a
@@ -712,9 +696,11 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     """
     names = parameter_path(path)
     held = _BOXED.get()
+    # A frozen parameter (`dew.batch.freeze`) is the parameter its module made.
+    unfrozen = ("params", *names[1:]) if names[:1] == (FROZEN,) else names
     # A declaration of no axes, a scalar's `()`, is a declaration all the same.
-    found = [table[key] for table, key in ((held, names), (held, ("params", *names)), (declared, names))
-             if key in table]
+    found = [table[key] for table, key in ((held, names), (held, ("params", *names)), (held, unfrozen),
+                                           (declared, names)) if key in table]
     if not found:
         return None
     axes = found[0]

@@ -79,7 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, boxed_axes, measured_links, pipeline_microbatches, unboxed
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, unboxed
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -363,9 +363,6 @@ class Trainer(Generic[Loss, Effects]):
         self._narrow, self._xla_defaults = True, False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
-        # The axes the objective's modules box on their own parameters, as the
-        # last trace of `initial_state` saw them (`_boxed_axes`).
-        self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found the objective: its modules,
         # head tile, XLA option choice and record (`_at_base_rung`); then the rung each shape compiled at, by
@@ -402,9 +399,6 @@ class Trainer(Generic[Loss, Effects]):
         key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
-        # Static metadata, the same on every trace of the state: the
-        # placement reads it from here rather than tracing init again.
-        self._boxed = boxed_axes(initialized)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
@@ -494,13 +488,9 @@ class Trainer(Generic[Loss, Effects]):
             return self._config.groups(state.variables["params"])
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
-        """The axes the objective's modules box on their own parameters
-        (`nn.with_logical_partitioning`), which its init returns and the state
-        unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build. A checkpoint records them for its restore."""
-        if self._boxed is None:
-            self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
-        return self._boxed
+        """The axes the objective's modules declare on their parameters (`Objective.parameter_axes`), a
+        drawn tree's and a held one's alike. A checkpoint records them for its restore."""
+        return self.objective.parameter_axes
 
     @ruled
     def shardings(self, state: TrainState) -> Placement[TrainState]:
