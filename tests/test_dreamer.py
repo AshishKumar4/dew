@@ -601,6 +601,28 @@ def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps
     assert owed[1] - owed[0] <= taken < owed[1] - owed[0] + 8
 
 
+def test_a_dreamer_run_resumed_with_longer_windows_owes_the_updates_after_it_at_their_pace(tmp_path):
+    """A DreamerV3 run of 16-step windows, resumed at its third update by a rollout drawing 64-step windows
+    (as a later phase of training lengthens them), owes its fourth and fifth updates the steps their
+    windows train on alone: after its prefill it takes at least those steps, and less than one step of
+    every target more, where owing the whole run's updates at the longer windows' pace would take twice
+    as many."""
+    objective = DreamerV3Objective(tiny())
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def drawing(length):
+        return DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
+                              prefill=64)
+
+    first = drawing(16)
+    dreamer_fit(tmp_path / "run", objective, first, 3)
+    resumed = drawing(64)
+    dreamer_fit(tmp_path / "run", objective, resumed, 5)
+    owed = 2 * 8 * 64 // 32
+    taken = resumed.environment_steps - first.environment_steps - 64 * 8
+    assert owed <= taken < owed + 8
+
+
 def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
     """A DreamerV3 run on targets a simulator steps, with a cooldown at its third update whose branch
     collects steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the
