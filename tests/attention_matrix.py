@@ -35,16 +35,23 @@ HEADS = {"mha": (8, 8), "gqa-8-2": (8, 2), "gqa-8-4": (8, 4)}
 """Query heads over key heads, by the `heads` axis's value."""
 BIAS = {"key-bias": template.Kind.KEY, "tile-bias": template.Kind.TILE}
 """The kind of the two parameters a bias hook adds, `s + a + 2 b`."""
+
+
+@functools.cache
+def _masked(mask: str):
+    """A call's spans under `mask`, and the keys each query keeps."""
+    segments = (np.repeat(np.arange(DOCUMENTS, dtype=np.int32), LENGTH // DOCUMENTS)[None]
+                if mask == "documents" else None)
+    causal = mask != "full"
+    spans = template.spans(LENGTH, LENGTH, 1, causal=causal,
+                           segment_ids=None if segments is None else jnp.asarray(segments))
+    return spans, kept(LENGTH, LENGTH, causal=causal, segment_ids=segments)
+
+
 def _case(case: dict[str, str]):
-    """`case`'s call: its operands' shapes and dtype, its spans and the keys they keep, and its hook."""
+    """`case`'s call: its operands' shapes and dtype, its spans and the keys they keep."""
     heads, kv_heads = HEADS[case["heads"]]
-    width = int(case["width"])
-    segments = (jnp.repeat(jnp.arange(DOCUMENTS, dtype=jnp.int32), LENGTH // DOCUMENTS)[None]
-                if case["mask"] == "documents" else None)
-    causal = case["mask"] != "full"
-    spans = template.spans(LENGTH, LENGTH, 1, causal=causal, segment_ids=segments)
-    keep = kept(LENGTH, LENGTH, causal=causal, segment_ids=None if segments is None else np.asarray(segments))
-    return heads, kv_heads, width, jnp.dtype(case["dtype"]), spans, keep
+    return heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"]), *_masked(case["mask"])
 
 
 def _hooks(case: dict[str, str], params: tuple) -> template.Hooks | None:
@@ -96,15 +103,16 @@ def _backward_op(case: dict[str, str]):
     """`case`'s Mosaic backward op, its bound arguments and the device it is read for, under the case's
     generation (`attention_mosaic._backward_call`)."""
     heads, kv_heads, width, dtype, spans, _ = _case(case)
-    query = jnp.zeros((1, LENGTH, heads, width), dtype)
-    key = jnp.zeros((1, LENGTH, kv_heads, width), dtype)
-    params = tuple(jnp.zeros(_param_shape(BIAS[case["hook"]], heads), jnp.float32) for _ in range(2)
-                   ) if case["hook"] in BIAS else ()
+    # Shapes alone: the analyses read the call's facts, not its values.
+    query = jax.ShapeDtypeStruct((1, LENGTH, heads, width), dtype)
+    key = jax.ShapeDtypeStruct((1, LENGTH, kv_heads, width), dtype)
+    params = tuple(jax.ShapeDtypeStruct(_param_shape(BIAS[case["hook"]], heads), jnp.float32)
+                   for _ in range(2)) if case["hook"] in BIAS else ()
+    residuals = jax.eval_shape(_residuals, query.shape)
     natural, accurate = _form(case)
     natural = attention_mosaic.NATURAL if natural is None else natural
-    op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query,
-                                               _residuals(query.shape), scale=None, natural=natural,
-                                               accurate=accurate)
+    op, args = attention_mosaic._backward_call(query, key, key, spans, _hooks(case, params), query, residuals,
+                                               scale=None, natural=natural, accurate=accurate)
     return op, op.bind(*args, interpret=False), generation.gpu_target()
 
 
