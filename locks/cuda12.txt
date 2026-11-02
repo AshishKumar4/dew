@@ -328,7 +328,7 @@ e2b==2.55.1
     # via dewml (pyproject.toml)
 e2b-dockerfile-utils==0.1.0
     # via e2b
-egglog==14.0.0
+egglog==14.0.0.post1
     # via dewml (pyproject.toml)
 einops==0.8.2
     # via
