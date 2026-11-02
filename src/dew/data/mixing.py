@@ -17,10 +17,10 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, listed, record, text
+from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import MEMBER, Owed, Record, Rejected, accounts, members_of, owed_members, owed_record
+from dew.data.pipeline import MEMBER, Owed, Record, Rejected, accounts, members_of, owed_members
 
 _log = logging.getLogger(__name__)
 
@@ -208,10 +208,10 @@ drops more than one record in a hundred is worth a look."""
 
 class _KeepAccepted:
     def __init__(self, counts: CorpusCounts, tokens: Callable[[Batch], int] | None,
-                 certain_after: int | None = None, members: Sequence[CorpusCounts] = (),
+                 certain_after: int | None = None, members: Mapping[str, CorpusCounts] | None = None,
                  credits: bool = False):
         self.counts, self.tokens, self.certain_after = counts, tokens, certain_after
-        self.members, self.credits = list(members), credits
+        self.members, self.credits = dict(members or {}), credits
         """A mixture's members' counts, under which it counts what it rejects of each member's rows
         (`Rejected.member`, `MEMBER`), and, where it `credits` them (its last counter), the examples each
         member's rows complete as it delivers them (`MEMBERS`)."""
@@ -225,7 +225,7 @@ class _KeepAccepted:
         """The counts a row of `member` (`MEMBER`) is counted under: its member's, else the counter's own."""
         if member is None or not self.members:
             return self.counts
-        return self.members[integer(member, "a row's mixture member")]
+        return self.members[text(member, "a row's mixture member")]
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
@@ -277,7 +277,7 @@ class _KeepAccepted:
         completed = {member: consumed - refused
                      for member, (consumed, refused) in members_of(element).items()}
         owner = self._of(tag)
-        own = None if tag is None else integer(tag, "a row's mixture member")
+        own = None if tag is None else text(tag, "a row's mixture member")
         for member, examples in completed.items():
             if member != own:
                 self.members[member].accepted += examples
@@ -349,12 +349,12 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         return self._predicate.owed.paid(next(self._read))
 
     def _counted(self) -> Mapping[str, object]:
-        # A mixture's counter keeps its members' counts beside its own (`MEMBERS`).
-        members = [{"corpus": counts.name, "label": counts.label, "counts": counts.state()}
-                   for counts in self._predicate.members]
+        # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
+        members = {key: {"corpus": counts.name, "label": counts.label, "counts": counts.state()}
+                   for key, counts in self._predicate.members.items()}
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
-                "consumed_members": owed_record(self._predicate.owed.members), "members": members}
+                "consumed_members": dict(self._predicate.owed.members), "members": members}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
@@ -362,13 +362,11 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate.warned = boolean(counted["warned"], "warned")
         self._predicate.owed = Owed(integer(counted["consumed"], "consumed examples pending"),
                                     owed_members(counted["consumed_members"], "consumed examples pending"))
-        members = listed(counted["members"], "a mixture counter's members", read=record,
-                         what="a list of member counters")
-        if len(members) != len(self._predicate.members):
-            raise ValueError(f"a mixture counter of {len(self._predicate.members)} members was saved with "
-                             f"{len(members)}")
-        for counts, saved in zip(self._predicate.members, members, strict=True):
-            counts.restore(record(saved["counts"], "member counts"))
+        # A member that joined since starts its counts; one that left takes its counts with it.
+        members = record(counted["members"], "a mixture counter's members")
+        for key, counts in self._predicate.members.items():
+            if key in members:
+                counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
 
 
 class Carried(pygrain.IterDataset[Batch]):
@@ -401,7 +399,7 @@ class _CarriedIterator(pygrain.DatasetIterator[Batch]):
 
     def get_state(self) -> Mapping[str, object]:
         return {"parent": self._read.get_state(), "owed": self._owed.examples,
-                "owed_members": owed_record(self._owed.members)}
+                "owed_members": dict(self._owed.members)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "carried parent"))
@@ -419,7 +417,8 @@ class Accepted(pygrain.IterDataset[Batch]):
     past an objective's step that makes rows of source examples counts none of the rows it keeps
     (`rows` false, `CorpusCounts.rows`). A mixture's counter past the mix counts what it rejects of each
     member's rows under that member (`members`, each's name and label), and its last counter, which
-    `credits` them, the examples each member's rows complete as it delivers them (`MEMBERS`)."""
+    `credits` them, the examples each member's rows complete as it delivers them (`MEMBERS`); each
+    member is its key, name and label."""
 
     def __init__(
         self,
@@ -431,7 +430,7 @@ class Accepted(pygrain.IterDataset[Batch]):
         certain_after: int | None = None,
         rows: bool = True,
         examples: bool = False,
-        members: Sequence[tuple[str, str]] = (),
+        members: Sequence[tuple[str, str, str]] = (),
         credits: bool = False,
     ):
         super().__init__(parent)
@@ -441,7 +440,7 @@ class Accepted(pygrain.IterDataset[Batch]):
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         counts = CorpusCounts(self._name, self._label, rows=self._rows, examples=self._examples)
-        members = [CorpusCounts(name, label, examples=True) for name, label in self._members]
+        members = {key: CorpusCounts(name, label, examples=True) for key, name, label in self._members}
         predicate = _KeepAccepted(counts, self._tokens, self._certain_after, members, self._credits)
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
@@ -877,11 +876,11 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                     rowless = counts
                 # A mixture's counter past the mix holds its members' counts beside its own (a chunk
                 # counter holds none).
-                for member in listed(node.get("members", []), "a mixture counter's members", read=record,
-                                     what="a list of member counters"):
-                    held = CorpusCounts(text(member["corpus"], "member corpus"),
-                                        text(member["label"], "member label"), examples=True)
-                    held.restore(record(member["counts"], "member counts"))
+                for member in record(node.get("members", {}), "a mixture counter's members").values():
+                    saved = record(member, "member counter")
+                    held = CorpusCounts(text(saved["corpus"], "member corpus"),
+                                        text(saved["label"], "member label"), examples=True)
+                    held.restore(record(saved["counts"], "member counts"))
                     _nested(counted, {held.name: held})
             interleaved = branch.get("iterators_in_use_states")
             if isinstance(interleaved, list):

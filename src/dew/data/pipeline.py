@@ -38,9 +38,9 @@ class Rejected:
     cut: Mapping[str, int] = dataclasses.field(default_factory=dict)
     """The tokens the cuts of the refused rows removed, by what each cut, which its corpus counts beside
     the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
-    member: int | None = None
+    member: str | None = None
     """The mixture member the rejected row was drawn from (`MEMBER`), which its refusal is counted under."""
-    members: Mapping[int, int] = dataclasses.field(default_factory=dict)
+    members: Mapping[str, int] = dataclasses.field(default_factory=dict)
     """Of `consumed`, the examples each mixture member's rows were the last of (`MEMBERS`)."""
 
 
@@ -60,9 +60,10 @@ ACCOUNTS = (CONSUMED, REFUSED)
 """A row's two counts of source examples, which every step carries together, as integers no batch stacks."""
 
 MEMBER = "_dew_member"
-"""The mixture member a row was drawn from, by its place among the mixture's corpora, set where a mixture a
-run bounds in examples draws it (`dew.data.lowering._Build.mixed`) and carried to every row a step makes of
-it, its rejection's marker too (`Rejected.member`)."""
+"""The mixture member a row was drawn from, by its key (`dew.data.analysis._member_keys`), which a member
+keeps when another joins or leaves, set where a mixture a run bounds in examples draws it
+(`dew.data.lowering._Build.mixed`) and carried to every row a step makes of it, its rejection's marker too
+(`Rejected.member`)."""
 
 MEMBERS = "_dew_members"
 """A row's counts of source examples (`ACCOUNTS`) by the mixture member each was drawn from (`MEMBER`):
@@ -73,7 +74,7 @@ and carried wherever its counts go, so a mixture counts each member's examples w
 COUNTING = (*ACCOUNTS, MEMBER, MEMBERS)
 """A row's fields the run counts it by, which every step carries out of its sight."""
 
-type Members = Mapping[int, tuple[int, int]]
+type Members = Mapping[str, tuple[int, int]]
 """Counts of source examples by mixture member (`MEMBERS`): consumed and, of them, refused."""
 
 
@@ -85,7 +86,7 @@ def members_of(row: Batch) -> Members:
     return held
 
 
-def member_fields(member: int) -> tuple[str, str]:
+def member_fields(member: str) -> tuple[str, str]:
     """The fields a layout lays a mixture member's counts out in beside its tokens, consumed and refused,
     each count at the last token of its document (`dew.data.lowering._ConsumedAt`)."""
     return f"{MEMBERS}/{member}/consumed", f"{MEMBERS}/{member}/refused"
@@ -97,26 +98,16 @@ def counted(field: str) -> bool:
     return field in ACCOUNTS or field.startswith(f"{MEMBERS}/")
 
 
-def owed_record(members: Mapping[int, int]) -> list[list[int]]:
-    """Examples owed by mixture member as a saved position holds them: member and count pairs."""
-    return [[member, count] for member, count in sorted(members.items()) if count]
+def owed_members(saved: object, what: str) -> dict[str, int]:
+    """Examples owed by mixture member read back from a saved position, which holds them by member key."""
+    if not isinstance(saved, Mapping):
+        raise ValueError(f"{what} by member are a mapping, got {type(saved).__name__}")
+    return {str(member): integer(count, f"{what} of member {member}") for member, count in saved.items()}
 
 
-def owed_members(saved: object, what: str) -> dict[int, int]:
-    """Examples owed by mixture member read back from a saved position (`owed_record`)."""
-    if not isinstance(saved, list):
-        raise ValueError(f"{what} are a list of member and count pairs, got {type(saved).__name__}")
-    owed: dict[int, int] = {}
-    for pair in saved:
-        if not isinstance(pair, list) or len(pair) != 2:
-            raise ValueError(f"{what} are member and count pairs, got {pair!r}")
-        owed[integer(pair[0], f"{what}' member")] = integer(pair[1], f"{what}' count")
-    return owed
-
-
-def joined(*members: Members) -> dict[int, tuple[int, int]]:
+def joined(*members: Members) -> dict[str, tuple[int, int]]:
     """Counts by mixture member summed member by member."""
-    total: dict[int, tuple[int, int]] = {}
+    total: dict[str, tuple[int, int]] = {}
     for held in members:
         for member, (consumed, refused) in held.items():
             before = total.get(member, (0, 0))
@@ -150,9 +141,9 @@ class Owed:
     them, those each mixture member's rows were the last of (`members`, `MEMBERS`)."""
 
     examples: int = 0
-    members: dict[int, int] = dataclasses.field(default_factory=dict)
+    members: dict[str, int] = dataclasses.field(default_factory=dict)
 
-    def owe(self, consumed: int, members: Mapping[int, int] | None = None) -> None:
+    def owe(self, consumed: int, members: Mapping[str, int] | None = None) -> None:
         """Owe `consumed` more examples to the next row kept, `members` of them by mixture member."""
         self.examples += consumed
         for member, count in (members or {}).items():

@@ -125,7 +125,7 @@ class _Held:
     since: int
     consumed: int
     refused: int
-    members: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    members: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     missing: int = 0
 
 
@@ -185,7 +185,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
 
     def get_state(self) -> Mapping[str, object]:
         held = [[unit, counts.since, counts.consumed, counts.refused,
-                 [[member, *split] for member, split in sorted(counts.members.items())]]
+                 {member: list(split) for member, split in counts.members.items()}]
                 for unit, counts in self._held.items()]
         return {"parent": self._rows.get_state(), "floor": self._floor, "drawn": sorted(self._drawn),
                 "held": held}
@@ -197,9 +197,10 @@ class _CompletedIterator(pygrain.DatasetIterator):
         self._held, self._waiting, self._floored = {}, {}, []
         for entry in listed(state["held"], "held counts", what="a list of held counts"):
             match entry:
-                case [unit, since, consumed, refused, list(split)]:
-                    triples = [integers(held, "a held member's counts") for held in split]
-                    members = {member: (count, part) for member, count, part in triples}
+                case [unit, since, consumed, refused, dict(split)]:
+                    pairs = {member: integers(held, "a held member's counts")
+                             for member, held in split.items()}
+                    members = {member: (pair[0], pair[1]) for member, pair in pairs.items()}
                     at = integer(unit, "a held count's unit")
                     counts = integer(consumed, "a held count"), integer(refused, "a held refusal")
                     self._held[at] = _Held(integer(since, "a held count's first unit"), *counts, members)
@@ -249,7 +250,7 @@ class _Released:
 
     consumed: int = 0
     refused: int = 0
-    members: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    members: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
 
     def add(self, consumed: int, refused: int, members: Members) -> None:
         self.consumed, self.refused = self.consumed + consumed, self.refused + refused

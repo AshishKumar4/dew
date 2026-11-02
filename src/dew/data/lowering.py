@@ -33,7 +33,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, integers, record, strings
+from dew._records import boolean, integer, integers, record, strings, text
 from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.analysis import (
     _LOCAL,
@@ -507,7 +507,7 @@ def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) ->
     holds them as its member's."""
     if given is None or isinstance(given, (bytes, Rejected)) or not any(name in given for name in COUNTING):
         return step(given)
-    member = None if MEMBER not in given else integer(given[MEMBER], "a row's mixture member")
+    member = None if MEMBER not in given else text(given[MEMBER], "a row's mixture member")
     unseen = {name: column for name, column in given.items() if name not in COUNTING}
     outputs = tuple(_as_member(made, member) for made in step(unseen))
     if CONSUMED not in given:
@@ -534,17 +534,17 @@ def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) ->
 
 @dataclasses.dataclass(frozen=True)
 class _Tagged:
-    """A mixture member's rows, each saying it is the member's at `index` (`MEMBER`)."""
+    """A mixture member's rows, each saying it is the member's of `key` (`MEMBER`)."""
 
-    index: int
+    key: str
 
     def __call__(self, row: Record) -> Record:
         if isinstance(row, Mapping):
-            return {**row, MEMBER: self.index}
-        return dataclasses.replace(row, member=self.index) if isinstance(row, Rejected) else row
+            return {**row, MEMBER: self.key}
+        return dataclasses.replace(row, member=self.key) if isinstance(row, Rejected) else row
 
 
-def _as_member(made: Record, member: int | None) -> Record:
+def _as_member(made: Record, member: str | None) -> Record:
     """A step's output of a mixture member's row as that member's (`MEMBER`, `Rejected.member`), its counts
     its member's where it first holds counts (the bound's marks)."""
     if member is None:
@@ -559,14 +559,14 @@ def _as_member(made: Record, member: int | None) -> Record:
     return tagged
 
 
-def _members_held(row: Batch, member: int | None) -> dict[int, tuple[int, int]]:
+def _members_held(row: Batch, member: str | None) -> dict[str, tuple[int, int]]:
     """`row`'s counts by mixture member (`MEMBERS`): its member's alone where it states no split."""
     if MEMBERS in row:
         return dict(members_of(row))
     return {} if member is None else {member: accounts(row)}
 
 
-def _owed_by(members: Mapping[int, tuple[int, int]]) -> dict[int, int]:
+def _owed_by(members: Mapping[str, tuple[int, int]]) -> dict[str, int]:
     """The examples a rejected row was the last of, by member (`Rejected.members`), from its counts."""
     return {member: consumed for member, (consumed, _) in members.items() if consumed}
 
@@ -762,7 +762,7 @@ class _Groups:
         # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
         # of where the group's rows are all one member's.
         tags = [row.get(MEMBER) for row in rows]
-        members = [_members_held(row, None if tag is None else integer(tag, "a row's mixture member"))
+        members = [_members_held(row, None if tag is None else text(tag, "a row's mixture member"))
                    for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
         common = tags[0] if tags and tags[0] is not None and len(set(tags)) == 1 else None
         rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
@@ -1075,7 +1075,7 @@ class _Ruled(pygrain.IterDataset):
     them (`_ConsumedAt`)."""
 
     def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows, consumed: bool = False,
-                 members: int = 0):
+                 members: tuple[str, ...] = ()):
         super().__init__(documents)
         self._documents, self._stage, self._consumed, self._members = documents, stage, consumed, members
 
@@ -1086,7 +1086,7 @@ class _Ruled(pygrain.IterDataset):
         documents, stage = self._documents.map(seen), self._stage
         if self._consumed:
             documents = documents.map(_ConsumedAt(stage.fields[0], self._members))
-            laid = (*ACCOUNTS, *(name for member in range(self._members) for name in member_fields(member)))
+            laid = (*ACCOUNTS, *(name for member in self._members for name in member_fields(member)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
         windows = (_packed(documents.map(stage.document), stage)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage))
@@ -1102,13 +1102,13 @@ class _ConsumedAt:
     document was drawn from goes with the window that holds its last token (`MEMBER`)."""
 
     field: str
-    members: int = 0
+    members: tuple[str, ...] = ()
 
     def __call__(self, document: Batch) -> Batch:
         length = len(document[self.field])
         counts = {name: integer(document.get(name, 0), f"a row's {name}") for name in ACCOUNTS}
         split = members_of(document)
-        for member in range(self.members):
+        for member in self.members:
             consumed, refused = split.get(member, (0, 0))
             counts.update(zip(member_fields(member), (int(consumed), int(refused)), strict=True))
         laid = {}
@@ -1123,7 +1123,7 @@ class _ConsumedAt:
 
 class _RuledIterator(pygrain.DatasetIterator):
     def __init__(self, windows: pygrain.DatasetIterator, seen: LayoutRule, field: str, *,
-                 consumed: bool = False, members: int = 0):
+                 consumed: bool = False, members: tuple[str, ...] = ()):
         super().__init__(windows)
         self._windows, self._seen, self._field, self._consumed = windows, seen, field, consumed
         self._members = members
@@ -1137,7 +1137,7 @@ class _RuledIterator(pygrain.DatasetIterator):
         if not self._members:
             return counted
         split = {}
-        for member in range(self._members):
+        for member in self._members:
             names = member_fields(member)
             consumed, refused = (int(np.sum(counted.pop(name))) for name in names)
             if consumed or refused:
@@ -1669,10 +1669,12 @@ class _Build:
                    for build, child in zip(builds, source.pipelines, strict=True)]
         # A run bounded in examples counts each member's where its rows are delivered: each row says the
         # member it was drawn from (`MEMBER`, `counted_members`).
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
-            mapped = [parent.map(_Tagged(index)) if tagged else parent
-                      for index, parent in enumerate(parents) if isinstance(parent, pygrain.MapDataset)]
+            mapped = [parent.map(_Tagged(key)) if tagged else parent
+                      for key, parent in zip(keys, parents, strict=True)
+                      if isinstance(parent, pygrain.MapDataset)]
             selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
             return pygrain.MapDataset.select_from_datasets(mapped, selection)
         streams = [
@@ -1680,10 +1682,9 @@ class _Build:
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
-            streams = [stream.map(_Tagged(index)) for index, stream in enumerate(streams)]
+            streams = [stream.map(_Tagged(key)) for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
@@ -1695,14 +1696,16 @@ class _Build:
             )
         return KeyedMix(streams, source.weights, keys)
 
-    def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str], ...]:
-        """The members of `pipeline`'s mixture, each's name and label, where a read per share counts each
-        member's source examples where its rows are delivered (a run bounded in examples, `_consumes`);
-        none elsewhere, a global order's counting nothing as it reads."""
+    def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
+        """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
+        per share counts each member's source examples where its rows are delivered (a run bounded in
+        examples, `_consumes`); none elsewhere, a global order's counting nothing as it reads."""
         source = pipeline.source
         if self.global_order or not isinstance(source, Mixture) or not _consumes(pipeline):
             return ()
-        return tuple((_name(child), _label(child)) for child in source.pipelines)
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
+        return tuple((key, _name(child), _label(child))
+                     for key, child in zip(keys, source.pipelines, strict=True))
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
@@ -2064,7 +2067,7 @@ class _Build:
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
             ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline),
-                           members=len(self.counted_members(pipeline)))
+                           members=tuple(key for key, _, _ in self.counted_members(pipeline)))
             rows = self.targeted(ruled, stage.fields[0], pipeline, at + 1)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
