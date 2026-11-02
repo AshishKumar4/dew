@@ -95,6 +95,7 @@ jobs:
       run: |
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
+        node site/scripts/render-posts.mjs --check
 
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement
