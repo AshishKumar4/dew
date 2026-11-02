@@ -181,10 +181,13 @@ def ptx_text(batches: int, products: int, fenced: bool = False) -> str:
         for k in range(8):
             lines.append(f"\tst.global.f32 \t[%rd2+{4 * k + 32 * batch}], %f{states[batch][k]};")
     header = (
-        ".version 8.8\n.target sm_90a\n.address_size 64\n\n.visible .entry syn(\n\t.param .u64 syn_param_0,\n"
+        # Its shared memory dynamic, as Mosaic GPU's kernels take theirs: a static array past 48 KB is no
+        # kernel ptxas takes (CUDA 12.9's: "uses too much shared data (0x18000 bytes, 0xc000 max)").
+        ".version 8.8\n.target sm_90a\n.address_size 64\n\n.extern .shared .align 128 .b8 smem[];\n\n"
+        ".visible .entry syn(\n\t.param .u64 syn_param_0,\n"
         "\t.param .u64 syn_param_1\n)\n.maxntid 128, 1, 1\n.minnctapersm 1\n{\n"
         f"\t.reg .pred \t%p<8>;\n\t.reg .b32 \t%r<{ints[0] + 8}>;\n\t.reg .f32 \t%f<{floats[0] + 8}>;\n"
-        "\t.reg .b64 \t%rd<64>;\n\t.shared .align 128 .b8 smem[98304];\n"
+        "\t.reg .b64 \t%rd<64>;\n"
         "\tld.param.u64 \t%rd1, [syn_param_0];\n\tcvta.to.global.u64 \t%rd2, %rd1;\n"
         "\tld.param.u64 \t%rd3, [syn_param_1];\n\tcvta.to.global.u64 \t%rd4, %rd3;\n"
         "\tmov.u32 \t%r1, %tid.x;\n\tmov.u32 \t%r2, smem;\n\tcvt.u64.u32 \t%rd5, %r2;\n"
