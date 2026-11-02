@@ -3,6 +3,7 @@ key block resident, walked by the query tiles that read it, its dK and dV, and t
 gradients; the fused fast form's keys-first launch adds each tile's dQ too."""
 
 import functools
+from collections.abc import Callable
 from types import MappingProxyType
 
 import jax
@@ -597,19 +598,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             lo, hi = (streamed if tiles.shared_dq or tiles.staged_logits
                       else program.readers(k_first, q_steps, spans_of, row)[:2])
             part = (index * count, count) if split else (0, block_q)
-
-            store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, (row, head), k_first,
-                                            index, walk.interpret)
-            coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
-                                          draw=None if drop_of is None else drop_of.draw(row, head))
-            params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
-                                          k_first=k_first, keys_first=True)
-            resident = k_smem.at[holder], v_smem.at[holder]
-            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
             stage = _logits_stage(family, consumers, logits_stages, index)
-            statistics = None if program.tiles.shared_dq else rows_of
-            step = functools.partial(_dkv_step, walk, resident, statistics, coords_of, params_of, store_tiles,
-                                     shares, part, stage, adds)
+            step = _consumer_step(walk, (row, head), k_first, index, holder, part, stage, shares,
+                                  refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
+                                        dq_ref, fused_stages),
+                                  statistics=None if program.tiles.shared_dq else rows_of)
             # The tiles its partner reads around its own, or its consumers' own loads of the query stream
             # where they feed it, the one key block's readers (`Family.walk_own`).
             key_sums, (dk, dv) = family.walk_own(
@@ -649,6 +642,26 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     return _dkv_launched(walk, launch, operands, graded, buffers, groups)
+
+
+def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: int, part: tuple, stage,
+                   shares: tuple, *, refs: tuple, statistics) -> Callable:
+    """A dK/dV consumer's step over the keys from `k_first` (`_dkv_step`), its query `part` of a slot, its
+    hook's coordinates, parameters and tile gradients' stores, its resident key and value block (its
+    `holder`'s), a fused launch's dQ adds and its logits' `stage`, for its batch row and head (`place`)."""
+    tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem, dq_ref, fused_stages = refs
+    family = walk.program.family
+    row, head = place
+    store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, place, k_first, index,
+                                    walk.interpret)
+    coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
+                                  draw=None if drop_of is None else drop_of.draw(row, head))
+    params_of = functools.partial(_score_params, family, score_refs, walk.kinds, row, head, k_first=k_first,
+                                  keys_first=True)
+    adds = _fused_adds(walk, dq_ref, fused_stages, place, index, k_smem, holder)
+    return functools.partial(_dkv_step, walk, (k_smem.at[holder], v_smem.at[holder]), statistics, coords_of,
+                             params_of, store_tiles, shares, part, stage, adds)
+
 
 def _dkv_views(named: dict, stat_refs: list, positions_ref, place: tuple, *, shared_dq: bool) -> dict:
     """The streams' views of a dK/dV program's batch row and head (`place`): its queries, output cotangents
