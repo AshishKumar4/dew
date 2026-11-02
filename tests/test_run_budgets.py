@@ -13,7 +13,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from data_support import Fanned, Questioned
+from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
@@ -185,15 +185,6 @@ def bound_read(
     return read, consumed
 
 
-class Twice:
-    """An objective's step that makes two rows of each packed window (`FlatMap.examples`)."""
-
-    identity = "twice@1"
-
-    def flat_map(self, element):
-        return (element, element)
-
-
 @pytest.mark.parametrize("expands", [False, True])
 @pytest.mark.parametrize("examples", [7, 10, 23])
 def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(examples, expands):
@@ -223,15 +214,6 @@ def test_a_memory_read_that_packs_as_it_holds_them_is_bounded_in_its_documents(e
                                           for index in range(1, 10) if reads[index]})
 
 
-def _jittered(metadata):
-    """A random step configured for the run, which binds to a random map (`RandomMap`)."""
-    class Jittered(grain.RandomMapTransform):
-        def random_map(self, element, rng):
-            return element
-
-    return Jittered()
-
-
 def _consumed_of(loader) -> int:
     """The examples a read of `loader`'s training stream consumes, read to its end."""
     stream = loader.train(DataPartition())
@@ -256,7 +238,7 @@ def test_held_layout_bounds_take_every_example_whatever_steps_or_windows_stand_a
     from dew.data.pipeline import Configured
 
     documents = [{"id": np.full(index % 3 + 2, index + 1, np.int32)} for index in range(10)]
-    configured = Configured(_jittered, needs=(), scope="run", random=True, one_to_one=True)
+    configured = Configured(jittered, needs=(), scope="run", random=True, one_to_one=True)
     chain = (Pipeline(Memory(documents)).map(configured).pack(8, fields=("id",)).shuffle(seed=1, window=4)
              .read("memory").batch(2))
     assert _consumed_of(compile(chain, read="memory", examples=7,
@@ -387,6 +369,90 @@ def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_
     finally:
         stream.close()
     assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
+
+
+_MAPPED = {
+    "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
+                      .shuffle(seed=1, window=4), "streamed"),
+    "held mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept).shuffle(seed=4),
+                    "memory"),
+}
+"""Concatenating packs with a step that keeps each window between the pack and the shuffle."""
+
+
+def _kept(row):
+    return row
+
+
+@pytest.mark.parametrize("layout", ["concat", "overlap", "windows", "strided", "held", "concat mapped",
+                                    "held mapped"])
+def test_a_bounded_mixture_counts_each_members_documents_where_the_windows_cutting_them_are_drawn(layout):
+    """Two named corpora of the twelve documents (`_pieces`, the right's tokens offset by 100,000), mixed
+    and read bounded to all 24, laid across windows that cut them and shuffled after (`_SPLIT`, a step that
+    keeps each window between them or not): by each batch, each member's rows (data/rows) are its documents
+    every token of which the batches delivered, which a window can hold pieces of two members' documents
+    (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = {**_SPLIT, **_MAPPED}[layout]
+    corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+               .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+    loader = compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+    # Every draw of each token the whole read makes, which a document's every window holds once drawn.
+    total = sum((tokens for tokens, _ in _drawn(loader, 0, 1)), collections.Counter())
+
+    def whole(seen, offset):
+        return sum(all(seen[token] and seen[token] == total[token]
+                       for token in range(offset + 1000 * (index + 1), offset + 1000 * (index + 1) + length))
+                   for index, length in enumerate(_LENGTHS))
+
+    stream = loader.train(DataPartition())
+    seen = collections.Counter()
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+            held = np.asarray(batch["id"])[real].ravel()
+            seen += collections.Counter(int(token) for token in held if token)
+            statistics = loader.statistics()
+            for name, offset in (("left", 0), ("right", 100_000)):
+                assert statistics.get(f"data/rows/{name}", 0) <= whole(seen, offset), name
+    finally:
+        stream.close()
+    for name, offset in (("left", 0), ("right", 100_000)):
+        assert statistics[f"data/rows/{name}"] == whole(seen, offset), name
+
+
+@pytest.mark.parametrize("layout", ["strided", "concat"])
+def test_a_bounded_mixtures_member_counts_resume_while_a_layout_holds_a_document(layout):
+    """The mixed read of the test above, its windows 2 tokens apart or packed, its position saved after two
+    batches while its layout holds pieces of a document: restored, it delivers the batches and counts each
+    member as the uninterrupted read does (row 3312)."""
+    from dew.data.pipeline import mix
+
+    laid, read = _SPLIT[layout]
+
+    def loader():
+        corpora = [Pipeline(Memory([{"id": document["id"] + offset} for document in _pieces()], shard_rows=3))
+                   .named(name) for name, offset in (("left", 0), ("right", 100_000))]
+        return compile(laid(mix(corpora)).read(read).batch(2), read=read, examples=2 * len(_LENGTHS))
+
+    def rest(stream):
+        held = [np.asarray(batch["id"]).tolist() for batch in stream]
+        stream.close()
+        return held
+
+    whole = loader()
+    stream = whole.train(DataPartition())
+    for _ in range(2):
+        next(stream)
+    state = stream.get_state()
+    after = rest(stream)
+    resumed = loader()
+    restored = resumed.train(DataPartition())
+    restored.set_state(state)
+    assert rest(restored) == after
+    assert {name: value for name, value in resumed.statistics().items() if name.startswith("data/rows/")} == {
+        name: value for name, value in whole.statistics().items() if name.startswith("data/rows/")}
 
 
 @pytest.mark.parametrize("layout", ["concat", "held"])

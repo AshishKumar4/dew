@@ -15,6 +15,7 @@ import fsspec
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import Keeps
 from storage_support import moto_bucket
 
 from dew.data.cache import Abandoned, Cache
@@ -840,18 +841,6 @@ def test_a_cache_followed_by_a_token_split_seals_the_fill_the_split_reads():
     publishing = Same()
     publish(Pipeline(documents).map(publishing), cache, read="indexed", loading=loading)
     assert publishing.calls == []
-
-
-@dataclass(frozen=True)
-class Keeps:
-    """Rejects a record whose id is a multiple of `every`, permanently: a record steps cannot make."""
-
-    every: int
-    identity = "keeps@1"
-    rejects = True
-
-    def __call__(self, row):
-        return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])

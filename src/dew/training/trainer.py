@@ -2177,8 +2177,8 @@ class Trainer(Generic[Loss, Effects]):
         formed = {} if warm else {name: value for summary in plan.summaries
                                   for name, value in summary.formed(scores).items() if name not in scores}
         if formed:
-            self._report_evaluation(dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed,
-                                                        previews=(), coordinated_batches=0))
+            dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed, previews=(),
+                                coordinated_batches=0).report(self._display, self.tracker)
         return dataclasses.replace(evaluations[0], scores={**scores, **formed},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
@@ -2481,21 +2481,8 @@ class Trainer(Generic[Loss, Effects]):
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
-            self._report_evaluation(dataclasses.replace(evaluation, scores={
-                name: value for name, value in evaluation.scores.items() if name not in (training or {})}))
+            dataclasses.replace(evaluation, scores={
+                name: value for name, value in evaluation.scores.items() if name not in (training or {})}
+            ).report(self._display, self.tracker)
         return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
 
-    def _report_evaluation(self, advanced: Evaluation) -> None:
-        """Print one evaluation on rank zero and log its previews and scores."""
-        def report() -> None:
-            if jax.process_index() != 0:
-                return
-            self._display.evaluation(advanced)
-            if self.tracker is not None:
-                for artifact in advanced.previews:
-                    self.tracker.artifact(artifact, advanced.step)
-                scalars = advanced.scalars
-                if scalars:
-                    self.tracker.log(scalars, advanced.step)
-
-        agreed("evaluation reporting", report)

@@ -52,6 +52,34 @@ for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
         assert zen4.endswith("/AuthenticAMD-25-17") and zen3.endswith("/AuthenticAMD-25-1"), (platforms, zen4)
 
 
+def test_a_worker_keeps_the_cache_it_shares_unless_the_shared_cache_is_on(tmp_path):
+    """Each xdist worker writes a cache directory of its own only where the shared cache keeps bundles of its
+    writes (DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN both set); a URL alone, which installs no shared cache,
+    leaves the workers one cache, so a program one compiled the others read (2026-11-02: a lane's probes
+    inherited the repository's URL with no token, and each of 16 workers compiled what another had, 33 s a
+    case against 4)."""
+    import os
+    import subprocess
+    import sys
+
+    site = tmp_path / "test_site.py"
+    seen = tmp_path / "seen.txt"
+    said = f"    open({str(seen)!r}, 'a').write(jax.config.jax_compilation_cache_dir + '\\n')\n"
+    site.write_text(f"import jax\n\n\ndef test_one():\n{said}\n\ndef test_two():\n{said}")
+    tests = Path(__file__).resolve().parent
+    paths = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
+    environment = {**os.environ, "PYTHONPATH": paths,
+                   "JAX_PLATFORMS": "cpu", "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache"),
+                   "JAX_ENABLE_COMPILATION_CACHE": "true", "DEW_XLA_CACHE_URL": "https://cache.invalid"}
+    for name in ("DEW_TEST_NO_CACHE", "DEW_XLA_CACHE_TOKEN"):
+        environment.pop(name, None)
+    command = [sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider", "-n", "2"]
+    done = subprocess.run([*command, str(site)], cwd=tmp_path, env=environment, capture_output=True,
+                          text=True, timeout=300)
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    assert set(seen.read_text().split()) == {str(tmp_path / "cache")}, seen.read_text()
+
+
 def test_a_collection_that_runs_no_test_fetches_no_bundle(cache_worker, tmp_path):
     """A `pytest --collect-only` (ci.py's `collect`) runs no test, so it fetches no file's bundle. Train
     459's 3.14 collect tasks restored the bundle of every file they imported, 602,483 programs and 6 GB
