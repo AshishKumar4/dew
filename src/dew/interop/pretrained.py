@@ -75,7 +75,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
-from dew.nn.sharding import boxed, current_boxes
+from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     DtypeName,
@@ -2000,10 +2000,20 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             params = materialize(params)
         variables = {"params": params}
     if backbone is None:
+        # A readout released alone reads no backbone to draw it over: placed by its shapes alone.
         return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed(variables), directory,
+    return description.bundle(backbone, head, placed(variables, axes=head_axes(head, backbone)), directory,
                               description.tokenizer_folder, **description.fields)
+
+
+def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
+    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by."""
+    from dew.decision.model import DecisionModel
+
+    return drawn_axes(lambda key: DecisionModel(backbone.model, head).initialize_head(
+        key, backbone.variables, jnp.zeros((1, 1), jnp.int32)))
 
 
 def _native_config(config: Mapping[str, object],

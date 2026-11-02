@@ -35,7 +35,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
-from dew.nn.sharding import boxed_axes
+from dew.nn.sharding import drawn_axes
 from dew.registry import from_record, to_record
 
 if TYPE_CHECKING:
@@ -2141,4 +2141,4 @@ def decoder_axes(model) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """The axes a decoder or its media wrapper draws each parameter in, read off its init traced for
     shapes alone over one row of token ids (`boxed_axes`): the table a loaded tree of it is placed by,
     as a run's objective holds its own (`Objective.parameter_axes`)."""
-    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), np.zeros((1, 2), np.int32)))
+    return drawn_axes(model.init, np.zeros((1, 2), np.int32))

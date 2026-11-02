@@ -518,6 +518,15 @@ def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
     return {parameter_path(path): tuple(box.names) for path, box in boxes if isinstance(box, nn.Partitioned)}
 
 
+def drawn_axes(init: Callable[..., object], *inputs) -> dict[Suffix, LogicalAxes]:
+    """The axes `init` (a module's, an objective's, a head's over its backbone) draws each parameter in,
+    read off its draw traced for shapes alone (`jax.eval_shape`, no array made) from a key and `inputs`:
+    the one table a plain tree of it is placed and stepped by, whether a run's objective holds it
+    (`Objective.parameter_axes`), a load places by it (`dew.interop.Pretrained`) or a tower carries its
+    own (`dew.interop.components.bind_component`)."""
+    return boxed_axes(jax.eval_shape(init, jax.random.key(0), *inputs))
+
+
 def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) -> dict[Suffix, LogicalAxes]:
     """`table`'s boxes placement reads under `rules`: those that name an axis the rules place, and those
     that name none at all, a parameter its module keeps whole on every device. A box whose names the
