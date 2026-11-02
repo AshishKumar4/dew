@@ -1058,13 +1058,13 @@ class CausalTransformer(nn.Module):
                                      self._dex_start(index), spec.routed)
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
-    @nn.nowrap
     def drawn_like(self, index: int) -> Hashable:
         """What layer `index` draws as: its scan key and what its extension starts from (`_dex_start`), so
         like layers draw under one scan. A method interceptor that gives a layer parameters of its own (an
         adapter's factors, `dew.lora`) keys it apart where they differ."""
         return (self.scan_keys[index], self._dex_start(index))
 
+    @nn.nowrap
     def _dex_start(self, index: int) -> DexStart | None:
         """What layer `index`'s extension starts from, which its variables keep (`dew.nn.dex`)."""
         return None if self.dex is None else self.dex.start(index)
