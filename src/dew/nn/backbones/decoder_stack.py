@@ -31,7 +31,15 @@ from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
-from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
+from ..sharding import (
+    is_boxed,
+    microbatched,
+    microbatches,
+    pipeline_stage,
+    pipeline_stages,
+    rows_boxed,
+    unboxed,
+)
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name, run_period
 
@@ -310,8 +318,11 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 return step(layer, carry, per_layer_input, store)[0], None
 
             repeats = count // len(run.specs) if periodic else count
+            # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
+            # axis, which the run's view cuts off again per layer (`_rows`).
             x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=repeats)(run, x, inputs)
+                           in_axes=2, length=repeats,
+                           metadata_params={nn.PARTITION_NAME: None})(run, x, inputs)
     return x
 
 
@@ -745,7 +756,8 @@ class StackView:
 
     def stack(self, variables: Mapping[str, Mapping]) -> dict:
         inside = {}
-        for collection, tree in variables.items():
+        # The run computes with the values as stored: a box's names describe a stored layer, not a stack.
+        for collection, tree in unboxed(variables).items():
             tree = dict(tree)
             if collection in self.banked:
                 inside[collection] = tree
@@ -806,13 +818,14 @@ class StackView:
                         for repeat, layer in enumerate(layers):
                             # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
                             row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
-                            tree[layer] = jax.tree.map(row, view[f'{prefix}{offset}'])
+                            tree[layer] = _rows(lambda path, leaf, row=row: row(leaf),
+                                                view[f'{prefix}{offset}'])
                     continue
                 for stage, names in enumerate(self._outside_names(first, count, prefix)):
                     for offset, layer in enumerate(names):
-                        tree[layer] = jax.tree_util.tree_map_with_path(
-                            functools.partial(self._leaf, stage, offset if count > 1 else None,
-                                              collection in self.broadcast), view)
+                        cut = functools.partial(self._leaf, stage, offset if count > 1 else None,
+                                                collection in self.broadcast)
+                        tree[layer] = _rows(cut, view)
             if self.stages > 1 and stages:
                 tree['stages'] = stages
             outside[collection] = tree
@@ -857,6 +870,14 @@ class DecoderBank:
     every layer's copy to the front and the whole stack is on the device at
     once. A host layout therefore refuses a plain loop
     (`dew.training.execution.resident`)."""
+
+
+def _rows(cut, tree):
+    """`cut(path, leaf)` of each of `tree`'s leaves, a layer's row of a stacked run's: a box a scan
+    stacked (`metadata_params`, as initialization draws a run) keeps the names of the axes the row keeps
+    (`rows_boxed`)."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: rows_boxed(leaf, cut(path, unboxed(leaf))), tree, is_leaf=is_boxed)
 
 
 def _on_stage_axis(leaf):

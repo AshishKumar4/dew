@@ -46,6 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 
 from dew.mesh import (
     SEQUENCE_AXIS,
@@ -553,6 +554,39 @@ _BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.Conte
     "boxed", default=types.MappingProxyType({}))
 """The axes modules boxed on their own parameters (`boxed_axes`), which
 `declared_axes` reads ahead of the suffix table while `boxed` holds them."""
+
+
+def declared(init, axes: LogicalAxes | None):
+    """`init` drawing a parameter whose module declares its logical `axes` where it makes it
+    (`nn.with_logical_partitioning`: the axes travel with the parameter, as Flax's partitioning reads
+    them), or `init` itself for `axes` None, a parameter its module names no axes of."""
+    return init if axes is None else nn.with_logical_partitioning(init, axes)
+
+
+def is_boxed(leaf) -> bool:
+    """Whether `leaf` is a box of axis metadata (`nn.LogicallyPartitioned`), which a tree walk stops at."""
+    return isinstance(leaf, meta.AxisMetadata)
+
+
+def unboxed(tree):
+    """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
+    holds, as it holds it: no constraint its names would apply inside a trace (`LogicallyPartitioned.unbox`)
+    is applied, so a view that restacks or slices the values (`StackView`) computes with them as stored."""
+    def value(leaf):
+        if isinstance(leaf, meta.Partitioned):
+            return leaf.unbox(apply_constraint=False)
+        return leaf.unbox() if isinstance(leaf, meta.AxisMetadata) else leaf
+    return jax.tree.map(value, tree, is_leaf=is_boxed)
+
+
+def rows_boxed(boxed, value):
+    """`value`, cut from `boxed`'s value along its leading axes (a stacked run's row), in `boxed`'s box
+    with the names of the axes it keeps: a box a scan stacked (`metadata_params`) handed back a row a
+    layer."""
+    if not isinstance(boxed, meta.Partitioned):
+        return value
+    kept = boxed.names[len(boxed.names) - np.ndim(value):]
+    return boxed.replace(value=value, names=kept)
 
 
 def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
