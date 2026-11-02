@@ -382,10 +382,12 @@ def rounding_growth(module: nn.Module, name: str | None, contraction: int, dtype
     at most the group's 2-norm, the group's norm grows by at most 1 + sqrt(g) c / 255, or
     1 + 2^-4 + sqrt(g) c 2^-10 / 448, and the operand's, its groups', by the same; a value clipped moves
     toward zero. Qwix takes a scale below sqrt of the operands' dtype's least normal number as 1
-    (qwix/_src/core/qarray.py, `compute_scale_zero_point`); a value rounded at a scale of 1 is 0 below a
-    half and at most its own size plus a half, twice its size, above it, so where that can meet a value of
-    a half or more, c M / B below sqrt(tiny) with M at least a half (B, Qwix's symmetric bound: 127.5,
-    448), a norm grows by at most 2 (float16's operands; bfloat16's and float32's tiny is far below).
+    (qwix/_src/core/qarray.py, `compute_scale_zero_point`), where an operand rounds as itself does: a
+    value below half the format's least step, q (int8's 1/2, e4m3fn's subnormal 2^-10), rounds to 0, and
+    one above moves by at most q, at most its own size, or by 2^-4 of itself in fp8's normal range, so it
+    grows to at most twice itself. Where c M / B < sqrt(tiny) can meet a value of q or more, B
+    sqrt(tiny) / c > q (B, Qwix's symmetric bound: 127.5, 448), an operand's norm grows by at most 2:
+    float16's operands, and float32's under a clip small enough. A clip is finite and positive.
 
     A weight calibration but `QWIX_WEIGHT_CALIBRATIONS` is refused: its clip is not one these read. A
     rule that quantizes the backward (`Quantization.bwd_qtype`) rounds the gradient a step follows, which
@@ -411,17 +413,19 @@ def rounding_growth(module: nn.Module, name: str | None, contraction: int, dtype
                          f"cancellation, so no curvature bound makes the step a descent: quantize the "
                          f"forward alone, or step it undamped")
     clip = float(arguments[0]) if arguments else 1.0
+    if not math.isfinite(clip) or clip <= 0:
+        raise ValueError(f"a weight calibration's clip is finite and positive, not {policy.calibration!r}")
     group = contraction if policy.tile_size is None else min(policy.tile_size, contraction)
-    bound = 127.5 if policy.dtype == "int8" else 448.0
-    # A scale Qwix takes as 1 (the docstring) can meet a value of a half or more.
-    unit = math.sqrt(float(jnp.finfo(dtype).tiny)) * bound > 0.5
+    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (448.0, 2.0 ** -10)
+    tiny = math.sqrt(float(jnp.finfo(dtype).tiny))
 
     def growth(scale: float) -> float:
         if policy.dtype == "int8":
             grown = 1 + math.sqrt(group) * scale / 255
         else:
             grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / 448
-        return max(grown, 2.0) if unit else grown
+        # A scale Qwix takes as 1 (the docstring) can meet a value it rounds to nonzero.
+        return max(grown, 2.0) if bound * tiny / scale > step else grown
 
     return (1.0 if policy.weight_only else growth(1.0)), growth(clip)
 
