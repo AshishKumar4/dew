@@ -34,8 +34,8 @@ import pytest
 import test_attention_accurate_form as accurate_form
 import test_attention_dropout as dropout
 import test_attention_inplace_operands as inplace
-import test_attention_matrix as matrix
 import test_attention_masked_rows as masked_rows
+import test_attention_matrix as matrix
 import test_attention_mosaic as mosaic
 import test_attention_route as route
 import test_attention_stability as stability
