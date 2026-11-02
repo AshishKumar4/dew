@@ -897,6 +897,42 @@ def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name)
                         truth_fn=functools.partial(plain, wide=jnp.float64))
 
 
+FP8_SHAPES = [(64, 256, 128), (40, 384, 256)]
+"""An FP8 product's decode and serving shapes, rows by depth by columns: a few rows (a decode step's), the
+depth a whole promotion's 128 or more."""
+
+
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2], ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize(("rows", "depth", "width"), FP8_SHAPES)
+def test_an_fp8_product_holds_check_1_under_its_contract(rows, depth, width, dtype):
+    """An FP8 product through the template on an H100 (`template.gemm` of FP8 codes, the matrix K-major
+    `[N, K]` as Hopper's FP8 tensor cores read it, `transpose_rhs`), its rows' and columns' scales applied
+    after: on par with the dequantized product with fp32 sums (`quantization._fp8_rows`'s, check 1's
+    reference arm) from the float64 product of the operands as quantized (testing.md, FP8 products: no FP8
+    floor; row 3620)."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        values = rng.normal(size=(rows, depth))
+        matrix = rng.normal(size=(width, depth))
+        row_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(rows, 1)), jnp.float32)
+        column_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(1, width)), jnp.float32)
+        return (jnp.asarray(values, dtype), jnp.asarray(matrix, dtype), row_scales, column_scales)
+
+    def dew(values, matrix, row_scales, column_scales):
+        product = template.gemm(values, matrix, None, transpose_rhs=True, out_dtype=jnp.float32,
+                                interpret_on_cpu=True)
+        return product * row_scales * column_scales
+
+    def dequantized(values, matrix, row_scales, column_scales, wide=jnp.float32):
+        product = jnp.dot(values.astype(wide), matrix.astype(wide).T, preferred_element_type=wide,
+                          precision=jax.lax.Precision.HIGHEST)
+        return product * row_scales.astype(wide) * column_scales.astype(wide)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert_as_exact(jax.jit(dew), jax.jit(dequantized), draw, f"an {jnp.dtype(dtype).name} product",
+                        seeds=SEEDS, truth_fn=functools.partial(dequantized, wide=jnp.float64))
+
+
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_epilogue_applies_to_every_row(generation_name):
     """A row past the routed ones sums nothing: its output is the epilogue of zero, the bias."""
