@@ -121,8 +121,8 @@ def _traced(fn, args):
     shapes, dtypes and weak types, as jit traces (its closure's arrays the program's constants), so its
     compiled runs (`_compiled`, `_span`) compile once."""
     leaves, structure = jax.tree.flatten(args)
-    key = (structure, tuple((np.shape(leaf), jnp.result_type(leaf), jax.dtypes.is_weakly_typed(leaf))
-                            for leaf in leaves))
+    key = (structure, tuple((np.shape(leaf), jnp.result_type(leaf),
+                             getattr(jax.typeof(leaf), "weak_type", False)) for leaf in leaves))
     traces = TRACES.setdefault(fn, {})
     if key not in traces:
         closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
