@@ -868,7 +868,8 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
             q_pos=None, columns=None, *, keys_first: bool = False, read: tuple[bool, bool] = (False, False),
-            draw: Draw | None = None, tile_keys: int | None = None) -> algebra.Coords:
+            draw: Draw | None = None, tile_keys: int | None = None, held: tuple | None = None
+            ) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
@@ -877,7 +878,8 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     a row's: each one's places a vector broadcast where the step surely reads them (`read`, its queries' and
     its keys', `algebra.places_read`), a tile otherwise. A part of the walk's tile (a consumer's share of
     its keys) states the whole tile's keys (`tile_keys`, `algebra.Coords.key_count`), so a part past the
-    call's keys is masked as its tile is."""
+    call's keys is masked as its tile is. `held` (`_query_bounds`) its queries' intervals and ids a walk
+    read once, before its loop, where it holds them."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
 
     def places(start, axis: int) -> jax.Array:
@@ -909,20 +911,33 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     if spans is None:
         return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, tile_keys=tile_keys,
                               key_start=key_start, key_offsets=key_offsets)
-    rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
-    of_queries, of_keys = ((family.columns_of, family.rows_of) if keys_first
-                           else (family.rows_of, family.columns_of))
+    keys = pl.ds(k_first, shape[key_axis])
+    of_keys = family.rows_of if keys_first else family.columns_of
+    bounds, query_ids = held if held is not None else _query_bounds(family, spans, row, first,
+                                                                    shape[query_axis], keys_first=keys_first)
+    ids = None
+    if query_ids is not None and spans.key_ids is not None:
+        ids = query_ids, of_keys(spans.key_ids.at[row, keys])
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys)
+
+
+def _query_bounds(family: mosaic.Family, spans: _Spans, row, first, count: int, *, keys_first: bool = False
+                  ) -> tuple[tuple, jax.Array | None]:
+    """A query block's intervals (one vector of bounds a call's run, `_spans_of`) and its ids, read from the
+    spans' arrays: what `_coords` reads a step, which a walk reads once before its loop where its steps
+    share its queries (every load in the loop waits its global latency, ET-DECPROF2-h100: a decode step's
+    walk stalled on its long scoreboard ten times its barrier's)."""
+    rows = pl.ds(first, count)
+    of_queries = family.columns_of if keys_first else family.rows_of
 
     def bounds_of(*run):
-        # A query's interval, or a call's run's, one vector of bounds a run (`_spans_of`).
         return of_queries(spans.start.at[(row, *run, rows)]), of_queries(spans.end.at[(row, *run, rows)])
 
     runs = [(run,) for run in range(spans.start.shape[1])] if spans.start.ndim == 3 else [()]
-    bounds = tuple(bounds_of(*run) for run in runs)
     ids = None
     if spans.query_ids is not None and spans.key_ids is not None:
-        ids = of_queries(spans.query_ids.at[row, rows]), of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys)
+        ids = of_queries(spans.query_ids.at[row, rows])
+    return tuple(bounds_of(*run) for run in runs), ids
 
 
 def _rows(family: mosaic.Family, ref, row, head, first, count: int):

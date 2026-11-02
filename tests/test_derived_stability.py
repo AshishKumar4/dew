@@ -52,16 +52,18 @@ ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIE
 @pytest.mark.parametrize(("name", "dtype"), ATTENTION_FAMILIES,
                          ids=[f"{name}-{dtype or 'as drawn'}" for name, dtype in ATTENTION_FAMILIES])
 def test_the_derived_attention_is_finite_where_the_reference_is_on_every_family(name, dtype):
-    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the reference is over
-    the family's draws, a row that sees nothing zero."""
+    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the reference is and
+    the float64 truth rounds finite (`assert_finite`) over the family's draws, a row that sees nothing
+    zero."""
     family = attention_suite.FAMILIES[name]
     family = family if dtype is None else dataclasses.replace(family, dtype=dtype)
     draw = attention_suite._cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(attention_suite._reference(family, anchored=False))))
+    truth = with_gradients(attention_suite._reference(family, anchored=True))
     label = f"portable derived {family.dtype} {name}"
     with derived():
         differentiated = jax.jit(with_gradients(attention_suite._mainloops(family, {})["portable"]))
-        attention_suite.assert_finite(differentiated, reference, draw, label,
+        attention_suite.assert_finite(differentiated, reference, truth, draw, label,
                                       seeds=attention_suite.SEEDS[name])
         attention_suite._held_empty(family, differentiated(*draw(0)), label)
 

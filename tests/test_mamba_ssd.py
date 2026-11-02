@@ -108,39 +108,31 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-DRAWN_APART = {128: ["bf16"], 256: ["ragged-documents", "wide-state-documents"]}
-"""The port's cases past two minutes in one process, by their recorded seeds: bf16 256 seconds, ragged
-documents 130 and wide-state documents 297 (train 270's CI on 66a222273, ledger 2119), each seed 0.5 to 2
-seconds of the interpreter's. Each runs as armada's map tasks of seeds and their judge (`check1_shards`),
-every seed drawn and judged as one process would."""
-
-LONG = {case for cases in DRAWN_APART.values() for case in cases}
+SEEDS = {128: ["bf16", "whole-chunks"], 256: ["ragged-documents", "wide-state-documents"]}
+"""The port's cases by their recorded seeds, each past or at two minutes in one process: bf16 256 seconds,
+ragged documents 130, wide-state documents 297 (train 270's CI on 66a222273, ledger 2119) and whole chunks
+136 (ssd-shards on 052cc16d8), each seed 0.5 to 2 seconds of the interpreter's. Each runs as armada's map
+tasks of seeds and their judge (`check1_shards`), every seed drawn and judged as one process would."""
 
 
-@pytest.mark.parametrize("case", [case for case in CASES if case not in LONG])
+@pytest.mark.parametrize("case", SEEDS[128])
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
     The truth is mamba_ssm's minimal torch reference in float64. Each of the case's head counts (`CASES`:
     kernels summing a group's heads take that many a program) runs every declared draw, each draw's truth
-    taken once for all of them.
+    taken once for all of them. A map task draws 16 seeds of both cases: 79 s, where 24 took 100
+    (ssd-shards2 on 2bd537430, 2.5 s a seed past 39 s of compiles).
     """
     _port_holds_check_1(case)
 
 
-@pytest.mark.parametrize("case", DRAWN_APART[128])
-@pytest.mark.check1_shards(seeds=128, per_task=32)
-def test_a_long_bf16_port_case_is_as_exact_as_mamba_ssm(case):
-    """`test_the_port_is_as_exact_as_mamba_ssm` over the bf16 case's 128 recorded seeds (`DRAWN_APART`), in
-    map tasks of 32 (64 s at its 2 seconds a seed)."""
-    _port_holds_check_1(case)
-
-
-@pytest.mark.parametrize("case", DRAWN_APART[256])
-@pytest.mark.check1_shards(seeds=256, per_task=32)
-def test_a_long_documents_port_case_is_as_exact_as_mamba_ssm(case):
-    """`test_the_port_is_as_exact_as_mamba_ssm` over the long cases of 256 recorded seeds (`DRAWN_APART`),
-    each map task of 32 drawing both cases (53 s at their 1.7 seconds a seed together)."""
+@pytest.mark.parametrize("case", SEEDS[256])
+@pytest.mark.check1_shards(seeds=256, per_task=24)
+def test_the_documents_port_cases_are_as_exact_as_mamba_ssm(case):
+    """`test_the_port_is_as_exact_as_mamba_ssm` over the cases of 256 recorded seeds (`SEEDS`), a map task
+    drawing 24 of both (32 took 69 to 91 s, ssd-shards on 052cc16d8)."""
     _port_holds_check_1(case)
 
 

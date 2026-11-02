@@ -2,8 +2,9 @@
 built work list, each query head of a key head's group a packed row, each row's keys cut into slices, merged.
 
 Each case is held to the reference path's attention over the same keys (check 1): a step of one query position
-and a verify block of four, grouped heads, rows of their own lengths and starts, sinks and a softcap, and the
-builders' inverse (`unpacked` of `packed`) and the work list's slices exactly covering each row's keys.
+and a verify block of four, grouped heads, rows of their own lengths and starts, sinks and a softcap, a row
+past the fold's reach, and the builders' inverse (`unpacked` of `packed`) and the work list's slices exactly
+covering each row's keys.
 """
 
 import itertools
@@ -76,6 +77,29 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
                     f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["one-query", "verify-four"])
+def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call):
+    """A decode step whose first row's query is 2^16 times a drawn one (its folded logits past
+    `algebra.FOLD_REACH`, where the fold's rounding moves its weights) and whose second row's is drawn: the
+    first row walked again in the natural form by the masked launch (`algebra.walked_launches`), the second
+    kept folded, each on par with the reference path (check 1)."""
+    positions, heads, kv_heads = CALLS[call]
+    spans = _spans(positions)
+    drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+
+    def draw(seed: int):
+        query, key, value, _ = drawn(seed)
+        return query.at[0].multiply(2.0 ** 16), key, value
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    f"template decode past the fold's reach {call}", seeds=SEEDS)
 
 
 PAGE = 128

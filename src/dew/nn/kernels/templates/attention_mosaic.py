@@ -231,8 +231,8 @@ class MosaicForward(_Mainloop[Tiles]):
     """The inference walk's output dtype, the query's where None: fp32 for a split launch's slices, which a
     merge takes (`attention_decode`)."""
     masked: bool = False
-    """Whether a natural spans call's guard runs as a launch every time over its live rows alone, no branch
-    (`algebra.walked_launches`' `masked`: a decode step's, row 1978)."""
+    """Whether a spans call's rewalk (the fold's natural walk, the headroom guard) runs as a launch every time
+    over its rows alone, no branch (`algebra.walked_launches`' `masked`: a decode step's, row 1978)."""
     splits: int = 1
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""

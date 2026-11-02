@@ -336,6 +336,109 @@ def quantized_products(module: nn.Module, name: str | None = None) -> QuantizedP
                              and policy.bwd_stochastic_rounding is not None)
 
 
+class LinearProducts(nn.Module):
+    """What a layer that reads its submodules' products asks of them, answered here for a plain call and
+    by a method interceptor that changes it for itself (`dew.lora`'s, a checkpoint's input quantization's):
+    the kernel each multiplies by (`applied_kernel`), whether it multiplies its input as a linear map
+    (`nonlinear_input`), and whether it is that map by its own kernel (`linear_product`). A model's head
+    and continuum level, MLA's absorbed projection and an in-context memory's heads read them."""
+
+    def applied_kernel(self, name: str) -> jax.Array:
+        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
+        interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
+        frozen FP8 site's is its codes decoded."""
+        return getattr(self, name).get_variable("params", "kernel")
+
+    def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
+        """Whether this call computes the submodule `name`, or a module under it, other than as a linear
+        map of its input: as the Qwix quantization the call runs under quantizes its activations or
+        gradients (`quantized_products`; a weight-only rule leaves it linear, by its quantized matrix),
+        read where `qwix`, and as a method interceptor answers for itself (a checkpoint's input
+        quantization, read where `input_scales`, and frozen FP8 products, `dew.lora`'s dropout on a
+        training forward)."""
+        return qwix and quantized_products(self, name).inputs
+
+    def linear_product(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` as the linear map of its input by the kernel it
+        holds: neither its input (`nonlinear_input`) nor its kernel (Qwix's quantized weights) rounded."""
+        return not (self.nonlinear_input(name) or quantized_products(self, name).weights)
+
+
+QWIX_WEIGHT_CALIBRATIONS = ("absmax", "absmax,<scale>")
+"""The weight calibrations whose rounding `rounding_growth` bounds: Qwix's absmax, scaled by a clip where
+one is given; another's range is the data's in a way no norm of it bounds."""
+
+
+def rounding_growth(module: nn.Module, name: str | None, contraction: int, dtype) -> tuple[float, float]:
+    """How much the Qwix quantization the call runs under (`QUANTIZED_TRACE`, `quantized_products`) can
+    grow the 2-norms of the two operands the bound `module`'s submodule `name` multiplies (without a
+    `name`, a product `module` forms in its own scope), over a contraction of `contraction`, its operands
+    of `dtype`: (its input's, its kernel's), 1 where that operand is not quantized.
+
+    Qwix scales each operand per channel, its every non-contracted axis, over the contraction or each tile
+    of `Quantization.tile_size` along it (qwix/_src/core/dot_general.py, `get_how_to_quantize`), so a
+    group of g values whose largest is M rounds by step / 2 each: int8 by c M / 255 (absmax over Qwix's
+    symmetric bound 127.5), fp8 e4m3fn by 2^-4 of the value and at most 2^-10 c M / 448 below its normal
+    range, c the weight calibration's clip (an activation's 1, Qwix's default absmax, dynamic). As M is
+    at most the group's 2-norm, the group's norm grows by at most 1 + sqrt(g) c / 255, or
+    1 + 2^-4 + sqrt(g) c 2^-10 / 448, and the operand's, its groups', by the same; a value clipped moves
+    toward zero. Qwix takes a scale below sqrt of the operands' dtype's least normal number as 1
+    (qwix/_src/core/qarray.py, `compute_scale_zero_point`), where an operand rounds as itself does: a
+    value below half the format's least step, q (int8's 1/2, e4m3fn's subnormal 2^-10), rounds to 0, and
+    one above moves by at most q, at most its own size, or by 2^-4 of itself in fp8's normal range, so it
+    grows to at most twice itself. Where c M / B < sqrt(tiny) can meet a value of q or more, B
+    sqrt(tiny) / c > q (B, Qwix's symmetric bound: 127.5, 448), an operand's norm grows by at most 2:
+    float16's operands, and float32's under a clip small enough. A clip is finite and positive.
+
+    A weight calibration but `QWIX_WEIGHT_CALIBRATIONS` is refused: its clip is not one these read. A
+    rule that quantizes the backward (`Quantization.bwd_qtype`) rounds the gradient a step follows, which
+    can reverse a small one formed by cancellation, so no curvature bound makes the step a descent: refused.
+    A provider of the caller's own (no `Quantization`) is refused too, its rounding unknown."""
+    trace: QuantizedTrace | None = QUANTIZED_TRACE.value
+    if trace is None or not quantized_products(module, name).weights:
+        return 1.0, 1.0
+    policy = trace.policy
+    site = "/".join((*module.path, *([] if name is None else [name])))
+    if policy is None:
+        raise ValueError(f"{site} computes under a Qwix provider of the caller's own, whose rounding no "
+                         "bound here reads")
+    method, *arguments = policy.calibration.split(",")
+    if method != "absmax" or len(arguments) > 1:
+        raise ValueError(f"a bound through {site} reads how far its Qwix "
+                         f"quantization rounds its kernel, which the weight calibration "
+                         f"{policy.calibration!r} does not bound; the bounded ones are "
+                         f"{', '.join(QWIX_WEIGHT_CALIBRATIONS)}")
+    if policy.bwd_qtype is not None:
+        raise ValueError(f"a damped step through {site} follows the gradient Qwix's rule rounds in the "
+                         f"backward ({policy.bwd_qtype}), which can reverse a small gradient formed by "
+                         f"cancellation, so no curvature bound makes the step a descent: quantize the "
+                         f"forward alone, or step it undamped")
+    clip = float(arguments[0]) if arguments else 1.0
+    if not math.isfinite(clip) or clip <= 0:
+        raise ValueError(f"a weight calibration's clip is finite and positive, not {policy.calibration!r}")
+    group = contraction if policy.tile_size is None else min(policy.tile_size, contraction)
+    bound, step = (127.5, 0.5) if policy.dtype == "int8" else (448.0, 2.0 ** -10)
+    tiny = math.sqrt(float(jnp.finfo(dtype).tiny))
+
+    def growth(scale: float) -> float:
+        if policy.dtype == "int8":
+            grown = 1 + math.sqrt(group) * scale / 255
+        else:
+            grown = 1 + 2 ** -4 + math.sqrt(group) * scale * 2 ** -10 / 448
+        # A scale Qwix takes as 1 (the docstring) can meet a value it rounds to nonzero.
+        return max(grown, 2.0) if bound * tiny / scale > step else grown
+
+    return (1.0 if policy.weight_only else growth(1.0)), growth(clip)
+
+
+def intercepted_nonlinear(module: LinearProducts, name: str, input_scales: bool = True) -> bool:
+    """Whether a method interceptor computes the bound `module`'s submodule `name` other than as a linear
+    map of its input (`nonlinear_input`, read apart from Qwix's quantization, which `rounding_growth`
+    bounds): a frozen FP8 product, an adapter's dropout, and a checkpoint's quantizer of its input where
+    `input_scales` (a bound that reads the quantizer's own rounding passes False)."""
+    return module.nonlinear_input(name, qwix=False, input_scales=input_scales)
+
+
 def _qwix(module: str = "qwix") -> ModuleType:
     """Qwix's `module`, imported when a call needs it; without Qwix, an error
     that names the extra which installs it."""
@@ -818,8 +921,10 @@ class InputQuantization:
                 # that does, is not.
                 name = args[0] if args else kwargs["name"]
                 held = flatten_dict(dict(getattr(module, name).variables.get(QUANTIZATION, {})))
-                return next_fun(*args, **kwargs) or any(
-                    path[-1] in (*INPUT_SCALES.values(), FROZEN_FP8[0]) for path in held)
+                # A caller that reads the input quantizer's rounding itself asks of the rest alone.
+                rounding = (*INPUT_SCALES.values(), FROZEN_FP8[0]) if kwargs.get("input_scales", True) else (
+                    FROZEN_FP8[0],)
+                return next_fun(*args, **kwargs) or any(path[-1] in rounding for path in held)
             calls = context.method_name in ("__call__", "_linear")
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
