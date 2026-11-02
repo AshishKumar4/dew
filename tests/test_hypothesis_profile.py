@@ -21,18 +21,20 @@ def test_drawn(value):
         out.write(f"{{value}}\\n")
 
 
-@given(strategies.integers())
+@given(strategies.just(0))
 def test_slow(value):
-    time.sleep(2.5)
+    with open({slow!r}, "a") as out:
+        out.write("ran\\n")
+    time.sleep(2.2)
 """
 
 
 @pytest.mark.parametrize("ci", ["", "true"])
 def test_a_property_test_runs_the_profiles_examples_alike_every_run_and_keeps_nothing_in_the_checkout(
         tmp_path, ci):
-    drawn = tmp_path / "drawn.txt"
+    drawn, slowed = tmp_path / "drawn.txt", tmp_path / "slow.txt"
     site = tmp_path / "test_site.py"
-    site.write_text(SITE.format(drawn=str(drawn)))
+    site.write_text(SITE.format(drawn=str(drawn), slow=str(slowed)))
     tests = Path(__file__).resolve().parent
     env = {name: value for name, value in os.environ.items()
            if name not in ("CI", "HYPOTHESIS_STORAGE_DIRECTORY")}
@@ -51,6 +53,7 @@ def test_a_property_test_runs_the_profiles_examples_alike_every_run_and_keeps_no
         assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
         runs.append(drawn.read_text().split())
     assert runs[0] == runs[1] and len(runs[0]) == 50, (len(runs[0]), len(runs[1]))
+    # Its one example past the 2 s deadline fails the test (which passes with none), run again only to confirm it.
     slow = ran("test_slow")
-    assert slow.returncode == 1 and "DeadlineExceeded" in slow.stdout, slow.stdout[-2000:]
+    assert slow.returncode == 1 and 0 < len(slowed.read_text().split()) <= 3, slow.stdout[-2000:]
     assert not (tmp_path / ".hypothesis").exists()
