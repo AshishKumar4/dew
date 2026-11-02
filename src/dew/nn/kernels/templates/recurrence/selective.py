@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import mosaic, scan as block_scan
+from dew.nn.kernels.templates import mosaic, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -193,16 +193,22 @@ sequential adds put B's gradient 1.95 times the portable scan's distance from fl
 starting at every chunk (the interpreted regime test); the adds a buffer takes fewer, as contended."""
 
 
-RESIDENT = 3
-"""The backward's programs a multiprocessor holds at once, mamba_ssm's kMinBlocks at 128 threads
-(`__launch_bounds__(128, 3)`, selective_scan_bwd_kernel.cuh): its compile caps a thread's registers at the
-register file's third (`mosaic.compiler_params`' `resident`, jax 0.12.0.1.post42's `min_blocks_per_sm`), where
-ptxas otherwise fills them, two programs a multiprocessor at any tokens a thread (row 2940)."""
-
 POSITIONS_PER_THREAD = 8
-"""The tokens a backward thread takes: the most whose registers fit `RESIDENT` programs, 65536 / (3 x 128) =
-170 a thread: at 8 the backward needed 152 spill-free (ptxas at minctasm 3, 165 taken), at 16 it needed 224
-(need-*-sm90 at 1213539d0 and 02c73b9f0, minctasm-1213539d0); its warpgroup's 1024 tokens a block."""
+"""The tokens a backward thread takes: the most whose registers leave a multiprocessor three programs, as
+mamba_ssm's kMinBlocks at 128 threads holds (`__launch_bounds__(128, 3)`, selective_scan_bwd_kernel.cuh): at
+8 the backward needed 152 registers spill-free (`BACKWARD_REGISTERS`), at 16 224, past every residency but
+one (need-*-sm90 at 1213539d0 and 02c73b9f0, minctasm-1213539d0); its warpgroup's 1024 tokens a block."""
+
+BACKWARD_REGISTERS = 152
+"""The registers a backward thread holds at `POSITIONS_PER_THREAD` tokens, ptxas's least spill-free cap (165
+taken at minctasm 3): its residency's need (`RESIDENT`)."""
+
+RESIDENT = max(programs for programs in range(1, resources.RESIDENT_PROGRAMS + 1)
+               if resources.entry_registers(1, programs) >= BACKWARD_REGISTERS)
+"""The backward's programs a multiprocessor holds at once: the most whose share of its registers holds
+`BACKWARD_REGISTERS` a thread (three, 168 each), which its compile caps a thread's registers at
+(`mosaic.compiler_params`' `resident`, `min_blocks_per_sm`), where ptxas otherwise fills them, two programs a
+multiprocessor at any tokens a thread (row 2940)."""
 
 
 def block_positions(length: int) -> int:

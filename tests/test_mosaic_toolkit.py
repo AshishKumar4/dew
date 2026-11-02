@@ -283,10 +283,11 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
 
 
 def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
-    """`resources.plan` on an A100 for one mma.sync consumer (two programs a multiprocessor, 81 KiB each):
-    a launch of 16 KiB a stage holds two programs at four stages; one of 40 KiB a stage holds two programs
-    at its floor of two only where it fits, else falls to one program and deepens there; one past every
-    residency at its floor plans nothing."""
+    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread, which leave a
+    multiprocessor four programs (`Family.programs` at the launch's own registers): a launch of 16 KiB a
+    stage holds all four at the deepest ring a quarter of its shared memory holds; one of 40 KiB a stage
+    holds the most programs whose share holds its floor of two stages; one past every residency at its
+    floor plans nothing."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
@@ -297,10 +298,12 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        share = resources.program_shared(generation.shared_budget(target), 2)
+        block = generation.shared_budget(target)
         small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
-    assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
-    assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
+    assert small is not None and (small[0].programs, small[0].stages) == (
+        4, min(8, resources.program_shared(block, 4) // (16 * 1024)))
+    assert wide is not None and wide[0].programs == max(
+        programs for programs in (1, 2, 3, 4) if resources.program_shared(block, programs) >= 2 * 40 * 1024)
     assert past is None
 
 
