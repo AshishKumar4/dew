@@ -13,9 +13,8 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
 - `merged`: the slices' softmax states, each its output normalized in fp32, its maximum and its
-  denominator, combined in slice order with the call's initial state (a sink, `Initial`) as one more
-  (the algebra's merge in natural units: each state's output weighed by its mass at the largest
-  maximum), one sum a row, deterministic.
+  denominator, combined with the call's initial state (a sink, `Initial`) as one more by the algebra's
+  fold over states (`algebra.merged`, `finish`), one sum a row, deterministic.
 
 No arithmetic of its own past the merge: the walk, the hooks and the guards are the template forward's.
 """
@@ -118,37 +117,38 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     return Plan(config, max(1, min(wanted, math.ceil(spans.keys / config.block_k))))
 
 
-def merged(out: jax.Array, maximum: jax.Array, total: jax.Array, initial: Initial | None = None) -> jax.Array:
-    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima and denominators
-    `[B, KV, S, Q]` (natural), and the call's `initial` state `[B, KV, Q]` (its sums `acc` unnormalized),
-    merged into the rows' output `[B, Q, KV, Dv]` fp32: each state's output weighed by its mass at the
-    rows' largest maximum, summed slice by slice then the initial state, over the summed mass; a state of no
-    mass adds nothing, and a row of none is zero, as the reference's."""
-    # The states along axis 1: `[B, S, Q, KV]` each, their outputs `[B, S, Q, KV, Dv]`.
-    maxima, totals = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
+def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,
+           initial: Initial | None = None) -> jax.Array:
+    """The slices' outputs `out` `[B, S, Q, KV, Dv]` (fp32, each normalized), maxima (in `spec`'s units,
+    `algebra.finished_rows`') and denominators `[B, KV, S, Q]`, and the call's `initial` state `[B, KV, Q]`
+    (its sums `acc` unnormalized) merged by the algebra's fold over states (`algebra.merged`, then
+    `finish`): the rows' output `[B, Q, KV, Dv]` fp32. Each state enters as its normalized output and its
+    mass, its denominator folded into its maximum (`m + log(total)`), so no output multiplied back by its
+    denominator passes fp32's largest; a state of no mass adds nothing, and a row of none is zero, as the
+    reference's."""
+    if not spec.natural:
+        raise ValueError("the template's decode merges natural states")
+    m, mass = (jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total))
     if initial is not None:
         held = initial.total > 0
         own = jnp.where(held[..., None], initial.acc / jnp.where(held, initial.total, 1.0)[..., None], 0.0)
         out = jnp.concatenate([out, jnp.swapaxes(own, 1, 2)[:, None]], axis=1)
-        maxima = jnp.concatenate([maxima, jnp.swapaxes(initial.m, 1, 2)[:, None]], axis=1)
-        totals = jnp.concatenate([totals, jnp.swapaxes(initial.total, 1, 2)[:, None]], axis=1)
-    seen = totals > 0
-    maxima = jnp.where(seen, maxima, -jnp.inf)
-    top = jnp.max(maxima, axis=1, keepdims=True)
-    weight = jnp.where(seen, totals * jnp.exp(maxima - jnp.where(jnp.isfinite(top), top, 0.0)), 0.0)
-    summed, mass = jnp.sum(weight[..., None] * out, axis=1), jnp.sum(weight, axis=1)[..., None]
-    return jnp.where(mass > 0, summed / jnp.where(mass > 0, mass, 1.0), 0.0)
+        m = jnp.concatenate([m, jnp.swapaxes(initial.m, 1, 2)[:, None]], axis=1)
+        mass = jnp.concatenate([mass, jnp.swapaxes(initial.total, 1, 2)[:, None]], axis=1)
+    seen = mass > 0
+    units = spec.scale if spec.raw else 1.0
+    folded = jnp.where(seen, m + jnp.log(jnp.where(seen, mass, 1.0)) / units, -jnp.inf)
+    state = algebra.merged(spec, algebra.Partial(out, folded, seen.astype(jnp.float32)), axis=1)
+    return algebra.finish(spec, state, initial=True)[0]
 
 
-def _natural_units(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None,
-                   natural: bool) -> float:
-    """The factor taking the forward's residual maxima to natural logits (`algebra.finished_rows`): the
-    accurate form's raw products' scale (`Forward.raw`), else 1."""
+def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | None) -> algebra.Forward:
+    """The call's natural form as the template's forward takes it (`attention_mosaic_forward._prepared`):
+    the units its finished rows' maxima are in (`algebra.finished_rows`), which its merge takes."""
     power, factor = prescale(query.dtype, query.shape[3], scale)
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
-                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+    return algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=factor,
+                           score_mod=hooks.score_mod, natural=True, initial=hooks.initial is not None,
                            prescale=power)
-    return spec.scale if spec.raw else 1.0
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
@@ -173,5 +173,5 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         out, maximum, total = attention_mosaic.forward(
             rows, key, value, row_spans, walked, scale=scale, natural=True, residuals=Kept.OUTPUT,
             interpret=interpret, out_dtype=jnp.float32, masked=True, splits=work.slices, pages=pages)[:3]
-    units = _natural_units(rows, row_spans, walked, scale=scale, natural=True)
-    return unpacked(merged(out, maximum * units, total, initial), heads).astype(query.dtype)
+    merged_rows = merged(_spec(rows, row_spans, walked, scale=scale), out, maximum, total, initial)
+    return unpacked(merged_rows, heads).astype(query.dtype)
