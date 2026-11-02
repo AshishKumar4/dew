@@ -19,6 +19,7 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+import math
 from typing import Any, ClassVar
 
 import jax
@@ -665,7 +666,7 @@ class StepLaunch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Launch:
         if _whole(ba.kwargs['hooks']):
             return WARPS
-        return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
+        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1]))
 
     def pinnable(self, ba, config) -> bool:
         # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
@@ -680,6 +681,14 @@ class StepLaunch(tuning.KernelOp):
             return super().unpinnable(ba, config)
         return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
                 "dividing the state's width")
+
+
+def column_block(width: int) -> int:
+    """A program's block of a head's `width` value columns: the widest power of two dividing it up to
+    `COLUMNS`' block (itself one), so the programs a head takes cover its every column and a Triton block's
+    size is a power of two. `min(COLUMNS.block, width)` launched `width // block` programs, which left an
+    80-wide head's last 16 columns unwritten and their state stale (quality audit, 2026-11-03)."""
+    return math.gcd(width, COLUMNS.block)
 
 
 def _whole(hooks: Hooks) -> bool:

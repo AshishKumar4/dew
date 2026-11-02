@@ -74,22 +74,24 @@ ONE_TAP_SEEDS = {jnp.float32: 256, jnp.bfloat16: 256}
 """Each one-tap operand dtype's seeds, sized by `seeds_for` on armada (2026-10-20) on the whole tree."""
 
 
-def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) -> recurrence.Step:
-    """A decode token's operands for `hooks`, every third row from the second idle."""
+def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
+             value_width: int = VALUE_WIDTH) -> recurrence.Step:
+    """A decode token's operands for `hooks`, `value_width` values a head, every third row from the second
+    idle."""
     rng = np.random.default_rng(seed)
 
     def normal(*shape, scale=1.0):
         return jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32)
 
-    channels = 2 * KEY_HEADS * KEY_WIDTH + VALUE_HEADS * VALUE_WIDTH
-    given = {'state': normal(ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, scale=0.3).astype(state_dtype),
+    channels = 2 * KEY_HEADS * KEY_WIDTH + VALUE_HEADS * value_width
+    given = {'state': normal(ROWS, VALUE_HEADS, KEY_WIDTH, value_width, scale=0.3).astype(state_dtype),
              'active': jnp.asarray(np.arange(ROWS) % 3 != 1)}
     if hooks.conv is not None:
         given |= {'token': normal(ROWS, channels), 'held': normal(ROWS, TAPS - 1, channels),
                   'taps': normal(channels, TAPS, scale=0.5)}
     else:
         given |= {'query': normal(ROWS, KEY_HEADS, KEY_WIDTH), 'key': normal(ROWS, KEY_HEADS, KEY_WIDTH) / 4,
-                  'value': normal(ROWS, VALUE_HEADS, VALUE_WIDTH)}
+                  'value': normal(ROWS, VALUE_HEADS, value_width)}
     if hooks.gates is not None:
         given['gate'] = normal(ROWS, VALUE_HEADS)
         if hooks.gates.write == 'sigmoid':
@@ -109,7 +111,7 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) ->
     if hooks.skip:
         given['skip'] = normal(VALUE_HEADS)
     if hooks.output is not None:
-        given |= {'z': normal(ROWS, VALUE_HEADS, VALUE_WIDTH), 'weight': normal(VALUE_WIDTH)}
+        given |= {'z': normal(ROWS, VALUE_HEADS, value_width), 'weight': normal(value_width)}
     return recurrence.Step(**given)
 
 
@@ -144,10 +146,11 @@ def orbit(given: recurrence.Step, seed: int) -> recurrence.Step:
     return dataclasses.replace(given, **moved)
 
 
-def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32) -> tuple[recurrence.Step]:
+def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32,
+         value_width: int = VALUE_WIDTH) -> tuple[recurrence.Step]:
     """Fresh operands and an independent exact orbit, deterministically keyed by the draw's seed."""
     operand_seed, orbit_seed = (int(value) for value in np.random.SeedSequence(seed).generate_state(2))
-    return (orbit(operands(hooks, operand_seed, state_dtype), orbit_seed),)
+    return (orbit(operands(hooks, operand_seed, state_dtype, value_width), orbit_seed),)
 
 
 def one_tap_operands(dtype, seed: int) -> recurrence.Step:
@@ -225,6 +228,25 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         if hooks.conv is not None:
             np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
             np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+
+
+UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
+          recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8}
+"""The hooks an 80-wide head steps under (the gated delta rule's, Mamba-2's rated scan with its skip) and
+their declared seeds."""
+
+
+@pytest.mark.parametrize('hooks', UNEVEN, ids=str)
+def test_a_head_wider_than_its_column_blocks_steps_every_column(hooks):
+    """A decode token over 80 value columns a head, at the launch's own config (unpinned): its output and
+    state within tests/reference_error.py's rule of the XLA form's fp32 run against its float64 run, every
+    column among them, so a head whose width no column block divides as many times as it launched them (80
+    of 32 took two programs, 64 columns) leaves none of its outputs unwritten or its state stale."""
+    width = 80
+    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks),
+                    functools.partial(draw, hooks, value_width=width), f'{hooks} {width} wide',
+                    seeds=UNEVEN[hooks], truth_fn=reference_fn)
 
 
 def test_a_column_block_pin_is_refused_where_a_hook_reads_a_whole_head():
