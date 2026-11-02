@@ -527,6 +527,9 @@ class DreamerV3Objective(Objective[Ratio]):
     is untouched)."""
 
     shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
+    resumable = ("entropy",)
+    """The entropy bonus weighs how the policy explores, which SkyDreamer lowers for its last phase; the
+    horizon, lambda and the rest say what the critic and world model estimate."""
     scales: Mapping[str, float] = {"decoder": 1.0, "reward": 1.0, "continue": 1.0, "dynamics": 1.0,
                                    "representation": 0.1, "policy": 1.0, "value": 1.0, "replay_value": 0.3}
 

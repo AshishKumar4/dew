@@ -740,6 +740,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     (`dew.nn.progress.ReadsProgress`); an objective that passes none refuses such a model, which would
     otherwise train at the run's end. An objective over another's model, a distillation's over its
     student, passes as that one does."""
+    resumable: ClassVar[tuple[str, ...]] = ()
+    """The arguments that weigh how the objective learns rather than say what it trains, which a run resumed
+    under its name may change (`dew.config.RunConfig.check_resume`), as a later phase of training lowers a
+    coefficient; every other argument the resume must keep."""
     ema_is_reference: ClassVar[bool] = False
     """Whether the objective's average is the frozen reference its loss compares against (an RL
     policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""

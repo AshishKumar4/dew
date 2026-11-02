@@ -187,13 +187,15 @@ class EnvRunConfig(RunConfig):
     imitation among its arguments), the rollout's settings (`rollout`), an optional teacher (`teacher`), the
     saved run the agent starts from (`pretrained`) and the episodes each validation flies (`episodes`).
 
-    The environment is what the run reads, as data is a run's, so a run resumed under its name may change
-    it (`RESUMABLE`): a curriculum resumes the run at a new difficulty. The run has no epochs, so its
+    The environment is what the run reads, as data is a run's, and the rollout how it collects and replays
+    it, so a run resumed under its name may change them (`RESUMABLE`): a curriculum resumes the run at a
+    new difficulty, a later phase of training at longer windows (SkyDreamer's), the rollout owing its
+    updates from there at its own pace. The run has no epochs, so its
     trainer validates and checkpoints at the cadences it names, none by default, and at its end."""
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "env": "env",
                                                    "teacher": "teacher"}
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes")
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes", "rollout")
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("dew.objectives.rl.dreamer:WorldModel"))
