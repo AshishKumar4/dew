@@ -686,6 +686,25 @@ def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, ca
         assert saved[name].dtype == tensor.dtype, name
 
 
+def test_every_conversion_that_renames_by_another_key_is_a_registered_familys():
+    """A checkpoint conversion that renames a key by whether another is stored (transformers'
+    `GroupWeightRename`) is read by no part's name map, which reads one name at a time
+    (`parts._load_names` refuses it, ledger 3114): every type whose conversion holds one is a registered
+    family's, which the parts route never reads (Kimi K2.5's, whose vision tower's renames these are).
+    A type of the parts route that holds one fails here, to be read by its inventory then."""
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+    from transformers.core_model_loading import GroupWeightRename
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+
+    from dew.interop.hf_decoders import families
+
+    grouped = {model_type for model_type in CONFIG_MAPPING_NAMES
+               if any(isinstance(transform, GroupWeightRename)
+                      for transform in get_checkpoint_conversion_mapping(model_type) or ())}
+    assert grouped
+    assert grouped <= set(families())
+
+
 def test_an_lfm2_of_convolutions_alone_assembles():
     """An LFM2 whose layers are all gated short convolutions (Lfm2Config allows no attention layer) states
     its head geometry through its model's config, as its rotary reads it, so it assembles: every layer a
