@@ -141,14 +141,13 @@ PAGE = 128
 @INTERPRETS
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
 def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call):
-    """A decode step over a paged cache (`attention.Pages`: pools `[KV, P, page, D]`, each row's pages in an
+    """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // PAGE
     table = jnp.asarray([[3, 0], [1, 2]], jnp.int32)[:, :per_row]
-    pages = template.Pages(table, PAGE)
 
     def gathered(pool):
         # [KV, P, page, D] at each row's pages: [B, K, KV, D].
@@ -157,7 +156,7 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call):
 
     def ours(query, key_pool, value_pool):
         with generation.assumed("sm90"):
-            return attention_decode.attend(query, key_pool, value_pool, spans, interpret=True, pages=pages)
+            return attention_decode.attend(query, key_pool, value_pool, spans, interpret=True, table=table)
 
     def reference(query, key_pool, value_pool):
         return template.reference(query, gathered(key_pool), gathered(value_pool), spans)

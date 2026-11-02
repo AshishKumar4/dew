@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.attention import (
     Dropout,
     Hooks,
     KeySpans,
-    Pages,
     Param,
     Split,
     by_power,
@@ -173,7 +172,7 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                    scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
-                   out_dtype=None, masked: bool = False, splits: int = 1, pages: Pages | None = None):
+                   out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None):
     """`MosaicForward`'s launch without residuals, at `tiles`, under the default's guards over whole launches
     (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a block of the family's swizzled value
     columns at a time: its walk carries its shifted and unshifted sums and forms both tiles' products a step
@@ -190,8 +189,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
-        pages=pages, inference=True)
-    table = None if pages is None else (pages.table, pages.size)
+        table=table, inference=True)
+    # A paged call's table and its pools' page (`_launch`'s `table`).
+    paged = None if table is None else (table, key.shape[2])
 
     def whole_rows(live: jax.Array) -> jax.Array:
         # A split launch's row live in every slice where it is in any (`[B, H, S·Qp]`): the guarded launch's
@@ -226,7 +226,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                 spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
                                 counted=form.natural == spec.natural and not again, kept=again,
-                                finishes=rows, columns=first, splits=splits, table=table,
+                                finishes=rows, columns=first, splits=splits, table=paged,
                                 out_dtype=jnp.float32 if split else out_dtype, walks=walks)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
@@ -254,7 +254,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             _, block, *block_rows = _launch(
                 q, k, v, guarded_spans, held._replace(output=()), guard, spec=form, hooks=_unhooked(hooks),
                 tiles=guarded, family=family, training=False, interpret=interpret, columns=first,
-                splits=splits, table=table, out_dtype=jnp.float32 if hooked_blocks else out_dtype,
+                splits=splits, table=paged, out_dtype=jnp.float32 if hooked_blocks else out_dtype,
                 finishes=finishes, column_width=columns.shape[-1] if first is not None else None,
                 walks=walks)
             blocks.append(block)
@@ -437,8 +437,8 @@ def _widened(array: jax.Array, width: int) -> jax.Array:
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-              scale: float, natural: bool, tiles: Tiles, family: mosaic.Family, pages: Pages | None = None,
-              inference: bool = False):
+              scale: float, natural: bool, tiles: Tiles, family: mosaic.Family,
+              table: jax.Array | None = None, inference: bool = False):
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`;
     an `inference` walk's queries to its query blocks alone, which every launch of it divides: a decode step's
     four rows padded to 128 took 21 of B128's 795 us at 4096 keys, ET-DECODE7-h100) and its heads to whole
@@ -459,7 +459,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     power, scale = prescale(query.dtype, query.shape[3], scale)
     folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
     taken = power if folding and spans.form != "spans" else 1.0
-    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles), pages,
+    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles), table,
                        query_block=tiles.consumers * tiles.block_q if inference else None)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
@@ -785,7 +785,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     model's layers alike lower one. With `splits` (an inference launch's, no initial state), each query
     tile's keys are cut into that many slices (`_Program.splits`), each a program of its own, and every
     per-row output above is the slices' own, slice by slice along its query axis (`S·Qp` rows). With
-    `table` (a paged call's page table and its keys a page, `attention.Pages`), `key` and `value` are its
+    `table` (a paged call's page table and its pools' keys a page, `forward`'s), `key` and `value` are its
     pools flattened, `[KV, P·size, D]`, and a step's key tile is read where the table maps it. With
     `column_width`, it walks `value`'s columns `columns` to `columns + column_width` where they lie, its
     output that block's. With `walks` (a masked launch's, `algebra.walked_launches`': `[B, Qp // block_q]`
@@ -827,7 +827,7 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
     batch, queries, heads, width = query.shape
     # A block of the values' columns where it walks one in place (`_launch`'s `column_width`).
     value_width = value.shape[-1] if column_block is None else column_block[1]
-    # A paged call's pools `[KV, P·size, D]`, its keys its table's slots (`Pages`).
+    # A paged call's pools `[KV, P·size, D]`, its keys its table's slots.
     keys_count, kv_heads = ((read[4].shape[1] * page, key.shape[0]) if page is not None
                             else (key.shape[1], key.shape[2]))
     group, consumers = heads // kv_heads, tiles.consumers
