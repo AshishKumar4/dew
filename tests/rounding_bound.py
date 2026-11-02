@@ -99,6 +99,9 @@ def rounding_bound(fn, *args, batch: int = 64):
     return (structure.unflatten([np.asarray(value) for value in outputs]), structure.unflatten(bounds))
 
 
+CHEAP_COMPILE = {"xla_backend_optimization_level": 0, "xla_llvm_disable_expensive_passes": True}
+"""The compile options of a rounding scale's program (`rounding_scale`)."""
+
 DRAWS = 16
 """The Gaussian tap draws that estimate a program's rounding scale (`rounding_scale`)."""
 
@@ -122,9 +125,12 @@ def rounding_scale(fn, *args, seed: int = 0):
         leaves, structure = jax.tree.flatten(wide)
         key = (structure, tuple((np.shape(leaf), np.asarray(leaf).dtype) for leaf in leaves))
         held = SCALES.setdefault(fn, {})
+        given = ([jnp.asarray(leaf) for leaf in leaves], jax.random.key(seed))
         if key not in held:
-            held[key] = _scale_program(fn, wide)
-        outputs, scales = held[key]([jnp.asarray(leaf) for leaf in leaves], jax.random.key(seed))
+            # XLA's cheapest compile: the program runs a few dozen times a site, and its passes cost far more
+            # than they save there (88.7 s of compile at XLA's default level, a corner gradient's).
+            held[key] = _scale_program(fn, wide).lower(*given).compile(compiler_options=CHEAP_COMPILE)
+        outputs, scales = held[key](*given)
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
     return tree.unflatten([np.asarray(value) for value in outputs]), tree.unflatten(
         [np.asarray(scale) for scale in scales])
