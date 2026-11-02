@@ -182,7 +182,7 @@ def test_a_file_a_tasks_deadline_cut_off_takes_the_times_of_the_tests_it_finishe
     records any test's, where its record lacks them; the plan then cuts the file by them, a test it never
     reached weighing their mean. A file red otherwise keeps its record."""
     heavy, failed = "tests/test_heavy.py", "tests/test_failed.py"
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240, "environment": {}}))
     (tmp_path / heavy).write_text("".join(f"def test_{index}():\n    pass\n" for index in range(6)))
     (tmp_path / failed).write_text("def test_a():\n    pass\n")
     (tmp_path / "tests/test_durations.json").write_text("{}\n")
