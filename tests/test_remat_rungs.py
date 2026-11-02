@@ -18,12 +18,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, VOCAB, Case
-from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, reads
+from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, tokens
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin, stepped_outputs
 from reference_error import assert_as_exact, widened
 from tool_support import load
-from whole_suite import timed
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -156,22 +155,11 @@ def _redrawn(inputs, seed: int):
     return jax.tree.map(leaf, inputs)
 
 
-def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
-    """Each rung holds less than the one below it, and its top rung steps the
-    forward the model does. Each rung keeps fewer residual bytes for its
-    backward than the rung below it (`_saved`), so no rung is a remat that
-    recomputes nothing. The top rung's checkpoint makes its forward another
-    program, which check 1 holds against the model's from the model's float64
-    twin over drawn inputs. Its backward recomputes, which can round apart
-    (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
-    test_decoder_remat.py found the same), so a covering class's member
-    (`GRADIENT_COVERING`) holds its gradients to check 1 too, each parameter
-    its own leaf. Both are taken over the variables with every
-    all-zero leaf drawn (tools/layout_parity.py's `zeros_drawn`): a zero output
-    projection or an identity modulation, as a fresh DiT holds them, would
-    leave its trunk's gradient zero and a wrong recomputed backward unseen.
-    A rung's record restores it from any rung below
-    it and moves no rung above it, and the top rung runs over the model's
+def _climbs_and_restores(model, variables, inputs, **apply) -> None:
+    """Each rung holds less than the one below it, and its record restores it. Each rung keeps fewer
+    residual bytes for its backward than the rung below it (`_saved`), over the variables with every
+    all-zero leaf drawn (`_zeros_drawn`), so no rung is a remat that recomputes nothing. A rung's record
+    restores it from any rung below it and moves no rung above it, and the top rung runs over the model's
     variables, every collection where it was.
 
     Of testing.md's memory settings, no remat and a rung of the planner's, a
@@ -190,54 +178,75 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
-    variables = {**variables, "params": ZEROS_DRAWN(variables["params"], jax.random.key(7))}
+    variables = _zeros_drawn(variables)
     saved = [_saved(rung, variables, inputs, **apply) for rung in rungs]
     assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
                                                                                          strict=True))
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
-    # Device arrays, made under x64 so they stay float64: a layer that indexes a weight by its ids
-    # (DeepSeek V4's hash routing, Gemma 4's per-expert scales) indexes a device array in a program.
+    assert rungs[-1].apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
+
+
+def _zeros_drawn(variables):
+    """`variables` with every all-zero leaf drawn (tools/layout_parity.py's `zeros_drawn`): a zero output
+    projection or an identity modulation, as a fresh DiT holds them, would leave its trunk's gradient zero
+    and a wrong recomputed backward unseen."""
+    return {**variables, "params": ZEROS_DRAWN(variables["params"], jax.random.key(7))}
+
+
+def _against_its_twin(model, variables):
+    """The model's top rung, its record, and its float64 twin over `variables` widened, every all-zero
+    leaf drawn (`_zeros_drawn`): the arms and the truth check 1 holds the top rung's step to. Device
+    arrays, made under x64 so they stay float64: a layer that indexes a weight by its ids (DeepSeek V4's
+    hash routing, Gemma 4's per-expert scales) indexes a device array in a program."""
+    top = _rungs(model)[-1]
     with jax.enable_x64(new_val=True):
-        twin, wide_variables = float64_twin(model), jax.tree.map(jnp.asarray, widened(variables))
-
-    # Plain functions of the inputs, which the gate compiles, the truths under x64 over inputs it widens.
-    def forward(rung, variables=variables):
-        return lambda *inputs: _call(rung, variables, inputs, **apply)
-
-    def stepped(rung, variables=variables):
-        return lambda *inputs: _stepped(rung, variables, inputs, **apply)
-
-    top = rungs[-1]
-    record = top.recompute_record()
-
-    def draw(seed):
-        return _redrawn(inputs, seed)
-
-    assert_as_exact(forward(top), forward(model), draw, f"forward at {record}", seeds=RUNG_SEEDS,
-                    truth_fn=forward(twin, wide_variables))
-    if name in GRADIENT_SEEDS:
-        if judged(model) is not model:
-            # The release's setting, whose gradient no float64 truth judges, steps finitely.
-            assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(stepped(top)(*inputs)))
-        assert_as_exact(stepped(judged(top)), stepped(judged(model)), draw, f"gradient at {record}",
-                        seeds=GRADIENT_SEEDS[name], truth_fn=stepped(judged(twin), wide_variables))
-    assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
+        return top, top.recompute_record(), float64_twin(model), jax.tree.map(jnp.asarray, widened(variables))
 
 
-PAST_TARGET = {"rungs": {"deepseek-v4-tiny": 130, "deepseek-v41-tiny": 126, "qwen35-tiny": 182,
-                         "glm5-next-tiny": 162, "kimi-k3-tiny": 128, "kimi-linear-tiny": 127,
-                         "qwen4-exp-native-tiny": 121}}
-"""The checkpoints whose rungs take past a group's 120 s to step (`timed`), each its seconds on armada:
-DeepSeek V4's and V4.1's at 93d13e2ae and d1cea9074, Kimi K3's and Kimi Linear's at 52ec00f1f, Qwen 3.5's
-and GLM-5 Next's in the durations record, Qwen4-Exp's native checkpoint at 5163cd0bd. Every train steps
-every other checkpoint's rungs, and the architectures' rungs cover each mixer these hold; Qwen4-Exp's
-transformers checkpoint (qwen4-exp-tiny, 111 s) steps the native one's decoder."""
+def _steps_its_forward(model, variables, inputs, **apply) -> None:
+    """The top rung's checkpoint makes its forward another program, which check 1 holds against the model's
+    from the model's float64 twin over drawn inputs (`_against_its_twin`)."""
+    variables = _zeros_drawn(variables)
+    top, record, twin, wide = _against_its_twin(model, variables)
+    assert_as_exact(lambda *drawn: _call(top, variables, drawn, **apply),
+                    lambda *drawn: _call(model, variables, drawn, **apply),
+                    lambda seed: _redrawn(inputs, seed), f"forward at {record}", seeds=RUNG_SEEDS,
+                    truth_fn=lambda *drawn: _call(twin, wide, drawn, **apply))
 
 
-@pytest.mark.parametrize("name", timed(PAST_TARGET, "rungs", PATHS))
-def test_a_checkpoints_remat_rungs_step_as_it_does(name):
-    source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(name, source.model, source.variables, (read.tokens,), method="logits")
+def _steps_its_gradient(name: str, model, variables, inputs, **apply) -> None:
+    """The top rung's backward recomputes, which can round apart (gemma2-tiny's gradients by up to 1.2e-4,
+    kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py found the same), so a covering class's member
+    (`GRADIENT_COVERING`) holds its gradients to check 1 against the model's from its float64 twin, each
+    parameter its own leaf (`_against_its_twin`), at the setting its truth resolves (`judged`)."""
+    variables = _zeros_drawn(variables)
+    top, record, twin, wide = _against_its_twin(model, variables)
+    if judged(model) is not model:
+        # The release's setting, whose gradient no float64 truth judges, steps finitely.
+        assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(_stepped(top, variables, inputs,
+                                                                                **apply)))
+    assert_as_exact(lambda *drawn: _stepped(judged(top), variables, drawn, **apply),
+                    lambda *drawn: _stepped(judged(model), variables, drawn, **apply),
+                    lambda seed: _redrawn(inputs, seed), f"gradient at {record}", seeds=GRADIENT_SEEDS[name],
+                    truth_fn=lambda *drawn: _stepped(judged(twin), wide, drawn, **apply))
+
+
+@pytest.mark.parametrize("name", PATHS)
+def test_a_checkpoints_remat_rungs_climb_and_restore(name):
+    source = loaded(name)
+    _climbs_and_restores(source.model, source.variables, (tokens(name),), method="logits")
+
+
+@pytest.mark.parametrize("name", PATHS)
+def test_a_checkpoints_top_rung_steps_its_forward_as_it_does(name):
+    source = loaded(name)
+    _steps_its_forward(source.model, source.variables, (tokens(name),), method="logits")
+
+
+@pytest.mark.parametrize("name", [name for name in PATHS if name in GRADIENT_SEEDS])
+def test_a_covering_checkpoints_top_rung_steps_its_gradient_as_it_does(name):
+    source = loaded(name)
+    _steps_its_gradient(name, source.model, source.variables, (tokens(name),), method="logits")
 
 
 CONTINUUM_SEEDS = 8
@@ -324,13 +333,32 @@ def _inputs(case) -> tuple:
     return sample, jnp.asarray([0.3, 0.7]), TextContext(text, jnp.ones((ROWS, TEXT_TOKENS), bool))
 
 
-@pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
-def test_an_architectures_remat_rungs_step_as_it_does(case):
-    """Every architecture test_architectures.py trains that climbs a remat
-    ladder, decoders and DiT stacks, at its size there."""
+def _built(case) -> tuple:
+    """The case's model, its variables and its inputs (`_inputs`)."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(case.name, model, model.init(jax.random.key(0), *inputs), inputs)
+    return model, model.init(jax.random.key(0), *inputs), inputs
+
+
+COVERED = [case for case in RECOMPUTED if case.name in GRADIENT_SEEDS]
+"""The architectures that stand for a class of the gradient's covering (`GRADIENT_COVERING`)."""
+
+
+@pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
+def test_an_architectures_remat_rungs_climb_and_restore(case):
+    """Every architecture test_architectures.py trains that climbs a remat
+    ladder, decoders and DiT stacks, at its size there."""
+    _climbs_and_restores(*_built(case))
+
+
+@pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
+def test_an_architectures_top_rung_steps_its_forward_as_it_does(case):
+    _steps_its_forward(*_built(case))
+
+
+@pytest.mark.parametrize("case", COVERED, ids=[case.name for case in COVERED])
+def test_a_covering_architectures_top_rung_steps_its_gradient_as_it_does(case):
+    _steps_its_gradient(case.name, *_built(case))
 
 
 def test_the_gradient_covering_names_tested_models():

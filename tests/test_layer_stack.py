@@ -31,7 +31,6 @@ from reference_error import (
 )
 from sharded import assert_sharded
 from token_support import token_rows
-from whole_suite import timed
 
 from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
@@ -285,13 +284,7 @@ class ScanCase:
         return arm("scanned"), arm("plain"), truth
 
 
-PAST_TARGET = {"scan": {"gemma3n": 151}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2137):
-Gemma 3n's scanned stack; every train scans the other shapes, the sparse gate's fault among them."""
-
-
-@pytest.mark.parametrize("shape", timed(PAST_TARGET, "scan", sorted(SHAPES)))
-def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
+def scans_as_the_loop(shape: str) -> None:
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
@@ -302,6 +295,21 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scanned, plain, truth = case.arms()
     assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
                     truth_fn=truth)
+
+
+@pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
+def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
+    """`scans_as_the_loop` over each shape but Gemma 3n's, which CI's map tasks draw
+    (`test_gemma3ns_runs_of_like_layers_scan_as_its_loop`)."""
+    scans_as_the_loop(shape)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
+    """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
+    (`check1_shards`), 32 a task: a task's compile and margins took 55 s and each seed 1.2 s on armada
+    (cProfile, 62a555f178)."""
+    scans_as_the_loop("gemma3n")
 
 
 def test_a_scanned_gate_at_another_sparsity_fails_check_1():
