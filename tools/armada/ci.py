@@ -774,16 +774,18 @@ RECORD_TRIES = 4
 
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order, but its check-1 sites',
-    which run in tasks of their own (`sites`)."""
-    tests: dict[str, list[float]] = {}
+    which run in tasks of their own (`sites`), and those of one shared setup one weight at the first one's place
+    (`session.units`), as a cut takes them."""
+    nodes: dict[str, list[str]] = {}
     held: dict[str, dict[str, Mark]] = {}
-    for node, seconds in sorted(durations_record().items()):
+    record = durations_record()
+    for node in sorted(record):
         name = node.split("::")[0]
         if name not in held:
             held[name] = sites(name)
-        if site_name(node) not in held[name]:
-            tests.setdefault(name, []).append(seconds)
-    return tests
+        if session.test_name(node) not in held[name]:
+            nodes.setdefault(name, []).append(node)
+    return {name: session.unit_seconds(own, [record[node] for node in own]) for name, own in nodes.items()}
 
 
 def durations_record() -> dict[str, float]:
@@ -794,14 +796,13 @@ def durations_record() -> dict[str, float]:
 def members(name: str, split: str) -> list[str]:
     """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
     the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.groups`)."""
+    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together."""
     held = sites(name)
     recorded = {node: seconds for node, seconds in durations_record().items()
-                if node.split("::")[0] == name and site_name(node) not in held}
+                if node.split("::")[0] == name and session.test_name(node) not in held}
     ordered = sorted(recorded)
     index, count = (int(part) for part in split.split("/"))
-    run = session.groups([recorded[node] for node in ordered], count)[index - 1]
-    return ordered[run.start:run.stop]
+    return session.cut(ordered, [recorded[node] for node in ordered], count)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -1079,12 +1080,6 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
     return found
 
 
-def site_name(node: str) -> str:
-    """Test node `node`'s test's name in its file, as `sites` names it: its function's, or a class's
-    method's `Class.test_name`, its parameters' ids aside."""
-    return node.partition("::")[2].split("[")[0].replace("::", ".")
-
-
 def draws_of(mark: Mark) -> list[tuple[int, int]]:
     """The units each map task of a site marked `mark` takes, at most its per_task each: together 0 to its
     units, every seed both of check 1's stages draw, or every unit of a `shards` test's work."""
@@ -1139,7 +1134,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 continue
             mark = held[test]
             whole = sum(seconds for node, seconds in record.items()
-                        if node.split("::")[0] == name and site_name(node) == test)
+                        if node.split("::")[0] == name and session.test_name(node) == test)
             maps = []
             for start, stop in draws_of(mark):
                 group = f"{test}.draws-{start}-{stop}"
@@ -1997,7 +1992,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
         marked = sites(name)
         own = {node: seconds for node, seconds in kept.items()
-               if node.split("::")[0] == name and site_name(node) not in marked}
+               if node.split("::")[0] == name and session.test_name(node) not in marked}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
@@ -2019,7 +2014,8 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     if seconds <= target or not own:
         return sum(own.values()) > target
     nodes = sorted(own)
-    recorded, ran = [own[node] for node in nodes], [observed[node] for node in nodes]
+    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
+    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:
