@@ -480,15 +480,15 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
-            residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False) -> jax.Array:
+            residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None) -> jax.Array:
     ...
 
 
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
-            residuals: Literal[Kept.SPLIT, Kept.OUTPUT],
-            interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
+            out_dtype=None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
