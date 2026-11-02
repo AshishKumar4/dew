@@ -15,7 +15,7 @@ import numpy as np
 
 from dew._records import integer, integers, record
 from dew.batch import Batch
-from dew.data.pipeline import ACCOUNTS, CONSUMED, Windows
+from dew.data.pipeline import CONSUMED, Windows, counted
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import aligned
@@ -151,7 +151,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             # token went to the first window holding it among them.
             upto = max(self._credited, kept if overlapping and len(windows) > 1 else end)
             emitted = {**emitted, **{name: int(np.sum(self._held[name][self._credited : upto]))
-                                     for name in ACCOUNTS if name in self._held}}
+                                     for name in self._held if counted(name)}}
             self._credited = max(0, upto - kept)
         self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)

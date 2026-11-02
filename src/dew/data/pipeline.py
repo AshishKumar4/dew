@@ -66,9 +66,12 @@ it, its rejection's marker too (`Rejected.member`)."""
 
 MEMBERS = "_dew_members"
 """A row's counts of source examples (`ACCOUNTS`) by the mixture member each was drawn from (`MEMBER`):
-member to consumed and refused, set where the bound marks a member's example (`MarkConsumed`) and carried
-wherever its counts go, so a mixture counts each member's examples where they are delivered
+member to consumed and refused, set where a member's row first holds counts (`dew.data.lowering._consumed_by`)
+and carried wherever its counts go, so a mixture counts each member's examples where they are delivered
 (`dew.data.mixing.CorpusCounts`)."""
+
+COUNTING = (*ACCOUNTS, MEMBER, MEMBERS)
+"""A row's fields the run counts it by, which every step carries out of its sight."""
 
 type Members = Mapping[int, tuple[int, int]]
 """Counts of source examples by mixture member (`MEMBERS`): consumed and, of them, refused."""
@@ -80,6 +83,35 @@ def members_of(row: Batch) -> Members:
     if not isinstance(held, Mapping):
         raise ValueError(f"a row's counts by mixture member are a mapping, got {type(held).__name__}")
     return held
+
+
+def member_fields(member: int) -> tuple[str, str]:
+    """The fields a layout lays a mixture member's counts out in beside its tokens, consumed and refused,
+    each count at the last token of its document (`dew.data.lowering._ConsumedAt`)."""
+    return f"{MEMBERS}/{member}/consumed", f"{MEMBERS}/{member}/refused"
+
+
+def counted(field: str) -> bool:
+    """Whether a layout's `field` lays out counts of source examples beside its tokens (`ACCOUNTS`, a
+    mixture member's `member_fields`), which a window takes the sum of."""
+    return field in ACCOUNTS or field.startswith(f"{MEMBERS}/")
+
+
+def owed_record(members: Mapping[int, int]) -> list[list[int]]:
+    """Examples owed by mixture member as a saved position holds them: member and count pairs."""
+    return [[member, count] for member, count in sorted(members.items()) if count]
+
+
+def owed_members(saved: object, what: str) -> dict[int, int]:
+    """Examples owed by mixture member read back from a saved position (`owed_record`)."""
+    if not isinstance(saved, list):
+        raise ValueError(f"{what} are a list of member and count pairs, got {type(saved).__name__}")
+    owed: dict[int, int] = {}
+    for pair in saved:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError(f"{what} are member and count pairs, got {pair!r}")
+        owed[integer(pair[0], f"{what}' member")] = integer(pair[1], f"{what}' count")
+    return owed
 
 
 def joined(*members: Members) -> dict[int, tuple[int, int]]:
@@ -104,14 +136,10 @@ def accounts(row: Batch | Rejected) -> tuple[int, int]:
 @dataclasses.dataclass(frozen=True)
 class MarkConsumed:
     """The step that marks each source example a run bounded in examples reads as one consumed by the row it
-    is read in (`CONSUMED`), set where the bound is (`dew.data.compile`), by the mixture member it was drawn
-    from where it was (`MEMBERS`)."""
+    is read in (`CONSUMED`), set where the bound is (`dew.data.compile`)."""
 
     def __call__(self, element: Batch) -> Batch:
-        marked = {**element, CONSUMED: 1, REFUSED: 0}
-        if MEMBER in element:
-            marked[MEMBERS] = {integer(element[MEMBER], "a row's mixture member"): (1, 0)}
-        return marked
+        return {**element, CONSUMED: 1, REFUSED: 0}
 
 
 @dataclasses.dataclass
