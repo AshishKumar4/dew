@@ -72,7 +72,7 @@ from dew.nn.sparse_selection import (
     sparse_latent_attention,
     top_k_selection,
 )
-from dew.quantization import quantized_products
+from dew.quantization import LinearProducts
 
 
 def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None,
@@ -306,7 +306,7 @@ class SparseIndexer(IndexerFront, nn.Module):
     ("q_a_layernorm",): ("qlora",),
     ("kv_a_layernorm",): ("kvlora",),
 })
-class MultiHeadLatentAttention(nn.Module):
+class MultiHeadLatentAttention(LinearProducts):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
@@ -951,17 +951,6 @@ class MultiHeadLatentAttention(nn.Module):
         """
         return (selection.shape[-1] < total and not self._qk_open()
                 and not self.nonlinear_input("kv_b_proj"))
-
-    def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name`, or a module under
-        it, other than as a linear map of its input. The layer's own Dense is
-        one unless the Qwix quantization the call runs under quantizes its
-        activations or gradients (`dew.quantization.quantized_products`); a
-        weight-only rule leaves it linear, by its quantized matrix, which the
-        absorbed path reads. A method interceptor that changes it answers for
-        itself: `dew.lora`'s dropout draws on its targets' inputs, and a
-        checkpoint's input quantization (`dew.quantization`) rounds them."""
-        return quantized_products(self, name).inputs
 
     def _scaled_query(self, q_pass, q_rot):
         """The whole query with YaRN's mscale on it, as every kernel reads it."""

@@ -524,9 +524,13 @@ def a_program_on_this_gpu_is_admitted_against_the_room_its_pool_left(tmp_path):
 
 
 COMPILED_ON_GPU = """\
+import json
+
 import jax
 import jax.numpy as jnp
 
+events = []
+jax.monitoring.register_event_listener(lambda event, **_: events.append(event))
 from dew import communicators
 from dew.communicators import Needs
 from dew.nn.kernels import options
@@ -541,23 +545,31 @@ ordinal = communicators.ordinal(gpu)
 needs = Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={ordinal: 2**20}, seconds=1.0)
 communicators.hold(communicators.Sizing(needs, 0.95, 0.9, {ordinal: 2**30}, {ordinal: 2**30}))
 assert float(options.program(tripled)(jax.device_put(jnp.ones(8), gpu))[0]) == 3.0
+print(json.dumps([events.count("/jax/compilation_cache/compile_requests_use_cache"),
+                  events.count("/jax/compilation_cache/cache_hits")]))
 """
-"""A process that compiles a program on its GPU through Dew's compile point under a sizing that admits it."""
+"""A process that compiles a program on its GPU through Dew's compile point under a sizing that admits it,
+printing its compilation-cache requests and hits."""
 
 
 def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_communicators(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): a program a process compiled and admitted on its GPU
     keeps its communicators in Dew's cache under its executable's fingerprint (`collectives_kept`), and a
-    second process that loads it from the compilation cache admits it from that record, reading none of its
-    text: it keeps no record of its own (row 3316)."""
+    second process that loads it from the compilation cache, every request a hit, admits it from that
+    record as it is, the file neither rewritten nor replaced (row 3316, 3474)."""
     cache, compiled = tmp_path / "cache", tmp_path / "xla"
     environment = {**os.environ, "XDG_CACHE_HOME": str(cache), "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
                    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0"}
     kept = cache / "dew" / "communicators" / "programs" / package_digest()
-    held = []
-    for _ in range(2):
-        subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment)
-        held.append(sorted(path.name for path in kept.iterdir()))
-        assert any(compiled.iterdir()), "the process cached no executable"
-    assert len(held[0]) == 1 and held[1] == held[0]
+
+    def ran() -> tuple[list[int], dict[str, tuple[int, int]]]:
+        done = subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment,
+                              capture_output=True, text=True)
+        requests = json.loads(done.stdout.strip().splitlines()[-1])
+        return requests, {path.name: (path.stat().st_ino, path.stat().st_mtime_ns) for path in kept.iterdir()}
+
+    _, written = ran()
+    (requests, hits), read = ran()
+    assert len(written) == 1 and read == written
+    assert requests and hits == requests
