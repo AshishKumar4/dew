@@ -954,8 +954,9 @@ def _squared_rows(rows: int, block: int):
 
     @pallas_fuser.custom_fusion
     def added(prod, residual):
+        # The order traced from an iota, so the fusion's body closes over no constant.
         count = rows // block
-        order = jnp.asarray([moved(row, count) for row in range(count)])
+        order = moved(jnp.arange(count), count)
         blocks = residual[:count * block].reshape(count, block, -1)[order].reshape(count * block, -1)
         return prod.at[:count * block].add(blocks)
 
