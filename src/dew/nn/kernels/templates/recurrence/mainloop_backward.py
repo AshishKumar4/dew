@@ -219,7 +219,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         return x.reshape(*x.shape[:2], heads // call.group, call.group, width).sum(3)[..., :run.key_width]
 
     # The launches' gradients in the operands' dtype (fla's), summed in fp32, the held operand's parts joined.
-    dv = call.held.joined(dv) if delta else dv.astype(jnp.float32)
+    dv = call.held.joined(dv) if delta else dv
     dk_w = None if dk_w is None else call.held.joined(dk_w)
     extra = 0.0 if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
@@ -377,7 +377,7 @@ def _reverse_held(call: _Call, bv: int, *, gates: bool, skips: bool = False) -> 
         [_f32(CHUNK, bv)] * (2 + gates + skips) + [_f32(call.block, bv)] * call.per_key
         + _held(given, CHUNK, bv) * (1 + gates)
         + _held(held, call.block, bv) + _held(call.memories, call.block, bv)
-        + _held(_value_grads(call), CHUNK, bv)
+        + _held(_reverse_values(call, gates=gates), CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
 
 
@@ -416,7 +416,8 @@ def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, ga
     `skips`, the skip's sums, and under a decay a key dimension the memory decay's."""
     width, value_width, given = call.width, call.value_width, call.given
     final = _Operand(batch * call.heads * width, 1, jnp.dtype(jnp.float32))
-    out_type = (call.memories.shape(value_width), _value_grads(call).shape(call.heads * value_width),
+    values = _reverse_values(call, gates=gates)
+    out_type = (call.memories.shape(value_width), values.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
                 *((jax.ShapeDtypeStruct((value_width // bv, call.heads, call.rows), jnp.float32),)
                   * (gates + skips)),
@@ -437,7 +438,7 @@ def _reverse_launched(call: _Call, batch: int, bv: int, walked_width: int, *, ga
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, tiles: Tiles, *, scale: float,
              skip=None, memory=None):
     """`(dh [chunks * HV * Dk, Dv], dv [R, HV * Dv], dh0 [B * HV * Dk, Dv])`: the gradient of the memory each
-    chunk leaves as `call.memories`, the corrected values' gradient in `_value_grads`' form (their own
+    chunk leaves as `call.memories`, the corrected values' gradient in `_reverse_values`' form (their own
     output's, `local`, `_local_back`'s, and the memory's, `algebra.reverse_carried`) and each row's initial
     memory's gradient, fp32, each sequence's chunks from its last over a value block, the states launch's
     (`tiles.block_v`; fla's dhu). `q`, `k`, `w`, `do`, `local` and `v` are laid as the forward's, `beta`
@@ -453,14 +454,15 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
     `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
     tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held)."""
-    width, value_width, family, grads = call.width, call.value_width, call.family, _value_grads(call)
+    gates, skips = v is not None, skip is not None
+    width, value_width, family = call.width, call.value_width, call.family
+    grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     batch = dht.shape[0] // (call.heads * width)
     final = _Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     chunks = call.chunks
-    gates, skips = v is not None, skip is not None
     assert gates or not skips, "the walk adds a skip where it gates the values"
     assert call.per_key == (memory is not None), "the walk takes the memories under a decay a key dimension"
 
@@ -853,6 +855,16 @@ def _value_grads(call: _Call) -> _Operand:
     `sum(v du)` took the rounding of every `du` it sums."""
     return dataclasses.replace(call.held, rows=call.rows) if call.delta else _Operand(call.rows, 1,
                                                                                        jnp.dtype(jnp.float32))
+
+
+def _reverse_values(call: _Call, *, gates: bool) -> _Operand:
+    """The form `_reverse` leaves the corrected values' gradient in: where the walk gates the values without
+    the delta rule, their gradient leaves it whole, the gate's and the skip's terms in it, its one reader
+    the call's own result (`_query_key` streams none): the operands' form, rounded once in the walk where an
+    XLA pass narrowed the fp32 tile after it (30 us of Nemotron-H 30B's SSD training on an H100, FS-WHY3).
+    Otherwise `_value_grads`', which later launches read."""
+    whole = gates and not call.delta and call.given.parts == 1
+    return call.given if whole else _value_grads(call)
 
 
 def _score_grads(call: _Call) -> _Operand:
