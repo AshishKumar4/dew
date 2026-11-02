@@ -253,15 +253,18 @@ def block_draw(name: str):
 def test_a_float16_indexer_weighs_its_heads_in_float32():
     """V3.2's indexer at float16 weighs its heads by a float32 `weights_proj` over its input cast up, as
     its reference keeps that module in a float16 load (`_keep_in_fp32_modules`,
-    modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830): the weights are bit for bit the float32
-    projection of the float16 input, as float32."""
+    modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830): the weights are bit for bit a float32
+    indexer's over the float16 input cast up, as float32."""
     hidden = jnp.asarray(np.random.default_rng(0x3080).standard_normal((2, 5, 32)), jnp.float16)
-    indexer = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float16)
-    variables = indexer.init(jax.random.key(0), hidden, method=lambda module, x: module.weights_proj(x))
-    weights = indexer.apply(variables, hidden, method=lambda module, x: module.weights_proj(x))
-    kernel = variables["params"]["weights_proj"]["kernel"]
-    wide = jnp.einsum("bsd,dh->bsh", hidden.astype(jnp.float32), kernel.astype(jnp.float32),
-                      precision=jax.lax.Precision.HIGHEST)
+
+    def weigh(module, x):
+        return module.weights_proj(x)
+
+    half = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float16)
+    variables = half.init(jax.random.key(0), hidden, method=weigh)
+    weights = half.apply(variables, hidden, method=weigh)
+    single = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float32)
+    wide = single.apply(variables, hidden.astype(jnp.float32), method=weigh)
     assert weights.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(weights), np.asarray(wide))
 
