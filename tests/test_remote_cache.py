@@ -63,7 +63,8 @@ def test_a_worker_keeps_the_cache_it_shares_unless_the_shared_cache_is_on(tmp_pa
     import sys
 
     site = tmp_path / "test_site.py"
-    said = "    print('CACHE', jax.config.jax_compilation_cache_dir)\n"
+    seen = tmp_path / "seen.txt"
+    said = f"    open({str(seen)!r}, 'a').write(jax.config.jax_compilation_cache_dir + '\\n')\n"
     site.write_text(f"import jax\n\n\ndef test_one():\n{said}\n\ndef test_two():\n{said}")
     tests = Path(__file__).resolve().parent
     paths = os.pathsep.join([str(tests), os.environ.get("PYTHONPATH", "")])
@@ -72,13 +73,11 @@ def test_a_worker_keeps_the_cache_it_shares_unless_the_shared_cache_is_on(tmp_pa
                    "JAX_ENABLE_COMPILATION_CACHE": "true", "DEW_XLA_CACHE_URL": "https://cache.invalid"}
     for name in ("DEW_TEST_NO_CACHE", "DEW_XLA_CACHE_TOKEN"):
         environment.pop(name, None)
-    command = [sys.executable, "-m", "pytest", "-q", "-s", "-p", "conftest", "-p", "no:cacheprovider",
-               "-n", "2"]
+    command = [sys.executable, "-m", "pytest", "-q", "-p", "conftest", "-p", "no:cacheprovider", "-n", "2"]
     done = subprocess.run([*command, str(site)], cwd=tmp_path, env=environment, capture_output=True,
                           text=True, timeout=300)
     assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
-    caches = {line.split()[1] for line in done.stdout.splitlines() if line.startswith("CACHE ")}
-    assert caches == {str(tmp_path / "cache")}, caches
+    assert set(seen.read_text().split()) == {str(tmp_path / "cache")}, seen.read_text()
 
 
 def test_a_collection_that_runs_no_test_fetches_no_bundle(cache_worker, tmp_path):
