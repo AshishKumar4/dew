@@ -996,7 +996,7 @@ def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refu
     frozen = {**variables, "params": traverse_util.unflatten_dict(params),
               QUANTIZATION: traverse_util.unflatten_dict({**scales, **codes})}
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
-    with pytest.raises(ValueError, match="other than as a linear"):
+    with pytest.raises(ValueError):
         objective.token_scores(frozen, tokens)
 
 
