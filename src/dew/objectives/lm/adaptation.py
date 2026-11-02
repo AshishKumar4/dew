@@ -213,14 +213,13 @@ def _arrays(applied) -> tuple[jax.Array, ...]:
     return tuple(jnp.asarray(value) for value in applied)
 
 
-_HALVINGS = 12
-"""The geometric bisection's halvings that find a damped window's rate (`_step_rate`): the bracket's ratio
-r becomes r^(2^-12), within 1% of the fixed point for any r below 10^17."""
+_SETTLINGS = 4
+"""The rounds of T(T(d)) that settle a damped window's rate toward its bound's fixed point (`_step_rate`)."""
 
 
 def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums, moved, gradient):
-    """A damped window's rate per row (`ChunkAdaptation.damped`): the largest d the bisection finds with
-    d <= rate / (1 + rate L(d)), L(d) its loss's curvature bound along a step of rate d, so d L(d) < 1. The
+    """A damped window's rate per row (`ChunkAdaptation.damped`): a d with d <= T(d) = rate / (1 + rate L(d)),
+    L(d) its loss's curvature bound along a step of rate d, so d L(d) < 1, settled toward T's fixed point. The
     window's `sums` `[B, _TERMS + 3]` of its slots' terms (`_gathered`), `bounds` the head's terms
     (`HeadTerms`), the start's output-map norm and its activation's p1, p2 (`_damping`), `moved` per row the
     Frobenius norms `down` and `up` have moved from the start before the window, and `gradient` the
@@ -229,12 +228,13 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
     |U - U0| |f| + |U0| |f - f0| along it, |f - f0| at most p1 |x| times D's distance: the head's bounds are
     read over every state that far from the window's (`HeadTerms.at`).
 
-    L grows with d, so d -> rate / (1 + rate L(d)) falls, and its fixed point is the largest such d:
-    rate / (1 + rate L(rate)), the bound at the plain step's length, is below it, the plain rate above,
-    and each of `_HALVINGS` geometric halvings keeps the half whose lower end the inequality admits. The
-    rate is a constant of the step, as its bound is: the outer gradient flows through the step's gradient,
-    not through the bound it reads (whose distances are zero at a run's start, where their root has no
-    derivative)."""
+    L grows with d, so T falls, and its fixed point d* is the largest such d: every d <= d* has
+    T(d) >= T(d*) = d* >= d. T(rate), the bound at the plain step's length, is at most d*, and so is
+    T(T(d)) for every d <= d*, which T(T) moves no lower than d (T(d) <= rate, so T(T(d)) >= T(rate)):
+    `_SETTLINGS` rounds of T(T) rise toward d* from below, each continuous in what the bound reads, so
+    the rate moves with its inputs' rounding by as much as they do. The rate is a constant of the step, as
+    its bound is: the outer gradient flows through the step's gradient, not through the bound it reads
+    (whose distances are zero at a run's start, where their root has no derivative)."""
     head, norm, p1, p2 = bounds
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(_TERMS))
     least, fed, longest = (sums[:, index] for index in range(_TERMS, _TERMS + 3))
@@ -263,13 +263,13 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
                 bend = bend + p1 * lengths
         return curvature * stretch + slope * bend
 
-    plain = jnp.full_like(squares, rate)
-    low, high = rate / (1 + rate * curvature_along(plain)), plain
-    for _ in range(_HALVINGS):
-        middle = jnp.sqrt(low * high)
-        admitted = middle * (1 + rate * curvature_along(middle)) <= rate
-        low, high = jnp.where(admitted, middle, low), jnp.where(admitted, high, middle)
-    return jax.lax.stop_gradient(low)
+    def settled(length: jax.Array) -> jax.Array:
+        return rate / (1 + rate * curvature_along(length))
+
+    damped = settled(jnp.full_like(squares, rate))
+    for _ in range(_SETTLINGS):
+        damped = settled(settled(damped))
+    return jax.lax.stop_gradient(damped)
 
 
 def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,

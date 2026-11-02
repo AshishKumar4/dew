@@ -127,8 +127,9 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
     real where the mask marks it and its document is not 0, as every reader of rows takes it. With
     `levels`, also the level each token reads. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at
-    rate / (1 + rate L), L written from `ChunkAdaptation.damped`'s bound for the test decoder's affine
+    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at a rate
+    settled toward the fixed point of d -> rate / (1 + rate L(d)) from T(rate), four rounds of T(T(d)),
+    L(d) written along a step of rate d from `ChunkAdaptation.damped`'s bound for the test decoder's affine
     head tied to its embeddings E: Ls = |E|^2 / 2 and Gs = sqrt 2 |E| (Frobenius norms), SiLU's derivative
     bounds p1, p2, the window's weighted sums of |x|^2, |f|^2, |f| |x| and |x| (x the state, f its
     silu(x D) at the level's start), and |U| and D's distance from the start along the step; every bound
@@ -173,17 +174,28 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         squares, inputs, crossed, lengths = energy
         rate = adaptation.rate
 
-        def reach(name):
-            moved = jnp.sqrt(jnp.sum(jnp.square(level[name]["kernel"] - start[name]["kernel"])))
-            return moved + rate * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
+        def curvature_along(length):
+            def reach(name):
+                moved = jnp.sqrt(jnp.sum(jnp.square(level[name]["kernel"] - start[name]["kernel"])))
+                return moved + length * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
 
-        spread = reach("down") if "down" in parts else 0.0
-        norm = output + (reach("up") if "up" in parts else 0.0)
-        stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
-            inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts else 0.0)
-        bend = (norm * p2 * squares if "down" in parts else 0.0) + (
-            p1 * lengths if parts == ["down", "up"] else 0.0)
-        return rate / (1 + rate * jax.lax.stop_gradient(curvature * stretch + slope * bend))
+            spread = reach("down") if "down" in parts else 0.0
+            norm = output + (reach("up") if "up" in parts else 0.0)
+            stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
+                inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts
+                else 0.0)
+            bend = (norm * p2 * squares if "down" in parts else 0.0) + (
+                p1 * lengths if parts == ["down", "up"] else 0.0)
+            return jax.lax.stop_gradient(curvature * stretch + slope * bend)
+
+        def settled(length):
+            return rate / (1 + rate * curvature_along(length))
+
+        # T(rate), then four rounds of T(T(d)), toward the bound's fixed point from below.
+        damped = settled(rate)
+        for _ in range(4):
+            damped = settled(settled(damped))
+        return jax.lax.stop_gradient(damped)
 
     def stepped(level, summed, energy):
         if adaptation.damped:
