@@ -44,7 +44,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import carry, cost, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
-from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum
+from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]
 
@@ -540,36 +540,28 @@ def _decays(exponents, base2: bool) -> _Decays:
     return _decays_of(exponents, base2)
 
 
-def _vanishing(dtype, base2: bool) -> float:
-    """The exponent at and below which a decay is zero in `dtype`, whatever exponents join it (each at most
-    zero): below the base's logarithm of its least subnormal (`exp(-105)` and `exp2(-151)` are zero in
-    fp32)."""
-    least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
-    return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
-
-
 def _walked(exponents, base2: bool) -> jax.Array:
     """A chunk's whole decay in natural units, per key, as a walk's state carries it (`Derived.step`,
     `merge`): its exponents' compensated sum, or its dtype's vanished decay where a token's decay vanishes
-    (`_vanishing`; two of -2**127 summed are -inf, and its residual NaN)."""
-    vanished = exponents <= _vanishing(exponents.dtype, base2)
+    (`vanishing`; two of -2**127 summed are -inf, and its residual NaN)."""
+    vanished = exponents <= vanishing(exponents.dtype, base2)
     live = _scanned(jnp.where(vanished, 0.0, exponents))[-1] * (math.log(2.0) if base2 else 1.0)
-    return _held(jnp.where(jnp.any(vanished, axis=0), _vanishing(exponents.dtype, base2=False), live))
+    return _held(jnp.where(jnp.any(vanished, axis=0), vanishing(exponents.dtype, base2=False), live))
 
 
 def _held(decay: jax.Array) -> jax.Array:
-    """A walk's decay in natural units held from below at its dtype's vanished one (`_vanishing`): zero
+    """A walk's decay in natural units held from below at its dtype's vanished one (`vanishing`): zero
     there, and a walk's sums of vanished chunks finite."""
-    return jnp.maximum(decay, jnp.asarray(_vanishing(decay.dtype, base2=False), decay.dtype))
+    return jnp.maximum(decay, jnp.asarray(vanishing(decay.dtype, base2=False), decay.dtype))
 
 
 def _decays_value(exponents, base2: bool) -> _Decays:
     """The decays (`_Decays`) of a chunk's tokens' exponents, each from the compensated prefix of its
-    segment: a token whose exponent vanishes (`_vanishing`, its decay and every decay through it zero) ends
+    segment: a token whose exponent vanishes (`vanishing`, its decay and every decay through it zero) ends
     one and starts the next, taken as 0 within it, so no span's sum holds a vanished token's (a prefix
     holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
     of `exp(-1)`), and each span through one is zero."""
-    vanished = exponents <= _vanishing(exponents.dtype, base2)
+    vanished = exponents <= vanishing(exponents.dtype, base2)
     high, low = _compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
     segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
     count = exponents.shape[0]

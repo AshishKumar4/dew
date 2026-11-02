@@ -133,8 +133,9 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
     out, pull = jax.vjp(reference, query, key, value)
     theirs = (out, *pull(dout))
     with derived():
-        mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles),
-                *attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)[:3])
+        made = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
+        mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles), made.query, made.key,
+                made.value)
     for leaf, ours, exact in zip(("output", "dq", "dk", "dv"), mine, theirs, strict=True):
         finite = np.isfinite(np.asarray(exact, np.float32))
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"
@@ -175,6 +176,14 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
     tokens = operands.value.shape[1]
     pattern = jnp.resize(jnp.asarray(DECAY_EDGES[edge], jnp.float32), (tokens,))
     target = jnp.broadcast_to(pattern[None, :, None], operands.value.shape[:3])
+    if hooks.rated:
+        # A rated decay's dt, the target over its rate, scales its writes too: each head's rate scaled by a
+        # power of two, which rounds no decay, so a vanishing decay's writes stay in fp32's range (at the
+        # draws' rates its float64 output was near 1e39), and its values by another, so the cotangent of dt
+        # times its rate (`log_gates`' pullback, before the fixture divides it back) does too (-6.2e38 at the
+        # token after a vanishing one, its composed gradient 1.2e24).
+        operands = dataclasses.replace(operands, rate=operands.rate * 2.0 ** 48,
+                                       value=operands.value * 2.0 ** -16)
     operands = recurrence_suite._formed(operands, hooks, target)
 
     def orders(fn, given, decays):
@@ -192,5 +201,7 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
         mine = orders(functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK), operands,
                       target)
     for leaf, ours, theirs in zip(("value", "gradient", "tangent"), mine, exact, strict=True):
-        finite = np.isfinite(np.asarray(theirs))
+        # Finite where float64's is within the call's float32: a value past its range overflows as it must.
+        with np.errstate(over="ignore"):
+            finite = np.isfinite(np.asarray(theirs).astype(np.float32))
         assert np.isfinite(np.asarray(ours))[finite].all(), f"{name} {edge} {leaf}"

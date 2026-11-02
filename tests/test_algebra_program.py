@@ -182,9 +182,11 @@ def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
     from egglog import Vec, eq, i64
 
     closed = jax.make_jaxpr(lambda x, y, s: (x * s[:, None]) @ y)(*rows(1, (64, 32), (32, 16), (64,)))
-    region = terms.region(closed)
+    # Operands of declared magnitudes, so the lift's products stay under the program's reach (`dominated`).
+    region = terms.region(closed, {0: 1.0, 1: 1.0, 2: 1.0})
     graph, _, _ = program.graphed(region)
-    program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
+    done = program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
+    assert done.fired["linear"] > 0
     scale = terms.Term.leaf(i64(2))
     lift = graph.extract(algebra.rules.lifted(Vec[i64](i64(64), i64(16)), i64(0)))
     broadcast = scale.shaped("broadcast_in_dim", lift)

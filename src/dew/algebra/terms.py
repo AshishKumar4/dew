@@ -33,7 +33,7 @@ from egglog import (
 )
 from egglog.declarations import Declarations, HasDeclarations
 from egglog.runtime import RuntimeExpr
-from jax._src import core as jax_core
+from jax._src import core as jax_core, literals as jax_literals
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -276,6 +276,19 @@ NOTHING = -(2 ** 20)
 
 type Ranges = Mapping[int, float | tuple[float, float]] | None
 """Declared ranges by input index (`region`'s): a bound on an input's magnitude, or an interval."""
+
+
+def _unbound(constant: jax.Array) -> jax.Array:
+    """A region's literal (a jaxpr's, `jax_core.Literal.val`) as a value of the trace evaluating it: a typed
+    host array keeps the type its trace gave it (its dtype, its weak type) and caches that trace's aval, mesh
+    and all, so a form cached across traces (`recurrence_algebra.derived_tile`) bound it under another manual
+    mesh and lowering refused (`For primitive gt, context mesh ... should match the aval mesh`); its type is
+    made anew here, in the evaluating trace's context. JAX binds a jaxpr's literals as these host arrays
+    where an array goes (`jax.core.eval_jaxpr`'s), as the forms' evaluation binds them."""
+    if not isinstance(constant, jax_literals.TypedNdArray):
+        return constant
+    return type(constant)(np.asarray(constant), jax_core.ShapedArray(constant.shape, constant.dtype,
+                                                                     weak_type=constant.aval.weak_type))
 
 
 @overload
@@ -683,7 +696,7 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     if (args := get_callable_args(term, Term.leaf)) is not None:
         return leaves[integer(args[0])]
     if (args := get_callable_args(term, Term.literal)) is not None:
-        return region_.literals[integer(args[0])]
+        return _unbound(region_.literals[integer(args[0])])
 
     def bound(left: Term, right: Term, index: i64Like) -> jax.Array:
         primitive, given = region_.params[integer(index)]

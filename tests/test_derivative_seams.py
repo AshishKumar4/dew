@@ -38,9 +38,9 @@ CONTRACTED = {
         ("test_a_grouped_gemm_holds_every_order", KERNEL),
     "src/dew/nn/kernels/templates/recurrence/selective.py::_scan":
         ("test_the_selective_scan_holds_its_orders", KERNEL),
-    "src/dew/algebra/scan.py::_decays_of":
+    "src/dew/algebra/scan.py::_decays_rule.linear_tangent":
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
-    "src/dew/algebra/scan.py::_lowered":
+    "src/dew/algebra/scan.py::_lowered_rule.linear_tangent":
         ("test_the_derived_delta_rule_chunks_hold_their_orders", NUMERICS),
     "src/dew/nn/kernels/recurrence_chunk.py::_portable_rule.linear_tangent":
         ("test_the_chunked_delta_rule_holds_every_order", NUMERICS),

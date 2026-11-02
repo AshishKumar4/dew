@@ -80,9 +80,14 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
         # The log decay is `rate * dt`: dt the target over each head's rate.
         return dataclasses.replace(operands, beta=target / operands.rate)
     if hooks.gates is not None:
-        # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero.
-        positive = jnp.maximum(-target, 1e-30)
-        gate = jnp.where(positive > 20.0, positive, jnp.log(jnp.expm1(positive)))
+        # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero. Each branch takes
+        # the inputs it selects alone, so an unselected one's derivative (expm1 past fp32's range, a log near
+        # zero's square) never multiplies the zero that unselects it into NaN.
+        live = -target > 1e-30
+        positive = jnp.where(live, -target, 1.0)
+        large = positive > 20.0
+        formed = jnp.where(large, positive, jnp.log(jnp.expm1(jnp.where(large, 1.0, positive))))
+        gate = jnp.where(live, formed, np.log(np.expm1(1e-30)))
         return dataclasses.replace(operands, gate=gate, log_a=jnp.zeros_like(operands.log_a),
                                    bias=jnp.zeros_like(operands.bias))
     shape = operands.log_decay.shape
