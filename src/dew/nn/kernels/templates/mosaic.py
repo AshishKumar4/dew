@@ -1236,7 +1236,7 @@ class Issuer[Accumulator](abc.ABC):
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
         so the vector is in a column's layout (`column`, a logits tile's keys'), as `algebra.room` reads
         it; no pass over the values outside the launch."""
-        values = plgpu.load(plgpu.transpose_ref(tile, (1, 0)), layout=self.layout, optimized=False)
+        values = plgpu.load(tile.transpose((1, 0)), layout=self.layout, optimized=False)
         return jnp.max(jnp.abs(values.astype(jnp.float32)), axis=0)
 
     column_scratch: int
