@@ -60,8 +60,8 @@ from dew import communicators
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
-from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_mesh, gpu_target, runtime_facts, tpu
+from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, step_flops
