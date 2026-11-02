@@ -673,12 +673,15 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.inference.projections import unpacked
+        from dew.nn.backbones.decoder_stack import stored_layers
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        values = unpacked(self.model, self.variables if variables is None else variables)
+        # A stage-local fit's store is read by its layers' names (`stored_layers`).
+        values = unpacked(self.model, stored_layers(self.model, self.variables if variables is None
+                                                    else variables))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -991,10 +994,12 @@ class PretrainedPipeline(Pretrained):
         `adapter.save` writes the factors alone.
         """
         from dew.interop import diffusion
+        from dew.nn.backbones.decoder_stack import stored_layers
 
         self._quantization()
         self._text_encoder("a saved pipeline writes it back")
-        values = self.variables if variables is None else variables
+        # A stage-local fit's store is read by its layers' names (`stored_layers`).
+        values = stored_layers(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
         diffusion.save_source(self, values, Path(directory), max_shard_size)

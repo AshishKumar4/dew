@@ -1490,8 +1490,7 @@ class Trainer(Generic[Loss, Effects]):
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
                 batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
-                                          interval, run, examples=self._examples, closes=True,
-                                          view=self._staging.outside)
+                                          interval, run, examples=self._examples, closes=True)
                 device, _ = split_fields(batch)
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
@@ -1942,7 +1941,7 @@ class Trainer(Generic[Loss, Effects]):
                     if batch is None:
                         break
                     batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
-                                          counted, branched, view=self._staging.outside)
+                                          counted, branched)
                     device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
@@ -2467,7 +2466,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm, updates=state.updates, outside=self._staging.whole,
+                warm=warm, updates=state.updates,
                 # A cooldown branch's beside the run's at the step it branched at (`COOLDOWN`).
                 scored_to=None if scored_to is None else os.path.join(
                     scored_to, f"step-{int(state.step)}", *((COOLDOWN,) if cooled else ())))

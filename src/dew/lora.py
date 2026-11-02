@@ -58,6 +58,7 @@ from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, s
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
+from dew.nn.backbones.decoder_stack import stored_layers
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
@@ -508,7 +509,7 @@ class Adapter:
         the codes go, since a model under the record would multiply them in the merged
         kernel's place. The result is one `params` collection.
         """
-        variables = decoded_frozen_fp8(thaw(variables))
+        variables = decoded_frozen_fp8(thaw(stored_layers(self.model, variables)))
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
@@ -526,7 +527,7 @@ class Adapter:
         A pipeline source, whose weights are named under several components, gets the
         Diffusers file with each component's PEFT config in its header.
         """
-        variables = thaw(variables)
+        variables = thaw(stored_layers(self.model, variables))
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}

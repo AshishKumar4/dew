@@ -100,6 +100,13 @@ def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
                 axis_types=mesh.axis_types)
 
 
+def _layer_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
+    """`decoder_stack.array_rows`, imported where a run is cut, as `_stacked_rows` is."""
+    from dew.nn.backbones.decoder_stack import array_rows
+
+    return array_rows(path, leaf, shape)
+
+
 def _stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
     """`decoder_stack.stacked_rows`, imported where a run is stacked: a run with no stage axis reads none of
     the decoder stack, as before stage-local storage (the axis registry its modules fill on import declares
@@ -107,10 +114,6 @@ def _stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Arra
     from dew.nn.backbones.decoder_stack import stacked_rows
 
     return stacked_rows(rows, shape)
-
-
-def _array_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
-    return list(leaf.reshape((-1, *leaf.shape[len(shape):])))
 
 
 def _sharded(sharding: NamedSharding, mesh: Mesh, spec: Sequence) -> NamedSharding:
@@ -168,7 +171,7 @@ class StageLocal:
         run already stacked stays as it is."""
         return _walked(tree, self.sites, lambda site, where, node: site.view.stage_form(where, node, stack))
 
-    def layered[Leaf](self, tree, cut: RowCut[Leaf] = _array_rows):
+    def layered[Leaf](self, tree, cut: RowCut[Leaf] = _layer_rows):
         """`staged`'s inverse, `cut(path, leaf, shape)` giving a stacked leaf's rows
         (`StackView.layer_form`)."""
         return _walked(tree, self.sites, lambda site, where, node: site.view.layer_form(node, cut))
@@ -285,12 +288,6 @@ class StageLocal:
                                                  served=served)
         return self.state(restored, self.restored), position
 
-    def outside(self, state: TrainState) -> TrainState:
-        """`state` with its variables and EMA as a model run outside the mesh reads them (`whole`): what a
-        preview's decode and a rollout's policy read."""
-        return dataclasses.replace(state, variables=self.whole(state.variables),
-                                   ema=None if state.ema is None else self.whole(state.ema))
-
     def stored(self, state: TrainState) -> TrainState:
         """`state` in its stored form, every field that holds or mirrors the variables with each layer whole
         on every stage (`whole`), as one device's run holds it (`Trainer.stored`). It holds what storing
@@ -359,10 +356,9 @@ class StageLocal:
         return self.staged(tree, stack)
 
     def whole(self, variables):
-        """`variables` with each stacked run back on its stored layers, each layer on every stage, as a
-        model run outside the mesh reads them: a preview's decode, a rollout's. It costs what a state
-        that held every layer on every device held throughout; variables that hold no stacked run
-        are returned as they are."""
+        """`variables` with each stacked run back on its stored layers, each layer on every stage
+        (`Trainer.stored`'s). It costs what a state that held every layer on every device held
+        throughout; variables that hold no stacked run are returned as they are."""
         if not self.holds(variables):
             return variables
         placement = self.rows_placement(jax.tree.map(lambda leaf: leaf.sharding, variables))
@@ -374,8 +370,8 @@ _MIRRORS = ("variables", "opt_state", "ema", "compute")
 
 
 def _cut_piece(piece: jax.Array, *, stacked: int) -> tuple[jax.Array, ...]:
-    """A stage's piece of a leaf stacked over `stacked` leading dimensions, as its rows."""
-    return tuple(piece.reshape((-1, *piece.shape[stacked:])))
+    """A stage's piece of a leaf stacked over `stacked` leading dimensions, as its rows (`array_rows`)."""
+    return tuple(_layer_rows((), piece, piece.shape[:stacked]))
 
 
 def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Array:

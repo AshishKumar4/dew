@@ -77,12 +77,11 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
 
 def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
                marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
-               examples: int | None = None, closes: bool = False,
-               view: Callable[[TrainState], TrainState]) -> tuple[Batch, bytes | None]:
-    """`batch` sampled through `rollout` from `state` as a model outside the mesh reads it (`view`,
-    `StageLocal.outside`), its host preparation `marked` and placed on `mesh` (`shard_batch`), its
-    seconds counted in `interval`, `run`'s stream placing nothing meanwhile (`FitRun.held`); without a
-    rollout, the batch as it is, the view never read. In a run on the examples clock the
+               examples: int | None = None, closes: bool = False) -> tuple[Batch, bytes | None]:
+    """`batch` sampled through `rollout` from `state`, as the run holds it, which its policy reads off
+    the mesh (`decoder_stack.off_stages`), its host preparation `marked` and placed on `mesh`
+    (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
+    (`FitRun.held`); without a rollout, the batch as it is. In a run on the examples clock the
     batch it makes consumes the examples of the batches it read, its step's and each it drew further
     (`clocked_rollout`). Where it `closes` a step of the run bounded to `examples`, the batch is closed
     (`FitRun.closing`) after the rollout's last draw, so the look-ahead that finds the stream's end, and
@@ -103,7 +102,7 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
-        made = clocked_rollout(rollout(view(state), _unclocked(batch), key, **further), batch, consumed)
+        made = clocked_rollout(rollout(state, _unclocked(batch), key, **further), batch, consumed)
         prepared = marked(made)
         # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
         batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {
