@@ -1972,14 +1972,14 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     not run, and one the checkout has changed since the verdict's commit, whose rows observed tests it may
     no longer hold (2026-10-31: train 370's fold replaced a head's 66 renamed test ids with main's old
     ones); a file the checkout no longer has loses them. A file a task's deadline cut off, run whole,
-    takes the times its row observed of the tests it finished where its record lacks them: no green run
-    would ever time it, and the plan cuts it by them, a test it never reached weighing their mean
-    (2026-11-02: base/kernels' test_algebra_laws, recorded nowhere, ran 46 of its ~70 tests and was cut
-    off every run). A reused row (the test cache) carries the times of the run that recorded it. Each
-    train folds main's CI so (the land queue), and nothing else writes the record. A site its file's marks
-    shard (`sites`) keeps its entries: its judge's row times its pooling, no measure of its draws, which
-    the site's recorded seconds weigh before armada times its map tasks (`site_entries`), and a judge
-    armada did not run is a row of its task's name."""
+    takes the times its row observed of the tests it finished (all but the last, which the deadline
+    stopped) where its record lacks them: no green run would ever time it, and the plan cuts it by them, a
+    test it never reached weighing their mean (2026-11-02: base/kernels' test_algebra_laws, recorded
+    nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the test cache) carries the
+    times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
+    writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
+    its pooling, no measure of its draws, which the site's recorded seconds weigh before armada times its
+    map tasks (`site_entries`), and a judge armada did not run is a row of its task's name."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}
@@ -1997,8 +1997,9 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
                                                                       for group in range(1, count + 1)})
         if splits == {""} and held[0].get("kind") == "deadline":
-            kept.update({node: round(seconds, 3) for node, seconds in held[0].get("tests", {}).items()
-                         if node not in kept})
+            # Its last test, the one the deadline stopped, is timed only as far as it ran.
+            finished = list(held[0].get("tests", {}).items())[:-1]
+            kept.update({node: round(seconds, 3) for node, seconds in finished if node not in kept})
             continue
         if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
             continue

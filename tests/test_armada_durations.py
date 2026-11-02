@@ -195,8 +195,9 @@ def test_a_file_a_tasks_deadline_cut_off_takes_the_times_of_the_tests_it_finishe
     verdict.write_text(json.dumps({"sha": main, "part": "all", "rows": rows}))
     monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
     assert ci.main() == 0
+    # Its last test, which the deadline stopped, is not taken.
     assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
-        f"{heavy}::test_{index}": 100.0 for index in range(4)}
+        f"{heavy}::test_{index}": 100.0 for index in range(3)}
     planned = sorted((entry["tests"], entry["split"]) for entry in ci.plan(240.0, {})
                      if entry["python"] == "3.12" and entry["tests"] == heavy)
     assert planned == [(heavy, "1/2"), (heavy, "2/2")]
