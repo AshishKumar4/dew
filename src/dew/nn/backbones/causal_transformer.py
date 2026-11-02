@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -1059,6 +1059,12 @@ class CausalTransformer(nn.Module):
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
     @nn.nowrap
+    def drawn_like(self, index: int) -> Hashable:
+        """What layer `index` draws as: its scan key and what its extension starts from (`_dex_start`), so
+        like layers draw under one scan. A method interceptor that gives a layer parameters of its own (an
+        adapter's factors, `dew.lora`) keys it apart where they differ."""
+        return (self.scan_keys[index], self._dex_start(index))
+
     def _dex_start(self, index: int) -> DexStart | None:
         """What layer `index`'s extension starts from, which its variables keep (`dew.nn.dex`)."""
         return None if self.dex is None else self.dex.start(index)
@@ -1794,8 +1800,9 @@ class CausalTransformer(nn.Module):
         if (self.is_initializing() and stages == 1 and not decode
                 and not self.has_variable('params', f'layers_{first}')):
             # A run draws its layers under one scan where they draw alike: a layer whose start is its own
-            # (DEX's heads and lambda_init, `_dex_start`) draws apart, and its run stacks it after.
-            drawn = tuple((key, self._dex_start(index)) for index, key in enumerate(self.scan_keys))
+            # (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) draws apart, and its run
+            # stacks it after.
+            drawn = tuple(self.drawn_like(index) for index in range(self.num_layers))
             groups = tuple((first + start, count)
                            for start, count in scan_groups(drawn[first:end], self.bank_layers))
             if any(count > 1 for _, count in groups):

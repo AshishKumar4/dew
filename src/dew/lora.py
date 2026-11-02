@@ -656,6 +656,14 @@ class _Branch:
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
         root = self.root
+        if context.method_name == "drawn_like":
+            # A layer draws as its stack says, and apart from layers whose factors differ from its own
+            # (`CausalTransformer.drawn_like`): a scanned run stacks one factor pair over its layers.
+            index = args[0] if args else kwargs["index"]
+            layer = (*root, *module.path, f"layers_{index}")
+            own = tuple(sorted((path[len(layer):], target) for path, target in self.targets.items()
+                               if path[:len(layer)] == layer))
+            return next_fun(*args, **kwargs), own
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
             # this call (`MultiHeadLatentAttention.nonlinear_input`): the
