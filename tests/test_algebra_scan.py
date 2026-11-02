@@ -500,7 +500,8 @@ def test_a_walk_through_a_vanished_decay_differentiates_and_merges_finite(decays
     _, tangent = jax.jvp(jax.grad(final), (g,), (jnp.ones_like(g),))
     start = forms.init(ones_chunk(g))
     merged = forms.merge(start, forms.step(start, forms.prepare(ones_chunk(g))), None)
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in (value, gradient, tangent, *merged))
+    leaves = (value, gradient, tangent, *jax.tree.leaves(merged))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in leaves)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float64, jnp.float16, jnp.bfloat16], ids=lambda d: jnp.dtype(d).name)
