@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from flax import linen as nn
 
@@ -15,7 +15,7 @@ from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import scaled
-from dew.nn.protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
+from dew.nn.protocols import ProjectionGroup, ReadsTrain, Routes, RoutesExperts, declared_groups
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,14 +35,18 @@ class ParallelBranch:
 class ParallelMixers(nn.Module):
     """The mixers of a parallel layer over one input: each reads the input times its branch's input
     multiplier, under the layer's call, and their outputs, each times its output multiplier, are summed
-    in the branches' order (`ParallelMixer`). Every branch holds its own parameters and its own decode
-    cache under its name."""
+    in the branches' order (`ParallelMixer`). Every branch holds its own parameters, its own decode cache
+    and its own routers under its name. A prediction depth's phase reaches the branches that read it
+    (`MixerBase.reads_phase`), the rest running their ordinary call; a routing replay reaches the branches
+    that route (`RoutesExperts`), each its own record by its name, or the one routed branch a layer's
+    single record."""
 
-    branches: tuple[tuple[str, Callable[..., nn.Module], float, float], ...]
-    """Each branch's name, its mixer's factory, and its input and output multipliers."""
+    branches: tuple[tuple[str, Callable[..., nn.Module], float, float, bool], ...]
+    """Each branch's name, its mixer's factory, its input and output multipliers, and whether it reads a
+    prediction phase."""
 
     def setup(self):
-        self.mixers = tuple(factory(name=name) for name, factory, _, _ in self.branches)
+        self.mixers = tuple(factory(name=name) for name, factory, _, _, _ in self.branches)
 
     @property
     def reads(self) -> frozenset[str]:
@@ -53,6 +57,18 @@ class ParallelMixers(nn.Module):
                                         for mixer in self.mixers))
 
     @property
+    def routes_experts(self) -> bool:
+        """Whether a branch routes over experts (`dew.nn.protocols.RoutesExperts`), so the layer's routing
+        replay reaches it."""
+        return bool(self._routed())
+
+    @nn.nowrap
+    def _routed(self) -> frozenset[str]:
+        """The branches that route over experts, by name."""
+        return frozenset(name for name, factory, *_ in self.branches
+                         if isinstance(built := factory(parent=None), RoutesExperts) and built.routes_experts)
+
+    @property
     def reads_train(self) -> bool:
         """Whether a branch takes the train flag (`dew.nn.protocols.ReadsTrain`)."""
         return any(isinstance(mixer, ReadsTrain) and mixer.reads_train for mixer in self.mixers)
@@ -60,27 +76,36 @@ class ParallelMixers(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Its branches' work; the scalings and the sum are elementwise."""
-        return sum(counted_flops(factory(parent=None), lengths) for _, factory, _, _ in self.branches)
+        return sum(counted_flops(factory(parent=None), lengths) for _, factory, _, _, _ in self.branches)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Its branches' learned maps."""
-        return sum(parameter_flops(factory(parent=None), lengths) for _, factory, _, _ in self.branches)
+        return sum(parameter_flops(factory(parent=None), lengths) for _, factory, _, _, _ in self.branches)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its branches declare (`dew.nn.protocols.ProjectionSites`)."""
         return declared_groups(*self.mixers)
 
     def __call__(self, x, call: MixerCall = PLAIN_CALL, *, train: bool = False,
-                 prediction_phase: PredictionPhase = 'ordinary'):
-        if prediction_phase != 'ordinary':
-            raise ValueError(f"a parallel layer runs its branches in the ordinary phase alone, not a "
-                             f"prediction depth's {prediction_phase!r}; give the prediction depth a mixer "
-                             "of one kind")
+                 prediction_phase: PredictionPhase = 'ordinary',
+                 routes: Routes | Mapping[str, Routes] | None = None):
+        routed = self._routed()
+        if routes is not None and not isinstance(routes, Mapping):
+            if len(routed) != 1:
+                raise ValueError(f"a layer's one routing record replays one routed site, and branches "
+                                 f"{sorted(routed)} route; key the record by branch name")
+            routes = {next(iter(routed)): routes}
+        if routes is not None and (missing := sorted(routed - set(routes))):
+            raise ValueError(f"the routing record names {sorted(routes)}, not the routed branches {missing}")
         total = None
-        for mixer, (_, _, into, out) in zip(self.mixers, self.branches, strict=True):
-            reads_train = isinstance(mixer, ReadsTrain) and mixer.reads_train
-            output = scaled(mixer(scaled(x, into), call, **({'train': train} if reads_train else {})), out)
+        for mixer, (name, _, into, out, phased) in zip(self.mixers, self.branches, strict=True):
+            options = {
+                **({'train': train} if isinstance(mixer, ReadsTrain) and mixer.reads_train else {}),
+                **({'prediction_phase': prediction_phase} if phased and prediction_phase != 'ordinary'
+                   else {}),
+                **({'routes': routes.get(name)} if routes is not None and name in routed else {})}
+            output = scaled(mixer(scaled(x, into), call, **options), out)
             total = output if total is None else total + output
         return total
 
@@ -91,8 +116,8 @@ class ParallelMixer(MixerBase):
     mixer under its name, at the layer's geometry: a parallel hybrid, Falcon-H1's Mamba-2 beside its
     attention. What a branch keeps, reads or refuses, the layer keeps, reads or refuses: its cache, its
     layer's index (`reads_depth`, which the call hands every branch), its remat marks, its mixed serving
-    step, its generation. A branch that routes experts is refused, as the layer replays one routing
-    record, for its feed-forward."""
+    step, its generation, a prediction depth's phase (`reads_phase`), and its routing replay, by its
+    name."""
 
     branches: tuple[ParallelBranch, ...] = ()
 
@@ -100,6 +125,10 @@ class ParallelMixer(MixerBase):
         names = [branch.name for branch in self.branches]
         if len(names) < 2 or len(set(names)) != len(names):
             raise ValueError(f"a parallel mixer runs two or more branches of distinct names, got {names}")
+
+    @property
+    def reads_phase(self) -> bool:
+        return any(branch.mixer.reads_phase for branch in self.branches)
 
     @property
     def reads_depth(self) -> bool:
@@ -134,11 +163,7 @@ class ParallelMixer(MixerBase):
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         factories = tuple((branch.name, branch.mixer.build(ctx), float(branch.input_multiplier),
-                           float(branch.output_multiplier)) for branch in self.branches)
-        for name, factory, _, _ in factories:
-            built = factory(parent=None)
-            if isinstance(built, RoutesExperts) and built.routes_experts:
-                raise ValueError(f"branch {name!r} routes experts, and a layer replays one routing record "
-                                 "for its feed-forward; route in the feed-forward")
+                           float(branch.output_multiplier), branch.mixer.reads_phase)
+                          for branch in self.branches)
         return functools.partial(ParallelMixers, branches=factories)
 

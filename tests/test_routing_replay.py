@@ -22,6 +22,7 @@ from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.inputs import FEEDFORWARD_ROUTES
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.lm import LMObjective
@@ -131,6 +132,60 @@ def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
     replayed = chosen((engine_layout({0: recorded}, 2)[:, :, :2], None))
     np.testing.assert_array_equal(replayed, recorded)
 
+
+def parallel_routed(dtype=None) -> LMObjective:
+    """Every layer a parallel mixer (`dew.nn.mixers.parallel`) of attention beside a routed MLP (`experts`),
+    its feed-forward routed too: two routed sites a layer."""
+    from dew.nn.mixers import AttentionMixer
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
+
+    experts = MLPMixer(intermediate_size=32, mixture=Mixture(experts=EXPERTS, top_k=TOP_K))
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1, mlp_features=64,
+        max_seq_len=SEQ_LEN, dtype=dtype, mixture=Mixture(experts=EXPERTS, top_k=TOP_K),
+        mixer=ParallelMixer(branches=(ParallelBranch("attention", AttentionMixer(), 0.8, 0.6),
+                                      ParallelBranch("experts", experts, 1.3, 0.7))))
+    return LMObjective(model, SEQ_LEN)
+
+
+def site_choices(obj, params, tokens, routes=None) -> dict[str, np.ndarray]:
+    """Each routed site's sown choice, `[B, S, layers, top_k]`, keyed as a record keys it: the feed-forward
+    (`FEEDFORWARD_ROUTES`) and the parallel mixer's routed branch by its name."""
+    sown = obj.token_scores(params, tokens, routing=True, routes=routes).routing
+    chosen = {FEEDFORWARD_ROUTES: {}, "experts": {}}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(sown):
+        keys = [entry.key for entry in path]
+        if keys[-2] == "indices":
+            site = "experts" if "self_attn" in keys else FEEDFORWARD_ROUTES
+            chosen[site][int(keys[0].split("_")[1])] = np.asarray(leaf)
+    return {site: np.stack([layers[index] for index in sorted(layers)], axis=2)
+            for site, layers in chosen.items()}
+
+
+def keyed_record(chosen: dict[str, np.ndarray], shift: int = 0) -> dict[str, np.ndarray]:
+    """`chosen` as an engine records it, `shift` experts off on every site, with a row for the last id."""
+    return {site: np.pad((record + shift) % EXPERTS, ((0, 0), (0, 1), (0, 0), (0, 0)))
+            for site, record in chosen.items()}
+
+
+def test_a_record_keyed_by_site_replays_each_routed_site_its_own():
+    """A layer that routes in a parallel mixer's branch and in its feed-forward replays a record keyed by
+    site: each router chooses its own entry's experts, one off its own choice on every token, and a
+    record of each site's own choice changes nothing, bit for bit. A single record, which names no site,
+    is refused there (ledger 3574)."""
+    obj = parallel_routed()
+    params = obj.init(jax.random.key(0))
+    tokens = tokens_of(2)
+    native = site_choices(obj, params, tokens)
+    shifted = keyed_record(native, shift=1)
+    replayed = site_choices(obj, params, tokens, routes=(shifted, None))
+    for site, chosen in replayed.items():
+        assert np.all(chosen != native[site]), site
+        np.testing.assert_array_equal(chosen, shifted[site][:, :-1], err_msg=site)
+    np.testing.assert_array_equal(replayed_log_probs(obj, params, tokens, (keyed_record(native), None)),
+                                  obj.per_token_log_probs(params, tokens))
+    with pytest.raises(ValueError):
+        obj.token_scores(params, tokens, routes=(shifted[FEEDFORWARD_ROUTES], None))
 
 def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
     """GPT OSS's experts, which a mixture builds under swigluoai (`Mixture.build`), replay a record

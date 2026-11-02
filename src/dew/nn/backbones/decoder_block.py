@@ -38,7 +38,14 @@ from ..hyper_connections import (
     gated_write,
     mix_streams,
 )
-from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..inputs import (
+    FEEDFORWARD_ROUTES,
+    AttentionMetadata,
+    LayerInputs,
+    MixerCall,
+    PredictionPhase,
+    routing_blocks,
+)
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..mlp import GatedMLP
@@ -959,10 +966,10 @@ class DecoderBlock(nn.Module):
             normed = self.input_layernorm(read)
         if self.wiring.normed_residual:
             state = state._replace(x=normed)
-        routes = self._routes(per_layer_input)
+        mixer_routes, routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
-            routes if self._mixer_routes else {}, None if per_layer_input is None else per_layer_input.depth)
+            mixer_routes, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train, "attention")
@@ -976,7 +983,6 @@ class DecoderBlock(nn.Module):
                 x=(state.x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), state.x.dtype)
             )
         if self.feedforward is not None:
-            routes = routes if self.routed else {}
             if joined is not None:
                 state, mlp_input = self._stream_normed(*joined, attention_branch)
                 state, read, site = self._read(state, "mlp")
@@ -1267,22 +1273,29 @@ class DecoderBlock(nn.Module):
                 "model passes down the stack as attention_metadata.token_ids")
         return {"tokens": attention_metadata.token_ids}
 
-    @property
-    def _mixer_routes(self) -> bool:
-        """Whether the token mixer is the layer's routed site. A layer replays
-        one routing record, so its mixer and its feed-forward do not both route."""
-        routes = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
-        if routes and self.routed:
-            raise ValueError("a layer replays one routing record, and this one routes in both its mixer "
-                             "and its feed-forward; route in one of them")
-        return routes
-
-    def _routes(self, per_layer_input: LayerInputs | None) -> dict:
-        """The layer's replayed experts, for its one routed site, the feed-forward
-        or the mixer; nothing without a record."""
+    def _routes(self, per_layer_input: LayerInputs | None) -> tuple[dict, dict]:
+        """The layer's replayed experts for its token mixer and for its feed-forward, each the call's
+        `routes` where that site routes, nothing without a record. A record keyed by site
+        (`LayerInputs.experts`) gives the feed-forward its `FEEDFORWARD_ROUTES` entry and the mixer the
+        rest, by its branches' names (a parallel layer's, `dew.nn.mixers.parallel`); a layer's one record,
+        its one routed site."""
         if per_layer_input is None or per_layer_input.experts is None:
-            return {}
-        return {"routes": (per_layer_input.experts, per_layer_input.routed)}
+            return {}, {}
+        experts, routed = per_layer_input.experts, per_layer_input.routed
+        mixer = isinstance(self.self_attn, RoutesExperts) and self.self_attn.routes_experts
+        if isinstance(experts, Mapping):
+            if self.routed and FEEDFORWARD_ROUTES not in experts:
+                raise ValueError(f"the routing record names {sorted(experts)}, not this layer's routed "
+                                 f"feed-forward ({FEEDFORWARD_ROUTES!r})")
+            sites = {name: (record, routed) for name, record in experts.items() if name != FEEDFORWARD_ROUTES}
+            return (({"routes": sites} if mixer else {}),
+                    ({"routes": (experts[FEEDFORWARD_ROUTES], routed)} if self.routed else {}))
+        if mixer and self.routed:
+            raise ValueError("a layer's one routing record replays one routed site, and this layer routes "
+                             "in both its mixer and its feed-forward; key the record by site "
+                             f"({FEEDFORWARD_ROUTES!r} and the mixer's routed branches' names)")
+        record = {"routes": (experts, routed)}
+        return (record if mixer else {}), (record if self.routed else {})
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
