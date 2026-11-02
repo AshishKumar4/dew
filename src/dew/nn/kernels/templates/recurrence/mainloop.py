@@ -630,9 +630,9 @@ def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, 
           stages: int | tuple[int, int] | None,
           consumers: int = 1) -> tuple[resources.LaunchPlan | None, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
-    holds at once, at most its `tiles`, its rings two deep where they run on across its tiles (a family's
-    whose walks do not scope their streams apart, `Family.walks_scoped`) and two deep hold as many programs as
-    one, so a tile's loads go out under the last tile's work: a launch of
+    holds at once, at most its `tiles`, its rings up to two deep where they run on across its tiles (a
+    family's whose walks do not scope their streams apart, `Family.walks_scoped`), at the plan that hides the
+    most latency (`resources.hidden`), so a tile's loads go out under the last tile's work: a launch of
     one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
     thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);

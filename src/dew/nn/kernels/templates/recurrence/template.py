@@ -186,8 +186,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
-        - stages: the deepest ring of the states launch's steps of which a multiprocessor holds as many
-          programs as one stage's (`states_held`, `_staged`), one where none of two or more is legal.
+        - stages: the ring of the states launch's steps whose plan hides the most latency, its programs a
+          multiprocessor and its depth one choice (`_staged`, `resources.hidden`).
         - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`), where
           they run the states launch in one wave and the training call's do not: on an H100 the 27B gated
           delta net's forward took 0.513 ms at the training call's 32-wide block, its states launch's 192
@@ -358,11 +358,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, *,
                 walkers: int = 1, wide: int | None = None) -> mainloop.Tiles | None:
         """`block`'s tiles at `walkers` walk roles (`Tiles.walkers`) with the widest output block legal beside
-        it (`Tiles.block_o`; `wide` where given), at the deepest ring of the states launch's steps of which
-        a multiprocessor holds as many programs as one stage's (`states_held`; `resources.deepest`, within
-        `Family.most_shared` over a step's bytes), else one stage; None where no output block is legal
-        beside it. The ring deepest alone held an A100's states launch to one program a multiprocessor,
-        where its registers held three (SE-family-a100-8c5b5b16a)."""
+        it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps, within
+        `Family.most_shared` over a step's bytes, whose plan hides the most latency, its programs a
+        multiprocessor (`states_held`) and its depth one choice (`resources.hidden`); None where no output
+        block is legal beside it."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family) if wide is None else [wide]
@@ -372,13 +371,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
                            if self.legal(ba, tiles, target)), None)
         if shallowest is None:
             return None
-        programs = self.states_held(ba, shallowest, target)
-        step = self._states(ba, shallowest, target).step_bytes
-        deepest = resources.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
-                                 lambda tiles: (self.legal(ba, tiles, target)
-                                                and self.states_held(ba, tiles, target) >= programs),
-                                 family.most_shared // max(step, 1))
-        return deepest or shallowest
+        states = self._states(ba, shallowest, target)
+        order = resources.hidden(family, states.consumers)
+        deeper = (dataclasses.replace(shallowest, stages=stages)
+                  for stages in range(2, family.most_shared // max(states.step_bytes, 1) + 1))
+        rings = [shallowest, *(tiles for tiles in deeper if self.legal(ba, tiles, target))]
+        return max(rings, key=lambda tiles: order(self.states_held(ba, tiles, target), tiles.stages))
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):

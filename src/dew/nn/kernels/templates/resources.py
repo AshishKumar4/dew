@@ -149,14 +149,6 @@ def held_rows(family: "Family", consumers: int, columns: int) -> int:
     return share // family.role_rows * family.role_rows * consumers
 
 
-def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) -> C | None:
-    """`make(stages)` at the most stages, from `most` down to two (one loading beside one consumed), that
-    `holds` (a launch's legality: its ring within a block's shared memory); None where none does. A
-    derived ring is the deepest a block holds (CUTLASS's StageCountAutoCarveout's rule: the block's shared
-    memory less what else it stages, over a stage's bytes)."""
-    return next((made for made in map(make, range(most, 1, -1)) if holds(made)), None)
-
-
 def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
          group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
@@ -439,14 +431,33 @@ def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
     return None
 
 
+def hidden(family: "Family", consumers: int) -> Callable[[int, int], tuple[int, int]]:
+    """The order of a launch's plans, the most latency hidden first, each by its programs a multiprocessor
+    runs at once and its stages a program (its ring's depth): residency and depth are one choice.
+
+    A family whose producer issues a program's loads and whose products run asynchronously to its consumers'
+    warps (warpgroup MMA beside a TMA producer) hides its loads' latency by the bytes it holds in flight, its
+    programs times its stages (a stage's bytes are the launch's own at every plan), ties to fewer programs
+    (a larger raise each, its state held once): an H100 ran the 27B gated delta net's states launch one
+    program five deep (184 KiB in flight), where its most programs, two one deep (74 KiB), slowed the
+    forward 1.4 to 1.5 times (FS-RESIDENT-WINDOW1-h100, FS-INFLIGHT1); Nemotron-H 30B's SSD query/key launch,
+    one stage, two programs at 1.35 times one's rate (FS-SSD-RESIDENT1-h100). A family whose consumers issue
+    their own loads and synchronous products (mma.sync, no producer) hides their issue latency by its
+    resident warps, its programs first, then its ring: an A100 held its states launch at three programs
+    where its deepest ring alone held one (SE-family-a100-8c5b5b16a)."""
+    if family.warpgroups(consumers) > consumers:
+        return lambda programs, stages: (programs * stages, -programs)
+    return lambda programs, stages: (programs, stages)
+
+
 def plan(launches, family: "Family", target, *, programs: int | None = None) -> tuple[LaunchPlan, ...] | None:
     """Each of `launches`' plan on `target` (a GPU's, or the one a CPU process states), or None where any
-    launch holds at no plan: within its family's registers (`Family.registers`), the most programs a
+    launch holds at no plan: within its family's registers (`Family.registers`), of the residencies a
     multiprocessor's registers hold of it at its own registers (`Family.programs`; `programs` where the
-    caller fixes the residency, which its registers must hold)
-    whose share of its shared memory (`program_shared`) holds the launch at its `floor`, then the deepest
-    ring that share holds at that residency, so stages never trade away a program. Each launch plans at
-    its own residency and depth; a template's legality is that every launch holds."""
+    caller fixes the residency, which its registers must hold) whose share of its shared memory
+    (`program_shared`) holds the launch at its `floor`, each at the deepest ring that share holds, the one
+    that hides the most latency (`hidden`). Each launch plans at its own residency and depth; a template's
+    legality is that every launch holds."""
     planned = _planned(launches, family, target, programs)
     if (asked := _ASKED.get()) is not None:
         asked.append(Asked(tuple(launch.tile for launch in launches),
@@ -465,6 +476,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
             return None
         most = resident_programs(family, launch.consumers, launch.registers, target)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
+        order = hidden(family, launch.consumers)
         found = None
         for held in residencies:
             share = program_shared(block, held)
@@ -473,8 +485,8 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
             stages = launch.floor
             while stages < launch.most and shared_bytes(family, launch.scope(stages + 1)) <= share:
                 stages += 1
-            found = LaunchPlan(stages, held, shared_bytes(family, launch.scope(stages)))
-            break
+            if found is None or order(held, stages) > order(found.programs, found.stages):
+                found = LaunchPlan(stages, held, shared_bytes(family, launch.scope(stages)))
         if found is None:
             return None
         plans.append(found)
