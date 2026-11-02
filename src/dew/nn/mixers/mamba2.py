@@ -242,6 +242,7 @@ class Mamba2(nn.Module):
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
             name="in_proj",
+            kernel_axes=("embed", "linear"),
             **normal_kernel(self.init_std),
         )
         self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
@@ -254,8 +255,9 @@ class Mamba2(nn.Module):
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
         self.norm = MambaRMSNormGated(
             epsilon=self.norm_eps, groups=self.norm_groups, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj', **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'),
+                              **normal_kernel(self.init_std if self.output_init_std is None
+                                              else self.output_init_std))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):

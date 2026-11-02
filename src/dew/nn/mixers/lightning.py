@@ -127,10 +127,10 @@ class LightningAttention(nn.Module):
                              f"{self.activation!r}")
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        self.qkv_proj = dense(3 * self.features, name='qkv_proj')
-        self.output_gate = dense(self.features, name='output_gate')
+        self.qkv_proj = dense(3 * self.features, name='qkv_proj', kernel_axes=('embed', 'linear'))
+        self.output_gate = dense(self.features, name='output_gate', kernel_axes=('embed', 'linear'))
         self.norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj')
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
