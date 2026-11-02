@@ -17,7 +17,7 @@ from ahead_programs import arguments, programs
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
 from token_support import token_rows
 
-from dew.nn.kernels.generation import assumed
+from dew.nn.kernels.generation import assumed, built_target
 from dew.nn.kernels.options import owned_program
 from dew.training import MeshSpec
 from dew.training.ahead import BuildTarget, compile_ahead, compile_only_gpus, compiled_in, dumps
@@ -130,7 +130,8 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
                    env=computing_otherwise(environment), check=True)
     ahead = pickle.loads((tmp_path / "outputs.pkl").read_bytes())
     for name, (function, _) in programs(generation).items():
-        with assumed(generation):
+        # Under the facts the build used: this GPU's generation and its own multiprocessors.
+        with assumed(built_target(generation, own.multiprocessors)):
             here = np.asarray(owned_program(function)(*arrays[name]))
         assert ahead[name].dtype == here.dtype and ahead[name].tobytes() == here.tobytes(), name
 
