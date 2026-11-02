@@ -1023,7 +1023,13 @@ class Objective(ABC, Generic[Loss, Effects]):
                 if name in shapes and shapes[name] != np.shape(leaf):
                     raise ValueError(f"the held {name} is {np.shape(leaf)}, where the objective's modules "
                                      f"make it {shapes[name]}")
-        return boxed_axes(drawn)
+        return {**self.tower_axes(), **boxed_axes(drawn)}
+
+    def tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """The axes the frozen towers this objective holds beside its draw were drawn in, by their paths in
+        its variables, each tower's own table (`dew.inputs.ConditionEncoder.parameter_axes`): none for an
+        objective that holds none."""
+        return {}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.

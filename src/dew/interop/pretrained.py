@@ -1184,7 +1184,21 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text, stored=stored))
-    return replace(loaded, variables=placed(loaded.variables), revision=commit)
+    # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables; one
+    # loaded without its text encoder encodes nothing to draw its denoiser over, and is placed by shapes.
+    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming and text else {})}):
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+
+
+def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a loaded pipeline's parameters are drawn in: its denoiser's draw over its encoders'
+    parameters' shapes, and each encoder's own table (`DiffusionObjective.denoiser_axes`, `tower_axes`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    objective = DiffusionObjective(loaded)
+    encoders = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                            loaded.variables["encoders"])
+    return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
 
 
 def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],

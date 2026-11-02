@@ -23,6 +23,7 @@ from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
+from dew.nn.sharding import drawn_axes
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.registry import dtype_name
 
@@ -148,6 +149,18 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     """The files of the CLIP tokenizers, each pinned as it was loaded (`dew.data.text.pin_tokenizer`),
     which `dependencies` records with the T5 segment's: the ids a caption tokenizes to are theirs."""
     keyword: ClassVar[str] = "conditioning"
+
+    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        """Each CLIP tower's draw under its name's `text_model`, and the T5 segment's under its own name,
+        over a row of token ids (`ConditionEncoder.parameter_axes`)."""
+        ids = jnp.zeros((1, 2), jnp.int32)
+        table: dict[tuple[str, ...], tuple[str | None, ...]] = {
+            (name, "text_model", *path[1:]): axes for name, tower in zip(self.names, self.towers, strict=True)
+            for path, axes in drawn_axes(tower.init, ids).items()}
+        if self.t5 is not None:
+            drawn = drawn_axes(self.t5.tower.init, ids)
+            table.update({(self.t5.name, *path[1:]): axes for path, axes in drawn.items()})
+        return table
 
     def dependencies(self) -> Mapping[str, object]:
         """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume
@@ -396,6 +409,10 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     `dependencies` records."""
     keyword: ClassVar[str] = "conditioning"
     assets: ClassVar[str] = "tokenizer"
+
+    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        """The language tower's draw over a row of token ids (`ConditionEncoder.parameter_axes`)."""
+        return drawn_axes(self.tower.init, jnp.zeros((1, 2), jnp.int32))
 
     def dependencies(self) -> Mapping[str, object]:
         """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume

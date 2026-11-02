@@ -55,6 +55,7 @@ from dew.nn.protocols import (
     CountedVideo,
     RequiresText,
 )
+from dew.nn.sharding import LogicalAxes, drawn_axes
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -602,15 +603,30 @@ class DiffusionObjective(Objective[Ratio]):
     # The held tree is the starting tree or the frozen towers a draw goes beside.
     _held_parts = True
 
-    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
-        """Draw the denoiser beside the held frozen towers."""
-        held = self.held_variables() if held is None else held
-        conditions = self.encode(held["encoders"])
+    def tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """Each frozen encoder's table under the `encoders` collection at its keyword."""
+        return {("encoders", keyword, *path): axes for keyword, condition in self.inputs.conditions.items()
+                for path, axes in condition.encoder.parameter_axes().items()}
+
+    def denoiser_axes(self, encoders) -> dict[tuple[str, ...], LogicalAxes]:
+        """The axes the denoiser draws each parameter in over what `encoders`' parameters, arrays or their
+        shapes, encode, traced for shapes alone (`drawn_axes`): the table a pipeline's load places its
+        denoiser by."""
+        return drawn_axes(self._drawn_denoiser, encoders)
+
+    def _drawn_denoiser(self, key: jax.Array, encoders) -> Variables:
+        """The denoiser drawn over the conditions `encoders` encode, mask and masked image beside them
+        where the inputs hold a mask."""
+        conditions = self.encode(encoders)
         if self.inputs.mask is not None:
             conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
                           "masked_image": jnp.zeros((1, *self.latent_shape))}
-        drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
-                                **conditions)
+        return self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)), **conditions)
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        """Draw the denoiser beside the held frozen towers."""
+        held = self.held_variables() if held is None else held
+        drawn = self._drawn_denoiser(key, held["encoders"])
         state = {**drawn, "encoders": held["encoders"]}
         built: Variables | None = None
         for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR, TEACHER):
