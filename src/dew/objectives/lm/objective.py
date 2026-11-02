@@ -86,6 +86,7 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     PositionCapacity,
+    SteppedFeedForward,
     SteppedInContext,
     TokenModel,
     head_table,
@@ -124,6 +125,7 @@ from dew.objectives.lm.chunked import (
     support_log_probs,
 )
 from dew.objectives.lm.head import HeadedObjective
+from dew.objectives.lm.stacking import stacked_scores
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.text import Sampling
 
@@ -453,6 +455,22 @@ class Scores(NamedTuple):
     logits: jax.Array | None = None
     inspected: dict | None = None
     moved: Mapping | None = None
+
+
+def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
+                    z_loss: float | None) -> None:
+    """Refuse what a decoder stepping its own feed-forward blocks in context (`ChunkAdaptation.layers`)
+    cannot score: its trunk runs chunk by chunk through its decode cache (`dew.objectives.lm.stacking`),
+    which gathers no collection (`routing`, `qk_stats`, `indexer`, `watched`), keeps no layer's states
+    and no prediction depth's inputs, replays no rollout's experts, and reads the head whole, not fused."""
+    asked = [name for name, given in (("collections", bool(collections)), ("depths", depths),
+                                      ("layers", bool(layers)), ("routes", routes is not None),
+                                      ("z_loss", z_loss is not None)) if given]
+    if asked:
+        raise ValueError(f"a decoder stepping its own feed-forward blocks in context runs chunk by chunk "
+                         f"through its decode cache, which gathers no collection, keeps no layer's or "
+                         f"prediction depth's states, replays no experts and reads the whole head: {asked} "
+                         f"are asked")
 
 
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
@@ -860,9 +878,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
-        with self._watched(prepared, watched):
-            hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
-                                                   layers, progress)
+        stacked = self.adaptation is not None and bool(self.adaptation.layers)
+        if stacked:
+            # The decoder's own blocks step chunk by chunk through its cache, which runs the trunk itself.
+            _refuse_stacked(opened, depths=depths, layers=layers, routes=routes, z_loss=z_loss)
+            hidden, gathered = None, {}
+        else:
+            with self._watched(prepared, watched):
+                hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
+                                                       {**packing, **replay}, layers, progress)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
         qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
@@ -870,13 +894,21 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self.fused_head(self.model, params) if z_loss is not None else None
-        dtype = at_least_fp32(hidden.dtype)
+        dtype = at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32) if hidden is None else hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         if rows is not None:
             # A filled row's targets weigh nothing, so a fused head's sum counts each real row once.
             weights = jnp.where(rows[:, None] > 0, weights, 0)
-        total, (losses, predicted, log_z), whole, moved = self._head_scores(
-            params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
+        if stacked:
+            hidden, adapted = stacked_scores(self.model, params, inputs, targets, weights,
+                                             prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                             predict=predict, logits=logits, train=train, rngs=rngs)
+            total, (losses, predicted, log_z), whole, moved = (
+                None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits, adapted.moved)
+        else:
+            total, (losses, predicted, log_z), whole, moved = self._head_scores(
+                params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss,
+                logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -1254,7 +1286,10 @@ class LMObjective(TokenScorer):
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         if adaptation is not None:
-            if not _steps_in_context(self.model):
+            if adaptation.layers and not isinstance(self.model, SteppedFeedForward):
+                raise ValueError("adaptation steps the decoder's own feed-forward blocks, which this model "
+                                 "does not name (`SteppedFeedForward`)")
+            if not adaptation.layers and not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
                                  "(CausalTransformer.continuum, `SteppedInContext`)")
             if samples is not None:
@@ -1293,10 +1328,15 @@ class LMObjective(TokenScorer):
         if self._carries and CARRIED not in tree:
             # A run that carries its level starts with nothing carried.
             # The level as the model reads it, its frozen leaves among it; the tree keeps its split.
-            level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)
-                     else None)
+            if self.adaptation.layers:
+                # The decoder's own blocks of those layers are the levels (`dew.objectives.lm.stacking`).
+                level = (self.model.feedforward_levels(thaw(tree), self.adaptation.layers)
+                         if isinstance(self.model, SteppedFeedForward) else None)
+            else:
+                level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)
+                         else None)
             if level is None:
-                raise ValueError("the model has no continuum level to step in context")
+                raise ValueError("the model has no continuum level or feed-forward block to step in context")
             tree = {**tree, CARRIED: _carried_start(level)}
         if self.indexer is not None:
             tree = thaw(tree)

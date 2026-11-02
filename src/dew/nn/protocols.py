@@ -320,6 +320,23 @@ class SteppedInContext(Protocol):
 
 
 @runtime_checkable
+class SteppedFeedForward(Protocol):
+    """A decoder whose own feed-forward blocks an objective steps in context, chunk by chunk through its
+    decode cache (`dew.objectives.lm.stacking`, Nested Learning's ad-hoc level stacking): the blocks of
+    some layers within a tree of its variables, by their scopes' names (`feedforward_levels`), the tree
+    with others in their place, its cache (`init_cache`) and a cached call's states and logits
+    (`states_and_logits`). Its owner keeps the blocks' place in its tree."""
+
+    def feedforward_levels(self, variables: VariableDict, layers: tuple[int, ...]) -> dict: ...
+
+    def with_feedforward_levels(self, variables: VariableDict, levels: Mapping) -> VariableDict: ...
+
+    def init_cache(self, batch_size: int): ...
+
+    def states_and_logits(self, tokens: jax.Array, **kwargs): ...
+
+
+@runtime_checkable
 class BoundedNorm(Protocol):
     """A norm whose derivatives in its input a curvature bound through it reads (a damped in-context
     step's under a head transform, `CausalTransformer.head_bounds`): `spread(x)`, per row the root mean

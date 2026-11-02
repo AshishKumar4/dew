@@ -203,6 +203,26 @@ def with_level_parameters(continuum: Levels, params: Mapping, levels) -> dict:
     return {**params, **{name: {**params[name], "continuum": level} for name, level in levels.items()}}
 
 
+def feedforward_levels(variables, layers: tuple[int, ...], count: int, scanned: bool) -> dict:
+    """The feed-forward blocks of a decoder's `layers` in `variables`, by their layers' scopes
+    (`layers_3`): the levels an objective steps in context (`SteppedFeedForward`), of a decoder of `count`
+    layers. A `scanned` stack holds them in one tree a run of layers: refused, as is a layer it lacks."""
+    if scanned:
+        raise ValueError("a scanned stack holds its layers' feed-forward blocks in one tree a run of layers; "
+                         "step them in context on a stack of its own layers (scan_layers=False)")
+    missing = sorted(set(layers) - set(range(count)))
+    if missing:
+        raise ValueError(f"this decoder has {count} layers, not {missing}")
+    return {f"layers_{layer}": variables["params"][f"layers_{layer}"]["mlp"] for layer in layers}
+
+
+def with_feedforward_levels(variables, levels: Mapping) -> dict:
+    """`variables` holding `levels` as their layers' feed-forward blocks (`feedforward_levels`)."""
+    params = variables["params"]
+    return {**variables, "params": {**params, **{name: {**params[name], "mlp": level}
+                                                 for name, level in levels.items()}}}
+
+
 @struct.dataclass
 class HeadTransform:
     """What bounds a head transform N(phi(D s)) before a head's rows (`HeadTerms`): phi's `slopes` (p1, p2,

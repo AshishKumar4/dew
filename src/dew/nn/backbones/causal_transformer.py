@@ -58,8 +58,10 @@ from dew.nn.continuum import (
     chain_states,
     continuum_chain,
     continuum_modules,
+    feedforward_levels,
     level_of,
     level_parameters,
+    with_feedforward_levels,
     with_level_parameters,
 )
 from dew.nn.dense import Dense
@@ -1253,7 +1255,7 @@ class CausalTransformer(LinearProducts):
 
     @property
     def in_context(self) -> bool:
-        """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
+        """Whether the model holds a continuum level (`SteppedInContext`)."""
         return self.continuum is not None
 
     @property
@@ -1262,12 +1264,9 @@ class CausalTransformer(LinearProducts):
         return 0 if self.continuum is None else len(continuum_chain(self.continuum))
 
     def head_bounds(self, states) -> HeadTerms:
-        """What bounds the curvature and the slope of a slot's cross entropy in the `states` `head_logits`
-        reads (`HeadTerms`, `SteppedInContext`), from the bound model's rows (`vocabulary_rows`, an adapter
-        applied), softcap and transform, a transform's norm read at the states (`BoundedNorm`; a norm that
-        bounds no derivatives is refused), each kernel's norm as Qwix's rounding can grow it, a step
-        following its straight-through gradient (`_head_growth`, which refuses a map an interceptor
-        rounds)."""
+        """What bounds a slot loss's curvature and slope in the `states` `head_logits` reads (`HeadTerms`):
+        the bound rows (`vocabulary_rows`), softcap and transform, its norm read at the states
+        (`BoundedNorm`), each kernel as Qwix's rounding can grow it (`_head_growth`)."""
         table = self._head_table()
         projection = table.projection
         maps = {None if self.tie_embeddings else "lm_head": jnp.shape(table.rows())[-1],
@@ -1292,6 +1291,13 @@ class CausalTransformer(LinearProducts):
             self.head_norm.derivative_bounds(dense.shape[-1])))
 
     @nn.nowrap
+    def feedforward_levels(self, variables, layers: tuple[int, ...]) -> dict:
+        """The feed-forward blocks of `layers` in `variables` (`dew.nn.continuum.feedforward_levels`)."""
+        return feedforward_levels(variables, layers, self.num_layers, self.scan_layers)
+
+    with_feedforward_levels = staticmethod(with_feedforward_levels)
+
+    @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
         return None if self.continuum is None else level_parameters(self.continuum, variables["params"])
@@ -1302,23 +1308,21 @@ class CausalTransformer(LinearProducts):
         return {**variables, "params": with_level_parameters(self.continuum, variables["params"], level)}
 
     def continuum_states(self, hidden, index: int | None = None):
-        """Final states `hidden` past the continuum levels, the states its head reads (`head_logits`), or
-        states past level `index` alone (`chain_states`): an objective that steps the levels in context
-        reads them with their own parameters here."""
+        """Final states `hidden` past the continuum levels, the head's input, or past level `index` alone
+        (`chain_states`), read at the levels' own parameters (`SteppedInContext`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
         return chain_states(self.continuum_level, hidden, index)
 
     def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0):
-        """What bounds a damped step of continuum level `index`'s `parts` at the states `hidden` it reads,
-        its maps' inputs as a checkpoint's quantizers round them (`Continuum.step_terms`)."""
+        """What bounds a damped step of continuum level `index`'s `parts` at its states `hidden`
+        (`Continuum.step_terms`), its maps' inputs as a checkpoint's quantizers round them."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
         return level_of(self.continuum_level, index).step_terms(hidden, parts, self._quantizer)
 
     def head_logits(self, x):
-        """The fp32 head over states the continuum level already read (`continuum_states`), or a
-        model without one's final states: `_logits` past the level."""
+        """The fp32 head over states past the continuum levels (`continuum_states`), or final states."""
         # A stream-width transform reads the final states before `project_out` takes them to the table's.
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))

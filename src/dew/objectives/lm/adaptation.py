@@ -91,6 +91,11 @@ class ChunkAdaptation:
     document afresh, Titans' and TTT's reset; "run", the level the run carried, each row's documents
     stepping one level in turn and each update carrying its rows' mean step on (module docstring),
     Nested Learning's continuum memory kept across documents and steps.
+
+    `layers` names the decoder layers whose own feed-forward blocks are the levels instead, one window
+    and rate a layer in its order or one for all (`dew.objectives.lm.stacking`, section 7.3's ad-hoc
+    level stacking): a pretrained decoder's blocks stepped in context from their trained values, which
+    continued pre-training trains through the steps; empty, the model's continuum levels.
     """
 
     window: int | tuple[int, ...] = 16
@@ -98,6 +103,7 @@ class ChunkAdaptation:
     select: tuple[str, ...] = ()
     damped: bool = False
     carry: str = "document"
+    layers: tuple[int, ...] = ()
 
     def __post_init__(self):
         windows = self.window if isinstance(self.window, tuple) else (self.window,)
@@ -113,6 +119,9 @@ class ChunkAdaptation:
         if self.carry not in ("document", "run"):
             raise ValueError(f"a level carries across a 'document' or a 'run', not {self.carry!r}")
         object.__setattr__(self, "select", tuple(self.select))
+        object.__setattr__(self, "layers", tuple(self.layers))
+        if len(set(self.layers)) != len(self.layers):
+            raise ValueError(f"each layer's feed-forward block is one level, not {self.layers}")
 
     def windows(self, levels: int) -> tuple[int, ...]:
         """Each of `levels` levels' window, a chain's in its order: `window`'s own, or one for all."""
