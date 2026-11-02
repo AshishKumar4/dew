@@ -1538,8 +1538,9 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             for each in found:
                 published(each)
             continue
-        tested(python, name, part, out.with_name(f"{out.name}.{index}"), deadline - (time.monotonic() - began),
-               grace, common, started, published, coverage, whole=whole, release=release, container=container)
+        left = deadline - (time.monotonic() - began)
+        tested(python, name, part, out.with_name(f"{out.name}.{index}"), left, grace, common, started,
+               published, coverage, whole=whole, release=release, container=container)
     out.write_text(json.dumps({"rows": rows}))
     # A map task's red row fails its task: armada runs no judge on draws a map task did not pass, and reads
     # the judge red, naming it (`site_entries`).
@@ -1628,9 +1629,9 @@ def tested(python: str, name: str, split: str, out: Path, deadline: float, grace
     """Test file `name` (in `split`'s group) run in a pytest process of its own (`alone`) under `environ`
     beside this process's, within `deadline` seconds (none left: red as its deadline cut it off, `file_row`),
     its row handed to `published` before its record goes to the cache, which can be slow (review: a slow
-    cache withheld the finished rows): the row carries its red, and the task's exit stays its own. With `network`, the network-marked tests alone,
-    with the Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's.
-    Its scratch logs are kept beside `out`.
+    cache withheld the finished rows): the row carries its red; the task's exit is its own. With `network`,
+    the network-marked tests alone, with the Hub open, recorded on the network lane's class (`device_class`);
+    `release`, a release check's. Its scratch logs are kept beside `out`.
 
     Every file that executes may leave anything behind (a file, a process, shared memory, a socket, the GPU's
     state), so a file's run is kept for reuse only where it ran first in a container no task had run in
