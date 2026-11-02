@@ -116,22 +116,23 @@ tasks of seeds and their judge (`check1_shards`), every seed drawn and judged as
 
 
 @pytest.mark.parametrize("case", SEEDS[128])
-@pytest.mark.check1_shards(seeds=128, per_task=24)
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
     The truth is mamba_ssm's minimal torch reference in float64. Each of the case's head counts (`CASES`:
     kernels summing a group's heads take that many a program) runs every declared draw, each draw's truth
-    taken once for all of them. A map task draws 24 seeds of both cases (bf16's 32 took 62 s).
+    taken once for all of them. A map task draws 16 seeds of both cases: 79 s, where 24 took 100
+    (ssd-shards2 on 2bd537430, 2.5 s a seed past 39 s of compiles).
     """
     _port_holds_check_1(case)
 
 
 @pytest.mark.parametrize("case", SEEDS[256])
-@pytest.mark.check1_shards(seeds=256, per_task=32)
+@pytest.mark.check1_shards(seeds=256, per_task=24)
 def test_the_documents_port_cases_are_as_exact_as_mamba_ssm(case):
     """`test_the_port_is_as_exact_as_mamba_ssm` over the cases of 256 recorded seeds (`SEEDS`), a map task
-    drawing 32 of both (69 to 91 s, ssd-shards on 052cc16d8)."""
+    drawing 24 of both (32 took 69 to 91 s, ssd-shards on 052cc16d8)."""
     _port_holds_check_1(case)
 
 
