@@ -249,8 +249,9 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
             for hi in range(lo, lo + 3 * stages + 1):
                 taken.clear()
                 singly = 0
-                for run, start, stop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
-                    for trip in range(int(start), int(stop)):
+                for loop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
+                    run = loop.step
+                    for trip in range(int(loop.lo), int(loop.hi)):
                         before = len(taken)
                         run(trip)
                         singly += len(taken) - before == 1

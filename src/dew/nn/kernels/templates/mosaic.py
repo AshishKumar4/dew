@@ -23,7 +23,7 @@ import functools
 import math
 import operator
 from collections.abc import Callable
-from typing import Self
+from typing import Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
@@ -341,9 +341,20 @@ def rotated(turned: Callable, lo, hi, first, stages: int) -> tuple:
     return run, (lo - first) // stages, (hi - first + stages - 1) // stages
 
 
-def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) -> tuple[tuple, ...]:
+class Loop(NamedTuple):
+    """A loop a walk runs in turn (`Family.accumulated`): `step(index, carry, accumulators)` from `lo` to
+    `hi`, then `then()` once inside the walk's scope where it is given (a ring segment's products done and
+    its slots given back before the next segment's steps wait for them, `RingFamily._walked`)."""
+
+    step: Callable
+    lo: Any
+    hi: Any
+    then: Callable[[], None] | None = None
+
+
+def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) -> tuple[Loop, ...]:
     """Steps `lo` to `hi` of a ring of `stages` slots (its counters from `first`) as the loops a walk runs in
-    turn, `((run, start, stop), ...)`; `turned(index, turn, *state, before=0) -> state` takes each step at
+    turn (`Loop`); `turned(index, turn, *state, before=0) -> state` takes each step at
     its `Turn`, `before` the steps of its trip's, in its range, known to precede it. A loop of a step a trip,
     its slot traced (`Turn.of`); or, `unrolled`, of a rotation of the ring a trip, its `stages` steps each at
     its slot, a constant, and the trip's one parity, so no step of it forms a slot's address by arithmetic
@@ -361,7 +372,7 @@ def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) ->
         return turned(index, Turn.of(index - first, stages), *state)
 
     if not unrolled:
-        return ((single, lo, hi),)
+        return (Loop(single, lo, hi),)
 
     def whole(rotation, *state):
         for slot in range(stages):
@@ -373,8 +384,8 @@ def stepping(turned: Callable, lo, hi, first, stages: int, *, unrolled: bool) ->
     # `hi` and the last not before the first (a range inside one rotation takes its steps one at a time).
     begin = jnp.minimum(lo + (first - lo) % stages, hi)
     end = jnp.maximum(hi - (hi - first) % stages, begin)
-    return ((single, lo, begin), (whole, (begin - first) // stages, (end - first) // stages),
-            (single, end, hi))
+    return (Loop(single, lo, begin), Loop(whole, (begin - first) // stages, (end - first) // stages),
+            Loop(single, end, hi))
 
 
 def rotations(lo, hi, first, stages: int, step: Callable[[jax.Array, "Turn"], None]) -> None:
@@ -1048,13 +1059,16 @@ class Issuer[Accumulator](abc.ABC):
 
     def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple[jax.Array, ...]]:
-        """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
-        `shapes` held across it from their `initial` values (`walk`): in registers, the walk's loop carrying
-        them (mma.sync's), unless the issuer's home is a ref it scopes (wgmma's)."""
+        """A walk of `segments` (`Loop`s) in turn, with the family's accumulators of `shapes` held across it
+        from their `initial` values (`walk`): in registers, the walk's loop carrying them (mma.sync's), unless
+        the issuer's home is a ref it scopes (wgmma's)."""
         del interpret
         both = (start, self.started(shapes, initial))
-        for step, lo, hi in segments:
-            both = lax.fori_loop(lo, hi, lambda index, both, step=step: step(index, *both), both)
+        for loop in segments:
+            both = lax.fori_loop(loop.lo, loop.hi, lambda index, both, step=loop.step: step(index, *both),
+                                 both)
+            if loop.then is not None:
+                loop.then()
         return both
 
     @abc.abstractmethod
@@ -1754,24 +1768,21 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 pl.when(index >= lo + in_flight)(lambda: given(turn.back(in_flight, stages), release=True))
             return carry, accumulators
 
-        def drained(lo, hi) -> tuple:
+        def drained(lo, hi) -> Callable[[], None]:
             # A segment's last `in_flight` steps' products done and their slots given back, oldest first,
             # before the next segment's steps wait for those slots: its own releases start at its own `lo`.
-            def drain(index, carry, accumulators):
-                del index
+            def drain():
                 self.settled()
                 for back in reversed(range(in_flight)):
                     pl.when(hi - back > lo)(lambda back=back: given(Turn.of(hi - 1 - back - first, stages),
                                                                     release=True))
-                return carry, accumulators
 
-            return drain, 0, 1
+            return drain
 
-        loops = []
+        loops: list[Loop] = []
         for step, lo, hi in segments:
-            loops += stepping(functools.partial(turned, step, lo), lo, hi, first, stages, unrolled=unrolled)
-            if in_flight:
-                loops.append(drained(lo, hi))
+            run = stepping(functools.partial(turned, step, lo), lo, hi, first, stages, unrolled=unrolled)
+            loops += [*run[:-1], run[-1]._replace(then=drained(lo, hi) if in_flight else None)]
         return self.accumulated(tuple(loops), start, shapes, interpret, initial)
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

@@ -123,17 +123,18 @@ class _Interpreter:
         return carry
 
     def scanned(self, params, values) -> list:
-        consts, carry = values[:params["num_consts"]], values[params["num_consts"]:
-                                                               params["num_consts"] + params["num_carry"]]
+        # The scan's operands in its three groups (`ft_in`: consts, carry, stacked), each group's count its
+        # leaves'.
+        num_consts, num_carry, _ = (len(jax.tree.leaves(group, is_leaf=lambda leaf: leaf is None))
+                                    for group in params["ft_in"].elts)
+        consts = values[:num_consts]
+        carry = values[num_consts:num_consts + num_carry]
+        stacked = values[num_consts + num_carry:]
         body = params["jaxpr"]
-        stacked = values[params["num_consts"] + params["num_carry"]:]
-        outputs = []
         for index in range(params["length"]):
             sliced = [None if value is None else value[index] for value in stacked]
-            found = self.run(body.jaxpr, body.consts, [*consts, *carry, *sliced])
-            carry, out = found[:params["num_carry"]], found[params["num_carry"]:]
-            outputs.append(out)
-        return [*carry, *([None] * (len(params["jaxpr"].out_avals) - params["num_carry"]))]
+            carry = self.run(body.jaxpr, body.consts, [*consts, *carry, *sliced])[:num_carry]
+        return [*carry, *([None] * (len(body.out_avals) - num_carry))]
 
     def scoped(self, params, values) -> list:
         jaxpr = params["jaxpr"]

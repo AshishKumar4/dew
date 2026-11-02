@@ -147,11 +147,13 @@ class WgmmaIssuer(mosaic.Issuer):
                 if value is not None:
                     acc[...] = value
             carry = start
-            for step, lo, hi in segments:
-                def stepped(index, carry, step=step):
+            for loop in segments:
+                def stepped(index, carry, step=loop.step):
                     return step(index, carry, accumulators)[0]
 
-                carry = lax.fori_loop(lo, hi, stepped, carry)
+                carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
+                if loop.then is not None:
+                    loop.then()
             plgpu.wgmma_wait(0)
             return carry, tuple(acc[...] for acc in accumulators)
 
