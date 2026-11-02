@@ -33,7 +33,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, integers, record, strings, text
+from dew._records import boolean, integer, record, strings, text
 from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.analysis import (
     _LOCAL,
@@ -70,7 +70,6 @@ from dew.data.dataset import (
     _stacked,
     logged_run,
     record_batch,
-    restore_parent,
     stacked,
     take_batch,
 )
@@ -86,7 +85,7 @@ from dew.data.mixing import (
     rewound,
     token_weights,
 )
-from dew.data.packing import FirstFitPacked
+from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -109,7 +108,6 @@ from dew.data.pipeline import (
     MapWithIndex,
     Mixture,
     Native,
-    Owed,
     Pack,
     Phases,
     Pipeline,
@@ -121,15 +119,18 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    Tagged,
     TokenBudget,
     TokenSplit,
     Windows,
     Workers,
     accounts,
     children,
+    consumed_by,
+    consumed_forward,
     examples_bound,
     joined,
-    members_of,
+    members_held,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -438,11 +439,11 @@ def _chained(
 ) -> tuple[Record, ...]:
     """What adjacent record `stages` make of one row: each stage's `_outputs` over every output of
     the one before, a marker passing through the rest, each row's consumed source examples carried to
-    the last output a stage makes of it (`_consumed_by`)."""
+    the last output a stage makes of it (`consumed_by`)."""
     held: tuple[Record, ...] = (value,)
     for stage in stages:
         step = functools.partial(_outputs, stage, position, rng=rng, counts=counts)
-        held = tuple(made for given in held for made in _consumed_by(given, step))
+        held = tuple(made for given in held for made in consumed_by(given, step))
     return held
 
 
@@ -495,76 +496,6 @@ type Share = Callable[[int], int | None] | None
 """A per-share read's part of the pool's first examples, as its root deals its source to the shares
 (`DataPartition.bounded`, `dew.data.shards.bounded`); None, or a part of None, where the root deals no
 count known ahead."""
-
-
-def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
-    """`step`'s outputs of `given`, the fields the run counts it by (`COUNTING`) kept out of the step's
-    sight: the mixture member it was drawn from (`MEMBER`) on every output, a rejected row's marker too
-    (`Rejected.member`), and the source examples it consumes (`CONSUMED`, and of them those it carries for
-    refused ones, `REFUSED`, those it completes by member, `MEMBERS`) carried to its last output: a row's
-    counts beside its own, a rejected row's on its marker (`Rejected.consumed`, every one of them refused
-    now, completing no member's), which the corpus's next kept row carries on (`Accepted`). Every other row
-    holds none, so the rows of one read hold the same fields. A member's row that first holds counts (the
-    bound's marks, `MarkConsumed`) completes them as its member's."""
-    if given is None or isinstance(given, (bytes, Rejected)) or not any(name in given for name in COUNTING):
-        return step(given)
-    member = None if MEMBER not in given else text(given[MEMBER], "a row's mixture member")
-    unseen = {name: column for name, column in given.items() if name not in COUNTING}
-    outputs = tuple(_as_member(made, member) for made in step(unseen))
-    if CONSUMED not in given:
-        return outputs
-    consumed, refused = accounts(given)
-    members = _members_held(given, member)
-    split = {MEMBERS: {}} if MEMBERS in given else {}
-    *rest, last = outputs
-    rest = [{CONSUMED: 0, REFUSED: 0, **split, **row} if isinstance(row, Mapping) else row for row in rest]
-    if isinstance(last, Rejected):
-        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
-    elif isinstance(last, Mapping):
-        own, owned = accounts(last)
-        carried = {**last, CONSUMED: consumed + own, REFUSED: refused + owned}
-        if split or MEMBERS in last:
-            carried[MEMBERS] = joined(members_of(last), members)
-    else:
-        raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
-                         "count of the examples it consumes; a step after the bound returns records")
-    return (*rest, carried)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Tagged:
-    """A mixture member's rows, each saying it is the member's of `key` (`MEMBER`)."""
-
-    key: str
-
-    def __call__(self, row: Record) -> Record:
-        if isinstance(row, Mapping):
-            return {**row, MEMBER: self.key}
-        return dataclasses.replace(row, member=self.key) if isinstance(row, Rejected) else row
-
-
-def _as_member(made: Record, member: str | None) -> Record:
-    """A step's output of a mixture member's row as that member's (`MEMBER`, `Rejected.member`), the
-    examples it completes its member's where it first holds counts (the bound's marks)."""
-    if member is None:
-        return made
-    if isinstance(made, Rejected):
-        return made if made.member is not None else dataclasses.replace(made, member=member)
-    if not isinstance(made, Mapping):
-        return made
-    tagged = {**made, MEMBER: member}
-    if CONSUMED in made and MEMBERS not in made:
-        tagged[MEMBERS] = _members_held(made, member)
-    return tagged
-
-
-def _members_held(row: Batch, member: str | None) -> dict[str, int]:
-    """The examples `row` completes by mixture member (`MEMBERS`): of its member alone, the consumed it
-    has not refused, where it states no split."""
-    if MEMBERS in row:
-        return dict(members_of(row))
-    consumed, refused = accounts(row)
-    return {} if member is None else joined({member: consumed - refused})
 
 
 def _run(
@@ -652,30 +583,6 @@ type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool 
 """A record's field, as the steps before a batch leave it."""
 
 
-def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
-    """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
-    to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
-    holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
-    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows; the row it
-    moves to carries it as refused (`REFUSED`)."""
-    carried: list[Record] = []
-    markers: list[int] = []
-    owed = Owed()
-    for element in elements:
-        if isinstance(element, Rejected) and element.consumed:
-            markers.append(len(carried))
-            owed.owe(element.consumed)
-        elif markers and isinstance(element, Mapping) and CONSUMED in element:
-            # The markers' counts move to this row; none follows them in the group otherwise.
-            for at in markers:
-                marker = carried[at]
-                assert isinstance(marker, Rejected)
-                carried[at] = dataclasses.replace(marker, consumed=0)
-            element, markers = owed.paid(element), []
-        carried.append(element)
-    return carried
-
-
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
@@ -689,7 +596,7 @@ class _Grouped:
         self.shared = True
 
     def __call__(self, elements: Sequence[Record]) -> Batch:
-        elements = _consumed_forward(elements)
+        elements = consumed_forward(elements)
         markers = [element for element in elements if isinstance(element, Rejected)]
         rows = [element for element in elements if not isinstance(element, Rejected)]
         records = [row for row in rows if isinstance(row, Mapping)]
@@ -751,16 +658,17 @@ class _Groups:
         rows = [record(value, "batched input") for value in group]
         # The source examples the group's rows consume are the run's accounting, out of the step's sight:
         # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
-        # last row, as a record step's expansion does (`_consumed_by`).
+        # last row, as a record step's expansion does (`consumed_by`).
         counted = [row for row in rows if CONSUMED in row]
         held = [accounts(row) for row in counted]
         consumed, refused = [count for count, _ in held], [part for _, part in held]
         # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
         # of where the group's rows are all one member's.
         tags = [row.get(MEMBER) for row in rows]
-        members = [_members_held(row, None if tag is None else text(tag, "a row's mixture member"))
+        members = [members_held(row, None if tag is None else text(tag, "a row's mixture member"))
                    for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
-        common = tags[0] if tags and tags[0] is not None and len(set(tags)) == 1 else None
+        alike = bool(tags) and tags[0] is not None and len(set(tags)) == 1
+        common = text(tags[0], "a row's mixture member") if alike else None
         counted_by = any(MEMBERS in row or MEMBER in row for row in rows if CONSUMED in row)
         rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
@@ -1112,7 +1020,7 @@ class _ConsumedAt:
             laid[name] = held
         if self.documents is not None:
             member = None if MEMBER not in document else text(document[MEMBER], "a row's mixture member")
-            ids = np.full(length, self.documents.laid(member, _members_held(document, member)), np.int64)
+            ids = np.full(length, self.documents.laid(member, members_held(document, member)), np.int64)
             if length:
                 ids[-1] = -ids[-1]
             laid[DOCUMENT] = ids
@@ -1159,84 +1067,6 @@ class _RuledIterator(pygrain.DatasetIterator):
 
     def close(self) -> None:
         self._windows.close()
-
-
-class _Concatenated(pygrain.IterDataset):
-    """Grain's concatenating packer, restored from a position read back from JSON, as every saved
-    position is. Its saved state marks a window's remainder by its slices and none by the tuple
-    (-1, -1), which JSON reads back as a list the packer does not take for that tuple, so a restore
-    reads the next document as a remainder cut to nothing and drops it (grain 0.2.18 to its main of
-    2026-10-18, `packing_concat_then_split._CtsState.has_remainder`). The slices go back as the
-    tuples the packer wrote."""
-
-    def __init__(self, parent: pygrain.IterDataset):
-        super().__init__(parent)
-        self._packed = parent
-
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _ConcatenatedIterator(self._packed.__iter__())
-
-
-class _ConcatenatedIterator(pygrain.DatasetIterator):
-    def __init__(self, parent: pygrain.DatasetIterator):
-        super().__init__(parent)
-        self._packed = parent
-
-    def __next__(self) -> Batch:
-        return next(self._packed)
-
-    def get_state(self) -> Mapping[str, object]:
-        return self._packed.get_state()
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        slices = record(state["remainder_slices"], "packed remainder")
-        self._packed.set_state({**state, "remainder_slices": {
-            name: integers(bounds, name) for name, bounds in slices.items()}})
-
-
-class _OverlappedCuts(pygrain.IterDataset):
-    """Documents as a concatenating pack (`Pack.overlap`) reads them: the tokens before each cut
-    through a document written again after it, so the window the cut ends and the next both hold
-    them. Grain's concatenating packer cuts the documents it joins every `seq_len` tokens, so how
-    full this stream leaves its window places the next cut."""
-
-    def __init__(self, parent: pygrain.IterDataset, stage: Pack):
-        super().__init__(parent)
-        self._documents, self._stage = parent, stage
-
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _OverlappedCutsIterator(self._documents.__iter__(), self._stage)
-
-
-class _OverlappedCutsIterator(pygrain.DatasetIterator):
-    """Each document with its cuts overlapped, and where the last one left its window: the room
-    left in it, saved with the parent's position."""
-
-    def __init__(self, parent: pygrain.DatasetIterator, stage: Pack):
-        super().__init__(parent)
-        self._documents, self._stage = parent, stage
-        self._room = stage.seq_len
-
-    def __next__(self) -> Batch:
-        document = next(self._documents)
-        count = len(document[self._stage.fields[0]])
-        pieces, start, room = [], 0, self._room
-        while count - start > room:
-            pieces.append(slice(start, start + room))
-            start, room = max(start + room - self._stage.overlap, 0), self._stage.seq_len
-        pieces.append(slice(start, count))
-        self._room = room - (count - start) or self._stage.seq_len
-        if len(pieces) == 1:
-            return document
-        return {name: np.concatenate([value[piece] for piece in pieces]) if name in self._stage.fields
-                else value for name, value in document.items()}
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"documents": self._documents.get_state(), "room": self._room}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        restore_parent(self._documents, state, "documents", "packed documents")
-        self._room = integer(state["room"], "packed window room")
 
 
 @overload
@@ -1677,7 +1507,7 @@ class _Build:
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
-            mapped = [parent.map(_Tagged(key)) if tagged else parent
+            mapped = [parent.map(Tagged(key).record) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
@@ -1687,7 +1517,7 @@ class _Build:
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
-            streams = [stream.map(_Tagged(key)) for key, stream in zip(keys, streams, strict=True)]
+            streams = [stream.map(Tagged(key)) for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
         if source.tokens is not None:

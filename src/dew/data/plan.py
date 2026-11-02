@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, json_value, record, set_added, without_removed
+from dew._records import ADDED, JSON, integer, json_value, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -442,7 +442,7 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
 
     if written.get("version") == 7:
         iterator = counted(iterator)
-    if saved.get("counters", 1) < COUNTERS:
+    if integer(saved.get("counters", 1), "a position's counters format") < COUNTERS:
         iterator = _by_member(iterator, plan)
     return earlier_plan(written, plan), iterator
 

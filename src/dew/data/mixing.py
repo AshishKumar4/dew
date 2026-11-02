@@ -223,11 +223,11 @@ class _KeepAccepted:
         """The source examples the rows it rejected since the last it kept were the last of (`CONSUMED`),
         which that next row carries on (`_AcceptedIterator`)."""
 
-    def _of(self, member: object) -> CorpusCounts:
+    def _of(self, member: str | None) -> CorpusCounts:
         """The counts a row of `member` (`MEMBER`) is counted under: its member's, else the counter's own."""
         if member is None or not self.members:
             return self.counts
-        return self.members[text(member, "a row's mixture member")]
+        return self.members[member]
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
@@ -245,7 +245,7 @@ class _KeepAccepted:
                 return True
             reason = "zero_targets"
             self.owed.owe(accounts(element)[0])
-            self._of(element.get(MEMBER)).rejected[reason] += 1
+            self._of(_member(element)).rejected[reason] += 1
         self.consecutive += 1
         # What it rejected, its own and its members' (a mixture's counter past the mix).
         rejected = sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
@@ -277,14 +277,18 @@ class _KeepAccepted:
         if not self.credits:
             self.counts.delivered(element)
             return
-        tag = element.get(MEMBER)
+        own = _member(element)
         completed = members_of(element)
-        owner = self._of(tag)
-        own = None if tag is None else text(tag, "a row's mixture member")
+        owner = self._of(own)
         for member, examples in completed.items():
             if member != own:
                 self.members[member].accepted += examples
-        owner.delivered(element, completed.get(own, 0) if owner is not self.counts else 0)
+        owner.delivered(element, 0 if own is None else completed.get(own, 0))
+
+
+def _member(row: Batch) -> str | None:
+    """The mixture member `row` was drawn from (`MEMBER`), none for a row of none or of several."""
+    return None if MEMBER not in row else text(row[MEMBER], "a row's mixture member")
 
 
 COUNTER = "dew.corpus_counts"

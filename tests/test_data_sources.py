@@ -8,6 +8,7 @@ import importlib.machinery
 import io
 import itertools
 import json
+import math
 import pickle
 import shutil
 import sys
@@ -389,9 +390,9 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
     try:
-        began = time.monotonic()
+        began = time.monotonic_ns()
         fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
-        waited, sent_by_then = time.monotonic() - began, len(sent)
+        waited, sent_by_then = time.monotonic_ns() - began, len(sent)
     finally:
         server.shutdown()
         server.server_close()
@@ -401,7 +402,7 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     # its deadline, set after `began`, not before it (asyncio runs a timer up to its clock's resolution
     # early; row 2091).
     assert sent_by_then <= 2 * 10
-    assert waited >= 1.0 - time.get_clock_info("monotonic").resolution
+    assert waited >= 1_000_000_000 - math.ceil(time.get_clock_info("monotonic").resolution * 1_000_000_000)
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():

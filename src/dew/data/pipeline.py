@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import JSON, integer, record
+from dew._records import JSON, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -65,7 +65,7 @@ keeps when another joins or leaves, set where a mixture a run bounds in examples
 
 MEMBERS = "_dew_members"
 """The source examples a row completes, delivered (`CONSUMED` less `REFUSED`), by the mixture member each
-was drawn from (`MEMBER`), set where a member's row first holds counts (`dew.data.lowering._consumed_by`)
+was drawn from (`MEMBER`), set where a member's row first holds counts (`consumed_by`)
 and carried wherever its counts go, so a mixture counts each member's examples where they are delivered
 (`dew.data.mixing.CorpusCounts`). Examples a step refused are carried on as refused (`Owed`) and complete
 no member's: what is refused of a member is counted where it is refused (`Rejected.member`)."""
@@ -119,13 +119,16 @@ class Documents:
         return {str(document): [self.held[document][0], dict(self.held[document][1])]
                 for document in sorted(set(documents)) if document in self.held}
 
-    def restore(self, saved: object) -> None:
+    def restore(self, saved: JSON) -> None:
         """Hold the documents a saved position held (`saved`) again."""
-        for document, (member, members) in record(saved, "held documents").items():
-            held = record(members, "a held document's examples by member")
-            self.held[integer(document, "a held document")] = (
-                None if member is None else str(member),
-                {str(key): integer(count, "a held document's examples") for key, count in held.items()})
+        for document, entry in record(saved, "held documents").items():
+            match entry:
+                case [member, {**members}] if member is None or isinstance(member, str):
+                    examples = {str(key): integer(count, "a held document's examples")
+                                for key, count in members.items()}
+                    self.held[integer(document, "a held document")] = (member, examples)
+                case _:
+                    raise ValueError(f"a held document is its member and examples by member, got {entry!r}")
 
 
 def accounts(row: Batch | Rejected) -> tuple[int, int]:
@@ -166,6 +169,104 @@ class Owed:
             return row
         consumed, refused = accounts(row)
         return {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
+
+
+def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
+    """`step`'s outputs of `given`, the fields the run counts it by (`COUNTING`) kept out of the step's
+    sight: the mixture member it was drawn from (`MEMBER`) on every output, a rejected row's marker too
+    (`Rejected.member`), and the source examples it consumes (`CONSUMED`, and of them those it carries for
+    refused ones, `REFUSED`, those it completes by member, `MEMBERS`) carried to its last output: a row's
+    counts beside its own, a rejected row's on its marker (`Rejected.consumed`, every one of them refused
+    now, completing no member's), which the corpus's next kept row carries on (`Accepted`). Every other row
+    holds none, so the rows of one read hold the same fields. A member's row that first holds counts (the
+    bound's marks, `MarkConsumed`) completes them as its member's."""
+    if given is None or isinstance(given, (bytes, Rejected)) or not any(name in given for name in COUNTING):
+        return step(given)
+    member = None if MEMBER not in given else text(given[MEMBER], "a row's mixture member")
+    unseen = {name: column for name, column in given.items() if name not in COUNTING}
+    outputs = tuple(as_member(made, member) for made in step(unseen))
+    if CONSUMED not in given:
+        return outputs
+    consumed, refused = accounts(given)
+    members = members_held(given, member)
+    split = {MEMBERS: {}} if MEMBERS in given else {}
+    *rest, last = outputs
+    rest = [{CONSUMED: 0, REFUSED: 0, **split, **row} if isinstance(row, Mapping) else row for row in rest]
+    if isinstance(last, Rejected):
+        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
+    elif isinstance(last, Mapping):
+        own, owned = accounts(last)
+        carried = {**last, CONSUMED: consumed + own, REFUSED: refused + owned}
+        if split or MEMBERS in last:
+            carried[MEMBERS] = joined(members_of(last), members)
+    else:
+        raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
+                         "count of the examples it consumes; a step after the bound returns records")
+    return (*rest, carried)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    """A mixture member's records, each saying it is the member's of `key` (`MEMBER`): a row as its field,
+    a rejected row's marker as its `member` (`record`)."""
+
+    key: str
+
+    def __call__(self, row: Batch) -> Batch:
+        return {**row, MEMBER: self.key}
+
+    def record(self, given: Record) -> Record:
+        if given is None or isinstance(given, bytes):
+            return given
+        if isinstance(given, Rejected):
+            return dataclasses.replace(given, member=self.key)
+        return self(given)
+
+
+def as_member(made: Record, member: str | None) -> Record:
+    """A step's output of a mixture member's row as that member's (`MEMBER`, `Rejected.member`), the
+    examples it completes its member's where it first holds counts (the bound's marks)."""
+    if member is None or made is None or isinstance(made, bytes):
+        return made
+    if isinstance(made, Rejected):
+        return made if made.member is not None else dataclasses.replace(made, member=member)
+    tagged = {**made, MEMBER: member}
+    if CONSUMED in made and MEMBERS not in made:
+        tagged[MEMBERS] = members_held(made, member)
+    return tagged
+
+
+def members_held(row: Batch, member: str | None) -> dict[str, int]:
+    """The examples `row` completes by mixture member (`MEMBERS`): of its member alone, the consumed it
+    has not refused, where it states no split."""
+    if MEMBERS in row:
+        return dict(members_of(row))
+    consumed, refused = accounts(row)
+    return {} if member is None else joined({member: consumed - refused})
+
+
+def consumed_forward(elements: Sequence[Record]) -> list[Record]:
+    """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
+    to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
+    holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
+    follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows; the row it
+    moves to carries it as refused (`REFUSED`)."""
+    carried: list[Record] = []
+    markers: list[int] = []
+    owed = Owed()
+    for element in elements:
+        if isinstance(element, Rejected) and element.consumed:
+            markers.append(len(carried))
+            owed.owe(element.consumed)
+        elif markers and isinstance(element, Mapping) and CONSUMED in element:
+            # The markers' counts move to this row; none follows them in the group otherwise.
+            for at in markers:
+                marker = carried[at]
+                assert isinstance(marker, Rejected)
+                carried[at] = dataclasses.replace(marker, consumed=0)
+            element, markers = owed.paid(element), []
+        carried.append(element)
+    return carried
 
 
 type Cuts = Mapping[str, tuple[int, int]]
