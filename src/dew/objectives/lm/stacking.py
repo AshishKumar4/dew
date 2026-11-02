@@ -21,8 +21,8 @@ packed row of several documents is refused there (`CausalTransformer`'s own refu
 A row whose attention reads its blocks whole (a prefix run's, `block_groups`) reads each block in one call,
 as a server's prefill reads a prompt's: a chunk's end that falls inside a block moves to the block's end
 (`_chunk_bounds`), so the chunk the block starts in reads it whole before the cache holds it, at that
-chunk's levels, and a block within one chunk stays there. Each chunk's call is as wide as its longest
-row's chunk needs, the least of the doublings of the least window that holds it (`_widths`); a chunk a
+chunk's levels, and a block within one chunk stays there. Each chunk's call is the least of three widths
+that holds its longest row's chunk (`_widths`): the least window, twice it, or the whole row; a chunk a
 longer block covers whole is not called, and its levels' windows open and close as any other's.
 """
 
@@ -235,12 +235,10 @@ def _chunk_bounds(blocks: jax.Array | None, rows: int, chunk: int, chunks: int) 
 
 
 def _widths(chunk: int, padded: int) -> tuple[int, ...]:
-    """The call widths a row of blocks reads its chunks in: `chunk` doubled until it holds the whole `padded`
-    row, so a chunk a block lengthens is read at the least that holds it and a short one at `chunk`."""
-    widths = [chunk]
-    while widths[-1] < padded:
-        widths.append(min(2 * widths[-1], padded))
-    return tuple(widths)
+    """The call widths a row of blocks reads its chunks in, three programs whatever the row's length: a chunk
+    at `chunk`, one a block no longer than a chunk lengthens at twice it (a block crossing a chunk's end runs
+    on at most a chunk past it), and one a longer block lengthens at the whole `padded` row."""
+    return tuple(sorted({chunk, min(2 * chunk, padded), padded}))
 
 
 def _cut(leaf: jax.Array, first: jax.Array, width: int, fill=0) -> jax.Array:
