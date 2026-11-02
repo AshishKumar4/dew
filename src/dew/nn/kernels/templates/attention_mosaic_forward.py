@@ -77,6 +77,26 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 )
 
 
+def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
+               training: bool, finishes: bool) -> tuple:
+    """`_launch`'s outputs' types: a peak walk's maxima and anchor keys; a training walk's status, residual
+    rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
+    along its query axis), and its finished rows where it `finishes`."""
+    rows_out = splits * queries
+    status_type = jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32)
+    if peaks:
+        return (jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
+                jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32))
+    if training:
+        return (status_type, jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
+                jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
+                jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32))
+    out_type = (status_type, jax.ShapeDtypeStruct((batch, rows_out, heads, value_width), out_dtype))
+    if finishes:
+        out_type += (jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32),)
+    return out_type
+
+
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None
                          ) -> tuple[list, dict]:
@@ -545,18 +565,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
-    live = None
-    if guard is not None:
-        # A split launch's live rows its slice's (`_Program.splits`), slice by slice along their query axis.
-        slice_first = program.split() * (guard.live.shape[-1] // program.splits) + first
-        live = family.rows_of(guard.live.at[row, head, pl.ds(slice_first, tiles.block_q)]) > 0
-
-    # A plain inference walk starts empty and merges the initial state past its keys (`algebra.merge`): read
-    # before the walk, the state's rows held live across it beside its products and the walk spilled 296
-    # bytes at D128's 64 x 128 (the held-term census), where an empty start's are constants.
-    merged = hooked.initial is not None and guard is None and residuals is None
-    start = (_initial(family, spec, hooked, state_rows, live) if hooked.initial is not None and not merged
-             else _empty(family, (tiles.block_q, value_width), live))
+    start, live, merged = _started(program, spec, guard, hooked, state_rows, first, value_width,
+                                   training=residuals is not None)
     pl.when(consumer == 1)(turn)
     # The queries' intervals and ids read once, before the walk (`_query_bounds`).
     held = None if spans is None else _query_bounds(family, spans, row, first, tiles.block_q)
@@ -638,6 +648,27 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         rows = (maximum, denominator, own, others_total, family.zeros((tiles.block_q,)))
         family.stored(tuple(family.as_row(part) for part in rows), residuals.rows, smem=row_smem)
         family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
+
+
+def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hooked: _Hooked, rows: tuple,
+             first, value_width: int, *, training: bool
+             ) -> tuple[algebra.Partial, jax.Array | None, bool]:
+    """A consumer's walk's start at its `rows` (batch row, head, queries from `first`): its state, its
+    guard's live rows (None unguarded) and whether the initial state merges past the walk instead
+    (`algebra.merge`). A plain inference walk starts empty and merges it: read before the walk, the state's
+    rows held live across it beside its products and the walk spilled 296 bytes at D128's 64 x 128 (the
+    held-term census), where an empty start's are constants."""
+    family, block_q = program.family, program.tiles.block_q
+    row, head, _ = rows
+    live = None
+    if guard is not None:
+        # A split launch's live rows its slice's (`_Program.splits`), slice by slice along their query axis.
+        slice_first = program.split() * (guard.live.shape[-1] // program.splits) + first
+        live = family.rows_of(guard.live.at[row, head, pl.ds(slice_first, block_q)]) > 0
+    merged = hooked.initial is not None and guard is None and not training
+    start = (_initial(family, spec, hooked, rows, live) if hooked.initial is not None and not merged
+             else _empty(family, (block_q, value_width), live))
+    return start, live, merged
 
 
 def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
@@ -867,23 +898,11 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
 
         family.roles(consumers, consumer, producer)
 
-
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
-    rows_out = splits * queries
-    status_type = jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32)
-    if peaks:
-        out_type: tuple = (jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
-                           jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32))
-    elif training:
-        out_type = (status_type, jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
-                    jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
-                    jax.ShapeDtypeStruct((batch, heads, queries, value_width), jnp.float32))
-    else:
-        out_type = (status_type, jax.ShapeDtypeStruct((batch, rows_out, heads, value_width), out_dtype))
-        if finishes:
-            out_type += (jax.ShapeDtypeStruct((2, batch, heads, rows_out), jnp.float32),)
+    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits, peaks=peaks,
+                          training=training, finishes=finishes)
     # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
     # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
     # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
