@@ -1033,7 +1033,8 @@ def _intra_system(q, k, g, beta, taken, call: _Call):
     """`A [R, HV * C]` of each chunk and value head under a decay a key dimension and the delta rule: the
     keys' system in `_systems`' form, the write-gated keys' pairs as `_intra`'s scores (`_intra_walk`), which
     `_intra_solve` inverts; a launch of its own, so each carries one sum."""
-    return _intra_walk(q, k, g, beta, taken, call, scale=1.0, system=True)
+    (system,) = _intra_walk(q, k, g, beta, taken, call, scale=1.0, system=True)
+    return system
 
 
 def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool):
