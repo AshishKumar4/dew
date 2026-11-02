@@ -2,7 +2,6 @@
 mode, its kernels' reverse rules, the paged decode kernel (ledger 2641; the harness is
 tests/contract_support.py)."""
 
-import contextlib
 import itertools
 
 import jax
@@ -11,7 +10,6 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels import generation
 
 
 def plain_attention(query, key, value):
@@ -60,15 +58,15 @@ def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge)
                     truth_fn=plain_attention, plain_fn=plain_attention, without=REVERSE_ONLY)
 
 
-@pytest.mark.parametrize("kernel", ["gpu_paged", "template_paged"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
-    """`kv_cache.gpu_paged` (the Pallas paged decode kernel's value) and `kv_cache.template_paged` (the
-    attention template's decode's, as an H100 runs it, at its pages of 64 keys), the gathered attention's
-    derivatives through `generation.linear_tangent`, interpreted off a GPU: every order runs in the query,
-    the key and value pages and the sinks, finite wherever float64 is a normal float32 and the plain formula,
-    one query a row over its row's first `lengths` keys gathered from its pages with the sinks in the
-    softmax, is."""
+def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
+    """`kv_cache.gpu_paged` (the Pallas paged decode kernel's value), interpreted off a GPU, and
+    `kv_cache.template_paged` (the attention template's decode's, at its pages of 64 keys, on an H100 in
+    the GPU flow, tests/test_gpu_attention.py: Mosaic GPU's interpreter runs its kernel through ordered
+    callbacks, which no rematerialization differentiates), the gathered attention's derivatives through
+    `generation.linear_tangent`: every order runs in the query, the key and value pages and the sinks,
+    finite wherever float64 is a normal float32 and the plain formula, one query a row over its row's first
+    `lengths` keys gathered from its pages with the sinks in the softmax, is."""
     page = 16 if kernel == "gpu_paged" else 64
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([page + 5, 2 * page], jnp.int32)
@@ -96,12 +94,5 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
         weights = jax.nn.softmax(jnp.concatenate([logits, sunk], axis=-1), axis=-1)[..., :-1]
         return jnp.einsum("rhk,rkhd->rhd", weights, values)
 
-    # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here, its
-    # derivatives' gathered attention on xla, which this host runs: over every order's tracing, whose rules
-    # trace past the call's own.
-    on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla", decode="xla"))
-    with contextlib.ExitStack() as stack:
-        for context in on_gpu if kernel == "template_paged" else ():
-            stack.enter_context(context)
-        assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge}",
-                        truth_fn=plain, plain_fn=plain)
+    assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
+                    truth_fn=plain, plain_fn=plain)
