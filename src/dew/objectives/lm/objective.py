@@ -458,19 +458,20 @@ class Scores(NamedTuple):
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
-                    z_loss: float | None) -> None:
+                    conditioned: bool) -> None:
     """Refuse what a decoder stepping its own feed-forward blocks in context (`ChunkAdaptation.layers`)
     cannot score: its trunk runs chunk by chunk through its decode cache (`dew.objectives.lm.stacking`),
     which gathers no collection (`routing`, `qk_stats`, `indexer`, `watched`), keeps no layer's states
-    and no prediction depth's inputs, replays no rollout's experts, and reads the head whole, not fused."""
+    and no prediction depth's inputs, replays no rollout's experts and reads no conditioning. Its head
+    reads the whole logits, a summed loss's z-loss from their log partition (`_scored_loss`)."""
     asked = [name for name, given in (("collections", bool(collections)), ("depths", depths),
                                       ("layers", bool(layers)), ("routes", routes is not None),
-                                      ("z_loss", z_loss is not None)) if given]
+                                      ("conditioning", conditioned)) if given]
     if asked:
         raise ValueError(f"a decoder stepping its own feed-forward blocks in context runs chunk by chunk "
                          f"through its decode cache, which gathers no collection, keeps no layer's or "
-                         f"prediction depth's states, replays no experts and reads the whole head: {asked} "
-                         f"are asked")
+                         f"prediction depth's states, replays no experts and reads no conditioning: "
+                         f"{asked} are asked")
 
 
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
@@ -876,7 +877,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         adaptation = self.adaptation
         if adaptation is not None and adaptation.layers:
             # The decoder's own blocks step chunk by chunk through its cache, which runs the trunk itself.
-            _refuse_stacked(opened, depths=depths, layers=layers, routes=routes, z_loss=z_loss)
+            _refuse_stacked(opened, depths=depths, layers=layers, routes=routes,
+                            conditioned=bool(prepared.conditioning))
             return self._stacked_scores(params, prepared, inputs, targets, roles, rows, adaptation,
                                         predict=predict, logits=logits, train=train, rngs=rngs)
         with self._watched(prepared, watched):
@@ -889,7 +891,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self.fused_head(self.model, params) if z_loss is not None else None
-        weights = self._weights(prepared, roles, at_least_fp32(hidden.dtype), rows)
+        weights = self._target_weights(prepared, roles, at_least_fp32(hidden.dtype), rows)
         total, (losses, predicted, log_z), whole, moved = self._head_scores(
             params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
@@ -917,7 +919,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole, inspected, moved)
 
-    def _weights(self, prepared, roles, dtype, rows):
+    def _target_weights(self, prepared, roles, dtype, rows):
         """Each target's weight in the loss (`_row_weights`), a filled row's (`rows`) at nothing, so a fused
         head's sum counts each real row once."""
         weights = self._row_weights(prepared, roles, dtype)
@@ -929,8 +931,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         (`ChunkAdaptation.layers`, `dew.objectives.lm.stacking`), which runs its trunk chunk by chunk
         through its decode cache: no collection, layer's states or prediction depth (`_refuse_stacked`)."""
         predict = self.token_accuracy if predict is None else predict
-        weights = self._weights(prepared, roles, at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32)),
-                                rows)
+        dtype = at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32))
+        weights = self._target_weights(prepared, roles, dtype, rows)
         hidden, adapted = stacked_scores(self.model, params, inputs, targets, weights,
                                          prepared.slice_tokens(stop=-1).token_fields, adaptation,
                                          predict=predict, logits=logits, train=train, rngs=rngs)
@@ -1291,7 +1293,9 @@ class LMObjective(TokenScorer):
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         if adaptation is not None:
-            if adaptation.layers and not isinstance(self.model, SteppedFeedForward):
+            # The model as its protocol names it, apart from `self.model`, which stays a module.
+            stepped: object = self.model
+            if adaptation.layers and not isinstance(stepped, SteppedFeedForward):
                 raise ValueError("adaptation steps the decoder's own feed-forward blocks, which this model "
                                  "does not name (`SteppedFeedForward`)")
             if not adaptation.layers and not _steps_in_context(self.model):

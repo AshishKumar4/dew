@@ -19,7 +19,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   pre-training trains the blocks' starts through their steps.
 - `dew.eval.continual`: a continual run's accuracy matrix, forgetting and backward transfer, and a language
   model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
-- An evaluation batch's device outputs come home through pinned host memory, in one transfer.
+- An evaluation's outputs, and every tree `collective_host` reads home on one process, come home through
+  their devices' pinned host memory where they have it, in one transfer (`dew._coordination.pinned_get`).
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
   curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and

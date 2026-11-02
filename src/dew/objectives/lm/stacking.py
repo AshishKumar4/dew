@@ -15,12 +15,16 @@ the chunks before it from the cache as they were, at the levels' versions they r
 read each level at the version its window opened with. A window's gradient in its level is the sum over
 its chunks of each chunk's loss's gradient there, the cache holding the chunks before it fixed: dynamic
 evaluation's segment gradient, a chunk its segment. A level's window counts the row's slots, its padding
-among them, as its cache reads them. The decode cache keeps no document ids, so a packed row of several
-documents is refused there (`CausalTransformer`'s own refusal): one document a row.
+among them, as its cache reads them. Each chunk reads the row's layout (`Coordinates`) at its own slots,
+its places, validity and documents as the caller gave them; the decode cache keeps no document ids, so a
+packed row of several documents is refused there (`CausalTransformer`'s own refusal): one document a row.
+A row whose blocks its attention reads whole (a prefix run's, `block_groups`) is refused: a block crossing
+a chunk would read its later tokens, which the cache does not yet hold.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Mapping
 
@@ -28,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import token_coordinates
+from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, TOKEN_LAYOUT_FIELDS, Coordinates, field_coordinates
 from dew.nn.inputs import sequence_blocks
 from dew.nn.protocols import SteppedFeedForward
 from dew.objectives.lm.adaptation import (
@@ -47,8 +51,9 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
                    logits: bool, train: bool = False, rngs=None) -> tuple[jax.Array, Adapted]:
     """Each target's next-token loss with the decoder's feed-forward blocks of `adaptation.layers`
     stepped in context (module docstring), over `inputs` `[B, S]` and their `targets` `[B, S]`, each
-    weighted as the loss weighs it (`weights`), the rows' token `fields` (a validity mask, document ids)
-    read by the decoder's calls: the final states the head read and the scores (`Adapted`)."""
+    weighted as the loss weighs it (`weights`), the rows' token `fields` (their layout, flat or as
+    `Coordinates`) read by the decoder's calls: the final states the head read and the scores
+    (`Adapted`)."""
     from dew.objectives.lm.chunked import logits_cross_entropy
 
     if not isinstance(model, SteppedFeedForward):
@@ -57,6 +62,14 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     if adaptation.damped:
         raise ValueError("a damped step bounds a continuum level's curvature through the head, which a "
                          "feed-forward block mid-stack reads through every later layer: step it undamped")
+    if BLOCKS_FIELD in fields:
+        raise ValueError("a decoder stepping its own blocks reads a row chunk by chunk through its cache, "
+                         "and this row's attention reads its blocks whole (a prefix run's), which a block "
+                         "crossing a chunk cannot: score it without stepping the blocks in context")
+    unread = sorted(set(fields) - {COORDINATES_FIELD, *TOKEN_LAYOUT_FIELDS})
+    if unread:
+        raise ValueError(f"a decoder stepping its own blocks reads a row's layout alone through its cache, "
+                         f"not its token fields {unread}")
     layers = adaptation.layers
     windows, rates = adaptation.windows(len(layers)), adaptation.rates(len(layers))
     chunk = min(windows)
@@ -78,29 +91,25 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
         edge = ((0, 0), (0, chunks * chunk - length), *((0, 0),) * (value.ndim - 2))
         return sequence_blocks(jnp.pad(value, edge, constant_values=fill), chunk, leading=True)
 
-    # A slot past the row is padding, which weighs nothing and the cache does not hold.
-    mask = fields.get("attention_mask", jnp.ones((rows, length), bool))
+    layout = _padded_layout(field_coordinates(fields, (rows, length)), rows, length, chunks * chunk)
     blocked = {"tokens": padded(inputs), "targets": padded(targets), "weights": padded(weights),
-               "attention_mask": padded(jnp.asarray(mask, bool)),
-               **({"segment_ids": padded(fields["segment_ids"])} if "segment_ids" in fields else {}),
                "index": jnp.arange(chunks)}
 
-    def row_forward(levels, row_cache, row_chunk):
+    def row_forward(levels, row_cache, tokens, row_layout):
         """One row's chunk through the decoder at `levels`, from its cache: its final states, logits and
         cache past the chunk."""
         held = {**model.with_feedforward_levels(variables, levels), "cache": row_cache}
-        # The chunk's layout as the decoder's own call converts it (`token_coordinates`).
-        segments = row_chunk.get("segment_ids")
-        coordinates = token_coordinates((1, chunk), segments=None if segments is None else segments[None],
-                                        valid=row_chunk["attention_mask"][None])
         (states, chunk_logits), mutated = model.apply(
-            held, row_chunk["tokens"][None], decode=True, train=train, rngs=rngs, mutable=["cache"],
-            method="states_and_logits", coordinates=coordinates)
+            held, tokens[None], decode=True, train=train, rngs=rngs, mutable=["cache"],
+            method="states_and_logits", coordinates=row_layout)
         return states[0], chunk_logits[0], mutated["cache"]
 
     def chunk_loss(levels, caches, block):
-        states, chunk_logits, moved = jax.vmap(row_forward)(
-            levels, caches, {name: value for name, value in block.items() if name != "index"})
+        # The chunk's slots of the row's layout, each row's as the decoder's call reads one row.
+        here = layout.along_tokens(lambda leaf: jax.lax.dynamic_slice_in_dim(leaf, block["index"] * chunk,
+                                                                              chunk, axis=1))
+        rowed = jax.tree.map(lambda leaf: leaf[:, None], here)
+        states, chunk_logits, moved = jax.vmap(row_forward)(levels, caches, block["tokens"], rowed)
         losses, top, log_z = logits_cross_entropy(chunk_logits, block["targets"], predict=predict)
         total = jnp.sum(jnp.asarray(block["weights"], losses.dtype) * losses)
         return total, (losses, top, log_z, chunk_logits if logits else None, states, moved)
@@ -143,3 +152,13 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
         moved = _moved(reached, started, weights)
     return joined(states), Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
                                    None if whole is None else joined(whole), moved)
+
+
+def _padded_layout(layout: Coordinates | None, rows: int, length: int, padded: int) -> Coordinates:
+    """A row's `layout` (None for every slot real, one document) over `padded` slots: the slots past the
+    row padding, invalid, of no document and at no place, which no real token reads."""
+    if layout is None or layout.valid is None:
+        base = Coordinates() if layout is None else layout
+        layout = dataclasses.replace(base, valid=jnp.ones((rows, length), bool))
+    extra = padded - length
+    return layout.along_tokens(lambda leaf: jnp.pad(leaf, ((0, 0), (0, extra))))

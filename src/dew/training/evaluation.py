@@ -783,31 +783,6 @@ def _as_placed(leaf) -> np.ndarray:
     return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
 
 
-def _hosted(device: Batch) -> Batch:
-    """A batch's device fields home (`_as_placed`), each array an accelerator holds read back through
-    its pinned host memory, all in one transfer: a GH200 read pageable host memory back at 27 GB/s and
-    pinned at 283. A host's own arrays and those already pinned read back as they are."""
-    leaves, tree = jax.tree.flatten(device)
-    staged = [index for index, leaf in enumerate(leaves) if _pinnable(leaf)]
-    moved = jax.device_put([leaves[index] for index in staged],
-                           [leaves[index].sharding.with_memory_kind("pinned_host") for index in staged])
-    for index, leaf in zip(staged, moved, strict=True):
-        leaves[index] = leaf
-    return tree.unflatten([_as_placed(leaf) for leaf in leaves])
-
-
-def _pinnable(leaf) -> bool:
-    """Whether `leaf` is an accelerator's array whose every device has pinned host memory to read it back
-    through (`_hosted`)."""
-    if not isinstance(leaf, jax.Array) or not leaf.is_fully_addressable:
-        return False
-    if leaf.sharding.memory_kind == "pinned_host":
-        return False
-    return all(device.platform != "cpu"
-               and "pinned_host" in {memory.kind for memory in device.addressable_memories()}
-               for device in leaf.sharding.device_set)
-
-
 def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
             summaries: _Accumulators, root: bool, written: Path | None = None):
     """Merge one batch into every metric's accumulator on root, returning what
@@ -824,7 +799,7 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
         device, host = split_fields(held)
-        home = with_host(_hosted(device), host)
+        home = with_host(jax.tree.map(_as_placed, device), host)
     else:
         device, host = split_fields(batch)
         if host:

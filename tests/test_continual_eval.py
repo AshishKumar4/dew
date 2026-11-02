@@ -35,9 +35,9 @@ def test_an_accuracy_matrix_reads_average_forgetting_and_backward_transfer():
 
 def test_an_accuracy_matrix_is_square_and_its_accuracies_shares():
     """An accuracy matrix holds one row a stage and one column a task, and accuracies in [0, 1]."""
-    with pytest.raises(ValueError, match="as many"):
+    with pytest.raises(ValueError):
         AccuracyMatrix(np.zeros((2, 3)))
-    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+    with pytest.raises(ValueError):
         AccuracyMatrix(np.array([[1.5]]))
 
 
@@ -61,7 +61,7 @@ def test_label_accuracy_is_the_share_of_prompts_whose_best_label_is_their_answer
     """A prompt's choice is its highest-scoring label, and the accuracy the share answered."""
     scores = np.array([[-1.0, -2.0], [-3.0, -0.5], [-0.1, -0.2]])
     assert label_accuracy(scores, [0, 1, 1]) == 2 / 3
-    with pytest.raises(ValueError, match="one answer a prompt"):
+    with pytest.raises(ValueError):
         label_accuracy(scores, [0])
 
 

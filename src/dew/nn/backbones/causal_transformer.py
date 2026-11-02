@@ -1286,14 +1286,14 @@ class CausalTransformer(LinearProducts):
                              f"derivatives, which {type(self.head_norm).__name__} bounds none of")
         dense = self.applied_kernel("head_dense")
         spread = self.head_norm.spread(ungated_activation(self.head_transform, self.head_dense(states)))
-        return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform(
+        return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform.of(
             _SLOPES[UNGATED[self.head_transform]], growth["head_dense"] * jnp.sqrt(_squared_norm(dense)),
             self.head_norm.derivative_bounds(dense.shape[-1])))
 
     @nn.nowrap
     def feedforward_levels(self, variables, layers: tuple[int, ...]) -> dict:
         """The feed-forward blocks of `layers` in `variables` (`dew.nn.continuum.feedforward_levels`)."""
-        return feedforward_levels(variables, layers, self.num_layers, self.scan_layers)
+        return feedforward_levels(variables, layers, self.num_layers)
 
     with_feedforward_levels = staticmethod(with_feedforward_levels)
 

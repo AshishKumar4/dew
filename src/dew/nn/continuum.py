@@ -30,6 +30,7 @@ from flax import struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import _SLOPES, activation
+from dew.nn.backbones.layer_names import group_layers
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import NormBounds
@@ -233,31 +234,63 @@ def level_parameters(continuum: Levels, params: Mapping):
             for index in range(len(continuum))}
 
 
-def with_level_parameters(continuum: Levels, params: Mapping, levels) -> dict:
-    """`params` holding `levels` as a model's continuum levels' parameters (`level_parameters`)."""
+def with_level_parameters(continuum: Levels | None, params: Mapping, levels) -> dict:
+    """`params` holding `levels` as a model's continuum levels' parameters (`level_parameters`); a model
+    without a continuum holds none."""
+    if continuum is None:
+        raise ValueError("this model has no continuum level")
     if isinstance(continuum, ContinuumLevel):
         return {**params, "continuum": levels}
     return {**params, **{name: {**params[name], "continuum": level} for name, level in levels.items()}}
 
 
-def feedforward_levels(variables, layers: tuple[int, ...], count: int, scanned: bool) -> dict:
-    """The feed-forward blocks of a decoder's `layers` in `variables`, by their layers' scopes
-    (`layers_3`): the levels an objective steps in context (`SteppedFeedForward`), of a decoder of `count`
-    layers. A `scanned` stack holds them in one tree a run of layers: refused, as is a layer it lacks."""
-    if scanned:
-        raise ValueError("a scanned stack holds its layers' feed-forward blocks in one tree a run of layers; "
-                         "step them in context on a stack of its own layers (scan_layers=False)")
+def feedforward_levels(variables, layers: tuple[int, ...], count: int) -> dict:
+    """The feed-forward blocks of a decoder's `layers` in `variables`, by their layers' names (`layers_3`):
+    the levels an objective steps in context (`SteppedFeedForward`), of a decoder of `count` layers. A
+    layer's block is read where its store holds it (`_stored_block`), a layer of its own or a row of a
+    bank of like layers, as `decoder_stack.StackView` stores either, a scanned stack's among them."""
     missing = sorted(set(layers) - set(range(count)))
     if missing:
         raise ValueError(f"this decoder has {count} layers, not {missing}")
-    return {f"layers_{layer}": variables["params"][f"layers_{layer}"]["mlp"] for layer in layers}
+    params = variables["params"]
+    levels = {}
+    for layer in layers:
+        name, row = _stored_block(params, layer)
+        block = params[name]["mlp"]
+        levels[f"layers_{layer}"] = (block if row is None
+                                     else jax.tree.map(lambda leaf, at=row: leaf[at], block))
+    return levels
 
 
 def with_feedforward_levels(variables, levels: Mapping) -> dict:
-    """`variables` holding `levels` as their layers' feed-forward blocks (`feedforward_levels`)."""
-    params = variables["params"]
-    return {**variables, "params": {**params, **{name: {**params[name], "mlp": level}
-                                                 for name, level in levels.items()}}}
+    """`variables` holding `levels` as their layers' feed-forward blocks (`feedforward_levels`), each
+    written where its store holds it: its layer's own, or its row of a bank."""
+    params = dict(variables["params"])
+    for key, level in levels.items():
+        name, row = _stored_block(params, int(key.removeprefix("layers_")))
+        if row is not None:
+            # The level's row of its bank, the bank's other rows as stored.
+            level = jax.tree.map(lambda stacked, leaf, at=row: stacked.at[at].set(leaf.astype(stacked.dtype)),
+                                 params[name]["mlp"], level)
+        params[name] = {**params[name], "mlp": level}
+    return {**variables, "params": params}
+
+
+def _stored_block(params: Mapping, layer: int) -> tuple[str, int | None]:
+    """Where `params` store decoder layer `layer`: its own `layers_N`, or the bank of a run of like layers
+    that holds it (`layers_3_7`) and its row there. A periodic run's bank, which holds a period's positions
+    apart, stores no block a layer as one row: refused."""
+    if f"layers_{layer}" in params:
+        return f"layers_{layer}", None
+    for name in params:
+        run = group_layers(name)
+        if run is not None and layer in run:
+            if "mlp" not in params[name]:
+                raise ValueError(f"layer {layer}'s feed-forward block is stored in the periodic bank {name}, "
+                                 "which holds a period's positions apart: step it in context on a store of "
+                                 "its own layers or of a run of like layers")
+            return name, layer - run.start
+    raise ValueError(f"no stored layer holds decoder layer {layer}")
 
 
 @struct.dataclass
@@ -266,9 +299,21 @@ class HeadTransform:
     `_SLOPES`), the Frobenius norm of D (`dense`), at least its spectral, and N's derivative bounds
     (`NormBounds`)."""
 
-    slopes: tuple[float, float | None] = struct.field(pytree_node=False)
+    slopes: tuple[float, float] = struct.field(pytree_node=False)
     dense: jax.Array
     norm: NormBounds
+
+    @classmethod
+    def of(cls, slopes: tuple[float, float | None], dense: jax.Array, norm: NormBounds) -> HeadTransform:
+        """A transform of activation `slopes` (`_SLOPES`), D's norm `dense` and its norm's bounds. An
+        activation whose second derivative no number bounds (ReLU's, a point mass at zero) bounds no
+        curvature in the states the head reads, a step crossing its kink jumping the gradient: refused."""
+        p1, p2 = slopes
+        if p2 is None:
+            raise ValueError("a damped step bounds the head's curvature through its transform's activation, "
+                             "whose second derivative a ReLU has none of (a point mass at zero), so no rate "
+                             "bounds it: a smooth head transform, or step it undamped")
+        return cls((p1, p2), dense, norm)
 
 
 @struct.dataclass
@@ -306,7 +351,7 @@ class HeadTerms:
         (p1, p2), dense = self.transform.slopes, self.transform.dense
         first, second = self.transform.norm.at(floor, p1 * dense * moved)
         jacobian = first * p1 * dense
-        bent = (second * p1 ** 2 + first * (p2 or 0.0)) * jnp.square(dense)
+        bent = (second * p1 ** 2 + first * p2) * jnp.square(dense)
         return jnp.square(jacobian) * self.curvature + self.slope * bent, jacobian * self.slope
 
 

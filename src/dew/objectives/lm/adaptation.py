@@ -37,6 +37,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import re
 from collections.abc import Mapping
 
 import jax
@@ -381,7 +382,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     the other levels as it read them (`_Chain`). A damped window's bound reads its slots' terms at the
     states and versions they read (`_slot_terms`), gathered over the window as the scan reads them."""
     start = _start(model, variables, adaptation)
-    names = _level_names(model, start)
+    names = _level_names(start)
     starts = [start] if not names else [start[name] for name in names]
     windows = adaptation.windows(len(starts))
     rows, length = targets.shape
@@ -397,7 +398,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
               sequence_blocks(jnp.pad(runs, edge, mode="edge"), block, leading=True),
               tuple(sequence_blocks(jnp.pad(key, edge, mode="edge"), block, leading=True) for key in keys))
     zeros = tuple(jax.tree.map(jnp.zeros_like, level) for level in chain.started)
-    nothing = _gathered(jnp.zeros((rows, 1), bool), jnp.zeros((rows, 1, _WIDTH), jnp.float32))
+    nothing = _gathered(jnp.zeros((rows, 1), bool), jnp.zeros((rows, 1, _WIDTH), at_least_fp32(hidden.dtype)))
     # Before a row's first real token no run is open: run 0, window -1.
     first = (chain.started, zeros, (nothing,) * len(starts), jnp.zeros((rows,), runs.dtype),
              tuple(jnp.full((rows,), -1, key.dtype) for key in keys))
@@ -426,7 +427,7 @@ class _Chain:
     scan reads them."""
 
     model: nn.Module
-    variables: object
+    variables: Mapping
     names: tuple[str, ...]
     starts: tuple
     adaptation: ChunkAdaptation
@@ -465,8 +466,8 @@ class _Chain:
     def level_terms(self, index: int, level, states) -> LevelTerms:
         """What bounds a damped step through level `index` at `level` and `states` (`LevelTerms`): of its
         parts that step, read after a level before it (`passed`)."""
-        return self.model.apply(self.held(index, level), states, self.parts, index, index > 0,
-                                method="level_terms")
+        return _level_terms(self.model.apply(self.held(index, level), states, self.parts, index, index > 0,
+                                             method="level_terms"))
 
     def bounds(self, hidden) -> tuple[HeadTerms, tuple]:
         """The head's bounds at the states past the levels' starts (`SteppedInContext.head_bounds`) and
@@ -475,10 +476,7 @@ class _Chain:
         for index, level in enumerate(self.starts):
             read.append(self.level_terms(index, level, passed))
             passed = self.level_states(index, level, passed)
-        head = self.model.apply(self.variables, passed, method="head_bounds")
-        if not isinstance(head, HeadTerms):
-            raise TypeError(f"a model stepped in context returns its head's bounds as `HeadTerms` "
-                            f"(`SteppedInContext.head_bounds`), not {type(head).__name__}")
+        head = _head_terms(self.model.apply(self.variables, passed, method="head_bounds"))
         return jax.lax.stop_gradient(head), tuple(jax.lax.stop_gradient(level) for level in read)
 
     def scored(self, versions, chosen, states, block_targets, block_weights):
@@ -501,7 +499,7 @@ class _Chain:
         losses, top, log_z = logits_cross_entropy(block_logits, block_targets, predict=self.predict)
         terms = None
         if self.adaptation.damped:
-            spread = self.model.apply(self.variables, passed, method="head_bounds").spread
+            spread = _head_terms(self.model.apply(self.variables, passed, method="head_bounds")).spread
             terms = _slot_terms(read, spread, block_weights)
         return losses, (top, log_z, block_logits, terms)
 
@@ -589,7 +587,8 @@ class _Chain:
             continuing = (last_run == run) & (last_place == places[index])
             following = closed[index] if self.straddles else jax.tree.map(jnp.add, partials[index], reached)
             energy = energies[index]
-            if self.adaptation.damped:
+            if terms is not None:
+                # A damped scan's slot terms (`scored`), gathered into the window's.
                 arrived = _gathered(last, terms[index])
                 kept = closing[index] if self.straddles else _joined(energies[index], arrived)
                 energy = jnp.where(continuing[:, None], kept, arrived)
@@ -597,6 +596,22 @@ class _Chain:
         levels, gradients, energies, places = (tuple(parts) for parts in zip(*carried, strict=True))
         state = (levels, gradients, energies, last_run, places)
         return state, (losses, top, log_z, block_logits if logits else None)
+
+
+def _head_terms(applied) -> HeadTerms:
+    """A model's head bounds as `nn.Module.apply` returns them, untyped (`SteppedInContext.head_bounds`)."""
+    if not isinstance(applied, HeadTerms):
+        raise TypeError(f"a model stepped in context returns its head's bounds as `HeadTerms` "
+                        f"(`SteppedInContext.head_bounds`), not {type(applied).__name__}")
+    return applied
+
+
+def _level_terms(applied) -> LevelTerms:
+    """A model's level terms as `nn.Module.apply` returns them, untyped (`SteppedInContext.level_terms`)."""
+    if not isinstance(applied, LevelTerms):
+        raise TypeError(f"a model stepped in context returns its level's terms as `LevelTerms` "
+                        f"(`SteppedInContext.level_terms`), not {type(applied).__name__}")
+    return applied
 
 
 def _rejoined(value: jax.Array, length: int) -> jax.Array:
@@ -620,10 +635,13 @@ def _chosen_by(chosen: jax.Array, values) -> jax.Array:
     return kept
 
 
-def _level_names(model: nn.Module, start) -> tuple[str, ...]:
-    """A chain's levels' names in its order (`SteppedInContext.in_context_levels`), none for one level."""
-    count = model.in_context_levels if isinstance(model, SteppedInContext) else 1
-    return () if count == 1 else tuple(f"continuum_{index}" for index in range(count))
+def _level_names(start: Mapping) -> tuple[str, ...]:
+    """A chain's levels' names in its order (`dew.nn.continuum.level_parameters`: `continuum_0` on), a
+    chain of one among them; none for one level's own tree, which holds its maps."""
+    names = [name for name in start if re.fullmatch(r"continuum_\d+", name)]
+    if not names or len(names) != len(start):
+        return ()
+    return tuple(sorted(names, key=lambda name: int(name.rsplit("_", 1)[1])))
 
 
 def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation,

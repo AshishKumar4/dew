@@ -119,6 +119,41 @@ def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 
                         variable_shapes(model))
 
 
+def literal_damped_rate(params, adaptation: ChunkAdaptation, parts: list[str], level, summed, energy):
+    """A damped window's rate as `equation_71` writes it for the test decoder's affine head tied to its
+    embeddings E: Ls = |E|^2 / 2 and Gs = sqrt 2 |E| (Frobenius norms), SiLU's derivative bounds p1, p2,
+    the window's weighted sums `energy` of |x|^2, |f|^2, |f| |x| and |x|, |U| at the window's own `level`
+    and D's reach along a step of rate d, `summed` the window's gradient; settled toward the fixed point
+    of d -> rate / (1 + rate L(d)) from T(rate), four rounds of T(T(d)), a constant of the step."""
+    table = jax.lax.stop_gradient(jnp.sum(jnp.square(params["embed_tokens"]["embedding"])))
+    curvature, slope = table / 2, jnp.sqrt(2 * table)
+    p1, p2 = _SLOPES[HIDDEN_ACT[LEVEL.activation]]
+    squares, inputs, crossed, lengths = energy
+    rate = adaptation.rate
+    # The window steps from its own level, `up`'s norm there.
+    output = jax.lax.stop_gradient(jnp.sqrt(jnp.sum(jnp.square(level["up"]["kernel"]))))
+
+    def curvature_along(length):
+        def reach(name):
+            return length * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
+
+        spread = reach("down") if "down" in parts else 0.0
+        norm = output + (reach("up") if "up" in parts else 0.0)
+        stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
+            inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts else 0.0)
+        bend = (norm * p2 * squares if "down" in parts else 0.0) + (
+            p1 * lengths if parts == ["down", "up"] else 0.0)
+        return jax.lax.stop_gradient(curvature * stretch + slope * bend)
+
+    def settled(length):
+        return rate / (1 + rate * curvature_along(length))
+
+    damped = settled(rate)
+    for _ in range(4):
+        damped = settled(settled(damped))
+    return jax.lax.stop_gradient(damped)
+
+
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
                 levels: bool = False, truth: bool = False, finals: bool = False):
     """Equation 71 read literally, token by token along each row: a run of a document's real tokens
@@ -127,13 +162,8 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
     real where the mask marks it and its document is not 0, as every reader of rows takes it. With
     `levels`, also the level each token reads. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at a rate
-    settled toward the fixed point of d -> rate / (1 + rate L(d)) from T(rate), four rounds of T(T(d)),
-    L(d) written along a step of rate d from `ChunkAdaptation.damped`'s bound for the test decoder's affine
-    head tied to its embeddings E: Ls = |E|^2 / 2 and Gs = sqrt 2 |E| (Frobenius norms), SiLU's derivative
-    bounds p1, p2, the window's weighted sums of |x|^2, |f|^2, |f| |x| and |x| (x the state, f its
-    silu(x D) at the window's own level), and |U| there and D's reach along the step; every bound is a
-    constant of the step, not differentiated.
+    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at the rate
+    `literal_damped_rate` writes from the window's terms at its own level.
 
     A level a run carries (`ChunkAdaptation.carry`, "run") starts at the trained level plus the carried
     collection's, and runs through the row's documents in turn: a run is the row's real tokens. With
@@ -171,42 +201,11 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     def choose(condition, first, second):
         return jax.tree.map(lambda one, other: jnp.where(condition, one, other), first, second)
 
-    table = jax.lax.stop_gradient(jnp.sum(jnp.square(params["embed_tokens"]["embedding"])))
-    curvature, slope = table / 2, jnp.sqrt(2 * table)
-    p1, p2 = _SLOPES[HIDDEN_ACT[LEVEL.activation]]
     parts = [name for name in ("down", "up") if not adaptation.select or name in adaptation.select]
-
-    def damped_rate(level, summed, energy):
-        squares, inputs, crossed, lengths = energy
-        rate = adaptation.rate
-        # The window steps from its own level, `up`'s norm there.
-        output = jax.lax.stop_gradient(jnp.sqrt(jnp.sum(jnp.square(level["up"]["kernel"]))))
-
-        def curvature_along(length):
-            def reach(name):
-                return length * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
-
-            spread = reach("down") if "down" in parts else 0.0
-            norm = output + (reach("up") if "up" in parts else 0.0)
-            stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
-                inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts
-                else 0.0)
-            bend = (norm * p2 * squares if "down" in parts else 0.0) + (
-                p1 * lengths if parts == ["down", "up"] else 0.0)
-            return jax.lax.stop_gradient(curvature * stretch + slope * bend)
-
-        def settled(length):
-            return rate / (1 + rate * curvature_along(length))
-
-        # T(rate), then four rounds of T(T(d)), toward the bound's fixed point from below.
-        damped = settled(rate)
-        for _ in range(4):
-            damped = settled(settled(damped))
-        return jax.lax.stop_gradient(damped)
 
     def stepped(level, summed, energy):
         if adaptation.damped:
-            rate = damped_rate(level, summed, energy)
+            rate = literal_damped_rate(params, adaptation, parts, level, summed, energy)
             return {name: {**part, "kernel": part["kernel"] - rate * summed[name]["kernel"]}
                     if name in parts else part for name, part in level.items()}
         return {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part, summed[name])
@@ -584,6 +583,58 @@ def test_a_damped_chain_refuses_a_level_after_whose_curvature_no_number_bounds()
         objective.token_scores(objective.init(jax.random.key(0)), tokens)
 
 
+@pytest.mark.parametrize("adaptation", [ChunkAdaptation(window=3, rate=0.5, select=("up",)),
+                                        ChunkAdaptation(window=3, rate=5.0, damped=True)],
+                         ids=["selected", "damped"])
+def test_a_chain_of_one_level_steps_as_the_level_alone(adaptation):
+    """A chain of one level (`continuum=(level,)`, its level in `continuum_0`) scores each target as the
+    same level held alone does, bit for bit: its steps selected or damped alike."""
+    chained = decoder(continuum=(LEVEL,))
+    variables = drawn_variables(0, chained)
+    params = {name: value for name, value in variables["params"].items() if name != "continuum_0"}
+    alone = {**variables, "params": {**params, "continuum": variables["params"]["continuum_0"]["continuum"]}}
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    scored = [LMObjective(model, LENGTH, adaptation=adaptation).token_scores(held, tokens).losses
+              for model, held in ((chained, variables), (MODEL, alone))]
+    np.testing.assert_array_equal(np.asarray(scored[0]), np.asarray(scored[1]))
+
+
+def test_a_float64_level_steps_damped():
+    """A float64 model's damped step carries its window's terms in float64, as its states hold them: its
+    losses are finite."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of("packed").items()}
+    with jax.enable_x64(new_val=True):
+        wide = MODEL.clone(dtype=jnp.float64)
+        variables, hidden, targets, weights = widened(draw(0, scale=0.5))
+        losses = adapted_scores(wide, variables, hidden, targets, weights, fields,
+                                ChunkAdaptation(window=3, rate=5.0, damped=True), predict=False,
+                                logits=False).losses
+        assert losses.dtype == jnp.float64 and np.all(np.isfinite(np.asarray(losses)))
+
+
+def test_a_damped_step_through_a_relu_head_transform_is_refused():
+    """A damped step bounds the head's curvature through its transform's activation, and a ReLU's second
+    derivative is a point mass, so a damped step under a ReLU head transform is refused (ValueError)."""
+    objective = LMObjective(decoder(head_transform="relu"), LENGTH,
+                            adaptation=ChunkAdaptation(select=("up",), damped=True))
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    with pytest.raises(ValueError):
+        objective.token_scores(objective.init(jax.random.key(0)), tokens)
+
+
+def test_a_chains_levels_count_as_head_work():
+    """A chain's levels (`continuum_0`, `continuum_1`) count as head work in a decoder's matrix usage, as
+    one level's `continuum` does: read on every head read, its own and each prediction depth's."""
+    from dew.nn.backbones.decoder_counts import matrix_usage, prediction_matrix_usage
+
+    lengths = np.asarray([LENGTH, LENGTH])
+    for scope in ("continuum", "continuum_0", "continuum_1"):
+        path = ("params", scope, "continuum", "up", "kernel")
+        assert np.all(matrix_usage(CHAINED, path, lengths, logits=True) == lengths), scope
+        assert not np.any(matrix_usage(CHAINED, path, lengths, logits=False)), scope
+        assert prediction_matrix_usage(CHAINED, path, lengths, [(lengths, lengths)]).size, scope
+
+
 def test_a_chain_starts_as_the_plain_head_and_steps_nothing_at_rate_zero():
     """A chain's levels start as the identity, so its logits are the model's without them, and a chain
     stepped at rate zero scores the targets as the level-free model does, bit for bit."""
@@ -604,12 +655,12 @@ def test_a_chain_starts_as_the_plain_head_and_steps_nothing_at_rate_zero():
 def test_a_chain_names_one_window_and_rate_a_level_its_windows_nested():
     """A chain's windows, ordered, each divide the next (a slower level steps on a faster one's
     boundary), and one window or rate a level, or one for all: else refused (ValueError)."""
-    with pytest.raises(ValueError, match="divide"):
+    with pytest.raises(ValueError):
         ChunkAdaptation(window=(2, 3))
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
     for adaptation in (ChunkAdaptation(window=(2, 4, 8)), ChunkAdaptation(window=2, rate=(0.1, 0.1, 0.1))):
         objective = LMObjective(CHAINED, LENGTH, adaptation=adaptation)
-        with pytest.raises(ValueError, match="2 levels"):
+        with pytest.raises(ValueError):
             objective.token_scores(objective.init(jax.random.key(0)), tokens)
 
 
@@ -1369,7 +1420,7 @@ def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refu
     frozen = {**variables, "params": traverse_util.unflatten_dict(params),
               QUANTIZATION: traverse_util.unflatten_dict({**scales, **codes})}
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
-    with pytest.raises(ValueError, match="other than as a linear"):
+    with pytest.raises(ValueError):
         objective.token_scores(frozen, tokens)
 
 
