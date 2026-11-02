@@ -313,6 +313,9 @@ class WrapperFields(AudioFields):
     """The wrapper's media components Dew has no port of, by their tensors' prefix (past `model.`) to
     the reason: a load takes its language model alone (`text_only`), and a multimodal load refuses
     them by name."""
+    text_unprefixed: NotRequired[tuple[str, ...]]
+    """The prefixes (past `model.`) under which a release saved before transformers nested its language
+    model keeps that model's modules at the top (Qwen2.5-VL-7B's `model.layers.*`), routed into it."""
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:

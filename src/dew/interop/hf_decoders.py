@@ -392,11 +392,32 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
                            _wrapper_audio(hf_config, used, record_int(text, "emb_features"), audio))
 
 
+def _text_vlm_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a VLM whose text decoder a registered family computes and whose vision tower Dew has no port
+    of (`TEXT_FAMILIES`: Qwen2-VL's, Qwen2.5-VL's, Qwen3-VL's and Qwen3-VL-MoE's): a load reads its
+    language model alone (`text_only`; `WrapperFields.unported`), as the family it follows. A release
+    saved before transformers nested it (Qwen2.5-VL-7B's) keeps that model's modules at the top
+    (`text_unprefixed`)."""
+    text = _wrapper_text(hf_config, used)
+    model_type = _records.text(hf_config["model_type"], "model_type")
+    used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id", "vision_token_id",
+                 "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
+    fields = _wrapper_fields(model_type, used, text, None, None, image, None,
+                             video=_records.integer(hf_config["video_token_id"], "video_token_id")
+                             if hf_config.get("video_token_id") is not None else None)
+    fields["text_model_type"] = TEXT_FAMILIES[_text_config(hf_config)["model_type"]]
+    fields["unported"] = {"visual.": f"{model_type}'s vision tower has no Dew port"}
+    fields["text_unprefixed"] = ("embed_tokens.", "layers.", "norm.")
+    return fields
+
+
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
-    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper}
+    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
+    **dict.fromkeys(("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"), _text_vlm_wrapper)}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -457,6 +478,8 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     for prefix in record.get("unported", {}):
         if bare.startswith(prefix):
             return "unported", bare
+    if bare.startswith(tuple(record.get("text_unprefixed", ()))):
+        return "language_model", f"model.{bare}"
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
         return "language_model", tail if tail.startswith(
