@@ -52,7 +52,7 @@ from dew.newton_schulz import (
     polar_express,
 )
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes, unboxed_path
+from dew.nn.sharding import boxed, boxed_axes, declarations, declared_axes, parameter_path, unboxed_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -113,8 +113,8 @@ def weight_decay_mask(params):
     """Mark every parameter but the biases and the vectors, which weight decay spares by default:
     nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
     of any rank (core/optimizer/__init__.py, optim/_param_groups.py), a per-head one included."""
-    return jax.tree_util.tree_map_with_path(lambda path, param: param.ndim >= 2 and not (
-        isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias"), params)
+    return jax.tree_util.tree_map_with_path(
+        lambda path, param: param.ndim >= 2 and parameter_path(path)[-1:] != ("bias",), params)
 
 
 def muon_partition(params) -> dict[str, str]:

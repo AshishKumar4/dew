@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
@@ -86,7 +87,7 @@ def test_cosine_uses_its_explicit_horizon_when_the_run_has_no_step_cap():
 def dit_params():
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                       mlp_ratio=1)
-    return model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
+    return nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,))))
 
 
 def muon_solver(forms: str = "accurate", optimizer: str = "muon", **kwargs):
@@ -854,7 +855,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     between the two groups' largest. One layer, so the clip's input is the
     embeddings both times."""
     model = tiny_decoder(output_gate=True, num_layers=1)
-    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
     ids = jnp.asarray(np.random.default_rng(1).integers(0, 32, (2, 8)), jnp.int32)
     _, sown = model.apply(variables, ids, mutable=["qk"])
     stats = sown["qk"]
@@ -874,7 +875,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     # Over drawn decoders and tokens, the maxima read after the clip on par with the maxima before it
     # times each group's eta (check 1), the truth both of the decoder in float64. The threshold is the
     # draw's, between the two groups' float32 maxima; the clip takes it as a number.
-    initialized = jax.jit(lambda key: model.init(key, jnp.ones((1, 8), jnp.int32)))
+    initialized = jax.jit(lambda key: nn.unbox(model.init(key, jnp.ones((1, 8), jnp.int32))))
 
     def maxima(of, variables, ids):
         _, sown = of.apply(variables, ids, mutable=["qk"])
@@ -923,7 +924,7 @@ def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logit
     again on the same tokens after the clip, the firing group's maxima shrink and the other group's
     hold, as the kernels' clip moves an unbiased layer's."""
     model = tiny_decoder(attention_bias=True, num_layers=1)
-    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
     rng = np.random.default_rng(2)
     attention = dict(variables["params"]["layers_0"]["self_attn"])
     for proj in ("q_proj", "k_proj"):
@@ -1033,7 +1034,7 @@ def test_the_sow_reports_the_kernels_logits():
     its maxima, which a stale or miswired sow would not. A closed collection
     sows nothing, and the plain forward skips the extra matmul."""
     model = tiny_decoder()
-    variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32)))
     ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], jnp.int32)
     _, sown = model.apply(variables, ids, mutable=["qk"])
     assert set(sown.get("qk", {})) == {"layers_0", "layers_1"}
