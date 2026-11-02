@@ -434,3 +434,15 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
         (single,) = resources.plan([launch(65536, 0, 128, 1)], family, target)
     assert (states.programs, states.stages) == (1, 5)
     assert (single.programs, single.stages) == (3, 1)
+
+
+def test_a_consumer_holds_no_more_registers_than_a_thread_addresses():
+    """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to
+    setmaxnreg's 256 registers, of which its thread holds the 255 it addresses (`Family.registers`): a
+    launch's code fitted to 256 spilled."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+    assert resources.raised_registers(1, 1) == 256
+    assert family.registers(1) == 255
