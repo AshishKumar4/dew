@@ -265,8 +265,9 @@ def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
 
 def test_a_rewrite_is_recorded_in_the_kernel_report():
     """Each program the pass rewrites is recorded in the one kernel report (`report.rewrites`): the equations
-    it read, the rule sets that fired and the nodes they introduced, the region's price before and after, and
-    the pass's seconds."""
+    it read, the rule sets that fired and the nodes they introduced, the region's price before and after, the
+    pass's seconds, and the roots whose cheaper form the program took, counted once the splice lands (a
+    report recorded before its splice claimed forms the program may not have taken; row 3582)."""
     def joined(x, y, a):
         return two_sums(x, y, a)
 
@@ -277,6 +278,7 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     assert made.fired.get("linear", 0) > 0
     assert made.after < made.before
     assert made.seconds > 0
+    assert made.spliced == 1
 
 def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
     """A program whose math no rule's left side reads (no sum of two reductions, products or contractions,
