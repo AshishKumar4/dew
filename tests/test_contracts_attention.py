@@ -85,7 +85,7 @@ def test_the_paged_decode_kernel_holds_every_order(edge, kernel):
     def paged(query, key, value, sinks):
         # The template's decode as the GPU its mainloop is qualified on runs it, interpreted here, its
         # derivatives' gathered attention on xla, which this host runs.
-        on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla"))
+        on_gpu = (generation.assumed("sm90"), generation.chosen(attention="xla", decode="xla"))
         with contextlib.ExitStack() as stack:
             for context in on_gpu if kernel == "template_paged" else ():
                 stack.enter_context(context)
