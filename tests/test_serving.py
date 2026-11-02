@@ -742,24 +742,41 @@ def hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
 
 
-def hybrid_task():
-    """`hybrid_model`'s greedy task, over drawn weights."""
-    model = hybrid_model()
+def parallel_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
+    """Falcon-H1's stack at toy size: every layer Mamba-2 beside attention on one norm
+    (`dew.nn.mixers.parallel`), each branch scaled in and out, the Mamba-2 branch's state and conv tail
+    each row's own and the attention branch's keys a paged server's pages."""
+    return CausalTransformer(
+        vocab_size=vocab_size, emb_features=width, num_layers=2, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=2 * width, max_seq_len=128, dtype="float32",
+        mixer={"class": "parallel", "fields": {"branches": [
+            {"name": "mamba", "input_multiplier": 1.3, "output_multiplier": 0.7,
+             "mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 8, "state_size": 8,
+                                                     "n_groups": 1, "chunk_size": 4}}},
+            {"name": "attention", "input_multiplier": 0.8, "output_multiplier": 0.6,
+             "mixer": {"class": "attention", "fields": {}}}]}})
+
+
+def hybrid_task(stack=hybrid_model):
+    """A hybrid `stack`'s greedy task (`hybrid_model`'s by default), over drawn weights."""
+    model = stack()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     return TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=EOS))
 
 
+@pytest.mark.parametrize("stack", [hybrid_model, parallel_hybrid_model], ids=["layered", "parallel"])
 @pytest.mark.parametrize("options", [
     {}, {"kv_cache": KVCache(page_size=4, pages=64)},
     {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3},
 ], ids=["dense", "paged", "paged-chunked"])
-def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options):
+def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options, stack):
     """A paged server keeps the attention layer's keys in its pool and each row's recurrent state
     in the row's slot: a row starts from a fresh state, wherever a former occupant left its own,
     and a prompt prefilled three tokens a step continues the state its earlier pieces left. Every
-    row is the lone task call's."""
-    bound = hybrid_task()
+    row is the lone task call's. A parallel hybrid's layers (Falcon-H1's, `parallel_hybrid_model`)
+    hold both in each layer, beside each other."""
+    bound = hybrid_task(stack)
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     _, tickets = served_alongside(bound, **options)
