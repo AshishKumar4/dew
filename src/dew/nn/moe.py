@@ -247,6 +247,15 @@ class Router(nn.Module):
     """The least a renormalization divides the chosen weights by (ERNIE 4.5's `moe_norm_min`, which
     clamps their sum from below where a biased selection picks weights that sum to less): above 0, the
     chosen weights divide by `max(sum + weight_sum_epsilon, weight_sum_min)`, a softmax's too."""
+    excluded_group_score: float | None = None
+    """What an expert outside a token's best groups is chosen by (`expert_groups`): None for nothing, never
+    chosen (DeepSeek V3's -inf), or the score its reference fills in, A.X-K2's 0.0
+    (`masked_fill(..., 0.0)`, modeling_axk2.py:340), which a best group's experts biased below zero rank
+    under."""
+    logit_softcap: float | None = None
+    """Where set, the cap `c` of each gate logit, `tanh(logit / c) * c` before its scores, in float32 as
+    the logits are (Laguna's `moe_router_logit_softcapping`, modeling_laguna.py:174-175); every reader of
+    the logits (the scores, the z-loss) reads them capped."""
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
@@ -286,6 +295,9 @@ class Router(nn.Module):
                     f"top_k of {self.top_k}")
         if self.bias_in_weights and not self.expert_bias:
             raise ValueError("bias_in_weights gates on the balancing bias, which expert_bias holds")
+        if self.logit_softcap is not None and not self.logit_softcap > 0:
+            raise ValueError(f"logit_softcap is a positive cap on the gate logits, or None for none; got "
+                             f"{self.logit_softcap}")
         if (self.routing_block is None) != (self.block_experts is None):
             raise ValueError("block routing names its block of tokens and the experts a block may use, "
                              f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
@@ -362,7 +374,8 @@ class Router(nn.Module):
             raise ValueError("only a hash router reads the token ids")
         selection = self.selection(scores, media, blocks)
         if self.expert_groups > 1:
-            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+            fill = -jnp.inf if self.excluded_group_score is None else self.excluded_group_score
+            selection = jnp.where(self.group_mask(selection), selection, fill)
         _, indices = jax.lax.top_k(selection, self.top_k)
         return indices
 
@@ -380,9 +393,13 @@ class Router(nn.Module):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
         `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
         (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
-        past each other, where the references' float32 routers multiply in IEEE float32."""
-        return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
-                              precision=exact_float32(self.precision))
+        past each other, where the references' float32 routers multiply in IEEE float32. A
+        `logit_softcap` caps them."""
+        logits = float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
+                                precision=exact_float32(self.precision))
+        if self.logit_softcap is None:
+            return logits
+        return jnp.tanh(logits / self.logit_softcap) * self.logit_softcap
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -1114,6 +1131,8 @@ class SparseMLP(nn.Module):
     hash_vocab: int | None = None
     weight_sum_epsilon: float = WEIGHT_SUM_EPSILON
     weight_sum_min: float = 0.0
+    router_softcap: float | None = None
+    excluded_group_score: float | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
@@ -1163,7 +1182,9 @@ class SparseMLP(nn.Module):
                            routing_block=self.routing_block,
                            block_experts=self.block_experts,
                            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
-                           hash_vocab=self.hash_vocab, init_std=self.init_std,
+                           logit_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
+                           hash_vocab=self.hash_vocab,
+                           init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(

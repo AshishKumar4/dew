@@ -13,6 +13,7 @@ from ..attention_residuals import DepthAttention
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUpLayer
 from ..hyper_connections import stream_head
+from .decoder_block import gate_flops
 
 if TYPE_CHECKING:
     import flax.linen as nn
@@ -46,7 +47,31 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     if decoder.attention_residuals is not None:
         sources = decoder.attention_residuals.blocks(decoder.num_layers) + 1
         count += depth_counter(DepthAttention(decoder.emb_features, parent=None), lengths, sources)
+    # The gated norms outside the layers (`NormSpec.gate_rank`): the embedding's once, at the lookup's
+    # width where it norms the lookup, and the final one's each time a call runs it (`final_norm_runs`).
+    lookup = decoder.embedding_features if decoder.embedding_norm_reads == 'lookup' else None
+    count += gate_flops(decoder.norms, ('embedding_layernorm',) if decoder.embedding_norm else (),
+                        lookup or decoder.emb_features, lengths, routed=None)
+    count += final_norm_runs(decoder) * gate_flops(decoder.norms, ('norm',), decoder.emb_features, lengths,
+                                                   routed=None)
     return count
+
+
+def final_norm_runs(decoder: CausalTransformer) -> int:
+    """How many times a call runs the decoder's final norm (`norm`): after its last layer where it ends in
+    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where its exit gate or its step
+    reads the normed state, and, under `reinject`, on each pass's input and after the passes. Under nGPT
+    none, its norm being the unit sphere's, which learns nothing."""
+    if decoder.ngpt is not None:
+        return 0
+    runs = int(decoder.final_norm)
+    loop = decoder.loop
+    if loop is not None:
+        later = loop.steps - 1
+        runs += later * int(loop.step_norm or loop.exit_gate)
+        if loop.reinject:
+            runs += 1 + later + 1
+    return runs
 
 
 def layer_counts(decoder: CausalTransformer, lengths, counter: Counter) -> list[float]:
@@ -89,6 +114,8 @@ def logits_flops(decoder: CausalTransformer, lengths) -> float:
     for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
         if site in projections:
             count += projection_flops(lengths, *projections[site])
+    if decoder.head_transform is not None:
+        count += gate_flops(decoder.norms, ('head_norm',), projections['head_dense'][1], lengths, routed=None)
     return count
 
 

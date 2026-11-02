@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
@@ -166,11 +166,15 @@ def decoded_ssd(x, dt, A, B, C, D, held=None, starts=None):
 class MambaRMSNormGated(nn.Module):
     """`MambaRMSNormGated` (modeling_mamba2.py:105-121): the gate first, the
     norm over the whole width after, both in fp32 (`at_least_fp32`), the weight applied to the
-    cast-back values."""
+    cast-back values. `gate_after` norms first and gates the weighted norm, and `scale_wide` applies the
+    weight in at least fp32 before the one cast, Falcon-H1's `FalconH1RMSNormGated` in either order
+    (`norm_before_gate`, modeling_falcon_h1.py:256-282)."""
 
     epsilon: float = 1e-5
     groups: int = 1
     """Nemotron-H normalizes each B/C group's channels separately after the gate."""
+    gate_after: bool = False
+    scale_wide: bool = False
     dtype: Dtype | None = None
 
     @nn.compact
@@ -179,10 +183,15 @@ class MambaRMSNormGated(nn.Module):
         wide = at_least_fp32(x.dtype)
         if self.groups < 1 or x.shape[-1] % self.groups:
             raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
-        y = x.astype(wide) * nn.silu(gate.astype(wide))
+        y = x.astype(wide)
+        if not self.gate_after:
+            y = y * nn.silu(gate.astype(wide))
         y = unweighted_rmsnorm(y.reshape(*y.shape[:-1], self.groups, -1), self.epsilon).reshape(y.shape)
         scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
-        return (scale.astype(dtype) * y.astype(dtype)).astype(dtype)
+        y = y * scale.astype(wide) if self.scale_wide else scale.astype(dtype) * y.astype(dtype)
+        if self.gate_after:
+            y = y.astype(wide) * nn.silu(gate.astype(wide))
+        return y.astype(dtype)
 
 
 @logical_axes({
@@ -225,6 +234,19 @@ class Mamba2(nn.Module):
     norm_groups: int = 1
     time_step_limit: tuple[float, float] = (0.0, float('inf'))
     norm_eps: float = 1e-5
+    norm_order: Literal['gate_first', 'norm_first'] | None = 'gate_first'
+    """Where the output's gate falls about its norm (`MambaRMSNormGated`): gated then normed, Mamba-2's;
+    normed then gated, Falcon-H1's `mamba_norm_before_gate`; or None, gated alone with no norm, Falcon-H1's
+    `mamba_rms_norm=False` (`y * silu(z)`, in at least fp32)."""
+    norm_scale_wide: bool = False
+    """Whether the norm's weight applies in at least fp32 before its one cast, Falcon-H1's."""
+    section_multipliers: tuple[float, ...] | None = None
+    """Where set, the in projection's output times a factor per section, its z, x, B, C and dt in that
+    order (Falcon-H1's `mup_vector` of its `ssm_multipliers`), the product in the projection's dtype as
+    its buffer is held."""
+    out_bias: bool | None = None
+    """Whether the out projection adds a bias, where it differs from the in projection's `use_bias`
+    (Falcon-H1's `projectors_bias` beside its `mamba_proj_bias`); None follows `use_bias`."""
     init_std: float | None = None
     """Normal std of in_proj and the conv taps (lm-engine draws both from the
     same std); None keeps lecun normal."""
@@ -278,10 +300,37 @@ class Mamba2(nn.Module):
         self.A_log = self.param('A_log', _log_head_index, (self.num_heads,))
         self.dt_bias = self.param('dt_bias', inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
-        self.norm = MambaRMSNormGated(
-            epsilon=self.norm_eps, groups=self.norm_groups, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj', **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+        if self.section_multipliers is not None and len(self.section_multipliers) != 5:
+            raise ValueError(f"section_multipliers scale the z, x, B, C and dt sections, five factors, got "
+                             f"{self.section_multipliers}")
+        if self.norm_order not in ('gate_first', 'norm_first', None):
+            raise ValueError(f"norm_order is 'gate_first', 'norm_first' or None, got {self.norm_order!r}")
+        if self.norm_order is not None:
+            self.norm = MambaRMSNormGated(
+                epsilon=self.norm_eps, groups=self.norm_groups, gate_after=self.norm_order == 'norm_first',
+                scale_wide=self.norm_scale_wide, dtype=self.dtype, name='norm')
+        self.out_proj = dense(self.emb_features, name='out_proj',
+                              use_bias=self.use_bias if self.out_bias is None else self.out_bias,
+                              **normal_kernel(self.init_std if self.output_init_std is None
+                                              else self.output_init_std))
+
+    def _gated(self, out, gate):
+        """The scan's output gated by z: through the norm, or, with none, times silu(z) in at least
+        fp32, cast back."""
+        if self.norm_order is not None:
+            return self.norm(out, gate)
+        wide = at_least_fp32(out.dtype)
+        return (out.astype(wide) * nn.silu(gate.astype(wide))).astype(out.dtype)
+
+    def _sectioned(self, projected):
+        """The in projection's output times its sections' factors (`section_multipliers`)."""
+        if self.section_multipliers is None:
+            return projected
+        groups = self.n_groups * self.state_size
+        widths = (self.intermediate_size, self.intermediate_size, groups, groups, self.num_heads)
+        factors = jnp.concatenate([jnp.full((width,), factor, projected.dtype)
+                                   for width, factor in zip(widths, self.section_multipliers, strict=True)])
+        return projected * factors
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -291,7 +340,7 @@ class Mamba2(nn.Module):
         valid = tokens.valid
         if valid is not None:
             x = jnp.where(valid[:, :, None], x, 0)
-        projected = self.in_proj(x)
+        projected = self._sectioned(self.in_proj(x))
         gate, mixed, dt = jnp.split(
             projected, [self.intermediate_size, self.intermediate_size + self.conv_features], axis=-1)
         # The conv sums in at least fp32 and hands the scan the compute
@@ -319,7 +368,7 @@ class Mamba2(nn.Module):
                                 ((taps, bias, *heads),))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(self.norm(out, gate))
+            return self.out_proj(self._gated(out, gate))
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                         (self.num_heads, self.state_size, self.head_dim),
                         decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
@@ -330,7 +379,7 @@ class Mamba2(nn.Module):
             return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
         if valid is not None:
             out = jnp.where(valid[:, :, None], out, 0)
-        return self.out_proj(self.norm(out, gate))
+        return self.out_proj(self._gated(out, gate))
 
 
 
@@ -433,6 +482,12 @@ class Mamba2Mixer(MixerBase):
     norm_groups: int = 1
     """One for Mamba-2's whole-width norm; n_groups for Nemotron-H's grouped norm."""
     time_step_limit: tuple[float, float] = (0.0, float('inf'))
+    norm_order: Literal['gate_first', 'norm_first'] | None = 'gate_first'
+    norm_scale_wide: bool = False
+    section_multipliers: tuple[float, ...] | None = None
+    out_bias: bool | None = None
+    """Falcon-H1's gated norm, its section multipliers and its out projection's own bias
+    (`Mamba2.norm_order`, `norm_scale_wide`, `section_multipliers`, `out_bias`)."""
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
@@ -450,6 +505,11 @@ class Mamba2Mixer(MixerBase):
             use_conv_bias=self.use_conv_bias,
             norm_groups=self.norm_groups,
             time_step_limit=(float(self.time_step_limit[0]), float(self.time_step_limit[1])),
+            norm_order=self.norm_order,
+            norm_scale_wide=self.norm_scale_wide,
+            section_multipliers=(None if self.section_multipliers is None
+                                 else tuple(float(factor) for factor in self.section_multipliers)),
+            out_bias=self.out_bias,
             norm_eps=ctx.norm_eps,
             init_std=ctx.init_std,
             output_init_std=ctx.output_init_std,

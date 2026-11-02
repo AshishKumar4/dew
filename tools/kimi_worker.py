@@ -1,5 +1,5 @@
-"""The Kimi K3 and Kimi Linear releases run over drawn batches, in float32 on the CUDA device and in float64
-on the CPU: the reference arm of tools/venv_reference.py's `kimi-k3` and `kimi-linear` sites, run in an
+"""The Kimi K3 and Kimi Linear releases run over drawn batches, in float32 and in float64, both on the CUDA
+device: the reference arm of tools/venv_reference.py's `kimi-k3` and `kimi-linear` sites, run in an
 environment holding the fixture's pinned torch and fla (tools/kimi_k3_reference.requirements.txt,
 tools/kimi_linear_reference.requirements.txt).
 

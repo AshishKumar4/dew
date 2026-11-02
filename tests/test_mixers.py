@@ -39,6 +39,7 @@ from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.parallel import ParallelMixer
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -244,7 +245,14 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {}),
                "memory": ({"memory": InContextMemory(
                    network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4, normalize=True,
-                   learning_rate=Gate(scale=0.1), momentum=Gate(), retention=Gate(bias=-2.0))}, {})}
+                   learning_rate=Gate(scale=0.1), momentum=Gate(), retention=Gate(bias=-2.0))}, {}),
+               # Falcon-H1's layers: Mamba-2 beside attention on one norm, each scaled in and out.
+               "parallel": ({"branches": [
+                   {"name": "mamba", "input_multiplier": 1.3, "output_multiplier": 0.7,
+                    "mixer": {"class": "mamba2", "fields": {"num_heads": 8, "head_dim": 32, "state_size": 32,
+                                                            "n_groups": 4, "chunk_size": 64}}},
+                   {"name": "attention", "input_multiplier": 0.8, "output_multiplier": 0.6,
+                    "mixer": {"class": "attention", "fields": {}}}]}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
@@ -255,7 +263,7 @@ REFUSED = {"kpool_sparse_attention"}
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
          "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
-         "mlp": 64, "qsa_attention": 128, "short_conv": 64}
+         "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -412,7 +420,8 @@ def test_no_token_reaches_another_document(kind):
 
 
 POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "attention_sinks": True,
-                 "value_scale": 0.5, "o_proj_bias": True, "attention_dropout_rate": 0.1}
+                 "value_scale": 0.5, "key_multiplier": 0.5, "o_proj_bias": True,
+                 "attention_dropout_rate": 0.1}
 """A value each attention policy (`MixerContext.policies`) asks with."""
 
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
@@ -428,23 +437,31 @@ ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_
 def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kind, policy):
     """A layer asking an attention policy builds a mixer that takes it, as an argument or in the
     context it holds (`CausalSelfAttention.ctx`), or refuses it by name; no attention-family kind
-    builds without it."""
+    builds without it. A parallel layer's every branch that attends takes it."""
     if kind in ATTENDS_NOTHING:
         pytest.skip(f"{kind} attends nothing")
     context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32,
                            **KIND_CONTEXT.get(kind, {}))
     asked = dataclasses.replace(context, **{policy: POLICY_VALUES[policy]})
     assert asked.policies()[policy] and not context.policies()[policy]
-    value = mixers.build(kind)
+    value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
     value.build(context)
     try:
         factory = value.build(asked)
     except ValueError as refused:
         assert policy in str(refused)
         return
-    held = factory.keywords.get("ctx")
-    taken = factory.keywords.get(policy) if held is None else getattr(held, policy)
-    assert taken == POLICY_VALUES[policy]
+    attending = (factory,)
+    if isinstance(value, ParallelMixer):
+        nothing = tuple(mixers[name] for name in ATTENDS_NOTHING)
+        branches = zip(value.branches, factory.keywords["branches"], strict=True)
+        attending = tuple(built for branch, (_, built, *_) in branches
+                          if not isinstance(branch.mixer, nothing))
+    assert attending
+    for built in attending:
+        held = built.keywords.get("ctx")
+        taken = built.keywords.get(policy) if held is None else getattr(held, policy)
+        assert taken == POLICY_VALUES[policy]
 
 
 def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary():
