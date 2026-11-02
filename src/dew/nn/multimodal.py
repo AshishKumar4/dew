@@ -528,9 +528,10 @@ class MultimodalTransformer(DecoderWrapper):
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
 
-    def head_bounds(self) -> tuple[jax.Array, jax.Array]:
-        """The decoder's head's curvature and slope bounds past its level (`SteppedInContext`)."""
-        return self.language_model.head_bounds()
+    def head_bounds(self, states):
+        """What bounds the decoder's head's curvature and slope past its level at `states`
+        (`SteppedInContext`)."""
+        return self.language_model.head_bounds(states)
 
     @nn.nowrap
     def in_context_level(self, variables):

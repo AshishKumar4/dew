@@ -8,18 +8,29 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 ## Unreleased
 
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
-  a logit softcap or a head transform: its rate bounds the window's curvature along the step from the
-  head's bounds (`head_bounds`) and the activation's derivatives, so it never overshoots, and stays
-  non-expansive where the loss is convex (an affine head, `up` alone). Its terms read the level's inputs as
-  its maps multiply them, a checkpoint's quantizer applied, and its rate is a constant of the step. A step
-  of `down` under ReLU, a head map that rounds its input or whose kernel Qwix rounds, a step of a level
-  kernel Qwix rounds, and a step of `down` through an `up` that rounds stay refused, as no curvature
-  bounds them (ReLU's and a quantized head were refused before, with every head but an affine one).
+  a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
+  curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and
+  it stays non-expansive where the loss is convex (an affine head, `up` alone). A head transform's norm is
+  bounded at the states the step can reach from the window's, not at a zero state (a norm declares its
+  bounds through `dew.nn.protocols.BoundedNorm`, `RMSNorm`, `LayerNorm` and `OffsetLayerNorm` among them).
+  Its terms read the level's inputs as its maps multiply them, a checkpoint's quantizer applied, and under
+  Qwix's forward quantization every operand as its rounding can grow it (`dew.quantization.rounding_growth`,
+  Qwix's unit scale for small float16 groups included), a step following Qwix's straight-through gradient:
+  the bound holds for the surrogate's smooth part, and a step that crosses a rounding cell adds the
+  quantization's own jump. Its rate is a constant of the step. Refused, as no curvature bounds them: a step
+  of `down` under ReLU; a head map, or an `up` a step of `down` reads, that a method interceptor computes
+  other than as a linear map (a checkpoint's quantizer of a head map's input, a frozen FP8 product, an
+  adapter's dropout); a head norm that declares no bounds; a Qwix weight calibration other than absmax,
+  clipped or not; and a Qwix rule that quantizes the backward, whose rounded gradient need not descend.
 - API changes for a model that holds a continuum level: `dew.nn.continuum.Continuum` takes the residual
   stream's width as a required `features` field, as its maps are built in `setup`; the `SteppedInContext`
-  hook `affine_head` is gone, replaced by `head_bounds` (bounds on a slot loss's curvature and slope in the
-  states the head reads) and `level_terms` (what bounds a damped step of the level), which
-  `CausalTransformer` and `MultimodalTransformer` implement.
+  hook `affine_head` is gone, replaced by `head_bounds(states)` (what bounds a slot loss's curvature and
+  slope in the states the head reads, `dew.nn.continuum.HeadTerms`) and `level_terms` (what bounds a damped
+  step of the level), which `CausalTransformer` and `MultimodalTransformer` implement. The functions
+  `head_curvature`, `up_energy` and `damping` of `dew.objectives.lm.adaptation` are gone, private to a
+  damped step now. `CausalTransformer`, `MultiHeadLatentAttention` and `InContextMemory` read their
+  submodules' products through one mixin, `dew.quantization.LinearProducts` (`applied_kernel`,
+  `nonlinear_input`, `linear_product`).
 - A pipelined run's state is stage-local: over a stage axis of S, each device holds its own stage's layers
   of each run a pipeline repeats, with their optimizer state and EMA, about 1/S of the run, and every rule
   of Dew's optimizers reads a stacked leaf as its stored layers. An LM's decoder, a decision's backbone,

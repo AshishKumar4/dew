@@ -127,8 +127,9 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
     real where the mask marks it and its document is not 0, as every reader of rows takes it. With
     `levels`, also the level each token reads. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at
-    rate / (1 + rate L), L written from `ChunkAdaptation.damped`'s bound for the test decoder's affine
+    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at a rate
+    settled toward the fixed point of d -> rate / (1 + rate L(d)) from T(rate), four rounds of T(T(d)),
+    L(d) written along a step of rate d from `ChunkAdaptation.damped`'s bound for the test decoder's affine
     head tied to its embeddings E: Ls = |E|^2 / 2 and Gs = sqrt 2 |E| (Frobenius norms), SiLU's derivative
     bounds p1, p2, the window's weighted sums of |x|^2, |f|^2, |f| |x| and |x| (x the state, f its
     silu(x D) at the level's start), and |U| and D's distance from the start along the step; every bound
@@ -173,17 +174,28 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         squares, inputs, crossed, lengths = energy
         rate = adaptation.rate
 
-        def reach(name):
-            moved = jnp.sqrt(jnp.sum(jnp.square(level[name]["kernel"] - start[name]["kernel"])))
-            return moved + rate * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
+        def curvature_along(length):
+            def reach(name):
+                moved = jnp.sqrt(jnp.sum(jnp.square(level[name]["kernel"] - start[name]["kernel"])))
+                return moved + length * jnp.sqrt(jnp.sum(jnp.square(summed[name]["kernel"])))
 
-        spread = reach("down") if "down" in parts else 0.0
-        norm = output + (reach("up") if "up" in parts else 0.0)
-        stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
-            inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts else 0.0)
-        bend = (norm * p2 * squares if "down" in parts else 0.0) + (
-            p1 * lengths if parts == ["down", "up"] else 0.0)
-        return rate / (1 + rate * jax.lax.stop_gradient(curvature * stretch + slope * bend))
+            spread = reach("down") if "down" in parts else 0.0
+            norm = output + (reach("up") if "up" in parts else 0.0)
+            stretch = (norm ** 2 * p1 ** 2 * squares if "down" in parts else 0.0) + (
+                inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares if "up" in parts
+                else 0.0)
+            bend = (norm * p2 * squares if "down" in parts else 0.0) + (
+                p1 * lengths if parts == ["down", "up"] else 0.0)
+            return jax.lax.stop_gradient(curvature * stretch + slope * bend)
+
+        def settled(length):
+            return rate / (1 + rate * curvature_along(length))
+
+        # T(rate), then four rounds of T(T(d)), toward the bound's fixed point from below.
+        damped = settled(rate)
+        for _ in range(4):
+            damped = settled(settled(damped))
+        return jax.lax.stop_gradient(damped)
 
     def stepped(level, summed, energy):
         if adaptation.damped:
@@ -460,6 +472,16 @@ transform, each with its variables' transform where it has one; and the level's 
 input through a checkpoint's FP8 quantizer, its states rounded (`_checkpoint`)."""
 
 
+MOVES = 1e-6
+"""The least fraction of the optimal stable step, 1 / L for L the window loss's largest curvature, a
+damped step takes at every head and part (`test_a_damped_rate_holds_below_one_over_its_windows_curvature_
+along_its_step`): a requirement, that the step moves the level. Where the bound read the plain step's reach
+and a head transform's norm at its epsilon, these draws' steps took 5e-14 to 3e-9 of it with both parts
+stepping, and 2e-10 to 7e-9 under the transform (main 62a555f17, armada job 20261102181903-215d5dc6); its
+own fixed point and the window's states take 5.5e-6 to 2.2e-2 (fix/t67a-review, job
+20261102182705-facdb322)."""
+
+
 @pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
 @pytest.mark.parametrize("head", sorted(DAMPED_HEADS))
 def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step(head, parts):
@@ -468,8 +490,9 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     step reaches, for each of `up`, `down` and both and for an affine head whose leading direction the
     ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
     input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
-    overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
-    from dew.objectives.lm.adaptation import _damping, _step_rate
+    overshoots. It moves the level: at least `MOVES` of the optimal stable step at every head. The
+    curvature is the loss's float64 Hessian at those float32 kernels."""
+    from dew.objectives.lm.adaptation import _damping, _gathered, _step_rate
 
     model, transform = DAMPED_HEADS[head]
     _, hidden, targets, weights = draw(0, scale=0.5)
@@ -493,7 +516,8 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     gradient = jax.grad(loss)(kernels, variables, states, weighed)
     *bounds, terms = _damping(model, variables, level, states, weighed, adaptation)
     moved = {part: jnp.zeros((1,), jnp.float32) for part in parts}
-    damped = float(_step_rate(adaptation, parts, bounds, jnp.sum(terms, axis=1), moved,
+    gathered = _gathered(jnp.ones(terms.shape[:2], bool), terms)
+    damped = float(_step_rate(adaptation, parts, bounds, gathered, moved,
                              {part: {"kernel": gradient[part][None]} for part in parts})[0])
     reached = {part: kernels[part] - damped * gradient[part] for part in parts}
 
@@ -508,6 +532,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
         largest = [curvature(kernels), curvature(reached)]
     assert all(damped * curvature <= 1 for curvature in largest), (head, parts, damped, largest)
     assert rate * largest[0] > 2
+    assert damped * largest[0] >= MOVES, (head, parts, damped * largest[0])
 
 
 def test_a_zero_heads_damped_step_is_finite():
@@ -515,7 +540,8 @@ def test_a_zero_heads_damped_step_is_finite():
     variables, hidden, targets, weights = draw(0, scale=0.5)
     zero = {**variables, "params": {**variables["params"],
                                     "embed_tokens": {"embedding": np.zeros((VOCAB, FEATURES), np.float32)}}}
-    assert [float(bound) for bound in MODEL.apply(zero, method="head_bounds")] == [0.0, 0.0]
+    head = MODEL.apply(zero, hidden, method="head_bounds")
+    assert [float(bound) for bound in (head.curvature, head.slope)] == [0.0, 0.0]
     zeroed = adapted_scores(MODEL, zero, hidden, targets, weights, {},
                             ChunkAdaptation(window=3, rate=0.5, select=("up",), damped=True),
                             predict=False, logits=False).losses
@@ -888,12 +914,17 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
 
 
-def _qwix(pattern: str, **options) -> CausalTransformer:
+def _qwix(pattern: str, calibration: str = "absmax", bwd_qtype: str | None = None, **options
+          ) -> CausalTransformer:
     """The test decoder built with `options`, its products at modules `pattern` selects trained in int8
-    (Qwix's quantization)."""
+    (Qwix's quantization) under the weight `calibration`, their backward quantized to `bwd_qtype`."""
     from dew.quantization import Quantization
 
-    return Quantization(patterns=(pattern,)).apply(decoder(**options))
+    return Quantization(patterns=(pattern,), calibration=calibration, bwd_qtype=bwd_qtype).apply(
+        decoder(**options))
+
+
+
 
 
 ROUNDED = {
@@ -901,32 +932,37 @@ ROUNDED = {
     "checkpoint-head_dense": (lambda: _checkpoint("head_dense", head_transform="gelu"), ("up",), True),
     "checkpoint-trunk": (lambda: _checkpoint("layers_0/self_attn/q_proj", tie_embeddings=False), (), False),
     "checkpoint-up-up": (lambda: _checkpoint("continuum/up"), ("up",), False),
-    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), True),
-    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), True),
+    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), False),
+    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), False),
     "checkpoint-down-both": (lambda: _checkpoint("continuum/down"), (), False),
-    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), True),
-    "qwix-tied": (lambda: _qwix("^$"), ("up",), True),
+    "qwix-everything": (lambda: _qwix(".*", head_transform="gelu"), (), False),
+    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), False),
+    "qwix-tied": (lambda: _qwix("^$"), ("up",), False),
     "qwix-lookup": (lambda: _qwix("embed_tokens"), ("up",), False),
-    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), True),
+    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), False),
     "qwix-down-up": (lambda: _qwix("continuum/down"), ("up",), False),
-    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), True),
+    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), False),
+    "qwix-clipped": (lambda: _qwix("continuum/up", "absmax,0.8"), ("up",), False),
+    "qwix-rms": (lambda: _qwix("continuum/up", "rms,3"), ("up",), True),
+    "qwix-backward": (lambda: _qwix("continuum/up", bwd_qtype="int8"), ("up",), True),
+
 }
 """Models whose head or level rounds a product, the parts a damped step steps through them, and whether
-it is refused (`test_a_damped_step_refuses_what_rounds_where_it_steps`)."""
+it is refused (`test_a_damped_step_bounds_what_rounds_where_it_steps`)."""
 
 
 @pytest.mark.parametrize("case", sorted(ROUNDED))
-def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
-    """A damped step's bounds hold where the maps it reads are linear in what it moves. A head map that
-    rounds its input (a checkpoint's quantizer of `lm_head`'s or of a transform's `head_dense`'s input)
-    makes the head piecewise constant in its states, and one Qwix quantizes (`lm_head`, a tied head's
-    product in the model's own scope, `^$`) rounds its inputs or multiplies by its kernel rounded; a
-    level map whose kernel Qwix rounds makes the loss piecewise constant in that kernel, and an `up`
-    that rounds its input makes the level's output piecewise constant in `down`: each refused
-    (ValueError). The rest runs, finite: a
-    trunk module's quantizer, a Qwix rule over the embedding's lookup alone, `up` alone through its
-    quantized input, both parts through a quantized `down` input, and `up` alone where Qwix rounds
-    `down`'s products."""
+def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
+    """A damped step's bounds read each map's operands as its rounding leaves them. A head map that
+    rounds its input through a method interceptor (a checkpoint's quantizer of `lm_head`'s or of a
+    transform's `head_dense`'s input) makes the head piecewise constant in its states: refused
+    (ValueError), as is a weight calibration of Qwix's whose clip no bound reads (`rms,3`), a Qwix rule
+    that rounds the backward, whose gradient a step follows (`bwd_qtype`). The rest
+    runs, finite: a trunk module's quantizer; a level map's checkpoint quantizer, its rounded input read
+    exactly; and Qwix's quantization of every product, of the head's, the tied table's in the model's
+    own scope (`^$`), the embedding's lookup alone, the level's either map, and under a clipped absmax,
+    each operand's norm grown as its rounding can grow it (`rounding_growth`), a step following Qwix's
+    straight-through gradient."""
     build, parts, refused = ROUNDED[case]
     objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
     variables = objective.init(jax.random.key(0))
@@ -938,6 +974,68 @@ def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
             objective.token_scores(variables, tokens)
     else:
         assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+
+
+def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refused():
+    """A step of `down` through an `up` that multiplies in frozen FP8 beside a checkpoint's quantizer of
+    its input is refused (ValueError): the bound reads the quantizer's rounding, not the frozen product's,
+    whose forward and gradient matrices round apart."""
+    from flax import traverse_util
+
+    from dew.quantization import QUANTIZATION, InputQuantization
+
+    record = InputQuantization(format="modelopt", sites=(("continuum/up", "fp8"),),
+                               frozen_fp8=("continuum/up",), measured_on="sm90")
+    objective = LMObjective(record.apply(decoder()), LENGTH,
+                            adaptation=ChunkAdaptation(select=("down",), damped=True))
+    variables = _scaled(objective.init(jax.random.key(0)))
+    codes = traverse_util.flatten_dict(record.packed(variables["params"]))
+    params = {path: leaf for path, leaf in traverse_util.flatten_dict(variables["params"]).items()
+              if path != ("continuum", "up", "kernel")}
+    scales = traverse_util.flatten_dict(variables[QUANTIZATION])
+    frozen = {**variables, "params": traverse_util.unflatten_dict(params),
+              QUANTIZATION: traverse_util.unflatten_dict({**scales, **codes})}
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    with pytest.raises(ValueError):
+        objective.token_scores(frozen, tokens)
+
+
+@pytest.mark.parametrize(("dtype", "calibration", "grown"), [
+    ("float16", "absmax", 2.0), ("float32", "absmax", 1 + math.sqrt(4) / 255),
+    ("float32", "absmax,1e-20", 2.0)])
+def test_qwixs_unit_scale_bounds_an_operands_growth_by_two(dtype, calibration, grown):
+    """Qwix takes a scale below sqrt of its dtype's least normal number as 1, where a value at least half
+    the format's least step rounds to as much as twice itself (`rounding_growth`): a float16 level's
+    `up` kernel grows by 2 in its damped step's terms, as a float32 one's does under a clip of 1e-20,
+    and a float32 one's by Qwix's int8 step alone otherwise; each at least what Qwix's own rounding of the
+    drawn kernel grows its columns' norm to."""
+    import qwix
+
+    _, hidden, _, _ = draw(0, scale=0.5)
+    model = _qwix("continuum/up", calibration, dtype=jnp.dtype(dtype))
+    variables = drawn_variables(0, model)
+    terms = model.apply(variables, hidden.astype(dtype), ("up",), method="level_terms")
+    assert terms[3] == grown
+    # Qwix's own rounding of the kernel `up` multiplies by, each output column its channel.
+    kernel = jnp.asarray(variables["params"]["continuum"]["up"]["kernel"], dtype)
+    rounded = qwix.dequantize(qwix.quantize(kernel, jnp.int8, channelwise_axes=(1,),
+                                            calibration_method=calibration))
+    after, before = (np.linalg.norm(np.asarray(part, np.float64), axis=0) for part in (rounded, kernel))
+    assert np.all(after <= grown * before), (after / before, grown)
+
+
+def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
+    """Under Qwix's int8 quantization of the level's `up`, a damped step's terms grow its input's norm and
+    its kernel's by 1 + sqrt(g) c / 255, g the contraction (the level's 4 hidden units) and c the weight
+    calibration's clip (`rounding_growth`): each slot's |f|^2 grows, the kernel's growth stated beside
+    it."""
+    _, hidden, _, _ = draw(0, scale=0.5)
+    plain = MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms")
+    for calibration, clip in (("absmax", 1.0), ("absmax,0.8", 0.8)):
+        model = _qwix("continuum/up", calibration)
+        rounded = model.apply(drawn_variables(0, model), hidden, ("up",), method="level_terms")
+        assert rounded[3] == 1 + math.sqrt(4) * clip / 255 and plain[3] == 1.0
+        assert np.all(np.asarray(rounded[1]) > np.asarray(plain[1]))
 
 
 def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
@@ -952,6 +1050,30 @@ def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
                               method="level_terms")[term]
         assert np.all(np.asarray(plain) > 0), site
         assert not np.any(np.asarray(rounded)), site
+
+
+def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
+    """A run's record states a damped adaptation of a decoder with a continuum level (`LMRunConfig`, its
+    model's `continuum` and its objective's `adaptation`): `run.json` reads back as the record that wrote
+    it, and the objective it builds steps the level damped, its losses finite (1925)."""
+    import json
+
+    from dew.config import ModelConfig, ObjectiveConfig, RunConfig
+    from dew.config.lm import LMRunConfig
+
+    adaptation = ChunkAdaptation(window=3, rate=0.5, damped=True)
+    config = LMRunConfig(
+        model=ModelConfig("causal_transformer", {
+            "vocab_size": VOCAB, "emb_features": FEATURES, "num_layers": 1, "num_heads": 2, "head_dim": 4,
+            "mlp_features": 16, "max_seq_len": 32, "attention_impl": "xla", "continuum": LEVEL}),
+        objective=ObjectiveConfig("lm", {"adaptation": adaptation}))
+    read = RunConfig.read(json.loads(json.dumps(config.record())))
+    assert read.record() == config.record()
+    objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)
+    assert objective.adaptation == adaptation
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
+                                                                tokens).losses)))
 
 
 def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
