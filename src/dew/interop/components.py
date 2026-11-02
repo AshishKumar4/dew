@@ -71,5 +71,7 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
             params.update(scoring)
             layouts += state_layouts
     if inputs:
-        params = check_tree({"params": params}, model, *inputs)["params"]
+        fitted = check_tree({"params": params}, model, *inputs)["params"]
+        # An eager tree carries the axes its modules declare, as a draw does; a lazy one reads them at load.
+        params = params if lazy else fitted
     return wrap(params), params, layouts, config

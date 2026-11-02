@@ -11,6 +11,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
+from dew.batch import Variables
 from dew.interop.unread import Stored, equal, held, valued
 from dew.nn.sharding import boxed_like, unboxed
 from dew.registry import dtype_name, resolve_dtype, storage_name
@@ -51,7 +52,7 @@ def check_shapes[PathT](loaded: Iterable[tuple[PathT, tuple[int, ...]]],
             f"unexpected {unexpected}, mismatched {sorted(mismatched)}")
 
 
-def check_tree[TreeT: Mapping[str, object]](variables: TreeT, module: nn.Module, *inputs) -> TreeT:
+def check_tree(variables: Variables, module: nn.Module, *inputs) -> dict[str, Variables]:
     """Check every collection against the module's abstract initialization, without another
     copy of its parameters, and return `variables` with each parameter in the box of axes its module
     declares (`boxed_like`), as a draw returns it. Inputs may be arrays or jax.ShapeDtypeStruct values."""
@@ -62,7 +63,7 @@ def check_tree[TreeT: Mapping[str, object]](variables: TreeT, module: nn.Module,
     # A module's draw boxes the parameters it declares the axes of; their shapes are their values'.
     drawn = jax.eval_shape(module.init, jax.random.key(0), *inputs)
     check_shapes(shapes(unboxed(dict(variables))).items(), shapes(unboxed(drawn)))
-    return boxed_like(dict(drawn), variables)
+    return {name: boxed_like(drawn.get(name, {}), tree) for name, tree in variables.items()}
 
 
 AUTO = "auto"

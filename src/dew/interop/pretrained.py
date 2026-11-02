@@ -1624,7 +1624,9 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
         parts["language_model"], record["text"], directory)})
     # Every component the record builds holds every leaf it computes with: a tower, projector or
     # prediction-depth tensor the checkpoint lacks is refused here, as a decoder's is.
-    variables = decoder_parts.check_decoder_tree(variables, model)
+    fitted = decoder_parts.check_decoder_tree(variables, model)
+    # An eager tree carries the axes its modules declare, as a draw does; a lazy one reads them at load.
+    variables = variables if lazy else fitted
     layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
@@ -1782,7 +1784,9 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
-    variables = decoder_parts.check_decoder_tree(variables, model)
+    fitted = decoder_parts.check_decoder_tree(variables, model)
+    # An eager tree carries the axes its modules declare, as a draw does; a lazy one reads them at load.
+    variables = variables if lazy else fitted
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
     # derived-export family binds too; `save` picks its writer by

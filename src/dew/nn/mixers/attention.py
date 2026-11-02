@@ -537,13 +537,11 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"DEX names heads {start.heads} of a layer of {self.ctx.num_heads}")
 
         def held(name: str, value: tuple[int, ...] | float, dtype) -> jax.Array:
-            def drawn() -> nn.LogicallyPartitioned:
+            def drawn() -> jax.Array:
                 if start is None:
                     raise ValueError("a DEX layer's chosen heads and lambda_init are its variables, which "
                                      "a layer built without them reads from the variables it is given")
-                # Whole on every device: no head split divides the chosen heads.
-                held = jnp.asarray(value, dtype)
-                return nn.LogicallyPartitioned(held, (None,) * held.ndim)
+                return jnp.asarray(value, dtype)
             return self.variable(DEX_COLLECTION, name, drawn).value
 
         # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
