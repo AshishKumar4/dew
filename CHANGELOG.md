@@ -14,13 +14,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   bounded at the states the step can reach from the window's, not at a zero state (a norm declares its
   bounds through `dew.nn.protocols.BoundedNorm`, `RMSNorm`, `LayerNorm` and `OffsetLayerNorm` among them).
   Its terms read the level's inputs as its maps multiply them, a checkpoint's quantizer applied, and under
-  Qwix's quantization every operand as its rounding can grow it (`dew.quantization.rounding_growth`), a
-  step following Qwix's straight-through gradient: the bound holds for the surrogate's smooth part, and a
-  step that crosses a rounding cell adds the quantization's own jump. Its rate is a constant of the step.
-  Refused, as no curvature bounds them: a step of `down` under ReLU; a head map or an `up` a method
-  interceptor computes other than as a linear map (a checkpoint's quantizer of a head map's input, a frozen
-  FP8 product, an adapter's dropout); a head norm that declares no bounds; a Qwix weight calibration other
-  than absmax, clipped or not.
+  Qwix's forward quantization every operand as its rounding can grow it (`dew.quantization.rounding_growth`,
+  Qwix's unit scale for small float16 groups included), a step following Qwix's straight-through gradient:
+  the bound holds for the surrogate's smooth part, and a step that crosses a rounding cell adds the
+  quantization's own jump. Its rate is a constant of the step. Refused, as no curvature bounds them: a step
+  of `down` under ReLU; a head map, or an `up` a step of `down` reads, that a method interceptor computes
+  other than as a linear map (a checkpoint's quantizer of a head map's input, a frozen FP8 product, an
+  adapter's dropout); a head norm that declares no bounds; a Qwix weight calibration other than absmax,
+  clipped or not; and a Qwix rule that quantizes the backward, whose rounded gradient need not descend.
 - API changes for a model that holds a continuum level: `dew.nn.continuum.Continuum` takes the residual
   stream's width as a required `features` field, as its maps are built in `setup`; the `SteppedInContext`
   hook `affine_head` is gone, replaced by `head_bounds(states)` (what bounds a slot loss's curvature and
