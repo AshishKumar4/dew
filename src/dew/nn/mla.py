@@ -193,7 +193,7 @@ class IndexerFront:
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         half = self.dtype is not None and jnp.dtype(self.dtype) == jnp.float16
         self.weights_proj = dense(self.n_heads, name='weights_proj',
-                                  **({'dtype': jnp.float32} if half and fp32_weights_at_half else {}))
+                                  dtype=jnp.float32 if half and fp32_weights_at_half else self.dtype)
         return dense
 
     def queries(self, q_resid):
