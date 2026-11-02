@@ -173,5 +173,7 @@ def test_a_sum_across_devices_is_weighed_as_a_sum_and_a_gather_as_a_move():
                                                                                          axis=1)),
                             mesh=mesh, in_specs=(P(None, "x"), P("x", None)), out_specs=(P(), P()))
     a, b, _ = draw(0)
-    _, (summed, gathered) = rounding_scale(sharded, a, b.T)
+    placed = (jax.device_put(a, jax.NamedSharding(mesh, P(None, "x"))),
+              jax.device_put(b.T, jax.NamedSharding(mesh, P("x", None))))
+    _, (summed, gathered) = rounding_scale(sharded, *placed)
     assert np.all(summed > 0) and np.all(gathered == 0)

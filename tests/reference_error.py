@@ -1183,10 +1183,13 @@ class _Weighed:
             exact = scale == 0
             wrong = exact & ~(value == true)
             if wrong.any():
+                # A decided failure of an exact reference's element (`Finding`), the most an arm misses by.
                 at = tuple(int(index) for index in np.argwhere(wrong)[0])
-                raise AssertionError(f"{arm}, {path}{list(at)}: no rounding of the reference's program "
-                                     f"reaches it (its rounding scale is zero), and the arm is not exact: "
-                                     f"{value[at]!r} against {true[at]!r}")
+                raise GateFailure([Finding(
+                    f"{arm}, {path}", "exact reference", float(np.max(np.abs(value - true)[wrong])),
+                    f"{arm}, {path}{list(at)}: no rounding of the reference's program reaches it (its "
+                    f"rounding scale is zero), and the arm is not exact: {value[at]!r} against "
+                    f"{true[at]!r}")])
             weighed.append(np.where(exact, 0.0, (value - true) / (unit * np.where(exact, 1.0, scale))))
         return structure.unflatten(weighed), self.zeros
 
