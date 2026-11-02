@@ -76,14 +76,10 @@ FRACTION = "XLA_PYTHON_CLIENT_MEM_FRACTION"
 SHARED = ""
 """The owner of what runs for every file: before the first test, around them, and after the last."""
 EXEC = "exec"
-"""A followed child's restart of this Python (`restarts`), logged with the restarting process's pid before
-the exec: the new image's own `PID` line, the same pid, in the same log, is the recorder's word that it took
-the log over (`logged`). No list of how an exec can drop the recorder (an argv[0], a prefix, an environment
-without the recorder's names) stands in for that word, nor does any other process's: a fork writes to its
-parent's log, and its restart answers only for itself (review)."""
-PID = "pid"
-"""The pid of the process image that writes a log's lines from there on, each image's first word
-(`follow`)."""
+"""A followed child's restart of this Python (`restarts`), logged before the exec: the new image's `began`
+after it is the recorder's word that it took the log over (`logged`). No list of how an exec can drop the
+recorder (an argv[0], a prefix, an environment without the recorder's names) stands in for that word
+(review)."""
 COUNTED = {"followed": "start\tfollowed", "unfollowed": "unfollowed\t1", "restarted": EXEC}
 """The line a child's log takes for each kind of start (`start`): a followed child's start a line each, so
 they are counted; an unfollowed one's; a restart of this Python's."""
@@ -696,7 +692,6 @@ def follow() -> None:
     write("owner", os.environ.get("DEW_EXECUTED_FILE", ""))
     write("inherited", int(os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")))
     write("began", time.time())
-    write(PID, os.getpid())
     for name in list(sys.modules):
         write("file", f"{IMPORTED}{name.partition('.')[0]}")
         if "." in name:
@@ -739,10 +734,9 @@ def follow() -> None:
         counted(start(event, args, str(directory), child=True))
 
     def counted(kind: str | None) -> None:
-        # A start's line (`start`, `spawned`, `COUNTED`): a followed child's, an unfollowed one's, a restart
-        # with its pid, which only this pid's next image answers (`EXEC`).
+        # A start's line (`start`, `spawned`, `COUNTED`): a followed child's, an unfollowed one's, a restart.
         if kind in COUNTED:
-            log.write(f"{COUNTED[kind]}\t{os.getpid()}\n" if kind == "restarted" else f"{COUNTED[kind]}\n")
+            log.write(f"{COUNTED[kind]}\n")
 
     def closing() -> None:
         write("ended", time.time())
@@ -784,15 +778,12 @@ def logged(path: Path) -> dict:
     and whether it closed."""
     record = {"file": "", "files": set(), "reads": set(), "expected": 0, "unfollowed": False, "began": 0.0,
               "ended": None, "pool": None, "peak": None, "inherited": False, "closed": False}
-    # Each restart (`EXEC`) by its pid, until that pid's next image says it took the log over (`PID`).
-    unanswered: set[str] = set()
+    restarting = False
     for line in path.read_text().splitlines():
         kind, _, value = line.partition("\t")
-        if kind == EXEC:
-            unanswered.add(value)
-        elif kind == PID:
-            unanswered.discard(value)
-        elif kind == "owner":
+        # A restart (`EXEC`) the new image never answered with its `began` ran unrecorded.
+        restarting = kind == EXEC or (restarting and kind != "began")
+        if kind == "owner":
             record["file"] = value
         elif kind == "file":
             record["files"].add(value)
@@ -810,8 +801,7 @@ def logged(path: Path) -> dict:
             record["inherited"] = value == "1"
         elif kind == "closed":
             record["closed"] = True
-    # A restart no image of its pid answered ran unrecorded.
-    record["unfollowed"] = record["unfollowed"] or bool(unanswered)
+    record["unfollowed"] = record["unfollowed"] or restarting
     return record
 
 
