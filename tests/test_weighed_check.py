@@ -25,9 +25,10 @@ REDRAW stage the unweighted check stays undecided on every arm below that its ro
 NULL_RUNS = 64
 """The null control's runs: the reference against itself on disjoint draws, judged as a weighed site is."""
 
-NULL_WEIGHED_SEEDS = 64
-"""The null control's weighed seeds: the reference against itself unpaired, its heavy class one element a
-draw, sized by the null runs' own verdicts on armada."""
+CONDITIONED_SEEDS = 64
+"""The weighed check's declared seeds here: its heavy class holds one value a draw, so the reference against
+itself unpaired needs 32 to resolve (`seeds_for(..., conditioning=True)`, job 20261102231336-2d4bf54c),
+and twice that resolves a doubled error on it and holds the null's runs."""
 
 
 def draw(seed: int):
@@ -56,7 +57,7 @@ def failed(dew, label: str, against=reference) -> GateFailure:
     """The failure check 1 decides `dew` against `against` with conditioning, never an Inconclusive."""
     with pytest.raises(GateFailure) as raised:
         assert_as_exact(jax.jit(dew), jax.jit(against), draw, label, seeds=WEIGHED_SEEDS,
-                        conditioning=WEIGHED_SEEDS)
+                        conditioning=CONDITIONED_SEEDS)
     assert not isinstance(raised.value, Inconclusive) and raised.value.findings
     return raised.value
 
@@ -87,7 +88,7 @@ def test_an_arm_as_exact_as_the_reference_passes_conditioned():
 
     assert_as_exact(jax.jit(swapped), jax.jit(reference), draw,
                     "the products swapped, cancelled the other way", seeds=WEIGHED_SEEDS,
-                    conditioning=WEIGHED_SEEDS)
+                    conditioning=CONDITIONED_SEEDS)
 
 
 def test_an_error_moved_onto_the_amplified_element_fails_decided():
@@ -114,7 +115,7 @@ def test_an_element_no_rounding_reaches_must_be_exact_in_every_arm():
         return jnp.concatenate([a[:, :1] * jnp.float32(1 + 2.0 ** -23), a[:, 1:] * b[:, 1:]], axis=-1)
 
     assert_as_exact(jax.jit(copied), jax.jit(copied), draw, "a copy", seeds=WEIGHED_SEEDS,
-                    conditioning=WEIGHED_SEEDS)
+                    conditioning=CONDITIONED_SEEDS)
     failed(nudged, "a copy nudged", against=copied)
 
 
@@ -123,7 +124,7 @@ def test_the_weighed_check_passes_the_reference_against_itself():
     passes every one of `NULL_RUNS` runs, each verdict naming the check that decided it, its false-failure
     rate bounded by `null_rate_bound`."""
     verdicts = null_runs(jax.jit(reference), draw, "the reference against itself, weighed",
-                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=NULL_WEIGHED_SEEDS)
+                         seeds=WEIGHED_SEEDS, runs=NULL_RUNS, conditioning=CONDITIONED_SEEDS)
     reds = sum(not verdict.startswith("pass") for verdict, _, _ in verdicts)
     assert reds == 0, (reds, null_rate_bound(reds, NULL_RUNS), verdicts)
 
