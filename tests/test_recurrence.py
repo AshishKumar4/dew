@@ -215,8 +215,11 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
     reference = reference_fn(given)
 
     configs = each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given)
-    # A column-split launch runs more than one block a head, its later programs' columns among them.
-    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1 for config in configs), configs
+    # A column-split launch runs more than one block a head, its later programs' columns among them; a decay
+    # a key dimension's blocks are as wide as the draws' heads (`recurrence.KEYED_COLUMNS`), its later
+    # blocks checked at 80 columns (`test_a_head_wider_than_its_column_blocks_steps_every_column`).
+    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1
+               or config.block == recurrence.KEYED_COLUMNS for config in configs), configs
     for config in configs:
         with tuning.pinned({recurrence.StepLaunch: config}):
             step = jax.jit(functools.partial(recurrence.step, hooks))
@@ -231,9 +234,10 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
 
 
 UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
-          recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8}
-"""The hooks an 80-wide head steps under (the gated delta rule's, Mamba-2's rated scan with its skip) and
-their declared seeds."""
+          recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
+          recurrence.Hooks(decay='vector'): 8}
+"""The hooks an 80-wide head steps under (the gated delta rule's, Mamba-2's rated scan with its skip, Kimi
+delta attention's decay a key dimension, five blocks a head) and their declared seeds."""
 
 
 @pytest.mark.parametrize('hooks', UNEVEN, ids=str)

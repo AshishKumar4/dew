@@ -570,8 +570,16 @@ class Launch:
 
 WARPS = Launch(0, 8)
 """The launch over a whole head."""
-COLUMNS = Launch(32, 8)
-"""The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
+COLUMNS = Launch(32, 4)
+"""The launch over value columns: 32 a program (16 to 64 measured within 3% on an RTX 4080), its four warps
+as fast as eight or faster on an H100 and an A100 at 32 and 128 rows, two percent at Kimi Linear's and
+Mamba-2 2.7B's states (step-configs at b98bf618f)."""
+
+KEYED_COLUMNS = 64
+"""The value columns a program takes under a decay a key dimension: its key dimension's decays, a program's
+own exponentials, amortized over twice the block. Kimi Linear's decode token at 128 rows took 0.209 ms on an
+H100 at 64 against 0.229 at 32, an A100 0.437 against 0.439, where a rated scan's (Mamba-2 2.7B's) took no
+less at 64 than at 32 on an H100 and 14% more on an A100 (step-configs at b98bf618f)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -666,7 +674,8 @@ class StepLaunch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Launch:
         if _whole(ba.kwargs['hooks']):
             return WARPS
-        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1]))
+        widest = KEYED_COLUMNS if ba.kwargs['hooks'].decay == 'vector' else COLUMNS.block
+        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1], widest))
 
     def pinnable(self, ba, config) -> bool:
         # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
@@ -683,12 +692,12 @@ class StepLaunch(tuning.KernelOp):
                 "dividing the state's width")
 
 
-def column_block(width: int) -> int:
+def column_block(width: int, widest: int = COLUMNS.block) -> int:
     """A program's block of a head's `width` value columns: the widest power of two dividing it up to
-    `COLUMNS`' block (itself one), so the programs a head takes cover its every column and a Triton block's
+    `widest` (itself one), so the programs a head takes cover its every column and a Triton block's
     size is a power of two. `min(COLUMNS.block, width)` launched `width // block` programs, which left an
     80-wide head's last 16 columns unwritten and their state stale (quality audit, 2026-11-03)."""
-    return math.gcd(width, COLUMNS.block)
+    return math.gcd(width, widest)
 
 
 def _whole(hooks: Hooks) -> bool:
