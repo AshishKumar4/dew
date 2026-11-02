@@ -382,10 +382,11 @@ LAYOUT_STEPS = (((1, "8x1 data"), (2, "2x4 fsdp")), ((1, "2x4 fsdp"), (2, "8x1 d
 count and each layout, and each step count meets each layout over the cases, as testing.md's
 settings pairwise asks."""
 
-PIPELINED = {"simple_dit": 1, "jepa_encoder": 2}
+PIPELINED = {"simple_dit": 1, "jepa_encoder": 2, "causal_transformer": 2}
 """The cases whose stack of like blocks splits into two stages (`decoder_stack.pipelines`), each with
 the steps it trains over them: the DiT's two blocks, the JEPA encoder's two beside its predictor's one,
-which runs whole on every stage."""
+which runs whole on every stage, and the decoder's two layers, its embedding and head on every stage
+(ledger 3369)."""
 
 LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
                   for steps, layout in LAYOUT_STEPS[index % 2]),
