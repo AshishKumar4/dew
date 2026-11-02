@@ -440,12 +440,13 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
               scale: float, natural: bool, tiles: Tiles, family: mosaic.Family, pages: Pages | None = None,
               inference: bool = False):
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`;
-    an `inference` walk's queries to its query blocks alone, which every launch of it divides: a decode
-    step's four rows padded to 128 took 21 of B128's 795 us at 4096 keys, ET-DECODE7-h100) and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
-    sums where its values can overflow them, the fold its logits' reach, `algebra.walked_launches`) and the
-    arrays its programs read beside the operands (`_Spans`, `_Hooked`), and the power of two its plain
-    launch took into its scale (1 where none, `_rewalked`). A call it takes none of is refused (`refused`,
-    which the op's eligibility reads too)."""
+    an `inference` walk's queries to its query blocks alone, which every launch of it divides: a decode step's
+    four rows padded to 128 took 21 of B128's 795 us at 4096 keys, ET-DECODE7-h100) and its heads to whole
+    swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its sums where its values can
+    overflow them, the fold its logits' reach, `algebra.walked_launches`) and the arrays its programs read
+    beside the operands (`_Spans`, `_Hooked`), and the power of two its plain launch took into its scale (1
+    where none, `_rewalked`). A call it takes none of is refused (`refused`, which the op's eligibility reads
+    too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
     # The query's power of two before its products (`prescale`). A folding call every row of which sees a
