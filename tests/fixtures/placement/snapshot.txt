@@ -9,14 +9,14 @@ GatedMLP+packed	['params']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsd
 GatedMLP+packed	['params']['gate_up_proj']['kernel']	8x32	embed,mlp	('fsdp', 'tensor')	device
 GatedMLP+ungated	['params']['down_proj']['kernel']	16x8	mlp,embed	('tensor', 'fsdp')	device
 GatedMLP+ungated	['params']['up_proj']['kernel']	8x16	embed,mlp	('fsdp', 'tensor')	device
-NormalAttention+flat	['params']['to_k']['bias']	16	head_dim	('fsdp',)	device
-NormalAttention+flat	['params']['to_k']['kernel']	32x16	heads,head_dim	('tensor', 'fsdp')	device
+NormalAttention+flat	['params']['to_k']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+NormalAttention+flat	['params']['to_k']['kernel']	32x16	embed,heads	('fsdp', 'tensor')	device
 NormalAttention+flat	['params']['to_out_0']['bias']	32	embed	('fsdp',)	device
-NormalAttention+flat	['params']['to_out_0']['kernel']	16x32	head_dim,embed	('fsdp',)	device
-NormalAttention+flat	['params']['to_q']['bias']	16	head_dim	('fsdp',)	device
-NormalAttention+flat	['params']['to_q']['kernel']	32x16	heads,head_dim	('tensor', 'fsdp')	device
-NormalAttention+flat	['params']['to_v']['bias']	16	head_dim	('fsdp',)	device
-NormalAttention+flat	['params']['to_v']['kernel']	32x16	heads,head_dim	('tensor', 'fsdp')	device
+NormalAttention+flat	['params']['to_out_0']['kernel']	16x32	heads,embed	('tensor', 'fsdp')	device
+NormalAttention+flat	['params']['to_q']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+NormalAttention+flat	['params']['to_q']['kernel']	32x16	embed,heads	('fsdp', 'tensor')	device
+NormalAttention+flat	['params']['to_v']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+NormalAttention+flat	['params']['to_v']['kernel']	32x16	embed,heads	('fsdp', 'tensor')	device
 NormalAttention+headed	['params']['to_k']['bias']	2x8	heads,head_dim	('tensor', 'fsdp')	device
 NormalAttention+headed	['params']['to_k']['kernel']	32x2x8	embed,heads,head_dim	('fsdp', 'tensor')	device
 NormalAttention+headed	['params']['to_out_0']['bias']	32	embed	('fsdp',)	device
@@ -1227,18 +1227,18 @@ flux2_transformer	['params']['single_transformer_blocks_0']['proj_fused']['kerne
 flux2_transformer	['params']['single_transformer_blocks_0']['to_qkv_mlp_proj']['kernel']	32x288	embed,.	('fsdp',)	device
 flux2_transformer	['params']['timestep_embedder_linear_1']['kernel']	32x32	.,embed	(None, 'fsdp')	device
 flux2_transformer	['params']['timestep_embedder_linear_2']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 flux2_transformer	['params']['transformer_blocks_0']['attn']['norm_added_k']['scale']	16	-	('fsdp',)	device
 flux2_transformer	['params']['transformer_blocks_0']['attn']['norm_added_q']['scale']	16	-	('fsdp',)	device
 flux2_transformer	['params']['transformer_blocks_0']['attn']['norm_k']['scale']	16	-	('fsdp',)	device
 flux2_transformer	['params']['transformer_blocks_0']['attn']['norm_q']['scale']	16	-	('fsdp',)	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['to_add_out']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	32x32	embed,.	('fsdp',)	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	32x32	embed,.	('fsdp',)	device
-flux2_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	32x32	embed,.	('fsdp',)	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['to_add_out']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+flux2_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 flux2_transformer	['params']['transformer_blocks_0']['ff']['down_proj']['kernel']	96x32	mlp,embed	('tensor', 'fsdp')	device
 flux2_transformer	['params']['transformer_blocks_0']['ff']['gate_up_proj']['kernel']	32x192	embed,mlp	('fsdp', 'tensor')	device
 flux2_transformer	['params']['transformer_blocks_0']['ff_context']['down_proj']['kernel']	96x32	mlp,embed	('tensor', 'fsdp')	device
@@ -1256,12 +1256,12 @@ flux_transformer	['params']['proj_out']['bias']	16	.	()	device
 flux_transformer	['params']['proj_out']['kernel']	24x16	embed,.	('fsdp',)	device
 flux_transformer	['params']['single_transformer_blocks_0']['attn']['norm_k']['scale']	12	-	()	device
 flux_transformer	['params']['single_transformer_blocks_0']['attn']['norm_q']['scale']	12	-	()	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_k']['bias']	24	.	()	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,.	('fsdp',)	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_q']['bias']	24	.	()	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,.	('fsdp',)	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_v']['bias']	24	.	()	device
-flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,.	('fsdp',)	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_k']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_q']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_v']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['single_transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 flux_transformer	['params']['single_transformer_blocks_0']['norm']['linear']['bias']	72	mlp	('tensor',)	device
 flux_transformer	['params']['single_transformer_blocks_0']['norm']['linear']['kernel']	24x72	embed,mlp	('fsdp', 'tensor')	device
 flux_transformer	['params']['single_transformer_blocks_0']['proj_fused']['bias']	24	embed	('fsdp',)	device
@@ -1276,26 +1276,26 @@ flux_transformer	['params']['timestep_embedder_linear_1']['bias']	24	embed	('fsd
 flux_transformer	['params']['timestep_embedder_linear_1']['kernel']	256x24	.,embed	(None, 'fsdp')	device
 flux_transformer	['params']['timestep_embedder_linear_2']['bias']	24	embed	('fsdp',)	device
 flux_transformer	['params']['timestep_embedder_linear_2']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	24x24	embed,.	('fsdp',)	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	24x24	embed,.	('fsdp',)	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	24x24	embed,.	('fsdp',)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['norm_added_k']['scale']	12	-	()	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['norm_added_q']['scale']	12	-	()	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['norm_k']['scale']	12	-	()	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['norm_q']['scale']	12	-	()	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['to_add_out']['bias']	24	embed	('fsdp',)	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_add_out']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_k']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,.	('fsdp',)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_add_out']['kernel']	24x24	heads,embed	('tensor', 'fsdp')	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_k']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 flux_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['bias']	24	embed	('fsdp',)	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_q']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,.	('fsdp',)	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_v']['bias']	24	.	()	device
-flux_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,.	('fsdp',)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	24x24	heads,embed	('tensor', 'fsdp')	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_q']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_v']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+flux_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 flux_transformer	['params']['transformer_blocks_0']['ff']['down_proj']['bias']	24	embed	('fsdp',)	device
 flux_transformer	['params']['transformer_blocks_0']['ff']['down_proj']['kernel']	96x24	mlp,embed	('tensor', 'fsdp')	device
 flux_transformer	['params']['transformer_blocks_0']['ff']['up_proj']['bias']	96	mlp	('tensor',)	device
@@ -1323,22 +1323,22 @@ hierarchical_mmdit	['params']['conditioning']['time_embed']['layers_1']['DenseGe
 hierarchical_mmdit	['params']['conditioning']['time_embed']['layers_1']['DenseGeneral_1']['kernel']	64x64	-	('fsdp',)	device
 hierarchical_mmdit	['params']['conditioning']['time_embed']['layers_2']['bias']	16	embed	('fsdp',)	device
 hierarchical_mmdit	['params']['conditioning']['time_embed']['layers_2']['kernel']	64x16	mlp,embed	('tensor', 'fsdp')	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_k_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_k_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_q_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_q_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_v_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_v_proj']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_k_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_k_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_q_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_q_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_v_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['add_v_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_add_out']['bias']	16	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_add_out']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_k']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_k']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_add_out']['kernel']	16x16	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_k']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_k']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_out_0']['bias']	16	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_out_0']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_q']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_q']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_v']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_v']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_out_0']['kernel']	16x16	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_q']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_q']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_v']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['decoder_block_stage0_0']['attn']['to_v']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['ff']['down_proj']['bias']	16	embed	('fsdp',)	device
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['ff']['down_proj']['kernel']	64x16	mlp,embed	('tensor', 'fsdp')	device
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['ff']['up_proj']['bias']	64	mlp	('tensor',)	device
@@ -1353,22 +1353,22 @@ hierarchical_mmdit	['params']['decoder_block_stage0_0']['norm1_context']['linear
 hierarchical_mmdit	['params']['decoder_block_stage0_0']['norm1_context']['linear']['kernel']	16x96	embed,mlp	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['embed']['patch_embed']['Conv_0']['bias']	16	embed	('fsdp',)	device
 hierarchical_mmdit	['params']['embed']['patch_embed']['Conv_0']['kernel']	2x2x3x16	.,.,.,embed	(None, None, None, 'fsdp')	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_k_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_k_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_q_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_q_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_v_proj']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_v_proj']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_k_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_k_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_q_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_q_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_v_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['add_v_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_add_out']['bias']	16	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_add_out']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_k']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_k']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_add_out']['kernel']	16x16	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_k']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_k']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_out_0']['bias']	16	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_out_0']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_q']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_q']['kernel']	16x16	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_v']['bias']	16	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_v']['kernel']	16x16	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_out_0']['kernel']	16x16	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_q']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_q']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_v']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage0_0']['attn']['to_v']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['ff']['down_proj']['bias']	16	embed	('fsdp',)	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['ff']['down_proj']['kernel']	64x16	mlp,embed	('tensor', 'fsdp')	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['ff']['up_proj']['bias']	64	mlp	('tensor',)	device
@@ -1381,22 +1381,22 @@ hierarchical_mmdit	['params']['encoder_block_stage0_0']['norm1']['linear']['bias
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['norm1']['linear']['kernel']	16x96	embed,mlp	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['norm1_context']['linear']['bias']	96	mlp	('tensor',)	device
 hierarchical_mmdit	['params']['encoder_block_stage0_0']['norm1_context']['linear']['kernel']	16x96	embed,mlp	('fsdp', 'tensor')	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_k_proj']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_k_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_q_proj']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_q_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_v_proj']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_v_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_k_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_k_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_q_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_v_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['add_v_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_add_out']['bias']	32	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_add_out']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_k']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_k']['kernel']	32x32	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_add_out']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_k']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_out_0']['bias']	32	embed	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_out_0']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_q']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_q']['kernel']	32x32	embed,.	('fsdp',)	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_v']['bias']	32	.	()	device
-hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_v']['kernel']	32x32	embed,.	('fsdp',)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_q']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_v']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+hierarchical_mmdit	['params']['encoder_block_stage1_0']['attn']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 hierarchical_mmdit	['params']['encoder_block_stage1_0']['ff']['down_proj']['bias']	32	embed	('fsdp',)	device
 hierarchical_mmdit	['params']['encoder_block_stage1_0']['ff']['down_proj']['kernel']	128x32	mlp,embed	('tensor', 'fsdp')	device
 hierarchical_mmdit	['params']['encoder_block_stage1_0']['ff']['up_proj']['bias']	128	mlp	('tensor',)	device
@@ -1967,10 +1967,10 @@ qwen_image_transformer	['params']['timestep_embedder_linear_1']['kernel']	256x24
 qwen_image_transformer	['params']['timestep_embedder_linear_2']['kernel']	24x24	.,embed	(None, 'fsdp')	device
 qwen_image_transformer	['params']['transformer_blocks_0']['attn']['norm_k']['scale']	12	-	()	device
 qwen_image_transformer	['params']['transformer_blocks_0']['attn']['norm_q']['scale']	12	-	()	device
-qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,.	('fsdp',)	device
-qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,.	('fsdp',)	device
-qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,.	('fsdp',)	device
+qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	24x24	heads,embed	('tensor', 'fsdp')	device
+qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+qwen_image_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 qwen_image_transformer	['params']['transformer_blocks_0']['img_mlp']['down_proj']['kernel']	72x24	mlp,embed	('tensor', 'fsdp')	device
 qwen_image_transformer	['params']['transformer_blocks_0']['img_mlp']['gate_proj']['kernel']	24x72	embed,mlp	('fsdp', 'tensor')	device
 qwen_image_transformer	['params']['transformer_blocks_0']['img_mlp']['up_proj']['kernel']	24x72	embed,mlp	('fsdp', 'tensor')	device
@@ -1994,20 +1994,20 @@ sd3_transformer	['params']['timestep_embedder_linear_1']['bias']	16	embed	('fsdp
 sd3_transformer	['params']['timestep_embedder_linear_1']['kernel']	256x16	.,embed	(None, 'fsdp')	device
 sd3_transformer	['params']['timestep_embedder_linear_2']['bias']	16	embed	('fsdp',)	device
 sd3_transformer	['params']['timestep_embedder_linear_2']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	16x16	embed,.	('fsdp',)	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_k']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	16x16	embed,.	('fsdp',)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_k_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_q_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['add_v_proj']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_k']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_k']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 sd3_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['bias']	16	embed	('fsdp',)	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	16x16	.,embed	(None, 'fsdp')	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_q']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	16x16	embed,.	('fsdp',)	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_v']['bias']	16	.	()	device
-sd3_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	16x16	embed,.	('fsdp',)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_out_0']['kernel']	16x16	heads,embed	('tensor', 'fsdp')	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_q']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_q']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_v']['bias']	16	heads	(('fsdp', 'tensor'),)	device
+sd3_transformer	['params']['transformer_blocks_0']['attn']['to_v']['kernel']	16x16	embed,heads	('fsdp', 'tensor')	device
 sd3_transformer	['params']['transformer_blocks_0']['ff']['down_proj']['bias']	16	embed	('fsdp',)	device
 sd3_transformer	['params']['transformer_blocks_0']['ff']['down_proj']['kernel']	64x16	mlp,embed	('tensor', 'fsdp')	device
 sd3_transformer	['params']['transformer_blocks_0']['ff']['up_proj']['bias']	64	mlp	('tensor',)	device
@@ -2056,22 +2056,22 @@ simple_mmdit	['params']['conditioning']['time_embed']['layers_2']['bias']	32	emb
 simple_mmdit	['params']['conditioning']['time_embed']['layers_2']['kernel']	128x32	mlp,embed	('tensor', 'fsdp')	device
 simple_mmdit	['params']['embed']['patch_embed']['Conv_0']['bias']	32	embed	('fsdp',)	device
 simple_mmdit	['params']['embed']['patch_embed']['Conv_0']['kernel']	4x4x3x32	.,.,.,embed	(None, None, None, 'fsdp')	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_k_proj']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_k_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_q_proj']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_q_proj']['kernel']	32x32	embed,.	('fsdp',)	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_v_proj']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['add_v_proj']['kernel']	32x32	embed,.	('fsdp',)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_k_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_k_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_q_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_v_proj']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['add_v_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 simple_mmdit	['params']['mmdit_block_0']['attn']['to_add_out']['bias']	32	embed	('fsdp',)	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_add_out']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_k']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_k']['kernel']	32x32	embed,.	('fsdp',)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_add_out']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_k']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 simple_mmdit	['params']['mmdit_block_0']['attn']['to_out_0']['bias']	32	embed	('fsdp',)	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_out_0']['kernel']	32x32	.,embed	(None, 'fsdp')	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_q']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_q']['kernel']	32x32	embed,.	('fsdp',)	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_v']['bias']	32	.	()	device
-simple_mmdit	['params']['mmdit_block_0']['attn']['to_v']['kernel']	32x32	embed,.	('fsdp',)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_q']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_v']['bias']	32	heads	(('fsdp', 'tensor'),)	device
+simple_mmdit	['params']['mmdit_block_0']['attn']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 simple_mmdit	['params']['mmdit_block_0']['ff']['down_proj']['bias']	32	embed	('fsdp',)	device
 simple_mmdit	['params']['mmdit_block_0']['ff']['down_proj']['kernel']	128x32	mlp,embed	('tensor', 'fsdp')	device
 simple_mmdit	['params']['mmdit_block_0']['ff']['up_proj']['bias']	128	mlp	('tensor',)	device
@@ -2807,24 +2807,24 @@ video_dit	['params']['temporal_block_0']['mlp']['up_proj']['bias']	128	mlp	('ten
 video_dit	['params']['temporal_block_0']['mlp']['up_proj']['kernel']	32x128	embed,mlp	('fsdp', 'tensor')	device
 wan_transformer	['params']['blocks_0']['attn1']['norm_k']['scale']	24	-	('fsdp',)	device
 wan_transformer	['params']['blocks_0']['attn1']['norm_q']['scale']	24	-	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn1']['to_k']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn1']['to_k']['kernel']	24x24	embed,.	('fsdp',)	device
+wan_transformer	['params']['blocks_0']['attn1']['to_k']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn1']['to_k']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 wan_transformer	['params']['blocks_0']['attn1']['to_out_0']['bias']	24	embed	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn1']['to_out_0']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-wan_transformer	['params']['blocks_0']['attn1']['to_q']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn1']['to_q']['kernel']	24x24	embed,.	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn1']['to_v']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn1']['to_v']['kernel']	24x24	embed,.	('fsdp',)	device
+wan_transformer	['params']['blocks_0']['attn1']['to_out_0']['kernel']	24x24	heads,embed	('tensor', 'fsdp')	device
+wan_transformer	['params']['blocks_0']['attn1']['to_q']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn1']['to_q']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+wan_transformer	['params']['blocks_0']['attn1']['to_v']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn1']['to_v']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 wan_transformer	['params']['blocks_0']['attn2']['norm_k']['scale']	24	-	('fsdp',)	device
 wan_transformer	['params']['blocks_0']['attn2']['norm_q']['scale']	24	-	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn2']['to_k']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn2']['to_k']['kernel']	24x24	embed,.	('fsdp',)	device
+wan_transformer	['params']['blocks_0']['attn2']['to_k']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn2']['to_k']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 wan_transformer	['params']['blocks_0']['attn2']['to_out_0']['bias']	24	embed	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn2']['to_out_0']['kernel']	24x24	.,embed	(None, 'fsdp')	device
-wan_transformer	['params']['blocks_0']['attn2']['to_q']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn2']['to_q']['kernel']	24x24	embed,.	('fsdp',)	device
-wan_transformer	['params']['blocks_0']['attn2']['to_v']['bias']	24	.	()	device
-wan_transformer	['params']['blocks_0']['attn2']['to_v']['kernel']	24x24	embed,.	('fsdp',)	device
+wan_transformer	['params']['blocks_0']['attn2']['to_out_0']['kernel']	24x24	heads,embed	('tensor', 'fsdp')	device
+wan_transformer	['params']['blocks_0']['attn2']['to_q']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn2']['to_q']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
+wan_transformer	['params']['blocks_0']['attn2']['to_v']['bias']	24	heads	(('fsdp', 'tensor'),)	device
+wan_transformer	['params']['blocks_0']['attn2']['to_v']['kernel']	24x24	embed,heads	('fsdp', 'tensor')	device
 wan_transformer	['params']['blocks_0']['ffn']['down_proj']['bias']	24	embed	('fsdp',)	device
 wan_transformer	['params']['blocks_0']['ffn']['down_proj']['kernel']	32x24	mlp,embed	('tensor', 'fsdp')	device
 wan_transformer	['params']['blocks_0']['ffn']['up_proj']['bias']	32	mlp	('tensor',)	device
@@ -2853,10 +2853,10 @@ z_image_transformer	['params']['cap_norm']['scale']	16	-	('fsdp',)	device
 z_image_transformer	['params']['cap_pad_token']	1x32	-	(None, 'fsdp')	device
 z_image_transformer	['params']['context_refiner_0']['attention']['norm_k']['scale']	16	-	('fsdp',)	device
 z_image_transformer	['params']['context_refiner_0']['attention']['norm_q']['scale']	16	-	('fsdp',)	device
-z_image_transformer	['params']['context_refiner_0']['attention']['to_k']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['context_refiner_0']['attention']['to_out_0']['kernel']	32x32	head_dim,embed	('fsdp',)	device
-z_image_transformer	['params']['context_refiner_0']['attention']['to_q']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['context_refiner_0']['attention']['to_v']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
+z_image_transformer	['params']['context_refiner_0']['attention']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['context_refiner_0']['attention']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+z_image_transformer	['params']['context_refiner_0']['attention']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['context_refiner_0']['attention']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 z_image_transformer	['params']['context_refiner_0']['attention_norm1']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['context_refiner_0']['attention_norm2']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['context_refiner_0']['feed_forward']['down_proj']['kernel']	85x32	mlp,embed	(None, 'fsdp')	device
@@ -2870,10 +2870,10 @@ z_image_transformer	['params']['final_modulation']['bias']	32	embed	('fsdp',)	de
 z_image_transformer	['params']['final_modulation']['kernel']	32x32	.,embed	(None, 'fsdp')	device
 z_image_transformer	['params']['layers_0']['attention']['norm_k']['scale']	16	-	('fsdp',)	device
 z_image_transformer	['params']['layers_0']['attention']['norm_q']['scale']	16	-	('fsdp',)	device
-z_image_transformer	['params']['layers_0']['attention']['to_k']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['layers_0']['attention']['to_out_0']['kernel']	32x32	head_dim,embed	('fsdp',)	device
-z_image_transformer	['params']['layers_0']['attention']['to_q']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['layers_0']['attention']['to_v']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
+z_image_transformer	['params']['layers_0']['attention']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['layers_0']['attention']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+z_image_transformer	['params']['layers_0']['attention']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['layers_0']['attention']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 z_image_transformer	['params']['layers_0']['attention_norm1']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['layers_0']['attention_norm2']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['layers_0']['feed_forward']['down_proj']['kernel']	85x32	mlp,embed	(None, 'fsdp')	device
@@ -2885,10 +2885,10 @@ z_image_transformer	['params']['layers_0']['modulation']['bias']	128	embed	('fsd
 z_image_transformer	['params']['layers_0']['modulation']['kernel']	32x128	.,embed	(None, 'fsdp')	device
 z_image_transformer	['params']['noise_refiner_0']['attention']['norm_k']['scale']	16	-	('fsdp',)	device
 z_image_transformer	['params']['noise_refiner_0']['attention']['norm_q']['scale']	16	-	('fsdp',)	device
-z_image_transformer	['params']['noise_refiner_0']['attention']['to_k']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['noise_refiner_0']['attention']['to_out_0']['kernel']	32x32	head_dim,embed	('fsdp',)	device
-z_image_transformer	['params']['noise_refiner_0']['attention']['to_q']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
-z_image_transformer	['params']['noise_refiner_0']['attention']['to_v']['kernel']	32x32	heads,head_dim	('tensor', 'fsdp')	device
+z_image_transformer	['params']['noise_refiner_0']['attention']['to_k']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['noise_refiner_0']['attention']['to_out_0']['kernel']	32x32	heads,embed	('tensor', 'fsdp')	device
+z_image_transformer	['params']['noise_refiner_0']['attention']['to_q']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+z_image_transformer	['params']['noise_refiner_0']['attention']['to_v']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
 z_image_transformer	['params']['noise_refiner_0']['attention_norm1']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['noise_refiner_0']['attention_norm2']['scale']	32	-	('fsdp',)	device
 z_image_transformer	['params']['noise_refiner_0']['feed_forward']['down_proj']['kernel']	85x32	mlp,embed	(None, 'fsdp')	device
