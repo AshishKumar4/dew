@@ -9,6 +9,7 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 import dataclasses
 import itertools
 import json
+import logging
 import os
 
 import lane_environment
@@ -183,6 +184,25 @@ def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refuse
     with Compiles("step") as compiles, pytest.raises(ValueError):
         compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     assert compiles.count == 0
+
+
+def test_a_run_compiled_ahead_on_gpus_given_no_capacity_hears_they_state_no_memory(tmp_path, monkeypatch,
+                                                                                    caplog):
+    """A run that sets its remat, compiled ahead on GPUs given no capacity, whose memory nothing states,
+    has no rung judged ("unstated", one answer for the walk and the footprint, `memory.judged`; rows 3667,
+    3668), compiles at its own rung alone, and hears once that its devices state no memory, not that its
+    layout cannot be judged ("unknown")."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    plan = record(ahead.plan, "plan")
+    derived = listed(plan["derived"], "derived", read=record, what="derived rungs")
+    assert compiles.count == 1 and [entry["label"] for entry in derived] == ["unstated"]
+    assert len([entry for entry in caplog.records if entry.name == "dew.training.planning"]) == 1
 
 
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
