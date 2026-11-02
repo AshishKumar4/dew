@@ -475,18 +475,34 @@ STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
 """A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
 
-def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
+def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = (), *,
+                          fused: bool = False) -> None:
     """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as
     GLM-4.7-Flash's and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their
     projection, its output norm and a block, and GLM-4.7-Flash's copies of the trunk's table and head,
-    beside the trunk the source's own save writes; `extra` names more tensors under it."""
+    beside the trunk the source's own save writes; `extra` names more tensors under it. `fused` stores
+    the depth's experts as transformers' fused module holds them (`mlp.experts.gate_up_proj`,
+    `mlp.experts.down_proj`), not one by one."""
+    import re
+
     from safetensors.torch import load_file, save_file
 
     path = directory / "model.safetensors"
     tensors = load_file(path)
     last, depth = f"model.layers.{layers - 1}.", f"model.layers.{layers}."
-    tensors.update({depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
-                    if name.startswith(last)})
+    block = {depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
+             if name.startswith(last)}
+    if fused:
+        experts = {}
+        for name in list(block):
+            if (found := re.fullmatch(rf"{re.escape(depth)}mlp\.experts\.(\d+)\.(\w+)\.weight", name)):
+                experts.setdefault(found.group(2), {})[int(found.group(1))] = block.pop(name)
+        count = len(experts["gate_proj"])
+        block[depth + "mlp.experts.gate_up_proj"] = torch.stack(
+            [torch.cat([experts["gate_proj"][index], experts["up_proj"][index]]) for index in range(count)])
+        block[depth + "mlp.experts.down_proj"] = torch.stack([experts["down_proj"][index]
+                                                             for index in range(count)])
+    tensors.update(block)
     generator = torch.Generator().manual_seed(7)
     tensors.update({depth + "eh_proj.weight": torch.randn(width, 2 * width, generator=generator),
                     depth + "enorm.weight": torch.ones(width), depth + "hnorm.weight": torch.ones(width),
@@ -502,7 +518,8 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     of and its load leaves unread: a load reads the trunk alone, whether it keeps the depth or not
     (`prediction_depths=0`), and computes the same logits; the depth's copies of the table and head are
     the trunk's, so a save after the table changes writes the copy that reloads. A tensor under the depth
-    that is none of its own and no block's is refused."""
+    that is none of its own and no block's is refused; a depth stored with fused experts loads
+    too, its fused tensors kept whole (ledger 3141)."""
     from interop_support import tiny_config
     from safetensors import safe_open
     from transformers import AutoModelForCausalLM
@@ -528,6 +545,18 @@ def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_tr
     copy = f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
     with safe_open(tmp_path / "saved" / "model.safetensors", "np") as stored:
         np.testing.assert_array_equal(stored.get_tensor(copy), np.asarray(table) * 2)
+    # A depth stored with fused experts loads as the per-expert one does, its fused tensors kept whole
+    # for the save (ledger 3141).
+    model.save_pretrained(tmp_path / "fused")
+    with_prediction_depth(tmp_path / "fused", config.num_hidden_layers, config.hidden_size, fused=True)
+    fused = Pretrained.load(tmp_path / "fused", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(fused.model.apply(fused.variables, ids)),
+                                  np.asarray(trunk.model.apply(trunk.variables, ids)))
+    fused.save(tmp_path / "fused-saved")
+    gate_up = f"model.layers.{config.num_hidden_layers}.mlp.experts.gate_up_proj"
+    with (safe_open(tmp_path / "fused" / "model.safetensors", "np") as source,
+          safe_open(tmp_path / "fused-saved" / "model.safetensors", "np") as saved):
+        np.testing.assert_array_equal(saved.get_tensor(gate_up), source.get_tensor(gate_up))
     model.save_pretrained(tmp_path / "unknown")
     with_prediction_depth(tmp_path / "unknown", config.num_hidden_layers, config.hidden_size,
                           ("unknown.weight",))
