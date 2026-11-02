@@ -1196,7 +1196,7 @@ def _stage_count(tree) -> int:
     return max((_stage_count(child) for child in tree.values()), default=1)
 
 
-def stored_layers(model, variables: Mapping[str, Mapping]) -> Mapping[str, Mapping]:
+def stored_layers(model, variables: Variables) -> Variables:
     """`variables` with every run a stage-local store stacks by stage on its stored layers (`layers_N`),
     each whole, as a reader by layer name reads them: an export, an adapter's merge or save. The runs are
     those `model` declares (`StagedStacks.stage_sites`), each cut back by the view it was stacked under
