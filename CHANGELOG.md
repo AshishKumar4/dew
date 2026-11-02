@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
+  a logit softcap or a head transform: its rate bounds the window's curvature along the step from the
+  head's bounds (`head_bounds`) and the activation's (`SLOPES`), so it never overshoots, and stays
+  non-expansive where the loss is convex (an affine head, `up` alone). A step of `down` under ReLU and a
+  quantized head input stay refused, as no curvature bounds them (both were refused before, with every
+  head but an affine one).
 - A step compiled ahead for GPUs with none attached compiles with XLA's autotuning off, unless `XLA_FLAGS` sets it: its programs
   and their memory are the same, and its fit search compiles each rung about a third faster.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
