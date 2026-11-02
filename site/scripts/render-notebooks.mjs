@@ -15,6 +15,7 @@ import {
 	generatedRoot,
 	lastUpdated,
 	pageFile,
+	published,
 	repoRoot,
 	rewriteMarkdown,
 	takeTitle,
@@ -151,7 +152,7 @@ for (const file of files) {
 			Number(match[2].replace(/_/g, '')),
 		]),
 	);
-	listing.push({ slug, number: stem.slice(0, 2), label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0], settings });
+	listing.push({ slug, number: stem.slice(0, 2), label: LABELS[stem] ?? title, title, description, accelerator, source, thumbnail: images[0], settings, published: published(source)?.toISOString() });
 	notebookOutputs[stem] = outputsByCell;
 }
 
