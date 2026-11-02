@@ -2576,6 +2576,46 @@ mixer:mlp	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsd
 mixer:mlp	['params']['layers_1']['self_attn']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
 mixer:mlp	['params']['layers_1']['self_attn']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
 mixer:mlp	['params']['norm']['scale']	32	-	('fsdp',)	device
+mixer:parallel	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
+mixer:parallel	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['layers_0']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_0']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_0']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['k_norm']['scale']	8	-	()	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['q_norm']['scale']	8	-	()	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_0']['self_attn']['attention']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['A_log']	8	-	()	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['D']	8	-	()	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['conv1d']['bias']	512	-	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['conv1d']['weight']	512x1x4	-	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['dt_bias']	8	-	()	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['in_proj']['kernel']	32x776	embed,linear	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['norm']['weight']	256	-	('fsdp',)	device
+mixer:parallel	['params']['layers_0']['self_attn']['mamba']['out_proj']['kernel']	256x32	attention,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['layers_1']['input_layernorm']['scale']	32	-	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['layers_1']['mlp']['gate_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_1']['mlp']['up_proj']['kernel']	32x64	embed,mlp	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_1']['post_attention_layernorm']['scale']	32	-	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['k_norm']['scale']	8	-	()	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['k_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['o_proj']['kernel']	32x32	attention,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['q_norm']['scale']	8	-	()	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['q_proj']['kernel']	32x32	embed,heads	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_1']['self_attn']['attention']['v_proj']['kernel']	32x32	embed,kv	('fsdp', 'tensor')	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['A_log']	8	-	()	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['D']	8	-	()	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['conv1d']['bias']	512	-	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['conv1d']['weight']	512x1x4	-	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['dt_bias']	8	-	()	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['in_proj']['kernel']	32x776	embed,linear	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['norm']['weight']	256	-	('fsdp',)	device
+mixer:parallel	['params']['layers_1']['self_attn']['mamba']['out_proj']['kernel']	256x32	attention,embed	('tensor', 'fsdp')	device
+mixer:parallel	['params']['norm']['scale']	32	-	('fsdp',)	device
 mixer:qsa_attention	['params']['embed_tokens']['embedding']	37x32	vocab,embed	(None, 'fsdp')	device
 mixer:qsa_attention	['params']['layers_0']['input_layernorm']['scale']	32	-	('fsdp',)	device
 mixer:qsa_attention	['params']['layers_0']['mlp']['down_proj']['kernel']	64x32	mlp,embed	('tensor', 'fsdp')	device
