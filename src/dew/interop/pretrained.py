@@ -29,7 +29,7 @@ from jax.typing import DTypeLike
 
 from dew import _records
 from dew._model_types import QWEN35_TYPES
-from dew.batch import Variables
+from dew.batch import Variables, unboxed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
 from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
@@ -680,7 +680,8 @@ class Pretrained:
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        values = unpacked(self.model, self.variables if variables is None else variables)
+        # A tree enters plain: a draw's boxes are its model's table, which no export reads.
+        values = unpacked(self.model, unboxed(self.variables if variables is None else variables))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
