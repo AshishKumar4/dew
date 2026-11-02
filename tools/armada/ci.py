@@ -1550,6 +1550,11 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return 0
 
 
+def lane_row(verdict: Path, found: dict) -> None:
+    """A GPU lane's file's row in its own verdict (`verdict`), the moment it is made (`tested`)."""
+    verdict.write_text(json.dumps({"rows": [found]}))
+
+
 def selection(tests: list[str], split: str, release: str = "") -> list[str]:
     """pytest's arguments that select `tests` as a CI task does: one group of a split file (`split`,
     split.py), a release check's tests (`release`, release.py), or a check-1 site's test alone (`split` its
@@ -2165,10 +2170,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                     environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                                "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                                "OMP_NUM_THREADS": threads, followed.STARTED_AT: started}
-                    # "off": no row of a GPU lane is read from the cache, an older keyed one among them.
-                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, "off",
-                                        session.GRACE, common, environ, None, network,
-                                        container=shared_device)] = fits
+                    # No row of a GPU lane is read from the cache, an older keyed one among them: each runs.
+                    running[pool.submit(tested, python, fits, "", verdicts[fits], deadline, session.GRACE,
+                                        common, environ, functools.partial(lane_row, verdicts[fits]), None,
+                                        network, container=shared_device)] = fits
                     continue
                 done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
