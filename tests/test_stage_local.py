@@ -211,16 +211,20 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
             built[0].validate(steps=STEPS)
         steps = built[0]
         start = initial(int(seed))
-        state, _ = steps._staging.supplied(wide(start) if exact else jax.tree.map(jnp.copy, start),
-                                          steps.shardings)
+        state = steps.staged(wide(start) if exact else jax.tree.map(jnp.copy, start))
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
             built.append(steps.compile(state, batch))
         for _ in range(STEPS):
             state, *_ = built[1](state, batch)
-        saved = steps._staging.saved(state)
+        saved = steps.stored(state)
         return jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")})
     return run
+
+
+def stacks_by_stage(validation) -> bool:
+    """Whether the state a run's validation reads holds a pipelined run stacked by stage."""
+    return any("stages/" in path for path in validation.leaves)
 
 
 SEEDS = 8
@@ -235,8 +239,7 @@ def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
     (row 861's MuonClip, seed 1)."""
     given = None if variables is None else variables(0)
     banked = trainer(model, optimizer, STAGED, 8, variables=given)
-    banked.validate(steps=STEPS)
-    assert banked._staging.sites, "the decoder's run splits over two stages"
+    assert stacks_by_stage(banked.validate(steps=STEPS)), "the decoder's run splits over two stages"
     initial = initials(model, optimizer, variables)
     local, replicated = (stepped(model, optimizer, STAGED, 8, initial, variables=given, stage_local=held)
                          for held in (True, False))
@@ -290,31 +293,32 @@ def stream():
 
 
 @pytest.mark.mesh(devices=8)
-def test_what_a_stage_local_run_hands_outside_the_trainer_is_its_stored_state(tmp_path):
-    """Every state a stage-local run hands its user is in its stored form, each field that mirrors the
-    variables with every layer whole (ledger 3438): `initial_state` and `fit` lay their states out as
-    the same run's with every layer whole on every stage; an Observe at the last step reads exactly the
-    state `fit` returns, which is exactly what the run's last checkpoint holds; that state trains on
-    when handed back to `fit`; and its objective's pipeline generates from it off the mesh."""
+def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_the_mesh(tmp_path):
+    """A stage-local run keeps one state, which `fit` returns and an Observe reads as the step holds it,
+    each layer on its own stage's devices, with no copy of every layer on every stage (ledgers 3438,
+    3457): its model reads it off the mesh as its stored layers, computing from it what it computes from
+    the same state with every layer whole (`Trainer.stored`), which is what the run's last checkpoint
+    holds; the objective's pipeline generates from it; and it trains on when handed back to `fit`."""
     model, optimizer = decoder(), optax.adam(1e-2)
-    stored = jax.tree.structure(trainer(model, optimizer, STAGED, 8, stage_local=False).initial_state())
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
-    assert jax.tree.structure(run.initial_state()) == stored
-    observe = Observe(STEPS, lambda state: on_host((state.variables, state.opt_state, state.ema)))
+    observe = Observe(STEPS, lambda state: state)
     trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
-    assert jax.tree.structure(dataclasses.replace(trained, compute=None)) == jax.tree.structure(
-        dataclasses.replace(run.initial_state(), compute=None))
-    held = on_host((trained.variables, trained.opt_state, trained.ema))
+    assert observe.values[-1][1] is trained and "stages" in trained.variables["params"]
+    stored = run.stored(trained)
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path)))
+    held = on_host((stored.variables, stored.opt_state, stored.ema))
     placed, _, _ = alone.place()
-    for read in (observe.values[-1][1], on_host((placed.variables, placed.opt_state, placed.ema))):
-        assert jax.tree.structure(read) == jax.tree.structure(held)
-        for mine, theirs in zip(jax.tree.leaves(read), jax.tree.leaves(held), strict=True):
-            np.testing.assert_array_equal(mine, theirs)
-    assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,
-                                                       state=trained).step) == STEPS + 1
+    restored = on_host((placed.variables, placed.opt_state, placed.ema))
+    assert jax.tree.structure(restored) == jax.tree.structure(held)
+    for mine, theirs in zip(jax.tree.leaves(restored), jax.tree.leaves(held), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+    ids = jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=3457)["text"])
+    np.testing.assert_array_equal(np.asarray(model.apply(dict(trained.variables), ids)),
+                                  np.asarray(model.apply(dict(stored.variables), ids)))
     generated = run.objective.pipeline(trained)([[1, 2]], 4, key=0).host()
     assert np.asarray(generated.tokens).shape[0] == 1
+    assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,
+                                                       state=trained).step) == STEPS + 1
 
 
 @pytest.mark.mesh(devices=8)
@@ -391,11 +395,11 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     for mine, theirs in zip(*leaves, strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
-    written = jax.device_get(whole._staging.saved(trained))
+    written = jax.device_get(whole.stored(trained))
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path / "whole")))
     alone.validate(steps=3)
     placed, _, _ = alone.place()
-    assert not alone._staging.sites
+    assert "stages" not in placed.variables["params"]
     for name in ("variables", "opt_state", "ema"):
         restored, held = jax.device_get(getattr(placed, name)), getattr(written, name)
         assert jax.tree.structure(restored) == jax.tree.structure(held), name
@@ -412,12 +416,11 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     only its own code knows is exact short of each layer a leaf of its own, which one program can hold on
     every stage alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
-    assert trainer(model, optax.adam(1e-3), STAGED, 8, ema=None)._staging.sites
+    assert stacks_by_stage(trainer(model, optax.adam(1e-3), STAGED, 8, ema=None).validate(steps=1))
     for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
-        whole = trainer(model, given, STAGED, 8, ema=None)
-        assert int(whole.fit(stream(), steps=1, log_every=1).step) == 1
-        assert not whole._staging.sites
+        fitted = trainer(model, given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1)
+        assert int(fitted.step) == 1 and "stages" not in fitted.variables["params"]
 
 
 @pytest.mark.mesh(devices=8)
@@ -454,7 +457,7 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
                   key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
                   layout=Layout(min_shard=TINY_SHARD), diloco=DiLoCo(every=2, rate=0.7, momentum=0.9),
                   tracker=None)
-    assert not run._staging.sites
+    assert not stacks_by_stage(run.validate(steps=2))
 
 
 @pytest.mark.mesh(devices=8)
@@ -499,6 +502,5 @@ def test_m3_given_dimension_numbers_keeps_every_layer_whole_and_trains():
                            optax.scale_by_learning_rate(1e-2)),
          "adam": optax.adam(1e-2)},
         lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params)))
-    run = trainer(decoder(), given, STAGED, 8, ema=None)
-    assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
-    assert not run._staging.sites
+    fitted = trainer(decoder(), given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1)
+    assert int(fitted.step) == 1 and "stages" not in fitted.variables["params"]

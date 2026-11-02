@@ -278,32 +278,32 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     def trained(threshold, first, second):
         train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
         initial = train.initial_state()
-        # The step consumes the state: what the expectation reads of it is taken first.
+        # The step consumes the state: what the expectation reads of it is taken first, each layer on its
+        # stored layers as `stored` gives a stage-local state's.
         start = jax.tree.map(np.asarray, initial.variables["params"])
         opt_state = jax.tree.map(np.asarray, initial.opt_state)
-        run = train.compile(initial, first)
-        partial, *_ = run(initial, first)
-        pooled = jax.tree.map(np.asarray, partial.accumulation.qk_stats)
+        held = train.staged(initial)
+        run = train.compile(held, first)
+        partial, *_ = run(held, first)
+        pooled = jax.tree.map(np.asarray, train.stored(partial).accumulation.qk_stats)
         final, *_ = run(partial, second)
         assert int(final.updates) == 1
-        return train, start, opt_state, pooled, jax.tree.map(np.asarray, final.variables["params"])
+        return start, opt_state, pooled, jax.tree.map(np.asarray, train.stored(final).variables["params"])
 
-    _, _, _, heard, _ = trained(.05, quiet, spoken)
+    _, _, heard, _ = trained(.05, quiet, spoken)
     assert all(np.all(peak == 0) for peak in _maxima(heard))
-    train, start, opt_state, pooled, final = trained(.05, spoken, quiet)
+    start, opt_state, pooled, final = trained(.05, spoken, quiet)
     assert max(float(np.max(peak)) for peak in _maxima(pooled)) > .05
     both = jax.tree_util.tree_map_with_path(
         lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
                                                       for entry in path) else leaf, pooled)
     zero = jax.tree.map(np.zeros_like, start)
-    # The run's clip reads each layer its two stages hold stacked as that layer (`StageLocal.held`).
-    with train._staging.held():
-        updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
-        expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
+    updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
+    expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
     jax.tree.map(np.testing.assert_array_equal, final, expected)
     assert any(not np.array_equal(after, before) for after, before in
                zip(jax.tree.leaves(final), jax.tree.leaves(start), strict=True))
-    _, start, _, _, still = trained(1e30, spoken, quiet)
+    start, _, _, still = trained(1e30, spoken, quiet)
     jax.tree.map(np.testing.assert_array_equal, still, start)
 
 
