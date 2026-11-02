@@ -113,9 +113,9 @@ def test_diffucoder_computes_dreams_source_logits(tmp_path):
     source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     path, label = FIXTURES / "dream-tiny" / "released.npz", "dream-tiny logits"
     seeds = declared_seeds(path)[label]
-    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+    config = json.loads((directory / "config.json").read_text())
     drawn, reference, truth = indexed_recording(
-        recording(path), label, seeds, inputs_of=lambda seed: draw("logits", seed, vocabulary),
+        recording(path), label, seeds, inputs_of=lambda seed: draw("logits", seed, config),
         truth_fn=remote_code_site(source, "logits", wide=True))
     forward = remote_code_site(source, "logits")
     assert_as_exact(lambda index, inputs: forward(inputs), reference, drawn, "DiffuCoder logits", seeds=seeds,
