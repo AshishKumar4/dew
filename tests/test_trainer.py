@@ -2260,14 +2260,15 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.variables))
     sharded = 0
     # The held tree enters plain (`dew.batch.unboxed`), the arrays the init drew in their boxes.
-    for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(weights)):
+    plain = nn.unbox(weights)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(plain):
         copy = held[path]
         assert copy.is_deleted(), jax.tree_util.keystr(path)
         assert copy.sharding == params[path], jax.tree_util.keystr(path)
         sharded += not copy.sharding.is_fully_replicated
         assert not leaf.is_deleted()
     assert sharded
-    jax.tree.map(np.testing.assert_array_equal, state.variables, weights)
+    jax.tree.map(np.testing.assert_array_equal, state.variables, plain)
 
 
 

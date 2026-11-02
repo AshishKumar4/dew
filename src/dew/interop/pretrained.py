@@ -2038,8 +2038,8 @@ def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tu
     from dew.decision.model import DecisionModel
 
     shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
-    return drawn_axes(lambda key: DecisionModel(backbone.model, from_record(Head, head)).initialize_head(
-        key, shapes, jnp.zeros((1, 1), jnp.int32)))
+    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
+                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
 
 
 def _native_config(config: Mapping[str, object],
