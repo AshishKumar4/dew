@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
+from flax import linen as nn
 from model_support import largest_difference, stepped_decode
 from reference_error import (
     FEWEST_SEEDS,
@@ -36,7 +37,10 @@ from whole_suite import timed
 from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.sharding import pipeline_microbatches
+from dew.nn.backbones.decoder_stack import StackView
+from dew.nn.mixers.attention import ATTENTION_AXES
+from dew.nn.mlp import MLP_AXES
+from dew.nn.sharding import boxed_axes, pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
@@ -387,6 +391,53 @@ TINY = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 4, "num_heads": 4
 
 def tiny(**overrides):
     return models.build("causal_transformer", **{**TINY, **overrides})
+
+
+def decoder_axes(layers):
+    """The declared kernels of an unpacked attention and gated feed-forward decoder."""
+    attention = ("q_proj", "k_proj", "v_proj", "o_proj")
+    feedforward = ("gate_proj", "up_proj", "down_proj")
+    return {("params", f"layers_{index}", module, name, "kernel"): table[name]
+            for index in range(layers)
+            for module, names, table in (("self_attn", attention, ATTENTION_AXES),
+                                        ("mlp", feedforward, MLP_AXES))
+            for name in names}
+
+
+@pytest.mark.parametrize("scan", (False, True))
+@pytest.mark.parametrize("bank_layers", (None, 1))
+def test_a_decoder_init_keeps_every_layers_declared_kernel_axes(scan, bank_layers):
+    """A layer's stored box names its own dimensions, whichever loop draws the layers."""
+    model = tiny(num_layers=2, scan_layers=scan, bank_layers=bank_layers)
+    ids = jnp.ones((1, 4), jnp.int32)
+    variables = jax.eval_shape(model.init, jax.random.key(0), ids)
+    expected = decoder_axes(2)
+    actual = boxed_axes(variables)
+    assert {path: actual[path] for path in expected if path in actual} == expected
+    for path, names in expected.items():
+        leaf = variables
+        for key in path:
+            leaf = leaf[key]
+        assert isinstance(leaf, nn.LogicallyPartitioned)
+        assert leaf.names == names
+        assert len(leaf.names) == leaf.value.ndim
+
+
+@pytest.mark.parametrize("period", (1, 2))
+def test_a_banked_decoder_keeps_axes_when_its_layers_are_stacked_and_restored(period):
+    """A bank or a period stores one extra unnamed axis and restores each layer's own axes."""
+    model = tiny(bank_layers=1)
+    ids = jnp.ones((1, 4), jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    view = StackView(((0, 4),), periods=(period,))
+    bank = view.stack(variables)
+    expected = decoder_axes(4)
+    axes = boxed_axes(bank)
+    assert len(axes) >= len(expected) // (4 // period)
+    for names in axes.values():
+        assert names[0] is None
+    assert boxed_axes(view.unstack(bank)) == boxed_axes(variables)
+    assert StackView(((0, 4),), banked=("params",)).stack(bank)["params"] == bank["params"]
 
 
 PERIODIC_SEEDS = 8
