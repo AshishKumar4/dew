@@ -16,10 +16,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
 
 from dew.algebra import SATURATION, derive
-from dew.nn.kernels import generation, recurrence_algebra
+from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra,
@@ -38,20 +37,12 @@ DTYPES = (jnp.bfloat16, jnp.float16, jnp.float32)
 
 
 def test_every_mainloop_s_tiles_lie_in_the_kernel_extents():
-    """No derivation emits a tile outside `ROWS`, `KEYS` and `WIDTHS`: on each GPU, the Pallas-Triton
-    mainloop's forward and backward tiles (`attention_triton._derived`) at every head width and dtype, its
-    inference and training forwards; on every family of each GPU (`bundles.layouts`) the Mosaic mainloop's
-    rows (its unit, `_derived`) and walked extents (`attention_mosaic_program.extents`), at every head
-    width's staging (a power of two, `template.power_of_two`, in the Mosaic mainloop's whole swizzled
-    rows)."""
-    for name, dtype, width in itertools.product(GPUS, DTYPES, WIDTHS):
-        target = generation.TARGETS[name]
-        arrays = {role: jax.ShapeDtypeStruct((1, 512, 2, width), dtype) for role in ("query", "key", "value")}
-        launches = [(attention_triton.TritonForward(), {**arrays, "residuals": residuals})
-                    for residuals in (False, True)] + [(attention_triton.TritonBackward(), arrays)]
-        for op, bound in launches:
-            tiles = op.derived(tokamax.BoundArguments(op, bound), target)
-            assert tiles is None or (tiles.block_q in ROWS and tiles.block_k in KEYS), (name, width, tiles)
+    """No derivation emits a tile outside `ROWS`, `KEYS` and `WIDTHS`: the Pallas-Triton mainloop's steps,
+    and on every family of each GPU (`bundles.layouts`) the Mosaic mainloop's rows (its unit, `_derived`)
+    and walked extents (`attention_mosaic_program.extents`), at every head width's staging (a power of two,
+    `template.power_of_two`, in the Mosaic mainloop's whole swizzled rows)."""
+    for tiles in (*attention_triton.FORWARD_STEPS, *attention_triton.BACKWARD_STEPS):
+        assert tiles.block_q in ROWS and tiles.block_k in KEYS, tiles
     for name, dtype in itertools.product(GPUS, DTYPES):
         for family in bundles.layouts(name, dtype):
             extents = attention_mosaic_program.extents(family, dtype, max(KEYS))
