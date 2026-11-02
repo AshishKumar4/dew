@@ -365,11 +365,16 @@ class RegisterModel:
         return min(self.most, cost.REGISTERS // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
-        """The consumer cap that leaves room for `programs` copies of this launch."""
-        share = cost.REGISTERS // (THREADS * programs)
-        if honored or not self.producer:
-            return (share - self.producer) // self.consumers // self.step * self.step
-        return share // (self.consumers + 1) // self.step * self.step
+        """The consumer cap that leaves room for `programs` copies of this launch: the registers the launch
+        gives a consumer thread there, its raise (`raised_registers`) where the compile honors raises, its
+        program's entry share otherwise (`entry_registers`, every warpgroup's alike), and without a producer
+        its consumers' share. A cap of the multiprocessor's share less the producer's passed a kernel past
+        its launch's raise (144 against 136, one consumer at three programs)."""
+        if not self.producer:
+            return entry_registers(self.consumers, programs)
+        if honored:
+            return raised_registers(self.consumers, programs)
+        return entry_registers(self.consumers + 1, programs)
 
     def record(self) -> dict:
         """The model's numeric facts; its live family supplies rules, not serialized state."""

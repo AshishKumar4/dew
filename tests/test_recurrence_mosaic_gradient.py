@@ -41,7 +41,8 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
                         ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
-                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
+                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept'),
+                        ('a decay a key dimension', 'bf16', 'recomputed')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
 and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
 dimension (`key_backward`'s), and an fp32 call's gradient refused. Interpreted, the whole grid took 5.4 times

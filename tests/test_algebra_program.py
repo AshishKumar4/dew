@@ -139,6 +139,25 @@ def test_a_windows_structure_decides_reordering_as_its_terms_do(fn):
             == algebra.rules.reorderable(terms.region(closed)))
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float8_e4m3fn],
+                         ids=lambda dtype: jnp.dtype(dtype).name)
+def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
+    """A literal 2 of each float dtype, numpy's own (float32) and ml_dtypes' (bfloat16, float8), which numpy's
+    type tree does not place among its floats: its magnitude (`terms.region`) and its power of two's exact and
+    positive scale (`rules.exact_scale`, `rules.positive_scale`) stated alike, where a bfloat16 or float8
+    literal had none."""
+    from egglog import EGraph, i64
+
+    closed = jax.make_jaxpr(lambda x: x * jnp.asarray(2.0, dtype))(jnp.ones((4,), dtype))
+    region = terms.region(closed)
+    literal = terms.Term.literal(i64(0))
+    graph = EGraph()
+    program.stated(graph, region)
+    assert region.magnitudes[terms.key(literal)] == 1
+    assert graph.check_bool(algebra.rules.exact_scale(literal))
+    assert graph.check_bool(algebra.rules.positive_scale(literal))
+
+
 def _shared_products(a, x, y):
     """Two matrix products of a shared operand, summed, their operands bounded (tanh's)."""
     a, x, y = jnp.tanh(a), jnp.tanh(x), jnp.tanh(y)
