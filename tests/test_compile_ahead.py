@@ -257,8 +257,11 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
 
 
 def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gpus(tmp_path):
-    """A step saved is the step loaded, executable and what XLA stated of it; this CPU host, which is
-    not the topology the step was compiled for, refuses to load it."""
+    """A step saved is the step loaded, executable and what XLA stated of it, with the target it was built
+    for (`BuildTarget`), the one rule every loader holds: this CPU host, which is not the topology the step
+    was compiled for, refuses to load it, and a run reproducing it derives its launches for its GPU only on
+    one of as many multiprocessors, as a balanced tail's grid past the GPU's residency can wait on a
+    program that never starts (row 3606)."""
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(compile_only_gpus("sm80", 2))),
@@ -268,6 +271,10 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     assert loaded == ahead
     with pytest.raises(ValueError):
         loaded.loaded()
+    assert loaded.derived_for(loaded.target) == loaded.target
+    fewer = dataclasses.replace(loaded.target, multiprocessors=loaded.target.multiprocessors - 6)
+    with pytest.raises(ValueError):
+        loaded.derived_for(fewer)
 
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
@@ -805,30 +812,90 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
 
 
+def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
+    """A device's own target, what a program compiled ahead is checked against, is the one `gpu_target`
+    resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an
+    sm90 kind the table names no SKU of its own kind, its peaks unknown, never the generation's canonical
+    device's."""
+    from types import SimpleNamespace
+
+    from dew.nn.kernels.generation import device_target
+
+    def device(kind, cores):
+        return SimpleNamespace(platform="gpu", device_kind=kind, compute_capability="9.0", core_count=cores,
+                               local_hardware_id=0)
+
+    pcie = device_target(device("NVIDIA H100 PCIe", 114))
+    unnamed = device_target(device("NVIDIA H20", 78))
+    assert (pcie.generation, pcie.device_kind, pcie.bf16_peak, pcie.multiprocessors) == (
+        "sm90", "NVIDIA H100 PCIe", 756e12, 114)
+    assert (unnamed.generation, unnamed.device_kind, unnamed.bf16_peak, unnamed.multiprocessors) == (
+        "sm90", "NVIDIA H20", None, 78)
+
+
 def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
     """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
     compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
     the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
-    missing)."""
+    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts every
+    compile done, the one the block stopped as JAX recorded it done, another thread's and those after it."""
     import threading
 
-    from dew.training.ahead import ExecutableOnly, executable_only
+    from dew.telemetry.instrumentation import Compiles, ExecutableOnly, executable_only
 
     x = jnp.arange(8.0)
     compiled = jax.jit(lambda value: value * 3).lower(x).compile()
     traced = jax.jit(lambda value: value * 5).trace(x)
     lowered = jax.jit(lambda value: value * 7).lower(x)
     elsewhere = []
-    with executable_only():
-        assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
-        for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
-            with pytest.raises(ExecutableOnly):
-                step()
-        thread = threading.Thread(target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
-        thread.start()
-        thread.join()
-    assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
-    assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+    with Compiles(None) as compiles:
+        with executable_only():
+            assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
+            for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
+                with pytest.raises(ExecutableOnly):
+                    step()
+            thread = threading.Thread(
+                target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
+            thread.start()
+            thread.join()
+        assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
+        assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
+    assert compiles.count == 3
+
+
+def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
+    """A `Compiles` block that closes while another thread's event is being told to it closes once that event
+    is held: what it counts when it closes is what it counts from then on, never a program late."""
+    import threading
+
+    told, release = threading.Event(), threading.Event()
+
+    class Slow(Compiles):
+        """An open block that takes its time over each event of its function it is told."""
+
+        def heard(self, kind, duration_secs, metadata):
+            if metadata.get("fun_name") == self.name:
+                told.set()
+                release.wait(60)
+            super().heard(kind, duration_secs, metadata)
+
+    def elevenfold(value):
+        return value * 11
+
+    x = jnp.arange(8.0)
+    compiles = Slow("elevenfold").__enter__()
+    compiler = threading.Thread(target=lambda: jax.jit(elevenfold).trace(x))
+    compiler.start()
+    assert told.wait(60)
+    closed = []
+    closer = threading.Thread(target=lambda: (compiles.__exit__(None, None, None),
+                                              closed.append(len(compiles.programs))))
+    closer.start()
+    closer.join(0.5)
+    release.set()
+    closer.join()
+    compiler.join()
+    assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
 
 
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,
