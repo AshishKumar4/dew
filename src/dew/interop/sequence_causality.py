@@ -13,9 +13,9 @@ positions' axis gives every entry the union, as any operation the walk holds no 
 changes its operands' shape. Dew's causal attention (`CAUSAL_ATTENTION`) gives each query its own
 position's set and its keys' up to its own; a computation Dew states is token by token (`TOKENWISE`)
 gives each token its own. Every set is an over-approximation: the walk may refuse a causal program, never
-admit a later read. A program is causal where every output's entry at a position reads no later one, at
-each length it is traced at, and its program is the same at each (a branch taken on the sequence's length
-is no structure one length shows)."""
+admit a later read. A program is causal at the length it is traced at where every output's entry at a
+position reads no later one; another length's program may differ (a branch taken on the sequence's
+length), so each length a model runs is proven on its own program."""
 
 from __future__ import annotations
 
@@ -62,25 +62,20 @@ type Held = Reads | None
 """What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
 
-def causality_refusal(programs: Mapping[int, tuple[core.ClosedJaxpr, int]]) -> str | None:
-    """Why the forward `programs` traces (each length's closed program and the index of its tokens,
-    `[B, S]`, the sequence on axis 1, among its inputs) is not provably causal, or None where, at every
-    length, each output's entry at a position reads that position and earlier ones alone, and the
-    programs are one program at every length."""
-    shapes = {length: _structure(closed.jaxpr) for length, (closed, _) in programs.items()}
-    if len(set(shapes.values())) > 1:
-        return (f"its program differs between {sorted(programs)} tokens (a branch taken on the sequence's "
-                "length), so no one length's walk holds for every length")
-    for length, (closed, tokens) in programs.items():
-        held: list[Held] = [None] * len(closed.jaxpr.invars)
-        held[tokens] = Reads(1, np.array([1 << position for position in range(length)], np.int64))
-        walk = _Walk(length)
-        consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
-        outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
-        for output in outputs:
-            if output is not None and _later(output, length):
-                where = f"; first at {walk.first}" if walk.first else ""
-                return f"an output's entry reads a later position at {length} tokens{where}"
+def causality_refusal(closed: core.ClosedJaxpr, tokens: int, length: int) -> str | None:
+    """Why the forward `closed` traces is not provably causal at `length` tokens (its input `tokens`,
+    `[B, S]`, the sequence on axis 1), or None where each output's entry at a position reads that
+    position and earlier ones alone. It holds for this length alone: a program may compute otherwise at
+    another, so a caller proves each length it runs (`torchax_fallback.TorchGraph.certify`)."""
+    held: list[Held] = [None] * len(closed.jaxpr.invars)
+    held[tokens] = Reads(1, np.array([1 << position for position in range(length)], np.int64))
+    walk = _Walk(length)
+    consts = [np.asarray(const) if _small_integer(const) else None for const in closed.consts]
+    outputs, _ = walk.run(closed.jaxpr, held, [None] * len(closed.jaxpr.invars), consts)
+    for output in outputs:
+        if output is not None and _later(output, length):
+            where = f"; first at {walk.first}" if walk.first else ""
+            return f"an output's entry reads a later position at {length} tokens{where}"
     return None
 
 
@@ -92,12 +87,6 @@ def _later(value: Reads, length: int) -> bool:
         return value.union != 0
     allowed = np.array([(1 << (index + 1)) - 1 for index in range(length)], np.int64)
     return bool(np.any(value.masks & ~allowed))
-
-
-def _structure(jaxpr: core.Jaxpr) -> tuple:
-    """`jaxpr`'s operations in order, each with its programs' own: its structure, apart from its
-    shapes."""
-    return tuple((eqn.primitive.name, *(_structure(inner) for inner in _programs(eqn))) for eqn in jaxpr.eqns)
 
 
 def _programs(eqn: core.JaxprEqn) -> list[core.Jaxpr]:
@@ -160,7 +149,7 @@ class _Walk:
             return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
         if name not in _MIXING and all(_shape(var) == shape for var in eqn.outvars) and all(
-                _shape(var) in ((), shape) for var, value in zip(eqn.invars, given, strict=True)
+                _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
                 if isinstance(value, Reads)):
             return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)
         return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
@@ -170,8 +159,8 @@ class _Walk:
         where they are integers or booleans of at most `CONCRETE` entries: the indices a gather, a slice
         or an update reads, and the tests that choose them."""
         if (any(operand is None for operand in operands) or _programs(eqn)
-                or not all(_indexing(_dtype(var)) and math.prod(_shape(var)) <= CONCRETE
-                           for var in eqn.outvars)):
+                or not all(isinstance(var.aval, ShapedArray) and _indexing(var.aval.dtype)
+                           and math.prod(_shape(var)) <= CONCRETE for var in eqn.outvars)):
             return [None] * len(eqn.outvars)
         bound = eqn.primitive.bind(*operands, **eqn.params)
         return [np.asarray(output) for output in (bound if eqn.primitive.multiple_results else [bound])]
@@ -181,14 +170,19 @@ def _shape(var) -> tuple[int, ...]:
     return tuple(var.aval.shape) if isinstance(var.aval, ShapedArray) else ()
 
 
-def _dtype(var) -> object:
-    return var.aval.dtype if isinstance(var.aval, ShapedArray) else None
-
-
-def _indexing(dtype: object) -> bool:
+def _indexing(dtype: np.dtype | jax.typing.DTypeLike) -> bool:
     """Whether `dtype` is an integer or boolean one, which indices and their tests hold (a key's
     extended dtype is neither)."""
     return isinstance(dtype, np.dtype) and (np.issubdtype(dtype, np.integer) or dtype == np.bool_)
+
+
+def _fits(operand: tuple[int, ...], out: tuple[int, ...]) -> bool:
+    """Whether an entrywise operand of shape `operand` broadcasts to `out` entry for entry: a scalar,
+    or a shape of its rank whose every axis is the output's or 1."""
+    if operand == ():
+        return True
+    return len(operand) == len(out) and all(size in (1, full)
+                                            for size, full in zip(operand, out, strict=True))
 
 
 def _flat(given: Sequence[Held]) -> Reads:

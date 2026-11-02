@@ -1,8 +1,8 @@
-"""The static causality walk tier 3 admits a source without its shrunken probe by
-(`dew.interop.sequence_causality`, ledger 1595): over small programs whose causality is known, traced at
-two coprime lengths, it admits each one whose every output position reads no later input through the
-operations it composes, and refuses each one that reads a later position, that it cannot show reads
-none, or whose program differs between the lengths."""
+"""The static causality walk tier 3 proves a source causal by at each length it runs, without its shrunken
+probe (`dew.interop.sequence_causality`, ledger 1595): over small programs whose causality is known, traced
+at 11 and 13 tokens, it admits each one whose every output position reads no later input through the
+operations it composes, and refuses each one that reads a later position or that it cannot show reads
+none; a program that computes otherwise past a length is proven below it and refused above."""
 
 import jax
 import jax.numpy as jnp
@@ -86,18 +86,19 @@ REFUSED = {
     "plain attention": lambda tokens: attention(*(embedded(tokens),) * 3, causal=False),
     "masked attention outside Dew's": lambda tokens: attention(*(embedded(tokens),) * 3, causal=True),
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
-    "a branch on the sequence's length": lambda tokens: (
-        jnp.cumsum(embedded(tokens), axis=1) if tokens.shape[1] == 13 else embedded(tokens) * 2),
     "layers scanned with a mean": lambda tokens: jax.lax.scan(
         lambda h, w: (h @ w - (h @ w).mean(axis=1, keepdims=True), None), embedded(tokens),
         jnp.ones((3, D, D)))[0],
 }
 
 
-def refusal(function):
-    programs = {length: (jax.make_jaxpr(function)(jnp.zeros((1, length), jnp.int32)), 0)
-                for length in LENGTHS}
-    return causality_refusal(programs)
+def refusal(function, lengths=LENGTHS):
+    """The walk's refusal of `function` at the first of `lengths` it refuses, None where it proves each."""
+    for length in lengths:
+        found = causality_refusal(jax.make_jaxpr(function)(jnp.zeros((1, length), jnp.int32)), 0, length)
+        if found is not None:
+            return found
+    return None
 
 
 @pytest.mark.parametrize("name", sorted(ADMITTED))
@@ -108,3 +109,15 @@ def test_a_program_whose_positions_read_no_later_one_is_admitted(name):
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_a_program_reading_a_later_position_or_unproven_is_refused(name):
     assert refusal(REFUSED[name]) is not None
+
+
+def test_a_program_that_reads_later_positions_past_a_length_is_proven_below_it_and_refused_above():
+    """A forward that shifts each position's state left past 16 tokens: its program at 13 tokens is
+    causal and at 17 it is not, so each length is proven on its own program, never one for all
+    (`torchax_fallback.TorchGraph.certify`)."""
+    def thresholded(tokens):
+        states = embedded(tokens)
+        return shifted_left(states) if tokens.shape[1] > 16 else states
+
+    assert refusal(thresholded, (13,)) is None
+    assert refusal(thresholded, (17,)) is not None

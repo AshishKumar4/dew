@@ -111,6 +111,10 @@ class TorchAdmission:
     reasons: Mapping[str, str]
     attends: bool = False
     why: str = ""
+    per_geometry: bool = False
+    """Whether its causality is proven per sequence length its forward runs at (`TorchGraph.certify`):
+    a source qualified on its full config without its probe (`qualified`), whose program at one length
+    says nothing of another's."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -178,9 +182,9 @@ type Traceable = jax.typing.ArrayLike | jax.ShapeDtypeStruct
 initialization and an unprobed source's qualification (`qualified`) hold them."""
 
 QUALIFYING = 13
-"""The most tokens a row `qualified` traces an unprobed source's forward over, at the two largest primes
-up to it its context holds (11 and 13): two coprime lengths, its program the same at both
-(`sequence_causality.causality_refusal`), and no other size of it taken for the sequence's."""
+"""The most tokens a row `qualified` traces an unprobed source's forward over at its load, the largest
+prime up to it its context holds: no other size of its program is taken for the sequence's. Each
+length it then runs is proven on its own (`TorchGraph.certify`)."""
 
 
 def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable) -> TorchAdmission:
@@ -190,10 +194,12 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     traces it over abstract weights (`TorchGraph.traced`), runs on Dew's attention in every decoder
     layer, each passing only keywords Dew computes with a mask its causal visibility reproduces
     (`_Probe`, read off the mask, `_masked`); an operation whose value the traced values decide (BLT's
-    `item()`) fails that trace with JAX's own error, naming it; the trace on Dew's attention is causal by
-    its program alone at two lengths, the same program at both (`sequence_causality.causality_refusal`:
-    each output position reading no later input through every operation); and its training forward
-    draws nothing on the host. Each refusal names its cause."""
+    `item()`) fails that trace with JAX's own error, naming it; the trace on Dew's attention at
+    `QUALIFYING` tokens is causal by its program (`sequence_causality.causality_refusal`: each output
+    position reading no later input through every operation); and its training forward draws nothing on
+    the host. Each refusal names its cause. torchax holds no symbolic length (its tensors' torch sizes
+    are integers), so no one trace proves every length: the admission is per geometry (`per_geometry`),
+    each length the model runs proven before its first program there runs (`TorchGraph.certify`)."""
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -206,27 +212,24 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     _registered()
     context = fields.get("max_position_embeddings")
     stated = None if context is None else _records.integer(context, "max_position_embeddings")
-    lengths = [prime for prime in (2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated][-2:]
-    if len(lengths) < 2:
-        raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its context "
-                         f"of {stated} positions holds no two lengths to trace it at")
+    length = max(prime for prime in (2, 3, 5, 7, 11, QUALIFYING) if stated is None or prime <= stated)
     probe = _Probe(abstract=True)
     try:
         # Its masks evaluated as the trace runs, so the probe reads their values (`_masked`).
         with probe.recording(), jax.ensure_compile_time_eval():
-            _abstract(source, _PROBE, lengths[-1], train=False)
+            _abstract(source, _PROBE, length, train=False)
         why = probe.kept_from_dew(int(source.num_hidden_layers))
         if why:
             raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and tier 3 "
                              "holds an unprobed source causal by Dew's attention, which it cannot run on: "
                              f"{why}")
-        programs = {length: _abstract(source, _ATTENTION, length, train=False)[:2] for length in lengths}
-        trained = _abstract(source, _ATTENTION, lengths[-1], train=True)[2]
+        closed, tokens, _ = _abstract(source, _ATTENTION, length, train=False)
+        trained = _abstract(source, _ATTENTION, length, train=True)[2]
     except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
             jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError) as error:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"does not trace at its full config: {type(error).__name__}: {error}") from error
-    refusal = causality_refusal(programs)
+    refusal = causality_refusal(closed, tokens, length)
     if refusal is not None:
         raise ValueError(f"model_type {model_type!r}'s probe does not run ({unavailable}), and its forward "
                          f"is not causal by its program: {refusal}")
@@ -234,7 +237,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({trained.host} "
                          "draws), which a traced step would fix for every step, and tier 3 trains the "
                          "models it loads")
-    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True)
+    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True, per_geometry=True)
 
 
 def _abstract(source, attention: str, length: int, *, train: bool):
@@ -936,6 +939,10 @@ class TorchGraph:
     axes: tuple[tuple[str, LogicalAxes], ...] = ()
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
+    certified: dict[int, str | None] | None = None
+    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each sequence length its
+    forward has been proven at, by the refusal its walk gave there (None where causal); None for a
+    probed source, whose causality its probe decided (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -974,7 +981,27 @@ class TorchGraph:
              (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1)
         return logits, written
 
+    def certify(self, length: int) -> None:
+        """For a source admitted per geometry (`certified`), prove its forward causal at `length` tokens
+        before a program at that length runs: its program over its variables' shapes and a row of
+        `length` tokens, walked by `sequence_causality.causality_refusal`, once a length. Refused where
+        an output position reads a later one."""
+        if self.certified is None:
+            return
+        if length not in self.certified:
+            closed, _, _ = self.traced(self.shapes["params"], self.shapes["buffers"],
+                                       jax.ShapeDtypeStruct((1, length), jnp.int32), None, train=False)
+            tokens = len(self.shapes["params"]) + len(self.shapes["buffers"])
+            self.certified[length] = causality_refusal(closed, tokens, length)
+        refusal = self.certified[length]
+        if refusal is not None:
+            raise ValueError(f"tier 3 qualified this source without its probe, causal at each length its own "
+                             f"program proves, and at {length} tokens it does not: {refusal}")
+
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
+        # A decoding call runs at its cache's capacity, which its prefill filled; any other at its row's.
+        cache = arguments[10]
+        self.certify(int(cache[2].shape[1]) if cache is not None else int(arguments[2].shape[1]))
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
         outputs = jax.tree.unflatten(jax.tree.structure(shapes),
@@ -1597,7 +1624,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
-                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes)
+                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
+                       certified={} if admission is not None and admission.per_geometry else None)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
