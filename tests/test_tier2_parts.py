@@ -448,6 +448,7 @@ BUILT_IN = {
                  "moe_intermediate_size": 32, "routed_scaling_factor": 1.7},
     "glm4": {"head_dim": None, "num_key_value_heads": 2, "attention_bias": True,
              "partial_rotary_factor": 0.5},
+    "apertus": {"hidden_act": "xielu"},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
@@ -464,11 +465,12 @@ first, a softmax router selecting with a `[1, experts]` correction bias beside a
 rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
 and keys normed after their rotation, at its dynamic-alpha base; and GLM-4's sandwich-normed layers, its
 gate and up projections one fused Linear and its rotary turning adjacent pairs of half of each head
-(ledger 3077)."""
+(ledger 3077); and Apertus's ungated MLP, its activation xIELU with learned parameters and stored buffers,
+beside Qwen3's per-head query and key norms (ledger 3076)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
                   "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
-                  "hunyuan_v1_moe": 8, "glm4": 8}
+                  "hunyuan_v1_moe": 8, "glm4": 8, "apertus": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
@@ -608,6 +610,28 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))
+
+
+@pytest.mark.parametrize("case", ["apertus", "glm4"])
+def test_a_learned_activation_and_a_fused_projection_save_as_stored(tmp_path, case):
+    """Apertus's xIELU parameters and the buffers Dew holds as constants, and GLM-4's fused gate and up
+    Linear, which a load reads as two projections, save back under their stored names bit for bit, the
+    buffers in their stored dtype (ledgers 3076, 3077)."""
+    from interop_support import tiny_config
+    from safetensors.numpy import load_file
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(tiny_config(case, **BUILT_IN[case]), dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path / "source")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded.save(tmp_path / "saved")
+    source, saved = (load_file(tmp_path / folder / "model.safetensors") for folder in ("source", "saved"))
+    assert set(saved) == set(source)
+    for name, tensor in source.items():
+        np.testing.assert_array_equal(saved[name], tensor, err_msg=name)
+        assert saved[name].dtype == tensor.dtype, name
 
 
 def test_an_lfm2_of_convolutions_alone_assembles():
