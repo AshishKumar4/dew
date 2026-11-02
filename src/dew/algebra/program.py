@@ -48,7 +48,9 @@ class Saturation:
 class AlgebraReport:
     """What one region's rewrite did: the equations it read, the sets admitted and the matches each fired,
     its limits, its iterations and nodes, whether a limit stopped it, the region's price before and after in
-    seconds (`cost.model`), and the rewrite's own seconds."""
+    seconds (`cost.model`), the rewrite's own seconds, and the roots whose cheaper form the program took
+    (`spliced`, `_splices`: a picked form that does not land, a value another window's form made or a form of
+    another type, is none)."""
 
     equations: int
     admitted: tuple[str, ...]
@@ -60,6 +62,7 @@ class AlgebraReport:
     before: float
     after: float
     seconds: float
+    spliced: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,9 +205,10 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     for window, yielded in _windows(jaxpr):
         done = _region(window, accurate=accurate, saturation=saturation)
-        kernel_report.record_rewrite(done.report)
-        if done.picked:
-            spliced.update(_splices(window, yielded, done, made_by, spliced))
+        landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
+        spliced.update(landed)
+        # Recorded once its splice lands: what the program took, not what the extraction picked.
+        kernel_report.record_rewrite(dataclasses.replace(done.report, spliced=len(landed)))
     if not spliced:
         return jaxpr
     return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns

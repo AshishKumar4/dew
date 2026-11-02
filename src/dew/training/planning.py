@@ -519,12 +519,13 @@ def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> di
 def rewrite_record(made) -> dict[str, JSON]:
     """A region the algebra pass rewrote as a compile traced its program (`dew.algebra.program.AlgebraReport`,
     `report.rewrites`): its equations, the sets admitted and the matches each fired, its iterations, nodes and
-    limits, its price before and after, and its seconds."""
+    limits, its price before and after, its seconds, and the roots its splice took."""
     fired: dict[str, JSON] = dict(made.fired)
     limits: list[JSON] = list(made.limits)
-    return {"equations": made.equations, "fired": fired, "iterations": made.iterations, "nodes": made.nodes,
-            "limits": limits, "limited": made.limited, "before": made.before, "after": made.after,
-            "seconds": made.seconds}
+    admitted: list[JSON] = list(made.admitted)
+    return {"equations": made.equations, "admitted": admitted, "fired": fired, "iterations": made.iterations,
+            "nodes": made.nodes, "limits": limits, "limited": made.limited, "before": made.before,
+            "after": made.after, "seconds": made.seconds, "spliced": made.spliced}
 
 
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
