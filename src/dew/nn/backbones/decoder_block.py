@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -41,12 +41,16 @@ from ..hyper_connections import (
 from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
+from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
+
+if TYPE_CHECKING:
+    from .causal_transformer import CausalTransformer
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
@@ -1408,3 +1412,40 @@ class MTPBlock(nn.Module):
 
 __all__ = ["DECODER_REMAT", "BlockWiring", "DecoderBlock", "MTPBlock", "Mixture", "RematPolicy",
            "remat_policy", "remat_record"]
+
+
+def feedforward_factories(model: "CausalTransformer"):
+    """Build the three feed-forward factories a layer of `model` can use.
+
+    Returns the dense gated MLP, the routed experts in its place and the
+    branch beside it, each a partial that the block calls with a name; the
+    mixture builds the routed one (`Mixture.build`) and places it
+    (`Mixture.beside_dense`). A model with no mixture gets only the first,
+    and None for the other two.
+    """
+    init_std, output_init_std = model.init_stds
+    # Every gated MLP in the model shares the activation and the clamp:
+    # the dense feed-forwards, the shared branch and the routed experts.
+    gated_mlp = functools.partial(GatedMLP, out_features=model.emb_features,
+                                  activation=model.mlp, use_bias=model.mlp_bias,
+                                  swiglu_limit=model.swiglu_limit, ngpt=model.ngpt,
+                                  init_std=init_std, output_init_std=output_init_std,
+                                  dtype=model.dtype, precision=model.precision)
+    dense = gated_mlp if model.mlp_multipliers is None else functools.partial(
+        gated_mlp, gate_multiplier=float(model.mlp_multipliers[0]),
+        down_multiplier=float(model.mlp_multipliers[1]))
+    mixture = model.mixture
+    if model.mlp == 'swigluoai' and (mixture is None or len(model.sparse_layers) != model.num_layers):
+        raise ValueError('swigluoai requires routed experts on every layer')
+    if mixture is None:
+        return dense, None, None
+    # The dense width is read only where the experts take it: layers that differ in it have none.
+    width = model.hidden_features if mixture.expert_features is None else mixture.expert_features
+    built = mixture.build(
+        out_features=model.emb_features, activation=model.mlp, dense=gated_mlp, hidden_features=width,
+        swiglu_limit=model.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
+        norm_eps=model.norm_eps, scale_offset=model.scale_offset,
+        scale_after_cast=model.scale_after_cast, dtype=model.dtype, precision=model.precision)
+    # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
+    routed, parallel = (None, built) if mixture.beside_dense else (built, None)
+    return dense, routed, parallel

@@ -88,7 +88,6 @@ from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
-from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
 from ..norms import RMSNorm
 from ..precision import (
@@ -118,6 +117,7 @@ from .decoder_block import (
     NormSpec,
     RematPolicy,
     decoder_norm,
+    feedforward_factories,
     remat_policy,
     remat_record,
 )
@@ -736,42 +736,6 @@ class CausalTransformer(nn.Module):
                 f"{sorted(set(types))}")
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
-    def feedforward_factories(self):
-        """Build the three feed-forward factories a layer can use.
-
-        Returns the dense gated MLP, the routed experts in its place and the
-        branch beside it, each a partial that the block calls with a name; the
-        mixture builds the routed one (`Mixture.build`) and places it
-        (`Mixture.beside_dense`). A model with no mixture gets only the first,
-        and None for the other two.
-        """
-        init_std, output_init_std = self.init_stds
-        # Every gated MLP in the model shares the activation and the clamp:
-        # the dense feed-forwards, the shared branch and the routed experts.
-        gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
-                                      activation=self.mlp, use_bias=self.mlp_bias,
-                                      swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
-                                      init_std=init_std, output_init_std=output_init_std,
-                                      dtype=self.dtype, precision=self.precision)
-        dense = gated_mlp if self.mlp_multipliers is None else functools.partial(
-            gated_mlp, gate_multiplier=float(self.mlp_multipliers[0]),
-            down_multiplier=float(self.mlp_multipliers[1]))
-        mixture = self.mixture
-        if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
-            raise ValueError('swigluoai requires routed experts on every layer')
-        if mixture is None:
-            return dense, None, None
-        # The dense width is read only where the experts take it: layers that differ in it have none.
-        width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
-        built = mixture.build(
-            out_features=self.emb_features, activation=self.mlp, dense=gated_mlp, hidden_features=width,
-            swiglu_limit=self.swiglu_limit, init_std=init_std, output_init_std=output_init_std,
-            norm_eps=self.norm_eps, scale_offset=self.scale_offset,
-            scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
-        # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
-        routed, parallel = (None, built) if mixture.beside_dense else (built, None)
-        return dense, routed, parallel
-
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Real-row hidden-state work, summing the same block factories as setup (`decoder_counts`). A
@@ -814,14 +778,14 @@ class CausalTransformer(nn.Module):
         """Each layer's block as setup builds it, unbound, which its counts read (`decoder_counts`)."""
         types, mixer = self.per_layer_types, self.layer_mixer
         specs = self._layer_specs(types, self.layer_kinds(types), mixer)
-        factories = self.feedforward_factories()
+        factories = feedforward_factories(self)
         return [self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
                 for index in range(self.num_layers)]
 
     @nn.nowrap
     def prediction_blocks(self) -> list[MTPBlock]:
         """Each prediction depth's block as setup builds it, unbound, which its counts read."""
-        types, factories = self.per_layer_types, self.feedforward_factories()
+        types, factories = self.per_layer_types, feedforward_factories(self)
         return self._prediction_depths(types, self.layer_kinds(types), self.layer_mixer, factories[0],
                                        factories[1], self.wiring)
 
@@ -891,7 +855,7 @@ class CausalTransformer(nn.Module):
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
                 name='per_layer_projection_norm')
-        gated_mlp, routed, parallel = self.feedforward_factories()
+        gated_mlp, routed, parallel = feedforward_factories(self)
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.
