@@ -447,3 +447,16 @@ def test_a_backward_walked_over_queries_sums_dk_dv_and_maps_dq():
 
     assert_as_exact(jax.jit(derived), jax.jit(lambda q, k, v: backward(*gradients(q, k, v))), small,
                     "backward over queries", seeds=16)
+
+
+@pytest.mark.parametrize("base2", [False, True], ids=["natural", "base2"])
+def test_a_keys_first_walk_derives_whatever_its_queries_and_width(base2):
+    """The forward walked with its tile's keys first (`attention_algebra.declaration(keys_first=True)`)
+    derives at a tile whose queries and head width differ: its weighted sums' product lays the width first
+    and the queries second, and its correction broadcasts along the queries, where its anchor lies."""
+    from dew.nn.kernels.templates import attention_algebra
+
+    forms = derive.derive(attention_algebra.declaration(base2=base2, keys_first=True), accurate=False,
+                          saturation=SATURATION)
+    slots = forms.slots({"logits": ((32, 64), jnp.float32), "values": ((32, 128), jnp.bfloat16)})
+    assert sorted(monoid for monoid, _ in slots) == ["max", "sum", "sum"]
