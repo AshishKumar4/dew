@@ -156,3 +156,17 @@ def test_a_length_past_a_machine_word_is_walked_whole():
     projection of 70 tokens is causal, and its left shift reads a later one."""
     assert refusal(ADMITTED["projection"], (70,)) is None
     assert refusal(REFUSED["a left shift by slice and concatenate"], (70,)) is not None
+
+
+def test_a_sequence_axis_kept_through_reshapes_is_walked_at_any_batch():
+    """512 rows of 4096 tokens, more entries a call than the walk sizes a reshaped axis anew (`CONCRETE`):
+    the heads split and merged keep the sequence axis in place, whose reads the walk carries as they are,
+    so the program is causal, and its left shift reads a later position (ledger 3677)."""
+    def heads(tokens):
+        split = embedded(tokens).reshape(*tokens.shape, 2, 4).transpose(0, 2, 1, 3)
+        return split.transpose(0, 2, 1, 3).reshape(*tokens.shape, D)
+
+    tokens = jax.ShapeDtypeStruct((512, 4096), jnp.int32)
+    for function, causal in ((heads, True), (lambda tokens: shifted_left(heads(tokens)), False)):
+        program = jax.make_jaxpr(function)(tokens)
+        assert (causality_refusal(program, 0, 4096, (0,)) is None) == causal

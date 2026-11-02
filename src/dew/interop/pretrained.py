@@ -1678,6 +1678,8 @@ type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedR
 def source_route(config: Mapping[str, object], *,
                  verified: Callable[..., verify.VerifiedMapping | verify.Unmapped] = verify.verify_mapping,
                  admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None,
+                 qualified: Callable[[Mapping[str, object], verify.ProbeUnavailable], TorchAdmission]
+                 | None = None,
                  remote: Path | None = None, pinned: sources.SourceReference | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
@@ -1687,6 +1689,7 @@ def source_route(config: Mapping[str, object], *,
     and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
+    None), and `qualified` whether it runs one whose probe cannot run (`torchax_fallback.qualified` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
     modeling code the load opted into running (`trust_remote_code`), and `pinned` the repository, Hub
     commit and folder it was fetched at, which a verification of that code is recorded under."""
@@ -1701,7 +1704,8 @@ def source_route(config: Mapping[str, object], *,
         from dew.interop import torchax_fallback
 
         torchax_fallback.refuse_quantized(config)
-        return TorchRoute(torchax_fallback.qualified(config, unavailable))
+        qualify = torchax_fallback.qualified if qualified is None else qualified
+        return TorchRoute(qualify(config, unavailable))
     match verdict:
         case verify.VerifiedMapping() as mapping:
             return VerifiedRoute(mapping)

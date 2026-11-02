@@ -116,10 +116,6 @@ class TorchAdmission:
     reasons: Mapping[str, str]
     attends: bool = False
     why: str = ""
-    per_geometry: bool = False
-    """Whether its causality is proven per program it runs (`TorchGraph.certify`): a source qualified on
-    its full config without its probe (`qualified`), whose program at one length or in one call says
-    nothing of another's."""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -203,8 +199,8 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
     `QUALIFYING` tokens is causal by its program (`sequence_causality.causality_refusal`: each output
     position reading no later input through every operation); and its training forward draws nothing on
     the host. Each refusal names its cause. torchax holds no symbolic length (its tensors' torch sizes
-    are integers), so no one trace proves every length: the admission is per geometry (`per_geometry`),
-    each program the model then runs proven before it runs (`TorchGraph.certify`)."""
+    are integers), so no one trace proves every length: each program the model then runs is proven before
+    it runs (`TorchGraph.certify`), as every attending source's is."""
     from transformers import AutoConfig
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
@@ -242,7 +238,7 @@ def qualified(config: Mapping[str, object], unavailable: verify.ProbeUnavailable
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({trained.host} "
                          "draws), which a traced step would fix for every step, and tier 3 trains the "
                          "models it loads")
-    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True, per_geometry=True)
+    return TorchAdmission(model_type, {"probe": str(unavailable)}, attends=True)
 
 
 def _abstract(source, attention: str, length: int, *, train: bool):
@@ -952,9 +948,10 @@ class TorchGraph:
     """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
     which its placement reads (`TorchCausalLM.placement`)."""
     certified: dict[tuple, str | None] | None = None
-    """For a source admitted per geometry (`TorchAdmission.per_geometry`): each program specialization it
-    has run, by the refusal its walk gave (None where causal); None for a probed source, whose causality
-    its probe decided (`certify`)."""
+    """For a source that runs on Dew's attention (`TorchAdmission.attends`): each program specialization it
+    has run, by the refusal its walk gave (None where causal), as a program at one length or in one call
+    says nothing of another's, its probe's included; None for another, which computes no attention Dew's
+    walk reads (`certify`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -1010,7 +1007,7 @@ class TorchGraph:
         return outputs
 
     def certify(self, traced, arguments: tuple, *, train: bool, max_segments: int) -> None:
-        """For a source admitted per geometry (`certified`), prove the program about to run, `traced`
+        """For a source that runs on Dew's attention (`certified`), prove the program about to run, `traced`
         over `arguments`, causal before it runs: its logits and states (its first two outputs) read at a
         position no later token (`sequence_causality.causality_refusal`), once a specialization (its
         arguments' structure, shapes and dtypes, train or not, its documents' bound). Refused where an
@@ -1025,8 +1022,8 @@ class TorchGraph:
             self.certified[signature] = causality_refusal(traced, tokens, int(arguments[2].shape[1]), (0, 1))
         refusal = self.certified[signature]
         if refusal is not None:
-            raise ValueError(f"tier 3 qualified this source without its probe, causal in each program its "
-                             f"own walk proves, and this one is not: {refusal}")
+            raise ValueError(f"tier 3 runs this source causal in each program its own walk proves, and this "
+                             f"one is not: {refusal}")
 
     def traced(self, params: Mapping[str, Traceable], buffers: Mapping[str, Traceable], tokens: Traceable,
                key: jax.Array | None,
@@ -1637,7 +1634,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes,
-                       certified={} if admission is not None and admission.per_geometry else None)
+                       certified={} if admission is not None and admission.attends else None)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
