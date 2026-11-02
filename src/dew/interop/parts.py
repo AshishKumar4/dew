@@ -189,6 +189,35 @@ def _read_layer_typed_model(view: PartView) -> Mapping[str, object]:
     return fields
 
 
+def _read_typed_rotary_model(view: PartView) -> Mapping[str, object]:
+    """Laguna's model: each layer attends under its config layer type's mask (Qwen2's,
+    `_read_layer_typed_model`) and rotates by its type's own rotary, which its rotary part (compared
+    whole, `_read_nothing`) builds from the type's record of `rope_parameters`: its base, its rope_type's
+    ramp and the fraction of each head it turns, its frequencies over that fraction
+    (`decoder_parts.partial_rope_entry`, the 'default' partial convention). Each type's kind takes its
+    own rotary; the model's base is its first layer's."""
+    fields = dict(_read_layer_typed_model(view))
+    types = _records.strings(fields['layer_types'], 'layer_types')
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    records = _records.record(view.config.rope_parameters or {}, 'rope_parameters')
+    stated = view.config.max_position_embeddings
+    bases: dict[str, float] = {}
+    for name in dict.fromkeys(types):
+        try:
+            theta, factor, ramp = decoder_parts.partial_rope_entry(
+                _records.record(records.get(name), f'rope_parameters {name}'), f'rope_parameters.{name}',
+                default_factor=1.0,
+                max_pos=None if stated is None else _records.integer(stated, 'max_position_embeddings'))
+        except ValueError as error:
+            raise Ambiguous(f"the {name} layers' rotary record is not one this rotation reads ({error})") \
+                from error
+        kind = dict(_records.record(kinds.get(name) or native_fields(LayerKind)(), name))
+        kind.update(rope_theta=theta, rope_scaling=decoder_parts.nested_ramp(ramp),
+                    partial_rotary_factor=float(factor))
+        kinds[name], bases[name] = kind, theta
+    return {**fields, 'kinds': kinds, 'rope_theta': bases[types[0]], 'partial_rotary_type': 'default'}
+
+
 def _head_geometry(view: PartView) -> dict[str, int]:
     """A causal attention's heads, key and value heads and head width, read off its query and key
     projections and its `head_dim`, each a whole number of heads."""
@@ -220,6 +249,23 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     """Qwen3's attention: Llama's with an RMSNorm over each head's queries and keys (`q_norm`, `k_norm`,
     read as norms like the block's)."""
     return {**_read_attention(view), 'qk_norm': True}
+
+
+def _read_laguna_attention(view: PartView) -> Mapping[str, object]:
+    """Laguna's attention: Qwen3's, each head's queries and keys normed, its heads its layer's own
+    (`num_attention_heads_per_layer`, a per-layer fact `_with_head_counts` gives its type's kind), and
+    its output gated by the softplus, in at least float32, of a projection of its own of the layer's
+    input (`g_proj`, Dew's `gate_proj`): one gate a head where `gating` is per head
+    (`gate_projection='head'`), else one a channel ('own'); a per-layer fact (`_with_attention_fields`)."""
+    fields = dict(_read_qk_norm_attention(view))
+    heads = _records.integer(fields.pop('num_heads'), 'num_heads')
+    per_head = bool(view.gate_per_head)
+    gates = heads if per_head else heads * _records.integer(fields['head_dim'], 'head_dim')
+    if view.g_proj.out_features != gates or view.g_proj.bias is not None:
+        raise Ambiguous(f"the output gate's projection holds {view.g_proj.out_features} unbiased gates where "
+                        f"its code reads {gates}")
+    return {**fields, 'output_gate': True, 'output_gate_activation': 'softplus',
+            _LAYER: {'heads': heads, 'attention': {'gate_projection': 'head' if per_head else 'own'}}}
 
 
 def _read_nope_attention(view: PartView) -> Mapping[str, object]:
@@ -351,6 +397,23 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
     weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
                      'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_laguna_router(view: PartView) -> Mapping[str, object]:
+    """Laguna's router: float32 logits, capped by `tanh(logit / c) * c` where its
+    `router_logit_softcapping` is positive, their sigmoid scores chosen by score plus its correction
+    bias (a parameter of its own), weighted by score renormalized over the chosen, nothing added to
+    their sum."""
+    cap = float(view.router_logit_softcapping)
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'sigmoid', 'bias': True, 'weight_sum_epsilon': 0.0,
+                     **({'router_softcap': cap} if cap > 0 else {})}}
+
+
+def _read_scaled_shared_moe(view: PartView) -> Mapping[str, object]:
+    """Laguna's MoE: its routed experts' sum times `routed_scaling_factor` beside its shared experts
+    (`_read_shared_moe`), which Dew's router folds into the chosen weights (`Mixture.scaling`)."""
+    return {_LAYER: {'scaling': float(view.routed_scaling_factor)}}
 
 
 def _read_glm4_attention(view: PartView) -> Mapping[str, object]:
@@ -618,6 +681,7 @@ _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 _GLM4 = 'transformers.models.glm4.modeling_glm4'
 _APERTUS = 'transformers.models.apertus.modeling_apertus'
+_LAGUNA = 'transformers.models.laguna.modeling_laguna'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -723,6 +787,16 @@ KNOWN: tuple[KnownPart, ...] = (
               _read_fused_mlp, canonical={'gate_up_proj': ''},
               split={'gate_up_proj': ('gate_proj', 'up_proj')}),
     KnownPart('rotary', f'{_GLM4}:Glm4RotaryEmbedding', {}, _read_partial_rotary, whole=True),
+    KnownPart('causal_lm', f'{_LAGUNA}:LagunaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_LAGUNA}:LagunaModel', _MODEL_CHILDREN, _read_typed_rotary_model),
+    KnownPart('rotary', f'{_LAGUNA}:LagunaRotaryEmbedding', {}, _read_nothing, whole=True),
+    KnownPart('attention', f'{_LAGUNA}:LagunaAttention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',), 'g_proj': ('linear',)},
+              _read_laguna_attention, canonical={'g_proj': 'gate_proj'}),
+    KnownPart('moe', f'{_LAGUNA}:LagunaSparseMoeBlock', _SHARED_MOE_CHILDREN, _read_scaled_shared_moe),
+    KnownPart('router', f'{_LAGUNA}:LagunaTopKRouter', {}, _read_laguna_router,
+              ('weight', 'e_score_correction_bias')),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -1019,7 +1093,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'conv', 'attention'))) for layer in routed}
+                               if key not in ('routed', 'nope', 'conv', 'attention', 'heads')))
+                  for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
@@ -1028,13 +1103,15 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
         # state them (DeepSeek's routing, HY-3's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
                                                 'groups', 'groups_per_token', 'weight_sum_epsilon',
-                                                'weight_sum_min') if key in mixture}
+                                                'weight_sum_min', 'router_softcap') if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
             norm_topk_prob=bool(mixture['norm_topk_prob']), expert_features=width,
             layers=None if len(routed) == fields['num_layers'] else tuple(routed)), **stated}
         fields.setdefault('mlp_features', width)
+    heads = {layer: facts['heads'] for layer, facts in assembler.layers.items() if 'heads' in facts}
+    fields.update(_with_head_counts(fields, heads))
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps',
                      'rope_theta'):
         if required not in fields:
@@ -1084,6 +1161,31 @@ def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, ob
                          'fields': {**_records.record(mixer.get('fields', {}), 'fields'), **(held[0] or {})}}
         kinds[name] = kind
     return {'layer_types': tuple(types), 'kinds': kinds}
+
+
+def _with_head_counts(fields: Mapping[str, object], heads: Mapping[int, object]) -> Mapping[str, object]:
+    """The model's query heads and the kinds whose layers' attentions hold others (`heads`, by layer,
+    Laguna's `num_attention_heads_per_layer`): the model's its first layer's, and each layer type whose
+    layers hold another count takes it into its kind; every layer of a type must hold the same."""
+    if not heads:
+        return {}
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    if set(heads) != set(range(count)):
+        raise Ambiguous("some layers' attentions state their heads and others do not")
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
+    model = _records.integer(heads[0], 'heads')
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    for name in dict.fromkeys(types):
+        held = {_records.integer(heads[layer], 'heads') for layer in range(count) if types[layer] == name}
+        if len(held) != 1:
+            raise Ambiguous(f"the {name} layers' attentions hold {sorted(held)} heads")
+        if (own := held.pop()) != model:
+            kind = dict(_records.record(kinds.get(name) or native_fields(LayerKind)(), name))
+            kind['num_heads'] = own
+            kinds[name] = kind
+    return {'num_heads': model, 'kinds': kinds, 'layer_types': tuple(types)}
 
 
 def _with_convolutions(fields: Mapping[str, object], convolutions: Mapping[int, object]

@@ -148,8 +148,9 @@ class MixerContext:
     kind (qwen4_exp's output_gate_type), which is the only gate a reference
     varies."""
     output_gate_activation: str = 'sigmoid'
-    """What the output gate passes its logits through: 'sigmoid' (Qwen3.5's), 'silu', or 'softplus2',
-    softplus at beta log 2, log2(1 + 2^x) (K2 Horizon's `attention_gate_func`)."""
+    """What the output gate passes its logits through: 'sigmoid' (Qwen3.5's), 'silu', 'softplus2',
+    softplus at beta log 2, log2(1 + 2^x) (K2 Horizon's `attention_gate_func`), or 'softplus' in at
+    least float32 (Laguna's)."""
     value_experts: ValueExperts | None = None
     """The layer's routed value experts in place of its value projection (`dew.nn.value_experts`, K2
     Horizon's MoVA), or None."""

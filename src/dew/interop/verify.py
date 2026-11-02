@@ -368,6 +368,10 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
+    if isinstance(per_layer := hf_config.get('num_attention_heads_per_layer'), list):
+        # Each layer's own query heads (Laguna's) keep their share of the key heads.
+        counts = _records.integers(per_layer, 'num_attention_heads_per_layer')
+        fields['num_attention_heads_per_layer'] = [count // kv_heads * small_kv for count in counts]
     if key('head_dim') in hf_config:
         # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
         # two equal.

@@ -254,6 +254,9 @@ GATE_ACTIVATIONS = {
     'silu': jax.nn.silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
     'softplus2': lambda gate: jax.nn.softplus(gate * math.log(2)) / math.log(2),
+    # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
+    # product casts back (modeling_laguna.py:410).
+    'softplus': lambda gate: jax.nn.softplus(gate.astype(at_least_fp32(gate.dtype))),
 }
 """The output gate's activations (`MixerContext.output_gate_activation`)."""
 

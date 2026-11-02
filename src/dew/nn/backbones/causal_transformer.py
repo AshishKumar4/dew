@@ -584,6 +584,7 @@ class CausalTransformer(nn.Module):
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
+            num_heads=self.num_heads if kind.num_heads is None else kind.num_heads,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
@@ -671,7 +672,7 @@ class CausalTransformer(nn.Module):
         there and nowhere else.
         """
         resolved = {
-            "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
+            "num_heads": kind.num_heads, "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
             "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling,
             "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
             "attention_chunk": kind.chunk,
