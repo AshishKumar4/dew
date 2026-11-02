@@ -50,17 +50,25 @@ class ChunkAdaptation:
     averaged; `select` names the level's parts that step (`down`, `up`), every part where empty, the
     others held at their trained values.
 
-    `damped` steps `up`'s kernel alone at rate / (1 + rate L), L a bound on the curvature of the
-    window's loss in it: half the squared Frobenius norm of the head (`head_curvature`), which bounds
-    the cross entropy's Hessian pulled back to the states, times the window's weighted sum of |a|^2,
-    a the inputs the kernel multiplies (`up_energy`); an adapter's factors on `up` hold, so the
-    level's output stays linear in what steps. Under an affine head the loss is convex in `up`, and a step
-    below 1 / L of a convex loss is non-expansive, so a window's step moves two nearby levels no
-    further apart, whatever the rate: their rounding grows at most by what each window adds. An
-    undamped step whose rate times curvature passes gradient descent's 2 diverges instead, its
-    rounding growing by 10^4 over three windows of 0.5 N(0, 1) weights at a rate of a half (ledger
-    1714). Stepping `down`, the loss is not convex, and a step at any positive rate expands a
-    direction of negative curvature, so no rate is stable by design there: `damped` steps `up` alone.
+    `damped` steps the selected parts' kernels alone (`up`'s, `down`'s, or both, every part where
+    `select` is empty; an adapter's factors on them hold) at rate / (1 + rate L), L a bound on the curvature
+    of the window's loss in them along the step (`_damping`): rate times L stays below 1, so a step never
+    overshoots, whatever the rate. The level reads s = x + U f, f = act(D x); with Ls and Gs the head's
+    bounds on a slot loss's curvature and slope in s (`SteppedInContext.head_bounds`), and p1, p2 the
+    activation's on |act'| and |act''| (`level_terms`), a slot's curvature is at most
+    Ls (|U|^2 p1^2 |x|^2 [D steps] + |f|^2 [U steps]) + Gs (|U| p2 |x|^2 [D steps] + p1 |x| [both step]),
+    |U| and |f| taken at their largest along the window's step (`stepped`), summed over the window by its
+    weights, x and f as `down` and `up` multiply them (a checkpoint's quantizer of their inputs applied),
+    L a constant of the step, not differentiated. Under an affine head the loss is convex in `up`, and a
+    step below 1 / L of a convex loss is non-expansive, so stepping `up` alone moves two nearby levels no
+    further apart, whatever the rate: their rounding grows at most by what each window adds. A softcap,
+    a head transform or a step of `down` leaves the loss non-convex, where a step below 1 / L expands two
+    levels' distance by at most 1 + rate L, under 2, a window, not by the rate times curvature past 2 of
+    an undamped step, whose rounding grows by 10^4 over three windows of 0.5 N(0, 1) weights at a rate
+    of a half (ledger 1714).
+    An activation whose act'' no number bounds (ReLU's, a point mass) bounds no step of `down`: refused,
+    as are a step of a kernel its product rounds and a step of `down` through an `up` that rounds its
+    input or kernel (`Continuum.step_terms`), the loss piecewise constant in what steps.
     """
 
     window: int = 16
@@ -74,10 +82,6 @@ class ChunkAdaptation:
         if not math.isfinite(self.rate) or self.rate < 0:
             raise ValueError(f"a window's step takes a finite rate of at least zero, not {self.rate}")
         object.__setattr__(self, "select", tuple(self.select))
-        if self.damped and self.select != ("up",):
-            raise ValueError("a damped step bounds the curvature of the loss in `up` alone, where it is "
-                             "convex; stepping `down` it is not, so no rate bound holds there: "
-                             "select=('up',)")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,23 +98,37 @@ class Adapted:
 def _stepped_mask(level: Mapping, adaptation: ChunkAdaptation) -> Mapping:
     """Whether each leaf of the level's parameters steps in context (`ChunkAdaptation.select`), in the
     level's own container (a dict or a `FrozenDict`), as every tree the scan maps beside it is: a
-    damped step's `up` kernel alone, any adapter's factors beside it held."""
+    damped step's selected parts' kernels alone (`_damped_parts`), any adapter's factors beside them held."""
     select = adaptation.select
     unknown = sorted(set(select) - set(level))
     if unknown:
         raise ValueError(f"the continuum level has no part {unknown}; it has {sorted(level)}")
-    if adaptation.damped and "kernel" not in level["up"]:
-        raise ValueError("a damped step steps the level's `up` kernel, and this level's `up` holds none of "
-                         f"its own ({sorted(level['up'])}): a frozen or quantized one is the model's")
+    parts = _damped_parts(level, adaptation)
 
     def keys(path) -> tuple[str, ...]:
         return tuple(str(part.key) if isinstance(part, jax.tree_util.DictKey) else str(part) for part in path)
 
     def stepped(path, _) -> bool:
         if adaptation.damped:
-            return keys(path) == ("up", "kernel")
+            return keys(path) in {(part, "kernel") for part in parts}
         return not select or keys(path)[0] in select
     return jax.tree_util.tree_map_with_path(stepped, level)
+
+
+def _damped_parts(level: Mapping, adaptation: ChunkAdaptation) -> tuple[str, ...]:
+    """The parts whose kernels a damped step steps (`ChunkAdaptation.damped`): the selected ones of the
+    level's `down` and `up`, both where `select` is empty; none for an undamped step."""
+    if not adaptation.damped:
+        return ()
+    parts = tuple(part for part in ("down", "up") if not adaptation.select or part in adaptation.select)
+    if not parts:
+        raise ValueError(f"a damped step steps the level's `down` or `up` kernel, not {adaptation.select}")
+    for part in parts:
+        if "kernel" not in level[part]:
+            raise ValueError(f"a damped step steps the level's `{part}` kernel, and this level's `{part}` "
+                             f"holds none of its own ({sorted(level[part])}): a frozen or quantized one is "
+                             "the model's")
+    return parts
 
 
 def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[jax.Array, jax.Array]:
@@ -127,6 +145,12 @@ def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[
     return jnp.asarray(runs), jnp.where(runs > 0, document_ranks(real, starts) // window, -1)
 
 
+def _distance(leaf: jax.Array, start: jax.Array) -> jax.Array:
+    """Per row, the Frobenius norm of `leaf` `[B, ...]` less `start` `[B, ...]`, in at least fp32."""
+    moved = (leaf - start).astype(at_least_fp32(leaf.dtype))
+    return jnp.sqrt(jnp.sum(jnp.square(moved), axis=tuple(range(1, moved.ndim))))
+
+
 def _rows(tree, rows: int):
     """Each leaf of `tree` once per row."""
     return jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (rows, *leaf.shape)), tree)
@@ -138,43 +162,65 @@ def _where(choice: jax.Array, first, second):
                         first, second)
 
 
-def head_curvature(model: nn.Module, variables) -> jax.Array:
-    """Half the squared Frobenius norm of the head's matrix (`vocabulary_rows`, an adapter on it
-    applied), the linear part of an affine head and at least its spectral norm: the cross entropy's
-    Hessian in the logits is at most 1/2 in norm, so this bounds it pulled back to the states the head
-    reads, for every head, its bias apart, as an estimate of the spectral norm cannot. Zero for a zero
-    head. A constant of the step, not differentiated."""
-    rows = jnp.asarray(model.apply(variables, method="vocabulary_rows"))
-    return jax.lax.stop_gradient(jnp.sum(jnp.square(rows.astype(at_least_fp32(rows.dtype)))) / 2)
+_TERMS = 4
+"""What each slot adds to its window's damping (`_damping`): weighted |x|^2, |f|^2, |f| |x| and |x|."""
 
 
-def up_energy(model: nn.Module, variables, level, hidden) -> jax.Array:
-    """Each slot's |a|^2 `[B, S]`, a the inputs the level's `up` kernel multiplies at its final state:
-    the norm of the derivative of the level's output there by that kernel, which is a times a unit
-    direction, for a level `x + up(f(down(x)))` (`dew.nn.continuum`), whatever else `up` holds. `down`
-    holds, so a is the level's start's."""
-    def slot(state):
-        def read(kernel):
-            held = model.with_in_context_level(variables, {**level, "up": {**level["up"], "kernel": kernel}})
-            return jnp.asarray(model.apply(held, state[None], method="continuum_states"))[0]
-
-        out, pull = jax.vjp(read, level["up"]["kernel"])
-        (derivative,) = pull(jnp.zeros_like(out).at[0].set(1))
-        return jnp.sum(jnp.square(derivative.astype(at_least_fp32(derivative.dtype))))
-
-    return jax.lax.stop_gradient(jax.vmap(jax.vmap(slot))(hidden))
-
-
-def damping(model: nn.Module, variables, start, hidden, weights, adaptation: ChunkAdaptation):
-    """A damped step's head curvature and each slot's weighted |a|^2 (`head_curvature`, `up_energy`),
-    whose window sums set its rate; zeros for an undamped step. Refused for a head that is not affine
-    in its states, whose curvature no norm bounds."""
+def _damping(model: nn.Module, variables, start, hidden, weights, adaptation: ChunkAdaptation):
+    """A damped step's bounds (`ChunkAdaptation.damped`): the head's on a slot loss's curvature and slope
+    in the states (`SteppedInContext.head_bounds`), the norm of the level's start's output map and its
+    activation's p1, p2, and each slot's weighted terms `[B, S, _TERMS]` at the level's start
+    (`level_terms`, of the parts that step, which refuses what no curvature bounds), whose window sums
+    set its rate (`_step_rate`); zeros for an undamped step."""
     if not adaptation.damped:
-        return jnp.zeros((), jnp.float32), jnp.zeros_like(weights)
-    if not model.apply(variables, method="affine_head"):
-        raise ValueError("a damped step bounds the head's curvature by its spectral norm, which an affine "
-                         "head alone has: this model's head has a transform, a softcap or nGPT's gains")
-    return head_curvature(model, variables), weights * up_energy(model, variables, start, hidden)
+        zero = jnp.zeros((), jnp.float32)
+        return zero, zero, zero, zero, zero, jnp.zeros((*weights.shape, _TERMS), jnp.float32)
+    parts = _damped_parts(start, adaptation)
+    curvature, slope = _arrays(model.apply(variables, method="head_bounds"))
+    held = model.with_in_context_level(variables, start)
+    squares, inputs, norm, p1, p2 = _arrays(model.apply(held, hidden, parts, method="level_terms"))
+    lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
+    terms = jnp.stack([squares, inputs, fed * lengths, lengths], axis=-1)
+    return jax.lax.stop_gradient((curvature, slope, norm, p1, p2, weights[..., None] * terms))
+
+
+def _arrays(applied) -> tuple[jax.Array, ...]:
+    """A method's tuple of arrays, as `nn.Module.apply` returns it untyped."""
+    return tuple(jnp.asarray(value) for value in applied)
+
+
+def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums, moved, gradient):
+    """A damped window's rate per row, rate / (1 + rate L), L its loss's curvature bound along the step
+    (`ChunkAdaptation.damped`): the window's `sums` `[B, _TERMS]` of its slots' terms, `bounds` the head's
+    curvature and slope, the start's output-map norm and its activation's p1, p2 (`_damping`), `moved` per
+    row the Frobenius norms `down` and `up` have moved from the start before the window, and `gradient`
+    the window's. A part's largest norm along the step is its start's plus what it moved and what this
+    step moves it at most, the rate times its gradient's norm. The rate is a constant of the step, as its
+    bound is: the outer gradient flows through the step's gradient, not through the bound it reads (whose
+    distances are zero at a run's start, where their root has no derivative)."""
+    curvature, slope, norm, p1, p2 = bounds
+    squares, inputs, crossed, lengths = (sums[:, index] for index in range(_TERMS))
+    rate = adaptation.rate
+
+    def reach(part: str) -> jax.Array:
+        if part not in parts:
+            return jnp.zeros_like(squares)
+        leaf = gradient[part]["kernel"]
+        step = jnp.sqrt(jnp.sum(jnp.square(leaf.astype(jnp.float32)), axis=tuple(range(1, leaf.ndim))))
+        return moved[part] + rate * step
+
+    # D's distance along the step bounds how far f = act(D x) moves, p1 |x| per unit; U's, its norm.
+    spread, output = reach("down"), norm + reach("up")
+    bend = jnp.zeros_like(squares)
+    stretch = jnp.zeros_like(squares)
+    if "down" in parts:
+        stretch = stretch + output ** 2 * p1 ** 2 * squares
+        bend = bend + output * p2 * squares
+    if "up" in parts:
+        stretch = stretch + inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares
+        if "down" in parts:
+            bend = bend + p1 * lengths
+    return jax.lax.stop_gradient(rate / (1 + rate * (curvature * stretch + slope * bend)))
 
 
 def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,
@@ -193,15 +239,9 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     steps = _stepped_mask(start, adaptation)
     rows, length = targets.shape
     window = adaptation.window
-    marked, documents = token_layout(fields)
-    # Only padding or several documents let a window open inside a block; else every window is one.
-    straddles = marked is not None or documents is not None
-    valid = real_slots(fields, (rows, length)) if straddles else None
-    if valid is not None:
-        # A padding slot weighs nothing, whatever weight it is given.
-        weights = jnp.where(valid, weights, 0)
-    runs, windows = window_keys(valid, documents, rows, length, window)
-    curvature, energies = damping(model, variables, start, hidden, weights, adaptation)
+    straddles, weights, runs, windows = _laid_out(fields, weights, rows, length, adaptation)
+    *bounds, energies = _damping(model, variables, start, hidden, weights, adaptation)
+    parts = _damped_parts(start, adaptation)
     blocks = -(-length // window)
     # The last block's slots past the row weigh nothing and belong to the row's last window.
     edge = ((0, 0), (0, blocks * window - length))
@@ -225,8 +265,13 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
 
     def stepped(level, gradient, energy):
         """`level` stepped by its window's `gradient`, at the rate a damped step takes from the
-        window's summed `energy` (`ChunkAdaptation.damped`), one rate a row."""
-        rate = adaptation.rate / (1 + adaptation.rate * curvature * energy) if adaptation.damped else None
+        window's summed terms `energy` and how far its kernels moved from the start (`_step_rate`),
+        one rate a row."""
+        rate = None
+        if adaptation.damped:
+            moved = {part: _distance(level[part]["kernel"], started[part]["kernel"]) for part in parts}
+            rate = _step_rate(adaptation, parts, bounds, energy, moved, gradient)
+
         def step(leaf, grad, moves):
             if not moves:
                 return leaf
@@ -249,7 +294,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
                 losses, _ = scored((at,), jnp.zeros_like(tail, jnp.int32), states, block_targets)
                 return jnp.sum(jnp.where(tail, block_weights * losses, 0.0))
             closed = jax.tree.map(jnp.add, partial, jax.grad(tail_loss)(level))
-            closed_energy = energy + jnp.sum(jnp.where(tail, block_energies, 0), axis=1)
+            closed_energy = energy + jnp.sum(jnp.where(tail[..., None], block_energies, 0), axis=1)
             levels = (level, stepped(level, closed, closed_energy), started)
             chosen = jnp.where(tail, 0, jnp.where(following, 1, 2))
         else:
@@ -273,16 +318,17 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
         for index, alternative in enumerate(levels[1:], start=1):
             opened = _where(chosen[:, -1] == index, alternative, opened)
         continuing = (last_run == run) & (last_place == place)
-        reached_energy = jnp.sum(jnp.where(last, block_energies, 0), axis=1)
+        reached_energy = jnp.sum(jnp.where(last[..., None], block_energies, 0), axis=1)
         carried = (opened, _where(continuing, closed, reached),
-                   jnp.where(continuing, closed_energy, reached_energy), last_run, last_place)
+                   jnp.where(continuing[:, None], closed_energy, reached_energy), last_run, last_place)
         return carried, (losses, top, log_z, block_logits if logits else None)
 
     zeros = jax.tree.map(jnp.zeros_like, started)
     # Before a row's first real token no run is open: run 0, window -1.
-    first = (started, zeros, jnp.zeros((rows,), energies.dtype), jnp.zeros((rows,), runs.dtype),
+    first = (started, zeros, jnp.zeros((rows, _TERMS), energies.dtype), jnp.zeros((rows,), runs.dtype),
              jnp.full((rows,), -1, windows.dtype))
-    _, (losses, top, log_z, whole) = jax.lax.scan(jax.checkpoint(block), first, inputs)
+    _, (losses, top, log_z, whole) = jax.lax.scan(
+        jax.checkpoint(block), first, inputs)
 
     def joined(value: jax.Array) -> jax.Array:
         """A scan's `[blocks, B, window, ...]` output as the row's `[B, S, ...]`."""
@@ -290,3 +336,16 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
 
     return Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
                    None if whole is None else joined(whole))
+
+
+def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation):
+    """Where the rows' windows run (`window_keys`): whether a window can open inside a block (padding
+    or several documents in a row), the weights with each padding slot's at nothing, and each slot's run
+    and window."""
+    marked, documents = token_layout(fields)
+    straddles = marked is not None or documents is not None
+    valid = real_slots(fields, (rows, length)) if straddles else None
+    if valid is not None:
+        weights = jnp.where(valid, weights, 0)
+    runs, windows = window_keys(valid, documents, rows, length, adaptation.window)
+    return straddles, weights, runs, windows
