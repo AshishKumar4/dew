@@ -445,6 +445,39 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                     token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
+QUALIFIED_SEEDS = 64
+"""The qualified source's check-1 seeds."""
+
+
+def test_a_source_whose_probe_cannot_run_qualifies_on_its_full_config_and_runs_as_transformers(tmp_path):
+    """A BERT decoder of 8 positions, which the probe's 16 tokens outrun (`verify.ProbeUnavailable`),
+    qualifies for tier 3 on its full config with no weights read (`torchax_fallback.qualified`, ledger
+    1595): its forward, traced over abstract weights, runs Dew's attention in each layer with a mask
+    Dew's causal visibility reproduces and is causal by its program (`sequence_causality`). It loads,
+    warning so, each program it runs proven causal before it runs (`TorchGraph.certify`), and its logits
+    over rows of its 8 positions are transformers' own (check 1, float64)."""
+    torch.manual_seed(0)
+    config = transformers.BertConfig(**{**TINY, "max_position_embeddings": 8}, is_decoder=True)
+    model = transformers.BertLMHeadModel(config).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl == "auto"
+    forward = jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids))
+    wide = float64_twin(model, lambda: transformers.BertLMHeadModel(config).to(torch.float64)).eval()
+
+    def draw(seed):
+        rows = np.random.default_rng([0x1595, seed]).integers(0, TINY["vocab_size"], (2, 8))
+        return (rows.astype(np.int32),)
+
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(jnp.asarray(ids)), np.float64)),
+                    as_given(lambda ids: torch_logits(model, ids)), draw, "qualified bert logits",
+                    seeds=QUALIFIED_SEEDS, truth_fn=as_given(lambda ids: torch_logits(wide, ids)))
+    forward(jnp.zeros((1, 5), jnp.int32))
+    certified = loaded.model.graph.certified
+    assert len(certified) == 2 and all(refusal is None for refusal in certified.values())
+
+
 PACKED_SEEDS = {"cohere": 256, "cohere2": 256}
 """Each model's packed rows' check-1 seeds, sized by `seeds_for` on armada."""
 
