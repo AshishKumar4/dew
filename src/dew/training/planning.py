@@ -639,10 +639,10 @@ class FitSearch[LossT, EffectsT]:
         most microbatches, fits the devices (`derived_headroom`, labelled 'fits'), before anything
         compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
-        devices, devices stating no memory) ends the walk where it started, at the base rung, as does a
-        ladder no rung of which fits. A run that sets its remat compiles at it alone, told first where
-        the derivation fits a lighter rung (`advise`). The derivation names no XLA workspace, so a
-        'fits' is a first guess and the compile the decision."""
+        devices) or devices that state no memory to judge one against ('unstated') end the walk where it
+        started, at the base rung, as does a ladder no rung of which fits. A run that sets its remat
+        compiles at it alone, told first where the derivation fits a lighter rung (`advise`). The
+        derivation names no XLA workspace, so a 'fits' is a first guess and the compile the decision."""
         if self.derive is None or self.resumed is not None:
             return
         if self.remat_set:
