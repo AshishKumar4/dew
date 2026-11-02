@@ -29,6 +29,7 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables
 from dew.nn.kernels.options import OuterProgram
+from dew.nn.sharding import unboxed
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes, first_episode_rows
@@ -122,7 +123,7 @@ class ControlPPOObjective(Objective[Ratio]):
         self.discount, self.lam, self.clip = discount, lam, clip
         self.reward_scaling, self.value_cost, self.entropy_cost = reward_scaling, value_cost, entropy_cost
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.variables = nn.unbox(variables)
+        self.variables = unboxed(variables)
         self.reads = reads
 
     def seen(self, observation: Observation) -> jax.Array:

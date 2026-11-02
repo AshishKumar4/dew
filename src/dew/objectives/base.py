@@ -54,7 +54,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken
+from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken, unboxed
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -802,7 +802,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             model = source
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
         self.variables = None if variables is OMITTED or variables is None else dicts(
-            unpacked(model, nn.unbox(variables)))
+            unpacked(model, unboxed(variables)))
         self.processor = None if processor is OMITTED else processor
         return model
 
@@ -1006,8 +1006,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
-                      for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(dict(drawn)))}
-            for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(dict(held))):
+                      for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(held))):
                 name = jax.tree_util.keystr(path)
                 if name in shapes and shapes[name] != np.shape(leaf):
                     raise ValueError(f"the held {name} is {np.shape(leaf)}, where the objective's modules "
@@ -1703,7 +1703,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
     if signature not in kept:
-        variables = nn.unbox(jax.eval_shape(objective.init, jax.random.key(0)))
+        variables = unboxed(jax.eval_shape(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
         rest = {name: value for name, value in variables.items() if name != "params"}
 

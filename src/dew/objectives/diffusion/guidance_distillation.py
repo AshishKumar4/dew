@@ -28,6 +28,7 @@ from dew.lora import unadapted
 from dew.nn.inspection import INSPECTED
 from dew.nn.kernels.options import Held
 from dew.nn.protocols import Lacks
+from dew.nn.sharding import unboxed
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, model_rngs
 from dew.registry import to_record
 from dew.sampling.guidance import guide
@@ -81,7 +82,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
                              f"{self.latent_shape}; they share one latent geometry")
         self.teacher = built
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.teacher_variables = dicts(nn.unbox(held))
+        self.teacher_variables = dicts(unboxed(held))
         self.scales = scales
 
     def program_key(self) -> tuple[ProgramModule, ...]:

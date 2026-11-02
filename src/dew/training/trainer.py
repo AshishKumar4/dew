@@ -79,7 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches, unboxed
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -402,7 +402,7 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
+        params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so

@@ -27,7 +27,7 @@ from .attention import scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .conv import Conv
 from .norms import RMSNorm
-from .sharding import logical_axes
+from .sharding import declared, logical_axes
 
 
 def _divisible(channels: float) -> int:
@@ -57,8 +57,10 @@ def _padding(kind: str, kernel: int):
 
 def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
           padding: str = "same", bias: bool = False, dtype: Dtype | None = None,
-          precision: PrecisionLike = None, name: str) -> Conv:
-    """Build a square convolution with timm's fan-out initializer.
+          precision: PrecisionLike = None, channels: str | None = None, name: str) -> Conv:
+    """Build a square convolution with timm's fan-out initializer, its output `channels` named (the model
+    width, `embed`, or an expanded middle, `mlp`) and its spatial and input sides not: a depthwise kernel
+    holds one input channel per group.
 
     The initializer's gain counts the groups, because a depthwise kernel's
     fan-out is its own group's alone.
@@ -67,13 +69,17 @@ def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
         features, (kernel, kernel), strides=(stride, stride),
         padding=_padding(padding, kernel), feature_group_count=groups,
         use_bias=bias, dtype=dtype, precision=precision,
-        kernel_init=nn.initializers.variance_scaling(2.0 * groups, "fan_out", "normal"),
+        kernel_init=declared(nn.initializers.variance_scaling(2.0 * groups, "fan_out", "normal"),
+                             None if channels is None else (None, None, None, channels)),
+        bias_init=declared(nn.initializers.zeros_init(), None if channels is None else (channels,)),
         name=name)
 
 
-def _timm_rms_norm(dtype: Dtype | None, name: str) -> RMSNorm:
-    """Build timm's `RmsNorm2d` (eps 1e-6), which reduces and scales in the input dtype."""
-    return RMSNorm(epsilon=1e-6, fp32_statistics=False, scale_after_cast=True, dtype=dtype, name=name)
+def _timm_rms_norm(dtype: Dtype | None, name: str, channels: str | None = None) -> RMSNorm:
+    """Build timm's `RmsNorm2d` (eps 1e-6), which reduces and scales in the input dtype, its scale over
+    the `channels` named."""
+    return RMSNorm(epsilon=1e-6, fp32_statistics=False, scale_after_cast=True, dtype=dtype, name=name,
+                   scale_axes=None if channels is None else (channels,))
 
 
 class MobileConvNormAct(nn.Module):
@@ -84,6 +90,8 @@ class MobileConvNormAct(nn.Module):
     padding: str = "same"
     bias: bool = False
     activate: bool = True
+    channels: str | None = None
+    """The logical name of its output channels (`_conv`), none for a block that names none."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -91,8 +99,8 @@ class MobileConvNormAct(nn.Module):
     def __call__(self, x):
         x = _conv(self.features, self.kernel, stride=self.stride, groups=self.groups,
                   padding=self.padding, bias=self.bias, dtype=self.dtype,
-                  precision=self.precision, name="conv")(x)
-        x = _timm_rms_norm(self.dtype, "bn")(x)
+                  precision=self.precision, channels=self.channels, name="conv")(x)
+        x = _timm_rms_norm(self.dtype, "bn", self.channels)(x)
         return gelu_tanh(x) if self.activate else x
 
 
@@ -101,7 +109,7 @@ class MobileLayerScale(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        gamma = self.param("gamma", nn.initializers.constant(self.initial_value),
+        gamma = self.param("gamma", declared(nn.initializers.constant(self.initial_value), ("embed",)),
                            (x.shape[-1],), jnp.float32)
         return x * gamma.astype(x.dtype)
 
@@ -182,31 +190,31 @@ class MobileResidual(nn.Module):
                 raise ValueError(f"group_size {size} does not divide {channels} channels")
             return channels // size
 
-        def cna(value, features, kernel, name, *, stride=1, grouped=False, activate=True):
+        def cna(value, features, kernel, name, channels, *, stride=1, grouped=False, activate=True):
             return MobileConvNormAct(
                 features, kernel, stride=stride, groups=groups(features) if grouped else 1,
-                padding=self.padding, activate=activate, dtype=self.dtype,
+                padding=self.padding, activate=activate, channels=channels, dtype=self.dtype,
                 precision=self.precision, name=name)(value)
 
         if spec.kind == "edge":
             x = _conv(middle, spec.middle_kernel, stride=spec.stride,
                       groups=groups(middle), padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="conv_exp")(x)
-            x = _timm_rms_norm(self.dtype, "bn1")(x)
+                      precision=self.precision, channels="mlp", name="conv_exp")(x)
+            x = _timm_rms_norm(self.dtype, "bn1", "mlp")(x)
             x = gelu_tanh(x)
             x = _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="conv_pwl")(x)
-            x = _timm_rms_norm(self.dtype, "bn2")(x)
+                      precision=self.precision, channels="embed", name="conv_pwl")(x)
+            x = _timm_rms_norm(self.dtype, "bn2", "embed")(x)
         else:
             if spec.start_kernel:
                 stride = 1 if spec.middle_kernel else spec.stride
-                x = cna(x, incoming, spec.start_kernel, "dw_start", stride=stride,
+                x = cna(x, incoming, spec.start_kernel, "dw_start", "embed", stride=stride,
                         grouped=True, activate=False)
-            x = cna(x, middle, 1, "pw_exp")
+            x = cna(x, middle, 1, "pw_exp", "mlp")
             if spec.middle_kernel:
-                x = cna(x, middle, spec.middle_kernel, "dw_mid", stride=spec.stride,
+                x = cna(x, middle, spec.middle_kernel, "dw_mid", "mlp", stride=spec.stride,
                         grouped=True)
-            x = cna(x, self.features, 1, "pw_proj", activate=False)
+            x = cna(x, self.features, 1, "pw_proj", "embed", activate=False)
             if self.layer_scale is not None:
                 x = MobileLayerScale(self.layer_scale, name="layer_scale")(x)
         if incoming == self.features and spec.stride == 1 and not self.noskip:
@@ -219,6 +227,9 @@ class MobileResidual(nn.Module):
 
 class MobileKVProjection(nn.Module):
     features: int
+    channels: str
+    """The logical name of the projection's output (`_conv`): the query holds every head, a multi-query
+    key and value hold one, and the output maps the head space back to the block width."""
     stride: int = 1
     padding: str = "same"
     dtype: Dtype | None = None
@@ -229,10 +240,10 @@ class MobileKVProjection(nn.Module):
         if self.stride > 1:
             x = _conv(x.shape[-1], 3, stride=self.stride, groups=x.shape[-1],
                       padding=self.padding, dtype=self.dtype,
-                      precision=self.precision, name="down_conv")(x)
-            x = _timm_rms_norm(self.dtype, "norm")(x)
+                      precision=self.precision, channels="embed", name="down_conv")(x)
+            x = _timm_rms_norm(self.dtype, "norm", "embed")(x)
         return _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
-                     precision=self.precision, name="proj")(x)
+                     precision=self.precision, channels=self.channels, name="proj")(x)
 
 
 # `MobileKVProjection` names its convolutions `proj`, which a router already
@@ -261,12 +272,12 @@ class MobileMultiQueryAttention(nn.Module):
     def __call__(self, x):
         batch, height, width, _ = x.shape
         spec = self.spec
-        query = MobileKVProjection(spec.heads * spec.head_dim, dtype=self.dtype,
+        query = MobileKVProjection(spec.heads * spec.head_dim, "heads", dtype=self.dtype,
                                     precision=self.precision, name="query")(x)
-        key = MobileKVProjection(spec.head_dim, stride=spec.kv_stride,
+        key = MobileKVProjection(spec.head_dim, "kv", stride=spec.kv_stride,
                                   padding=self.padding, dtype=self.dtype,
                                   precision=self.precision, name="key")(x)
-        value = MobileKVProjection(spec.head_dim, stride=spec.kv_stride,
+        value = MobileKVProjection(spec.head_dim, "kv", stride=spec.kv_stride,
                                     padding=self.padding, dtype=self.dtype,
                                     precision=self.precision, name="value")(x)
         query = query.reshape(batch, height * width, spec.heads, spec.head_dim)
@@ -275,7 +286,7 @@ class MobileMultiQueryAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=self.attention_impl)
         out = out.reshape(batch, height, width, spec.heads * spec.head_dim)
-        return MobileKVProjection(self.features, dtype=self.dtype,
+        return MobileKVProjection(self.features, "embed", dtype=self.dtype,
                                    precision=self.precision, name="output")(out)
 
 
@@ -359,7 +370,7 @@ class MobileMultiScaleFusion(nn.Module):
             else:
                 strides = (height // size, width // size)
                 x = nn.avg_pool(x, strides, strides=strides, padding="VALID")
-        return _timm_rms_norm(self.dtype, "norm")(x)
+        return _timm_rms_norm(self.dtype, "norm", "embed")(x)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -438,7 +449,7 @@ class MobileNetV5Encoder(nn.Module):
         fixed = args.channel_multiplier < 1.0 if args.fix_stem is None else args.fix_stem
         stem = args.stem_size if fixed else _divisible(args.stem_size * args.channel_multiplier)
         x = MobileConvNormAct(stem, 3, stride=2, padding=args.pad_type,
-                              bias=args.stem_bias, dtype=self.dtype,
+                              bias=args.stem_bias, channels="embed", dtype=self.dtype,
                               precision=self.precision, name="conv_stem")(x)
         features = [x] if 0 in self.selected else []
         for stage in range(4):

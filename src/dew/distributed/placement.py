@@ -38,7 +38,16 @@ from dew.mesh import (
     logical_spec,
     mesh_axes,
 )
-from dew.nn.sharding import Suffix, boxed, boxed_axes, current_boxes, declarations, declared_axes, ruled_boxes
+from dew.nn.sharding import (
+    Suffix,
+    boxed,
+    boxed_axes,
+    current_boxes,
+    declarations,
+    declared_axes,
+    ruled_boxes,
+    unboxed,
+)
 from dew.state import VARIABLE_FIELDS
 
 # The role axes no parameter splits over: diloco holds DiLoCo's replica
@@ -547,7 +556,7 @@ class Layout:
             return NamedSharding(mesh, spec)
 
         with self._declared(tree):
-            return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+            return jax.tree_util.tree_map_with_path(leaf_sharding, unboxed(tree))
 
     def _declared(self, tree):
         """The context in which `declared_axes` reads the axes `tree`'s
@@ -648,7 +657,7 @@ class Layout:
         if all(mesh.shape[axis] == 1 for axis in parameter_axes(mesh.axis_names)):
             return
 
-        path_leaves, _ = jax.tree_util.tree_flatten_with_path(nn.unbox(params))
+        path_leaves, _ = jax.tree_util.tree_flatten_with_path(unboxed(params))
         splits = {axis for axis in parameter_axes(mesh.axis_names) if mesh.shape[axis] > 1}
         declared = declarations(params)
         with self._declared(params):

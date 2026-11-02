@@ -282,11 +282,10 @@ def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str])
     is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
     if not modules:
         return ()
-    from flax import linen as nn
-
+    from dew.nn.sharding import unboxed
     from dew.optim import parameter_name
 
-    trained = nn.unbox(jax.eval_shape(lambda: objective.init(jax.random.key(0))))["params"]
+    trained = unboxed(jax.eval_shape(lambda: objective.init(jax.random.key(0))))["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
     return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
 

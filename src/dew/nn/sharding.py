@@ -565,6 +565,16 @@ def declared(init: Initializer, axes: LogicalAxes | None) -> Initializer:
     return init if axes is None else nn.with_logical_partitioning(init, axes)
 
 
+def unboxed(tree):
+    """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
+    holds, as stored: how a tree enters Dew. No constraint its names would apply is applied, which
+    `LogicallyPartitioned.unbox` (and `nn.unbox`) applies under an active mesh and bound Flax rules: Dew
+    places the arrays from its run's own table (`Objective.parameter_axes`), in one place."""
+    def stored(leaf):
+        return leaf.unbox(apply_constraint=False) if isinstance(leaf, nn.Partitioned) else leaf
+    return jax.tree.map(stored, tree, is_leaf=lambda leaf: isinstance(leaf, nn.Partitioned))
+
+
 def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
     """The axes each parameter carries in the box its module drew it in (`nn.with_logical_partitioning`),
     by its full path, collection first: where a run's table is read off its objective's draw

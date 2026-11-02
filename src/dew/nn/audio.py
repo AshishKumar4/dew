@@ -33,7 +33,7 @@ from dew.registry import from_record
 from .activations import activation
 from .conv import Conv
 from .norms import LayerNorm, RMSNorm
-from .sharding import logical_axes
+from .sharding import logical_axes, unboxed
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
 
@@ -611,7 +611,7 @@ def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     features = (
         config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
     )
-    template = nn.unbox(jax.eval_shape(config.build().init, jax.random.key(0),
+    template = unboxed(jax.eval_shape(config.build().init, jax.random.key(0),
                                        jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
                                        jax.ShapeDtypeStruct((1, 16), jnp.bool_)))
     return {tuple(str(k.key) for k in path): value.shape

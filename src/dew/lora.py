@@ -87,7 +87,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, unboxed
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -212,7 +212,7 @@ class LoRA:
 
         _refuse_unadaptable(model)
         # A draw boxes the parameters its modules declare the axes of; the adapter reads their values.
-        variables = nn.unbox(variables)
+        variables = unboxed(variables)
         if fp8_base is not None:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -1072,7 +1072,7 @@ def bound_layouts(model: nn.Module, variables: Variables,
         return layouts
     # A draw boxes the kernels its modules declare the axes of; their shapes are their values'.
     derived = {".".join(module): _kernel_layout(module, kernel)
-               for module, kernel in _kernels(nn.unbox(variables).get("params", {}), ())
+               for module, kernel in _kernels(unboxed(variables).get("params", {}), ())
                if kernel.ndim == 2}
     if not derived:
         raise ValueError(

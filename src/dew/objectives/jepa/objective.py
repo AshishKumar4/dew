@@ -37,7 +37,7 @@ from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import accumulated, at_least_fp32
-from dew.nn.sharding import explicit_spec, whole_spec
+from dew.nn.sharding import explicit_spec, unboxed, whole_spec
 from dew.objectives.base import (
     Aux,
     EMASpec,
@@ -158,8 +158,8 @@ class JepaObjective(Objective[Ratio]):
         self.sample = sample
         self.label_key = label_key
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.encoder_variables = dicts(nn.unbox(encoder_variables))
-        self.predictor_variables = dicts(nn.unbox(predictor_variables))
+        self.encoder_variables = dicts(unboxed(encoder_variables))
+        self.predictor_variables = dicts(unboxed(predictor_variables))
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(

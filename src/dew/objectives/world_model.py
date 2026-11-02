@@ -26,6 +26,7 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables
 from dew.nn.attention import reference_attention
+from dew.nn.sharding import unboxed
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
 
@@ -279,7 +280,7 @@ class WorldModelObjective(Objective[Ratio]):
                  shortcut: bool = True):
         self.model = model
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.tokenizer, self.tokenizer_variables = tokenizer, nn.unbox(tokenizer_variables)
+        self.tokenizer, self.tokenizer_variables = tokenizer, unboxed(tokenizer_variables)
         self.shortcut = shortcut
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:

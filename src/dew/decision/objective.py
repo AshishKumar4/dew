@@ -43,6 +43,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
+from dew.nn.sharding import unboxed
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -310,7 +311,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.variables = dicts(nn.unbox(held))
+        self.variables = dicts(unboxed(held))
         self.label_smoothing = label_smoothing
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
