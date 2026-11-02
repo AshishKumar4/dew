@@ -716,8 +716,8 @@ LAGUNA_XS = {
 
 JAMBA_REASONING = {
     "architectures": ["JambaForCausalLM"], "model_type": "jamba", "attention_dropout": 0.0,
-    "attn_layer_offset": 7, "attn_layer_period": 14, "bos_token_id": 1, "eos_token_id": [2, 519], "expert_layer_offset": 1,
-    "expert_layer_period": 2, "hidden_act": "silu", "hidden_size": 2560, "intermediate_size": 8192,
+    "attn_layer_offset": 7, "attn_layer_period": 14, "bos_token_id": 1, "eos_token_id": [2, 519],
+    "expert_layer_offset": 1, "expert_layer_period": 2, "hidden_act": "silu", "hidden_size": 2560, "intermediate_size": 8192,
     "mamba_conv_bias": True, "mamba_d_conv": 4, "mamba_d_state": 16, "mamba_dt_rank": 160, "mamba_expand": 2,
     "mamba_proj_bias": False, "max_position_embeddings": 262144, "num_attention_heads": 20, "num_experts": 1,
     "num_experts_per_tok": 1, "num_hidden_layers": 28, "num_key_value_heads": 1, "num_logits_to_keep": 1,
