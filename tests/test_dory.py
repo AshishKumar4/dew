@@ -5,6 +5,7 @@ own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
 import contextlib
 import dataclasses
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -850,37 +851,43 @@ SYMMETRIC = {'attention': {'q_proj': ('query', 1), 'k_proj': ('key', 1), 'v_proj
                      'suv_up': ('mlp', 0), 'down_proj': ('mlp', 0)}}
 
 
-def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
-    """`variables` under the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or taken
-    back from them where `inverse`: each attention's and feed-forward's parameters along the axes it
-    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py), each leaf
-    where it is, a device array on its device."""
-    from residual_orders import permuted
+def symmetric_leaves(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+    """The function taking each parameter of `variables` (its path within `params`, and the leaf) under
+    the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or back from them where `inverse`:
+    each attention's and feed-forward's parameters along the axes it reorders (`SYMMETRIC`), then the
+    residual stream's units (tests/residual_orders.py), where the leaf is, one leaf at a time; so a caller
+    placing each leaf as it goes reorders it on the device and holds one leaf beside the reordered ones."""
+    from residual_orders import residual_reorder
 
     found = load_tool('dory_vllm_reference').maps(config, drawn)
     if inverse:
         found = {part: {layer: np.argsort(order) for layer, order in by.items()}
                  for part, by in found.items()}
     kinds = config['layer_types']
+    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
+    along_residual = residual_reorder(variables, residual)
 
     def reorder(path, leaf):
         names = [getattr(entry, 'key', None) for entry in path]
-        if not names[0].startswith('layers_'):
-            return leaf
-        layer = int(names[0].removeprefix('layers_'))
-        parameter = names[-2] if names[-1] == 'kernel' else names[-1]
-        named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
-        if named is None:
-            return leaf
-        part, axis = named
-        order = found[part][layer]
-        if isinstance(leaf, jax.Array):
-            return jnp.take(leaf, jnp.asarray(order), axis=axis)
-        return np.take(np.asarray(leaf), order, axis=axis)
+        if names[0].startswith('layers_'):
+            layer = int(names[0].removeprefix('layers_'))
+            parameter = names[-2] if names[-1] == 'kernel' else names[-1]
+            named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
+            if named is not None:
+                part, axis = named
+                order = found[part][layer]
+                leaf = (jnp.take(leaf, jnp.asarray(order), axis=axis) if isinstance(leaf, jax.Array)
+                        else np.take(np.asarray(leaf), order, axis=axis))
+        return along_residual(path, leaf)
 
-    params = jax.tree_util.tree_map_with_path(reorder, variables['params'])
-    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
-    return permuted({**variables, 'params': params}, residual)
+    return reorder
+
+
+def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+    """`variables` under the symmetries `drawn`, or taken back from them where `inverse`
+    (`symmetric_leaves`), each leaf where it is, a device array on its device."""
+    reorder = symmetric_leaves(variables, config, drawn, inverse=inverse)
+    return {**variables, 'params': jax.tree_util.tree_map_with_path(reorder, variables['params'])}
 
 
 def decoding(model: CausalTransformer):
@@ -948,8 +955,13 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             for prompt, tokens, prompt_rows in parts.values()])}
 
     def dew(index, order):
-        # Each order's weights placed alone, and gone from the device when the call returns.
-        return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
+        # Each order's weights placed a leaf at a time and reordered there, so the device holds the order's
+        # weights and one leaf beside them, gone when the call returns; the host reordered the 4B's 16 GB
+        # in about two minutes an order.
+        reorder = symmetric_leaves(weights, config, order)
+        placed = {**weights, 'params': jax.tree_util.tree_map_with_path(
+            lambda path, leaf: reorder(path, jax.device_put(leaf)), weights['params'])}
+        return jax.tree.map(np.asarray, rows(programs, jax.device_put(placed)))
 
     # The float64 arm on the default device, a GPU's float64 units where one runs the test
     # (`plain_float64`); its weights kept on the host and placed for a call alone, so the device never
@@ -958,9 +970,14 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
         wide_programs = decoding(model.clone(dtype=jnp.float64))
     held = widened(weights)
 
-    def truth(order):
+    @functools.cache
+    def decoded_truth():
         with plain_float64():
             return rows(wide_programs, jax.device_put(held))
+
+    def truth(order):
+        # The orders are exact symmetries, so every order's truth is the identity's, decoded once.
+        return decoded_truth()
 
     truth.dew_programs = True
     seeds = int(stored[f'{site}.seeds'])
