@@ -7,6 +7,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A step compiled ahead for GPUs with none attached compiles with XLA's autotuning off, unless `XLA_FLAGS` sets it: its programs
+  and their memory are the same, and its fit search compiles each rung about a third faster.
 - A run of epochs over a read with no record count (an objective makes rows of its examples, a pack lays
   them out, a filter cuts them per share) counts an epoch as a pass over its source examples, and a
   memory read that packs them as it holds them bounds the passes with its pack. A run bounded in
