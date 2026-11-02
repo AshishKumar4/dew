@@ -117,7 +117,8 @@ def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
         kept, others = fn(structure.unflatten(fetched), *given.unflatten(operands))
         return structure.flatten_up_to(kept), others
 
-    shapes = [jax.ShapeDtypeStruct(field.shape, field.dtype, sharding=sharding)
+    shapes = [jax.ShapeDtypeStruct(field.shape, field.dtype, sharding=sharding,
+                                   weak_type=jax.typeof(field).weak_type)
               for field, sharding in zip(fields, onto_device, strict=True)]
     traced, (_, others_shape) = jax.make_jaxpr(whole, return_shape=True)(shapes, operands)
     program = traced.jaxpr

@@ -85,9 +85,12 @@ class Footprint:
 
     @property
     def temporaries(self) -> int | None:
-        """The most the step holds at once beside its state: its gradient program's peak, or its commit's
-        gradient and staged fields where they are more. None where `peak` is."""
-        return None if self.peak is None else max(self.peak, self.gradients + self.staged)
+        """The most the step holds at once beside its state: its gradient program's peak, or, where its
+        commit stages host-resident fields, its whole gradient and those where they are more. None where
+        `peak` is."""
+        if self.peak is None or not self.staged:
+            return self.peak
+        return max(self.peak, self.gradients + self.staged)
 
     def record(self) -> dict[str, JSON]:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
@@ -300,30 +303,38 @@ def staged_bytes(optimizer: optax.GradientTransformation | None, state: TrainSta
     the whole fields where the commit reads them at once, as a window of several microbatches commits under
     a conditional, a dynamically scaled loss admits the commit on the whole committed state's finiteness,
     and an update that solves its system reads the whole state. A device's share of each leaf."""
-    resting = [getattr(state, field) for field in COMMIT_FIELDS
-               if getattr(state, field) is not None and not in_device(getattr(state, field))]
-    whole = placed_bytes(resting)
+    resting = {field: getattr(state, field) for field in COMMIT_FIELDS
+               if getattr(state, field) is not None and not in_device(getattr(state, field))}
+    whole = placed_bytes(list(resting.values()))
     if (not resting or optimizer is None or window > 1 or state.scale is not None
             or solves_equations(state)):
         return whole
-    fields, structure = jax.tree.flatten((state.opt_state, state.ema))
-    variables = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), state.variables)
+    fields, structure = jax.tree.flatten(resting)
+    held = {field: getattr(state, field) for field in COMMIT_FIELDS if field not in resting}
 
-    def commit(fields, gradients, variables, progress):
-        opt_state, ema = structure.unflatten(fields)
+    def commit(fields, held, gradients, variables, progress):
+        current = {**held, **structure.unflatten(fields)}
         extra = {"qk_stats": None, "progress": progress} if isinstance(
             optimizer, optax.GradientTransformationExtraArgs) else {}
-        update, opt_state = optimizer.update(gradients, opt_state, variables["params"], **extra)
+        update, opt_state = optimizer.update(gradients, current["opt_state"], variables["params"], **extra)
         moved = {**variables, "params": optax.apply_updates(variables["params"], update)}
-        return opt_state, None if ema is None else ema_update(ema, moved, 0.5)
+        return opt_state, None if current["ema"] is None else ema_update(current["ema"], moved, 0.5)
 
-    traced = jax.make_jaxpr(commit)([jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for leaf in fields],
-                                    variables["params"], variables, jax.ShapeDtypeStruct((), np.float32))
+    variables = abstract(state.variables)
+    traced = jax.make_jaxpr(commit)(abstract(fields), abstract(held), variables["params"], variables,
+                                    jax.ShapeDtypeStruct((), np.float32))
     equations, _ = flattened(traced.jaxpr, traced.jaxpr.invars, traced.consts)
-    sizes = [0 if in_device(leaf) else placed_bytes([leaf]) for leaf in fields]
-    cut, _, _ = chunks(equations, traced.jaxpr.invars[:len(fields)], sizes)
-    held = sorted((sum(sizes[index] for index in chunk) for chunk in cut), reverse=True)
-    return min(whole, sum(held[:2]))
+    # Cut by the fields' whole bytes, as the commit cuts them (`staged`), each chunk held as a device's share.
+    cut, _, _ = chunks(equations, traced.jaxpr.invars[:len(fields)],
+                       [math.prod(leaf.shape) * leaf.dtype.itemsize for leaf in fields])
+    shares = sorted((placed_bytes([fields[index] for index in chunk]) for chunk in cut), reverse=True)
+    return min(whole, sum(shares[:2]))
+
+
+def abstract(tree):
+    """`tree`'s leaves as their shapes, dtypes and weak types alone, in no memory space of their own."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                          weak_type=jax.typeof(leaf).weak_type), tree)
 
 
 def in_device(tree) -> bool:
