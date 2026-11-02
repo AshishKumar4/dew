@@ -34,7 +34,7 @@ in one launch, two, or one whose consumers share a key block; the operands' dtyp
 form."""
 
 CELLS: dict[str, tuple[str, str]] = {
-    "attention": ("test_attention_matrix", "a_routes_training_step_is_on_par"),
+    "attention": ("attention_matrix", "a_routes_training_step_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
