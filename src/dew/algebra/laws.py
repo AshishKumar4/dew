@@ -20,12 +20,12 @@ symbols, every element its own symbol, a dtype's largest magnitude read as a fin
 (`LEAST`: the empty state's anchor, whose weights vanish); each comparison the sides hold (a mask's position
 against a key's) decided each way in turn (`_cases`), each maximum and minimum by each order of the values it
 compares (`_orderings`), and the two sides' difference zero as a rational function of exponentials
-(`_zero`). The forms are proven at the tile of extent 2 along the walked axis and 1 along every other: a law
-holds of each element of a state alone (a walked reduction is a sum or a maximum over a set, its laws those
-of the set's union), so a tile's extents change no law; the forms at a kernel's tile are certified where
-their structure (each term's constructors, operation names and parameters but for the extents they hold,
-`skeleton`) is a certified tile's, which the suite holds for every tile a GPU's derivation emits
-(tests/test_algebra_laws.py)."""
+(`_zero`). A certificate is a reduced-tile proof: the laws hold of the forms at the small tile they were
+proven at. A kernel's tile shares it where its forms' structure (`skeleton`) is that tile's and its extents
+are equal and unequal as that tile's are (tests/test_algebra_laws.py), so a broadcast or reshape that confuses
+two axes shows the same at both. That a law proven at the small tile holds at a kernel's is not proven: a
+form whose reductions treat their elements alike holds its laws at any extent in every case the suite has
+seen, but a form that held them at a few elements and broke them at more would share the certificate."""
 
 import dataclasses
 import functools
@@ -172,20 +172,35 @@ def certified(declaration, shapes: Mapping) -> Certificate:
                    declared=declaration.function, shapes=shapes, walked=walked, mapped=forms.mapped)
 
 
-EXTENTS = frozenset({"shape", "new_sizes", "sizes", "start_indices", "limit_indices", "slice_sizes"})
-"""The parameters that hold a tile's extents, which `skeleton` reads past: no law reads them."""
+SHAPES = frozenset({"shape", "new_sizes", "sizes"})
+"""The parameters that hold a value's shape, which `skeleton` reads past: a well-typed term's are its
+operands' and its consumers' shapes, so two tiles whose extents are equal and unequal alike take them alike.
+A window's parameters (a slice's starts, limits and sizes) are no type's: they stay in the skeleton, so a
+form sliced at one place shares no certificate with a form sliced at another."""
 
 
 def skeleton(term, region) -> str:
     """A term's structure in `region` (`terms.Region`): its constructors, operation names, literals and each
-    parameter but the extents it holds (`EXTENTS`), so the forms of two tiles of one declaration have one
-    skeleton exactly where they compute alike up to their extents."""
+    parameter but the shapes it holds (`SHAPES`), so the forms of two tiles of one declaration whose extents
+    are equal and unequal alike have one skeleton exactly where they compute alike up to their extents."""
     from egglog import declarations
 
     def parameter(index: int) -> str:
         primitive, params = region.params[index]
-        kept = {name: value for name, value in sorted(params.items()) if name not in EXTENTS}
+        kept = {name: value for name, value in sorted(params.items()) if name not in SHAPES}
         return f"{primitive.name}{kept}"
+
+    made = {leaf: (opaque, place) for opaque in region.opaque for place, leaf in enumerate(opaque.outputs)}
+
+    def defined(leaf: int) -> str:
+        # A leaf an equation outside the language computes (a local value: a slice of an operand the walk
+        # does not read), as that equation and its inputs: a leaf's index names no computation.
+        opaque, place = made[leaf]
+        kept = {name: value for name, value in sorted(opaque.equation.params.items()) if name not in SHAPES}
+        literals = iter(opaque.literals)
+        inputs = [walk(term.__egg_typed_expr__, None, 0) if term is not None else repr(next(literals))
+                  for term in opaque.inputs]
+        return f"{opaque.equation.primitive.name}{kept}({','.join(inputs)})[{place}]"
 
     def walk(expr, method: str | None, place: int) -> str:
         inner = expr.expr if isinstance(expr, declarations.TypedExprDecl) else expr
@@ -203,10 +218,21 @@ def skeleton(term, region) -> str:
             named = inner.callable
             methods = (declarations.MethodRef, declarations.ClassMethodRef)
             name = named.method_name if isinstance(named, methods) else named.ident.name
+            leaf = _inner_literal(inner.args[0]) if name == "leaf" else None
+            if isinstance(leaf, int) and leaf in made:
+                return defined(leaf)
             return f"{name}({','.join(walk(arg, name, index) for index, arg in enumerate(inner.args))})"
         return type(inner).__name__
 
     return walk(term.__egg_typed_expr__, None, 0)
+
+
+def _inner_literal(expr):
+    """A term argument's literal value, None where it is no literal."""
+    from egglog import declarations
+
+    inner = expr.expr if isinstance(expr, declarations.TypedExprDecl) else expr
+    return inner.value if isinstance(inner, declarations.LitDecl) else None
 
 
 _PARAMETER = {"dot": 2, "reduce": 3, "shaped": 2, "binary": 3, "compare": 3, "unary": 2, "convert": 2}
@@ -392,15 +418,16 @@ def _dot(x, y, dimension_numbers) -> np.ndarray:
 
 
 def _equal(law: str, mine, theirs) -> None:
-    """Each element of two structures equal over the reals in every case of their comparisons (`_cases`) and
-    every order of their maxima (`_orderings`); `Unlawful` with the first that differs."""
-    left = [np.asarray(leaf, object).ravel() for leaf in jax.tree.leaves(mine)]
-    right = [np.asarray(leaf, object).ravel() for leaf in jax.tree.leaves(theirs)]
+    """Two structures of the same arrays, each of one shape, each element equal over the reals in every case
+    of their comparisons (`_cases`) and every order of their maxima (`_orderings`); `Unlawful` with the first
+    that differs: a value's shape is its contract, so the same elements laid out otherwise break the law."""
+    left = [np.asarray(leaf, object) for leaf in jax.tree.leaves(mine)]
+    right = [np.asarray(leaf, object) for leaf in jax.tree.leaves(theirs)]
     shapes = [part.shape for part in left], [part.shape for part in right]
     if shapes[0] != shapes[1]:
         raise Unlawful(law, f"its sides' shapes differ: {shapes[0]} and {shapes[1]}")
     for one, other in zip(left, right, strict=True):
-        for a, b in zip(one, other, strict=True):
+        for a, b in zip(one.ravel(), other.ravel(), strict=True):
             for decided, mine_case, theirs_case in _cases(sympy.sympify(a), sympy.sympify(b)):
                 for ordered in _orderings(mine_case - theirs_case):
                     if not _zero(ordered):

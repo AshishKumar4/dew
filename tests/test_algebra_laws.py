@@ -3,9 +3,10 @@
 an RTX PRO 6000 (sm80, sm90, sm120) lie in `ROWS`, `KEYS` and `WIDTHS`. Over them each declaration's forms
 take a few distinct structures (`laws.skeletons`: extraction is priced, so a tile's extents can choose
 another form), and each is certified at a small tile of the same structure (`witness`), proven over the
-reals. A witness keeps every axis past one where it can and the kernel tile's equal extents equal, so a form
-that confuses two axes of one extent shows it in its values (the keys-first forward's broadcast did, at
-square tiles alone)."""
+reals. A witness keeps every axis past one and its extents equal and unequal as the kernel tile's are, so a
+form that confuses two axes of one extent shows it in its values (the keys-first forward's broadcast did, at
+square tiles alone). The proofs are reduced-tile proofs, shared by the kernel tiles of their structure
+(`dew.algebra.laws`)."""
 
 import functools
 import itertools
@@ -106,34 +107,28 @@ def _pattern(tile: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(index for index, other in enumerate(tile) if other == extent) for extent in tile)
 
 
-SMALL = tuple(sorted(itertools.product((2, 3, 4, 5), (1, 2), (2, 3, 4, 5)),
-                     key=lambda tile: (sum(tile), tile)))
-"""A witness's candidate tiles, (rows, keys, width): the walked axis at most 2 (a law's maxima compare every
-key of two tiles), every other axis past one, smallest first."""
-
-SMALLEST = tuple(sorted(itertools.product((1, 2, 3, 4, 5), (1, 2), (1, 2, 3, 4, 5)),
-                        key=lambda tile: (sum(tile), tile)))
-"""Where no tile of `SMALL` takes a structure: any small tile."""
+SMALL = tuple(sorted(itertools.product((2, 3, 4, 5), (2,), (2, 3, 4, 5)), key=lambda tile: (sum(tile), tile)))
+"""A witness's candidate tiles, (rows, keys, width): the walked axis 2 (a law's maxima compare every key of
+two tiles), every axis past one (an axis of one broadcasts as a kept axis does), smallest first."""
 
 
 def witness(declaration, shapes, kernel_tile: tuple[int, int, int], found: tuple) -> tuple[int, int, int]:
-    """A small tile whose forms' structure is `found` (the kernel tile's): first one whose axes' equal
-    extents are the kernel tile's (the walked axis apart), else any of `SMALL`, else of `SMALLEST`."""
-    rows, _, width = kernel_tile
-    alike = [tile for tile in SMALL if (tile[0] == tile[2]) == (rows == width)]
-    for tile in (*alike, *SMALL, *SMALLEST):
-        if laws.skeletons(declaration, shapes(*tile)) == found:
+    """The smallest tile whose extents are equal and unequal as the kernel tile's are (an unused axis, 0,
+    apart) and whose forms' structure is `found`, the kernel tile's."""
+    for rows, keys, width in SMALL:
+        tile = (rows, keys, width if kernel_tile[2] else 0)
+        if _pattern(tile) == _pattern(kernel_tile) and laws.skeletons(declaration, shapes(*tile)) == found:
             return tile
-    raise AssertionError(f"no small tile takes the structure the kernel tile {kernel_tile} takes")
+    raise AssertionError(f"no small tile takes the structure and the equal extents of {kernel_tile}")
 
 
 def _certify_every_structure(declaration, shapes, tiles) -> None:
-    """Each distinct structure `declaration`'s forms take over the kernel `tiles` certified at its
-    witness."""
+    """Each distinct structure `declaration`'s forms take over the kernel `tiles`, with each pattern of equal
+    extents it takes it at, certified at its witness."""
     structures: dict = {}
     for tile in tiles:
-        structures.setdefault(laws.skeletons(declaration, shapes(*tile)), tile)
-    for found, tile in structures.items():
+        structures.setdefault((laws.skeletons(declaration, shapes(*tile)), _pattern(tile)), tile)
+    for (found, _), tile in structures.items():
         laws.certified(declaration, shapes(*witness(declaration, shapes, tile, found)))
 
 
