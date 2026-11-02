@@ -26,10 +26,10 @@ NULL_RUNS = 64
 """The null control's runs: the reference against its reformulation on the same draws, judged as a weighed
 site is."""
 
-CONDITIONED_SEEDS = 64
-"""The weighed check's declared seeds here: its heavy class holds one value a draw, so the reference against
-itself unpaired needs 32 to resolve (`seeds_for(..., conditioning=True)`, job 20261102231336-2d4bf54c),
-and twice that resolves a doubled error on it and holds the null's runs."""
+CONDITIONED_SEEDS = 256
+"""The weighed check's declared seeds here: its heavy class holds one value a draw, some draws exact in both
+arms (no paired ratio), so its pooled interval resolves within 1.5 at 256 over the null's runs (64 left 10
+of 64 runs undecided; job 20261102233337, paired)."""
 
 
 def draw(seed: int):
