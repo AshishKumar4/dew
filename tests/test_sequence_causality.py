@@ -170,3 +170,17 @@ def test_a_sequence_axis_kept_through_reshapes_is_walked_at_any_batch():
     for function, causal in ((heads, True), (lambda tokens: shifted_left(heads(tokens)), False)):
         program = jax.make_jaxpr(function)(tokens)
         assert (causality_refusal(program, 0, 4096, (0,)) is None) == causal
+
+
+def test_a_convolution_padding_an_empty_sequence_reads_nothing():
+    """A convolution over a sequence with no positions whose padding still gives outputs: each output
+    reads no position, so the program is causal, where the walk's convolution rule read an empty
+    operand's rows."""
+    def padded(tokens):
+        empty = embedded(tokens)[:, :0, :1]
+        out = jax.lax.conv_general_dilated(empty, jnp.ones((2, 1, 1)), (1,), ((1, 1),),
+                                           dimension_numbers=("NWC", "WIO", "NWC"))
+        return embedded(tokens) + jnp.sum(out)
+
+    program = jax.make_jaxpr(padded)(jax.ShapeDtypeStruct((1, 6), jnp.int32))
+    assert causality_refusal(program, 0, 6, (0,)) is None

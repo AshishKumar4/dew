@@ -106,6 +106,14 @@ def _none(size: int) -> np.ndarray:
     return np.full(size, NONE, np.int64)
 
 
+def _read_at(latest: np.ndarray, rows: np.ndarray) -> np.ndarray:
+    """The latest position each of `rows` (-1 for none, of any shape) reads among `latest`'s, which may
+    hold none."""
+    if len(latest) == 0:
+        return np.full(rows.shape, NONE, np.int64)
+    return np.where(rows >= 0, latest[np.clip(rows, 0, len(latest) - 1)], NONE)
+
+
 type Held = Reads | None
 """What the walk knows of a value: the positions it reads, or None where the tokens do not reach it."""
 
@@ -474,8 +482,7 @@ def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
     size = _shape(eqn.outvars[0])[out_spec[2 + spatial]]
     reads = np.arange(size)[:, None] * stride - low + np.arange(width)[None, :] * dilation
     inside = (reads >= 0) & (reads < len(lhs.latest))
-    rows = np.where(inside, lhs.latest[np.clip(reads, 0, len(lhs.latest) - 1)], NONE).max(axis=1,
-                                                                                         initial=NONE)
+    rows = _read_at(lhs.latest, np.where(inside, reads, -1)).max(axis=1, initial=NONE)
     return [Reads(out_spec[2 + spatial], rows)]
 
 
@@ -596,7 +603,7 @@ def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
 def _decided(ids: np.ndarray, latest: np.ndarray) -> Reads:
     """Reads of a value whose entries hold the operand rows `ids` (-1 for none): along its axis whose
     index decides the rows, each index's latest; the axis giving the earliest where none does alone."""
-    read = np.where(ids >= 0, latest[np.clip(ids, 0, len(latest) - 1)], NONE)
+    read = _read_at(latest, ids)
     best: Reads | None = None
     for axis in range(ids.ndim):
         rows = np.moveaxis(read, axis, 0).reshape(ids.shape[axis], -1).max(axis=1, initial=NONE)
