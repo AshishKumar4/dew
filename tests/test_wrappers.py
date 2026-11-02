@@ -708,7 +708,9 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
                                   vision_start_token_id=253, vision_end_token_id=252, **VLM_TEXT[model_type])
 
     def built(dtype):
-        return AutoModelForImageTextToText.from_config(config, dtype=dtype).eval()
+        # Its experts looped as written, which the float64 twin's matmuls run (grouped_mm takes no double).
+        return AutoModelForImageTextToText.from_config(config, dtype=dtype,
+                                                       experts_implementation="eager").eval()
 
     torch.manual_seed(0)
     model = built(torch.float32)
