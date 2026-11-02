@@ -96,6 +96,20 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                               "    again['REEXECED'] = '1'\n"
                               "    os.execve(sys.executable, [sys.executable, __file__], again)\n"
                               "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
+        # A fork restarting without the recorder's start, then its parent restarting with it: the fork writes
+        # its restart into its parent's log, which the parent's own restart must not answer (review).
+        "reexec_fork.py": "import os, sys\n"
+                          "if os.environ.get('REEXECED') != '1':\n"
+                          "    child = os.fork()\n"
+                          "    if child == 0:\n"
+                          "        bare = {name: value for name, value in os.environ.items()\n"
+                          "                if name != 'DEW_EXECUTED_FOLLOWER'}\n"
+                          "        bare['REEXECED'] = '1'\n"
+                          "        os.execve(sys.executable, [sys.executable, __file__], bare)\n"
+                          "    os.waitpid(child, 0)\n"
+                          "    again = {**os.environ, 'REEXECED': '1'}\n"
+                          "    os.execve(sys.executable, [sys.executable, __file__], again)\n"
+                          "sys.path.insert(0, 'tests')\nimport plain\nassert plain.helper()\n",
         # The same with the option grouped with another (review: `-BX utf8` read the `utf8` as the program).
         "reexec_bare_bx.py": "import os, sys\n"
                              "if os.environ.get('REEXECED') != '1':\n"
@@ -123,6 +137,8 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                            "                   check=True)\n",
         "test_reexecs_bare_env.py": started + "subprocess.run([sys.executable, 'tests/reexec_bare_env.py'],\n"
                                               "                   check=True)\n",
+        "test_reexecs_fork.py": started + "again = [sys.executable, 'tests/reexec_fork.py']\n"
+                                          "subprocess.run(again, check=True)\n",
         "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
                                     "    child.kill()\n    child.wait()\n",
         "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
@@ -139,7 +155,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
         return reusable_now(ci, tests)
 
     # The first four files are followed (reused as their inputs stand); every other, unfollowed, never is.
-    never = [False] * 9
+    never = [False] * 10
     assert reused() == [True, True, True, True, *never]
     (tmp_path / "notes/page.md").write_text("page again\n")
     assert reused() == [False, True, True, True, *never]
@@ -159,6 +175,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_reexecs_base.py": ["unrecorded"],
                                    "tests/test_reexecs_argv0.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_env.py": ["unrecorded"],
+                                   "tests/test_reexecs_fork.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_w.py": ["unrecorded"],
                                    "tests/test_reexecs_bare_x.py": ["unrecorded"]}
 
