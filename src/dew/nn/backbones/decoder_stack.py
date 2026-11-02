@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
@@ -85,24 +86,31 @@ def on_host(tree) -> bool:
 
 
 def _apart(held: dict) -> tuple[dict, dict]:
-    """A run's read-only variables as its layers read them from their banks: the variables a layer is
-    fetched as, and the expert kernels it reads in place where they sit in device memory (`BANKED_EXPERTS`,
-    each the run's whole stack, `dew.nn.moe.experts_apart`), which fetching would copy out a layer at a
-    time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on an H100). Kernels in host memory
-    are fetched with the rest."""
-    params = held.get('params')
-    if params is None or not holds_experts(params):
-        return held, {}
-    apart = experts_apart({'params': params})
-    if on_host(apart[BANKED_EXPERTS]):
-        return held, {}
-    return {**held, 'params': apart['params']}, {BANKED_EXPERTS: apart[BANKED_EXPERTS]}
+    """A run's read-only variables as its layers read them from their banks: those in host memory, which
+    a layer is fetched as a layer at a time, and those in device memory, which each layer reads where they
+    lie (`_with`): the expert kernels whole (`BANKED_EXPERTS`, each the run's stack,
+    `dew.nn.moe.experts_apart`) and the rest sliced in the iteration that reads them, where the reading
+    fusion takes the slice. Fetched, a layer is a copy the iteration before stages: 1.2 GB a layer at
+    Qwen3-30B-A3B's experts, half a decode step on an H100, and 0.29 ms a step of its attention's
+    projections, norms and router over 8 layers (OM-1342-cache-experts-2f9c0a176)."""
+    flat = flatten_dict(held)
+    fetched = unflatten_dict({path: leaf for path, leaf in flat.items() if on_host(leaf)})
+    in_place = unflatten_dict({path: leaf for path, leaf in flat.items() if not on_host(leaf)})
+    params = in_place.get('params')
+    if params is not None and holds_experts(params):
+        in_place = {**in_place, **experts_apart({'params': params})}
+    return fetched, in_place
 
 
 def _with(read, in_place: dict, index):
-    """A layer's read-only variables: those fetched for it, and the expert kernels it reads in place at
-    its `index` in the run (`dew.nn.moe.at_iteration`)."""
-    return read if not in_place else {**read, **at_iteration(in_place, index)}
+    """A layer's read-only variables: those fetched for it, and those it reads in place at its `index` in
+    the run (`_apart`): its slice of each, and the expert kernels whole beside the index
+    (`dew.nn.moe.at_iteration`)."""
+    if not in_place:
+        return read
+    sliced = merge(read, _layer_slice({name: tree for name, tree in in_place.items()
+                                       if name != BANKED_EXPERTS}, index))
+    return sliced if BANKED_EXPERTS not in in_place else {**sliced, **at_iteration(in_place, index)}
 
 
 def _layer_slice(tree, index):
@@ -347,9 +355,10 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
     `banked` says the store holds each run's parameters as one array
     (`dew.inference.banks`). Those runs, and runs the layout left in host
-    memory, are read one layer at a time in `_prefetched_run`: at most two of a
-    run's layers are on the device, staging crosses run boundaries, and no fetch
-    can be hoisted above the layer before it (it is issued inside that layer's
+    memory, are read one layer at a time in `_prefetched_run`: a bank in device
+    memory where it lies (`_apart`), and one in host memory fetched, at most two
+    of a run's layers on the device, staging crossing run boundaries, and no
+    fetch hoisted above the layer before it (it is issued inside that layer's
     iteration or ordered by the carry). Training uses the native Linen scan
     instead, with map_variables staging one row under remat, so the backward
     refetches the pinned bank rather than keeping a device copy. Each fetched
@@ -503,9 +512,9 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     reads and writes its keys and values where the bank holds them, a step's
     tokens at their slots alone (`dew.nn.kv_cache.at_layer`), and every other
     leaf as its slice, written back; a cache the layers create comes out stacked
-    like `state`. `in_place` holds the expert kernels each layer reads where
-    they lie (`_apart`), handed to every iteration whole with its index rather
-    than staged.
+    like `state`. `in_place` holds the variables each layer reads where they
+    lie in device memory (`_apart`), handed to every iteration whole with its
+    index rather than staged.
     """
     in_place = in_place or {}
     def body(carry, index):
