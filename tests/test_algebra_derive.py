@@ -159,6 +159,24 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
     assert_as_exact(jax.jit(run), jax.jit(whole(DECLARED[name][0])), draw, f"{name} {walk}", seeds=16)
 
 
+def softmax_beside_a_half_maximum(q, k, v, rows, keys):
+    """A softmax walk beside an unwalked maximum of the queries in fp16, independent of it."""
+    del rows, keys
+    s = (q @ k.T) * WIDTH ** -0.5
+    p = jnp.exp(s - jnp.max(s, axis=-1, keepdims=True))
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None] + jnp.max(q.astype(jnp.float16), axis=-1).astype(
+        jnp.float32)[:, None]
+
+
+def test_each_maximum_takes_its_own_dtypes_least_value():
+    """A softmax walk in fp32 beside an independent fp16 maximum: each maximum's empty state its own
+    dtype's least value, so the declaration derives and its walk computes it (check 1), where one least
+    value for the whole program refused maxima of two dtypes (row 3637)."""
+    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False, saturation=SATURATION)
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(softmax_beside_a_half_maximum)), draw,
+                    "a softmax beside an fp16 maximum", seeds=16)
+
+
 def unshifted(q, k, v, rows, keys):
     """Softmax with no maximum: no walked reduction scales the sums, each an independent sum."""
     del rows, keys
