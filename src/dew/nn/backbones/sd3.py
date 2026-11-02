@@ -180,7 +180,7 @@ class SD3Transformer(TextStream, nn.Module):
                        + embedding(self, conditioning.pooled, self.features, "text_embedder", **dense))
 
         context = Dense(self.caption_projection_dim, name="context_embedder", **dense,
-                        dot_general=float32_dot_general)(
+                        kernel_axes=(None, "embed"), dot_general=float32_dot_general)(
             conditioning.context)
         for index in range(self.num_layers):
             image, context = self._block(index, name=f"transformer_blocks_{index}")(
@@ -189,7 +189,7 @@ class SD3Transformer(TextStream, nn.Module):
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
         image = Dense(patch * patch * self.out_channels, name="proj_out", **dense,
-                      dot_general=float32_dot_general)(image)
+                      kernel_axes=("embed", None), dot_general=float32_dot_general)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 

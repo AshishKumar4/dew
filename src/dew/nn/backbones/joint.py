@@ -53,9 +53,11 @@ def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = Tru
     activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
     as `{name}_linear_1` and `{name}_linear_2` in the calling module.
     """
+    names = (f"{name}_linear_1", f"{name}_linear_2")
+    # Each shards its output, the model's width.
     mlp = GatedMLP(features, features, in_features=x.shape[-1], activation=activation, use_bias=bias,
-                    names=(f"{name}_linear_1", f"{name}_linear_2"), dtype=dtype, precision=precision,
-                    name=name)
+                    names=names, named_axes=tuple((layer, (None, "embed")) for layer in names), dtype=dtype,
+                    precision=precision, name=name)
     nn.share_scope(owner, mlp)
     return mlp(x)
 

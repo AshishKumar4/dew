@@ -144,6 +144,8 @@ class GatedMLP(nn.Module):
     in_features: int | None = None
     activation_after: bool = False
     names: tuple[str, str] = ('up_proj', 'down_proj')
+    named_axes: tuple[tuple[str, LogicalAxes], ...] = ()
+    """The logical axes of projections under names of the owner's own (`names`), beside `MLP_AXES`."""
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -170,14 +172,15 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
+        axes = {**MLP_AXES, **dict(self.named_axes)}
         if self._gated():
             if self._packed():
                 group = self._group()
                 self.gate_up_proj = dense(sum(group.widths), name=group.packed,
-                                          kernel_axes=MLP_AXES.get(group.packed))
+                                          kernel_axes=axes.get(group.packed))
             else:
                 self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj',
-                                       kernel_axes=MLP_AXES['gate_proj'])
+                                       kernel_axes=axes['gate_proj'])
         elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
             raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
         if self._gated() and (self.in_features is not None or self.activation_after
@@ -185,8 +188,8 @@ class GatedMLP(nn.Module):
             raise ValueError('in_features, activation_after and names shape an ungated MLP')
         up, down = ('up_proj', 'down_proj') if self._gated() else self.names
         if not self._packed():
-            self.up_proj = dense(projections[up][1], name=up, kernel_axes=MLP_AXES.get(up))
-        self.down_proj = dense(projections[down][1], name=down, kernel_axes=MLP_AXES.get(down),
+            self.up_proj = dense(projections[up][1], name=up, kernel_axes=axes.get(up))
+        self.down_proj = dense(projections[down][1], name=down, kernel_axes=axes.get(down),
                                **normal_kernel(self.init_std if self.output_init_std is None
                                                else self.output_init_std))
         if self.dropout_rate:
