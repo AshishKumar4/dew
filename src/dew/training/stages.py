@@ -50,9 +50,7 @@ import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import in_namespace
 from dew.mesh import STAGE_AXIS, LayoutRefused
-from dew.nn.backbones.decoder_stack import DecoderBank, RowCut, RowStack, stacked_rows
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.sharding import held_by_stage
 from dew.optim import STACKED_STATES
@@ -61,6 +59,7 @@ if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition
     from dew.distributed.placement import Layout
+    from dew.nn.backbones.decoder_stack import DecoderBank, RowCut, RowStack
     from dew.nn.protocols import ProjectionGroup
     from dew.nn.sharding import Schedule
     from dew.state import TrainState
@@ -99,6 +98,15 @@ def stage_mesh(mesh: Mesh, stage: int) -> Mesh:
     a stacked leaf sits there with the spec the layout gives its layer."""
     return Mesh(np.take(mesh.devices, [stage], axis=mesh.axis_names.index(STAGE_AXIS)), mesh.axis_names,
                 axis_types=mesh.axis_types)
+
+
+def _stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
+    """`decoder_stack.stacked_rows`, imported where a run is stacked: a run with no stage axis reads none of
+    the decoder stack, as before stage-local storage (the axis registry its modules fill on import declares
+    a parameter of another model by its name alone, ledger 1153)."""
+    from dew.nn.backbones.decoder_stack import stacked_rows
+
+    return stacked_rows(rows, shape)
 
 
 def _array_rows(path, leaf: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
@@ -145,6 +153,8 @@ class StageLocal:
                       "state keeps every layer whole on every stage", type(objective).__name__, stages)
         # A run a collection holds in part (a stack frozen by layer index) stays on its stored layers in
         # every collection, which the pipeline restacks as it would any stored layers.
+        from dew.inference.banks import in_namespace
+
         return cls(tuple(site for site in declared if not any(
             site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh)
 
@@ -152,7 +162,7 @@ class StageLocal:
     def stages(self) -> int:
         return self.mesh.shape[STAGE_AXIS]
 
-    def staged[Leaf](self, tree, stack: RowStack[Leaf] = stacked_rows):
+    def staged[Leaf](self, tree, stack: RowStack[Leaf] = _stacked_rows):
         """`tree`, any tree that holds or mirrors variables, with each run stacked by stage, its rows
         made one leaf by `stack(rows, shape)` (`StackView.stage_form`): arrays, shapes or shardings. A
         run already stacked stays as it is."""
@@ -368,7 +378,7 @@ def _cut_piece(piece: jax.Array, *, stacked: int) -> tuple[jax.Array, ...]:
 
 def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Array:
     """A stage's rows stacked into its piece of the leaf, `[1, *within, ...]`."""
-    return stacked_rows(rows, (1, *within))
+    return _stacked_rows(rows, (1, *within))
 
 
 def _layered_arrays(local: StageLocal, tree):
