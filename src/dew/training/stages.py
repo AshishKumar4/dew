@@ -254,12 +254,15 @@ class StageLocal:
 
     def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState]
                  ) -> tuple[TrainState, TrainState]:
-        """A state given whole, its runs stacked by stage onto the placement `validated` gives the
-        stacked state's shapes, and that placement."""
+        """A state given whole, wherever its arrays are (one device's, another mesh's), its runs stacked by
+        stage onto the placement `validated` gives the stacked state's shapes, and that placement: placed
+        whole on this mesh first, as `validated` places it, and stacked there."""
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(jax.eval_shape(stack, state))
-        return (owned_program(stack, out_shardings=placement)(state) if self.sites
-                else jax.device_put(state, placement)), placement
+        if not self.sites:
+            return jax.device_put(state, placement), placement
+        whole = jax.device_put(state, validated(jax.eval_shape(lambda given: given, state)))
+        return owned_program(stack, out_shardings=placement)(whole), placement
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,
