@@ -40,9 +40,9 @@ EXACT = frozenset({
     "name", "pjit_name", "nextafter", "random_bits", "random_seed", "random_wrap", "random_unwrap",
     "threefry2x32", "split", "scatter", "stack", "unstack", "bitcast_convert_type", "device_put",
     "sharding_constraint", "mesh_cast", "pvary", "reshard", "tie_in", "reduce_and", "reduce_or",
-    "select_and_gather_add_exact"})
+    "select_and_gather_add_exact", "empty2"})
 """Operations whose float results are their operands' values moved or selected, or exact: no rounding.
-An integer result rounds nothing either."""
+An integer result rounds nothing either, nor does an array made to be written over (`empty2`)."""
 
 ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "reduce_precision"})
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
