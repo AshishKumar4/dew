@@ -26,6 +26,10 @@ NULL_RUNS = 64
 """The null control's runs: the reference against its reformulation on the same draws, judged as a weighed
 site is."""
 
+WEIGHED_DECIDED = 40
+"""The null runs the weighed check decides at least: 40 of 64 on armada at 256 conditioned seeds (20 the
+unweighted check passed, 4 its worst-row rule failed, row 3684; job for 7316a2074a)."""
+
 CONDITIONED_SEEDS = 256
 """The weighed check's declared seeds here: its heavy class holds one value a draw, some draws exact in both
 arms (no paired ratio), so its pooled interval resolves within 1.5 at 256 over the null's runs (64 left 10
@@ -123,16 +127,20 @@ def test_an_element_no_rounding_reaches_must_be_exact_in_every_arm():
 def test_the_weighed_check_passes_the_reference_against_its_reformulation():
     """The null control, judged as a weighed site is (paired, as the corner sites run): the reference
     against its own math reformulated, the amplified element cancelled the other way and the products'
-    operands swapped, on the same draws, passes every one of `NULL_RUNS` runs, each verdict naming the
-    check that decided it, its false-failure rate bounded by `null_rate_bound`."""
+    operands swapped, on the same draws. Over `NULL_RUNS` runs no verdict the weighed check decides is red,
+    and it decides at least `WEIGHED_DECIDED` of them, so the control is never vacuous. The unweighted
+    check's own verdicts are not asserted here: its worst-row rule decides some of these heavy-tailed runs
+    falsely, the central gate's row 3684, whose own null judges it."""
     def reformulated(a, b, big):
         return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
 
     verdicts = null_runs(jax.jit(reference), draw, "the reference against its reformulation, weighed",
                          seeds=WEIGHED_SEEDS, runs=NULL_RUNS, dew_fn=jax.jit(reformulated), paired=True,
                          conditioning=CONDITIONED_SEEDS)
-    reds = sum(not verdict.startswith("pass") for verdict, _, _ in verdicts)
-    assert reds == 0, (reds, null_rate_bound(reds, NULL_RUNS), verdicts)
+    weighed = [verdict for verdict, _, _ in verdicts if verdict.endswith(", conditioned")]
+    reds = sum(verdict != "pass, conditioned" for verdict in weighed)
+    assert reds == 0, (reds, null_rate_bound(reds, len(weighed)), verdicts)
+    assert len(weighed) >= WEIGHED_DECIDED, (len(weighed), verdicts)
 
 
 def test_a_rounding_reaches_an_element_its_first_derivative_does_not():
