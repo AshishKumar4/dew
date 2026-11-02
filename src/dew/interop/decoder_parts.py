@@ -1087,16 +1087,18 @@ under the mixer's slot (`dew.nn.mixers.short_conv.GatedShortConv`): its projecti
 taps."""
 
 MAMBA_LEAVES: Leaves = {
-    **{f'mamba.{leaf}': ('self_attn', leaf) for leaf in ('A_log', 'D')},
+    **{f'mamba.{leaf}': ('self_attn', leaf) for leaf in ('A_log', 'D', 'dt_bias')},
+    'mamba.norm.weight': ('self_attn', 'norm', 'weight'),
     **{f'mamba.{linear}.{leaf}': ('self_attn', linear, 'kernel' if leaf == 'weight' else 'bias')
        for linear in ('in_proj', 'x_proj', 'dt_proj', 'out_proj') for leaf in ('weight', 'bias')},
     **{f'mamba.conv1d.{leaf}': ('self_attn', 'conv1d', leaf) for leaf in ('weight', 'bias')},
     **{f'mamba.{norm}.weight': ('self_attn', norm, 'scale')
        for norm in ('dt_layernorm', 'b_layernorm', 'c_layernorm')},
 }
-"""A Mamba layer's tensors (Jamba's), by their names past `model.layers.N.`, under the mixer's slot
-(`dew.nn.mixers.mamba.Mamba`): its projections, its `[D, 1, K]` taps, its `A_log` and `D`, and the norms
-of its raw step, B and C (`Mamba.step_norm_eps`)."""
+"""A Mamba mixer's tensors, by their names past `model.layers.N.`, under the mixer's slot: Jamba's Mamba-1
+(`dew.nn.mixers.mamba.Mamba`), its projections, its `[D, 1, K]` taps, its `A_log` and `D`, and the norms
+of its raw step, B and C (`Mamba.step_norm_eps`); Falcon-H1's Mamba-2 (`dew.nn.mixers.mamba2.Mamba2`), its
+projections and taps, its heads' `A_log`, `D` and `dt_bias`, and its gated norm's weight."""
 
 
 XIELU_LEAVES: Leaves = {f'mlp.act_fn.{name}': ('mlp', 'act_fn', name)

@@ -217,6 +217,10 @@ class CausalTransformer(nn.Module):
     """The dense feed-forward width. None means four times `emb_features`, a
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
+    mlp_multipliers: tuple[float, float] | None = None
+    """The dense feed-forward's gate and output multipliers (Falcon-H1's `mlp_multipliers`,
+    `GatedMLP.gate_multiplier` and `down_multiplier`); None for neither. The shared and routed experts
+    take none."""
     max_seq_len: int = 2048
     context_length: int | None = None
     """The context a checkpoint states (max_position_embeddings), which an export writes back;
@@ -745,11 +749,14 @@ class CausalTransformer(nn.Module):
                                       swiglu_limit=self.swiglu_limit, ngpt=self.ngpt,
                                       init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
+        dense = gated_mlp if self.mlp_multipliers is None else functools.partial(
+            gated_mlp, gate_multiplier=float(self.mlp_multipliers[0]),
+            down_multiplier=float(self.mlp_multipliers[1]))
         mixture = self.mixture
         if self.mlp == 'swigluoai' and (mixture is None or len(self.sparse_layers) != self.num_layers):
             raise ValueError('swigluoai requires routed experts on every layer')
         if mixture is None:
-            return gated_mlp, None, None
+            return dense, None, None
         # The dense width is read only where the experts take it: layers that differ in it have none.
         width = self.hidden_features if mixture.expert_features is None else mixture.expert_features
         built = mixture.build(
@@ -759,7 +766,7 @@ class CausalTransformer(nn.Module):
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, precision=self.precision)
         # A branch beside the dense feed-forward rides every sparse layer's; one in its place replaces it.
         routed, parallel = (None, built) if mixture.beside_dense else (built, None)
-        return gated_mlp, routed, parallel
+        return dense, routed, parallel
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:

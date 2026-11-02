@@ -150,6 +150,26 @@ def _read_scaled_model(view: PartView) -> Mapping[str, object]:
     return {**_read_llama_model(view), 'embedding_multiplier': float(view.embedding_multiplier)}
 
 
+def _read_multiplied_causal_lm(view: PartView) -> Mapping[str, object]:
+    """Falcon-H1's causal LM: Llama's, its logits times its model's `lm_head_multiplier`, which Dew's head
+    reads as dividing its input by the reciprocal (`logits_scaling`, in at least float32)."""
+    return {**_read_causal_lm(view), 'logits_scaling': 1.0 / float(view.model.lm_head_multiplier)}
+
+
+def _read_parallel_hybrid_layer(view: PartView) -> Mapping[str, object]:
+    """Falcon-H1's layer: one norm's output read side by side by its Mamba-2 mixer (`mamba`, whose code
+    first scales its input by its `ssm_in_multiplier`) and its attention (`self_attn`, its input times
+    `attention_in_multiplier`), their outputs times `ssm_out_multiplier` and `attention_out_multiplier`
+    summed in that order into one residual add, then Llama's feed-forward: a per-layer fact
+    (`_Assembler.parallel`) of each branch's name and its input's and its output's multipliers
+    (`dew.nn.mixers.parallel.ParallelBranch`), by the child that runs it."""
+    return {_LAYER: {'parallel': {
+        'mamba': {'name': 'mamba', 'input_multiplier': float(view.mamba.ssm_in_multiplier),
+                  'output_multiplier': float(view.ssm_out_multiplier)},
+        'self_attn': {'name': 'attention', 'input_multiplier': float(view.attention_in_multiplier),
+                      'output_multiplier': float(view.attn_out_multiplier)}}}}
+
+
 def _read_scaled_layer(view: PartView) -> Mapping[str, object]:
     """Granite's layer: Llama's, each sublayer's output times its `residual_multiplier` into the residual."""
     return {'residual_multiplier': float(view.residual_multiplier)}
@@ -266,6 +286,12 @@ def _read_laguna_attention(view: PartView) -> Mapping[str, object]:
                         f"its code reads {gates}")
     return {**fields, 'output_gate': True, 'output_gate_activation': 'softplus',
             _LAYER: {'heads': heads, 'attention': {'gate_projection': 'head' if per_head else 'own'}}}
+
+
+def _read_keyed_attention(view: PartView) -> Mapping[str, object]:
+    """Falcon-H1's attention: Llama's, its keys times `key_multiplier` before their rotation, which scales
+    every score alike: read as the scores' scale (`attention_scale`), its own times that multiplier."""
+    return {**_read_attention(view), 'attention_scale': float(view.scaling) * float(view.key_multiplier)}
 
 
 def _read_nope_attention(view: PartView) -> Mapping[str, object]:
@@ -406,6 +432,60 @@ def _read_step_normed_mamba(view: PartView) -> Mapping[str, object]:
 def _read_mlp(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
+
+
+def _read_multiplied_mlp(view: PartView) -> Mapping[str, object]:
+    """Falcon-H1's MLP: Llama's, its gate projection's output times the first of its `mlp_multipliers`
+    before the activation and its down projection's output times the second (`mlp_multipliers`)."""
+    multipliers = (float(view.gate_multiplier), float(view.down_multiplier))
+    return {**_read_mlp(view), **({'mlp_multipliers': multipliers} if multipliers != (1.0, 1.0) else {})}
+
+
+def _read_sectioned_mamba2(view: PartView) -> Mapping[str, object]:
+    """Falcon-H1's Mamba-2 mixer (`dew.nn.mixers.mamba2.Mamba2`): its in projection's output times its
+    `mup_vector`, one factor a section of z, x, B, C and dt (`section_multipliers`), Mamba-2's causal
+    depthwise convolution activated by silu and chunked scan, the scan's output gated by z under its
+    gated norm, in the order its `norm_before_gate` states and its weight applied in float32
+    (`norm_order`, `norm_scale_wide`), or with no norm where `mamba_rms_norm` is off, and its out
+    projection biased apart (`projectors_bias`, `out_bias`); a per-layer fact (`_with_mixers`). The
+    multiplier its input takes first is its layer's branch's (`_read_parallel_hybrid_layer`)."""
+    heads, head_dim, inner = int(view.num_heads), int(view.head_dim), int(view.intermediate_size)
+    groups, state, taps = int(view.n_groups), int(view.ssm_state_size), int(view.conv_kernel_size)
+    conv, width = view.conv1d, inner + 2 * groups * state
+    if heads * head_dim != inner:
+        raise Ambiguous(f"its {heads} heads of {head_dim} do not tile its {inner} inner channels")
+    if (view.activation != 'silu' or conv.groups != width or conv.in_channels != width
+            or conv.kernel_size != (taps,) or conv.padding != (taps - 1,)):
+        raise Ambiguous("the convolution is not one causal depthwise filter per channel activated by silu")
+    vector = view.mup_vector.reshape(-1)
+    sections, start = [], 0
+    for size in (inner, inner, groups * state, groups * state, heads):
+        section = vector[start:start + size]
+        if section.numel() != size or not bool((section == section[0]).all()):
+            raise Ambiguous("its in projection's multipliers are not one factor a section of z, x, B, C "
+                            "and dt")
+        sections.append(float(section[0]))
+        start += size
+    if start != vector.numel():
+        raise Ambiguous("its in projection's multipliers run past its sections")
+    use_bias = view.in_proj.bias is not None
+    fields: dict[str, object] = {
+        'num_heads': heads, 'head_dim': head_dim, 'state_size': state, 'n_groups': groups,
+        'conv_kernel': taps, 'chunk_size': int(view.chunk_size), 'use_bias': use_bias,
+        'use_conv_bias': conv.bias is not None,
+        'time_step_limit': tuple(float(bound) for bound in view.time_step_limit),
+        'section_multipliers': tuple(sections),
+        'out_bias': None if (view.out_proj.bias is not None) == use_bias else view.out_proj.bias is not None}
+    stated: dict[str, object] = {}
+    if view.mamba_rms_norm:
+        norm = view.norm
+        fields.update(norm_order='norm_first' if norm.norm_before_gate else 'gate_first',
+                      norm_scale_wide=True, norm_groups=int(norm.n_groups))
+        # The gated norm's epsilon is the mixer's context's, the block norms' (`MixerContext.norm_eps`).
+        stated['norm_eps'] = float(norm.variance_epsilon)
+    else:
+        fields['norm_order'] = None
+    return {**stated, _LAYER: {'mixer': {'kind': 'mamba2', 'class': 'mamba2', 'fields': fields}}}
 
 
 def _read_mixtral_moe(view: PartView) -> Mapping[str, object]:
@@ -720,6 +800,7 @@ _GLM4 = 'transformers.models.glm4.modeling_glm4'
 _APERTUS = 'transformers.models.apertus.modeling_apertus'
 _LAGUNA = 'transformers.models.laguna.modeling_laguna'
 _JAMBA = 'transformers.models.jamba.modeling_jamba'
+_FALCON_H1 = 'transformers.models.falcon_h1.modeling_falcon_h1'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -835,6 +916,24 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('moe', f'{_LAGUNA}:LagunaSparseMoeBlock', _SHARED_MOE_CHILDREN, _read_scaled_shared_moe),
     KnownPart('router', f'{_LAGUNA}:LagunaTopKRouter', {}, _read_laguna_router,
               ('weight', 'e_score_correction_bias')),
+    KnownPart('causal_lm', f'{_FALCON_H1}:FalconH1ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_multiplied_causal_lm),
+    KnownPart('model', f'{_FALCON_H1}:FalconH1Model',
+              {'embed_tokens': ('embedding',), 'layers': ('layers',), 'final_layernorm': ('norm',),
+               'rotary_emb': ('rotary',)}, _read_scaled_model, canonical={'final_layernorm': 'norm'}),
+    KnownPart('layer', f'{_FALCON_H1}:FalconH1DecoderLayer',
+              {'mamba': ('mamba2',), 'self_attn': ('attention',), 'feed_forward': ('mlp',),
+               'input_layernorm': ('norm',), 'pre_ff_layernorm': ('norm',)}, _read_parallel_hybrid_layer,
+              canonical={'feed_forward': 'mlp', 'pre_ff_layernorm': 'post_attention_layernorm'}),
+    KnownPart('attention', f'{_FALCON_H1}:FalconH1Attention', _ATTENTION_CHILDREN, _read_keyed_attention),
+    KnownPart('mamba2', f'{_FALCON_H1}:FalconH1Mixer',
+              {'in_proj': ('linear',), 'conv1d': ('conv1d',), 'norm': ('gated_norm',),
+               'out_proj': ('linear',)},
+              _read_sectioned_mamba2, ('dt_bias', 'A_log', 'D')),
+    KnownPart('gated_norm', f'{_FALCON_H1}:FalconH1RMSNormGated', {}, _read_nothing, ('weight',)),
+    KnownPart('gated_norm', 'torch.nn:Identity', {}, _read_nothing),
+    KnownPart('mlp', f'{_FALCON_H1}:FalconH1MLP',
+              dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)), _read_multiplied_mlp),
     KnownPart('causal_lm', f'{_JAMBA}:JambaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
               _read_causal_lm),
     KnownPart('model', f'{_JAMBA}:JambaModel',
@@ -971,6 +1070,10 @@ class Assembly:
     hold flat (`KnownPart.flat`), which the family's `prepare` reads flat."""
     constants: frozenset[str] = frozenset()
     """The canonical names of the stored buffers Dew holds as constants (`KnownPart.constants`)."""
+    branches: Mapping[int, Mapping[str, str]] = field(default_factory=dict)
+    """Each layer that runs mixers side by side (`dew.nn.mixers.parallel`, Falcon-H1's): its children's
+    canonical names onto their branches' names, under which the layer's mixer holds each branch's
+    parameters (`family`)."""
     depths: int = 0
     """The prediction depths the source's release stores past the trunk (its config's
     `num_nextn_predict_layers`: GLM-4.7-Flash's `model.layers.47.*`, HY-3's `.80.*`), which its own code
@@ -1140,6 +1243,38 @@ class _Assembler:
                             "call")
         return part.role
 
+    def parallel(self) -> dict[int, dict[str, str]]:
+        """Each layer whose part runs mixers side by side (`parallel`, Falcon-H1's) made one `parallel` mixer
+        fact in place (`dew.nn.mixers.parallel.ParallelMixer`, a kind `_with_mixers` makes): its branches in
+        its forward's order, each with its input's and its output's multipliers, the one named `attention`
+        the layer's attention (its per-layer fields, `attention`, and its placing no positions, `nope`) and
+        the other its mixer part's (`mixer`). Returns each such layer's children's canonical names onto
+        their branches' (`Assembly.branches`)."""
+        branched: dict[int, dict[str, str]] = {}
+        for layer, facts in self.layers.items():
+            parallel = facts.pop('parallel', None)
+            if parallel is None:
+                continue
+            own = facts.pop('mixer', None)
+            if own is None:
+                raise Ambiguous(f"layer {layer} runs a mixer beside its attention that no part states")
+            own = dict(_records.record(own, 'mixer'))
+            attention = dict(_records.record(facts.pop('attention', {}), 'attention'))
+            if facts.pop('nope', False):
+                attention['nope'] = True
+            runs, names = [], {}
+            for child, stated in _records.record(parallel, 'parallel').items():
+                run = dict(_records.record(stated, child))
+                name = _records.text(run['name'], 'name')
+                run['mixer'] = ({'class': 'attention', 'fields': attention} if name == 'attention'
+                                else {'class': own['class'], 'fields': own['fields']})
+                runs.append(run)
+                names[child] = name
+            facts['mixer'] = {'kind': f"{own['kind']}_attention", 'class': 'parallel',
+                              'fields': {'branches': runs}}
+            branched[layer] = names
+        return branched
+
 
 def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -> Assembly:
     """`model`, a source's causal LM, assembled from known parts, or `Ambiguous` naming the module that
@@ -1152,7 +1287,7 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads')))
+                               if key not in ('routed', 'nope', 'mixer', 'attention', 'heads', 'parallel')))
                   for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
@@ -1174,11 +1309,14 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
-    # A base for the rotary wherever a layer's attention rotates: one neither unrotated nor another mixer.
-    rotating = [layer for layer in range(_records.integer(fields['num_layers'], 'num_layers'))
-                if not {'nope', 'mixer'} & set(assembler.layers.get(layer, {}))]
+    # A base for the rotary wherever a layer's attention rotates: one placed by positions, its layer's
+    # mixer an attention or beside one.
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    rotating = [held for held in (assembler.layers.get(layer, {}) for layer in range(count))
+                if not held.get('nope') and ('parallel' in held or 'mixer' not in held)]
     if rotating and 'rope_theta' not in fields:
         raise Ambiguous("no part states rope_theta")
+    branches = assembler.parallel()
     unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
     fields.update(_without_positions(fields, unrotated))
     fields.update(_with_mixers(fields, {layer: facts['mixer'] for layer, facts in assembler.layers.items()
@@ -1195,7 +1333,7 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
                     tuple(assembler.dropouts), _load_names(model, inventory), frozenset(assembler.flat),
-                    frozenset(assembler.constants), depths)
+                    frozenset(assembler.constants), branches, depths)
 
 
 def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, object]
@@ -1361,6 +1499,12 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
                   **decoder_parts.MAMBA_LEAVES}
         path = decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
+        parts = canonical.split('.', 4)
+        if path is not None and len(parts) == 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
+            branch = assembly.branches.get(int(parts[2]), {}).get(parts[3])
+            if branch is not None:
+                # A branch of a parallel layer's mixer holds what the layer's own mixer would.
+                path = (*path[:3], branch, *path[3:])
         if canonical in assembly.constants and path is not None:
             # A buffer no step trains, held where Dew keeps constants (`KnownPart.constants`).
             return ('constants', *path[1:])
