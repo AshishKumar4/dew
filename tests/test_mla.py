@@ -264,7 +264,7 @@ def test_a_float16_indexer_weighs_its_heads_in_float32():
         return module.weights_proj(x)
 
     half = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float16)
-    variables = half.init(jax.random.key(0), hidden, method=weigh)
+    variables = nn.unbox(half.init(jax.random.key(0), hidden, method=weigh))
     stored = decoding_storage(half, variables)
     assert stored["params"]["weights_proj"]["kernel"].dtype == jnp.float32
     weights = half.apply(stored, hidden, method=weigh)

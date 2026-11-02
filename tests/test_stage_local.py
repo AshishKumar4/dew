@@ -18,6 +18,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying
+from flax import linen as nn
 from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
@@ -171,8 +172,8 @@ def initials(model, optimizer, variables=None):
     def initial(seed: int):
         if seed not in made:
             with jax.enable_x64(new_val=False):
-                drawn = (init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32)) if variables is None
-                         else variables(seed))
+                drawn = (nn.unbox(init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32)))
+                         if variables is None else variables(seed))
                 # The run's own tree and dtypes, which a draw of the same model holds.
                 drawn = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables, drawn)
                 ema = None if start.ema is None else {name: jax.tree.map(jnp.copy, drawn[name])

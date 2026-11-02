@@ -966,7 +966,7 @@ def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
     straight-through gradient."""
     build, parts, refused = ROUNDED[case]
     objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     # A checkpoint's quantizer reads the scale its variables hold, positive.
     variables = _scaled(variables) if case.startswith("checkpoint") else variables
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
@@ -989,7 +989,7 @@ def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refu
                                frozen_fp8=("continuum/up",), measured_on="sm90")
     objective = LMObjective(record.apply(decoder()), LENGTH,
                             adaptation=ChunkAdaptation(select=("down",), damped=True))
-    variables = _scaled(objective.init(jax.random.key(0)))
+    variables = _scaled(nn.unbox(objective.init(jax.random.key(0))))
     codes = traverse_util.flatten_dict(record.packed(variables["params"]))
     params = {path: leaf for path, leaf in traverse_util.flatten_dict(variables["params"]).items()
               if path != ("continuum", "up", "kernel")}
@@ -1073,7 +1073,7 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
     objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)
     assert objective.adaptation == adaptation
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
-    assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(nn.unbox(objective.init(jax.random.key(0))),
                                                                 tokens).losses)))
 
 
