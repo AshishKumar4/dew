@@ -162,8 +162,11 @@ def _step(case: dict[str, str], spans, *, reference: bool):
         def attended(query, key, value, *params):
             hooks = _hooks(case, params)
             if reference:
-                return template.reference(query, key, value, spans, hooks)
-            return attention_route.attend(query, key, value, spans, hooks, natural=natural, accurate=accurate)
+                out = template.reference(query, key, value, spans, hooks)
+            else:
+                out = attention_route.attend(query, key, value, spans, hooks, natural=natural,
+                                             accurate=accurate)
+            return jnp.asarray(out)
 
         out, pull = jax.vjp(attended, query, key, value, *params)
         return (out, *pull(dout.astype(out.dtype)))
@@ -224,10 +227,11 @@ def a_routes_training_step_is_on_par(case: tuple[str, ...]) -> None:
     named = dict(zip(AXES["attention"], case, strict=True))
     heads, _, _, _, spans, keep = _case(named)
     config = pin_of(named)
-    pins = {attention_mosaic.MosaicBackward: config} if config is not None else {}
 
     def ours(*operands):
-        with tuning.pinned(pins):
+        if config is None:
+            return _step(named, spans, reference=False)(*operands)
+        with tuning.pinned({attention_mosaic.MosaicBackward: config}):
             return _step(named, spans, reference=False)(*operands)
 
     terms = terms_of(keep, heads, kind=BIAS.get(named["hook"]),
