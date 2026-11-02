@@ -577,6 +577,25 @@ def test_a_dreamer_rollouts_step_counts_past_32_bits_come_back_from_its_checkpoi
     assert (back.environment_steps, back._prefilled) == (2**33 + 2**31 + 7, 2**31 + 5)
 
 
+def test_a_dreamer_rollouts_steps_saved_without_its_pacing_come_back_from_its_checkpoint(tmp_path):
+    """A Dreamer rollout's step counts saved in a run's checkpoint without where it owes its updates from (as
+    an earlier Dew saved them) come back into a fresh rollout through the run's restore
+    (`_rollout_resumed`), which then owes from them."""
+    from dew.checkpoints import Checkpoints
+    from dew.training._fit import _rollout_resumed, _rollout_saved
+
+    objective = DreamerV3Objective(tiny())
+    rollout = dreamer_targets(objective, checkpointed=False)
+    state = dreamer_fit(None, objective, rollout, 2)
+    saved = {name: leaf for name, leaf in _rollout_saved(rollout).items() if name in ("taken", "prefilled")}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(2, state, rollout=saved)
+    checkpoints.wait()
+    back = dreamer_targets(objective, checkpointed=False)
+    _rollout_resumed(back, checkpoints, 2, state.key.sharding)
+    assert (back.environment_steps, back._prefilled) == (rollout.environment_steps, rollout._prefilled)
+
+
 def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps_after_it(tmp_path):
     """A DreamerV3 run resumed at its third update from checkpoints written without its rollout's state
     (as an earlier Dew wrote them) begins its targets and replay again and owes the steps of its fourth
