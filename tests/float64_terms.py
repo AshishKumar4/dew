@@ -71,12 +71,52 @@ def float64_terms(fn, *args):
     (a softmax's shift invariance). A leaf made by any other operation is
     its own size, and an input carries no terms, so a parameter's terms
     after an update are the update's. Nothing propagates through the layers
-    behind a sum, which would bound the whole computation."""
+    behind a sum, which would bound the whole computation.
+
+    A program whose every step its shapes decide (no branch or loop its
+    values pick, `_static`) is evaluated by the same rules traced once into
+    one compiled float64 program (`_compiled`), which each later call of `fn`
+    on arguments of the same shapes runs: the operations and their order are
+    the walk's, compiled where the walk dispatched each alone."""
     closed = jax.make_jaxpr(fn)(*args)
-    values, energies = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
+    leaves = jax.tree.leaves(args)
+    if _static(closed.jaxpr):
+        values, energies = _compiled(closed)(closed.consts, leaves)
+    else:
+        values, energies = _evaluated(closed.jaxpr, closed.consts, leaves)
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
     return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
                                                    for energy, value in zip(energies, values, strict=True)])
+
+
+COMPILED: dict = {}
+"""Each static program's compiled evaluation (`_compiled`), by its jaxpr's text."""
+
+
+def _static(jaxpr) -> bool:
+    """Whether `jaxpr`, its calls' and scans' bodies included, takes no branch or loop its values pick
+    (`cond`, `while`), which the walk reads concretely (`_applied`)."""
+    for equation in jaxpr.eqns:
+        if equation.primitive.name in ("cond", "while"):
+            return False
+        for value in equation.params.values():
+            bodies = value if isinstance(value, tuple | list) else (value,)
+            for body in bodies:
+                inner = getattr(body, "jaxpr", body)
+                if hasattr(inner, "eqns") and not _static(inner):
+                    return False
+    return True
+
+
+def _compiled(closed):
+    """The compiled evaluation (`_evaluated`) of `closed`, a static jaxpr, taking its constants and its
+    inputs: one a program, by its text, which holds its operations, their parameters and its inputs'
+    shapes and dtypes, so a function traced afresh each call (`float64_forward`'s) compiles once."""
+    key = str(closed.jaxpr)
+    if key not in COMPILED:
+        jaxpr = closed.jaxpr
+        COMPILED[key] = jax.jit(lambda consts, given: _evaluated(jaxpr, consts, given))
+    return COMPILED[key]
 
 
 def _evaluated(jaxpr, consts, args, given=None):
