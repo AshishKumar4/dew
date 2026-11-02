@@ -376,8 +376,10 @@ class MosaicForward(_Mainloop[Tiles]):
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
                                            min(config.stages, steps), out_dtype=out_dtype)
+        # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
+        guarded = algebra.headroom(value.dtype) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, _scope(family, allocations, reducing(
-            family, config.consumers, self.score_mod, self.output_mod)))
+            family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)

@@ -871,5 +871,6 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair * splits, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
                          approx_math=approx_math, name=name, cost=cost,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod)
+                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
+                                                      guarded=read[2] is not None)
                          )(query, key, value, *leaves)
