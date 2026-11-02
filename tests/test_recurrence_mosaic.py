@@ -398,6 +398,30 @@ def test_the_mosaic_launches_state_their_work(training):
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
+@lowers('sm90')
+@pytest.mark.parametrize(("key_width", "value_width", "dtype", "block"),
+                         [(128, 128, jnp.bfloat16, 16), (128, 128, jnp.bfloat16, 32),
+                          (576, 128, jnp.bfloat16, None), (128, 256, jnp.float32, None)],
+                         ids=["bf16 16 wide", "bf16 32 wide", "bf16 576 keys derived", "fp32 derived"])
+def test_an_output_launch_lowers_at_a_value_block_narrower_than_its_keys(key_width, value_width, dtype,
+                                                                         block):
+    """A gated delta rule's forward lowered for an H100 at value blocks narrower than its keys' rows, pinned
+    or as its tiles derive (a 576-wide bf16 key's, an fp32 call's): the output launch's queries are the left
+    operand of its scores' product and of its memory's (`Q Kᵀ`, `Q H`), and warpgroup MMA reads a product's
+    shared operands at one transform, so the keys' swizzle is one the memory's value-block rows fill too. At
+    the keys' own 128 bytes Mosaic GPU found no layout for a 32-wide block's (from 99c198a208)."""
+    operands = [jax.ShapeDtypeStruct((1, 256, 2, key_width), dtype)] * 2 + [
+        jax.ShapeDtypeStruct((1, 256, 4, value_width), dtype), jax.ShapeDtypeStruct((1, 256, 4), jnp.float32),
+        jax.ShapeDtypeStruct((1, 256, 4), dtype)]
+    # The run's fast forms, under which an fp32 call derives tiles at all (`fast_rounding`).
+    with generation.assumed('sm90'):
+        tiles = mainloop.Tiles(block, 1) if block is not None else template.MOSAIC.derived(
+            template.MOSAIC.bind(*operands, None, None, floor=None, bound=1.0, rounded=True),
+            generation.gpu_target())
+        jax.jit(lambda *given: mosaic_rule(*given, tiles=tiles, bound=1.0, rounded=True)[0]).trace(
+            *operands).lower(lowering_platforms=("cuda",))
+
+
 @lowers('sm80')
 @pytest.mark.parametrize('target', ['sm80', 'sm86'])
 def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
