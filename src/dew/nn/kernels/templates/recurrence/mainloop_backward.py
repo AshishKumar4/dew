@@ -698,16 +698,17 @@ def _query_key_held(call: _Call) -> _Held:
 
 
 def _query_key_landing(call: _Call, splits: int) -> dict:
-    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient (fp32 where there are two
-    splits or more) and the queries' and keys' sums."""
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule (fp32
+    where there are two splits or more) and the queries' and keys' sums."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    return {"weights": held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32),
-            "sums": ((CHUNK, call.block), jnp.float32)}
+    weights = held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32)
+    return {**({"weights": weights} if call.delta else {}), "sums": ((CHUNK, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
     """`_query_key`'s streams at value split `vq` (`_query_key_split`) and its outputs' types, each split's
-    sums its own (the weights' gradient in fp32 where there are two splits or more)."""
+    sums its own (the weights' gradient, the delta rule's alone, in fp32 where there are two splits or
+    more)."""
     width, held, memories, given = call.width, call.held, call.memories, call.given
     splits = call.value_width // vq
     tiles = _streamed(queries=((CHUNK, call.block), given), keys=((CHUNK, call.block), given),
@@ -719,14 +720,15 @@ def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
     terms = jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.rows), jnp.float32)
     weights = (dataclasses.replace(held, rows=call.rows).shape(call.heads * width) if splits == 1
                else jax.ShapeDtypeStruct((call.rows, splits * call.heads * width), jnp.float32))
-    return tiles, (keyed_out, keyed_out, weights, terms, terms,
+    return tiles, (keyed_out, keyed_out, *((weights,) if call.delta else ()), terms, terms,
                    jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
                                         jnp.float32))
 
 
 @_lowered_once
 def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _Call, *, scale: float):
-    """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held, after, leaving [blocks, HV, R], memory
+    """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held (None without the delta rule, which forms no
+    weights), after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` in
     `_score_grads`' form, `_scores_back`'s: `[R, HV * C]` with the delta rule, each step's value head's
@@ -748,9 +750,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     keyed_width, key_blocks = call.heads // group * width, width // call.block
 
     def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
-                beta_ref, dq_ref, dk_ref, dw_ref, after_ref, leaving_ref, memory_ref, *, streams, staging,
-                landing):
+                beta_ref, *outs, streams, staging, landing):
         del staging
+        dq_ref, dk_ref, *weights_ref, after_ref, leaving_ref, memory_ref = outs
         c, n, keyed = at["blocks"], at["chunks"], at["heads"]
         split = at["values"]
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
@@ -781,11 +783,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
             columns = pl.ds(split * keyed_width + key_columns, call.block)
             sums = {"dq": dq_ref.at[span, columns], "dk": dk_ref.at[span, columns]}
             weights_at = h * width + c * call.block
-            stored = functools.partial(
-                _gradient_stored, call,
-                weights=(held.views(dw_ref, row, CHUNK, weights_at, call.block) if splits == 1 else
-                         [dw_ref.at[span, pl.ds(split * call.heads * width + weights_at, call.block)]]),
-                sums=sums, first=first_head, landing=landing, apart=splits > 1)
+            weights = (() if not weights_ref else
+                       held.views(weights_ref[0], row, CHUNK, weights_at, call.block) if splits == 1 else
+                       [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
+            stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
+                                       landing=landing, apart=splits > 1)
 
             issue = Issuer(call)
             ds = _tile(slots, "ds", grads) if scores else None
@@ -832,7 +834,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     scores = 2 * CHUNK * CHUNK * call.block
     each = (2 + call.delta) * CHUNK * value_width * call.block + scores * call.delta
     work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
-    dq, dk, dw, after, leaving, memory = _kernel(
+    dq, dk, *weights, after, leaving, memory = _kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
@@ -840,9 +842,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:
-        dq, dk, dw = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, dw))
+        dq, dk, *weights = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, *weights))
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
-    return dq, dk, dw if splits == 1 else held.split(dw), after, leaving, memory
+    dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
+    return dq, dk, dw, after, leaving, memory
 
 
 def _value_grads(call: _Call) -> _Operand:
