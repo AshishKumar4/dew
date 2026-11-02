@@ -3,6 +3,7 @@ tools/dory_reference.py transcribes its forward and writes tests/fixtures/hf/dor
 tests' reference, and tests/fixtures/hf/dory-1.0-4b holds the released config and what vLLM's
 own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -919,6 +920,17 @@ def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Arr
     return scored(jnp.concatenate(rows))
 
 
+@contextlib.contextmanager
+def plain_float64():
+    """Within the block, Dew decodes in float64 as a truth: its kernels chosen as a CPU's and its attention
+    plain XLA. Float64 is the oracle of an fp32 run, so the attention kernels' exact algebra, which their
+    fp32 sums need, buys the truth nothing, and it took four and a half minutes to trace at the release's
+    depth (row 2491's stack samples)."""
+    with jax.enable_x64(new_val=True), generation.assumed('cpu'), generation.chosen(attention='xla',
+                                                                                     decode='xla'):
+        yield
+
+
 def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weights, config: dict,
                                parts: dict, label: str) -> None:
     """Check 1 of `model` over `weights` (host arrays) decoding `parts` (each prompt, the tokens drawn
@@ -939,15 +951,15 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
         # Each order's weights placed alone, and gone from the device when the call returns.
         return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
 
-    # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
-    # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
-    # the device never holds them beside an order's.
-    with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+    # The float64 arm on the default device, a GPU's float64 units where one runs the test
+    # (`plain_float64`); its weights kept on the host and placed for a call alone, so the device never
+    # holds them beside an order's.
+    with plain_float64():
         wide_programs = decoding(model.clone(dtype=jnp.float64))
     held = widened(weights)
 
     def truth(order):
-        with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+        with plain_float64():
             return rows(wide_programs, jax.device_put(held))
 
     truth.dew_programs = True
