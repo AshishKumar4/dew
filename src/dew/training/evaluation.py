@@ -247,9 +247,9 @@ class Evaluation:
                 f"evaluation/counts/{self.split}/coordinated_batches": float(self.coordinated_batches),
                 f"evaluation/counts/{self.split}/records": float(self.records), **share, **clocked}
 
-    def report(self, display: TrainingDisplay, tracker: Tracker | None) -> None:
+    def _report(self, display: TrainingDisplay, tracker: Tracker | None) -> None:
         """Print this evaluation on rank zero (`display`) and log its previews and scores there to `tracker`,
-        every process agreeing it was reported."""
+        every process agreeing it was reported: the trainer's, whose display is its own."""
         def report() -> None:
             if jax.process_index() != 0:
                 return
