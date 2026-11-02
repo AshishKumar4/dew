@@ -89,7 +89,7 @@ from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain
-from ..norms import OffsetLayerNorm, RMSNorm
+from ..norms import RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -155,17 +155,6 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
-def _norm_gain(norm: nn.Module) -> jax.Array:
-    """The largest gain `norm`'s weight puts on its normalized input, |g| over its features: its scale,
-    from one where it stores its offset from one (`RMSNorm.scale_offset`, `OffsetLayerNorm`), one
-    without a scale."""
-    scale = norm.variables.get("params", {}).get("scale")
-    if scale is None:
-        return jnp.ones((), jnp.float32)
-    offset = isinstance(norm, OffsetLayerNorm) or (isinstance(norm, RMSNorm) and norm.scale_offset)
-    return jnp.max(jnp.abs(jnp.asarray(scale, jnp.float32) + (1 if offset else 0)))
-
-
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -1302,7 +1291,7 @@ class CausalTransformer(nn.Module):
             p1, p2 = SLOPES[UNGATED[self.head_transform]]
             dense = self.applied_kernel("head_dense")
             spread = jnp.sum(jnp.square(dense.astype(at_least_fp32(dense.dtype))))
-            gain = _norm_gain(self.head_norm)
+            gain = self.head_norm.largest_gain()
             epsilon = self.head_norm.epsilon
             jacobian = jnp.sqrt(gain ** 2 * p1 ** 2 * spread / epsilon)
             bent = gain * (6 * p1 ** 2 / epsilon + (p2 or 0) / math.sqrt(epsilon)) * spread

@@ -407,25 +407,32 @@ def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
     site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level's update over {kind}", CARRY_SEEDS)
 
 
+def _replayed():
+    """The batch for each step of a run, its position the stream's checkpointed state."""
+    return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
+        0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
+
+
+def _checkpointed(objective, directory):
+    """A trainer of `objective` checkpointing under `directory`."""
+    return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
+                   checkpoints=Checkpoints(str(directory)))
+
+
 def test_a_run_that_carries_its_level_resumes_what_it_carried_bit_for_bit(tmp_path):
     """A run that carries its level (`carry="run"`) starts with nothing carried, carries its rows' steps
     from its first update, and a run resumed from its checkpoint ends where the uninterrupted one does,
     bit for bit, what it carried among its state."""
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
 
-    def rows():
-        return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
-            0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
-
     def trainer(directory):
-        return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
-                       checkpoints=Checkpoints(str(directory)))
+        return _checkpointed(objective, directory)
 
     start = objective.init(jax.random.key(0))
     assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(start[CARRIED]))
-    whole = trainer(tmp_path / "whole").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
-    trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
-    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
+    whole = trainer(tmp_path / "whole").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
     assert any(np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(whole.variables[CARRIED]))
     for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
@@ -595,6 +602,23 @@ def test_a_damped_step_steps_its_parts_kernels_alone_an_adapters_factors_held():
                      "up": {"kernel": True, "lora_A": True, "lora_B": True}}
 
 
+def weighted_loss(fields, adaptation: ChunkAdaptation, *, truth: bool | None = None):
+    """The rows' weighted losses through the adapted level as a function of a draw: Dew's
+    (`adapted_scores`), or the literal loop's where `truth` is given (`equation_71`)."""
+    def loss(variables, hidden, targets, weights):
+        losses = (adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                                 predict=False, logits=False).losses if truth is None else
+                  equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth))
+        return jnp.sum(weights * losses)
+    return loss
+
+
+def differentiated(fn):
+    """`fn` of a draw differentiated in its variables and states under a cotangent (`with_gradients`)."""
+    return lambda variables, hidden, targets, weights, cotangent: with_gradients(
+        lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+
+
 DAMPED_GRADIENT_SEEDS = {"documents": 32, "packed": 128, "padded": 64}
 """Check 1's declared seeds for the outer gradient through damped steps at the corner, one draw a seed,
 sized paired by `seeds_for` on armada."""
@@ -619,17 +643,10 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
         variables, hidden, targets, weights = draw(seed, scale=scale)
         return variables, hidden, targets, weights, np.float32(1.0)
 
-    def dew(variables, hidden, targets, weights):
-        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, fields,
-                                                adaptation, predict=False, logits=False).losses)
-
-    def differentiated(fn):
-        return lambda variables, hidden, targets, weights, cotangent: with_gradients(
-            lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+    dew = weighted_loss(fields, adaptation)
 
     def reference(truth):
-        return differentiated(lambda variables, hidden, targets, weights: jnp.sum(weights * equation_71(
-            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)))
+        return differentiated(weighted_loss(fields, adaptation, truth=truth))
 
     seeds = DAMPED_GRADIENT_SEEDS[kind] if damped else GRADIENT_SEEDS[kind, rate, scale]
     site(differentiated(dew), reference, gradient_draw, rate, scale, 3,
@@ -727,17 +744,7 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding
         variables, hidden, targets, weights = draw(seed, rows=BOUND_ROWS)
         return variables, hidden, targets, weights, np.float32(1.0)
 
-    def differentiated(fn):
-        return lambda variables, hidden, targets, weights, cotangent: with_gradients(
-            lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
-
-    def dew(variables, hidden, targets, weights):
-        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, fields,
-                                                adaptation, predict=False, logits=False).losses)
-
-    def reference(variables, hidden, targets, weights):
-        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation,
-                                             truth=True))
+    dew, reference = weighted_loss(fields, adaptation), weighted_loss(fields, adaptation, truth=True)
 
     # Each half of the draws its own test, each within CI's time.
     draws = range(half * BOUND_SEEDS // 2, (half + 1) * BOUND_SEEDS // 2)
@@ -962,18 +969,12 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     bit: the loss reads the batch and the variables alone."""
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1))
 
-    def rows():
-        # The batch for each step, its position the stream's checkpointed state.
-        return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
-            0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
-
     def trainer(directory):
-        return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
-                       checkpoints=Checkpoints(str(directory)))
+        return _checkpointed(objective, directory)
 
-    whole = trainer(tmp_path / "whole").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
-    trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
-    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1,
+    whole = trainer(tmp_path / "whole").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1,
                                                checkpoint_every=2)
     start = objective.init(jax.random.key(0))["params"]["continuum"]
     assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),

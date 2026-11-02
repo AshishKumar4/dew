@@ -211,13 +211,18 @@ def damping(model: nn.Module, variables, start, hidden, weights, adaptation: Chu
         raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                          "activation's second derivative, which a ReLU has none of (a point mass at zero), "
                          "so no rate bounds it there: select=('up',), or a smooth activation")
-    curvature, slope = model.apply(variables, method="head_bounds")
+    curvature, slope = _arrays(model.apply(variables, method="head_bounds"))
     held = model.with_in_context_level(variables, start)
-    squares, inputs, norm = model.apply(held, hidden, method="level_terms")
+    squares, inputs, norm = _arrays(model.apply(held, hidden, method="level_terms"))
     lengths, fed = jnp.sqrt(squares), jnp.sqrt(inputs)
     terms = jnp.stack([squares, inputs, fed * lengths, lengths], axis=-1)
     return (jax.lax.stop_gradient(curvature), jax.lax.stop_gradient(slope), jax.lax.stop_gradient(norm),
             jax.lax.stop_gradient(weights[..., None] * terms))
+
+
+def _arrays(applied) -> tuple[jax.Array, ...]:
+    """A method's tuple of arrays, as `nn.Module.apply` returns it untyped."""
+    return tuple(jnp.asarray(value) for value in applied)
 
 
 def step_rate(model: nn.Module, adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums,
@@ -269,15 +274,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     steps = _stepped_mask(start, adaptation)
     rows, length = targets.shape
     window = adaptation.window
-    marked, documents = token_layout(fields)
-    # Only padding or several documents let a window open inside a block; else every window is one.
-    straddles = marked is not None or documents is not None
-    valid = real_slots(fields, (rows, length)) if straddles else None
-    if valid is not None:
-        # A padding slot weighs nothing, whatever weight it is given.
-        weights = jnp.where(valid, weights, 0)
-    # A carried level steps through a row's documents in turn, one run a row.
-    runs, windows = window_keys(valid, None if carries else documents, rows, length, window)
+    straddles, weights, runs, windows = _laid_out(fields, weights, rows, length, adaptation)
     *bounds, energies = damping(model, variables, start, hidden, weights, adaptation)
     parts = damped_parts(start, adaptation)
     blocks = -(-length // window)
@@ -376,6 +373,20 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     moved = _moved(stepped(level, partial, energy), started, weights) if carries else None
     return Adapted(joined(losses), None if top is None else joined(top), joined(log_z),
                    None if whole is None else joined(whole), moved)
+
+
+def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation):
+    """Where the rows' windows run (`window_keys`): whether a window can open inside a block (padding
+    or several documents in a row), the weights with each padding slot's at nothing, and each slot's run
+    and window. A carried level steps through a row's documents in turn, one run a row."""
+    marked, documents = token_layout(fields)
+    straddles = marked is not None or documents is not None
+    valid = real_slots(fields, (rows, length)) if straddles else None
+    if valid is not None:
+        weights = jnp.where(valid, weights, 0)
+    documents = None if adaptation.carry == "run" else documents
+    runs, windows = window_keys(valid, documents, rows, length, adaptation.window)
+    return straddles, weights, runs, windows
 
 
 def _start(model: nn.Module, variables, adaptation: ChunkAdaptation) -> Mapping:
