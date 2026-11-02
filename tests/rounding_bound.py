@@ -129,6 +129,7 @@ def _run(jaxpr, consts, args, taps, weights):
     for equation in jaxpr.eqns:
         inputs = [read(var) for var in equation.invars]
         outputs = _applied(equation, inputs, taps, weights)
+        assert all(value is not None for value in outputs), (equation.primitive.name, sorted(equation.params))
         values.update(zip(equation.outvars, outputs, strict=True))
     return [read(var) for var in jaxpr.outvars]
 
