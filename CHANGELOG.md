@@ -50,11 +50,14 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   program whose communicators need more than the room left is refused at Dew's one compile point, naming
   the bytes (`dew.communicators`). `import dew` sets `NCCL_RUNTIME_CONNECT=0`. A host's GPUs are counted
   through its CUDA driver, so a container without nvidia-smi counts them too (`dew.pool.local_gpu_count`).
-- Dew requires its JAX build 0.12.0.1.post42, and its `cuda12` and `cuda13` extras install Dew's builds of
-  the CUDA plugins, which Dew's package index serves: Mosaic GPU honours a kernel's register raises
-  (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC blocks by their
-  strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and `griddepcontrol`
-  (docs/installation.md lists each fix).
+- Dew requires its JAX build 0.12.0.1.post45, and its `cuda12` and `cuda13` extras install Dew's builds of
+  the CUDA plugins and their PJRT plugins, which Dew's package index serves: Mosaic GPU honours a kernel's
+  register raises (`setmaxnreg`) and a stated minimum of resident blocks per SM, copies untiled CP_ASYNC
+  blocks by their strides, multiplies float32 as TF32 on `mma.sync`, and issues scoped atomics, fences and
+  `griddepcontrol`, and Triton's pipeliner gives a tile a wgmma reads from shared memory, and another use
+  reads in registers, a buffer of its own a stage, so Pallas Triton attention's dK on an H100 is right and the
+  same every run (docs/installation.md lists each fix). The register raises hold from post43, whose PJRT
+  plugin, where Mosaic GPU compiles a kernel, is Dew's build too.
 - DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
   mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
   outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
