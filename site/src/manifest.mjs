@@ -74,6 +74,7 @@ export const groups = [
 	{
 		label: 'Reference',
 		items: [
+			{ source: 'docs/design/architecture.md', slug: 'reference/architecture', label: 'How Dew works' },
 			{ source: 'docs/models.md', slug: 'reference/models', label: 'Supported models' },
 			{ source: 'docs/performance.md', slug: 'reference/performance', label: 'Performance' },
 			{ source: 'docs/benchmarks.md', slug: 'reference/benchmarks', label: 'Step benchmarks' },
@@ -84,6 +85,10 @@ export const groups = [
 	{
 		items: [{ source: 'docs/tutorials.md', slug: 'tutorials', label: 'Overview' }],
 		generated: 'tutorials',
+	},
+	{
+		items: [{ source: 'docs/posts.md', slug: 'posts', label: 'Overview' }],
+		generated: 'posts',
 	},
 	{
 		items: [
@@ -98,8 +103,9 @@ export const groups = [
 	},
 ];
 
-// Research notes and design history stay in the repository. Links to them from
-// a docs page go to GitHub; a link to any other `docs/` page must be listed above.
+// Research notes and design history stay in the repository, the architecture page
+// (listed above) aside. Links to them from a docs page go to GitHub; a link to any
+// other `docs/` page must be listed above.
 export const repositoryOnly = ['docs/research/', 'docs/design/'];
 
 export const pages = groups.flatMap((group) => group.items ?? []);

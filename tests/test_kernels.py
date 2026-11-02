@@ -49,7 +49,7 @@ def test_a_flash_wheel_holds_code_for_its_architectures_major_from_their_minor_u
 
 
 def flash_here():
-    """dew_flash_attn where the installed wheel holds code for this GPU (the fact `flash_refusal` reads);
+    """dew_flash_attn where the installed wheel holds code for this GPU (the fact `_flash_built` reads);
     a GPU it was not built for skips by name, where 'auto' runs another kernel."""
     flash = pytest.importorskip("dew_flash_attn")
     from dew.nn.attention_kernels import flash_architectures, flash_built_for
