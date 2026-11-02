@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `ChunkAdaptation(carry="run")` keeps a continuum level's in-context steps across documents and updates: a
+  row's documents step one level in turn, and each update carries its rows' mean step into the `carried`
+  collection, which the run saves and resumes bit for bit. The per-document reset stays the default.
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
   curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and

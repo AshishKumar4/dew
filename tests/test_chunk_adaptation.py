@@ -24,7 +24,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
 from dew.objectives.lm import LMObjective, Samples
-from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
+from dew.objectives.lm.adaptation import CARRIED, ChunkAdaptation, adapted_scores
 from dew.training import Checkpoints, Trainer
 
 VOCAB = 16
@@ -120,7 +120,7 @@ def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
-                levels: bool = False, truth: bool = False):
+                levels: bool = False, truth: bool = False, finals: bool = False):
     """Equation 71 read literally, token by token along each row: a run of a document's real tokens
     starts from the level's start; each real token reads its window's level, and at the first real
     token of the run's next window the level steps by `rate` times the summed gradient of the window's
@@ -135,6 +135,10 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     silu(x D) at the level's start), and |U| and D's distance from the start along the step; every bound
     is a constant of the step, not differentiated.
 
+    A level a run carries (`ChunkAdaptation.carry`, "run") starts at the trained level plus the carried
+    collection's, and runs through the row's documents in turn: a run is the row's real tokens. With
+    `finals`, each row's level at its end, its open window's step applied, is returned beside the losses.
+
     With `truth`, each token's loss is written log(1 + sum over the other tokens of exp(their logit less
     the target's)), whose derivative at the target is minus the others' probabilities summed: the
     float64 truth check 1 holds both arms to (`truthful`). The log-softmax's derivative there, p_y - 1,
@@ -143,13 +147,16 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     is about 4e-17."""
     params = variables["params"]
     start = params["continuum"]
+    carries = adaptation.carry == "run"
+    if carries:
+        start = jax.tree.map(jnp.add, start, variables["carried"])
     rows, length = targets.shape
     valid = fields.get("attention_mask")
     documents = fields.get("segment_ids")
     real = (jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool))
     if documents is not None:
         real = real & (jnp.asarray(documents) != 0)
-    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
+    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None or carries
                  else jnp.asarray(documents, jnp.int32))
 
     def token_loss(level, state, target):
@@ -234,9 +241,9 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
     def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
         first = (start, zeros, jnp.zeros((4,), hidden.dtype), jnp.int32(0), jnp.int32(-1), jnp.int32(0),
                  jnp.zeros((), bool))
-        _, losses = jax.lax.scan(token, first, (row_hidden, row_targets, row_weights, row_real,
-                                                row_documents))
-        return losses
+        (level, summed, energy, *_), losses = jax.lax.scan(
+            token, first, (row_hidden, row_targets, row_weights, row_real, row_documents))
+        return (losses, stepped(level, summed, energy)) if finals else losses
 
     return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
 
@@ -350,6 +357,93 @@ def scan_as_equation_71(kind: str, window: int, rate: float, scale: float) -> No
          ADAPTATION_SEEDS[window, rate, scale])
 
 
+CARRY_SEEDS = 8
+"""Check 1's declared seeds for a carried level's windows and its rows' mean step, each a draw."""
+
+
+def carried_draw(seed: int):
+    """A draw (`draw`) whose variables carry a level moved by 0.1 N(0, 1) (`CARRIED`)."""
+    variables, hidden, targets, weights = draw(seed)
+    rng = np.random.default_rng(seed + 1_000)
+    carried = jax.tree.map(lambda leaf: (0.1 * rng.standard_normal(leaf.shape)).astype(np.float32),
+                           variables["params"]["continuum"])
+    return {**variables, CARRIED: carried}, hidden, targets, weights
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_a_carried_level_steps_through_a_rows_documents_as_equation_71_reads_them(kind):
+    """A level the run carries (`carry="run"`) starts at the trained level plus what is carried, and
+    each row's documents step it in turn, a packed row's second document reading the level its first
+    left: each loss on par with the literal loop's (check 1), over every layout, at a window of three
+    and a rate of a tenth."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.1, carry="run")
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(truth):
+        return lambda variables, hidden, targets, weights: equation_71(
+            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
+
+    site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level over {kind}", CARRY_SEEDS)
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
+    """What an update carries on (`_carried_update`) is what was carried plus the mean, over the rows
+    whose targets weigh anything, of how far each row's windows moved the level, its last window's step
+    applied: on par with the literal loop's rows' final levels (check 1), over every layout."""
+    from dew.objectives.lm.adaptation import _carried_update
+
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.1, carry="run")
+
+    def dew(variables, hidden, targets, weights):
+        moved = adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                               predict=False, logits=False).moved
+        return _carried_update(variables[CARRIED], moved)
+
+    def reference(truth):
+        def carried(variables, hidden, targets, weights):
+            _, finals = equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                                    truth=truth, finals=True)
+            start = jax.tree.map(jnp.add, variables["params"]["continuum"], variables[CARRIED])
+            counted = jnp.sum(weights, axis=1) > 0
+            return jax.tree.map(lambda held, final, began: held + jnp.sum(jnp.where(
+                counted.reshape(-1, *[1] * (began.ndim)), final - began, 0), axis=0) / jnp.sum(counted),
+                variables[CARRIED], finals, start)
+        return carried
+
+    site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level's update over {kind}", CARRY_SEEDS)
+
+
+@pytest.mark.parametrize("frozen", ["level", "down"])
+def test_a_run_carries_a_level_whose_leaves_are_frozen(frozen):
+    """A run that carries its level starts with nothing carried in the level's whole tree, its frozen
+    leaves among it (`thaw`), and scores through it: the whole level frozen, or its `down` alone, the
+    variables keeping their split."""
+    from dew.batch import FROZEN
+
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
+    tree = MODEL.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))
+    level = dict(tree["params"]["continuum"])
+    if frozen == "level":
+        params = {name: value for name, value in tree["params"].items() if name != "continuum"}
+        cold = {"continuum": level}
+    else:
+        cold = {"continuum": {"down": level.pop("down")}}
+        params = {**tree["params"], "continuum": level}
+    split = {**tree, "params": params, FROZEN: cold}
+    completed = objective.complete_variables(jax.random.key(0), split)
+    assert jax.tree.structure(completed[CARRIED]) == jax.tree.structure(tree["params"]["continuum"])
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(completed[CARRIED]))
+    assert completed[FROZEN] == split[FROZEN]
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(completed, tokens).losses)))
+
+
 def _replayed():
     """The batch for each step of a run, its position the stream's checkpointed state."""
     return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
@@ -360,6 +454,25 @@ def _checkpointed(objective, directory):
     """A trainer of `objective` checkpointing under `directory`."""
     return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
                    checkpoints=Checkpoints(str(directory)))
+
+
+def test_a_run_that_carries_its_level_resumes_what_it_carried_bit_for_bit(tmp_path):
+    """A run that carries its level (`carry="run"`) starts with nothing carried, carries its rows' steps
+    from its first update, and a run resumed from its checkpoint ends where the uninterrupted one does,
+    bit for bit, what it carried among its state."""
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1, carry="run"))
+
+    def trainer(directory):
+        return _checkpointed(objective, directory)
+
+    start = objective.init(jax.random.key(0))
+    assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(start[CARRIED]))
+    whole = trainer(tmp_path / "whole").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1, checkpoint_every=2)
+    assert any(np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(whole.variables[CARRIED]))
+    for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
 
 
 PADDING_SEEDS = 8
