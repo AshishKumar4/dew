@@ -32,7 +32,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#9a4614f3ceef08946a32a4a679b579ff208d8585
+  ARMADA: github:AshishKumar4/armada#2c1fc83b46c8c2b7bbb3b5e06e8a5b3ec5c6da2f
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
