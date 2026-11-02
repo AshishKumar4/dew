@@ -213,15 +213,25 @@ def _arrays(applied) -> tuple[jax.Array, ...]:
     return tuple(jnp.asarray(value) for value in applied)
 
 
+_HALVINGS = 12
+"""The geometric bisection's halvings that find a damped window's rate (`_step_rate`): the bracket's ratio
+r becomes r^(2^-12), within 1% of the fixed point for any r below 10^17."""
+
+
 def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums, moved, gradient):
-    """A damped window's rate per row, rate / (1 + rate L), L its loss's curvature bound along the step
-    (`ChunkAdaptation.damped`): the window's `sums` `[B, _TERMS + 3]` of its slots' terms (`_gathered`),
-    `bounds` the head's terms (`HeadTerms`), the start's output-map norm and its activation's p1, p2
-    (`_damping`), `moved` per row the Frobenius norms `down` and `up` have moved from the start before the
-    window, and `gradient` the window's. A part's largest norm along the step is its start's plus what it
-    moved and what this step moves it at most, the rate times its gradient's norm, and a slot's state
-    s = x + U f moves by at most |U - U0| |f| + |U0| |f - f0| along it, |f - f0| at most p1 |x| times D's
-    distance: the head's bounds are read over every state that far from the window's (`HeadTerms.at`). The
+    """A damped window's rate per row (`ChunkAdaptation.damped`): the largest d the bisection finds with
+    d <= rate / (1 + rate L(d)), L(d) its loss's curvature bound along a step of rate d, so d L(d) < 1. The
+    window's `sums` `[B, _TERMS + 3]` of its slots' terms (`_gathered`), `bounds` the head's terms
+    (`HeadTerms`), the start's output-map norm and its activation's p1, p2 (`_damping`), `moved` per row the
+    Frobenius norms `down` and `up` have moved from the start before the window, and `gradient` the
+    window's set L(d). A part's largest norm along the step is its start's plus what it moved and what this
+    step moves it at most, d times its gradient's norm, and a slot's state s = x + U f moves by at most
+    |U - U0| |f| + |U0| |f - f0| along it, |f - f0| at most p1 |x| times D's distance: the head's bounds are
+    read over every state that far from the window's (`HeadTerms.at`).
+
+    L grows with d, so d -> rate / (1 + rate L(d)) falls, and its fixed point is the largest such d:
+    rate / (1 + rate L(rate)), the bound at the plain step's length, is below it, the plain rate above,
+    and each of `_HALVINGS` geometric halvings keeps the half whose lower end the inequality admits. The
     rate is a constant of the step, as its bound is: the outer gradient flows through the step's gradient,
     not through the bound it reads (whose distances are zero at a run's start, where their root has no
     derivative)."""
@@ -229,28 +239,37 @@ def _step_rate(adaptation: ChunkAdaptation, parts: tuple[str, ...], bounds, sums
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(_TERMS))
     least, fed, longest = (sums[:, index] for index in range(_TERMS, _TERMS + 3))
     rate = adaptation.rate
+    steps = {part: jnp.sqrt(jnp.sum(jnp.square(gradient[part]["kernel"].astype(jnp.float32)),
+                                    axis=tuple(range(1, gradient[part]["kernel"].ndim))))
+             for part in parts}
 
-    def reach(part: str) -> jax.Array:
-        if part not in parts:
-            return jnp.zeros_like(squares)
-        leaf = gradient[part]["kernel"]
-        step = jnp.sqrt(jnp.sum(jnp.square(leaf.astype(jnp.float32)), axis=tuple(range(1, leaf.ndim))))
-        return moved[part] + rate * step
+    def curvature_along(length: jax.Array) -> jax.Array:
+        """L for a step of rate `length`, per row."""
+        def reach(part: str) -> jax.Array:
+            return moved[part] + length * steps[part] if part in parts else jnp.zeros_like(squares)
 
-    # D's distance along the step bounds how far f = act(D x) moves, p1 |x| per unit; U's, its norm.
-    spread, output = reach("down"), norm + reach("up")
-    turned = p1 * spread * longest
-    curvature, slope = head.at(least, reach("up") * (fed + turned) + norm * turned)
-    bend = jnp.zeros_like(squares)
-    stretch = jnp.zeros_like(squares)
-    if "down" in parts:
-        stretch = stretch + output ** 2 * p1 ** 2 * squares
-        bend = bend + output * p2 * squares
-    if "up" in parts:
-        stretch = stretch + inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares
+        # D's distance along the step bounds how far f = act(D x) moves, p1 |x| per unit; U's, its norm.
+        spread, output = reach("down"), norm + reach("up")
+        turned = p1 * spread * longest
+        curvature, slope = head.at(least, reach("up") * (fed + turned) + norm * turned)
+        bend = jnp.zeros_like(squares)
+        stretch = jnp.zeros_like(squares)
         if "down" in parts:
-            bend = bend + p1 * lengths
-    return jax.lax.stop_gradient(rate / (1 + rate * (curvature * stretch + slope * bend)))
+            stretch = stretch + output ** 2 * p1 ** 2 * squares
+            bend = bend + output * p2 * squares
+        if "up" in parts:
+            stretch = stretch + inputs + 2 * p1 * spread * crossed + p1 ** 2 * spread ** 2 * squares
+            if "down" in parts:
+                bend = bend + p1 * lengths
+        return curvature * stretch + slope * bend
+
+    plain = jnp.full_like(squares, rate)
+    low, high = rate / (1 + rate * curvature_along(plain)), plain
+    for _ in range(_HALVINGS):
+        middle = jnp.sqrt(low * high)
+        admitted = middle * (1 + rate * curvature_along(middle)) <= rate
+        low, high = jnp.where(admitted, middle, low), jnp.where(admitted, high, middle)
+    return jax.lax.stop_gradient(low)
 
 
 def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,
