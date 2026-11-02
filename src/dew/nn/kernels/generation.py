@@ -504,6 +504,19 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     return GpuTarget(identifier, identifier)
 
 
+def built_target(generation: str, multiprocessors: int | None = None) -> GpuTarget:
+    """The GPU a program compiled ahead is built for: the CUDA `generation`'s target (`gpu_target`) with the
+    `multiprocessors` its build states, where it states them (an H100 PCIe's 114 against the canonical H100's
+    132), else the generation's own. What a build's XLA target (`dew.training.ahead.target_config`), its
+    launches (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
+    target = gpu_target(generation)
+    if multiprocessors is None:
+        return target
+    if multiprocessors <= 0:
+        raise ValueError(f"a GPU states a positive count of multiprocessors, not {multiprocessors}")
+    return dataclasses.replace(target, multiprocessors=multiprocessors)
+
+
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and

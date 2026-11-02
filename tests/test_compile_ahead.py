@@ -391,7 +391,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
         path = tmp_path / f"step{len(stated)}.dew-aot"
         run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
                                "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
-                               "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
+                               "--trainer.compile-ahead.devices", "1",
+                               "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
                                "--trainer.compile-ahead.frontier", *stated],
                               default=lm(tmp_path, drawn=False))
