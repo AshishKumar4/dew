@@ -33,7 +33,6 @@ import pytest
 from attention_oracle import exact_attention
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, with_gradients
-from whole_suite import timed
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -869,31 +868,30 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
                                     "values not finite where the reference's are")
 
 
-PAST_TARGET = {
-    "accurate": {("a small weight on a large value, bfloat16", "triton"): 325,
-                 ("a small weight on a large value, float32", "triton"): 320,
-                 ("a resumed state of a large denominator", "triton"): 269,
-                 ("a resumed state beside an overflowing column", "triton"): 144,
-                 ("a small column beside an overflowing one", "triton"): 141,
-                 ("a cotangent on a small column beside an overflowing one", "triton"): 139,
-                 ("a column near fp32's least normal beside an overflowing one", "triton"): 135},
-    "frozen default": {("a small column beside an overflowing one",): 181,
-                       ("a cotangent on a small column beside an overflowing one",): 168,
-                       ("a column near fp32's least normal beside an overflowing one",): 137},
-    "frozen rows": {("a small column beside an overflowing one",): 175,
-                    ("a resumed state beside an overflowing column",): 120,
-                    ("a column near fp32's least normal beside an overflowing one",): 119,
-                    ("a cotangent on a small column beside an overflowing one",): 118},
-    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default"): 143}}
-"""The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
-train 281's or 283's CI (f083bb557, cdc28de85; rows 2117, 2193, 2204): the whole suite's run holds them
-(`timed`), every other case of their tests runs each train."""
+GPU_ONLY = {
+    "accurate": {("a small weight on a large value, bfloat16", "triton"),
+                 ("a small weight on a large value, float32", "triton"),
+                 ("a resumed state of a large denominator", "triton"),
+                 ("a resumed state beside an overflowing column", "triton"),
+                 ("a small column beside an overflowing one", "triton"),
+                 ("a cotangent on a small column beside an overflowing one", "triton"),
+                 ("a column near fp32's least normal beside an overflowing one", "triton")},
+    "frozen rows": {"a small column beside an overflowing one",
+                    "a resumed state beside an overflowing column",
+                    "a column near fp32's least normal beside an overflowing one",
+                    "a cotangent on a small column beside an overflowing one"},
+    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default")}}
+"""The cases whose Pallas-Triton kernel interpreted on a CPU passes the suite's 120 s target (118 to 325 s on
+armada, train 281's and 283's CI, rows 2117, 2193, 2204), by test: each runs compiled on a GPU in its flow
+(tests/test_gpu_attention.py), which proves the kernel the route runs, in seconds, where the interpreter
+proves an interpreter (as `GPU_TRITON_FAMILIES`')."""
 
 
-ACCURATE_ARMS = timed(PAST_TARGET, "accurate", [(family, name) for family in TEMPLATE_FAMILIES
-                                   for name in _mainloops(FAMILIES[family], ACCURATE)])
+ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
+                 for name in _mainloops(FAMILIES[family], ACCURATE)
+                 if (family, name) not in GPU_ONLY["accurate"]]
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
-its own, so none holds a CPU task past the suite's target (row 1849)."""
+its own, so none holds a CPU task past the suite's target (row 1849); those past it on a GPU (`GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
@@ -939,15 +937,18 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 (`MosaicBackward.derived`)."""
 
 
-GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
+GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
+                       "a small column beside an overflowing one",
+                       "a cotangent on a small column beside an overflowing one",
+                       "a column near fp32's least normal beside an overflowing one")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): 256 draws interpreted take past the CPU suite's 240 s target (218-257 s,
-row 1849)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
+s, rows 1849, 2193; `GPU_ONLY`)."""
 
 
-@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen default", [
+@pytest.mark.parametrize("family", [
     family for family in TEMPLATE_FAMILIES
-    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES]))
+    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
@@ -957,8 +958,8 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     default_is_finite(family, "triton")
 
 
-@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen rows", [family for family in TEMPLATE_FAMILIES
-                                                        if FAMILIES[family].overflows]))
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
+                                    if FAMILIES[family].overflows and family not in GPU_ONLY["frozen rows"]])
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
     pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
@@ -1126,8 +1127,11 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     return decoded, forward
 
 
-@pytest.mark.parametrize("family, form", timed(PAST_TARGET, "decode", DECODED),
-                         ids=[f"{family}-{form}" for family, form in DECODED])
+DECODED_ON_CPU = [case for case in DECODED if case not in GPU_ONLY["decode"]]
+
+
+@pytest.mark.parametrize("family, form", DECODED_ON_CPU,
+                         ids=[f"{family}-{form}" for family, form in DECODED_ON_CPU])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),
     each row's keys the first `K` of its cache, check 1 over the family's draws."""

@@ -102,6 +102,21 @@ def test_the_attention_kernels_run_on_this_gpu():
         *(Cell(f"the Pallas-Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
+        # The stability cases whose kernel interpreted passes the CPU suite's target (`GPU_ONLY`), compiled.
+        *(Cell(f"the accurate form is finite and as exact as the reference at fp32's edges: {family} {name}",
+               functools.partial(
+                   stability.test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
+                   family, name))
+          for family, name in sorted(stability.GPU_ONLY["accurate"])),
+        *(Cell(f"the Pallas-Triton backward reads a guarded forward's rows whatever its pass: {family}",
+               functools.partial(
+                   stability.test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass,
+                   family))
+          for family in sorted(stability.GPU_ONLY["frozen rows"])),
+        *(Cell(f"decode is finite and as exact as the reference at fp32's edges: {family} {form}",
+               functools.partial(stability.test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
+                                 family, form))
+          for family, form in sorted(stability.GPU_ONLY["decode"])),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic"), "sm90")
           for family in stability.MOSAIC_FAMILIES),
