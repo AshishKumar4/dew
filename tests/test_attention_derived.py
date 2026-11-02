@@ -179,11 +179,11 @@ def derived_backward(form: str, along: str):
 
     def tile(values: dict, index: int) -> dict:
         part = slice(index * BLOCK, (index + 1) * BLOCK)
-        tiled = (("q", "dout", "peak", "total", "anchor", "delta", "logits") if along == "rows"
+        tiled = (("q", "dout", "peak", "total", "anchor", "delta", "logits", "seen") if along == "rows"
                  else ("k", "values"))
 
         def part_of(name, value):
-            if along == "keys" and name == "logits":
+            if along == "keys" and name in ("logits", "seen"):
                 return value[:, part]
             return value[part] if name in tiled else value
 
@@ -193,7 +193,7 @@ def derived_backward(form: str, along: str):
         _, peak, total, delta = rows_of(q, k, v, d)
         logits = jnp.where(seen, float32_einsum("qd,kd->qk", q, k) * SCALE, -jnp.inf)
         values = {"logits": logits, "q": q, "k": k, "values": v, "dout": d, "peak": peak, "total": total,
-                  "anchor": jnp.zeros_like(delta), "delta": delta}
+                  "anchor": jnp.zeros_like(delta), "delta": delta, "seen": seen}
         parts = [tile(values, index) for index in range(LENGTH // BLOCK)]
         mapped = [forms.mapped(part) for part in parts]
         dq, dk, dv, *_ = forms.finish(walked(forms, parts), values, shapes=shaped(parts[0]))
@@ -343,6 +343,22 @@ def test_a_derived_backward_of_one_key_gives_an_exactly_zero_query_gradient():
     with fast(derived=True):
         grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
     np.testing.assert_array_equal(np.asarray(grads.query, np.float32), 0.0)
+
+
+def test_a_derived_backward_masks_an_empty_querys_overflowing_product():
+    """Two fp32 queries over one key, the second seeing none, the value's first component 2^127 and the second
+    query's output cotangent 4 there: its product `dP` is 2^129, past fp32's largest, beside a weight of 0.
+    Under the derived backward every gradient is finite, as the reference's are: the cotangents are masked
+    where a query sees no key (`softmax_cotangents`, as `grad_scores`), not multiplied by its zero weight."""
+    query, key, value, dout, tiles = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
+                                             [[0.0], [4.0]])
+    spans = template.KeySpans(jnp.asarray([[0, 1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32), None, None,
+                              keys=1)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, None), query, key, value)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in pull(dout))
+    with fast(derived=True):
+        grads = attention_portable.backward(query, key, value, spans, None, dout, **tiles)
+    assert all(np.isfinite(np.asarray(grad)).all() for grad in (grads.query, grads.key, grads.value))
 
 
 def test_a_derived_backward_scales_its_cotangents_before_their_products():

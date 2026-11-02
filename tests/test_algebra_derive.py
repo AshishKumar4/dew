@@ -332,6 +332,41 @@ def test_an_integer_bitwise_values_bound_is_its_dtypes():
     assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
 
 
+@pytest.mark.parametrize("wrapped", ["converted", "negated", "subtracted"])
+def test_an_unsigned_values_bound_is_its_dtypes_where_it_wraps(wrapped):
+    """int32's -1 converted to uint32, uint32's 1 negated, and uint32's 0 less 1 are each `2**32 - 1`, though
+    their operands are declared at 1: a walk's sum of four such, converted to float32 and times 2^94, each
+    scaled by its row's quarter, is finite, and the walk keeps the scale inside its sum (bible §6), where the
+    real arithmetic's bound would take it out, the four terms' sum past float32's largest."""
+    signed = wrapped == "converted"
+    tile = {"s": jnp.full((2,), 0.25, jnp.float32),
+            "x": jnp.full((2, 4), -1 if signed else 1, jnp.int32 if signed else jnp.uint32)}
+
+    def scaled(s, x):
+        wrap = {"converted": lambda: x.astype(jnp.uint32), "negated": lambda: -x,
+                "subtracted": lambda: jnp.uint32(0) - x}[wrapped]()
+        return jnp.sum(s[:, None] * (wrap.astype(jnp.float32) * jnp.float32(2.0 ** 94)), axis=1)
+
+    declaration = derive.Reduction(scaled, {"s": ("rows",), "x": ("rows", "keys")}, walked="keys",
+                                   exponent="e", ranges={"x": 1.0})
+    assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
+def test_a_float64_programs_reach_is_its_largest_power_of_two():
+    """A float64 walk's sum of two values declared at 2^1023, each scaled by its row's half, is float64's
+    2^1023, finite, and the walk keeps the scale inside its sum (bible §6): float64's reach is 2^1023, not
+    the 2^1024 its largest's `log2` rounds to."""
+    with jax.enable_x64(new_val=True):
+        tile = {"s": jnp.full((2,), 0.5, jnp.float64), "x": jnp.full((2, 2), 2.0 ** 1023, jnp.float64)}
+
+        def scaled(s, x):
+            return jnp.sum(s[:, None] * x, axis=1)
+
+        declaration = derive.Reduction(scaled, {"s": ("rows",), "x": ("rows", "keys")}, walked="keys",
+                                       exponent="e", ranges={"x": 2.0 ** 1023})
+        assert np.all(np.isfinite(scaled(**tile))) and np.all(np.isfinite(one_tile(declaration, tile)))
+
+
 def test_a_walks_finish_is_its_own_whatever_walk_came_before():
     """A sum returned in its operand's dtype, walked over bfloat16 tiles and then over float32 ones, whose
     states are alike (a float32 sum each, as JAX sums a narrow value): each walk's finish its own forms', the

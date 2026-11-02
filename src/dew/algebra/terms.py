@@ -266,7 +266,7 @@ def region(closed: jcore.Jaxpr, ranges: Mapping[int, float | tuple[float, float]
             name = equation.primitive.name
             source = equation.invars[0]
             held = isinstance(source, jcore.Var) and source in nonpositive
-            if name in KEEPING_SIGN and held:
+            if name in KEEPING_SIGN and held and _keeps_sign(source, out):
                 nonpositive.add(out)
             exponentiated = name in ("exp", "exp2") and held
             _typed(dtypes, magnitudes, term, out, UNIT if exponentiated else _bounded(equation, operands))
@@ -305,25 +305,64 @@ BITWISE = frozenset({"and", "or", "xor", "not"})
 `not(-2**31)` is `2**31 - 1`)."""
 UNIT = 0
 KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
-"""The language's equations whose output is at most 0 where their operand is."""
+"""The language's equations whose output is at most 0 where their operand is, between signed dtypes
+(`_keeps_sign`: a negative value converted to a boolean is true, to an unsigned integer positive)."""
+
+
+def _signed(dtype) -> bool:
+    """Whether `dtype` holds negative values: a float's or a signed integer's."""
+    return jnp.issubdtype(dtype, jnp.floating) or jnp.issubdtype(dtype, jnp.signedinteger)
+
+
+def _keeps_sign(source, out) -> bool:
+    """Whether a value of `source`'s dtype at most 0 stays at most 0 as `out`'s: both signed (`_signed`)."""
+    return all(isinstance(atom.aval, ShapedArray) and _signed(atom.aval.dtype) for atom in (source, out))
+
+
+def _integer_range(dtype) -> Magnitude:
+    """The power of two bounding every value of the integer `dtype`: a signed one of `bits` bits
+    `2**(bits - 1)`, an unsigned one `2**bits`."""
+    integers = jnp.iinfo(dtype)
+    return integers.bits - (integers.min < 0)
 
 
 def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magnitude | None:
     """A bound on the magnitude of `equation`'s output from its operands' (`operands`, `Magnitude`), None
-    where its primitive proves none (an exponential of a value of any magnitude, a quotient)."""
+    where its primitive proves none (an exponential of a value of any magnitude, a quotient), as its output's
+    dtype holds it: a boolean at most 1 whatever made it (a tiny float converted is 1); an integer at most
+    its dtype's range (`_integer_range`), within which a sum or a product wraps, and at it where an unsigned
+    result may wrap from below zero (`uint32(0) - 1`, a negation, a conversion of int32's -1: `2**32 - 1`)
+    and for a bitwise operation (int32's `not(-2**31)` is `2**31 - 1`); a float as the real arithmetic
+    bounds it (`_real_bound`)."""
+    aval = equation.outvars[0].aval
+    if not isinstance(aval, ShapedArray):
+        return None
+    dtype = np.dtype(aval.dtype)
+    if dtype == np.bool_:
+        return UNIT
+    real = _real_bound(equation, operands)
+    if not jnp.issubdtype(dtype, jnp.integer):
+        return real
+    full = _integer_range(dtype)
+    name = equation.primitive.name
+    source = equation.invars[0].aval
+    from_unsigned = isinstance(source, ShapedArray) and jnp.issubdtype(source.dtype, jnp.unsignedinteger)
+    wraps = jnp.issubdtype(dtype, jnp.unsignedinteger) and (
+        name in ("neg", "sub") or (name == "convert_element_type" and not from_unsigned))
+    if name in BITWISE or wraps:
+        return full
+    return None if real is None else min(real, full)
+
+
+def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magnitude | None:
+    """`_bounded`'s bound as the real arithmetic on the operands' bounds proves it (a float's, or an
+    integer's before its dtype wraps it)."""
     name = equation.primitive.name
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
     if name in BITWISE:
-        aval = equation.outvars[0].aval
-        if not isinstance(aval, ShapedArray):
-            return None
-        dtype = np.dtype(aval.dtype)
-        if dtype == np.bool_:
-            return UNIT
-        # A signed integer of `bits` bits is at most 2**(bits - 1) in magnitude, an unsigned one 2**bits.
-        integers = jnp.iinfo(dtype)
-        return integers.bits - (integers.min < 0)
+        # An integer's its dtype's range, a boolean's 1 (`_bounded`).
+        return None
     if name in COMPARISONS or name in ("is_finite", "sign") or (name in BOUNDED and real):
         return UNIT
     if any(bound is None for bound in operands):

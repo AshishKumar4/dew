@@ -54,9 +54,11 @@ import inspect
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import types
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
 
@@ -396,6 +398,10 @@ def reading() -> Iterator[None]:
         _READING.reset(token)
 
 
+_TRACED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""Each hook object's traced keys while it lives (`KernelOp.identified`), by the op and field tracing it."""
+
+
 @dataclasses.dataclass(frozen=True)
 class KernelOp(tokamax.Op):
     """One Pallas launch: its heuristic (a template's derived) config, or, where an opt-in tuning run
@@ -548,15 +554,32 @@ class KernelOp(tokamax.Op):
     def identified(self, name: str, value: Callable | str | None) -> str | None:
         """The hook field or argument `name`'s value as a launch's identity reads it every launch, tuning or
         not (`report._identity`: its kernels' names, its refusals): by its parts where they tell what it
-        computes (`described`), tracing nothing, else what it computes (`traced`). A key already as it
-        is."""
+        computes (`described`), tracing nothing, else what it computes (`traced`), traced once for each of
+        its objects this process keeps alive (`_TRACED`: a model's layers share their hooks). A key already
+        as it is."""
         if value is None or isinstance(value, str):
             return self.traced(name, value)
         try:
             parts = described(value)
         except _Undescribed:
-            return self.traced(name, value)
+            return self._traced_once(name, value)
         return "described:" + hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+
+    def _traced_once(self, name: str, value: Callable) -> str | None:
+        """`traced`, kept for `value`'s object while it lives, by this op's other fields and `name` (the
+        layouts the template traces it at)."""
+        try:
+            held = _TRACED.setdefault(value, {})
+            place = (type(self), name, tuple((field.name, getattr(self, field.name))
+                                             for field in dataclasses.fields(self)
+                                             if field.name not in (*self.HOOKS, "config", "vjp")))
+            hash(place)
+        except TypeError:
+            # An object no weak reference or hash holds: traced each time.
+            return self.traced(name, value)
+        if place not in held:
+            held[place] = self.traced(name, value)
+        return held[place]
 
     def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
         """The launch of `ba` at `config` as a resource derivation lowers it (never run): a function of the
@@ -674,8 +697,13 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
         for equation in jaxpr.eqns:
+            context = equation.ctx
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
-                   tuple((bound(var), str(var.aval)) for var in equation.outvars))
+                   tuple((bound(var), str(var.aval)) for var in equation.outvars),
+                   # The configuration an equation evaluates and lowers under (a key's bits' construction).
+                   _parameter((context.compute_type, context.threefry_partitionable, context.xla_metadata,
+                               str(context.cur_abstract_mesh), str(context.cur_layout_mode),
+                               context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
@@ -693,13 +721,20 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
 
 def _parameter(value) -> Hashable:
-    """An equation's parameter as `program`'s digest reads it: a number, a string or a tuple of them as it
-    is, an array by its shape, dtype and bytes' digest, a function by its module and name, any other object
-    by its type and its representation, less a memory address (which no two processes share)."""
+    """An equation's parameter as `program`'s digest reads it, the same in every process: a number or a
+    string as it is, a sequence's and a set's parts in order (a set's sorted by their own, which a process's
+    hash seed does not order), a mapping's items sorted, an array by its shape, dtype and bytes' digest, a
+    function by its module and name, any other object by its type and its representation less a memory
+    address (which no two processes share); each tagged with its kind."""
     if value is None or isinstance(value, (bool, int, float, complex, str)):
-        return value
+        return type(value).__name__, value
     if isinstance(value, (tuple, list)):
-        return tuple(_parameter(part) for part in value)
+        return type(value).__name__, tuple(_parameter(part) for part in value)
+    if isinstance(value, (set, frozenset)):
+        return "set", tuple(sorted((_parameter(part) for part in value), key=repr))
+    if isinstance(value, dict):
+        return "mapping", tuple(sorted(((_parameter(key), _parameter(part)) for key, part in value.items()),
+                                       key=repr))
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
         array = np.asarray(value)
         return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()[:16]
@@ -713,56 +748,47 @@ class _Undescribed(Exception):
     """A part `described` says nothing of without running it."""
 
 
+def _located_value(value: type | types.FunctionType) -> bool:
+    """Whether `value` is the object its module holds under its own qualified name (a module-level function
+    or class): one name says what it is in every process of a checkout."""
+    module = sys.modules.get(value.__module__)
+    name = value.__qualname__
+    return module is not None and "." not in name and vars(module).get(name) is value
+
+
 def described(value: object, within: frozenset[int] = frozenset()) -> Hashable:
-    """What `value` computes, told by its parts without running it: a number, a string, a dtype, a class or
-    an enumeration's member as it is; an array by its shape, dtype and bytes (a traced one, data the
-    compiled launch reads, by its shape and dtype); a tuple, a partial, a dataclass's fields and a custom
-    derivative's functions, each part described in turn; a function by its code (its bytecode, constants and
-    the names it reads, each global a number or string reads at its value), defaults and closure.
-    `_Undescribed` where a part is an object of no described parts (a callable object, `jnp.add`'s among
-    them, may read an array its call holds). A function its own closure reaches again (a recursive local
-    function, `within`) is named by its place alone there."""
+    """What `value` computes, told by its parts without running it, each tagged with its kind: a number, a
+    string or bytes, a dtype, an enumeration's member; an array by its shape, dtype and bytes (a traced one,
+    data the compiled launch reads, by its shape and dtype); a tuple's, a list's and a partial's parts; a
+    module-level function or class by its name (`_located_value`) and a dataclass of one by its fields.
+    `_Undescribed` for anything else (a closure, a local function or class, a callable object, a container
+    reaching itself again, `within`): what its call reads is not in its parts, so it is traced (`program`)."""
     if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
-        return value
+        return type(value).__name__, value
     if isinstance(value, enum.Enum):
-        return _named(type(value)), value.name
-    if isinstance(value, type):
-        return _named(value)
+        return "enum", _named(type(value)), value.name
     if isinstance(value, np.dtype):
-        return str(value)
+        return "dtype", str(value)
     if isinstance(value, jax.core.Tracer):
         return "traced", value.shape, str(value.dtype)
     if isinstance(value, (np.ndarray, jax.Array, np.generic)):
         array = np.asarray(value)
         return "array", array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest()
+    if id(value) in within:
+        raise _Undescribed(f"a {type(value).__qualname__} reaches itself")
+    within = within | {id(value)}
     if isinstance(value, (tuple, list)):
-        return tuple(described(part, within) for part in value)
+        return type(value).__name__, tuple(described(part, within) for part in value)
     if isinstance(value, functools.partial):
         return ("partial", described(value.func, within), described(value.args, within),
                 described(tuple(sorted(value.keywords.items())), within))
-    if isinstance(value, types.CodeType):
-        return "code", value.co_code, described(value.co_consts, within), value.co_names, value.co_varnames
-    if isinstance(value, types.FunctionType):
-        if id(value) in within:
-            return "again", value.__module__, value.__qualname__
-        within = within | {id(value)}
-        try:
-            cells = tuple(cell.cell_contents for cell in value.__closure__ or ())
-        except ValueError as empty:
-            raise _Undescribed(f"{value.__qualname__} closes over an unset name") from empty
-        plain = tuple((name, value.__globals__[name]) for name in value.__code__.co_names
-                      if isinstance(value.__globals__.get(name), (bool, int, float, complex, str)))
-        keywords = tuple(sorted((value.__kwdefaults__ or {}).items()))
-        return ("function", value.__module__, value.__qualname__, described(value.__code__, within), plain,
-                described(value.__defaults__ or (), within), described(keywords, within),
-                described(cells, within))
-    if isinstance(value, (jax.custom_vjp, jax.custom_jvp)):
-        parts = [getattr(value, name, None) for name in ("fun", "fwd", "bwd", "jvp", "nondiff_argnums")]
-        return _named(type(value)), described(parts, within)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _named(type(value)), tuple((field.name, described(getattr(value, field.name), within))
-                                          for field in dataclasses.fields(value))
-    raise _Undescribed(f"{type(value).__qualname__} says nothing of what it computes but by running it")
+    if isinstance(value, (type, types.FunctionType)) and _located_value(value):
+        return "named", value.__module__, value.__qualname__
+    if dataclasses.is_dataclass(value) and not isinstance(value, type) and _located_value(type(value)):
+        fields = tuple((field.name, described(getattr(value, field.name), within))
+                       for field in dataclasses.fields(value))
+        return "dataclass", _named(type(value)), fields
+    raise _Undescribed(f"a {type(value).__qualname__} says nothing of what it computes but by running it")
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:

@@ -445,9 +445,9 @@ def _derived_dq(formed, q, do, q_pos, m, anchor, delta, total, lo, hi, draw, *, 
     def tiles_at(j):
         columns, seen, k_tile, v_tile, logits, slopes = formed(j, slopes=True)
         tiles = {"logits": logits, "q": call_q, "k": k_tile, "values": v_tile, "dout": do, "peak": m,
-                 "total": total, "anchor": anchor, "delta": delta}
+                 "total": total, "anchor": anchor, "delta": delta, "seen": seen}
         if slopes is not None:
-            tiles["slope"], tiles["seen"] = slopes[0], seen
+            tiles["slope"] = slopes[0]
         if draw is not None:
             tiles["keep"] = draw(q_pos, columns[None, :])
         return tiles, slopes, seen
@@ -520,9 +520,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             rows, q, do, seen, logits, slopes, zt = tile_at(i)
             tiles = {"logits": logits, "q": q, "k": k_tile, "values": v_tile, "dout": do,
                      "peak": peak[row, head, rows], "total": total[row, head, rows],
-                     "anchor": anchor[row, head, rows], "delta": delta[row, head, rows]}
+                     "anchor": anchor[row, head, rows], "delta": delta[row, head, rows], "seen": seen}
             if slopes is not None:
-                tiles["slope"], tiles["seen"] = slopes[0], seen
+                tiles["slope"] = slopes[0]
             if zt is not None:
                 tiles["keep"] = zt
             return tiles, slopes, seen

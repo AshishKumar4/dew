@@ -146,8 +146,10 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
                  "anchor": read(anchor), "delta": read(delta)}
         if multiplier is not None:
             tiles["keep"] = multiplier
-        exponentials, weights, cotangents = algebra.derived_cotangents(bool(coords.keys_first),
-                                                                       multiplier is not None).mapped(tiles)
+        if seen is not None:
+            tiles["seen"] = seen
+        exponentials, weights, cotangents = algebra.derived_cotangents(
+            bool(coords.keys_first), multiplier is not None, seen is not None).mapped(tiles)
         return exponentials, weights, cotangents, slopes, seen
     inverse_total = per_query(algebra.inverse(read(total)))
     # The fast form's exponent unclamped, its maximum safe where a query saw no key (`algebra.safe_peak`, a

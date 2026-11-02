@@ -280,7 +280,8 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
             continue
         magnitude = region.magnitudes.get(terms.key(output))
         if magnitude is not None:
-            bounded[DECAYS + 1 + index] = 2.0 ** magnitude
+            # No bound where it passes float64's range (a step of 2**1023 declared, `prepare`'s values).
+            bounded[DECAYS + 1 + index] = math.inf if magnitude >= 1024 else 2.0 ** magnitude
     # The solve's inverse less its diagonal: the inverse of a unit lower-triangular matrix whose entries
     # are at most `a` in magnitude is at most `(1 + a)^(C - 1)` (by induction on the substitution); its
     # entries `s_i C_i . B_j` times a decay at most 1, a contraction over the keys: at most the declared
@@ -690,14 +691,24 @@ def _lowered_rule() -> Callable:
     return generation.linear_tangent(forward, backward, _doubled)
 
 
-def _compensated(values, *, reverse: bool = False) -> tuple[jax.Array, jax.Array]:
+def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), each a float and
-    its rounding error (a compensated scan)."""
+    its rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
+    element of it the first of its segment's)."""
     def combine(left, right):
         total, error = two_sum(left[0], right[0])
-        return total, error + left[1] + right[1]
+        summed = total, error + left[1] + right[1]
+        if restarts is None:
+            return summed
+        # Where the right part restarts, the left's sums are not its segment's.
+        kept = right[2]
+        return (jnp.where(kept, right[0], summed[0]), jnp.where(kept, right[1], summed[1]),
+                left[2] | right[2])
 
-    return lax.associative_scan(combine, (values, jnp.zeros_like(values)), reverse=reverse)
+    if restarts is None:
+        return lax.associative_scan(combine, (values, jnp.zeros_like(values)), reverse=reverse)
+    high, low, _ = lax.associative_scan(combine, (values, jnp.zeros_like(values), restarts), reverse=reverse)
+    return high, low
 
 
 class _Decays(NamedTuple):
@@ -714,28 +725,40 @@ class _Decays(NamedTuple):
 
 def _decays(exponents, base2: bool) -> _Decays:
     """`exponents`' decays (`_Decays`, `exp` or `exp2` of the sums), each exponent a partial sum of the
-    compensated prefix differenced from both parts: every exponent taken is at most zero, so each stays
-    finite at any decay, at `tokens^2 keys` elementwise work a chunk (a sub-chunk factoring around a
-    reference prefix is the faster equal form, the extraction's choice under a kernel cost)."""
+    compensated prefix of its segment differenced from both parts (`_decays_value`): every exponent taken is
+    at most zero, so each stays finite at any decay, at `tokens^2 keys` elementwise work a chunk (a sub-chunk
+    factoring around a reference prefix is the faster equal form, the extraction's choice under a kernel
+    cost)."""
     return _decays_of(exponents, base2)
 
 
-FLOOR = -(2.0 ** 100)
-"""The least exponent a chunk's decays sum (`_decays_value`): below it a token's decay, and every decay
-through it, is zero in fp32 whatever the other tokens' (each at most `log(float32 max)`, or the token scan is
-not finite), so an exponent held at it is exact, its derivative zero as the decay's, and a chunk's prefix of
-under 2**27 tokens stays finite (two of -2**127 summed are -inf, whose differences are NaN)."""
+def _vanishing(dtype, base2: bool) -> float:
+    """The exponent at and below which a decay is zero in `dtype`, whatever exponents join it (each at most
+    zero): below the base's logarithm of its least subnormal (`exp(-105)` and `exp2(-151)` are zero in
+    fp32)."""
+    least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
+    return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 
 
 def _decays_value(exponents, base2: bool) -> _Decays:
-    high, low = _compensated(jnp.maximum(exponents, FLOOR))
+    """The decays (`_Decays`) of a chunk's tokens' exponents, each from the compensated prefix of its
+    segment: a token whose exponent vanishes (`_vanishing`, its decay and every decay through it zero) ends
+    one and starts the next, taken as 0 within it, so no span's sum holds a vanished token's (a prefix
+    holding -2**127 twice is -inf; one holding -2**70 loses a later -1 to its rounding, its decay 1 in place
+    of `exp(-1)`), and each span through one is zero."""
+    vanished = exponents <= _vanishing(exponents.dtype, base2)
+    high, low = _compensated(jnp.where(vanished, 0.0, exponents), restarts=vanished)
+    segments = jnp.cumsum(vanished.astype(jnp.int32), axis=0)
     count = exponents.shape[0]
     below = (jnp.arange(count)[:, None] >= jnp.arange(count)[None, :])[:, :, None]
     gaps = (high[:, None] - high[None, :]) + (low[:, None] - low[None, :])
-    return _Decays(entering=_exp(base2, high + low),
-                   to_last=_exp(base2, (high[-1] - high) + (low[-1] - low)),
-                   whole=_exp(base2, high[-1] + low[-1]),
-                   between=jnp.where(below, _exp(base2, jnp.where(below, gaps, 0.0)), 0.0))
+    # A span holds a vanished token where its ends lie in two segments, or its start in the first's.
+    joined = below & (segments[:, None] == segments[None, :])
+    started, ending = segments == 0, segments == segments[-1]
+    return _Decays(entering=jnp.where(started, _exp(base2, high + low), 0.0),
+                   to_last=jnp.where(ending, _exp(base2, (high[-1] - high) + (low[-1] - low)), 0.0),
+                   whole=jnp.where(started[-1], _exp(base2, high[-1] + low[-1]), 0.0),
+                   between=jnp.where(joined, _exp(base2, jnp.where(joined, gaps, 0.0)), 0.0))
 
 
 def _decays_of(exponents, base2: bool) -> _Decays:

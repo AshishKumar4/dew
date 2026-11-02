@@ -378,6 +378,50 @@ def test_a_chunk_of_any_finite_nonpositive_decays_stays_finite(tokens):
     assert np.all(np.isfinite(np.asarray(forms.mapped(forms.prepare(chunk), forms.init({})))))
 
 
+def test_a_chunks_later_decays_keep_their_digits_after_a_vanished_one():
+    """A scalar SSD chunk whose log decays are -2^127, -2^70 and -1 (two vanished, then e^-1), its writes
+    `2^127` from the second token on: the token scan's output is `(1 + e^-1) 2^127`, finite; the derived
+    chunk's is too, its last decay e^-1, not the 1 a prefix holding -2^70 rounds its -1 into, whose two
+    writes sum past float32's largest."""
+    def ssd(h, q, b, v, g):
+        return jnp.exp(g) * h + b[:, None] * v[None, :]
+
+    def read(h, q, b, v, g):
+        return q @ h
+
+    operands = {"q": ("time", "key"), "b": ("time", "key"), "v": ("time", "value"), "g": ("time",)}
+    forms = scan.derive_scan(scan.Scan(ssd, read, operands, walked="time", state=((1, 1), jnp.float32),
+                                       ranges={"g": (-np.inf, 0.0)}), saturation=SATURATION)
+    writes = jnp.asarray([[0.0], [2.0 ** 127], [2.0 ** 127]])
+    chunk = {"q": jnp.ones((3, 1)), "b": jnp.ones((3, 1)), "v": writes,
+             "g": jnp.asarray([-(2.0 ** 127), -(2.0 ** 70), -1.0])}
+    h, expected = jnp.zeros((1, 1)), []
+    for index in range(3):
+        token = [chunk[name][index] for name in operands]
+        expected.append(read(h := ssd(h, *token), *token))
+    outputs = forms.mapped(forms.prepare(chunk), forms.init({}))
+    assert np.all(np.isfinite(np.asarray(expected))) and np.all(np.isfinite(np.asarray(outputs)))
+
+
+def test_a_chunk_of_a_vast_declared_step_derives():
+    """A float64 SSD scan whose step is declared at 2^1023 and its input at 2: its token values' bounds pass
+    float64's range, so the derivation holds none of them (no `OverflowError`), and a chunk of zero steps maps
+    finite."""
+    def ssd(h, q, b, x, dt):
+        return jnp.exp(-dt) * h + b[:, None] * (x * dt)[None, :]
+
+    def read(h, q, b, x, dt):
+        return q @ h
+
+    operands = {"q": ("time", "key"), "b": ("time", "key"), "x": ("time", "value"), "dt": ("time",)}
+    with jax.enable_x64(new_val=True):
+        forms = scan.derive_scan(scan.Scan(ssd, read, operands, walked="time", state=((2, 2), jnp.float64),
+                                           ranges={"dt": 2.0 ** 1023, "x": 2.0, "q": 1.0, "b": 1.0}),
+                                 saturation=SATURATION)
+        chunk = {"q": jnp.ones((4, 2)), "b": jnp.ones((4, 2)), "x": jnp.ones((4, 2)), "dt": jnp.zeros((4,))}
+        assert np.all(np.isfinite(np.asarray(forms.mapped(forms.prepare(chunk), forms.init({})))))
+
+
 def _primitives(jaxpr):
     """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
     derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""

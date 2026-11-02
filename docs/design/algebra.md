@@ -388,15 +388,19 @@ range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's co
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
 outside the language, has none. Each equation in the language composes its operands' bounds: sums take twice
 the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
-function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`, a boolean's bitwise operation)
-is 1, a complex operand's sine or tangent none (`sin(pi/2 + 89j)` is 2.2e38), an integer's bitwise operation
-its dtype's range (int32's `not(-2**31)` is `2**31 - 1`), and a rounding to an integer (`floor`, `ceil`,
-`round`) its operand's or 1 (`ceil(2**-126)` is 1). An exponential of an unbounded operand, or a quotient, has no
+function (`tanh`, `sin`, `logistic` of a real operand; a comparison, `sign`) is 1, a complex operand's sine
+or tangent none (`sin(pi/2 + 89j)` is 2.2e38), and a rounding to an integer (`floor`, `ceil`, `round`) its
+operand's or 1 (`ceil(2**-126)` is 1). Each bound is its output dtype's too: a boolean is at most 1 whatever
+made it (a tiny float converted is 1); an integer at most its dtype's range, within which a sum or a product
+wraps, and at that range for a bitwise operation and where an unsigned result may wrap from below zero
+(`uint32(0) - 1`, a negation, int32's -1 converted: `2**32 - 1`). A conversion keeps a value at most 0 only
+between signed dtypes. An exponential of an unbounded operand, or a quotient, has no
 bound; an exponential of an operand at most 0 is at most 1.
 
 The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
 finite. A reordering is admitted only when every new intermediate it makes has a number bound under the
-program's reach, the narrowest float's largest power of two (`rules.reach`; `rules.dominated`): a number bound
+program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
+its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
 admits nothing: the reference's value may sit far below any bound over it while the new intermediate
 overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. Each rule computes its new
@@ -678,17 +682,19 @@ forms where the declarations state the walk:
   axes (a split decode's, `_rows`).
 - The attention backward. The plain-JAX mainloop walks dQ over the keys and dK and dV over the queries by
   the backward declaration's forms, each launch's tile reader and hook gradients shared with its
-  hand-written algebra; its dP sums in fp32, its cotangents through a hook are masked where the tile's
-  queries see no key (`pulled`: a padded query's hook derivative need not be finite), and they take the
-  scale before their products, the reference's order. Every Mosaic backward launch takes its tiles' weights and score cotangents from the
+  hand-written algebra; its dP sums in fp32, its score cotangents are masked where the tile's queries see
+  no key, before and after a hook's derivative (`softmax_cotangents`, `pulled`: an empty query's product or
+  a padded query's hook derivative need not be finite), and they take the scale before their products, the
+  reference's order. Every Mosaic backward launch takes its tiles' weights and score cotangents from the
   tile declaration (`softmax_cotangents`) over its own products. Both cover hooks' slopes, dropout, the
   first pass's D and initial states.
 - The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
   (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
   `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
-  carries typed as every operand varies, its decays' exponents held at `scan.FLOOR` (a decay of zero
-  there in fp32: two tokens' -2**127 summed are -inf), a pair no decay joins selected away before its
-  decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
+  carries typed as every operand varies, its decays' prefix restarting at a token whose decay vanishes in
+  its dtype (`_vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum
+  holds its exponent: a prefix of -2**127 twice is -inf, one of -2**70 loses a later -1), a pair no decay
+  joins selected away before its decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
   prefix's decays.
 

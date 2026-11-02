@@ -414,7 +414,8 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     # against 0.5 (x + y)), so an unbounded value has none (`terms.Magnitude`).
     floats = [jnp.finfo(dtype).max for dtype in region.dtypes.values() if jnp.issubdtype(dtype, jnp.floating)]
     if floats:
-        facts.append(set_(rules.reach()).to(i64(math.floor(math.log2(min(floats))))))
+        # The largest power of two under the float's largest, exactly (float64's log2 rounds to 1024).
+        facts.append(set_(rules.reach()).to(i64(math.frexp(float(min(floats)))[1] - 1)))
     if facts:
         graph.register(*facts)
 

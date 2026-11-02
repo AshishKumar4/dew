@@ -4,6 +4,9 @@ its timings, written and read back equal, through tokamax's public API alone."""
 import dataclasses
 import functools
 import json
+import os
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -182,44 +185,59 @@ def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
         assert keys[0] == keys[2]
 
 
-def test_a_launchs_identity_reads_its_hooks_without_running_them():
-    """A launch's identity (`KernelOp.identified`, every launch's, tuning or not) reads its hooks' parts and
-    runs none: a hook that raises when run keys alike to its equal (a closure over an equal value), and apart
-    from one over another value, one of another body, another on its line, and hooks whose fields differ."""
-    def raising(scale):
-        def hook(tile):
-            raise AssertionError(f"a launch's identity ran its hook at {scale}")
-        return hook
+def _refusing_hook(tile):
+    """A module-level hook that refuses to run: a launch's identity names it without running it."""
+    raise AssertionError("a launch's identity ran its hook")
 
-    def other(scale):
-        def hook(tile):
-            raise ValueError(f"a launch's identity ran its hook at {scale}")
-        return hook
 
+@dataclasses.dataclass(frozen=True)
+class _Scaled:
+    """A module-level hook class whose call refuses to run: named by its class and its fields."""
+
+    scale: float
+
+    def __call__(self, tile):
+        raise AssertionError(f"a launch's identity ran its hook at {self.scale}")
+
+
+def test_a_launchs_identity_names_its_named_hooks_without_running_them():
+    """A launch's identity (`KernelOp.identified`, every launch's, tuning or not) names a module-level hook,
+    a dataclass of one and a partial of them by their parts, running none: equal parts alike, another field's
+    value or a list for a tuple apart. The whole identity, its kernels' names (`report.launching`), reads an
+    argument's hooks alike."""
     op = _HookedKernel()
-    first = op.identified("prologue", raising(2.0))
-    assert first == op.identified("prologue", raising(2.0))
-    assert str(first).startswith("described:")
+    named = op.identified("prologue", _Scaled(2.0))
+    assert named == op.identified("prologue", _Scaled(2.0))
+    assert str(named).startswith("described:")
+    assert named != op.identified("prologue", _Scaled(3.0))
+    partial = functools.partial(_Scaled, 2.0)
+    assert op.identified("prologue", partial) != op.identified("prologue", functools.partial(_Scaled, 3.0))
+    assert tuning.described(([1],)) != tuning.described(((1,),))
+    hooked = _HookedKernel(prologue=_refusing_hook)
+    whole = report._identity(hooked, hooked.bind(TILE, _Hooks(_Scaled(3.0), (0,))))
+    assert whole == report._identity(hooked, hooked.bind(TILE, _Hooks(_Scaled(3.0), (0,))))
+    for changed in (_Hooks(_Scaled(4.0), (0,)), _Hooks(_Scaled(3.0), (1,))):
+        assert whole != report._identity(hooked, hooked.bind(TILE, changed))
+
+
+def test_a_closure_hook_is_traced_once_while_it_lives():
+    """A closure's parts do not say what its call reads (`tuning.described`), so a launch's identity traces
+    it, once for the object while it lives (a model's layers share it): twice asked, traced once; two
+    closures of one line computing apart, apart."""
+    traced = []
+
+    def counting(scale):
+        def hook(tile):
+            traced.append(scale)
+            return tile * scale
+        return hook
+
+    op, shared = _HookedKernel(), counting(2.0)
+    first = op.identified("prologue", shared)
+    assert first == op.identified("prologue", shared) and traced == [2.0]
+    assert op.identified("prologue", counting(3.0)) != first
     doubled, tripled = lambda tile: tile * 2, lambda tile: tile * 3
-    for apart in (raising(5.0), other(2.0), doubled):
-        assert op.identified("prologue", apart) != first
     assert op.identified("prologue", doubled) != op.identified("prologue", tripled)
-
-    def recursive(depth):
-        def walk(tile, steps=depth):
-            return tile if steps == 0 else walk(tile, steps - 1)
-        return walk
-
-    # A local function its own closure reaches again.
-    assert op.identified("prologue", recursive(2)) == op.identified("prologue", recursive(2))
-    assert op.identified("prologue", recursive(2)) != op.identified("prologue", recursive(3))
-    # A launch's whole identity, its kernels' names (`report.launching`), reads an argument's hooks alike:
-    # apart where a hook's value or another field differs.
-    hooked = _HookedKernel(prologue=raising(2.0))
-    named = report._identity(hooked, hooked.bind(TILE, _Hooks(raising(3.0), (0,))))
-    assert named == report._identity(hooked, hooked.bind(TILE, _Hooks(raising(3.0), (0,))))
-    for changed in (_Hooks(raising(4.0), (0,)), _Hooks(raising(3.0), (1,))):
-        assert named != report._identity(hooked, hooked.bind(TILE, changed))
 
 
 def _scaled_hook(tile):
@@ -258,3 +276,34 @@ def test_a_module_level_hook_round_trips_and_any_other_callable_is_refused():
     for name in ("json", "_shadowed_hook", "_no_such_hook"):
         with pytest.raises(tuning.Unreadable):
             tuning.decoded({"function": f"{__name__}:{name}"})
+
+
+def test_a_programs_key_holds_what_its_equations_evaluate_under():
+    """A key's bits drawn under Threefry's partitionable construction and under its default are different
+    streams of one equation (its context, `JaxprEqnContext`): `tuning.program` keys them apart."""
+    key = jax.ShapeDtypeStruct((), jax.random.key(0).dtype)
+
+    def bits(seed):
+        return jax.random.bits(seed, shape=(4,))
+
+    with jax.threefry_partitionable(new_val=True):
+        partitionable = tuning.program(bits, key)
+    with jax.threefry_partitionable(new_val=False):
+        default = tuning.program(bits, key)
+    assert partitionable != default
+
+
+UNORDERED = """
+from dew.nn.kernels import tuning
+print(repr(tuning._parameter(frozenset({"data", "model", "expert", "pipeline"}))))
+"""
+"""A parameter JAX holds as a set of axis names (`shard_map`'s manual axes), as `program` reads it."""
+
+
+def test_a_programs_key_reads_a_set_alike_in_every_process():
+    """A set of axis names reads alike in processes of different hash seeds, whose sets iterate in different
+    orders: every process keys a launch alike, so each takes process 0's picks (`_settle`)."""
+    read = {subprocess.run([sys.executable, "-c", UNORDERED], capture_output=True, text=True, check=True,
+                           env={**os.environ, "PYTHONHASHSEED": seed, "JAX_PLATFORMS": "cpu"}).stdout
+            for seed in ("1", "2", "3", "4")}
+    assert len(read) == 1

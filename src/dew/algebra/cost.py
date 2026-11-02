@@ -124,7 +124,9 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
     primitive operations), as JAX lowers both to one algorithm; 16-bit operands' 16-bit mode, fp32
     operands' TF32 at the default precision (the product declaration's, `product.declared`) and IEEE fp32
     above it; any other operand's on the CUDA cores."""
-    written = precision if isinstance(precision, tuple) else (precision,)
+    # A dot algorithm is a named tuple itself: one, not a pair of precisions.
+    written = precision if isinstance(precision, tuple) and not isinstance(
+        precision, jax.lax.DotAlgorithm) else (precision,)
     for algorithm in written:
         if isinstance(algorithm, jax.lax.DotAlgorithm):
             narrow = {jnp.dtype(algorithm.lhs_precision_type), jnp.dtype(algorithm.rhs_precision_type)}
