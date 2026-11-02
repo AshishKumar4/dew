@@ -31,6 +31,7 @@ from dew.nn.protocols import StagedStacks
 
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
+from ..kv_cache import at_layer, from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
@@ -117,12 +118,6 @@ def _with(read, in_place: dict, index):
 def _layer_slice(tree, index):
     return jax.tree.map(
         lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, 0, keepdims=False), tree)
-
-
-def _layer_written(tree, values, index):
-    return jax.tree.map(
-        lambda bank, leaf: jax.lax.dynamic_update_index_in_dim(bank, leaf, index, 0),
-        tree, values)
 
 
 WRITTEN = ('cache', ROUTER_COLLECTION, 'qk', INDEXER_COLLECTION)
@@ -517,11 +512,13 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     place of its copy. Each layer reads its slice of `state`, the caller's
     opened collections, and their values come out stacked per iteration, as
     flax's scan hands them out. The carry is the hidden state, the staged
-    variables and the cache, written in place one layer's slice per iteration
-    so a decode step holds one banked cache; a cache the layers create comes
-    out stacked like `state`. `in_place` holds the expert kernels each layer
-    reads where they lie (`_apart`), handed to every iteration whole with its
-    index rather than staged.
+    variables and the cache, so a decode step holds one banked cache: each layer
+    reads and writes its keys and values where the bank holds them, a step's
+    tokens at their slots alone (`dew.nn.kv_cache.at_layer`), and every other
+    leaf as its slice, written back; a cache the layers create comes out stacked
+    like `state`. `in_place` holds the expert kernels each layer reads where
+    they lie (`_apart`), handed to every iteration whole with its index rather
+    than staged.
     """
     in_place = in_place or {}
     def body(carry, index):
@@ -529,20 +526,20 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(_with(current, in_place, index), _layer_slice(state, index),
-                                None if held is None else _layer_slice(held, index),
+                                None if held is None else at_layer(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
-            held = _layer_written(held, changed.pop('cache'), index)
+            held = from_layer(held, changed.pop('cache'), index)
         return (hidden, staged, held), changed
 
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
     x, changed = layer(_with(current, in_place, last), _layer_slice(state, last),
-                       None if cache is None else _layer_slice(cache, last), x,
+                       None if cache is None else at_layer(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
-        cache = _layer_written(cache, changed.pop('cache'), last)
+        cache = from_layer(cache, changed.pop('cache'), last)
     changed = jax.tree.map(
         lambda rows, final: jnp.concatenate([rows, final[None]]), sown, changed)
     if cache is not None:
