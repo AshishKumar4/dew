@@ -1250,6 +1250,11 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
     passes: PassTokens = field(default_factory=PassTokens, compare=False)
     """The tokens each pass shape's text passes computed and their rows held (`PassTokens.metrics`)."""
 
+    @property
+    def model(self) -> DecisionModel:
+        """The decision's model, whose weights every pass reads (`Scoring.model`)."""
+        return self.decide.model
+
     def metrics(self) -> dict[str, float]:
         """Its passes' share of their tokens its rows held (`PassTokens.metrics`), as its server reports it
         (`dew.inference.scoring.Metered`)."""

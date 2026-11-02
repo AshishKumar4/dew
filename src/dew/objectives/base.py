@@ -59,7 +59,7 @@ from dew.nn.precision import (
     weighted_total,
 )
 from dew.nn.progress import END, Progress, ReadsProgress
-from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
+from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters, StagedStacks
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -939,6 +939,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return ()
 
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
+        stage-local state is made from: the trainer keeps each stacked by stage on the stage's own
+        devices, its optimizer state and EMA with it (`dew.training.stages`). The default is the
+        `model` the objective holds, whose tree is the objective's own, as its model declares
+        them (`StagedStacks`); an objective that holds its networks in parts of its tree says
+        where each lies."""
+        model = vars(self).get("model")
+        return model.stage_sites(store, stages) if isinstance(model, StagedStacks) else ()
+
     @property
     def initializer(self) -> Initializer:
         """`init` as one value a JIT can take, with the held arrays as its arguments.
@@ -980,7 +990,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         held = self.held_variables() if variables is None else variables
         if held is not None and "params" in held:
-            tree = held
+            # A store a stage-local run handed on is read on its stored layers, whatever this run keeps.
+            from dew.nn.backbones.decoder_stack import stored_layers
+
+            tree = stored_layers(self, held)
         elif held is None or self._held_parts:
             tree = self.fresh_variables(key, held)
         else:

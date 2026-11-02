@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,7 +106,23 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
 # documented API. A landing snippet file shows only its marked regions.
 DEW_USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py",
          "tutorials/*.ipynb", "site/snippets/*.py", "site/src/data/*.py"]
-DEW_USAGE_SKIP = ("docs/research/", "docs/design/")
+MANIFEST = "site/src/manifest.mjs"
+"""The site's information architecture: the pages it shows (each item's `source`) and the folders it keeps
+in the repository (`repositoryOnly`), a page under one of them shown only where it is listed (`shown`)."""
+
+
+def shown(repo: Path, skip: tuple[str, ...] = ()) -> Callable[[str], bool]:
+    """Whether a repository path is a page the site shows a reader, read from the manifest (`MANIFEST`): every
+    check of what a reader sees runs on these, the architecture page among them, not on a folder list of its
+    own (review, train 456: a listed page under docs/design went unchecked). A package with no manifest shows
+    every path outside its folders `skip`."""
+    if not (repo / MANIFEST).is_file():
+        return lambda path: not path.startswith(skip)
+    text = (repo / MANIFEST).read_text()
+    listed = set(re.findall(r"source: '([^']+)'", text))
+    found = re.search(r"repositoryOnly = \[([^\]]*)\]", text)
+    kept = tuple(re.findall(r"'([^']+)'", found.group(1))) if found else ()
+    return lambda path: path in listed or not path.startswith(kept)
 
 
 
@@ -128,6 +144,8 @@ class Package:
     declared: str = "site/scripts/gen_api.py"  # the file declaring `groups` at any commit (`groups_at`)
     distribution: str = "dewml"  # the name pip installs the package by (`pinned`)
     usage_skip: tuple[str, ...] = ()
+    """Folders whose files show no reader Dew code, for a package without a site manifest (`MANIFEST`), whose
+    own pages decide instead (`usage_files`)."""
     special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
     fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
 
@@ -150,7 +168,7 @@ class Package:
 
 
 DEW = Package("dew", Path(__file__).resolve().parents[2], "https://github.com/AshishKumar4/dew/blob/main/",
-              DEW_GROUPS, usage=DEW_USAGE, usage_skip=DEW_USAGE_SKIP)
+              DEW_GROUPS, usage=DEW_USAGE)
 P = DEW
 
 
@@ -533,10 +551,12 @@ def import_statements(code: str) -> Iterator[ast.ImportFrom]:
 
 
 def usage_files() -> Iterator[tuple[str, Path]]:
+    """Each file of `P.usage` a reader sees (`shown`)."""
+    visible = shown(P.repo, P.usage_skip)
     for glob in P.usage:
         for path in sorted(P.repo.glob(glob)):
             relative = path.relative_to(P.repo).as_posix()
-            if not relative.startswith(P.usage_skip):
+            if visible(relative):
                 yield relative, path
 
 

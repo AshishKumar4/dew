@@ -257,8 +257,8 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None
-            ) -> Evaluation:
+            updates: int | jax.Array | None = None,
+            scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -285,7 +285,6 @@ class Evaluation:
         microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
         only the work training accepted. `updates` is the updates training
         committed (`Step.updates`), and defaults to the schedule's step.
-
         `warm` scores at most `WARM_BATCHES` batches and finalizes no score, so
         the evaluation holds none: a pass over them runs every program a longer
         pass does, the loss's reduction included, which a run compiles this way
@@ -309,6 +308,7 @@ class Evaluation:
         from dew.nn.inputs import request_key
         key = request_key(key)
         if episodic(batches):
+            # A policy flies off the mesh, reading a stage-local store as its layers (`off_stages`).
             return cls._episodes(batches, averaged if averaged is not None else variables, key=key, step=step,
                                  schedule_step=schedule_step, updates=updates, split=split, warm=warm,
                                  metrics=metrics or batches.metrics, training=training)
@@ -585,8 +585,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                                            written=written,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
-                previews = _previewed(objective, variables, batch, context,
-                                      preview_key=preview_key, scored=produced, root=root)
+                previews = _previewed(objective, variables, batch, context, preview_key=preview_key,
+                                      scored=produced, root=root)
             produced = batch = None
             scored += 1
             if (not metrics and not loss and not kept) or (warm and scored == WARM_BATCHES):

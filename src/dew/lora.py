@@ -59,6 +59,7 @@ from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_names import group_layers
+from dew.nn.backbones.decoder_stack import stored_layers
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
@@ -86,7 +87,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS
+from dew.nn.sharding import LOW_RANK_FACTORS, stored_paths
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -508,7 +509,7 @@ class Adapter:
         the codes go, since a model under the record would multiply them in the merged
         kernel's place. The result is one `params` collection.
         """
-        variables = decoded_frozen_fp8(thaw(variables))
+        variables = decoded_frozen_fp8(thaw(stored_layers(self.model, variables)))
         merged: dict = {}
         for path, target in self.targets.items():
             node = _node(variables, path)
@@ -526,7 +527,7 @@ class Adapter:
         A pipeline source, whose weights are named under several components, gets the
         Diffusers file with each component's PEFT config in its header.
         """
-        variables = thaw(variables)
+        variables = thaw(stored_layers(self.model, variables))
         components = _components(self.layouts)
         names = {layout.paths[0][:-1]: name for name, layout in self.layouts.items()
                  if layout.paths[0][-1] == "kernel"}
@@ -615,6 +616,17 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     return None
 
 
+def _stored_target(targets: Mapping[Path, Target], root: Path, path: Path) -> Target | None:
+    """The target of the module at `path` below `root`, a pipeline stage's layer standing for each
+    stored layer it runs (`stored_paths`), whose targets must agree, since the stages run one program
+    over one stacked factor pair."""
+    found = {_target_at(targets, root + held) for held in stored_paths(path)}
+    if len(found) > 1:
+        raise ValueError(f"{'/'.join(path)} runs the layers of every pipeline stage, whose adapter targets "
+                         f"differ; a pipeline stacks one factor pair over all of them")
+    return found.pop()
+
+
 @dataclass(frozen=True)
 class _Bound:
     """An adapter's settings, held once by the model it adapts (its branch, `_Branch`) and read by its
@@ -662,20 +674,21 @@ class _Branch:
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
-                and _targets_under(self.targets, root + module.path + (name,)))
+                and any(_targets_under(self.targets, root + path)
+                        for path in stored_paths((*module.path, name))))
         if context.method_name == "applied_kernel":
             # A model asks for the kernel its submodule multiplies by
             # (`CausalTransformer.applied_kernel`): a target's carries the
             # branch's update, as `LoRA.merge` sums it.
             name = args[0] if args else kwargs["name"]
             kernel = next_fun(*args, **kwargs)
-            target = _target_at(self.targets, root + module.path + (name,))
+            target = _stored_target(self.targets, root, (*module.path, name))
             if target is None:
                 return kernel
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = (_target_at(self.targets, root + module.path)
+        target = (_stored_target(self.targets, root, module.path)
                   if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)
