@@ -625,6 +625,31 @@ def test_a_dreamer_run_resumed_with_longer_windows_owes_the_updates_after_it_at_
     assert owed <= taken < owed + 8
 
 
+def test_a_dreamer_rollout_restored_after_collecting_for_an_uncommitted_update_owes_it_none_again():
+    """A Dreamer rollout called twice for its third update (an accumulation window's microsteps, or an
+    update the trainer rejected and draws again), its state saved after the first call and restored with
+    its replay into a fresh rollout, takes on the second call and the updates after it the steps the
+    uninterrupted rollout takes: the steps it took for the update not yet committed stand paid."""
+    from types import SimpleNamespace
+
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    batch = {}
+
+    def called(rollout, updates):
+        for at, update in enumerate(updates):
+            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at))
+
+    uninterrupted = dreamer_targets(objective, checkpointed=True)
+    called(uninterrupted, (0, 1, 2, 2, 3, 4))
+    stopped = dreamer_targets(objective, checkpointed=True)
+    called(stopped, (0, 1, 2))
+    resumed = dreamer_targets(objective, checkpointed=True)
+    resumed.restored(stopped.saved())
+    called(resumed, (2, 3, 4))
+    assert resumed.environment_steps == uninterrupted.environment_steps
+
+
 def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():
     """A DreamerV3 run on targets a simulator steps, with a cooldown at its third update whose branch
     collects steps of its own, ends, every leaf bit for bit, where the run with no cooldown does: the
