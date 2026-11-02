@@ -636,8 +636,8 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
          f"scale {scale}", seeds, damped=damped)
 
 
-BOUND_SEEDS = 8
-"""The draws of eight rows each that a diverging corner's site holds element by element
+BOUND_SEEDS, BOUND_ROWS = 8, 8
+"""The draws, and each one's rows, that a diverging corner's site holds element by element
 (`assert_within_rounding`)."""
 
 
@@ -678,7 +678,7 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_within_its_roundi
     grows by 10^13 over eleven steps), and check 1's pooled ratio does not resolve: each loss within
     Dew's rounding bound of the literal loop's float64 truth (`assert_within_rounding`), over every
     layout."""
-    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind, BOUND_ROWS).items()}
     adaptation = ChunkAdaptation(window=1, rate=0.5)
     assert corner(0.5, 0.5, 1)
 
@@ -689,7 +689,7 @@ def test_the_one_token_window_where_the_inner_step_diverges_is_within_its_roundi
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation, truth=True)
 
-    assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=8), BOUND_SEEDS,
+    assert_within_rounding(dew, reference, lambda seed: draw(seed, rows=BOUND_ROWS), BOUND_SEEDS,
                            f"the one-token window at the corner over {kind}")
 
 
@@ -699,12 +699,12 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_within_its_rounding
     by a half every three tokens, rate times curvature past 2 (`CORNER_WINDOWS`), where check 1's pooled
     ratio does not resolve: each leaf within Dew's rounding bound of the literal loop's float64 truth
     (`assert_within_rounding`), over every layout."""
-    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind, BOUND_ROWS).items()}
     adaptation = ChunkAdaptation(window=3, rate=0.5)
     assert corner(0.5, 0.5, 3)
 
     def gradient_draw(seed):
-        variables, hidden, targets, weights = draw(seed, rows=8)
+        variables, hidden, targets, weights = draw(seed, rows=BOUND_ROWS)
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def differentiated(fn):

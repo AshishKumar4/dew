@@ -41,7 +41,7 @@ CPU's float32 implementations over every normal float32 input whose result is a 
 exhaustively against float64 references (2^32 inputs each, 11-02), rounded up at the second decimal.
 XLA CPU flushes subnormal inputs to zero, so the bound holds where no elementary function reads one."""
 
-SUMMED = frozenset({"dot_general", "reduce_sum", "cumsum"})
+SUMMED = frozenset({"dot_general", "reduce_sum", "cumsum", "scatter-add"})
 """Sums of terms, bounded by their terms' magnitudes."""
 
 CALLS = ("pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint", "custom_jvp_call",
@@ -215,6 +215,13 @@ def _weight(equation, name, params, inputs, value):
     if name == "reduce_sum":
         count = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["axes"]]))
         return max(count - 1, 0) * terms
+    if name == "scatter-add":
+        # Each element adds its operand's value and at most every scattered update, one rounding each.
+        numbers = params["dimension_numbers"]
+        updates = equation.invars[2].aval.shape
+        count = int(np.prod([size for axis, size in enumerate(updates)
+                             if axis not in numbers.update_window_dims]))
+        return count * terms
     count = equation.invars[0].aval.shape[params["axis"]]
     return max(count - 1, 0) * terms
 
