@@ -65,7 +65,7 @@ from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
-from dew.nn.sharding import LogicalAxes, boxed_axes, rows_taken
+from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1013,7 +1013,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         `jax.eval_shape`), which placement, the optimizer and a checkpoint read for a drawn tree and a
         held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
         refused by its path: its axes would name another parameter's dimensions."""
-        drawn = jax.eval_shape(functools.partial(self.init, variables={}), jax.random.key(0))
+        drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
         held = self.held_variables()
         if held is not None and "params" in held:
             shapes = {jax.tree_util.keystr(path): np.shape(leaf)
@@ -1720,7 +1720,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
     if signature not in kept:
-        variables = unboxed(jax.eval_shape(objective.init, jax.random.key(0)))
+        variables = unboxed(abstract(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
         rest = {name: value for name, value in variables.items() if name != "params"}
 

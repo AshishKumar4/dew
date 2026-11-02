@@ -29,6 +29,7 @@ from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import accumulated, capped_logits, float32_dot_general
 from dew.nn.rope import sinusoid_frequencies, sinusoids
+from dew.nn.sharding import abstract
 from dew.registry import from_record
 
 from .activations import activation
@@ -610,7 +611,7 @@ def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     features = (
         config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
     )
-    template = unboxed(jax.eval_shape(config.build().init, jax.random.key(0),
+    template = unboxed(abstract(config.build().init, jax.random.key(0),
                                        jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
                                        jax.ShapeDtypeStruct((1, 16), jnp.bool_)))
     return {tuple(str(k.key) for k in path): value.shape

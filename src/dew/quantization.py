@@ -77,6 +77,7 @@ from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
+from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -1595,10 +1596,10 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
+def _serving_parameters(parameters: Variables, shaped: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
-    shapes = flatten_dict(abstract)
+    shapes = flatten_dict(shaped)
     quantized = {}
     for path, parameter in flatten_dict(parameters).items():
         host = isinstance(parameter, np.ndarray)
@@ -1650,8 +1651,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
                 scope.put_variable(collection, name, value)
         return served.clone(parent=scope)(*args, **kwargs)
 
-    _, abstract = unboxed(jax.eval_shape(core.init(initialized), jax.random.key(0), variables))
-    parameters = _serving_parameters(variables["params"], abstract["params"])
+    _, abstracted = unboxed(abstract(core.init(initialized), jax.random.key(0), variables))
+    parameters = _serving_parameters(variables["params"], abstracted["params"])
     return served, {**variables, "params": parameters}
 
 

@@ -25,6 +25,7 @@ from dew.batch import unboxed
 from dew.decision.laya import IN_PROJ
 from dew.decision.layout import DecisionInputs
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, write_file
+from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
     from dew.decision.sources import PretrainedDecision
@@ -81,7 +82,7 @@ def _shaped(width: int, head: nn.Module, params: dict) -> dict:
     inputs = DecisionInputs(tokens=jnp.zeros((1, 2), jnp.int32), segments=jnp.ones((1, 2), jnp.int32),
                             kinds=jnp.zeros((1, 1), jnp.int32), questions=one, spans=jnp.asarray([[[0, 1]]]),
                             option_spans=jnp.asarray([[[[0, 1]]]]), options=one[..., None])
-    shapes = unboxed(jax.eval_shape(head.init, jax.random.key(0), jnp.zeros((1, 2, width)), inputs,
+    shapes = unboxed(abstract(head.init, jax.random.key(0), jnp.zeros((1, 2, width)), inputs,
                                      jnp.zeros((3, width))))["params"]
     flat_shapes = dict(jax.tree_util.tree_leaves_with_path(shapes))
     reshaped = {path: leaf.reshape(flat_shapes[path].shape)

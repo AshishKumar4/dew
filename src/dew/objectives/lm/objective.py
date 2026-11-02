@@ -92,7 +92,7 @@ from dew.nn.protocols import (
     refuse_block_reading,
     refuse_prefix,
 )
-from dew.nn.sharding import LOGITS, constrain
+from dew.nn.sharding import LOGITS, abstract, constrain
 from dew.nn.visibility import prefix_groups
 from dew.objectives.base import (
     OMITTED,
@@ -1267,7 +1267,7 @@ class LMObjective(TokenScorer):
         """
         if self.indexer is not None:
             tree = thaw(tree)
-            drawn = jax.eval_shape(self.fresh_variables, key, None)
+            drawn = abstract(self.fresh_variables, key, None)
             missing = leaves_by_path(drawn["params"]).keys() - leaves_by_path(tree["params"]).keys()
             if self._warmup and missing:
                 outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
