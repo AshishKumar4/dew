@@ -109,7 +109,7 @@ A template is one algorithm, written once, that generates the kernel for the dev
 
 ![A template's layers. A lower layer holds no decision an upper one owns: attention's mainloop never masks, applies a hook, narrows a dtype or does softmax math, and its algebra never issues a product or knows its GPU. The recurrence mainloop splits its products, casts and adds the skip term itself.](https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/architecture-template.svg)
 
-*Figure 3. A template's layers. A lower layer holds no decision an upper one owns: attention's mainloop never masks, applies a hook, narrows a dtype or does softmax math, and its algebra never issues a product or knows its GPU. The recurrence mainloop splits its products, casts and adds the skip term itself.*
+*Figure 2. A template's layers. A lower layer holds no decision an upper one owns: attention's mainloop never masks, applies a hook, narrows a dtype or does softmax math, and its algebra never issues a product or knows its GPU. The recurrence mainloop splits its products, casts and adds the skip term itself.*
 
 ### The algebra interface
 
