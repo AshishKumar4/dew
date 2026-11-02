@@ -192,3 +192,54 @@ def test_a_form_that_breaks_a_law_is_refused():
     with pytest.raises(laws.Unlawful, match="identity"):
         laws.certify(init=forms.init, step=forms.step, merge=kept, finish=forms.finish,
                      declared=declaration.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0})
+
+
+def _biased(start: int):
+    """Attention plus a bias wider than the values by one, sliced from `start`: a form over an operand the
+    walk does not read, its window's place a parameter."""
+    def attention(logits, values, bias):
+        p = jnp.exp(logits - jnp.max(logits, axis=-1)[:, None])
+        return (p @ values) / jnp.sum(p, axis=-1)[:, None] + bias[:, start:start + values.shape[1]]
+
+    declaration = derive.Reduction(attention, {"logits": ("rows", "keys"), "values": ("keys", "width"),
+                                               "bias": ("rows", "wide")}, walked="keys", exponent="e")
+
+    def shapes(rows, keys, width):
+        return {"logits": ((rows, keys), jnp.float32), "values": ((keys, width), jnp.float32),
+                "bias": ((rows, width + 1), jnp.float32)}
+
+    return declaration, shapes
+
+
+def test_forms_sliced_at_two_places_share_no_certificate():
+    """Two declarations that slice an operand one place apart have forms of two structures at a kernel's
+    tile, so neither's certificate is the other's: a window's place is no shape's (`laws.SHAPES`)."""
+    (first, shapes), (second, _) = _biased(0), _biased(1)
+    assert laws.skeletons(first, shapes(64, 64, 128)) != laws.skeletons(second, shapes(64, 64, 128))
+
+
+def test_forms_sliced_off_by_one_are_refused():
+    """The forms of a declaration that slices one place on, certified against the declaration that slices
+    where they should: the declared function's law breaks."""
+    (declared, shapes), (shifted, _) = _biased(0), _biased(1)
+    forms = derive.derive(shifted, accurate=False, saturation=SATURATION)
+    with pytest.raises(laws.Unlawful, match="declared"):
+        laws.certify(init=forms.init, step=forms.step, merge=forms.merge, finish=forms.finish,
+                     declared=declared.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0},
+                     mapped=forms.mapped)
+
+
+def test_forms_whose_output_is_laid_out_otherwise_are_refused():
+    """The forward's forms with their output reshaped from rows by width to width by rows, its elements the
+    same in the same order: the declared function's law breaks on the output's shape."""
+    declaration, shapes = _forward(base2=False, keys_first=False, dtype=jnp.float32)
+    forms = derive.derive(declaration, accurate=False, saturation=SATURATION)
+
+    def reshaped(*args, **kwargs):
+        output = forms.finish(*args, **kwargs)
+        return jnp.reshape(output, output.shape[::-1])
+
+    with pytest.raises(laws.Unlawful, match="shapes differ"):
+        laws.certify(init=forms.init, step=forms.step, merge=forms.merge, finish=reshaped,
+                     declared=declaration.function, shapes=shapes(3, 2, 4), walked={"logits": 1, "values": 0},
+                     mapped=forms.mapped)
