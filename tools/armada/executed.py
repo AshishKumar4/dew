@@ -131,11 +131,11 @@ def watched() -> None:
     """pytest's own entry points to the marker registrations wrapped once a process, as this plugin is
     imported, before any conftest's hook of any kind or order can read them (review: a conftest's
     command-line hook, run first, read them before a watch set in a hook of this plugin's). A test's or a
-    conftest's read of every registration (`Config.getini("markers")`) is its owner's input, pytest's own reads of them, at configure
-    and at a mark's first use, none; and each marker a lookup asks for (`pytest.mark.<name>`, which
-    --strict-markers validates as it looks it up), its owner's input whether any test then carries it or not
-    (review: a helper evaluating an unregistered marker it never applies fails its importers' collection once
-    the registration goes)."""
+    conftest's read of every registration (`Config.getini("markers")`) is its owner's input, pytest's own
+    reads of them, at configure and at a mark's first use, none; and each marker a lookup asks for
+    (`pytest.mark.<name>`, which --strict-markers validates as it looks it up), its owner's input whether any
+    test then carries it or not (review: a helper evaluating an unregistered marker it never applies fails
+    its importers' collection once the registration goes)."""
     looked, read = pytest.MarkGenerator.__getattr__, pytest.Config.getini
 
     def looking(self, name):
