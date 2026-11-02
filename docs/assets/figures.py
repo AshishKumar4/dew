@@ -1220,19 +1220,13 @@ def cfg_sweep_figure():
 
 
 Part = tuple[str, Sequence[str], str, tuple[float, float, float, float]]
-"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; "plain";
-"elsewhere", built on another branch, amber) and where it sits in the wide layout (x, y, width, height)."""
+"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; or
+"plain") and where it sits in the wide layout (x, y, width, height)."""
 
 
 def part(svg: Figure, x, y, w, h, title, lines, kind: str):
     """One part, drawn as its kind is (`Part`)."""
-    if kind == "elsewhere":
-        svg.rect(x, y, w, h, fill="warm_fill", stroke="warm")
-        svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
-        for i, line in enumerate(lines):
-            svg.text(x + 12, y + 45 + 19 * i, line, size=13, color="muted")
-    else:
-        box(svg, x, y, w, h, title, lines, accent=kind == "dew")
+    box(svg, x, y, w, h, title, lines, accent=kind == "dew")
 
 
 def drawn(name: str, label: str, size: tuple[int, int], parts: Sequence[Part],
@@ -1265,19 +1259,17 @@ def architecture_flow_figure():
     """One training run through Dew, from the user's code to the GPU (docs/design/architecture.md)."""
     label = ("One training run through Dew. A script calls Trainer(objective, optax, key).fit(data), or "
              "dew train builds the same Trainer from a RunConfig. Trainer.fit compiles the step: jax.jit "
-             "traces it, it is lowered to StableHLO with kernels as custom calls, and XLA compiles it; the "
-             "algebra pass, which rewrites the traced step's math between tracing and lowering, is on "
-             "base/kernels. Kernels come from Dew's templates, vendor libraries or XLA, and run in one "
-             "executable per step.")
+             "traces it, it is lowered to StableHLO with kernels as custom calls, and XLA compiles it. "
+             "Kernels come from Dew's templates, vendor libraries or XLA, and run in one executable per "
+             "step.")
     parts = [
         ("Trainer(…).fit(data)", ["a script or notebook"], "plain", (110, 16, 340, 62)),
         ("or: dew train run.json", ["RunConfig builds the same Trainer"], "plain", (462, 16, 282, 62)),
         ("Trainer.fit", ["compiles a step per batch shape,", "runs it every micro-batch"], "plain",
          (110, 100, 634, 81)),
-        ("jax.jit", ["traces the step"], "plain", (110, 203, 140, 62)),
-        ("algebra pass", ["on base/kernels"], "elsewhere", (258, 203, 160, 62)),
-        ("lower", ["StableHLO"], "plain", (426, 203, 150, 62)),
-        ("XLA compile", ["fuses, runs ptxas"], "plain", (584, 203, 160, 62)),
+        ("jax.jit", ["traces the step"], "plain", (110, 203, 206, 62)),
+        ("lower", ["StableHLO"], "plain", (324, 203, 206, 62)),
+        ("XLA compile", ["fuses, runs ptxas"], "plain", (538, 203, 206, 62)),
         ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62)),
         ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62)),
         ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62)),
@@ -1288,9 +1280,8 @@ def architecture_flow_figure():
         for y, lane in ((49, "YOUR CODE"), (142, "TRAINER"), (236, "COMPILE"), (320, "KERNELS"),
                         (404, "GPU")):
             svg.text(16, y, lane, size=11, weight=600, color="muted")
-        for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 181, 427, 201), (250, 234, 256, 234),
-                               (418, 234, 424, 234), (576, 234, 582, 234), (427, 265, 427, 285),
-                               (427, 349, 427, 369)):
+        for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 181, 427, 201), (316, 234, 322, 234),
+                               (530, 234, 536, 234), (427, 265, 427, 285), (427, 349, 427, 369)):
             svg.arrow(x1, y1, x2, y2)
 
     drawn("architecture-flow", label, (760, 449), parts, wide)
@@ -1299,15 +1290,15 @@ def architecture_flow_figure():
 def architecture_template_figure():
     """A kernel template's layers, and an attention forward call through them."""
     label = ("A template's layers, top deciding: choice derives one config from device facts; the mainloop "
-             "orders the bundle's steps; the toolkit holds one Family per instruction family, its bundles "
-             "WGMMA, FED and Mma routed and TCGEN05 not; then structure, hooks and the algebra. An "
+             "orders the bundle's steps; the toolkit holds one Family per instruction family, and the bundles "
+             "WGMMA, FED and Mma; then structure, hooks and the algebra. An "
              "attention forward call goes from attention_route through MosaicForward.derived, bundles.of, "
              "the launch and each consumer's walk.")
     parts = [
         ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62)),
         ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62)),
         ("toolkit: one Family each", ["instructions, rings, roles, registers;",
-                                      "WGMMA, FED, Mma; TCGEN05 unrouted"], "dew", (16, 174, 400, 81)),
+                                      "bundles: WGMMA, FED, Mma"], "dew", (16, 174, 400, 81)),
         ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62)),
         ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62)),
         ("algebra", ["init, step, merge, finish on tiles"], "dew", (16, 403, 400, 62)),
