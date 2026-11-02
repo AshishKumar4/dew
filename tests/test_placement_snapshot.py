@@ -25,3 +25,18 @@ def test_each_parameter_is_placed_as_the_snapshot_records(name):
     """Each of the case's leaves, its optimizer state and EMA where a trainer's are recorded, has the
     shape, axes, spec and memory kind its line in the snapshot records."""
     assert snapshot(name, cases()[name]) == RECORDED[name]
+
+
+def test_a_pipelines_state_and_load_are_placed_as_recorded(tmp_path):
+    """The tiny Flux pipeline's training state, its frozen CLIP and T5 encoders by their own tables beside
+    its denoiser's (`DiffusionObjective.tower_axes`), and its load placed on a mesh by the same tables
+    (`pipeline_axes`), are placed as `fixtures/placement/flux_pipeline.txt` records. At main f1f9eecff0
+    every encoder and autoencoder line was the same; the joint attention's projections, flat matrices
+    that now name their heads, split over the tensor axis (ledger 3453)."""
+    import subprocess
+    import sys
+
+    out = tmp_path / "flux_pipeline.txt"
+    subprocess.run([sys.executable, "tools/pipeline_placement.py", str(out)], check=True,
+                   cwd=Path(__file__).resolve().parents[1])
+    assert out.read_text().splitlines() == (SNAPSHOT.parent / "flux_pipeline.txt").read_text().splitlines()
