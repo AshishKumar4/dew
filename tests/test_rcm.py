@@ -182,18 +182,17 @@ def saved_teacher(tmp_path_factory) -> _Teacher:
 
 
 def _saved_teacher(root: Path) -> _Teacher:
-    """`saved_teacher`, saved under `root`."""
+    """`saved_teacher`, saved under `root`: a flow run stepped once by Adam, saved as its run saves it
+    (`saved_after_one_step`)."""
     from diffusion_stubs import batch_for
-    from diffusion_support import images_of
+    from diffusion_support import images_of, saved_after_one_step
 
-    from dew.checkpoints import Checkpoints
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.presets import Flow
     from dew.inputs import TextCondition
     from dew.registry import ModelConfig
     from dew.sampling import Euler
-    from dew.training import Trainer
 
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
@@ -203,18 +202,8 @@ def _saved_teacher(root: Path) -> _Teacher:
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
-    teacher = teacher_run.build()
-    trainer = Trainer(teacher, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(teacher, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
     directory = root / "teacher"
-    directory.mkdir()
-    checkpoints = Checkpoints(str(directory))
-    # As the teacher's run saves it, its task's record beside its weights.
-    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
-    checkpoints.wait()
-    teacher_run.save(str(directory))
+    _, state, batch = saved_after_one_step(teacher_run, lambda task: batch_for(task, 4), directory, 1e-2)
     return _Teacher(teacher_run, directory, state, batch)
 
 
@@ -315,25 +304,16 @@ def test_a_saved_student_samples_as_its_objective_and_holds_its_teacher(saved_te
     teacher, loads without its teacher's run."""
     import shutil
 
-    from dew.checkpoints import Checkpoints
+    from diffusion_support import saved_after_one_step
+
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inference import TextToImage
-    from dew.training import Trainer
 
-    batch = saved_teacher.batch
     # The teacher's run copied here, as this test moves it away.
     teacher = tmp_path / "teacher"
     shutil.copytree(saved_teacher.directory, teacher)
     config = _distilling(saved_teacher, teacher, **ALTERNATING)
-    task = config.build()
-    trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(5))
-    distilled = trainer.initial_state()
-    distilled, *_ = trainer.compile(distilled, batch)(distilled, batch)
-    (tmp_path / "student").mkdir()
-    checkpoints = Checkpoints(str(tmp_path / "student"))
-    checkpoints.save(1, distilled, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(tmp_path / "student"))
+    task, distilled, _ = saved_after_one_step(config, saved_teacher.batch, tmp_path / "student", 1e-3, key=5)
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
@@ -344,49 +324,17 @@ def test_a_saved_student_samples_as_its_objective_and_holds_its_teacher(saved_te
                                   expected)
 
 
-def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tmp_path):
+def test_an_accumulated_distillation_alternates_its_networks_update_by_update(saved_teacher):
     """An update of rCM takes two microbatches (`accumulation=2`), each of its update's phase: the
     loss reads the committed updates (`Step.updates`), so a critic update's second microbatch leaves
     the student's gradient zero, and four updates past a one-update warmup move the student, the
     student, the fake score and the student, each alone."""
-    import dataclasses
-
-    from diffusion_stubs import batch_for
-    from diffusion_support import images_of
-
-    from dew.checkpoints import Checkpoints
-    from dew.config import ObjectiveConfig, TrainerConfig
-    from dew.config.diffusion import DiffusionRunConfig
-    from dew.diffusion.presets import Flow
-    from dew.inputs import TextCondition
     from dew.objectives.base import Step
     from dew.objectives.diffusion.objective import FAKE_SCORE
-    from dew.registry import ModelConfig
-    from dew.sampling import Consistency, Euler
     from dew.training import Trainer
 
-    teacher_run = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                         "dtype": "float32", "attention_impl": "xla"}),
-        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
-        text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
-    teacher = teacher_run.build()
-    trainer = Trainer(teacher, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(teacher, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    (tmp_path / "teacher").mkdir()
-    checkpoints = Checkpoints(str(tmp_path / "teacher"))
-    # As the teacher's run saves it, its task's record beside its weights.
-    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
-    checkpoints.wait()
-    teacher_run.save(str(tmp_path / "teacher"))
-    task = dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=ObjectiveConfig(
-        "rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, "tangent_warmup": 1,
-                "student_update_freq": 2, "max_simulation_steps": 2})).build()
+    batch = saved_teacher.batch
+    task = _distilling(saved_teacher, **ALTERNATING).build()
 
     trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
     distilled, _, _ = trainer.place()
