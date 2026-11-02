@@ -461,11 +461,13 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
                                            "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
                                            "attention_impl": "xla"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
-        data=images.pipe(presets.images, 16, batch=8).read("streamed").loading(Loading(workers=0)),
+        # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
+        data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
+        .loading(Loading(workers=0)),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=None, epochs=2, log_every=1,
                               eval_every=None, checkpoint_every=None))
     prepared = run.prepare()
-    assert prepared.dataset.examples is not None
+    assert prepared.dataset.examples is not None and prepared.dataset.example_steps is None
     assert prepared.objective.ema.progressed
 
 
