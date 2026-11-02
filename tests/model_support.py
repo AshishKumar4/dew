@@ -141,7 +141,7 @@ def flat_tree(tree) -> dict:
     """`tree`'s leaves by their dictionary keys joined with dots, the way a
     checkpoint names them: 'params.layers_0.mlp.gate.kernel'."""
     return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+            for path, leaf in jax.tree_util.tree_flatten_with_path(nn.unbox(tree))[0]}
 
 
 def decoder(kind: str = "attention") -> CausalTransformer:

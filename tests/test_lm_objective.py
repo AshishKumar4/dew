@@ -133,7 +133,7 @@ def assert_scores_the_written_cross_entropy(dew, draw, label, *, seeds, counted=
 @functools.cache
 def decoder_init():
     """The test decoder's initialization, compiled once for every draw."""
-    return jax.jit(make_objective().init)
+    return jax.jit(lambda *args: nn.unbox(make_objective().init(*args)))
 
 
 def drawn_tokens(**options):
@@ -389,7 +389,7 @@ def test_evaluation_reads_the_ema_copy():
     """Over drawn live and averaged decoders and tokens, evaluation's mean loss on par with the written
     cross entropy of the averaged copy (check 1), and not the live one's."""
     objective = make_objective()
-    initialized = jax.jit(objective.init)
+    initialized = jax.jit(lambda *args: nn.unbox(objective.init(*args)))
     tokens = drawn_tokens()
 
     def draw(seed):
@@ -982,7 +982,7 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
     zed = LMObjective(model, 8, ema_decay=None, balance=ExpertBalance(router_z_loss=0.3))
-    initialized = jax.jit(zed.init)
+    initialized = jax.jit(lambda *args: nn.unbox(zed.init(*args)))
     captured = selection_margins.capture(model)
     config = {"mixture": {"experts": 4, "top_k": 2}}
 

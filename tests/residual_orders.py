@@ -97,9 +97,11 @@ def _axes_of(variables, axes):
 
 
 def model_axes(model, *inputs):
-    """The axes `model` draws each parameter in (`boxed_axes` of its init traced for shapes alone): the
-    table of a plain tree of it, a loaded or unboxed one, for `residual_width` and `permuted`."""
-    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), *inputs))
+    """The axes `model` draws each parameter in (`boxed_axes` of its init traced for shapes alone, over
+    `inputs`, a decoder's two tokens by default): the table of a plain tree of it, a loaded or unboxed
+    one, for `residual_width` and `permuted`."""
+    tokens = (jnp.zeros((1, 2), jnp.int32),)
+    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), *(inputs or tokens)))
 
 
 def residual_width(variables, axes=None) -> int:
@@ -148,15 +150,15 @@ def order(width: int, seed: int, group: int = 1) -> np.ndarray:
     return _grouped(np.random.default_rng([0x0BB17, width, group, seed]), width, group)
 
 
-def orbit(variables, *rest, group: int = 1):
+def orbit(variables, *rest, group: int = 1, axes=None):
     """Check 1's draw over the residual orbit of `variables` (`assert_as_exact`'s `draw`): seed s gives
     `variables` with the residual stream in `order(width, s, group)`, and the rest of the arguments as
-    they are.
+    they are; a plain tree's axes are `axes` (`model_axes`).
     The truth of each draw is the reference's own float64 run on it, so nothing is permuted back."""
-    width = residual_width(variables)
+    width = residual_width(variables, axes)
 
     def draw(seed):
-        return (permuted(variables, order(width, seed, group)), *rest)
+        return (permuted(variables, order(width, seed, group), axes), *rest)
 
     return draw
 

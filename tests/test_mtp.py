@@ -83,7 +83,7 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
     # The decode step's first-depth logits on par with the depth's over the step's own operands, the
     # trunk's first state and its next token (ledger 1543: the reference at the shapes the step computes),
     # from the full depth's in float64 (check 1 over drawn models and tokens).
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         ids = token_batch(batch=2, seed=seed)[TEXT_KEY]
@@ -216,7 +216,7 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
     assert abs(float(loss) - ce) > 1e-2
 
     # Over drawn models and tokens, the term and the loss it joins on par with the written ones (check 1).
-    init = jax.jit(objective.init)
+    init = jax.jit(lambda *args: nn.unbox(objective.init(*args)))
 
     def draw(seed):
         return init(jax.random.key(seed)), token_batch(seed=seed)[TEXT_KEY]

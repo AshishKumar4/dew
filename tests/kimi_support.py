@@ -12,7 +12,7 @@ import numpy as np
 from model_support import parameter_loss
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FACTOR, assert_as_exact_over_orders, distance, ieee_fixture
-from residual_orders import permuted
+from residual_orders import model_axes, permuted
 from scipy.special import log_softmax
 
 from dew.batch import Variables
@@ -65,7 +65,8 @@ def assert_update_as_exact(source, directory: Path) -> Variables:
         {**loaded.variables, "params": stepped(params)}, inputs.tokens, **inputs.kwargs()))
     drawn = ieee_fixture(directory / "orders.npz")
     truth = reference["updated_logits_f64"][valid]
-    mine = [distance(np.asarray(updated(permuted(loaded.variables, order)["params"]))[valid], truth)
+    axes = model_axes(loaded.model)
+    mine = [distance(np.asarray(updated(permuted(loaded.variables, order, axes)["params"]))[valid], truth)
             for order in drawn["orders"]]
     assert_as_exact_over_orders(mine, drawn["updated_logits"], "updated logits")
     return {**loaded.variables, "params": jax.jit(stepped)(loaded.variables["params"])}

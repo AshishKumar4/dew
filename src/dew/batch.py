@@ -663,14 +663,20 @@ def thaw(variables: Variables) -> Variables:
     return {**rest, "params": merge(variables.get(FROZEN, {}), variables.get("params", {}))}
 
 
-def unboxed(tree):
+def unboxed[Tree](tree: Tree) -> Tree:
     """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
     holds, as stored: how a tree enters Dew. No constraint its names would apply is applied, which
     `LogicallyPartitioned.unbox` (and `nn.unbox`) applies under an active mesh and bound Flax rules: Dew
-    places the arrays from its run's own table (`Objective.parameter_axes`), in one place."""
-    def stored(leaf):
-        return leaf.unbox(apply_constraint=False) if isinstance(leaf, meta.Partitioned) else leaf
-    return jax.tree.map(stored, tree, is_leaf=lambda leaf: isinstance(leaf, meta.Partitioned))
+    places the arrays from its run's own table (`Objective.parameter_axes`), in one place. A tree that
+    holds no box is the caller's own, as `dicts` keeps it, so a placement writing each placed leaf into
+    the dict that held it writes into the caller's."""
+    def boxed(leaf) -> bool:
+        return isinstance(leaf, meta.Partitioned)
+
+    if not any(boxed(leaf) for leaf in jax.tree.leaves(tree, is_leaf=boxed)):
+        return tree
+    return jax.tree.map(lambda leaf: leaf.unbox(apply_constraint=False) if boxed(leaf) else leaf, tree,
+                        is_leaf=boxed)
 
 
 def dicts[Tree](tree: Tree) -> Tree:

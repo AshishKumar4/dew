@@ -214,7 +214,7 @@ def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query
 def model_draw(model: CausalTransformer, *, gated: bool = True):
     """Check 1's draw for `model`: a seed's variables, their gates drawn away from zero where
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     cross = model.cross_attention
     assert cross is not None

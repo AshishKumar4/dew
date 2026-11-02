@@ -41,7 +41,6 @@ from affine_run import (
     raw_leaf,
     val_batches,
 )
-from flax import linen as nn
 from flax.core import FrozenDict, freeze as frozen_dict
 from recording import RecordingTracker, preempting
 from reference_error import as_given, assert_as_exact
@@ -752,7 +751,7 @@ def held_lm_trainer(container=dict, **settings):
     in `container` (Flax's FrozenDict, say)."""
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
-    weights = nn.unbox(jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0)))
+    weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
     objective = LMObjective(model, seq_len=4, variables=container(weights), ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights

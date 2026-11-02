@@ -755,7 +755,7 @@ def test_a_remat_policy_changes_no_gradient(policy):
     from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    initialize = jax.jit(layer.init)
+    initialize = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
 
     def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)

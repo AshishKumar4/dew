@@ -105,7 +105,7 @@ from reference_error import (
     distance,
     within,
 )
-from residual_orders import orders, permuted, residual_width
+from residual_orders import model_axes, orders, permuted, residual_width
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
@@ -237,8 +237,9 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
-    for k, order in enumerate(orders(residual_width(trip.trained), ORDERS, tool.SEED)):
-        variables, export = permuted(trip.trained, order), tmp_path / str(k)
+    axes = model_axes(trip.source.model)
+    for k, order in enumerate(orders(residual_width(trip.trained, axes), ORDERS, tool.SEED)):
+        variables, export = permuted(trip.trained, order, axes), tmp_path / str(k)
         mine.append(distance(np.asarray(forward(variables, trip.ids)), trip.truth))
         if k == 0:
             continue

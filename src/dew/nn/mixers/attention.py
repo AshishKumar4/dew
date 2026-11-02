@@ -528,7 +528,9 @@ class CausalSelfAttention(nn.Module):
                                      "a layer built without them reads from the variables it is given")
                 return jnp.asarray(value, dtype)
             # Whole on every device, as DEX's parameters are.
-            return self.variable(DEX_COLLECTION, name, declared(drawn, (None,) * jnp.ndim(value))).value
+            # A head list is one axis, a scalar none.
+            rank = 1 if isinstance(value, tuple) else 0
+            return self.variable(DEX_COLLECTION, name, declared(drawn, (None,) * rank)).value
 
         # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
         # every device (`dew.nn.dex`).

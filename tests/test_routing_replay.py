@@ -71,7 +71,7 @@ def replayed_log_probs(obj, params, tokens, routes):
 def replay_draw(obj, batch: int):
     """Check 1's draw of a replay: a seed's parameters and tokens, and a record one expert off the
     router's own choice on every layer, so the replay moves each token."""
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
     sown = jax.jit(lambda params, tokens: obj.token_scores(params, tokens, routing=True).routing)
 
     def draw(seed):
@@ -170,7 +170,7 @@ def test_the_gate_keeps_its_gradient_under_replay():
     is scored from the whole logits, whose head forward mode passes; the tiled
     head's custom backward is another test's."""
     obj, wide = objective(layers=(1, 3)), objective(layers=(1, 3), dtype=jnp.float64)
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 
     def draw(seed):
         params = init(jax.random.fold_in(jax.random.key(0), seed))
@@ -345,7 +345,7 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
 
     obj, wide = objective(scan=True), objective(scan=True, dtype=jnp.float64)
     grpo = GRPOObjective(obj.model, SEQ_LEN)
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
     first_routes = np.broadcast_to(np.arange(TOP_K, dtype=np.uint8), (4, LAYERS, TOP_K)).copy()
     later_routes = np.broadcast_to(first_routes[0], (7, LAYERS, TOP_K)).copy()
     later_routes[conflict] += TOP_K

@@ -712,7 +712,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     once, as the chunked head's does.
     """
     model, wide = small_model(), small_model(dtype=jnp.float64)
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(0), seed), 3)
@@ -1109,7 +1109,7 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     model, wide = (small_model(dtype=dtype, tie_embeddings=tie_embeddings, final_logit_softcap=30.)
                    for dtype in (jnp.float32, jnp.float64))
 
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (4, 16), 0, 97)

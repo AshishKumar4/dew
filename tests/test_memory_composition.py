@@ -151,7 +151,7 @@ def factor_draw(model, lora):
     """A draw of a seed's base weights for `model` as its init draws them, the factors of `lora`
     attached over them each drawn a tenth of a normal from zero, and its token rows."""
     ids = jnp.zeros((ROWS, LENGTH), jnp.int32)
-    initialize = jax.jit(model.init)
+    initialize = jax.jit(lambda *args: nn.unbox(model.init(*args)))
     attached = traverse_util.flatten_dict(lora.apply(model, initialize(jax.random.key(0), ids), key=0)
                                           .variables["params"])
 

@@ -1031,7 +1031,7 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
     wide = decoder.clone(dtype=jnp.float64)
     keep = jnp.asarray(block_causal(blocks)[:, :-1, :-1])
     counted = ~((blocks[:, :-1] == blocks[:, 1:]) & (blocks[:, :-1] >= 0))
-    init = jax.jit(decoder.init)
+    init = jax.jit(lambda *args: nn.unbox(decoder.init(*args)))
 
     def draw(seed):
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (2, seq + 1), 0, 37)

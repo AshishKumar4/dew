@@ -277,7 +277,7 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
     conv = Conv(**settings, feature_group_count=features // group_width, dtype=dtype)
     reference, peaks_of = ungrouped_reference(qwix, {**settings, "dtype": dtype}, group_width)
     ranges = jnp.logspace(-3, 0, features)
-    init = jax.jit(conv.init)
+    init = jax.jit(lambda *args: nn.unbox(conv.init(*args)))
     quantized = Quantization().apply(conv)
 
     def draw(seed):
@@ -1156,7 +1156,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     model = tiny(num_layers=4)
     qmodel = Quantization().apply(model)
     info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         variables = init(jax.random.key(seed), jnp.ones((1, SEQ_LEN), jnp.int32))

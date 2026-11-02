@@ -35,6 +35,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
+from dew.nn.sharding import boxed_axes
 from dew.registry import from_record, to_record
 
 if TYPE_CHECKING:
@@ -2134,3 +2135,10 @@ def check_decoder_tree(variables: Mapping[str, object], model) -> None:
     """`check_tree` against a decoder or its media wrapper, whose `init` reads one row of token ids
     (a wrapper's conditioners then build the smallest media their towers take)."""
     check_tree(variables, model, np.zeros((1, 2), np.int32))
+
+
+def decoder_axes(model) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a decoder or its media wrapper draws each parameter in, read off its init traced for
+    shapes alone over one row of token ids (`boxed_axes`): the table a loaded tree of it is placed by,
+    as a run's objective holds its own (`Objective.parameter_axes`)."""
+    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), np.zeros((1, 2), np.int32)))

@@ -23,19 +23,20 @@ import jax
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from residual_orders import orders, permuted, residual_width
+from residual_orders import model_axes, orders, permuted, residual_width
 
 from dew.interop import Pretrained
 
 
 def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
-    drawn = orders(residual_width(loaded.variables), count, seed, group)
+    axes = model_axes(loaded.model)
+    drawn = orders(residual_width(loaded.variables, axes), count, seed, group)
     # A new directory, so no order keeps a truth written for weights drawn before.
     out.mkdir(parents=True)
     np.save(out / "orders.npy", drawn)
     for k, order in enumerate(drawn):
-        loaded.save(out / str(k), variables=permuted(loaded.variables, order))
+        loaded.save(out / str(k), variables=permuted(loaded.variables, order, axes))
         # Not numerics.npz: each order's float64 truth is its own, which its reference's recorder writes
         # there (`symmetric`).
         for name in ("reference.npz", "generation_config.json"):

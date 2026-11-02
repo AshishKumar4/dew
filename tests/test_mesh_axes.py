@@ -32,7 +32,7 @@ from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import Link, boxed, declared_axes
+from dew.nn.sharding import Link, boxed, boxed_axes, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -566,7 +566,8 @@ def one_step(spec):
     mesh = spec.build()
     objective = LMObjective(tiny(), SEQ_LEN)
     initial = nn.unbox(objective.init(jax.random.key(0)))
-    placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
+    with boxed(objective.parameter_axes):
+        placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
     assert_sharded(placed["params"], mesh)
     batch = shard_batch(mesh, next(token_batches()))
 
@@ -611,12 +612,14 @@ def test_a_dit_steps_under_a_tensor_axis():
     images = jax.random.normal(jax.random.key(1), (BATCH, 8, 8, 3), jnp.float32)
     times = jnp.full((BATCH,), 0.5, jnp.float32)
     layout = Layout(min_shard=TINY_SHARD)
-    shardings = layout.shardings(
-        mesh, nn.unbox(jax.eval_shape(model.init, jax.random.key(0), images, times)))
+    drawn = jax.eval_shape(model.init, jax.random.key(0), images, times)
+    # The draw boxes the parameters its modules declare the axes of: the table they are placed by.
+    with boxed(boxed_axes(drawn)):
+        shardings = layout.shardings(mesh, unboxed(drawn))
 
     with jax.set_mesh(mesh):
-        # The draw boxes the parameters its modules declare the axes of; the checks read their values.
-        placed = unboxed(jax.jit(model.init, out_shardings=shardings)(jax.random.key(0), images, times))
+        placed = jax.jit(lambda key: unboxed(model.init(key, images, times)), out_shardings=shardings)(
+            jax.random.key(0))
         loss, grads = jax.jit(jax.value_and_grad(
             lambda trainable: jnp.mean(
                 (model.apply({**placed, "params": trainable}, images, times) - images) ** 2)))(

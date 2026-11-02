@@ -519,7 +519,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
         wide = stepped(model.clone(dtype=jnp.float64))
         exact = jax.device_get(wide(widened(variables["params"]), ids))
         last = orders(units, 2, seed=0)[-1]
-        found = jax.device_get(wide(permuted(widened(variables), last)["params"], ids))
+        found = jax.device_get(wide(permuted(widened(variables), last, axes)["params"], ids))
         roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables["params"]), ids))
         for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
                                       jax.tree.leaves(ordered(exact, last)), strict=True):
@@ -534,7 +534,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     distances: dict = {}
     with jax.set_mesh(mesh):
         for order in orders(units, ORDERS, seed=1):
-            params = jax.device_put(permuted(variables, order)["params"], whole)
+            params = jax.device_put(permuted(variables, order, axes)["params"], whole)
             truth = jax.tree_util.tree_leaves_with_path(ordered(exact, order))
             found = {"dew": jax.device_get(kernel(params, placed))}
             with generation.assumed("cpu"):

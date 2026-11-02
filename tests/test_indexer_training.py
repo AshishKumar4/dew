@@ -203,7 +203,7 @@ def test_a_packed_batch_selects_inside_its_documents():
     segments = jnp.asarray(np.array([[1] * 3 + [2] * 4 + [0] * (SEQ - 7)]))
     positions = jnp.asarray(np.array([list(range(3)) + list(range(4)) + [0] * (SEQ - 7)]))
     covering, dense = deepseek_stack(SEQ), deepseek_stack(None)
-    init = jax.jit(covering.init)
+    init = jax.jit(lambda *args: nn.unbox(covering.init(*args)))
 
     def draw(seed):
         rng = np.random.default_rng([4, seed])

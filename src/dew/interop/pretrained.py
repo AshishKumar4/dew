@@ -75,6 +75,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.nn.sharding import boxed, current_boxes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     DtypeName,
@@ -112,7 +113,8 @@ class Placing(Protocol):
     a leaf at a time, by the layout as `model`, where it places its own tree, refines it
     (`RefinesLayout`); as they are where the load places nothing."""
 
-    def __call__(self, variables: Variables, model: RefinesLayout | None = None) -> Variables: ...
+    def __call__(self, variables: Variables, model: RefinesLayout | None = None,
+                 axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
 
 
 
@@ -1074,8 +1076,13 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "
                          "fills it places it, so pass no mesh or layout")
 
-    def placed(variables: Variables, model: RefinesLayout | None = None) -> Variables:
-        return place(variables, mesh, _refined(layout, model)) if streaming else variables
+    def placed(variables: Variables, model: RefinesLayout | None = None,
+               axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables:
+        if not streaming:
+            return variables
+        # A loaded tree is plain: the axes it is placed by are its model's draw's (`axes`).
+        with boxed({**current_boxes(), **(axes or {})}):
+            return place(variables, mesh, _refined(layout, model))
 
     return streaming, placed
 
@@ -2270,7 +2277,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        return kind(model, placed(variables), processor, config, directory, built, generation_config,
+        return kind(model, placed(variables, axes=decoder_parts.decoder_axes(model)), processor, config,
+                    directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.

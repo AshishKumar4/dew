@@ -27,6 +27,7 @@ from tool_policy import ToolPolicy
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.loading import place
 from dew.inference.serving import Server
+from dew.interop.decoder_parts import decoder_axes
 from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -35,6 +36,7 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.protocols import held_groups
+from dew.nn.sharding import boxed
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
 
@@ -189,7 +191,8 @@ def test_a_dropped_server_frees_its_weights_without_a_collection():
         # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
         # holding what it drew, which is flax's to drop, not the server's.
         model = decoder().clone(max_seq_len=128)
-        params = nn.unbox(jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+        init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
+        params = init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
         bound = TextGeneration(model, params, RunProcessor(Digits()),
                                sampling=Sampling(temperature=0, eos_token_ids=None))
         server = Server.from_task(bound, slots=2, capacity=128)
@@ -929,7 +932,8 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         bound = bound.bind(nn.unbox(bound.model.init(jax.random.key(seed), jnp.ones((1, 2), jnp.int32))))
         alone = [bound(prompt, budget, key=index).host()
                  for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-        placed = bound.bind(place(bound.variables, mesh, layout))
+        with boxed(decoder_axes(bound.model)):
+            placed = bound.bind(place(bound.variables, mesh, layout))
         server, tickets = served_alongside(placed, slots=8, admission=8, **options)
         assert_sharded(placed.variables["params"], server.mesh)
         assert server.groups == jax.device_count() // mesh.tensor
@@ -1000,9 +1004,9 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    served = generation(
-        dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
-    )
+    with boxed(decoder_axes(lone.model)):
+        placed = place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    served = generation(dispatch, placed)
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
                                        decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)

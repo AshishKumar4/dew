@@ -468,7 +468,7 @@ def context_draw(layer):
     """Check 1's draw for `layer`'s read: its variables, its sinks drawn away from zero where it has
     them, an input, a context, each row's real context tokens (a row of none among them) and a
     cotangent."""
-    init = jax.jit(layer.init)
+    init = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
 
     def draw(seed):
         rng = np.random.default_rng(seed)

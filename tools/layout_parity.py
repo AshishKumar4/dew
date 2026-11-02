@@ -1716,7 +1716,9 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
 
     sys.path.insert(0, str(REPO / "tests"))
     from reference_error import ORDERS, chain_roundings, distance
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
+
+    from dew.registry import models as registered
 
     if jax.process_count() != 1:
         raise ValueError('residual-order comparisons run in one process')
@@ -1735,7 +1737,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
         truth_step = anchor_program(reference, batch, base)
         anchor, wide = anchor_loss(reference, batch, base)
         roundings = chain_roundings(jax.make_jaxpr(jax.value_and_grad(anchor))(wide, batch))
-        drawn = orders(residual_width(base.variables), ORDERS, seed=2024)
+        axes = model_axes(registered.build(reference.architecture, **reference.config))
+        drawn = orders(residual_width(base.variables, axes), ORDERS, seed=2024)
         ref_shardings = jax.tree.map(lambda leaf: leaf.sharding, base)
         model_out = out / model
         model_out.mkdir(exist_ok=True)
@@ -1749,17 +1752,17 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
         invariance, identity, identity_loss = [], None, None
 
         def flat(tree, order):
-            canonical = permuted({'params': jax.device_get(tree)}, np.argsort(order))['params']
+            canonical = permuted({'params': jax.device_get(tree)}, np.argsort(order), axes)['params']
             return {jax.tree_util.keystr(path): np.asarray(leaf)
                     for path, leaf in jax.tree_util.tree_flatten_with_path(canonical)[0]}
 
         def ordered_state(template, order, shardings):
             copied = jax.tree.map(lambda leaf: leaf.copy(), template)
-            copied = dataclasses.replace(copied, variables=permuted(copied.variables, order))
+            copied = dataclasses.replace(copied, variables=permuted(copied.variables, order, axes))
             return jax.device_put(copied, shardings)
 
         for index, order in enumerate(drawn):
-            variables = permuted(base.variables, order)
+            variables = permuted(base.variables, order, axes)
             params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables['params'])
             truth_loss, truth_tree = truth_step(params, batch)
             truth_loss, truth = float(truth_loss), flat(truth_tree, order)

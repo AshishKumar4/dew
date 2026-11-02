@@ -224,18 +224,22 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
     3453), as it does the headed attention's three-axis kernels: the flat kernels took the headed
     attention's suffix declarations, three axes cut to their two, which no matrix's sides read."""
     from dew.nn.attention_blocks import NormalAttention
+    from dew.nn.sharding import boxed, boxed_axes
     from dew.optim import OptimConfig, muon_partition
 
     for flat in (True, False):
         model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat, attention_impl="xla")
-        params = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32)))["params"]
-        split = muon_partition(params)
+        drawn = model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32))
+        params = nn.unbox(drawn)["params"]
+        # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
+        with boxed(boxed_axes(drawn)):
+            split = muon_partition(params)
+            solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
+            state = solver.init(params)
+            gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
+            updates, _ = solver.update(gradients, state, params)
         assert {path: reason for path, reason in split.items() if path.endswith("['kernel']")} == {
             f"['{name}']['kernel']": "muon" for name in ("to_q", "to_k", "to_v", "to_out_0")}
-        solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
-        state = solver.init(params)
-        gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
-        updates, _ = solver.update(gradients, state, params)
         stepped = optax.apply_updates(params, updates)
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(stepped), strict=True):
             assert np.all(np.isfinite(np.asarray(after))) and not np.array_equal(after, before)
