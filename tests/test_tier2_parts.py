@@ -16,6 +16,7 @@ import pytest
 import torch
 from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
 from reference_error import as_given, assert_as_exact
+from selection_margins import stable_top_k
 
 from dew.interop import Pretrained, parts
 from dew.interop.verify import VerifiedMapping, scatter_weights, verify_mapping
@@ -723,9 +724,11 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
     reference = built(torch.float32)
     wide = float64_twin(reference, lambda: built(torch.float64)).eval()
     draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), case)
-    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                    torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
-                    truth_fn=torch_logits(wide, float64))
+    # A lightning indexer's top-k ends in ties of keys it scores zero, which the reference breaks as Dew.
+    with stable_top_k():
+        assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                        torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
+                        truth_fn=torch_logits(wide, float64))
 
 
 LAGUNA_XS = {

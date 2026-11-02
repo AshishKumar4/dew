@@ -27,7 +27,6 @@ import itertools
 import json
 import math
 from pathlib import Path
-from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -41,7 +40,7 @@ from model_support import as_stepped, decode_through
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
-from selection_margins import indexer_margins
+from selection_margins import indexer_margins, stable_top_k
 from tool_support import load
 
 from dew.batch import coordinates
@@ -138,20 +137,6 @@ def block_variables(tensors: dict) -> dict:
              if name not in ("hidden", "output")}
     tree = translate_weights(names, {"tie_embeddings": False})["params"]
     return {"params": tree["layers_0"]["self_attn"]}
-
-
-@contextlib.contextmanager
-def stable_top_k():
-    """`Tensor.topk` choosing among equal scores by the lower index, as `jax.lax.top_k` documents:
-    a stable descending sort's first k. `torch.topk` promises no order among ties, so this is one of
-    its permitted behaviours; it moves no selection a score decides."""
-    def topk(self, k, dim=-1, largest=True, sorted=True):
-        assert largest, "the indexer ranks its largest scores"
-        order = torch.sort(self, dim=dim, descending=True, stable=True).indices.narrow(dim, 0, k)
-        return torch.return_types.topk((self.gather(dim, order), order))
-
-    with patch.object(torch.Tensor, "topk", topk):
-        yield
 
 
 REFERENCE = {"mla_v3": ("V3", "DeepseekV3Config", "DeepseekV3Attention", "DeepseekV3RotaryEmbedding"),

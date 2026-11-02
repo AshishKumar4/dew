@@ -5,6 +5,9 @@ inputs whose margins clear MARGIN, so its float32 runs and its float64 run selec
 rounding of a boundary picks other keys, units or experts in other runs, a difference no precision
 bounds (docs/design/testing.md asks a stated margin of such a draw)."""
 
+import contextlib
+from unittest.mock import patch
+
 import jax
 import numpy as np
 from flax import linen as nn
@@ -16,6 +19,24 @@ run and the float64 run select alike. Gemma 3n's gate in tests/test_architecture
 whose inputs carry the rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's
 deviation over the 1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the
 median and 2.5e-6 at the 99th percentile."""
+
+
+@contextlib.contextmanager
+def stable_top_k():
+    """`Tensor.topk` choosing among equal scores by the lower index, as `jax.lax.top_k` documents:
+    a stable descending sort's first k. `torch.topk` promises no order among ties, so this is one of
+    its permitted behaviours; it moves no selection a score decides. A lightning indexer's relu scores
+    a key every head disagrees with exactly zero, so its top-k often ends in such a tie
+    (`indexer_margins`), which the reference then breaks as Dew does."""
+    import torch
+
+    def topk(self, k, dim=-1, largest=True, sorted=True):
+        assert largest, "the indexer ranks its largest scores"
+        order = torch.sort(self, dim=dim, descending=True, stable=True).indices.narrow(dim, 0, k)
+        return torch.return_types.topk((self.gather(dim, order), order))
+
+    with patch.object(torch.Tensor, "topk", topk):
+        yield
 
 
 def routes(config) -> bool:
