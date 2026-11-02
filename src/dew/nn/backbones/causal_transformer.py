@@ -49,10 +49,10 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel, HeadTerms, HeadTransform, _squared_norm
+from dew.nn.continuum import Continuum, ContinuumLevel, HeadTerms, HeadTransform, _head_growth, _squared_norm
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
-from dew.quantization import quantized_products
+from dew.quantization import LinearProducts
 from dew.registry import from_record, read_arguments
 
 from ..activations import _SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
@@ -165,7 +165,7 @@ _FINAL = "final_residual"
     # square kernel takes the shape heuristic the way the other indexed
     # projections do.
 })
-class CausalTransformer(nn.Module):
+class CausalTransformer(LinearProducts):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
     The defaults train a model from scratch: multi-head attention, swiglu,
@@ -1248,32 +1248,29 @@ class CausalTransformer(nn.Module):
         """What bounds the curvature and the slope of a slot's cross entropy in the `states` `head_logits`
         reads (`HeadTerms`, `SteppedInContext`), from the bound model's rows (`vocabulary_rows`, an adapter
         applied), softcap and transform, a transform's norm read at the states (`BoundedNorm`; a norm that
-        bounds no derivatives is refused). A head map (`lm_head`,
-        `project_out`, `head_dense`, or a tied head's product in the model's own scope) that rounds its
-        input (`nonlinear_input`) makes the head piecewise constant in its states, and one whose kernel
-        Qwix rounds multiplies by a matrix these norms do not read: refused."""
-        heads = [*([] if self.tie_embeddings else ["lm_head"]),
-                 *([] if self.embedding_features is None else ["project_out"]),
-                 *([] if self.head_transform is None else ["head_dense"])]
-        rounded = [name for name in heads
-                   if self.nonlinear_input(name) or quantized_products(self, name).weights]
-        tied = quantized_products(self) if self.tie_embeddings else None
-        rounded += ["the tied table's product"] if tied is not None and (tied.inputs or tied.weights) else []
-        if rounded:
-            raise ValueError(f"a damped step bounds the head's curvature in its states, and the head's "
-                             f"{rounded} round their inputs, making it piecewise constant there, which no "
-                             f"curvature bounds, or their kernels, a matrix these bounds do not read: step "
-                             f"it undamped")
-        table = _squared_norm(jnp.asarray(self.vocabulary_rows()))
+        bounds no derivatives is refused), each kernel's norm as Qwix's rounding can grow it, a step
+        following its straight-through gradient (`_head_growth`, which refuses a map an interceptor
+        rounds)."""
+        table, projection = self._head_table(), self.embedding_features is not None
+        maps = {None if self.tie_embeddings else "lm_head": jnp.shape(table.rows())[-1],
+                **({"project_out": jnp.shape(table.projection.kernel)[0]} if projection else {}),
+                **({} if self.head_transform is None else {"head_dense": self.emb_features})}
+        growth = _head_growth(self, maps)
+        logits = growth[None if self.tie_embeddings else "lm_head"]
+        squared = jnp.square(logits) * _squared_norm(jnp.asarray(self.vocabulary_rows()))
+        if projection and logits * growth["project_out"] > 1:
+            # Two rounded matrices' product, bounded by their norms'.
+            squared = (jnp.square(logits * growth["project_out"]) * _squared_norm(table.rows())
+                       * _squared_norm(table.projection.kernel))
         if self.head_transform is None:
-            return HeadTerms.of(table, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
+            return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
         if not isinstance(self.head_norm, BoundedNorm):
             raise ValueError(f"a damped step bounds a head transform's curvature through its norm's "
                              f"derivatives, which {type(self.head_norm).__name__} bounds none of")
         dense = self.applied_kernel("head_dense")
         spread = self.head_norm.spread(ungated_activation(self.head_transform, self.head_dense(states)))
-        return HeadTerms.of(table, self.final_logit_softcap, spread, HeadTransform(
-            _SLOPES[UNGATED[self.head_transform]], jnp.sqrt(_squared_norm(dense)),
+        return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform(
+            _SLOPES[UNGATED[self.head_transform]], growth["head_dense"] * jnp.sqrt(_squared_norm(dense)),
             self.head_norm.derivative_bounds(dense.shape[-1])))
 
     @nn.nowrap
@@ -2129,16 +2126,6 @@ class CausalTransformer(nn.Module):
                            self.final_logit_softcap, self.precision, compute=self.dtype,
                            input_quantizer=None if self.tie_embeddings else self._quantizer(self.lm_head),
                            scale=self._token_gains(), projection=projection)
-
-    def applied_kernel(self, name: str) -> jax.Array:
-        """The kernel the submodule `name` multiplies its input by on this call: its own. A method
-        interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update."""
-        return getattr(self, name).get_variable("params", "kernel")
-
-    def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name` other than as a linear map of its input
-        (`dew.nn.continuum.Continuum.nonlinear_input`), which a damped step's head bounds read."""
-        return quantized_products(self, name).inputs
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

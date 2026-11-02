@@ -29,7 +29,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.norms import NormBounds
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
-from dew.quantization import InputQuantizer, quantized_products
+from dew.quantization import InputQuantizer, LinearProducts, intercepted_nonlinear, rounding_growth
 
 Quantizers = Callable[[nn.Module], InputQuantizer | None]
 """A model's checkpoint quantizer of a layer's input (`CausalTransformer._quantizer`), None for none."""
@@ -53,7 +53,7 @@ class ContinuumLevel:
     ("continuum", "down"): ("embed", "mlp"),
     ("continuum", "up"): ("mlp", "embed"),
 })
-class Continuum(nn.Module):
+class Continuum(LinearProducts):
     """The level `ContinuumLevel` describes over `[..., features]` states: `x + up(act(down(x)))`,
     `up` zero at its start."""
 
@@ -85,61 +85,47 @@ class Continuum(nn.Module):
         """The level's output map, U, zero at its start: the feed-forward's `down_proj`, stored as `up`."""
         return self.mlp.down_proj
 
-    def applied_kernel(self, name: str) -> jax.Array:
-        """The kernel the map `name` (`down`, `up`) multiplies its input by on this call: its own. A method
-        interceptor that changes that answers for itself (`CausalTransformer.applied_kernel`): `dew.lora`'s
-        adds its factors' update, and a frozen FP8 site's is its codes decoded."""
-        return getattr(self, name).get_variable("params", "kernel")
-
-    def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the map `name` other than as a linear map of its input: as the Qwix
-        quantization the call runs under quantizes its activations or gradients
-        (`dew.quantization.quantized_products`), and as a method interceptor answers for itself (a
-        checkpoint's input quantization and frozen FP8 products, `dew.lora`'s dropout on a training
-        forward)."""
-        return quantized_products(self, name).inputs
-
     def step_terms(self, x: jax.Array, parts: tuple[str, ...], quantizer: Quantizers
-                   ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]:
+                   ) -> tuple[jax.Array, jax.Array, jax.Array, float, float, float]:
         """What bounds a damped step of the level's `parts` (`down`, `up`) at states `x` `[..., features]`
         (`dew.objectives.lm.adaptation._damping`): each state's |x|^2 and |f|^2, x and f = act(down(x)) as
         `down` and `up` multiply them (`quantizer`, a model's checkpoint quantizer of a map's input, None
-        for none), the Frobenius norm of the kernel `up` multiplies by (`applied_kernel`, an adapter's
-        update on it included), at least its spectral norm, in at least fp32; and the activation's bounds
-        p1, p2 on |act'| and |act''| (`_SLOPES`).
+        for none), the Frobenius norm of the kernel `up` holds (`applied_kernel`, an adapter's update on it
+        included), at least its spectral norm, in at least fp32, and how much its product's rounding can grow
+        any kernel's norm (1 unrounded); and the activation's bounds p1, p2 on |act'| and |act''|
+        (`_SLOPES`).
 
-        A map whose product rounds its kernel (Qwix's quantized weights) makes the loss piecewise constant
-        in that kernel, and an `up` that computes other than the linear map of its input by its kernel
-        (`nonlinear_input`, or its kernel rounded) makes the level's output piecewise constant in `down`,
-        through its rounding of f: the gradient jumps at every rounding boundary, and no curvature bounds
-        a step there, refused, as is a step of `down` through an activation whose act'' no number bounds
-        (ReLU's, a point mass at zero). A quantizer of `down`'s input rounds the states, which no step
-        moves."""
+        Where Qwix's quantization rounds a map's operands (`rounding_growth`), each norm here is the most its
+        rounding grows it to, and a step follows Qwix's straight-through gradient: the bound holds for the
+        straight-through surrogate's smooth part, and a step that crosses a rounding cell adds the
+        quantization's own jump. A step of `down` through an `up` a method interceptor computes other than
+        as a linear map (`intercepted_nonlinear`: an adapter's dropout, a frozen FP8 product, a
+        checkpoint's quantizer of its input, apart from the quantizer `quantizer` reads) is refused, as is
+        one through an activation whose act'' no number bounds (ReLU's, a point mass at zero). A quantizer
+        of `down`'s input rounds the states, which no step moves."""
         p1, p2 = _SLOPES[activation(self.level.activation)]
         if "down" in parts and p2 is None:
             raise ValueError("a damped step of the level's `down` bounds its loss's curvature through its "
                              "activation's second derivative, which a ReLU has none of (a point mass at "
                              "zero), so no rate bounds it there: select=('up',), or a smooth activation")
-        for name in parts:
-            if quantized_products(self, name).weights:
-                raise ValueError(f"a damped step of the level's `{name}` bounds the loss's curvature in its "
-                                 "kernel, and this call's quantization rounds that kernel in its product, "
-                                 "making the loss piecewise constant in it, which no curvature bounds: step "
-                                 "it undamped")
-        if "down" in parts and (self.nonlinear_input("up") or quantized_products(self, "up").weights):
+        if "down" in parts and quantizer(self.up) is None and intercepted_nonlinear(self, "up"):
             raise ValueError("a damped step of the level's `down` bounds the loss's curvature through the "
-                             "map `up` applies to f = act(D x), and this call's `up` rounds its input or its "
-                             "kernel, making the level's output piecewise constant in `down`, which no "
+                             "map `up` applies to f = act(D x), and this call computes `up` other than as a "
+                             "linear map of f (an adapter's dropout or a frozen FP8 product), which no "
                              "curvature bounds: select=('up',), or step it undamped")
+        # Each map's operands as Qwix's rounding can grow them: its input's, then its kernel's.
+        down_input, _ = rounding_growth(self, "down", self.features)
+        up_input, up_kernel = rounding_growth(self, "up", self.level.hidden)
 
         def read(value: jax.Array, layer: nn.Module) -> jax.Array:
             rounding = quantizer(layer)
             return (value if rounding is None else rounding.qdq(value)).astype(at_least_fp32(x.dtype))
 
-        fed = read(activation(self.level.activation)(self.down(x)), self.up)
+        fed = up_input * read(activation(self.level.activation)(self.down(x)), self.up)
         kernel = self.applied_kernel("up").astype(at_least_fp32(x.dtype))
-        return (jnp.sum(jnp.square(read(x, self.down)), axis=-1), jnp.sum(jnp.square(fed), axis=-1),
-                jnp.sqrt(jnp.sum(jnp.square(kernel))), p1, p2 or 0.0)
+        return (jnp.sum(jnp.square(down_input * read(x, self.down)), axis=-1),
+                jnp.sum(jnp.square(fed), axis=-1), jnp.sqrt(jnp.sum(jnp.square(kernel))), up_kernel, p1,
+                p2 or 0.0)
 
 
 @struct.dataclass
@@ -190,6 +176,20 @@ class HeadTerms:
         jacobian = first * p1 * dense
         bent = (second * p1 ** 2 + first * (p2 or 0.0)) * jnp.square(dense)
         return jnp.square(jacobian) * self.curvature + self.slope * bent, jacobian * self.slope
+
+
+def _head_growth(model: nn.Module, maps: dict[str | None, int]) -> dict[str | None, float]:
+    """How much Qwix's rounding can grow each head map's kernel's norm (`rounding_growth`), `maps` each map's
+    contraction by its submodule's name (None for a tied table's product in the model's own scope). A map
+    a method interceptor computes other than as a linear map of its input (`intercepted_nonlinear`: a
+    checkpoint's quantizer of its input, a frozen FP8 product, an adapter's dropout) makes the head
+    piecewise constant in its states, whose gradient no Lipschitz bound holds: refused."""
+    rounded = [name for name in maps if name is not None and intercepted_nonlinear(model, name)]
+    if rounded:
+        raise ValueError(f"a damped step bounds the head's curvature in its states, and the head's "
+                         f"{rounded} round their inputs, making it piecewise constant there, which no "
+                         f"curvature bounds: step it undamped")
+    return {name: rounding_growth(model, name, contraction)[1] for name, contraction in maps.items()}
 
 
 def _squared_norm(value: jax.Array) -> jax.Array:

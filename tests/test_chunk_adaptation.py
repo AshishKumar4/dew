@@ -472,6 +472,16 @@ transform, each with its variables' transform where it has one; and the level's 
 input through a checkpoint's FP8 quantizer, its states rounded (`_checkpoint`)."""
 
 
+MOVES = 1e-6
+"""The least fraction of the optimal stable step, 1 / L for L the window loss's largest curvature, a
+damped step takes at every head and part (`test_a_damped_rate_holds_below_one_over_its_windows_curvature_
+along_its_step`): a requirement, that the step moves the level. Where the bound read the plain step's reach
+and a head transform's norm at its epsilon, these draws' steps took 5e-14 to 3e-9 of it with both parts
+stepping, and 2e-10 to 7e-9 under the transform (main 62a555f17, armada job 20261102181903-215d5dc6); its
+own fixed point and the window's states take 5.5e-6 to 2.2e-2 (fix/t67a-review, job
+20261102182705-facdb322)."""
+
+
 @pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
 @pytest.mark.parametrize("head", sorted(DAMPED_HEADS))
 def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step(head, parts):
@@ -480,7 +490,8 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     step reaches, for each of `up`, `down` and both and for an affine head whose leading direction the
     ones vector is orthogonal to, a logit softcap, a head transform and a level whose `down` reads its
     input quantized, at a rate whose plain step is far past 2 over that curvature: the step never
-    overshoots. The curvature is the loss's float64 Hessian at those float32 kernels."""
+    overshoots. It moves the level: at least `MOVES` of the optimal stable step at every head. The
+    curvature is the loss's float64 Hessian at those float32 kernels."""
     from dew.objectives.lm.adaptation import _damping, _gathered, _step_rate
 
     model, transform = DAMPED_HEADS[head]
@@ -521,6 +532,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
         largest = [curvature(kernels), curvature(reached)]
     assert all(damped * curvature <= 1 for curvature in largest), (head, parts, damped, largest)
     assert rate * largest[0] > 2
+    assert damped * largest[0] >= MOVES, (head, parts, damped * largest[0])
 
 
 def test_a_zero_heads_damped_step_is_finite():
@@ -902,12 +914,12 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
 
 
-def _qwix(pattern: str, **options) -> CausalTransformer:
+def _qwix(pattern: str, calibration: str = "absmax", **options) -> CausalTransformer:
     """The test decoder built with `options`, its products at modules `pattern` selects trained in int8
-    (Qwix's quantization)."""
+    (Qwix's quantization) under the weight `calibration`."""
     from dew.quantization import Quantization
 
-    return Quantization(patterns=(pattern,)).apply(decoder(**options))
+    return Quantization(patterns=(pattern,), calibration=calibration).apply(decoder(**options))
 
 
 ROUNDED = {
@@ -915,32 +927,34 @@ ROUNDED = {
     "checkpoint-head_dense": (lambda: _checkpoint("head_dense", head_transform="gelu"), ("up",), True),
     "checkpoint-trunk": (lambda: _checkpoint("layers_0/self_attn/q_proj", tie_embeddings=False), (), False),
     "checkpoint-up-up": (lambda: _checkpoint("continuum/up"), ("up",), False),
-    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), True),
-    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), True),
+    "checkpoint-up-down": (lambda: _checkpoint("continuum/up"), ("down",), False),
+    "checkpoint-up-both": (lambda: _checkpoint("continuum/up"), (), False),
     "checkpoint-down-both": (lambda: _checkpoint("continuum/down"), (), False),
-    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), True),
-    "qwix-tied": (lambda: _qwix("^$"), ("up",), True),
+    "qwix-everything": (lambda: _qwix(".*", head_transform="gelu"), (), False),
+    "qwix-lm_head": (lambda: _qwix("lm_head", tie_embeddings=False), ("up",), False),
+    "qwix-tied": (lambda: _qwix("^$"), ("up",), False),
     "qwix-lookup": (lambda: _qwix("embed_tokens"), ("up",), False),
-    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), True),
+    "qwix-up-up": (lambda: _qwix("continuum/up"), ("up",), False),
     "qwix-down-up": (lambda: _qwix("continuum/down"), ("up",), False),
-    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), True),
+    "qwix-down-down": (lambda: _qwix("continuum/down"), ("down",), False),
+    "qwix-clipped": (lambda: _qwix("continuum/up", "absmax,0.8"), ("up",), False),
+    "qwix-rms": (lambda: _qwix("continuum/up", "rms,3"), ("up",), True),
 }
 """Models whose head or level rounds a product, the parts a damped step steps through them, and whether
-it is refused (`test_a_damped_step_refuses_what_rounds_where_it_steps`)."""
+it is refused (`test_a_damped_step_bounds_what_rounds_where_it_steps`)."""
 
 
 @pytest.mark.parametrize("case", sorted(ROUNDED))
-def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
-    """A damped step's bounds hold where the maps it reads are linear in what it moves. A head map that
-    rounds its input (a checkpoint's quantizer of `lm_head`'s or of a transform's `head_dense`'s input)
-    makes the head piecewise constant in its states, and one Qwix quantizes (`lm_head`, a tied head's
-    product in the model's own scope, `^$`) rounds its inputs or multiplies by its kernel rounded; a
-    level map whose kernel Qwix rounds makes the loss piecewise constant in that kernel, and an `up`
-    that rounds its input makes the level's output piecewise constant in `down`: each refused
-    (ValueError). The rest runs, finite: a
-    trunk module's quantizer, a Qwix rule over the embedding's lookup alone, `up` alone through its
-    quantized input, both parts through a quantized `down` input, and `up` alone where Qwix rounds
-    `down`'s products."""
+def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
+    """A damped step's bounds read each map's operands as its rounding leaves them. A head map that
+    rounds its input through a method interceptor (a checkpoint's quantizer of `lm_head`'s or of a
+    transform's `head_dense`'s input) makes the head piecewise constant in its states: refused
+    (ValueError), as is a weight calibration of Qwix's whose clip no bound reads (`rms,3`). The rest
+    runs, finite: a trunk module's quantizer; a level map's checkpoint quantizer, its rounded input read
+    exactly; and Qwix's quantization of every product, of the head's, the tied table's in the model's
+    own scope (`^$`), the embedding's lookup alone, the level's either map, and under a clipped absmax,
+    each operand's norm grown as its rounding can grow it (`rounding_growth`), a step following Qwix's
+    straight-through gradient."""
     build, parts, refused = ROUNDED[case]
     objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
     variables = objective.init(jax.random.key(0))
@@ -952,6 +966,20 @@ def test_a_damped_step_refuses_what_rounds_where_it_steps(case):
             objective.token_scores(variables, tokens)
     else:
         assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
+
+
+def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
+    """Under Qwix's int8 quantization of the level's `up`, a damped step's terms grow its input's norm and
+    its kernel's by 1 + sqrt(g) c / 255, g the contraction (the level's 4 hidden units) and c the weight
+    calibration's clip (`rounding_growth`): each slot's |f|^2 grows, the kernel's growth stated beside
+    it."""
+    _, hidden, _, _ = draw(0, scale=0.5)
+    plain = MODEL.apply(drawn_variables(0), hidden, ("up",), method="level_terms")
+    for calibration, clip in (("absmax", 1.0), ("absmax,0.8", 0.8)):
+        model = _qwix("continuum/up", calibration)
+        rounded = model.apply(drawn_variables(0, model), hidden, ("up",), method="level_terms")
+        assert rounded[3] == 1 + math.sqrt(4) * clip / 255 and plain[3] == 1.0
+        assert np.all(np.asarray(rounded[1]) > np.asarray(plain[1]))
 
 
 def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():

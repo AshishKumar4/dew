@@ -367,10 +367,11 @@ QWIX_WEIGHT_CALIBRATIONS = ("absmax", "absmax,<scale>")
 one is given; another's range is the data's in a way no norm of it bounds."""
 
 
-def rounding_growth(module: nn.Module, name: str, contraction: int) -> tuple[float, float]:
+def rounding_growth(module: nn.Module, name: str | None, contraction: int) -> tuple[float, float]:
     """How much the Qwix quantization the call runs under (`QUANTIZED_TRACE`, `quantized_products`) can
-    grow the 2-norms of the two operands the bound `module`'s submodule `name` multiplies, over a
-    contraction of `contraction`: (its input's, its kernel's), 1 where that operand is not quantized.
+    grow the 2-norms of the two operands the bound `module`'s submodule `name` multiplies (without a
+    `name`, a product `module` forms in its own scope), over a contraction of `contraction`: (its input's,
+    its kernel's), 1 where that operand is not quantized.
 
     Qwix scales each operand per channel, its every non-contracted axis, over the contraction or each tile
     of `Quantization.tile_size` along it (qwix/_src/core/dot_general.py, `get_how_to_quantize`), so a
@@ -385,12 +386,13 @@ def rounding_growth(module: nn.Module, name: str, contraction: int) -> tuple[flo
     if trace is None or not quantized_products(module, name).weights:
         return 1.0, 1.0
     policy = trace.policy
+    site = "/".join((*module.path, *([] if name is None else [name])))
     if policy is None:
-        raise ValueError(f"{'/'.join((*module.path, name))} computes under a Qwix provider of the caller's "
-                         "own, whose rounding no bound here reads")
+        raise ValueError(f"{site} computes under a Qwix provider of the caller's own, whose rounding no "
+                         "bound here reads")
     method, *arguments = policy.calibration.split(",")
     if method != "absmax" or len(arguments) > 1:
-        raise ValueError(f"a bound through {'/'.join((*module.path, name))} reads how far its Qwix "
+        raise ValueError(f"a bound through {site} reads how far its Qwix "
                          f"quantization rounds its kernel, which the weight calibration "
                          f"{policy.calibration!r} does not bound; the bounded ones are "
                          f"{', '.join(QWIX_WEIGHT_CALIBRATIONS)}")

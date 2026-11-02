@@ -295,7 +295,7 @@ class SteppedInContext(Protocol):
     (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model at the states `head_logits`
     reads, what bounds the curvature and slope of a slot's loss in them (`HeadTerms`); `level_terms`, for
     the parts that step, the level's |x|^2 and |f|^2 at final states as its maps multiply them, its output
-    map's norm and its activation's derivative bounds."""
+    map's norm and how much its rounding can grow it, and its activation's derivative bounds."""
 
     @property
     def in_context(self) -> bool: ...
@@ -303,7 +303,7 @@ class SteppedInContext(Protocol):
     def head_bounds(self, states: jax.Array) -> HeadTerms: ...
 
     def level_terms(self, states: jax.Array, parts: tuple[str, ...]
-                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float]: ...
+                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float, float]: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
