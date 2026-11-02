@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import flax.linen as nn
 import jax
@@ -30,13 +31,15 @@ from flax import struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import _SLOPES, activation
-from dew.nn.backbones.layer_names import group_layers
 from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import NormBounds
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 from dew.quantization import InputQuantizer, LinearProducts, intercepted_nonlinear, rounding_growth
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_stack import StackView
 
 Quantizers = Callable[[nn.Module], InputQuantizer | None]
 """A model's checkpoint quantizer of a layer's input (`CausalTransformer._quantizer`), None for none."""
@@ -244,53 +247,25 @@ def with_level_parameters(continuum: Levels | None, params: Mapping, levels) -> 
     return {**params, **{name: {**params[name], "continuum": level} for name, level in levels.items()}}
 
 
-def feedforward_levels(variables, layers: tuple[int, ...], count: int) -> dict:
+def feedforward_levels(view: StackView, variables, layers: tuple[int, ...]) -> dict:
     """The feed-forward blocks of a decoder's `layers` in `variables`, by their layers' names (`layers_3`):
-    the levels an objective steps in context (`SteppedFeedForward`), of a decoder of `count` layers. A
-    layer's block is read where its store holds it (`_stored_block`), a layer of its own or a row of a
-    bank of like layers, as `decoder_stack.StackView` stores either, a scanned stack's among them."""
-    missing = sorted(set(layers) - set(range(count)))
+    the levels an objective steps in context (`SteppedFeedForward`). `view` is how `variables` store the
+    decoder's stack (`SteppedFeedForward.stored_view`), each block read where it holds it: a layer of its
+    own, or its row of a run's bank, a scanned stack's or a periodic run's among them
+    (`StackView.stored_layer`)."""
+    missing = sorted(set(layers) - set(range(view.per_stage)))
     if missing:
-        raise ValueError(f"this decoder has {count} layers, not {missing}")
-    params = variables["params"]
-    levels = {}
-    for layer in layers:
-        name, row = _stored_block(params, layer)
-        block = params[name]["mlp"]
-        levels[f"layers_{layer}"] = (block if row is None
-                                     else jax.tree.map(lambda leaf, at=row: leaf[at], block))
-    return levels
+        raise ValueError(f"this decoder has {view.per_stage} layers, not {missing}")
+    return {f"layers_{layer}": view.stored_layer(variables["params"], layer, "mlp") for layer in layers}
 
 
-def with_feedforward_levels(variables, levels: Mapping) -> dict:
+def with_feedforward_levels(view: StackView, variables, levels: Mapping) -> dict:
     """`variables` holding `levels` as their layers' feed-forward blocks (`feedforward_levels`), each
-    written where its store holds it: its layer's own, or its row of a bank."""
-    params = dict(variables["params"])
+    written where `view` holds it (`StackView.with_stored_layer`), a bank's other rows as stored."""
+    params = variables["params"]
     for key, level in levels.items():
-        name, row = _stored_block(params, int(key.removeprefix("layers_")))
-        if row is not None:
-            # The level's row of its bank, the bank's other rows as stored.
-            level = jax.tree.map(lambda stacked, leaf, at=row: stacked.at[at].set(leaf.astype(stacked.dtype)),
-                                 params[name]["mlp"], level)
-        params[name] = {**params[name], "mlp": level}
+        params = view.with_stored_layer(params, int(key.removeprefix("layers_")), "mlp", level)
     return {**variables, "params": params}
-
-
-def _stored_block(params: Mapping, layer: int) -> tuple[str, int | None]:
-    """Where `params` store decoder layer `layer`: its own `layers_N`, or the bank of a run of like layers
-    that holds it (`layers_3_7`) and its row there. A periodic run's bank, which holds a period's positions
-    apart, stores no block a layer as one row: refused."""
-    if f"layers_{layer}" in params:
-        return f"layers_{layer}", None
-    for name in params:
-        run = group_layers(name)
-        if run is not None and layer in run:
-            if "mlp" not in params[name]:
-                raise ValueError(f"layer {layer}'s feed-forward block is stored in the periodic bank {name}, "
-                                 "which holds a period's positions apart: step it in context on a store of "
-                                 "its own layers or of a run of like layers")
-            return name, layer - run.start
-    raise ValueError(f"no stored layer holds decoder layer {layer}")
 
 
 @struct.dataclass

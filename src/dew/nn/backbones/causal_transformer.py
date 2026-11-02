@@ -58,10 +58,8 @@ from dew.nn.continuum import (
     chain_states,
     continuum_chain,
     continuum_modules,
-    feedforward_levels,
     level_of,
     level_parameters,
-    with_feedforward_levels,
     with_level_parameters,
 )
 from dew.nn.dense import Dense
@@ -728,9 +726,14 @@ class CausalTransformer(LinearProducts):
         bound to them reads them. `scanned` records whether those fetches are
         sequenced, which a host layout requires.
         """
+        return (DecoderBank((), self.stored_view(store), scanned=self.scan_layers),)
+
+    def stored_view(self, store: Variables) -> StackView:
+        """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
+        plans its runs (`SteppedFeedForward`)."""
         bound = self if self.scope is not None else self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
+        return StackView(bound.groups)
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
         """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
@@ -1289,13 +1292,6 @@ class CausalTransformer(LinearProducts):
         return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform.of(
             _SLOPES[UNGATED[self.head_transform]], growth["head_dense"] * jnp.sqrt(_squared_norm(dense)),
             self.head_norm.derivative_bounds(dense.shape[-1])))
-
-    @nn.nowrap
-    def feedforward_levels(self, variables, layers: tuple[int, ...]) -> dict:
-        """The feed-forward blocks of `layers` in `variables` (`dew.nn.continuum.feedforward_levels`)."""
-        return feedforward_levels(variables, layers, self.num_layers)
-
-    with_feedforward_levels = staticmethod(with_feedforward_levels)
 
     @nn.nowrap
     def in_context_level(self, variables):

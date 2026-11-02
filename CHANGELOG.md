@@ -22,7 +22,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `continuum_0`, `continuum_1`, ...; a single level keeps `continuum`.
 - `ChunkAdaptation(layers=...)` steps a pretrained decoder's own feed-forward blocks in context, chunk by chunk
   through its decode cache (`dew.objectives.lm.stacking`, section 7.3's ad-hoc level stacking), so continued
-  pre-training trains the blocks' starts through their steps.
+  pre-training trains the blocks' starts through their steps. A prefix run's blocks, and a batch's, are read
+  whole: a chunk that a block crosses reads it to its end before the cache holds it. The blocks are read and
+  written wherever the store keeps them, a run's bank included (`StackView.stored_layer`).
 - `dew.eval.continual`: a continual run's accuracy matrix, forgetting and backward transfer, and a language
   model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
 - An evaluation's outputs, and every tree `collective_host` reads home on one process, come home through

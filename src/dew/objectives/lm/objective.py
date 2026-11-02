@@ -67,6 +67,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
+from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
@@ -1340,7 +1341,8 @@ class LMObjective(TokenScorer):
             # The level as the model reads it, its frozen leaves among it; the tree keeps its split.
             if adaptation.layers:
                 # The decoder's own blocks of those layers are the levels (`dew.objectives.lm.stacking`).
-                level = (self.model.feedforward_levels(thaw(tree), adaptation.layers)
+                thawed = thaw(tree)
+                level = (feedforward_levels(self.model.stored_view(thawed), thawed, adaptation.layers)
                          if isinstance(self.model, SteppedFeedForward) else None)
             else:
                 level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)

@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.backbones.decoder_stack import DecoderBank
+    from dew.nn.backbones.decoder_stack import DecoderBank, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
@@ -322,14 +322,12 @@ class SteppedInContext(Protocol):
 @runtime_checkable
 class SteppedFeedForward(Protocol):
     """A decoder whose own feed-forward blocks an objective steps in context, chunk by chunk through its
-    decode cache (`dew.objectives.lm.stacking`, Nested Learning's ad-hoc level stacking): the blocks of
-    some layers within a tree of its variables, by their scopes' names (`feedforward_levels`), the tree
-    with others in their place, its cache (`init_cache`) and a cached call's states and logits
-    (`states_and_logits`). Its owner keeps the blocks' place in its tree."""
+    decode cache (`dew.objectives.lm.stacking`, Nested Learning's ad-hoc level stacking): how a tree of its
+    variables stores its layer stack (`stored_view`), where the blocks of some layers are read and written
+    (`dew.nn.continuum.feedforward_levels`), its cache (`init_cache`) and a cached call's states and
+    logits (`states_and_logits`)."""
 
-    def feedforward_levels(self, variables: VariableDict, layers: tuple[int, ...]) -> dict: ...
-
-    def with_feedforward_levels(self, variables: VariableDict, levels: Mapping) -> VariableDict: ...
+    def stored_view(self, store: VariableDict) -> StackView: ...
 
     def init_cache(self, batch_size: int): ...
 
