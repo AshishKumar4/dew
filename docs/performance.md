@@ -1281,7 +1281,7 @@ and backward in ms, median of 20, jax 0.11.2:
 
 An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
 loses to the mask, and 64 wins at every document count. So flash takes packed calls wherever it
-takes the call, and `flash_refusal` takes a packed call there when its
+takes the call, and its requirements (`FLASH_SUPPORTS`) take a packed call there when its
 `Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`). A packed read declares the most
 documents its windows hold: what its plan or memory read placed in one, or a streamed pack's
 `segments`; a streamed pack without one declares the row length, which stays on the mask. Decision
