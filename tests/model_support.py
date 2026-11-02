@@ -287,7 +287,7 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
     gradient of the logits' product with the cotangent, by each parameter's dotted path; `update`, the
     logits after one SGD step at `RATE` on the rows' next-token cross-entropy; `biased` over left-padded
     rows, each row's real slots alone (`row0`, `row1`); `image` and `video` over a row whose placeholders
-    its drawn media fill, read as the source's processor reads its own processor's fields
+    its drawn media fill, laid out as the source's processor reads its own processor's fields
     (`Processor.from_hf`)."""
     import optax
     from reference_error import widened
@@ -338,13 +338,27 @@ def remote_code_site(source, site: str, *, wide: bool = False) -> Callable[[dict
             return {"row0": logits[0], "row1": logits[1, PADDED:]}
         return jax.jit(biased)
     if site in ("image", "video"):
-        forward = jax.jit(model.apply)
+        from remote_code_draws import draw
+
+        from dew.nn.inputs import ModelInputs
+
+        # The processor's reading of a draw, the same for every draw of the site, whose placeholders and
+        # grid are fixed (`remote_code_draws.IMAGE_AT`, `IMAGE_GRID`): each patch vector marked by its
+        # index, one past it, where `from_hf` places it, which a traced draw's vectors then fill.
+        template = draw(site, 0, dict(source.config))
+        pixels = "pixel_values" if site == "image" else "pixel_values_videos"
+        count = template[pixels].shape[0]
+        marked = np.broadcast_to(np.arange(1, count + 1, dtype=np.float32)[:, None], template[pixels].shape)
+        layout = source.processor.from_hf({"input_ids": template["ids"], **{
+            name: marked if name == pixels else value for name, value in template.items() if name != "ids"}})
+        places = np.asarray(layout.conditioning["pixel_values"])[..., 0].astype(np.int64)
 
         def media(inputs):
-            fields = {name: np.asarray(value) for name, value in inputs.items() if name != "ids"}
-            batch = source.processor.from_hf({"input_ids": np.asarray(inputs["ids"]), **fields})
-            return {"logits": forward(variables, batch.tokens, **batch.kwargs())}
-        return media
+            placed = jnp.where((places > 0)[..., None], inputs[pixels][np.maximum(places - 1, 0)], 0)
+            batch = ModelInputs(inputs["ids"], layout.token_fields,
+                                {**layout.conditioning, "pixel_values": placed.astype(inputs[pixels].dtype)})
+            return {"logits": model.apply(variables, batch.tokens, **batch.kwargs())}
+        return jax.jit(media)
     return jax.jit(lambda inputs: {"logits": model.apply(variables, inputs["ids"])})
 
 
