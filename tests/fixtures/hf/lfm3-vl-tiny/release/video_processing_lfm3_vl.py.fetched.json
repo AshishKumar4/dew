@@ -1,0 +1,10 @@
+{
+ "bytes": 17161,
+ "kind": "release",
+ "license": "lfm1.0",
+ "path": "releases/9a6b7804c520b59ae6a20bff4814196c187ef5b3ed8c93cbd7d0a9a66c413478/video_processing_lfm3_vl.py",
+ "reference": "LiquidAI/LFM3-VL-2B@f83d2b0a2296aaa277f394990a9b8b949ddf9691/video_processing_lfm3_vl.py",
+ "repo": "dewml/fixtures",
+ "revision": null,
+ "sha256": "9a6b7804c520b59ae6a20bff4814196c187ef5b3ed8c93cbd7d0a9a66c413478"
+}
