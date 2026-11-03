@@ -54,16 +54,23 @@ def _case(case: dict[str, str]):
     return heads, kv_heads, int(case["width"]), jnp.dtype(case["dtype"]), *_masked(case["mask"])
 
 
-def _hooks(case: dict[str, str], params: tuple) -> template.Hooks | None:
-    """`case`'s hook over its drawn `params`."""
-    if case["hook"] == "softcap":
-        return template.Hooks(lambda s, q_pos, k_pos: CAP * jnp.tanh(s / CAP))
-    if case["hook"] in BIAS:
-        def score_mod(s, q_pos, k_pos, a, b):
-            return s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype)
+def _softcapped(s, q_pos, k_pos):
+    """The softcap hook's logits."""
+    return CAP * jnp.tanh(s / CAP)
 
-        kind = BIAS[case["hook"]]
-        return template.Hooks(score_mod, tuple(template.Param(param, kind) for param in params))
+
+def _biased(s, q_pos, k_pos, a, b):
+    """A bias hook's logits, its two parameters added."""
+    return s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype)
+
+
+def _hooks(case: dict[str, str], params: tuple) -> template.Hooks | None:
+    """`case`'s hook over its drawn `params`: one function a hook, so every case's call of it is the one the
+    template's analyses of a hook (its legality, traced at each tile shape) are kept for."""
+    if case["hook"] == "softcap":
+        return template.Hooks(_softcapped)
+    if case["hook"] in BIAS:
+        return template.Hooks(_biased, tuple(template.Param(param, BIAS[case["hook"]]) for param in params))
     return None
 
 
