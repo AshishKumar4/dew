@@ -47,8 +47,9 @@ def test_a_case_of_a_translated_config_is_read_back_as_the_case_it_builds(name):
             == to_record(models.build(case.architecture, **case.config), object))
 
 
+@pytest.mark.parametrize("named", ["directory", "config.json"])
 @pytest.mark.parametrize("name", ["qwen35-tiny", "qwen35-native-tiny"])
-def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
+def test_a_case_names_a_checkpoints_config_on_the_command_line(name, named):
     """`--cases` names a checkpoint's config (`hf_config`, its directory or its config.json): a decoder's own,
     or a multimodal wrapper's whose language model a text-only load reads (`decoder_config`), which the case's
     model is built from as the family translates it, the case's own `config` fields over the translated ones
@@ -59,8 +60,9 @@ def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
     step = load("benchmark_step")
     models_module = load("benchmark_models")
     directory = FIXTURES / name
+    checkpoint = directory if named == "directory" else directory / "config.json"
     [case] = step.cases_from_json(json.dumps([{"architecture": "causal_transformer",
-                                              "hf_config": str(directory), "config": {"max_seq_len": 128},
+                                              "hf_config": str(checkpoint), "config": {"max_seq_len": 128},
                                               "dtype": "float32", "batch_size": 2, "seq_len": 8}]))
     translated = translate_config(decoder_config(json.loads((directory / "config.json").read_text())))
     assert translated["max_seq_len"] != 128

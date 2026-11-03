@@ -979,10 +979,15 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
+    ({"kernels/flash_attn/dew_flash_attn/__init__.py": "VALUE = 2\n"}, "on"),
+    ({"stubs/pkg/__init__.pyi": "VALUE: int\n"}, "on"), ({"licenses/NOTICE": "notice\n"}, "on"),
+    ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
+        "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
+        "the manifest",
         "the pool", "the environment's variables"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):

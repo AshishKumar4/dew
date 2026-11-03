@@ -807,7 +807,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      coordinates: Coordinates | None = None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
                      indexer: bool = False, layers: Sequence[int] = (), watched: bool = False,
-                     routes: tuple[jax.Array, jax.Array | None] | None = None,
+                     routes: tuple[jax.Array | Mapping[str, jax.Array], jax.Array | None] | None = None,
                      predict: bool | None = None, z_loss: float | None = None, logits: bool = False,
                      progress: Progress = END, rows: jax.Array | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
@@ -828,7 +828,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         targets whose role matches keep their weight.
 
         `routes` replays a rollout engine's expert choices: `[B, seq_len + 1,
-        layers, top_k]` ids aligned with `tokens`, and `[B, seq_len + 1]`
+        layers, top_k]` ids aligned with `tokens`, one such array a routed
+        site keyed by its path where the layers route at several
+        (`dew.nn.inputs.LayerInputs.experts`), and `[B, seq_len + 1]`
         booleans marking the ids the record covers (None for all). Every
         router selects those experts instead of its own top-k and still
         weights them from its scores (`dew.nn.protocols.Routes`); the stack slices

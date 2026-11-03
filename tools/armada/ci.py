@@ -181,6 +181,9 @@ NEWEST_FILES = (
     # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
+    # Host allocations a test bounds by tracemalloc's peak, which moves on 3.14: a pool's export peaked past
+    # half its model on 3.14 in CI's process, green there standalone.
+    "tests/test_saved_sources.py", "tests/test_mixture_scale.py",
 )
 """The files the newest Python runs whole on a pushed run: those its changes broke before, and
 the ones around the same machinery. It imports every other test file there (`COLLECT`), and runs
@@ -188,8 +191,9 @@ every file on the daily run. The list is kept by hand, from those breaks, becaus
 derive it: the test cache records the checkout's files a run executed and read (executed.py),
 while each break lived in the standard library's or a dependency's behaviour under the new
 Python (PEP 649's lazy annotations read through tyro, forkserver as the default start method,
-threads ended at interpreter exit), which no record sees; and the plan runs where the records'
-token is not. Across 34 suite runs no file was red on 3.14 alone."""
+threads ended at interpreter exit, a process's allocations under tracemalloc), which no record
+sees; and the plan runs where the records' token is not. A file red on the newest Python alone is
+found by the daily run, which the land queue reads, and joins the list."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_SECONDS = 6.0
@@ -916,13 +920,17 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/")
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/",
+          "kernels/", "stubs/", "licenses/", "images/", ".thresh/")
 """Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
-notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
-elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
-no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
-reused)."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
+notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A native
+kernel package's sources (kernels/), which the environment installs as a built wheel, never as these
+files, a type stub, a license, an image and thresh's annotations are placed alike: each is the input of
+the files whose runs read it, of none where none does. A change elsewhere is placed by none, and runs
+the whole suite (`policy`): a workflow change reran every file while no record placed it (the
+maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused), and a change to
+a kernel package's wrapper ran train 537's whole suite on both Pythons."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "MANIFEST.in")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
 it turned the cache off for every train holding such a head, which then ran its whole suite on every

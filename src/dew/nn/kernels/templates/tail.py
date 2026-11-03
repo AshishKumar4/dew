@@ -49,18 +49,21 @@ class Tail:
                 jnp.minimum(gathered, self.partitions))
 
 
-def balanced(tiles: int, steps: int, programs: int) -> Tail | None:
-    """A dense kernel gradient's tail (`Tail`) where its `tiles` of `steps` each leave a last wave at
-    most half full over `programs`; None elsewhere. A short last wave's programs idle while a few walk
-    whole tiles, which balancing them saves; but the programs sharing a balanced tile read its operands
-    apart, without the reuse a wave's neighbouring tiles share, at about half the rate, so a tail
-    balances where it is at most half a wave, and none where the whole product is one: TGHYBRID1-h100 and
+def balanced(tiles: int, steps: int, programs: int, *, handoff_steps: float = 0.0) -> Tail | None:
+    """A dense kernel gradient's tail (`Tail`) where balancing its last wave is no slower than walking it,
+    priced in MMA steps; None elsewhere. Walked, the last wave's `tiles` mod `programs` tiles take their
+    `steps` whole while the other programs idle. Balanced, the programs share those steps, but the programs
+    sharing a balanced tile read its operands apart, without the reuse a wave's neighbouring tiles share,
+    at about half the rate, and a tile's partials reach the program that adds them through a hand-off
+    (`handoff_steps`, the part's measured semaphore hand-off in the tile's steps, row 3613): so a tail
+    balances where it is at most half a wave less its hand-off, and none where the whole product is one
+    wave: TGHYBRID1-h100 and
     BALANCED1-h100 (an H100 PCIe's 114 programs) measured every tail at most half a wave faster or level
     (Qwen3.5-4B's up and down projections' kernel gradients 3% to 7%, Llama 3 8B's output projection's 3%,
     their 36, 36 and 56 tiles) and every fuller one slower (Qwen3.5-4B's query-key-value projection's 6%,
     its output projection's 30% at 92 tiles, its key projection's 87% at 80 tiles and no whole wave)."""
     waves, tail = divmod(tiles, programs)
-    if waves == 0 or tail == 0 or steps == 0 or 2 * tail > programs:
+    if waves == 0 or tail == 0 or steps == 0 or 2 * tail * steps / programs + handoff_steps > steps:
         return None
     iterations = tail * steps
     return Tail(waves, iterations, min(programs, iterations), steps)

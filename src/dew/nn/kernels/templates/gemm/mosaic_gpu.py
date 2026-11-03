@@ -54,7 +54,7 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, mosaic, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
@@ -495,7 +495,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     tail = None
     if (dense and paired is None and tiles.cluster == 1 and family_of(tiles, lhs.dtype).fixes_up
             and not exact_sums):
-        tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors)
+        tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
+                                handoff_steps=handoff_steps(tiles, multiprocessors=multiprocessors,
+                                                            target=generation.gpu_target()))
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -796,7 +798,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     tail = None
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
     if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
-        tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors)
+        tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors,
+                                handoff_steps=handoff_steps(tiles, multiprocessors=multiprocessors,
+                                                            target=generation.gpu_target()))
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
@@ -1042,17 +1046,36 @@ def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, ste
     return first | last
 
 
+def step_seconds(tiles: Tiles, *, multiprocessors: int, target) -> float | None:
+    """One MMA step of `tiles`, in seconds: its FLOPs at a multiprocessor's share of `target`'s dense bf16
+    peak, the unit the kernel gradient's split (`split_count`) and a balanced tail (`handoff_steps`) price
+    their walks in; None where the target states no peak."""
+    peak = target.bf16_peak
+    flops = 2 * tiles.block_m * tiles.block_n * tiles.block_k
+    return None if peak is None else flops / (peak / multiprocessors)
+
+
+def handoff_steps(tiles: Tiles, *, multiprocessors: int, target) -> float:
+    """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
+    of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its peak is
+    unmeasured."""
+    step = step_seconds(tiles, multiprocessors=multiprocessors, target=target)
+    handoff = target.handoff_seconds
+    return 0.0 if step is None or handoff is None else handoff / step
+
+
 def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, multiprocessors: int,
-                step_seconds: float | None, bandwidth: float | None) -> int:
+                step_seconds: float | None, bandwidth: float | None, launch_seconds: float | None) -> int:
     """Dew: the slices a kernel gradient's contraction splits into at `tiles` (`Tiles.splits`, `tgmm`),
     from the call's extents and the device's facts. Over a wave (`multiprocessors` x `tiles.programs`)
     and `rows` in steps a group (on average), the busiest program walks ceil(tiles x s / wave) output
     tiles of ceil(steps / s) steps at s slices. The split is the least s whose walk, with the time its
     fp32 partials take written and read back (2s + 1 passes over the output at `bandwidth`, in steps of
-    `step_seconds`), is shorter than the unsplit walk, each slice keeping at least the ring's stages and
-    one more; one where none is, or where the device states no rate. A bounded comparison over the
-    facts, no table, no timing: Key's 2560 x 1024 gradient over 24,576 rows on an H100 splits in three,
-    2 x 128 steps against 384."""
+    `step_seconds`) and the launch their sum adds (`launch_seconds`, the part's measured launch in a
+    program, row 3613; none where unmeasured), is shorter than the unsplit walk, each slice keeping at
+    least the ring's stages and one more; one where none is, or where the device states no rate. A bounded
+    comparison over the facts, no table, no timing: Key's 2560 x 1024 gradient over 24,576 rows on an H100
+    splits in three, 2 x 128 steps against 384."""
     if step_seconds is None or bandwidth is None:
         return 1
     wave = multiprocessors * tiles.programs
@@ -1062,7 +1085,9 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
     def walk(splits: int) -> float:
         passes = 0 if splits == 1 else 2 * splits + 1
         partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
-        return -(-output * splits // wave) * -(-steps // splits) + partials
+        # A split runs its partials' launch and XLA's sum of them where the unsplit call runs one launch.
+        launches = 0 if splits == 1 or launch_seconds is None else launch_seconds / step_seconds
+        return -(-output * splits // wave) * -(-steps // splits) + partials + launches
 
     return next((splits for splits in range(2, steps // (tiles.stages + 1) + 1) if walk(splits) < walk(1)), 1)
 

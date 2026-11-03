@@ -482,7 +482,7 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
-    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.streamed`,
+    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
     reaches; a part no one measured, at its clocks' (row 3612)."""
     hopper = generation.TARGETS["sm90"]
@@ -493,8 +493,8 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
 
     (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
     assert measured is not None and measured < 4.0e12
-    # A Hopper part no row's streams name (an H800's), priced at its clocks.
-    assert memory_rate("NVIDIA H800", 2.0e12) == 2.0e12
+    # A part no device reports (its kind the test's own), which no row's streams can name: its clocks'.
+    assert memory_rate("a Hopper part no one measured", 2.0e12) == 2.0e12
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])

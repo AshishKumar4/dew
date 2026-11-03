@@ -33,10 +33,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypedDict
 
-import numpy as np
-
 from dew._records import JSON, finite, integer, integers, listed, record as section, text
 from dew.data.prompts import PromptRecord
+from dew.inference.rollouts import routing_head, routing_json, routing_record, routing_rows
 
 from .records import messages, reals
 from .rollout import Reward
@@ -71,7 +70,7 @@ class VerlRow(TypedDict):
     response_ids: list[int]
     response_mask: list[int]
     response_logprobs: list[float]
-    routed_experts: list[list[list[int]]] | None
+    routed_experts: list[list[list[int]]] | dict[str, list[list[list[int]]]] | None
     multi_modal_data: object
     reward_score: float | None
     num_turns: int
@@ -101,7 +100,9 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
     """Export JSON-compatible `AgentLoopOutput` rows, one per strict chain.
 
     A session without calls has no chain and writes no row. `routed_experts`
-    is written when the chain's last recorded call covers every row.
+    is written when the chain's last recorded call covers every row, an
+    object of one such list a routed site, by its path, where the calls'
+    records are keyed by site (`dew.inference.rollouts.Routing`).
     """
     rows: list[VerlRow] = []
     for given in trajectories:
@@ -163,8 +164,8 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
                 "response_ids": chain.tokens[start:],
                 "response_mask": [int(drawn) for drawn in sampled[start:]],
                 "response_logprobs": chain.behavior[start:],
-                "routed_experts": (routing.tolist() if routing is not None
-                                   and len(routing) == len(chain.tokens) - 1 else None),
+                "routed_experts": (routing_json(routing) if routing is not None
+                                   and routing_rows(routing) == len(chain.tokens) - 1 else None),
                 "multi_modal_data": trajectory.extras.get("multi_modal_data"),
                 "reward_score": session.reward,
                 "num_turns": 1 + len(chain.members) + gaps,
@@ -220,7 +221,7 @@ def _calls(row: Mapping[str, object], version: int | None,
     runs = (_runs(mask, len(prompt)) if described is None
             else [(integer(call["start"], "start"), integer(call["count"], "count")) for call in described])
     routed = row.get("routed_experts")
-    record = None if routed is None else np.asarray(routed)
+    record = None if routed is None else routing_record(routed)
     calls = []
     for number, (begin, length) in enumerate(runs):
         meta = described[number] if described is not None else {}
@@ -232,9 +233,9 @@ def _calls(row: Mapping[str, object], version: int | None,
         if not begin or begin + length > len(full):
             raise ValueError(f"verl call {number} samples ids {begin}..{begin + length} of a "
                              f"{len(full)}-id row after a nonempty prompt")
-        if record is not None and len(record) < forwarded:
+        if record is not None and routing_rows(record) < forwarded:
             raise ValueError(
-                f"verl routed_experts covers {len(record)} ids; call {number} forwarded {forwarded}"
+                f"verl routed_experts covers {routing_rows(record)} ids; call {number} forwarded {forwarded}"
             )
         support = meta.get("support")
         offset = begin - len(prompt)
@@ -250,7 +251,7 @@ def _calls(row: Mapping[str, object], version: int | None,
                 version=integer(stated, "version"),
                 raw_log_probs=None if meta.get("raw_log_probs") is None
                 else reals(meta["raw_log_probs"], "raw_log_probs"),
-                routed_experts=None if record is None else record[:forwarded],
+                routed_experts=None if record is None else routing_head(record, forwarded),
                 support=None if support is None else listed(
                     support, "support", read=integers, what="a list of token-id lists"),
                 reward=None if meta.get("reward") is None else finite(meta["reward"], "reward"),
