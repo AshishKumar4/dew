@@ -1063,11 +1063,11 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     the file's record and the split plugin its collected tests alike, the marked tests one weight at
     the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
-    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
-    plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
-    to share its fixture); its setup's group keeps the place of its first recorded test, where the plan has
-    it, though the new test comes first. A test the record lacks, alone or a new setup's, weighs nothing too,
-    so the recorded tests keep the plan's groups. A mark written
+    yet joins its setup's tests all the same (Main, 2026-11-02: a marked pair waited on the record to share
+    its fixture), its setup's group keeping the place of its first recorded test, where the plan has it,
+    though the new test comes first. A test the record lacks, alone or a new setup's, weighs its file's mean,
+    so the task's cut may part from the plan's: each test still runs in one group, and its file's groups run,
+    never reused, until the record names it (`record`'s `unkeyed`). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1105,7 +1105,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
     assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
-    # A new lone test, or a new setup's pair, before recorded a, b, c rides, weightless, in the first group.
+    # A new lone test, or a new setup's pair, before recorded a, b, c weighs their mean: the task cuts the
+    # file by it, the plan by the record, and the file's groups are not reused.
     files = {"lone": ("0x", "1a", "2b", "3c"), "group": ("0y", "0z", "1a", "2b", "3c")}
     for name, tests in files.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1119,12 +1120,16 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     commit(tmp_path, "files whose new tests come before their recorded ones")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert all(row["exitCode"] == 0 for row in rows)
-    for name, new in (("lone", ["0x"]), ("group", ["0y", "0z"])):
+    cuts = {"lone": (("0x", "1a"), ("2b", "3c"), ()), "group": (("0y", "0z"), ("1a", "2b"), ("3c",))}
+    for name, cut in cuts.items():
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)
-            for group, tests in ((1, (*new, "1a")), (2, ("2b",)), (3, ("3c",)))}
+            for group, tests in enumerate(cut, start=1)}
         assert [ci.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
             [node[name, test]] for test in ("1a", "2b", "3c")]
+        common = ci.shared("3.12")
+        assert [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)] == [
+            None, None, None]
     for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
                       "@pytest.mark.shared_setup(NAME)\n"):
         (tmp_path / "tests/test_refused.py").write_text(
