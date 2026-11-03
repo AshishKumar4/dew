@@ -29,7 +29,7 @@ dataset-prep/datasets
 PLAN.md
 NEWREPO.md
 .claude/
-.venv/
+.venv
 .worktrees/
 samples/
 .pytest_cache/
