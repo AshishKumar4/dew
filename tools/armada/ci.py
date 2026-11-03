@@ -1588,7 +1588,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # The tail long enough to hold a stall's stacks, which come before the interrupt's report.
+                     # Long enough to hold a stall's stacks, which come before its interrupt's report.
                      "output": "\n".join(red + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
