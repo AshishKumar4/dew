@@ -24,7 +24,7 @@ stacks at module scope, so they are compiled with those names stubbed, as
 tools/parity_rl.py does; every number written comes from the reference's
 own arithmetic. Run with an interpreter that has torch:
 
-  ~/Desktop/dew/.venv/bin/python tools/parity_agentic.py
+  .venv/bin/python tools/parity_agentic.py
 """
 
 import sys

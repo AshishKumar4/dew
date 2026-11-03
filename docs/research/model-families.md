@@ -82,7 +82,7 @@ code. Checked against the source on 2026-09-22:
 Two primary sources only.
 
 1. The model implementations in the pinned venv, transformers 5.16.1, at
-   `~/Desktop/dew/.venv/lib/python3.12/site-packages/transformers`. Below this
+   `.venv/lib/python3.12/site-packages/transformers`. Below this
    is written `TF`, so `TF/models/qwen3/configuration_qwen3.py:62` is a real
    file and line in this checkout. Files whose header says "generated from
    modular_x.py" are still the code that runs.
@@ -1024,7 +1024,7 @@ fits", never as "this is trainable here".
 One correction for whoever writes these tests: the allocator knob is
 `XLA_CLIENT_MEM_FRACTION`. `XLA_PYTHON_CLIENT_MEM_FRACTION` still works but is
 deprecated in this jaxlib, and setting both raises
-(`~/Desktop/dew/.venv/lib/python3.12/site-packages/jaxlib/xla_client.py:180-190`).
+(`.venv/lib/python3.12/site-packages/jaxlib/xla_client.py:180-190`).
 Preallocation is turned off with `XLA_PYTHON_CLIENT_PREALLOCATE` (`:191`). The
 default fraction is set inside the C++ allocator, not in the Python layer, so
 its value was not verified here; measure it with

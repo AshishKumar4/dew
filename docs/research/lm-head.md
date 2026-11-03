@@ -128,29 +128,29 @@ control, and not on a tolerance the machine cannot hold.
 ## Reproduction
 
 ```bash
-cd ~/Desktop/dew/.worktrees/lm-head
+# From a worktree of the branch beside a checkout of main at $MAIN, with main's .venv.
 nvidia-smi --query-compute-apps=pid --format=csv,noheader   # only the desktop
 
 # The step, before and after. The harness is this branch's in both runs.
-PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/benchmark_step.py \
+PYTHONPATH=$MAIN/src $MAIN/.venv/bin/python tools/benchmark_step.py \
   --preset small --architectures causal_transformer --steps 50 \
   --json-out /tmp/lm-head/before.json
-PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/benchmark_step.py \
+PYTHONPATH=$PWD/src $MAIN/.venv/bin/python tools/benchmark_step.py \
   --preset small --architectures causal_transformer --steps 50 \
   --json-out /tmp/lm-head/after.json
 # The head in isolation, one process per variant.
 for v in baseline stored4 stored8 remat4 stored4-noacc; do
-  PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/benchmark_lm_head.py $v
+  PYTHONPATH=$PWD/src $MAIN/.venv/bin/python tools/benchmark_lm_head.py $v
 done
 
 # Twenty steps from one seed, each side and each precision.
-PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
+PYTHONPATH=$MAIN/src $MAIN/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --out /tmp/lm-head/losses-main.json
-PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
+PYTHONPATH=$PWD/src $MAIN/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --out /tmp/lm-head/losses-branch.json
-PYTHONPATH=~/Desktop/dew/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
+PYTHONPATH=$MAIN/src $MAIN/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --precision highest --out /tmp/lm-head/losses-main-fp32.json
-PYTHONPATH=$PWD/src ~/Desktop/dew/.venv/bin/python tools/lm_step_parity.py \
+PYTHONPATH=$PWD/src $MAIN/.venv/bin/python tools/lm_step_parity.py \
   --steps 20 --precision highest --out /tmp/lm-head/losses-branch-fp32.json
 ```
 
