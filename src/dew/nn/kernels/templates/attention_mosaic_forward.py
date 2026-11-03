@@ -727,9 +727,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         def shifted(at, slots, carry, accumulators):
             return step(lo + at, slots, carry, accumulators)
 
-        rows, (acc,) = walker(shifted, (start.m, start.total), ((tiles.block_q, value_width),),
-                              initial=(start.acc,))
-        state, trained = algebra.Partial(acc, *rows), None
+        if guard is not None:
+            # A guarded walk's whole state its carry (`walked`'s), no accumulators.
+            state, trained = walker(shifted, start, ())[0], None
+        else:
+            rows, (acc,) = walker(shifted, (start.m, start.total), ((tiles.block_q, value_width),),
+                                  initial=(start.acc,))
+            state, trained = algebra.Partial(acc, *rows), None
     else:
         # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
         state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
