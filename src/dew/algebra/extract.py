@@ -26,10 +26,11 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Hashable, Iterable, Mapping, Sequence
-from typing import Protocol, Self
+from typing import Protocol
 
 import numpy as np
 from egglog import BaseExpr, DagCostModel, EGraph, get_callable_args, get_callable_fn
+from egglog.egraph import ComparableAdd
 from scipy.optimize import milp
 from scipy.sparse import coo_array
 
@@ -46,15 +47,12 @@ class Level:
     added: float = 0.0
 
 
-class Linear(Protocol):
+class Linear(ComparableAdd, Protocol):
     """A price extraction composes from its nodes' and compares level by level, in order (`levels`): a DAG's
-    price at a level is the largest of its nodes' summed pieces and of their peaks, plus their additions."""
+    price at a level is the largest of its nodes' summed pieces and of their peaks, plus their additions
+    (`valued`); egglog's comparable addition (`ComparableAdd`) beside."""
 
     def levels(self) -> tuple[Level, ...]: ...
-
-    def __add__(self, other: Self) -> Self: ...
-
-    def __lt__(self, other: Self) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,10 +87,15 @@ def cheapest[Price: Linear](graph: EGraph, root: BaseExpr, model: DagCostModel[P
     return form, price
 
 
+def valued(level: Level) -> float:
+    """A composed price's `level` as one value: the larger of its pieces and its peak, plus its additions."""
+    return max([*level.summed, level.peak]) + level.added
+
+
 def _dearer(price: Linear, optimum: Linear) -> bool:
     """Whether `price` is above `optimum`, level by level, beyond rounding (a millionth, HiGHS's gap)."""
     for mine, best in zip(price.levels(), optimum.levels(), strict=True):
-        ours, theirs = (max([*level.summed, level.peak]) + level.added for level in (mine, best))
+        ours, theirs = valued(mine), valued(best)
         if math.isinf(ours) and math.isinf(theirs):
             return False
         if ours > theirs + 1e-6 * abs(theirs):
@@ -106,7 +109,7 @@ def extracted[Price: Linear](graph: EGraph, root: BaseExpr,
                              model: DagCostModel[Price]) -> tuple[BaseExpr, Price]:
     """`root`'s cheapest form under `model` and its price, each shared node once (the module's account)."""
     nodes, owner, greedy = recorded(graph, root, model)
-    chosen = solved(nodes, owner, greedy)
+    chosen = solved(nodes, owner, greedy, model.identity)
     keys = {node.key for node in chosen}
     forced = DagCostModel(marginal_cost=lambda _, node: int(terms.key(node) not in keys), identity=0)
     return graph.extract(root, cost_model=forced, extractor="greedy-dag"), _priced(chosen, model.identity)
@@ -120,6 +123,9 @@ def recorded[Price: Linear](graph: EGraph, root: BaseExpr,
     the extraction prices the nodes `root` reaches alone, so its class is the one no node reads (a bundle
     of roots), or the class of its row where the DAG reads it back. A node of a table (a constructor's row)
     is in the class its row holds; a value (a literal, a container) is a class of its own."""
+    # The root first, so its constructors' tables are among those read: on a graph that does not hold it
+    # yet, its rows are made by the extraction, after the tables were listed.
+    graph.register(root)
     tables = {function for function, _ in graph.all_function_sizes()}
     nodes: dict[Hashable, Node[Price]] = {}
 
@@ -146,21 +152,37 @@ def recorded[Price: Linear](graph: EGraph, root: BaseExpr,
     return nodes, terms.key(found), greedy
 
 
-def solved[Price: Linear](nodes: Mapping[Hashable, Node[Price]], root: Hashable,
-                          near: Price) -> list[Node[Price]]:
+def solved[Price: Linear](nodes: Mapping[Hashable, Node[Price]], root: Hashable, near: Price,
+                          identity: Price) -> list[Node[Price]]:
     """The nodes of the cheapest DAG holding `root`'s class (the module's account), each level solved in
     units of `near`'s (a price of the graph's, greedy extraction's): the solver closes a gap of a millionth
-    of a unit, so a level of picoseconds against peaks of microseconds is solved to its own digits."""
+    of a unit, so a level of picoseconds against peaks of microseconds is solved to its own digits. A level's
+    choice is kept only where its DAG's earlier levels, priced as `identity` and its nodes add them, are no
+    dearer than the choice before it: the solver's tolerance admits a dearer earlier level by a hair."""
     classes: dict[Hashable, list[Node[Price]]] = {}
     for node in nodes.values():
         classes.setdefault(node.owner, []).append(node)
     used = _reachable(classes, root)
-    chosen = [node for owner in used for node in classes[owner]]
-    program = _Program(chosen, {owner: classes[owner] for owner in used}, root)
+    candidates = [node for owner in used for node in classes[owner]]
+    program = _Program(candidates, {owner: classes[owner] for owner in used}, root)
+    kept: list[Node[Price]] | None = None
     for depth, level in enumerate(near.levels()):
         program.level(depth, max([*level.summed, level.peak]) + (level.added if math.isfinite(level.added)
                                                                   else 0.0))
-    return [node for node, taken in zip(chosen, program.solution(), strict=True) if taken]
+        taken = [node for node, on in zip(candidates, program.solution(), strict=True) if on]
+        if kept is not None and _dearer_before(_priced(taken, identity), _priced(kept, identity), depth):
+            break
+        kept = taken
+    return kept if kept is not None else [node for node, on in zip(candidates, program.solution(),
+                                                                   strict=True) if on]
+
+
+def _dearer_before(price: Linear, best: Linear, depth: int) -> bool:
+    """Whether `price` is dearer than `best` at a level before `depth`, the first where they differ."""
+    for mine, theirs in zip(price.levels()[:depth], best.levels()[:depth], strict=True):
+        if valued(mine) != valued(theirs):
+            return valued(mine) > valued(theirs)
+    return False
 
 
 def _reachable(classes: Mapping[Hashable, Sequence[Node]], root: Hashable) -> list[Hashable]:
@@ -279,8 +301,7 @@ class _Program:
         objective = {number: level.added * scale for number, level in enumerate(levels)
                      if level.added and math.isfinite(level.added)}
         objective[bound] = 1.0
-        least = self._least(objective)
-        self.rows.append((objective, -np.inf, least + 1e-9 * max(1.0, abs(least))))
+        self.rows.append((objective, -np.inf, self._least(objective)))
 
     def solution(self) -> list[bool]:
         """Each node's choice at the last level solved."""
@@ -304,8 +325,11 @@ class _Program:
         upper = np.asarray([high for _, _, high in self.rows])
         optimum = milp(cost, constraints=(matrix, lower, upper), integrality=integrality,
                        bounds=(np.zeros(self.width), self.upper), options={"mip_rel_gap": 0.0})
-        if optimum.x is None:
+        if optimum.status == 2:
             raise ValueError(f"no DAG of the e-graph's nodes holds its root: {optimum.message}")
+        if not optimum.success or optimum.x is None:
+            raise RuntimeError(f"HiGHS proved no optimum of the extraction (status {optimum.status}): "
+                               f"{optimum.message}")
         self.chosen = optimum.x[:len(self.nodes)]
         return float(optimum.fun)
 

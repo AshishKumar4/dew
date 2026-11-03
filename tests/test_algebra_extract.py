@@ -54,7 +54,8 @@ class Cost:
 
 
 PRICES = {"big": Cost(10.0), "shared": Cost(6.0), "small": Cost(6.5), "f": Cost(1.0), "g": Cost(1.0),
-          "slow": Cost(math.inf), "fast": Cost(3.0)}
+          "slow": Cost(math.inf), "fast": Cost(3.0), "tied": Cost(1.0, 1.0),
+          "untied": Cost(1.0000000005, 0.0)}
 
 
 def priced(graph: EGraph, node) -> Cost:
@@ -130,3 +131,24 @@ def test_an_infinitely_priced_node_is_avoided_where_a_dag_holds_none():
     only = Toy.leaf("slow")
     alone.register(only)
     assert math.isinf(extract.extracted(alone, only, MODEL)[1].seconds)
+
+
+def test_a_later_level_never_buys_a_dearer_earlier_one():
+    """`tied` costs 1.0 then 1.0, `untied` a hair more first and nothing then: compared in order, `tied`
+    is cheaper, whatever the solver's tolerance admits of `untied`'s first level, and the oracle passes
+    greedy's choice of it."""
+    graph = EGraph()
+    root = Toy.scaled(Toy.leaf("tied"), 0)
+    graph.register(root, union(Toy.leaf("tied")).with_(Toy.leaf("untied")))
+    for form, price in (extract.extracted(graph, root, MODEL),
+                        extract.cheapest(graph, root, MODEL, checked=True)):
+        assert price == Cost(1.0, 1.0)
+        assert str(form) == str(root)
+
+
+def test_a_root_the_graph_does_not_hold_yet_is_extracted_exactly():
+    """A root first registered by its extraction is extracted as one already held is."""
+    graph = EGraph()
+    form, price = extract.extracted(graph, Toy.two(Toy.leaf("small"), Toy.leaf("big")), MODEL)
+    assert price == Cost(16.5)
+    assert str(form) == str(Toy.two(Toy.leaf("small"), Toy.leaf("big")))
