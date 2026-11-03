@@ -758,11 +758,12 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
 
 
 def _key_views(named: dict, row, head, sources, table, *, page: int | None, block_k: int,
-               column_block: tuple[int, int] | None) -> dict:
+               column_block: jax.Array | None) -> dict:
     """The views a launch's rings read its keys and values from (`Family.opened`), at batch row `row` and key
     head `head`: a call's rows of keys at the row its `sources` name (`_views_of`; its own without), a paged
     pool's where its `table` maps them (`_paged_views`); the values' at their block of the columns where the
-    launch walks one (`column_block`, its first column and width), a step's block index the block's."""
+    launch walks one (`column_block`, the block's index among the columns' blocks), a step's block index
+    the block's."""
     if page is None:
         views = _views_of(named, row if sources is None else sources[row], head)
     else:
@@ -770,7 +771,7 @@ def _key_views(named: dict, row, head, sources, table, *, page: int | None, bloc
     if column_block is None or "values" not in views:
         return views
     ref, tile = views["values"]
-    block = column_block[0] // column_block[1]
+    block = column_block
 
     def at_columns(j):
         # A paged tile's pages each at the column block (`mosaic.Pieces`).
@@ -833,24 +834,29 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
+    # A block of the values' columns its index a scalar the programs read, so every block's launch is one
+    # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
+    # resource gate's cases 50 to 150 s on a CPU).
+    block = None if column_width is None else jnp.full((1,), (columns or 0) // column_width, jnp.int32)
     return _launched(query, key, value,
-                     (spans, hooked, guard, anchors, None if table is None else table[0], walks, sources),
+                     (spans, hooked, guard, anchors, None if table is None else table[0], walks, sources,
+                      block),
                      hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
                      counted=counted, finishes=finishes, target=generation.gpu_target(),
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_block=None if column_width is None else (columns, column_width))
+                     column_width=column_width)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_block"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_width"))
 def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_block: tuple[int, int] | None = None):
+              column_width: int | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -860,7 +866,7 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width = query.shape
     # A block of the values' columns where it walks one in place (`_launch`'s `column_width`).
-    value_width = value.shape[-1] if column_block is None else column_block[1]
+    value_width = value.shape[-1] if column_width is None else column_width
     # A paged call's pools `[KV, P·size, D]`, its keys its table's slots.
     keys_count, kv_heads = ((read[4].shape[1] * page, key.shape[0]) if page is not None
                             else (key.shape[1], key.shape[2]))
@@ -888,11 +894,12 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         written, refs = refs[:len(out_type)], refs[len(out_type):]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if peaks or (reuse and not training) else (stages[0], stages[1:])
-        spans_of, hooked_of, guard_of, anchors_of, table_of, walks_of, sources_of = treedef.unflatten(read)
+        (spans_of, hooked_of, guard_of, anchors_of, table_of, walks_of, sources_of,
+         block_of) = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         named = {"keys": k_ref} if peaks else {"keys": k_ref, "values": v_ref}
         views = _key_views(named, row, lax.div(head, group), sources_of, table_of, page=page, block_k=block_k,
-                           column_block=column_block)
+                           column_block=None if block_of is None else block_of[0])
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
