@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """A GPU's memory facts as its kernels meet them, measured rather than read off its datasheet (row 3612): the
 device seconds one kernel takes to stream N bytes from cold HBM, against N, and the fit `seconds = fixed +
-bytes / plateau` over them, with the least kernel's seconds (a launch's floor on the device).
+bytes / plateau` over them, with the least kernel's seconds (a launch's floor on the device), and the wall
+seconds a launch adds to a program that runs kernels one after another and a hand-off's between two programs
+of one launch (row 3613's fixed costs of a launch and of the balanced tail's partials).
 
     python tools/device_facts.py --out facts.json
 
@@ -9,6 +11,15 @@ Each point reads an array of N bytes once (its sum, `read`) or reads and writes 
 twice the L2 that evicts it (`cold`); CUPTI times the kernel alone (`jax.experimental.mosaic.gpu.profiler`),
 the median of `--repeats` after `--warmup`. An H200's read, measured so, ramps from 2.6 TB/s at 16.8 MB to
 4.5 at 805 MB over a 2.5-2.8 us fixed cost, which a peak bandwidth alone prices as free at small transfers.
+
+A chain is one program of N tiny kernels, each reading the last's output and held apart from it by an
+optimization barrier (so XLA fuses none), timed whole by the wall clock (`dew.telemetry.benchmark.samples`,
+as XLA launches it, its command buffers at JAX's default) for N from 1 to 64; the line's slope is a launch's
+seconds in a program, its intercept the call's own. A hand-off is one GPU-scope semaphore signal another
+program waits on, as the balanced tail's partials (`templates.mosaic.RingFamily.fixed_up`): two programs of
+one kernel each signal the other and wait on their own K times, CUPTI timing it for K from 16 to 1024; the
+slope over the K rounds is one hand-off's seconds, measured where the GPU's ring families run the tail (TMA,
+sm90 on).
 """
 
 import argparse
@@ -20,8 +31,17 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.mosaic.gpu import profiler
 
+from dew.nn.kernels import generation
+from dew.telemetry.benchmark import samples
+
 SIZES = tuple(2 ** power for power in range(20, 31))
 """The bytes each point streams: 1 MiB to 1 GiB, by doubling."""
+
+CHAINS = (1, 2, 4, 8, 16, 32, 64)
+"""The kernels each chain launches one after another."""
+
+ROUND_TRIPS = (16, 64, 256, 1024)
+"""The rounds each hand-off kernel's two programs make, each one hand-off."""
 
 
 def timed(fn, args, *, flush, warmup: int, repeats: int) -> float:
@@ -44,6 +64,37 @@ def fitted(points: list[tuple[int, float]]) -> tuple[float, float]:
     sizes, seconds = np.asarray([b for b, _ in points], float), np.asarray([s for _, s in points], float)
     slope, fixed = np.polyfit(sizes, seconds, 1)
     return float(fixed), float(1.0 / slope)
+
+
+def chained(length: int):
+    """A program of `length` kernels one after another: each adds one to the last's output, an optimization
+    barrier between them, so each is a kernel of its own."""
+    def program(x):
+        for _ in range(length):
+            x = jax.lax.optimization_barrier(x + 1.0)
+        return x
+    return jax.jit(program)
+
+
+def handed_off(count: int):
+    """One kernel of two programs passing a GPU-scope semaphore back and forth `count` times."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(_):
+        program = jax.lax.axis_index("x")
+        ready = pl.get_global(plgpu.SemaphoreType.REGULAR((2,)))
+
+        # Each round both programs signal the other's semaphore and wait on their own: one hand-off a round.
+        def round_trip(_, carry):
+            plgpu.semaphore_signal(ready.at[1 - program], memory_scope="gpu")
+            plgpu.semaphore_wait(ready.at[program], memory_scope="gpu")
+            return carry
+
+        jax.lax.fori_loop(0, count, round_trip, 0)
+
+    return jax.jit(plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((2, 128), jnp.float32), grid=(2,),
+                                grid_names=("x",)))
 
 
 def main() -> None:
@@ -69,7 +120,19 @@ def main() -> None:
         print(json.dumps(row), flush=True)
     tiny = jnp.ones((256,), jnp.float32)
     least = timed(copy, (tiny,), flush=lambda: tiny, warmup=args.warmup, repeats=args.repeats)
-    facts = {"device": device.device_kind, "l2_bytes": l2, "least_kernel_seconds": least, "points": rows}
+    chains = [(length, statistics.median(samples(chained(length), tiny, warmup=args.warmup,
+                                                 repeats=args.repeats)))
+              for length in CHAINS]
+    slope, intercept = np.polyfit([length for length, _ in chains], [seconds for _, seconds in chains], 1)
+    facts = {"device": device.device_kind, "l2_bytes": l2, "least_kernel_seconds": least, "points": rows,
+             "chain": {"launch_seconds": float(slope), "call_seconds": float(intercept),
+                       "points": [{"kernels": length, "seconds": seconds} for length, seconds in chains]}}
+    if generation.gpu_target().architecture.tma:
+        trips = [(count, timed(handed_off(count), (), flush=lambda: tiny, warmup=args.warmup,
+                               repeats=args.repeats)) for count in ROUND_TRIPS]
+        hop, _ = np.polyfit([count for count, _ in trips], [seconds for _, seconds in trips], 1)
+        facts["handoff"] = {"seconds": float(hop), "points": [{"round_trips": count, "seconds": seconds}
+                                                              for count, seconds in trips]}
     for name, moved in (("read", 1), ("copy", 2)):
         fixed, plateau = fitted([(row["bytes"] * moved, row[name]["seconds"]) for row in rows])
         facts[name] = {"fixed_seconds": fixed, "plateau_bytes_per_second": plateau}

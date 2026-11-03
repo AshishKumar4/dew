@@ -1480,13 +1480,11 @@ def a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_determi
 
 
 
-def a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
-    """A cache prefill of left-padded prompts builds its cursor mask, which
-    sends a training call to xla (`kernel_for_materialized_mask`); a prefill
-    runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
-    took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
-    on an RTX 4080). The prefill scores on par with the full pass, both from
-    the model in float64 (check 1)."""
+def a_padded_prefill_is_on_par_with_the_full_pass(rng, without_deterministic_ops):
+    """A cache prefill of left-padded prompts on a GPU's kernels, its rows'
+    padding the selector's key validity (docs/performance.md, the prefill's
+    attention), scores on par with the full pass, both from the model in
+    float64 (check 1)."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
     made, _ = decode_steps(model)

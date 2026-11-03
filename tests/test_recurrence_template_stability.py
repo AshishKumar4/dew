@@ -10,7 +10,7 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
   form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype. Mamba2's rated
   decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
-  16-bit numbers mamba_ssm's (`mainloop._prepared`), to the port of mamba_ssm's kernels, as recorded
+  16-bit numbers mamba_ssm's (`mainloop.prepared`), to the port of mamba_ssm's kernels, as recorded
   mamba_ssm holds them at the same inputs (test_mamba_ssd).
 
 Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
@@ -45,7 +45,7 @@ HOOKS = SITES['scalar delta']
 
 def forms_of(hooks) -> tuple[str | None, ...]:
     """The run's forms a form's checks run under: the rated scan's fast and accurate both, whose numbers
-    differ (mamba_ssm's rounding, `mainloop._prepared`, and three fp32 parts), any other form's the run's
+    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts), any other form's the run's
     own (None), which its numbers do not read."""
     return ('fast', 'accurate') if hooks.rated else (None,)
 

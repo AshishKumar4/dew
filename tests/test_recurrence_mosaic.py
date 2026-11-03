@@ -13,6 +13,7 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -259,26 +260,66 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     return rule
 
 
-SHARDED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16')}
-"""The interpreted forward's cases whose recorded sites declare 256 seeds on the CPU (`fla_sites`, sized by
-the gate's rule against fla's own spread): together 840 s a whole run, past a CI task's share, so their draws
-are sharded over map tasks (`check1_shards`); the others declare 128 and run whole."""
+DRAWN_FORWARD: set[tuple] = set()
+"""The interpreted forward's drawn cases, each a test of its own (`drawn_forward`); the rest of
+`INTERPRETED_FORWARD` the template refuses (the refusal test below)."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=128)
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, SHARDED_FORWARD))
-def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at the cases of 256 recorded seeds
-    (`SHARDED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+def drawn_forward(case: str, dtype: str) -> Callable:
+    """A drawn forward case's test: the case taken out of the refused ones (`DRAWN_FORWARD`) and
+    `the_mosaic_forward_is_as_exact_as_its_reference` run by the test it decorates, a check-1 site of its own
+    (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
+    main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
+    (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
+    (keyed-shards at 7e3a5fb48)."""
+    DRAWN_FORWARD.add((case, dtype))
+
+    def check():
+        the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype])
+
+    return lambda test: functools.update_wrapper(check, test)
 
 
-@pytest.mark.parametrize(('case', 'dtype'),
-                         interpreted(FORWARD_GRID, INTERPRETED_FORWARD - SHARDED_FORWARD))
-def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference(case, dtype):
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at the cases of 128 recorded seeds, a decay a key
-    dimension's."""
-    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('one sequence', 'fp32')
+def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
+    forms."""
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('a ragged length', 'bf16')
+def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('packed documents', 'bf16')
+def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension', 'bf16')
+def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension."""
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension, packed', 'bf16')
+def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call of packed documents under a decay a
+    key dimension."""
+
+
+@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD - DRAWN_FORWARD))
+def test_an_fp32_call_under_a_decay_a_key_dimension_is_refused_by_the_mainloop(case, dtype):
+    """An fp32 call under a decay a key dimension: the template's route and the mainloop's rule both refuse
+    it, under either forms (`on_the_mainloop`, `mainloop.per_key_refusal`); its arm is the portable math's
+    (test_recurrence_chunk's)."""
+    hooks = case_hooks(case)
+    assert on_the_mainloop(hooks, case, dtype, forms='accurate') is None
+    assert on_the_mainloop(hooks, case, dtype) is None
 
 
 def the_mosaic_forward_is_as_exact_as_its_reference(case: str, dtype) -> None:
@@ -308,31 +349,35 @@ UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, mult
 memory a block, 16 multiprocessors, its clock and its memory's bandwidth, as its device reports them."""
 
 
-@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
-def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_reference(dtype):
-    """The recurrence template on a GPU no row names (`UNSEEN`): its facts and its family's bundle's
-    (mma.sync's) alone derive the call's tiles (`template.Mosaic.derived`): every launch's shared memory as
-    the bundle declares it within a block of it (`template.planned`), with two chunks in flight
-    unless two are past it or leave a multiprocessor fewer of the states launch's programs
-    (`Mosaic.states_held`); at those tiles the forward, on the bundle interpreted, is on par from float64 with
-    its reference's (check 1, as `the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants,
-    which the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too.
-    An fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
-    merges hold the inverse's three parts)."""
-    assert generation.family(UNSEEN.generation) == 'mma.sync'
+def unseen_call(dtype) -> tuple:
+    """The case 'one sequence' in `dtype` on the GPU no row names (`UNSEEN`): its hooks and its call bound to
+    the template (`template.MOSAIC.bind`)."""
     case = 'one sequence'
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     (operands,) = draw(dtype, 0, **geometry(case))
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
                                  operands.beta, operands.state, operands.starts, bound=hooks.inverse_bound)
+    return hooks, bound
+
+
+@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
+def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
+    """The recurrence template on a GPU no row names (`UNSEEN`): its facts and its family's bundle's
+    (mma.sync's) alone derive the call's tiles (`template.Mosaic.derived`): every launch's shared memory as
+    the bundle declares it within a block of it (`template.planned`), with two chunks in flight
+    unless two are past it or leave a multiprocessor fewer of the states launch's programs
+    (`Mosaic.states_held`). Its variants, which the opt-in tuner times (`Mosaic.variants`), lead with those
+    tiles, each legal there. An fp32 call it refuses: a launch's registers at its narrowest tiles pass a
+    thread's (the fp32 solve's merges hold the inverse's three parts)."""
+    assert generation.family(UNSEEN.generation) == 'mma.sync'
+    _, bound = unseen_call(dtype)
     budget = generation.shared_budget(UNSEEN)
-    if dtype == jnp.float32:
-        with generation.assumed(UNSEEN):
+    with generation.assumed(UNSEEN):
+        if dtype == jnp.float32:
             assert template.MOSAIC.derived(bound, UNSEEN) is None
             narrowest = mainloop.Tiles(bundles.of('sm80', jnp.bfloat16).narrowest_columns(jnp.bfloat16), 1)
             assert template.MOSAIC.registers(bound, narrowest) > template.MOSAIC.register_budget(narrowest)
-        return
-    with generation.assumed(UNSEEN):
+            return
         picked = template.MOSAIC.derived(bound, UNSEEN)
         assert picked is not None and template.MOSAIC.fitting(bound, UNSEEN) == (picked,)
         assert template.MOSAIC.staged_bytes(bound, picked, UNSEEN) <= budget
@@ -346,22 +391,28 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
         assert variants[0] == picked and len(set(variants)) == len(variants)
         assert all(template.MOSAIC.legal(bound, tiles, UNSEEN) for tiles in variants)
 
+
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_the_template_on_an_unseen_gpu_is_as_exact_as_its_reference():
+    """The bf16 forward on the GPU no row names (`UNSEEN`) at each of its variants (`Mosaic.variants`, which
+    lead with its derived tiles, `test_an_unseen_gpus_facts_derive_the_templates_tiles`), on its bundle
+    interpreted: on par from float64 with recorded fla-core (check 1, as
+    `the_mosaic_forward_is_as_exact_as_its_reference`'s). Each variant's value block and stages change which
+    program computes a value column. Its site's 256 recorded seeds at three variants took 267 to 306 s whole
+    on the CPU (int-g1-each at 7683420535), so its draws are sharded over map tasks (`check1_shards`)."""
+    hooks, bound = unseen_call(jnp.bfloat16)
+    with generation.assumed(UNSEEN):
+        variants = template.MOSAIC.variants(bound)
+
     def dew(given: Chunk, tiles: mainloop.Tiles):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=tiles, starts=given.starts, scale=hooks.scale, bound=hooks.inverse_bound,
                            family=bundles.of('sm80', jnp.bfloat16))
 
-    truth = jax.jit(functools.partial(token_by_token, hooks))
-    # Each variant: its value block and stages change which program computes a value column.
     for tiles in variants:
-        label = f'the mosaic forward on an unseen GPU at {tiles}, in {jnp.dtype(dtype).name}'
-        if dtype != jnp.float32:
-            the_template_is_as_exact_as_fla(functools.partial(dew, tiles=tiles), recorded_site(case, dtype),
-                                            ('out', 'final'), label)
-            continue
-        assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), truth,
-                        functools.partial(draw, dtype, **geometry(case)), label,
-                        seeds=SEEDS, truth_fn=truth)
+        the_template_is_as_exact_as_fla(functools.partial(dew, tiles=tiles),
+                                        recorded_site('one sequence', jnp.bfloat16), ('out', 'final'),
+                                        f'the mosaic forward on an unseen GPU at {tiles}, in bfloat16')
 
 
 @pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
@@ -452,7 +503,7 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
-    lowered program, which both layers call (`mainloop._lowered_once`), as many as one layer's. Each call
+    lowered program, which both layers call (`mainloop.lowered_once`), as many as one layer's. Each call
     site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
     on its layers' identical kernels (row 2102)."""
     import re
@@ -650,7 +701,7 @@ def resource_floor(name: str) -> float | None:
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
-launches the keys-gated ones (`mainloop._Call.gated_keys`)."""
+launches the keys-gated ones (`mainloop.Call.gated_keys`)."""
 
 
 def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.ShapeDtypeStruct]:

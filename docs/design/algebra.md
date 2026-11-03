@@ -529,8 +529,8 @@ class Extraction:
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
 - One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
-  an operation's work by unit (tensor-core FLOPs by mode, the 16-bit mode's and TF32's; CUDA-core fp32
-  operations, a product at `Precision.HIGHEST` among them; SFU exponentials; conversions) and its bytes by
+  an operation's work by unit (tensor-core FLOPs by mode, the 16-bit mode's, TF32's and FP8's, `fp8_flops`;
+  CUDA-core fp32 operations, a product at `Precision.HIGHEST` among them; SFU exponentials; conversions) and its bytes by
   level (device memory, shared memory). The algebra's terms price through it (`cost.work`: a product's FLOPs in
   its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
   algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
@@ -543,12 +543,13 @@ class Extraction:
   takes fewer seconds and no more of that work (`cost.cheaper`), so it is cheaper whatever the rate. A process
   of no accelerator prices as the interpreted templates' H100, a GPU no row names by its family's and its
   runtime's facts (`cost.target`):
-  - XLA's fusion (`cost.fused`), for the compile-time pass over a program and error-aware extraction. A
-    program's operands are read from device memory once, however many reductions read them (XLA's fusion
-    reads a sibling reduction's inputs once), and elementwise work fuses into its consumer. Each unit's work
-    runs at the whole device's rate, in series with the memory traffic.
+  - XLA's fusion (`cost.fused`), for the compile-time pass over a program, error-aware extraction and the
+    derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
+    span priced at that loop's step). A program's operands are read from device memory once, however many
+    reductions read them (XLA's fusion reads a sibling reduction's inputs once), and elementwise work fuses
+    into its consumer. Each unit's work runs at the whole device's rate, in series with the memory traffic.
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
-    takes (`derive`, `carry.split`). A tile's work runs on its program with its units overlapped, the longest
+    takes (`derive`). A tile's work runs on its program with its units overlapped, the longest
     unit's time. Its operands are staged by the walk, so its device bytes are the launch's.
 - Either schedule's time is the work-span model's (Brent's): the larger of a form's work at its units'
   rates and its span, its critical path's dependent steps, at one step's latency. On XLA's path a step is
@@ -572,8 +573,8 @@ class Extraction:
   form. One e-graph of a program's every window grew its extraction with the program: a gemma3n training
   step's took past 500 seconds, 14 million cost additions in one extraction. A term keys a dictionary by its
   declaration (`terms.key`), not its text, which egglog formats through black at about a millisecond a term.
-- Extraction for a template's interface prices candidates through the tile walk; the compile-time pass prices
-  them through XLA's fusion. Each shared term is priced once either way.
+- Extraction for a template's interface (`derive`) prices candidates through the tile walk; the compile-time
+  pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk does not yet read registers (the liveness pass) or the walk's rings when pricing a candidate.
   Both are properties of a whole chosen DAG, not of a node, and the template's compile gate checks them on the
   form chosen.

@@ -33,13 +33,12 @@ cap): a plain mainloop the accumulator and 32 (its step's descriptors too), exac
 
 PRODUCER_REGISTERS = 24
 """The registers a thread of a cooperative block's producer warpgroup lowers to (`set_max_registers`):
-setmaxnreg's floor (PTX ISA), two consumers' raise 240 (FlashAttention 3's). A measured bound, not yet the
-rule: a producer's rule is the least of setmaxnreg's steps of 8 holding its own issue code's live set,
-computed per launch once a liveness model prices the producer's branch, beside `Family.held_registers` and
-`CONTROL_REGISTERS`. The live sets vary (PRODFLOOR3, whole-program ptxas 12.9 and 13.4 with the raises
-honored): 24 holds the recurrence's training kernels' and the attention forward's and backward's producers
-at D64 and D128 but the natural training forward's at D128 under 13.4, which spills 60 bytes at it (52 at
-40)."""
+setmaxnreg's floor (PTX ISA), two consumers' raise 240 (FlashAttention 3's). A producer's rule is the least
+of setmaxnreg's steps of 8 that holds its issue loop's live set, and every family's holds at the floor, so the
+rule is this constant: ptxas spills nothing at 24 in the attention forward's 154 kernels and backward's 17
+and the recurrence's 75 under 12.9, and in the D128 forward's 144, the training and natural forms among
+them, under 13.4 (row 3639's scans, each kernel's decrease rewritten to 24 through 96). A producer that
+outgrew it would spill, which the CPU compile gate refuses (tests/kernel_compile.py's `mosaic_failures`)."""
 
 
 THREADS = 128
