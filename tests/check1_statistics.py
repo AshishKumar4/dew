@@ -15,7 +15,7 @@ FACTOR = 2.0
 ROW_FACTOR = 4.0
 """How far Dew may sit from a row of float64 zero against the reference's own error on that row
 (`pooled_zero_rows`), and the one-draw rule's worst-row factor (tests/one_draw.py). Check 1's worst row is
-held at PARITY, not by a factor (`_paired_rows`)."""
+held at PARITY by its pooled worst-row ratio, not by a factor (reference_error.py's `_worst_rows`)."""
 
 
 PARITY = 1.5
@@ -45,14 +45,6 @@ the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it t
 decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
-SCREEN = 0.05
-"""Where check 1's first stage draws the second for a worst row (`_paired_rows`): its sign test's p-value
-under SCREEN, short of LOWER_TAIL. The first stage's few seeds cannot reach LOWER_TAIL (at 8 seeds a sign
-test's least p-value is 2^-8, 3.9e-3), so a worst row above the reference's there is judged over the
-second's REDRAW times as many; the final verdict fails only at LOWER_TAIL over every seed, so the screen
-adds no false red."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Finding:
     """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
@@ -484,24 +476,6 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
             if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
-def _paired_rows(paired: np.ndarray) -> float:
-    """Check 1's worst-row test, its p-value: `paired` holds a leaf's paired worst rows, each the log of
-    Dew's worst row over the reference's on the same draw (a seed's, or at a site that stacks examples an
-    example's, `_example_worst_rows`), a row's error over its own size; of those past PARITY either way,
-    the count with Dew's past PARITY times the reference's against Binomial(n, 1/2). Under equal exactness
-    the two arms are exchangeable on each draw, so its ratio is as likely past PARITY as under its inverse
-    whatever their own spread (the known null, distribution-free): its false-red rate is at most the tail
-    it is read at for every tail of the rows' errors, light or heavy, narrow rows of one value among them,
-    where a maximum over a leaf's rows and seeds against the reference's is an extreme of two heavy-tailed
-    samples and no measure of either (ledger 2469; row 3684: a factor on that maximum failed equally exact
-    pairs on 6% of runs where one element a row dominated). Dew whose worst rows sit past PARITY times the
-    reference's on more draws than the reverse is refused, as BIBLE §7 holds a worst row at PARITY."""
-    from scipy import stats
-
-    above, below = int(np.sum(paired > math.log(PARITY))), int(np.sum(paired < -math.log(PARITY)))
-    return float(stats.binom.sf(above - 1, above + below, 0.5)) if above else 1.0
-
-
 PREVIOUS_TAILS = (5e-4, 5e-4)
 """The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
 
@@ -520,3 +494,40 @@ def _verdict(over: list[Finding], unresolved: list[Finding]) -> str:
     """A judgement's verdict: "over" where any leaf failed, else "inconclusive" where any is unresolved,
     else "pass"."""
     return "over" if over else "inconclusive" if unresolved else "pass"
+
+
+def _worst_rows(leaf: str, logs: np.ndarray, drawn_as: str, tails: tuple[float, float], *, contained: bool,
+                typical: bool) -> tuple[list[Finding], list[Finding]]:
+    """Check 1's worst-row rule on a leaf's draws, `logs` each draw's worst row by its log for Dew and the
+    reference ((draws, 2), `log_over`): each arm's worst rows squared and pooled over the draws as the pooled
+    ratio pools errors (`_pooled`), the ratio held to PARITY by the same interval (`_interval`, `_status`),
+    and, at the final verdict, a ratio its draws leave inconclusive read by its typical draw
+    (`_typical_status`). A ratio one draw dominates is inconclusive, never over; a Dew whose worst row sits a
+    little past the reference's on every draw is on par (row 3684). Its findings and its inconclusives."""
+    finite = logs[np.isfinite(logs).all(axis=1)]
+    if not len(finite) or not (finite > LOG_ZERO).any():
+        return [], []
+    # Each arm's squares scaled by the largest of either, so no sum overflows and the ratio is unchanged.
+    mine, theirs = np.exp(2 * (finite - finite.max())).T
+    count = len(finite)
+    if np.sum(theirs) == 0:
+        return [Finding(leaf, "row", float(finite[:, 0].max()),
+                        f"{leaf}: the reference's worst row equals float64 on every {drawn_as[:-1]} "
+                        "and dew's does not")], []
+    ratio, (low, high) = _pooled(mine, theirs), _interval(mine, theirs, tails=tails)
+    status, found = _status(ratio, low, high, contained=contained), None
+    if status == "inconclusive" and contained and typical:
+        found = _typical_status(mine, theirs, tails)
+        status = found[0]
+    measure = math.log(max(ratio, 1e-300))
+    if status == "over":
+        return [Finding(leaf, "row", measure, f"{leaf}: dew's worst row's RMS over {count} {drawn_as} is "
+                        f"{ratio:.3f} times the reference's, interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")], []
+    if status == "inconclusive":
+        return [], [Finding(
+            leaf, "inconclusive", measure, f"{leaf}: inconclusive: dew's worst row's RMS ratio {ratio:.3f}'s "
+            f"interval over {count} {drawn_as} is [{low:.3f}, {high:.3f}], wider than {PARITY}"
+            + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s [{found[2]:.3f}, "
+               f"{found[3]:.3f}]: {found[4]}") + "; give the site larger inputs or more seeds (`seeds_for`)")]
+    return [], []

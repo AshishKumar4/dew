@@ -84,7 +84,6 @@ from check1_statistics import (
     PREVIOUS_TAILS,
     REDRAW,
     ROW_FACTOR,
-    SCREEN,
     UPPER_TAIL,
     Finding,
     GateFailure,
@@ -92,7 +91,6 @@ from check1_statistics import (
     ZeroRows,
     _interval,
     _over,
-    _paired_rows,
     _pooled,
     _scaled_rms,
     _sized,
@@ -100,6 +98,7 @@ from check1_statistics import (
     _typical_status,
     _unresolved_against_itself,
     _verdict,
+    _worst_rows,
     log_over,
     log_ratio,
     log_sum,
@@ -733,8 +732,8 @@ class _Draws:
     """A site whose leaves stack independent examples on their first axis (`assert_as_exact`'s
     `examples`): each seed's per-example log RMS ratios of each leaf (`_example_ratios`), else None."""
     example_rows: list[list[np.ndarray | None]] | None = None
-    """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
-    on the same example, each over its size (`_example_worst_rows`), else None."""
+    """At such a site, each seed's per-example logs of Dew's worst row and the reference's on the same
+    example, each over its size, an (examples, 2) array a leaf (`_example_worst_rows`), else None."""
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
@@ -762,8 +761,8 @@ class _Draws:
         return None if any(ratios is None for ratios in found) else found
 
     def of_example_rows(self, index: int) -> np.ndarray | None:
-        """Leaf `index`'s per-example paired worst-row log ratios over every seed, or None where the site
-        stacks no examples or the leaf has no rows (`_example_worst_rows`)."""
+        """Leaf `index`'s per-example worst-row logs over every seed, Dew's and the reference's, or None
+        where the site stacks no examples or the leaf has no rows (`_example_worst_rows`)."""
         if self.example_rows is None or any(seed[index] is None for seed in self.example_rows):
             return None
         return np.concatenate([seed[index] for seed in self.example_rows])
@@ -1273,8 +1272,8 @@ def _examples_at(ratios, worsts, prepared: "_Prepared", other, terms, *, first: 
 
 
 def _paired_examples(worsts) -> list[np.ndarray | None] | None:
-    """Each leaf's per-example paired worst rows of a draw, Dew's over the reference's, by their logs."""
-    return None if worsts is None else [None if pair is None else pair[0] - pair[1] for pair in worsts]
+    """Each leaf's per-example worst rows of a draw, Dew's and the reference's logs side by side."""
+    return None if worsts is None else [None if pair is None else np.stack(pair, axis=-1) for pair in worsts]
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
@@ -1513,26 +1512,13 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        # Dew's worst row against the reference's on each draw, an example or a seed (`_paired_rows`), the
-        # first stage's few seeds screened (SCREEN), the final verdict at the tail.
-        examples_rows = draws.of_example_rows(index) if contained else None
-        rows = (examples_rows if examples_rows is not None
-                else draws.worst[:, index, 0] - draws.worst[:, index, 1])
-        drawn_as = "examples" if examples_rows is not None else "seeds"
-        found_rows = _paired_rows(rows)
-        above, below = int(np.sum(rows > math.log(PARITY))), int(np.sum(rows < -math.log(PARITY)))
-        if found_rows < tails[0]:
-            over.append(Finding(
-                leaf, "row", float(np.quantile(rows, 1 - tails[0])),
-                f"{leaf}: dew's worst row is past {PARITY} times the reference's on the same draw on {above} "
-                f"of {len(rows)} {drawn_as}, the reference's past it on {below} (p {found_rows:.1e}; "
-                "`_paired_rows`)"))
-        elif contained and not typical and found_rows < SCREEN:
-            unresolved.append(Finding(
-                leaf, "inconclusive", float(np.quantile(rows, 1 - tails[0])),
-                f"{leaf}: inconclusive: dew's worst row is past {PARITY} times the reference's on {above} of "
-                f"{len(rows)} {drawn_as}, the reference's on {below} (p {found_rows:.1e}, under {SCREEN}), "
-                "judged again over the second stage's draws"))
+        # Dew's worst row against the reference's, each arm's RMS over the draws (each example's at a site
+        # that stacks them, else each seed's), judged as the pooled ratio is (`_worst_rows`).
+        stacked = draws.of_example_rows(index) if contained else None
+        found_rows = _worst_rows(leaf, stacked if stacked is not None else draws.worst[:, index, :],
+                                 "examples" if stacked is not None else "seeds", tails, contained=contained,
+                                 typical=typical)
+        over, unresolved = over + found_rows[0], unresolved + found_rows[1]
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1562,8 +1548,8 @@ def _staged(drawn, seeds: int, label: str, *,
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    # The final verdict: a leaf its pooled ratio leaves inconclusive asked of its typical draw, and its worst
-    # row judged at the tail, no longer screened (`_judgement`'s `typical`).
+    # The final verdict: a leaf its pooled ratio or worst rows leave inconclusive asked of its typical draw
+    # (`_judgement`'s `typical`).
     return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
@@ -1708,13 +1694,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False) -> None:
-    """Check 1 of the gate: on par. Each leaf's RMS error from float64,
-    pooled over the site's declared seeds, within PARITY times the reference's, and its worst row within
-    PARITY times the reference's on the same draw, on no more of the seeds than the reverse
-    (`_paired_rows`); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
-    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
-    over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of
-    squared errors, not seed by seed); every value finite.
+    """Check 1 of the gate: on par. Each leaf's RMS error from float64, pooled over the site's declared seeds,
+    within PARITY times the reference's, and its worst row's RMS over the seeds within PARITY times the
+    reference's (`_worst_rows`); each row of float64 zero (below RESOLUTION of its leaf where a live reference
+    does not measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
+    over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of squared
+    errors, not seed by seed); every value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs

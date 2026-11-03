@@ -1,6 +1,6 @@
-"""Check 1's worst-row rule (tests/reference_error.py, `_paired_rows`) on comparisons whose answer is known:
-each draw's worst row of Dew held to the reference's on the same draw at PARITY by a sign test, which equally
-exact arms pass whatever their rows' tails, and the evidence it reads alike for both arms on every path."""
+"""Check 1's worst-row rule (tests/check1_statistics.py, `_worst_rows`) on comparisons whose answer is known:
+each arm's worst rows pooled over the draws, Dew's held to PARITY times the reference's by the pooled ratio's
+interval, and the evidence it reads alike for both arms on every path."""
 
 import math
 
@@ -11,10 +11,9 @@ from reference_error import GateFailure, as_given, assert_as_exact
 
 def test_the_worst_row_is_held_at_parity_at_every_row_width():
     """The worst-row rule judged alone through check 1's stages (`_staged` on a leaf whose pooled ratio is
-    one): Dew's worst row just past PARITY times the reference's on every seed fails, its first stage's eight
-    seeds screening it (`SCREEN`) and the second's forty refusing it, and just inside PARITY passes, at one
-    value a row as at eight (row 3684: a factor of 90 and 11 at narrow rows, and 4 at wider ones, held no
-    worst row at PARITY)."""
+    one): Dew's worst row just past PARITY times the reference's on every seed fails, drawing the second
+    stage, and just inside PARITY passes at the first, at one value a row as at eight (row 3684: a factor of
+    90 and 11 at narrow rows, and 4 at wider ones, held no worst row at PARITY)."""
     from reference_error import NO_ZERO_ROWS, PARITY, _Draws, _staged
 
     for width in (1, 2, 3, 8):
@@ -63,85 +62,66 @@ def test_a_row_ten_times_the_references_fails_at_every_width_through_check_one()
         assert raised.type is GateFailure
 
 
-def test_the_paired_worst_row_refuses_a_row_far_off_on_some_draws_and_passes_equally_exact_arms():
-    """Each draw's worst row is held to the reference's on the same draw (`_paired_rows`, ledger 2469):
-    equally exact arms, their worst rows' log ratios symmetric however wide (a spread of 1.0 and 2.0), pass;
-    Dew ten times the reference's on a fifth of 512 draws of such spread is refused at LOWER_TAIL; and two
-    draws past PARITY, both Dew's, are no finding."""
-    from reference_error import LOWER_TAIL, _paired_rows
-
-    rng = np.random.default_rng([2469, 512])
-    for spread in (1.0, 2.0):
-        null = rng.normal(0.0, spread, 512)
-        assert _paired_rows(null) >= LOWER_TAIL
-        off = null.copy()
-        off[::5] += math.log(10.0)
-        assert _paired_rows(off) < LOWER_TAIL
-    assert _paired_rows(np.asarray([3.0, 3.0, 0.0])) >= LOWER_TAIL
-
-
-def test_the_worst_row_passes_heavy_tailed_equal_arms_and_fails_one_twice_the_references_every_seed():
-    """Check 1's worst row through its stages (`_staged`), on a leaf whose pooled ratio is one (row 3684):
-    equally exact arms whose rows' errors are heavy-tailed, one element a row amplified by 2^k for k uniform
-    over 0 to 24 in each arm apart, pass on every one of 64 runs, where the worst row over the seeds held
-    at four times the reference's worst failed such pairs on about 6% of runs (one draw's amplified element
-    past four times the other arm's every one); and Dew's worst row twice the reference's on every seed fails,
-    which four times passed."""
+def staged(worst: np.ndarray, width: int = 8):
+    """Check 1's stages (`_staged`) over a leaf whose pooled ratio is one and whose worst rows are `worst`
+    ((seeds, 2), each draw's worst row by its log, Dew's and the reference's), 8 seeds and then 40."""
     from reference_error import NO_ZERO_ROWS, _Draws, _staged
 
-    def staged(worst):
-        def drawn(start, stop):
-            count = stop - start
-            return _Draws(["leaf"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
-                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (8,))
-        return _staged(drawn, 8, "leaf")
+    def drawn(start, stop):
+        count = stop - start
+        return _Draws(["leaf"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop, None, :],
+                      [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,))
 
-    rng = np.random.default_rng([3684, 64])
-    reds = 0
-    for _ in range(64):
-        # 40 seeds of 16 rows of 8 values, each arm's errors standard normal with one element a row
-        # amplified, over a shared standard normal truth; each seed's worst row by its log over its size.
-        truth = np.sqrt(np.mean(np.square(rng.standard_normal((40, 16, 8))), axis=2))
-        arms = []
-        for _ in range(2):
-            errors = rng.standard_normal((40, 16, 8))
+    return _staged(drawn, 8, "leaf")
+
+
+def worst_rows(rng, shift: np.ndarray, amplified: bool = False, unpaired: bool = False) -> np.ndarray:
+    """40 seeds' worst rows by their logs, Dew's and the reference's, of 16 rows of 8 standard normal errors
+    over a standard normal truth, Dew's each `shift` (a seed's factor, by its log) off; `amplified`, one
+    element a row times 2^k, k uniform over 0 to 24 in each arm apart; `unpaired`, each arm on a truth of
+    its own."""
+    def sized():
+        return np.sqrt(np.mean(np.square(rng.standard_normal((40, 16, 8))), axis=2))
+
+    truth = sized()
+    arms = []
+    for _ in range(2):
+        errors = rng.standard_normal((40, 16, 8))
+        if amplified:
             errors[..., 0] *= 2.0 ** rng.integers(0, 25, (40, 16))
-            arms.append(np.log((np.sqrt(np.mean(np.square(errors), axis=2)) / truth).max(axis=1)))
-        over, unresolved, _ = staged(np.stack(arms, axis=-1)[:, None, :])
-        reds += bool(over or unresolved)
-    assert reds == 0
-    twice = np.zeros((40, 1, 2))
-    twice[..., 0] = math.log(2.0)
-    over, _, stage = staged(twice)
-    assert over and over[0].rule == "row" and stage == 2
+        arms.append(np.log((np.sqrt(np.mean(np.square(errors), axis=2)) / (sized() if unpaired else truth))
+                           .max(axis=1)))
+    arms[0] = arms[0] + shift
+    return np.stack(arms, axis=-1)
 
 
-def test_equal_arms_whose_worst_rows_take_turns_pass_where_one_seeds_maximum_failed_them():
-    """Through `assert_as_exact` (row 3684): two arms each a value off by its own seed's noise, a first row of
-    1/64 the leaf's so it is every arm's worst row on every seed, Dew's noise there 40 times its other rows'
-    on seed 0 and the reference's 3 times on seeds 1 to 20. Dew's worst row is past PARITY times the
-    reference's on fewer seeds than the reverse, so the pair passes; the worst row over every seed held at
-    four times the reference's worst failed it by its one seed."""
-    def draw(seed):
-        rng = np.random.default_rng([3684, seed])
-        values = rng.standard_normal((256, 8))
-        values[0] = 2.0 ** -6
-        mine, theirs = rng.standard_normal((2, 256, 8))
-        if seed == 0:
-            mine[0] *= 40.0
-        elif seed <= 20:
-            theirs[0] *= 3.0
-        return values, mine, theirs
+@pytest.mark.parametrize(("factor", "share", "fails"),
+                         [(1.2, 1.0, False), (2.0, 1.0, True), (10.0, 0.2, True)])
+def test_the_worst_row_passes_dew_a_little_past_the_reference_and_fails_it_twice_off_or_far_off_on_some(
+        factor, share, fails):
+    """Each arm's worst row pooled over the draws as the pooled ratio pools errors (`_worst_rows`, row 3684):
+    Dew's worst row 1.2 times the reference's on every seed is on par and passes, where a sign test of
+    draws past PARITY either way failed it; twice on every seed fails; ten times on a fifth of the seeds
+    fails, the fault ledger 2469 asks the worst row to see, on every one of 16 runs."""
+    rng = np.random.default_rng([3684, 8, int(10 * factor)])
+    for _ in range(16):
+        shift = np.where(np.arange(40) % round(1 / share) == 0, math.log(factor), 0.0)
+        over, unresolved, _ = staged(worst_rows(rng, shift))
+        assert (bool(over), unresolved) == (fails, []), (factor, share, over, unresolved)
 
-    @as_given
-    def dew(values, mine, theirs):
-        return {"leaf": values + 2.0 ** -20 * mine}
 
-    @as_given
-    def reference(values, mine, theirs):
-        return {"leaf": values + 2.0 ** -20 * theirs}
+@pytest.mark.parametrize(("amplified", "unpaired"), [(False, True), (True, False), (True, True)])
+def test_equally_exact_arms_are_never_over_whatever_their_rows_tails_or_pairing(amplified, unpaired):
+    """Equally exact arms, their rows' errors light-tailed but on truths of their own, or one element a row
+    amplified by 2^k for k uniform over 0 to 24, so one draw may rule an arm's worst rows, are never over
+    on any of 32 runs: where one draw dominates the ratio is inconclusive, its site given more seeds, never
+    a fault (row 3684: the worst row over every seed held at four times the reference's worst failed such
+    pairs on about 6% of runs)."""
+    rng = np.random.default_rng([3684, 9, amplified, unpaired])
+    for _ in range(32):
+        over, _, _ = staged(worst_rows(rng, np.zeros(40), amplified, unpaired))
+        assert not over
 
-    assert_as_exact(dew, reference, draw, "turns", seeds=8, truth_fn=lambda values, *_: {"leaf": values})
 
 
 def test_a_library_arm_never_holds_dews_worst_row_to_less_than_the_references():

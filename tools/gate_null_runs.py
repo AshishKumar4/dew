@@ -19,10 +19,12 @@ verdicts.
 Usage, from the checkout: python tools/gate_null_runs.py <class> --seeds K --runs N --chunk C
     [--paired] [--orders K] [--fault NAME]
 or, for the worst-row rule's controls (`row_controls`): python tools/gate_null_runs.py <rows a draw>
-    --rows <values a row> --seeds K --runs N --chunk C [--amplified] [--unpaired], printing its red runs
+    --rows <values a row> --seeds K --runs N --chunk C [--amplified] [--unpaired] [--row-fault F S],
+    printing its runs over, inconclusive and at the second stage
 """
 
 import argparse
+import collections
 import json
 import sys
 from pathlib import Path
@@ -506,17 +508,19 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
 
 
 def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, amplified: bool = False,
-                 unpaired: bool = False) -> list:
+                 unpaired: bool = False, fault: tuple[float, float] = (1.0, 0.0)) -> list:
     """Check 1's verdicts (`_staged`) on its worst-row rule alone for equally exact pairs as sites run it,
     `runs` runs from `chunk`'s own stream: `rows` rows a draw of `width` values, truths and errors standard
     normal, the arms' errors independent; with `amplified`, one element a row amplified by 2^k, k uniform over
     0 to 24 in each arm apart, the heavy-tailed class where one element rules its row (row 3684); both arms on
-    one truth, so each row's size is shared, or with `unpaired` each on a truth of its own. The pooled ratio
+    one truth, so each row's size is shared, or with `unpaired` each on a truth of its own; with `fault`
+    (factor, share), Dew's worst row that factor times its own on that share of the seeds. The pooled ratio
     is exactly one, so only the rows decide. Each run's verdict and stage."""
     import numpy as np
     from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _staged, _verdict
 
-    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified), int(unpaired)])
+    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified), int(unpaired),
+                                 round(1000 * fault[0]), round(1000 * fault[1])])
     span = (1 + REDRAW) * seeds
 
     def sized() -> np.ndarray:
@@ -532,6 +536,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
                 errors[..., 0] *= 2.0 ** rng.integers(0, 25, (span, rows))
             size = sized() if unpaired else truth
             arms.append((np.sqrt(np.mean(np.square(errors), axis=2)) / size).max(axis=1))
+        arms[0] = np.where(rng.random(span) < fault[1], fault[0], 1.0) * arms[0]
         worst = np.stack(arms, axis=-1)[:, None, :]
 
         def drawn(start, stop, worst=worst):
@@ -557,6 +562,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--amplified", action="store_true", help="with --rows, one element a row amplified "
                         "by 2^k, k uniform over 0 to 24, in each arm apart")
     parser.add_argument("--unpaired", action="store_true", help="with --rows, each arm on a truth of its own")
+    parser.add_argument("--row-fault", type=float, nargs=2, metavar=("FACTOR", "SHARE"),
+                        help="with --rows, Dew's worst row FACTOR times its own on SHARE of the seeds")
     parser.add_argument("--today", action="store_true", help="the procedure before the two stages")
     parser.add_argument("--fault", help="run the class's reference with this fault of its own (FAULTS) "
                         "as Dew, for power")
@@ -570,17 +577,18 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     from reference_error import _drawn, null_runs, seeds_for
 
-    if (options.amplified or options.unpaired) and options.rows is None:
-        parser.error("--amplified and --unpaired are the worst-row controls' (--rows)")
+    if (options.amplified or options.unpaired or options.row_fault) and options.rows is None:
+        parser.error("--amplified, --unpaired and --row-fault are the worst-row controls' (--rows)")
     if options.rows is not None:
         if options.today or options.paired or options.orders or options.fault or options.seeds is None:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
+        fault = tuple(options.row_fault) if options.row_fault else (1.0, 0.0)
         verdicts = row_controls(options.rows, int(options.name), options.seeds, options.runs, options.chunk,
-                                options.amplified, options.unpaired)
+                                options.amplified, options.unpaired, fault)
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
-                          "amplified": options.amplified, "unpaired": options.unpaired,
+                          "amplified": options.amplified, "unpaired": options.unpaired, "fault": fault,
                           "chunk": options.chunk, "runs": len(verdicts),
-                          "reds": sum(verdict != "pass" for verdict, _ in verdicts),
+                          "verdicts": dict(collections.Counter(verdict for verdict, _ in verdicts)),
                           "second_stage": sum(stage == 2 for _, stage in verdicts)}), flush=True)
         return 0
     if options.ratio is not None:
