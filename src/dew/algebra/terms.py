@@ -251,6 +251,12 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
+def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[str, str]:
+    """An equation's primitive and parameters as a region holds them: two whose parameters print alike share
+    one entry of its table (`Region.params`), the first's."""
+    return primitive.name, repr(sorted(values.items(), key=lambda named: named[0]))
+
+
 def declarations(language: object) -> Declarations:
     """A language's declarations (egglog's `HasDeclarations`), which reading at import frees its defining
     frame (`linear_scan._DECLARATIONS`)."""
@@ -321,7 +327,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
 
     def param(primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
         # A product's operands' dtypes key its parameters too, its mode's (`cost.work`).
-        key = (primitive.name, repr(sorted(values.items(), key=lambda named: named[0])), operands)
+        key = (*parameters_key(primitive, values), operands)
         if key not in indexed:
             indexed[key] = len(params)
             params.append((primitive, dict(values)))

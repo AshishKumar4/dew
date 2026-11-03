@@ -657,6 +657,12 @@ class Rewrite:
   (`rules.reorderable`): every reordering makes its new intermediate of an operand the program bounds (§6.3),
   and commutativity alone leaves every price as it was. Most of a training step's regions are its own math
   over unbounded values: a gemma3n step's 2879 each fired commutativity alone.
+- A region's rewrite is derived once per structure in a process (`program._derived`, bounded by
+  `WINDOWS_HELD`): keyed by what its derivation reads (`program.structure`: its inputs' types, each
+  equation's primitive, parameters as the region holds them, protection, operands by position or literal
+  value, and the values it yields), the numerics' forms, the saturation and the target it is priced for.
+  Every layer of a stack and every compile of one step (the planner's candidates, a resumed run's
+  relowering) take the first derivation, spliced into each program apart.
 - `passes` is the seam's switch. `PASSES` lives in JAX's trace context, so every jit and every executable map
   that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
   never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
