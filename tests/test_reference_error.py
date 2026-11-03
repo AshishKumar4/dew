@@ -1592,14 +1592,11 @@ def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_te
     def program(a, b, c, noises):
         return {"rows": jnp.concatenate([a[:1] - b[:1], c[1:]])}
 
-    def arm(scale, index):
-        @as_given
-        def run(a, b, c, noises):
-            out = np.concatenate([a[:1] - b[:1], c[1:]])
-            out[0] += scale * noises[index, 0]
-            out[1:] += 2.0 ** -24 * c[1:] * noises[index, 1:]
-            return {"rows": out}
-        return run
+    def computed(scale, index, a, b, c, noises):
+        out = np.concatenate([a[:1] - b[:1], c[1:]])
+        out[0] += scale * noises[index, 0]
+        out[1:] += 2.0 ** -24 * c[1:] * noises[index, 1:]
+        return {"rows": out}
 
     def draw(seed):
         rng = np.random.default_rng([3684, 6, seed])
@@ -1608,10 +1605,12 @@ def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_te
         b[0] -= 1e-6 * rng.standard_normal(8)
         return {"a": a, "b": b, "c": rng.standard_normal((64, 8)), "noises": rng.standard_normal((2, 64, 8))}
 
-    reference, dew = arm(1e-7, 0), arm(1e-6, 1)
+    @as_given
+    def dew(index, inputs):
+        return computed(1e-6, 1, **inputs)
 
     def evaluate(inputs):
-        return jax.tree.map(np.asarray, reference(**inputs)), program(**inputs)
+        return computed(1e-7, 0, **inputs), program(**inputs)
 
     def as_inputs(fn):
         return lambda inputs: fn(**inputs)
@@ -1622,8 +1621,8 @@ def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_te
     drawn, recorded_reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
                                                          truth_fn=as_inputs(program))
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(lambda index, inputs: as_inputs(dew)(inputs), recorded_reference, drawn, "summarized",
-                        seeds=seeds, truth_fn=truth, terms=lambda index, inputs: as_inputs(program)(inputs))
+        assert_as_exact(dew, recorded_reference, drawn, "summarized", seeds=seeds, truth_fn=truth,
+                        terms=lambda index, inputs: as_inputs(program)(inputs))
     assert raised.type is GateFailure and {finding.rule for finding in raised.value.findings} == {"row"}
 
 
