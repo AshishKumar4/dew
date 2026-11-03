@@ -93,20 +93,56 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     assert "&lt;script&gt;" in slow._repr_html_()
 
 
-def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise():
-    """Two calls compared (`compared`): one sleeping twice the other's time, timed in interleaved,
-    role-swapped pairs, read as their paired ratio, whose bootstrap interval lies well apart from 1 (under
-    2, each call's own dispatch added to both), and the faster call against itself (its A/A) holding 1: an
-    interval apart from 1 and from the A/A's is a difference the placement does not make (row 3616, the
-    kernel challenge's method: one-sided runs moved -0.6% to +0.6% whatever the change)."""
+class Scheduled:
+    """The host's clock as `dew.telemetry.benchmark` reads it (`time.perf_counter`, its seam), advanced by
+    the calls it times alone: each by its sleep and the delay a seeded scheduler adds past it, as a busy
+    host's do (row 3793's measurements). Outside a burst a call is late by 0.1 to 1.5 ms; a burst, which
+    one call in 30 begins, makes 20 calls 1 to 8 ms late and one in ten of them 12 to 40 ms, at most
+    `long` such a run. No delay is negative: a sleep returns no sooner than asked."""
+
+    def __init__(self, seed: int, long: int = 15):
+        self.rng, self.now, self.burst, self.long = np.random.default_rng(seed), 0.0, 0, long
+
+    def read(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        if not self.burst and self.rng.random() < 1 / 30:
+            self.burst = 20
+        if not self.burst:
+            late = self.rng.uniform(1e-4, 1.5e-3)
+        elif self.long and self.rng.random() < 0.1:
+            self.long, late = self.long - 1, self.rng.uniform(0.012, 0.040)
+        else:
+            late = self.rng.uniform(1e-3, 8e-3)
+        self.burst = max(self.burst - 1, 0)
+        self.now += seconds + late
+
+
+def scheduled(monkeypatch, seed: int) -> Scheduled:
+    """A seeded `Scheduled` clock that `compared` reads in place of the host's."""
+    from dew.telemetry import benchmark
+
+    clock = Scheduled(seed)
+    monkeypatch.setattr(benchmark.time, "perf_counter", clock.read)
+    return clock
+
+
+def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise(monkeypatch):
+    """Two calls compared (`compared`): one taking twice the other's time, timed in pairs, read as their
+    paired ratio, and the faster call against itself (its A/A), over 24 pairs at 95%, on a host whose
+    scheduler bursts (`Scheduled`, seed 3): the pair's interval well apart from 1, under 2, and the A/A's
+    holding 1, below it."""
     from dew.telemetry.benchmark import compared
 
+    clock = scheduled(monkeypatch, 3)
+
     def slow():
-        time.sleep(0.004)
+        clock.sleep(0.004)
         return jnp.zeros(())
 
     def fast():
-        time.sleep(0.002)
+        clock.sleep(0.002)
         return jnp.zeros(())
 
     result = compared(slow, fast, pairs=24, warmup=1)
