@@ -16,8 +16,17 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying, dataset
+from check1_statistics import GateFailure, Inconclusive
 from flax import linen as nn
-from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
+from reference_error import (
+    MOST_SEEDS,
+    as_given,
+    assert_as_exact,
+    over_windows,
+    widened,
+    windows,
+    with_gradients,
+)
 
 from dew.batch import TEXT_KEY
 from dew.nn.activations import _SLOPES, HIDDEN_ACT
@@ -73,9 +82,21 @@ three, past gradient descent's 2 (the configurations below it peak at 1.64), and
 by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its paired ratio to narrow
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
-documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): ledger 1714 holds their
-end-to-end contracts open, and the one-token window's error each window adds is held from the level
-the window starts at (`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
+documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): their error is the
+amplified rows', so their sites weigh each element's error by the loop's own rounding there
+(`assert_as_exact`'s `conditioning`, `CORNER_SEEDS`), and the one-token window's error each window
+adds is held from the level the window starts at
+(`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
+
+
+CORNER_SEEDS = {("forward", "documents"): 8, ("forward", "packed"): 8, ("forward", "padded"): 8,
+                ("gradient", "documents"): 32, ("gradient", "packed"): 8, ("gradient", "padded"): 8}
+"""Check 1's declared seeds for the corner's weighed check (`conditioning`): the one-token window's
+forward, one draw a seed, and the outer gradient through windows of three, `CORNER_WINDOWS` draws a seed,
+sized paired by `seeds_for` with `conditioning` on armada (jobs 20261102185852-e58d5454 and
+20261102191535-92e11e67). Each corner site's unweighted check, whose sizing never resolves, declares
+MOST_SEEDS, the cap, and spends it with its REDRAW stage before the weighed check decides, its draws as
+CI's map tasks, 1280 a task (`check1_shards`)."""
 
 
 def corner(rate: float, scale: float, window: int, damped: bool = False) -> bool:
@@ -98,11 +119,12 @@ def pooled(dew, reference, drawn, rate: float, scale: float, window: int, damped
 
 
 def site(dew, reference, drawn, rate: float, scale: float, window: int, label: str, seeds: int, *,
-         damped: bool = False) -> None:
+         damped: bool = False, conditioning: int | None = None) -> None:
     """Check 1 of Dew's arm against the literal loop's at a site, both held to the loop's float64 truth
-    (`pooled`)."""
+    (`pooled`), and where it stays undecided each element's error weighed by the loop's own rounding there
+    over `conditioning` seeds (`assert_as_exact`'s)."""
     dew, literal, drawn, truth = pooled(dew, reference, drawn, rate, scale, window, damped)
-    assert_as_exact(dew, literal, drawn, label, seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, literal, drawn, label, seeds=seeds, truth_fn=truth, conditioning=conditioning)
 
 
 @functools.cache
@@ -326,6 +348,98 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate, scale):
     weights drawn at a quarter, where a half's step does not diverge, and at a half where the rate or the
     window keeps it from diverging."""
     scan_as_equation_71(kind, window, rate, scale)
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=1280)
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed(kind):
+    """At the corner, 0.5 N(0, 1) weights stepped by a half every token, where gradient descent diverges
+    and a row's rounding grows by 10^13 over eleven steps (`CORNER_WINDOWS`), each target's loss is on
+    par with the literal loop's (check 1), each element's error weighed by the loop's own rounding there
+    (`conditioning`, ledger 1714), over every layout."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(truth):
+        return jax.jit(lambda variables, hidden, targets, weights: equation_71(
+            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth))
+
+    assert_as_exact(jax.jit(dew), reference(truth=False), draw,
+                    f"the one-token window at the corner over {kind}", seeds=MOST_SEEDS,
+                    truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", kind])
+
+
+@pytest.mark.check1_shards(seeds=512, per_task=1280)
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed(kind):
+    """The outer loss's gradient through the windows' steps at the corner, 0.5 N(0, 1) weights stepped by
+    a half every three tokens (`CORNER_WINDOWS`), is on par with the literal loop's (check 1), each
+    element's error weighed by the loop's own rounding there (`conditioning`, ledger 1714), over every
+    layout, `CORNER_WINDOWS` draws a seed."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.5)
+
+    def gradient_draw(seed):
+        variables, hidden, targets, weights = draw(seed)
+        return variables, hidden, targets, weights, np.float32(1.0)
+
+    def reference(truth):
+        return differentiated(weighted_loss(fields, adaptation, truth=truth))
+
+    site(differentiated(weighted_loss(fields, adaptation)), reference, gradient_draw, 0.5, 0.5, 3,
+         f"the outer gradient at the corner over {kind}", MOST_SEEDS,
+         conditioning=CORNER_SEEDS["gradient", kind])
+
+
+def corner_failure(dew, label: str) -> GateFailure:
+    """The failure the one-token corner's public flow decides for `dew` against the literal loop: its own
+    budgets, MOST_SEEDS unweighted and its weighed seeds (`CORNER_SEEDS`, `conditioning`), structured
+    findings, never Inconclusive."""
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+
+    def reference(truth):
+        return jax.jit(lambda variables, hidden, targets, weights: equation_71(
+            MODEL, variables, hidden, targets, weights, {}, adaptation, truth=truth))
+
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact(dew, reference(truth=False), draw, label, seeds=MOST_SEEDS,
+                        truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", "documents"])
+    assert not isinstance(raised.value, Inconclusive) and raised.value.findings
+    return raised.value
+
+
+def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
+    """The weighed corner has teeth: Dew's one-token window stepped at a rate 2^-10 past the loop's fails the
+    corner's public flow (`corner_failure`) decided."""
+    off = ChunkAdaptation(window=1, rate=0.5 * (1 + 2 ** -10))
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, off, predict=False,
+                              logits=False).losses
+
+    corner_failure(jax.jit(dew), "a rate off at the corner")
+
+
+def test_the_weighed_corner_fails_an_error_past_parity():
+    """An arm whose every error is 1.6 times the literal loop's, the loop's own result moved 0.6 of its error
+    further from float64, fails the corner's public flow decided (`corner_failure`): past PARITY, never
+    held on par."""
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+    loop, exact = (jax.jit(lambda *arguments, truth=truth: equation_71(MODEL, *arguments, {}, adaptation,
+                                                                          truth=truth))
+                   for truth in (False, True))
+
+    def dew(variables, hidden, targets, weights):
+        run = np.asarray(loop(variables, hidden, targets, weights), np.float64)
+        with jax.enable_x64(new_val=True):
+            truth = np.asarray(exact(*widened((variables, hidden, targets, weights))))
+        return (run + 0.6 * (run - truth)).astype(np.float32)
+
+    corner_failure(as_given(dew), "an error 1.6 times the loop's at the corner")
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
