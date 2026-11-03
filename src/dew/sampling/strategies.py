@@ -85,9 +85,9 @@ Reindex = Callable[[DecoderState, jax.Array], DecoderState]
 
 class Verify(Protocol):
     """`DecodeOps.verify`: a block of tokens per row behind a validity mask, fed to the model, and the
-    state, every position's logits and hidden states it leaves. A row whose tokens cross
-    `DecodeOps.rebuild_position` rebuilds its caches; without `rebuilds`, a call no row crosses, the
-    program carries no rebuild."""
+    state, every position's logits and hidden states it leaves. A row whose tokens cross the model's
+    cache rebuild (`DecodeOps.crosses`) rebuilds its caches; without `rebuilds`, a call no row crosses,
+    the program carries no rebuild."""
 
     def __call__(self, state: DecoderState, tokens: jax.Array, valid: jax.Array, /, *,
                  rebuilds: bool = True) -> tuple[DecoderState, jax.Array, jax.Array | None]: ...
@@ -114,9 +114,10 @@ class DecodeOps:
     `record` appends the states `verify` returned for a stretch's real
     positions to the drafter's windows, and `draft` drafts the next block from
     each row's first token, handing each position's logits to a `choose`.
-    `rebuild_position` is the position past which the model's cached keys go
-    stale (`text.rebuild_position`), a row crossing it rebuilding every cache
-    in `verify`; None where none goes stale.
+    `crosses` says which rows a call taking them from `lengths` tokens to
+    `following` carries past the position where the model's cached keys go
+    stale (`text.rebuild_position`), each such row rebuilding every cache in
+    `verify`; None where none goes stale.
     """
 
     advance: Advance
@@ -127,7 +128,7 @@ class DecodeOps:
     depths: int = 0
     record: Record | None = None
     draft: DraftBlock | None = None
-    rebuild_position: int | None = None
+    crosses: Callable[[jax.Array, jax.Array], jax.Array] | None = None
 
 
 class Strategy(Protocol):
@@ -876,11 +877,12 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     for every row or a row's own (`[rows]`). A decode with nothing to draft
     with is refused (`refuse_undrafted`).
 
-    A row whose candidates would cross `DecodeOps.rebuild_position` keeps none
-    and draws its one token as the walk does, so the candidates' verify crosses
-    nothing and carries no rebuild, the replay's being the block's one (ledger
-    3703: two rebuilds a block, each a whole prefill, compiled 27 s of DSpark's
-    program): the row walks a token a block until its candidates are past it."""
+    A row whose candidates would cross the model's cache rebuild
+    (`DecodeOps.crosses`) keeps none and draws its one token as the walk does,
+    so the candidates' verify crosses nothing and carries no rebuild, the
+    replay's being the block's one (ledger 3703: two rebuilds a block, each a
+    whole prefill, compiled 27 s of DSpark's program): the row walks a token a
+    block until its candidates are past it."""
     refuse_undrafted(ops)
     verify, block_size = ops.verify, plan.block
     assert verify is not None
@@ -889,11 +891,9 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
         jax.random.fold_in(key, count), 2 * block_size + 1))(step.keys, step.step)
-    position, lengths = ops.rebuild_position, state.lengths
-    # The candidates reach `lengths + block_size`, so a row crosses among them where the change is past
-    # its length and before that.
-    walking = (jnp.zeros(rows, bool) if position is None or lengths is None else
-               (lengths <= position) & (position < lengths + block_size))
+    # The candidates take a row to `lengths + block_size` tokens at most.
+    walking = (jnp.zeros(rows, bool) if ops.crosses is None or state.lengths is None else
+               ops.crosses(state.lengths, state.lengths + block_size))
 
     drafted = _drafted(plan, ops, state, step, keys, base, active, budget,
                        transform, stopping)
@@ -975,7 +975,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                   jnp.zeros(rows, bool))
     # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
     # most `block_size` blocks.
-    walks = 0 if ops.rebuild_position is None else min(block_size, budget)
+    walks = 0 if ops.crosses is None else min(block_size, budget)
     blocks = -(-(budget + walks) // 2)
     out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),

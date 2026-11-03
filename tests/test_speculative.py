@@ -125,7 +125,7 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
     walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
     (`strategies.block_step`), crossing in the replay of what the block emits, so a block's program holds
-    the rebuild, a whole prefill of the history, once: its candidates' verify asks for none (ledger 3703:
+    the rebuild, a whole prefill of the history, once: its candidates' verify compiles none (ledger 3703:
     it held a second, 27 s of the DSpark program's compile on CPU). A prompt that starts so walks a token
     a block and still fills its budget."""
     from dew.nn.inputs import ModelInputs
@@ -142,14 +142,15 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
                                       greedy_walk(model, params, prompts, steps))
         np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
-    # The speculative loop traced over the decode's own operations (`DecodeOps`), its verifies recorded.
+    # The speculative loop traced over the decode's own operations (`DecodeOps`), each verify's program
+    # held: its conds, the rebuild's among them.
     ops = decode_ops(model, params, 0, prediction_depths(model))
-    verified, asked = ops.verify, []
+    verified, conds = ops.verify, []
     assert verified is not None
 
     def verify(state, tokens, valid, **options):
-        # Whether the call may rebuild (`strategies.Verify`), which it does unless told not to.
-        asked.append(options.get("rebuilds", True))
+        program = jax.make_jaxpr(lambda *operands: verified(*operands, **options))(state, tokens, valid)
+        conds.append(sum(equation.primitive.name == "cond" for equation in program.eqns))
         return verified(state, tokens, valid, **options)
 
     prompts, steps = cases[0]
@@ -165,7 +166,9 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
                                     decoding.finish(decoding.Finishing.of(())), steps, 1)
 
     jax.make_jaxpr(speculate)(prompts)
-    assert asked == [False, True]
+    # A block verifies its candidates, then replays what it emits, which alone holds the rebuild's cond.
+    candidates, replay = conds
+    assert replay == candidates + 1
 
 
 def stretch_verified(model, params, depths):
