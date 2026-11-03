@@ -146,7 +146,7 @@ from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import Sample
+from dew.sampling.strategies import Sample, Speculative
 from dew.sampling.text import Generation, Sampling, check_inputs, decoded_rows, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
@@ -606,7 +606,7 @@ class Server:
             self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
-                                                      capacity=capacity), variables)
+                                                      capacity=capacity, plan=rows.placement.plan), variables)
             rows.check(shapes.decoder.cache)
             held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
@@ -639,7 +639,7 @@ class Server:
                 # formats would repeat the server's largest compile (`resident_formats`).
                 self._step = chosen
             self._resident, self._carried = split_donated(
-                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
+                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan))
             self._keep_states(formats)
 
     def _keep_states(self, formats) -> None:
@@ -681,7 +681,10 @@ class Server:
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
         must stay within the model's context. The task's `n` must be one, and
-        its strategy must be the row-wise sampler, with or without a grammar.
+        its strategy the row-wise sampler, with or without a grammar, or
+        speculative blocks (`Speculative`): each iteration then drafts,
+        verifies and emits a block in every row, which draws as the row-wise
+        sampler draws, over a dense cache whose prompts prefill whole.
 
         `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`). A
         paged layout pools the pages of every row, so short requests fit more
@@ -728,8 +731,13 @@ class Server:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
-        if not isinstance(strategy, Sample):
-            raise ValueError("a server runs the row-wise sampler; beam and speculative loops are batch-wide")
+        if not isinstance(strategy, Sample | Speculative):
+            raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
+                             "batch-wide")
+        plan = strategy if isinstance(strategy, Speculative) else None
+        if plan is not None and (chunk is not None or prefix_cache):
+            raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
+                             "own prefill; serve without chunk and prefix_cache")
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
@@ -758,6 +766,11 @@ class Server:
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every)
+        if plan is not None:
+            if isinstance(rows, PagedRows):
+                raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
+                                 "before it, which a dense cache holds per row; serve without page_size")
+            rows.placement = dataclasses.replace(rows.placement, plan=plan)
         return cls(
             model,
             task.placed,
@@ -767,7 +780,7 @@ class Server:
             sampling=dataclasses.replace(policy, stop=task.sampling.stop),
             transforms=transforms,
             stopping=stopping,
-            grammar=strategy.grammar,
+            grammar=None if plan is not None else strategy.grammar,
             rows=rows,
             slots=slots,
             capacity=rounded,
@@ -1158,7 +1171,9 @@ class Server:
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
-        iteration; resolve the rows that ended."""
+        iteration and each iteration's tokens in order (one a token a step, a
+        speculative block's kept slots); resolve the rows that ended at the
+        iteration's last."""
         if self._pending is None:
             return
         error, draws = jax.device_get(self._pending)
@@ -1172,15 +1187,16 @@ class Server:
         drew: dict[int, _Row] = {}
         for step in range(draws.drawn.shape[0]):
             for slot, row in list(self._rows.items()):
-                if not draws.drawn[step, slot]:
+                kept = np.flatnonzero(draws.drawn[step, slot])
+                if not len(kept):
                     continue
                 if not row.tokens:
                     row.ticket.first = now
-                row.tokens.append(int(draws.token[step, slot]))
-                row.behavior.append(float(draws.behavior[step, slot]))
-                row.raw.append(float(draws.raw[step, slot]))
+                row.tokens.extend(int(token) for token in draws.token[step, slot, kept])
+                row.behavior.extend(float(value) for value in draws.behavior[step, slot, kept])
+                row.raw.extend(float(value) for value in draws.raw[step, slot, kept])
                 drew[slot] = row
-                if draws.stopped[step, slot] or len(row.tokens) == row.budget:
+                if draws.stopped[step, slot] or len(row.tokens) >= row.budget:
                     del self._rows[slot]
                     self.rows.release(row)
                     del drew[slot]
