@@ -12,7 +12,15 @@ centred on its course, the sky turned; its pillars stand where its course's do, 
 radius; its props stand outside the course, placed by its look. A shutter's open and close cameras blur the
 image by the drone's motion (`motion_blur` samples, at least two; HyperDrone's paper, Sec 4.1, finds two
 enough). At "medium" fidelity HyperLux draws base-color textures without lights; exposure, white balance,
-gamma and noise are the race's (`dew.rl.flight.developed`)."""
+gamma and noise are the race's (`dew.rl.flight.developed`).
+
+A `fisheye` lens is an equidistant fisheye of that horizontal field of view (an FPV quadrotor's wide lens):
+each output pixel at angle theta from the axis lies at a radius proportional to theta, theta reaching half the
+field of view at the image's side edges. HyperLux casts pinholes (`set_cameras`), so the renderer draws a
+pinhole of the same horizontal field of view `source` pixels square and samples it, bilinearly, at each
+output pixel's direction (`fisheye_map`): a pinhole of that field of view reaches 67.8 degrees from its axis
+at its corners where the fisheye's corners lie further out, so a fisheye image's outer corners, which no
+pinhole of it holds, are black."""
 
 from __future__ import annotations
 
@@ -23,13 +31,50 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import Fetched, owned_program, program
 from dew.rl.flight import ASPECTS, GATES, OBSTACLES, Scene
 
 SUNK = (0.0, 0.0, -1000.0)
 """Where a placement not shown stands, shrunk to a thousandth, out of every camera's sight."""
 PROPS = 6
 """Each prop's placements a drone's scene holds."""
+
+
+def fisheye_map(size: int, source: int, fov: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Where each pixel of a `size`-square equidistant fisheye image of horizontal field of view `fov`
+    (degrees) samples a `source`-square pinhole image of the same field of view: for each output pixel the
+    four source pixels about its direction `[size, size, 4]` (each its row * source + column) and their
+    bilinear weights `[size, size, 4]`, 0 where the pinhole does not hold the direction; and where it does
+    `[size, size]`."""
+    half = np.deg2rad(fov) / 2
+    centers = (np.arange(size) + 0.5) / size * 2 - 1
+    down, right = np.meshgrid(centers, centers, indexing="ij")
+    radius = np.hypot(right, down)
+    theta = half * radius
+    # A direction's right and down over its forward, across the pinhole's half width (tan(half)).
+    tangent = np.tan(np.minimum(theta, np.pi / 2 - 1e-6)) / np.maximum(radius, 1e-12) / np.tan(half)
+    across, along = right * tangent, down * tangent
+    held = (theta < np.pi / 2) & (np.abs(across) <= 1) & (np.abs(along) <= 1)
+    column, row = (across + 1) / 2 * source - 0.5, (along + 1) / 2 * source - 0.5
+    left, top = np.floor(column), np.floor(row)
+    dx, dy = column - left, row - top
+    corners, weights = [], []
+    for oy, wy in ((0, 1 - dy), (1, dy)):
+        for ox, wx in ((0, 1 - dx), (1, dx)):
+            r = np.clip(top + oy, 0, source - 1).astype(np.int32)
+            c = np.clip(left + ox, 0, source - 1).astype(np.int32)
+            corners.append(r * source + c)
+            weights.append(np.where(held, wy * wx, 0.0))
+    return np.stack(corners, -1), np.stack(weights, -1), held
+
+
+def fisheyed(images: jax.Array, corners: jax.Array, weights: jax.Array) -> jax.Array:
+    """Pinhole images `[B, S, S, C]` resampled to a fisheye `[B, N, N, C]` by `fisheye_map`'s corners and
+    weights, in the weights' dtype."""
+    flat = images.reshape(images.shape[0], -1, images.shape[-1]).astype(weights.dtype)
+    sampled = jnp.einsum("bnkc,nk->bnc", flat[:, corners.reshape(-1, 4)], weights.reshape(-1, 4))
+    size = corners.shape[0]
+    return sampled.reshape(images.shape[0], size, size, -1)
 
 
 def _yawed(yaw: jax.Array, position: jax.Array) -> jax.Array:
@@ -45,14 +90,24 @@ def _yawed(yaw: jax.Array, position: jax.Array) -> jax.Array:
 class HyperLuxRenderer:
     """`count` drones' front cameras `size` pixels square (`dew.rl.flight.Renderer`) over the assets in
     `assets` (`tools/fpv_assets.py`'s manifest), at HyperLux's `fidelity`, blurred by `motion_blur` samples
-    (1 for none). Its images are `[count, size, size, 3]` uint8."""
+    (1 for none). Its images are `[count, size, size, 3]` uint8: pinholes of the cameras' fields of view, or
+    with a `fisheye` lens equidistant fisheyes of that field of view, drawn from pinholes `source` pixels
+    square (the module docstring), whose cameras' field of view must be the lens's."""
 
     aspect = 1.0
 
     def __init__(self, count: int, assets: str | Path, *, size: int = 96, fidelity: str = "medium",
-                 motion_blur: int = 2):
+                 motion_blur: int = 2, fisheye: float | None = None, source: int | None = None):
         import hyperlux
         from hyperlux.camera import RGB, CameraSpec
+
+        if (fisheye is None) != (source is None):
+            raise ValueError("a fisheye lens samples a pinhole drawn at a source size: give both, or neither")
+        self.fisheye = fisheye
+        self._lens = None if fisheye is None else tuple(
+            jnp.asarray(part, dtype) for part, dtype in zip(fisheye_map(size, int(source or 0), fisheye)[:2],
+                                                           (jnp.int32, jnp.float32), strict=True))
+        resolution = size if source is None else source
 
         folder = Path(assets)
         manifest = json.loads((folder / "manifest.json").read_text())
@@ -79,7 +134,7 @@ class HyperLuxRenderer:
         self._rgb = RGB("rgba8")
         layout = self._layout()
         self.renderer = hyperlux.HyperLux(
-            size, size, batch_size=count, fidelity=fidelity, num_probes=0,
+            resolution, resolution, batch_size=count, fidelity=fidelity, num_probes=0,
             cameras=(CameraSpec("front", (self._rgb,)),), num_overlays=count,
             max_overlay_instances=len(layout), max_overlays_per_camera=1, motion_blur_samples=motion_blur)
         self.renderer.init(scene, asset_pool=pool)
@@ -88,7 +143,8 @@ class HyperLuxRenderer:
             self.renderer.attach(drone, drone)
             placements += [self.renderer.spawn(drone, asset) for asset in layout]
         self._placements = self.renderer.placement_batch(placements)
-        self._placed = OuterProgram(jax.vmap(self._poses))
+        self._placed = Fetched(owned_program(jax.vmap(self._poses)))
+        self._fisheyed = Fetched(program(fisheyed))
 
     def _layout(self) -> list[int]:
         """Each placement's asset in a drone's overlay, in `_poses`' order."""
@@ -165,7 +221,10 @@ class HyperLuxRenderer:
             self.renderer.set_cameras(closed)
         self.renderer.render()
         blocks = [jax.dlpack.from_dlpack(block) for block in self.renderer.outputs[self._rgb].blocks]
-        return jnp.concatenate(blocks)[..., :3]
+        images = jnp.concatenate(blocks)[..., :3]
+        if self._lens is None:
+            return images
+        return jnp.round(jnp.clip(self._fisheyed(images, *self._lens), 0, 255)).astype(jnp.uint8)
 
 
-__all__ = ["PROPS", "SUNK", "HyperLuxRenderer"]
+__all__ = ["PROPS", "SUNK", "HyperLuxRenderer", "fisheye_map", "fisheyed"]

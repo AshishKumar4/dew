@@ -5,6 +5,7 @@ them, a resume ending where the run that never stopped ends, and each setup the 
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import jax
@@ -98,7 +99,7 @@ def assert_bitwise(one, other) -> None:
 
 
 def ppo(root: Path):
-    run = dataclasses.replace(teacher_run(root, 3), episodes=EpisodesConfig(steps=16))
+    run = dataclasses.replace(teacher_run(root, 3), episodes={"episodes": EpisodesConfig(steps=16)})
     objective = teacher_policy()
     env = Batched(FlightEnv(racing(), VIEWS), 16)
     return run, objective, ControlRollout(objective, env, unroll_length=4, epochs=1, minibatches=2)
@@ -139,23 +140,37 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     assert_bitwise(state, saved.prepare().train("again"))
 
 
-@pytest.mark.parametrize("agent", ["ppo", "dreamer"])
-def test_a_runs_episodes_score_its_greedy_flights_from_the_evaluations_key(tmp_path, agent):
+@pytest.mark.parametrize("drawn", [False, True], ids=["greedy", "drawn"])
+@pytest.mark.parametrize("agent", ["ppo", "dreamer", "dreamer in a simulator"])
+def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, agent, drawn):
     """A run validated by its episodes logs at its end `episodes/return` and `episodes/steps`: the first
-    episodes its greedy policy earns flown 16 steps from the key the run's key gives its last step
-    (`dew.rl.evaluation.episodes`), on its averaged weights where it keeps them; a PPO policy over the race's
-    observation, a Dreamer agent over the driven step (`Driven`) from the memory it starts with."""
+    episodes its greedy policy earns, or with `drawn` the policy's draws as it acts (`act`), flown 16 steps
+    from the key the run's key gives its last step (`dew.rl.evaluation.episodes`), on its averaged weights
+    where it keeps them; a PPO policy over the race's observation, a Dreamer agent over the driven step
+    (`Driven`) from the memory it starts with, and a Dreamer agent trained in a race a host simulator
+    steps, flown in a race of the split's own (`DrivenSimulator`)."""
     from dew.rl.env import Driven
+    from dew.rl.simulator import DrivenSimulator
     from dew.training.tracker import LocalTracker
 
-    run, objective, _ = ppo(tmp_path) if agent == "ppo" else dreamer(tmp_path)
-    run = dataclasses.replace(run, episodes=EpisodesConfig(steps=16))
+    run, objective, _ = {"ppo": ppo, "dreamer": dreamer, "dreamer in a simulator": transdreamer_race}[agent](
+        tmp_path)
+    count = 16 if agent == "ppo" else 8
+    simulated = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": count}
+    own = EnvConfig("gate_race", simulated) if agent == "dreamer in a simulator" else None
+    split = EpisodesConfig(steps=16, env=own, drawn=drawn)
+    run = dataclasses.replace(run, episodes={"episodes": split})
     state = run.prepare().train("scored")
     logged = {name: value for _, scalars in LocalTracker(str(tmp_path / "scored" / "tracking")).scalars()
               for name, value in scalars.items() if name.startswith("episodes/")}
-    race = Batched(FlightEnv(racing(), VIEWS), 16 if agent == "ppo" else 8)
-    flown = (episodes(objective.greedy, race, 16) if agent == "ppo" else
-             episodes(objective.greedy, Driven(race), 16, memory=objective.memory))
+    policy = objective.act if drawn else objective.greedy
+    if agent == "ppo":
+        race = Batched(FlightEnv(racing(), VIEWS), count)
+        flown = episodes(policy, race, 16)
+    else:
+        race = (DrivenSimulator(GateRace(None, racing(), views=VIEWS, count=count)) if own is not None
+                else Driven(Batched(FlightEnv(racing(), VIEWS), count)))
+        flown = episodes(policy, race, 16, memory=objective.memory)
     with generation.run_precision(run.trainer.precision):
         expected = flown(state.variables if state.ema is None else state.averaged,
                          evaluation_key(state.key, 3))
@@ -250,6 +265,22 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped_and_keeps_what_it_trai
         run.override({"trainer.steps": 8, **trained}).prepare().train("stopped")
 
 
+def test_a_dreamer_run_resumed_in_a_later_phase_trains_on_and_at_another_horizon_is_refused(tmp_path):
+    """A DreamerV3 run trained to its second update and resumed under its name in a later phase of its
+    training, drawing longer windows at a lower entropy (SkyDreamer's last phases), trains on to its fourth:
+    the rollout and the entropy are how it learns. Resumed again at another horizon, which says what its
+    critic estimates, it is refused."""
+    run = student(tmp_path, 2)
+    run.prepare().train("phased")
+    later = dataclasses.replace(
+        run, rollout=RolloutConfig("dreamer", {"batch": 8, "length": 16, "train_ratio": 16.0, "prefill": 16,
+                                               "capacity": 64}),
+        objective=ObjectiveConfig(DREAMER_V3, {"entropy": 1e-5}))
+    assert int(later.override({"trainer.steps": 4}).prepare().train("phased").step) == 4
+    with pytest.raises(ValueError):
+        later.override({"trainer.steps": 6, "objective.horizon": 100.0}).prepare().train("phased")
+
+
 @pytest.fixture(scope="module")
 def saved_teacher(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("teacher")
@@ -264,11 +295,15 @@ REFUSED = {
     "a teacher that neither labels nor demonstrates": {"teacher": True},
     "a width the environment states": {"model": ModelConfig(WORLD_MODEL,
                                                             {**TINY, "reads": "state", "action_size": 4})},
+    "an auxiliary head's width": {"model": ModelConfig(WORLD_MODEL, {**TINY, "reads": "state",
+                                                                     "auxiliary": [["teacher", 80, 8]]})},
+    "a proprioceptive entry's width": {"model": ModelConfig(WORLD_MODEL, {**TINY, "reads": "state",
+                                                                          "proprio": [["teacher", 80]]})},
     "a simulator batched again": {"env": EnvConfig("gate_race", {"renderer": None, "racing": RACING,
                                                                  "views": list(VIEWS), "count": 8}, count=8)},
-    "episodes a simulator flies": {"env": EnvConfig("gate_race", {"renderer": None, "racing": RACING,
-                                                                  "views": list(VIEWS), "count": 8}),
-                                   "episodes": EpisodesConfig(steps=4)},
+    "episodes the run's own simulator flies": {
+        "env": EnvConfig("gate_race", {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": 8}),
+        "episodes": {"episodes": EpisodesConfig(steps=4)}},
     "an unbatched environment": {"env": EnvConfig("flight", {"racing": RACING, "views": list(VIEWS)})},
     "another objective's rollout": {"rollout": RolloutConfig("control")},
     "a teacher for a rollout that takes none": {"teacher": "demonstrates", "objective": ObjectiveConfig(
@@ -277,6 +312,20 @@ REFUSED = {
     "a model beside the run it starts from": {"pretrained": True},
 }
 """Each setup an environment run refuses, as the one change to a run that prepares."""
+
+
+def test_a_world_models_named_entries_take_their_widths_from_the_environment(tmp_path):
+    """A record naming a world model's auxiliary heads by their views and units builds the model with each
+    head's width the race's view of it, one drone's flattened: the drone's state and the teacher's view."""
+    model = ModelConfig(WORLD_MODEL, {**TINY, "reads": "state", "auxiliary": [["state", 8], ["teacher", 16]]})
+    run = student(tmp_path, 1, model=model)
+    assert run.env is not None
+    race = run.env.build()
+    shown = jax.eval_shape(race.reset, jax.random.key(0))[1].observation
+    agent = run.agent(race)
+    assert isinstance(agent, DreamerV3Objective)
+    assert agent.model.auxiliary == (("state", math.prod(shown["state"].shape[1:]), 8),
+                                     ("teacher", math.prod(shown["teacher"].shape[1:]), 16))
 
 
 @pytest.mark.parametrize("change", list(REFUSED))

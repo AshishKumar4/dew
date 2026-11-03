@@ -2,16 +2,16 @@
 there, or placed from a run one process checkpointed; a split scored by its episodes evaluated in a pool,
 its scorer once failing, once reporting fewer scores than it declares, on one process alone."""
 
-import itertools
+import dataclasses
 from collections.abc import Callable
 
 import jax
-import numpy as np
 import optax
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
 from test_env_rollout import Walk
 
+from dew.objectives.rl.config import idle
 from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
 from dew.rl.env import Batched, TimeLimit
 from dew.training import Trainer
@@ -32,13 +32,14 @@ def unjoined(directory, *, stateful: bool = True):
 
 
 def fitted(trainer) -> dict:
-    """The pool's size and the type of the ValueError a step's fit of `trainer` raised, or None."""
-    from dew.data.dataset import Loader
-
-    idle = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    """The pool's size and the type of the ValueError a step's fit of `trainer` raised, or None. The run's
+    loader is the idle one read through a generator, which reports no position, so its checkpoint holds
+    none: a pool of another size places it, and only the rollout's state refuses it."""
+    held = idle()
+    unpositioned = dataclasses.replace(
+        held, train=lambda partition: (batch for batch in held.train(partition)))
     try:
-        trainer.fit(idle, steps=1)
+        trainer.fit(unpositioned, steps=1)
         refused = None
     except ValueError as error:
         refused = type(error).__name__

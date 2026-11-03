@@ -28,11 +28,11 @@ import numpy as np
 from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import program
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
-from dew.rl.evaluation import episodes, first_episode_rows
-from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout, simulator_start
+from dew.rl.evaluation import episodes
+from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout
 from dew.rl.surrogate import clipped_surrogate_terms
 
 if TYPE_CHECKING:
@@ -208,6 +208,33 @@ class ControlPPOObjective(Objective[Ratio]):
         return Ratio(per_step.sum(), jnp.asarray(per_step.size, per_step.dtype)), Aux(metrics)
 
 
+def _summary(steps: Transition, returns: jax.Array):
+    """A collection `steps` `[unrolls, T, envs, ...]` as the sequences its minibatches are drawn from, and
+    each environment's running return `returns`, read where its episode ends, over the unrolls in order:
+    the returns, the sequences, the mean return of the episodes that ended and their count."""
+    def tally(held, step: Transition):
+        total = held + step.following.reward
+        return jnp.where(step.following.done, 0, total), (total, step.following.done)
+
+    flat = jax.tree.map(lambda leaf: leaf.reshape(-1, *leaf.shape[2:]), steps)
+    returns, (totals, ended) = jax.lax.scan(tally, returns, flat)
+
+    # [unrolls, T, envs, ...] to sequences [unrolls * envs, T, ...].
+    def sequences(leaf):
+        leaf = jnp.moveaxis(leaf, 2, 1)
+        return leaf.reshape(-1, *leaf.shape[2:])
+
+    extras = steps.extras
+    if not isinstance(extras, Mapping):
+        raise TypeError("a control rollout records its policy's raw actions and log-probabilities")
+    batch = {"observation": steps.observation, "raw_action": extras["raw_action"],
+             "log_prob": extras["log_prob"], "reward": steps.following.reward,
+             "terminated": steps.following.terminated, "truncated": steps.following.truncated,
+             "following": steps.following.observation}
+    ended_returns = jnp.sum(jnp.where(ended, totals, 0)) / jnp.maximum(jnp.sum(ended), 1)
+    return returns, jax.tree.map(sequences, batch), ended_returns, jnp.sum(ended)
+
+
 class Saved(TypedDict):
     """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`)."""
 
@@ -238,13 +265,10 @@ class ControlRollout:
     _collected: Mapping[str, np.ndarray] | None = field(default=None, init=False, repr=False)
     _order: np.ndarray | None = field(default=None, init=False, repr=False)
     _ended: float = field(default=float("nan"), init=False, repr=False)
-    _bound: tuple[Env | Simulator, Callable[[Variables, Carry], tuple[Carry, Transition]]] | None = field(
-        default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if min(self.unroll_length, self.unrolls, self.epochs, self.minibatches) < 1:
             raise ValueError("a control rollout collects and serves at least one of each")
-        self._summarized = OuterProgram(self._summary)
 
     @property
     def metrics(self) -> Mapping[str, float]:
@@ -287,7 +311,7 @@ class ControlRollout:
 
         def collected(variables, carry):
             _, steps = self._unrolled(env, variables, carry)
-            return self._summary(steps, jnp.zeros(count, jnp.float32))[1]
+            return _summary(steps, jnp.zeros(count, jnp.float32))[1]
 
         gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
         order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
@@ -302,13 +326,12 @@ class ControlRollout:
 
     def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
         """The collection for the rollout's environment as it is now: a run may change it between
-        collections (a curriculum), its collection made again; episodes under way carry on."""
+        collections (a curriculum), its collection made again; episodes under way carry on. Over a JAX
+        environment it is the objective's program (`Objective.program`), which runs the policy's modules."""
         env = self.env
-        if self._bound is None or self._bound[0] != env:
-            collect = (functools.partial(self._simulated, env) if isinstance(env, Simulator)
-                       else OuterProgram(functools.partial(self._unrolled, env)))
-            self._bound = (env, collect)
-        return self._bound[1]
+        if isinstance(env, Simulator):
+            return functools.partial(self._simulated, env)
+        return self.objective.program("collection", functools.partial(self._unrolled, env), holds=(env,))
 
     def _unrolled(self, env: Env, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
         """The carry after `unrolls` rollouts of the live policy in `env` and their steps
@@ -323,33 +346,10 @@ class ControlRollout:
         and their steps `[unrolls, T, envs, ...]`."""
         unrolled = []
         for _ in range(self.unrolls):
-            carry, steps = simulator_rollout(simulator, self.objective.act, params, carry, self.unroll_length)
+            carry, steps = simulator_rollout(simulator, self.objective.act, params, carry, self.unroll_length,
+                                             models=self.objective.towers())
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
-
-    def _summary(self, steps: Transition, returns: jax.Array):
-        # Each environment's running return, read where its episode ends, over the unrolls in order.
-        def tally(held, step: Transition):
-            total = held + step.following.reward
-            return jnp.where(step.following.done, 0, total), (total, step.following.done)
-
-        flat = jax.tree.map(lambda leaf: leaf.reshape(-1, *leaf.shape[2:]), steps)
-        returns, (totals, ended) = jax.lax.scan(tally, returns, flat)
-
-        # [unrolls, T, envs, ...] to sequences [unrolls * envs, T, ...].
-        def sequences(leaf):
-            leaf = jnp.moveaxis(leaf, 2, 1)
-            return leaf.reshape(-1, *leaf.shape[2:])
-
-        extras = steps.extras
-        if not isinstance(extras, Mapping):
-            raise TypeError("a control rollout records its policy's raw actions and log-probabilities")
-        batch = {"observation": steps.observation, "raw_action": extras["raw_action"],
-                 "log_prob": extras["log_prob"], "reward": steps.following.reward,
-                 "terminated": steps.following.terminated, "truncated": steps.following.truncated,
-                 "following": steps.following.observation}
-        ended_returns = jnp.sum(jnp.where(ended, totals, 0)) / jnp.maximum(jnp.sum(ended), 1)
-        return returns, jax.tree.map(sequences, batch), ended_returns, jnp.sum(ended)
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         served = int(state.updates) % (self.epochs * self.minibatches)
@@ -360,7 +360,7 @@ class ControlRollout:
         collected, order = self._collected, self._order
         if served == 0 or collected is None or order is None:
             carry, steps = self._collector()(state.variables, carry)
-            returns, gathered, ended, count = self._summarized(steps, returns)
+            returns, gathered, ended, count = program(_summary)(steps, returns)
             collected = jax.device_get(gathered)
             self._ended = float(ended) if int(count) else float("nan")
             sequences = len(collected["reward"])
@@ -378,13 +378,8 @@ def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params:
                    steps: int, *, greedy: bool = True) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
-    episode where `steps` is an episode's length, read as every first episode is
-    (`dew.rl.evaluation.first_episode_rows`; an `Env`'s by `dew.rl.evaluation.episodes`)."""
-    policy = objective.greedy if greedy else objective.act
-    if isinstance(env, Simulator):
-        _, taken = simulator_rollout(env, policy, params, simulator_start(env, key), steps, reset=False)
-        return float(jnp.mean(first_episode_rows(taken.following)["return"]))
-    return episodes(policy, env, steps)(params, key)["return"]
+    episode where `steps` is an episode's length (`dew.rl.evaluation.episodes`)."""
+    return episodes(objective.greedy if greedy else objective.act, env, steps)(params, key)["return"]
 
 
 __all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",

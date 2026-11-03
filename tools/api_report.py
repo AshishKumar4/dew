@@ -202,10 +202,15 @@ def exports() -> list[str]:
 
 
 def config() -> list[str]:
+    """Every record dataclass a run's `run.json` holds: those of `dew.config` and its modules, and of the
+    module of each run kind the registry names (`dew.registry.runs`), wherever it lives."""
     import dew.config
+    from dew.registry import runs
 
-    modules = [dew.config, *(importlib.import_module(f"dew.config.{info.name}")
-                             for info in pkgutil.iter_modules(dew.config.__path__))]
+    kinds = {runs.paths[name].partition(":")[0] for name in runs.paths}
+    modules = {dew.config, *(importlib.import_module(f"dew.config.{info.name}")
+                             for info in pkgutil.iter_modules(dew.config.__path__)),
+               *(importlib.import_module(module) for module in kinds)}
     lines = []
     for module in sorted(modules, key=lambda module: module.__name__):
         for name, cls in sorted(vars(module).items()):
