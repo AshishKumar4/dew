@@ -533,6 +533,9 @@ def test_a_products_mode_prices_it():
     spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
     assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)
     assert product(spelled, jnp.float32).flops == 3 * flops
+    # An FP8 dot algorithm's products are the 8-bit mode's, as FP8 operands' are.
+    eight = jax.lax.DotAlgorithm(jnp.float8_e4m3fn, jnp.float8_e4m3fn, jnp.float32)
+    assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
 
 
 def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():

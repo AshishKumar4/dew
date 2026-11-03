@@ -133,6 +133,8 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
             narrow = {jnp.dtype(algorithm.lhs_precision_type), jnp.dtype(algorithm.rhs_precision_type)}
             if narrow <= {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)}:
                 return "16bit", algorithm.num_primitive_operations
+            if narrow <= set(EIGHT):
+                return "8bit", algorithm.num_primitive_operations
             return "fp32", algorithm.num_primitive_operations
     for name in precision_names(precision):
         if (found := _ALGORITHM.fullmatch(name)) is not None:

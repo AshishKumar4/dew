@@ -13,6 +13,7 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -259,57 +260,59 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     return rule
 
 
-SHARDED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16')}
-"""The interpreted forward's cases whose recorded sites declare 256 seeds on the CPU (`fla_sites`, sized by
-the gate's rule against fla's own spread): a map task of 128 seeds of all three took 1045 to 1071 s on main's
-CI (Main, 2026-11-02), so each case is a check-1 site of its own, sharded over map tasks of 16
-(`check1_shards`)."""
+DRAWN_FORWARD: set[tuple] = set()
+"""The interpreted forward's drawn cases, each a test of its own (`drawn_forward`); the rest of
+`INTERPRETED_FORWARD` the template refuses (the refusal test below)."""
+
+
+def drawn_forward(case: str, dtype: str) -> Callable:
+    """A drawn forward case's test: the case taken out of the refused ones (`DRAWN_FORWARD`) and
+    `the_mosaic_forward_is_as_exact_as_its_reference` run by the test it decorates, a check-1 site of its own
+    (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
+    main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
+    (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
+    (keyed-shards at 7e3a5fb48)."""
+    DRAWN_FORWARD.add((case, dtype))
+
+    def check():
+        the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype])
+
+    return lambda test: functools.update_wrapper(check, test)
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('one sequence', 'fp32')
 def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either forms
-    (`SHARDED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference('one sequence', jnp.float32)
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
+    forms."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('a ragged length', 'bf16')
 def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length
-    (`SHARDED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference('a ragged length', jnp.bfloat16)
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('packed documents', 'bf16')
 def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents
-    (`SHARDED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference('packed documents', jnp.bfloat16)
-
-
-KEYED_FORWARD = {('a decay a key dimension', 'bf16'), ('a decay a key dimension, packed', 'bf16')}
-"""The interpreted forward's 16-bit cases under a decay a key dimension, 128 recorded seeds each: 250 s and
-past 600 s a whole run on the CPU (int-g1-each at 7683420535), so their draws are sharded over map tasks
-(`check1_shards`), each case a site of its own: a task of 8 seeds of both took 117 to 125 s, half of it
-their compiles (keyed-shards at 7e3a5fb48)."""
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension', 'bf16')
 def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension
-    (`KEYED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference('a decay a key dimension', jnp.bfloat16)
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension, packed', 'bf16')
 def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call of packed documents under a decay a
-    key dimension (`KEYED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference('a decay a key dimension, packed', jnp.bfloat16)
+    key dimension."""
 
 
-@pytest.mark.parametrize(('case', 'dtype'),
-                         interpreted(FORWARD_GRID, INTERPRETED_FORWARD - SHARDED_FORWARD - KEYED_FORWARD))
+@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD - DRAWN_FORWARD))
 def test_an_fp32_call_under_a_decay_a_key_dimension_is_refused_by_the_mainloop(case, dtype):
     """An fp32 call under a decay a key dimension: the template's route and the mainloop's rule both refuse
     it, under either forms (`on_the_mainloop`, `mainloop.per_key_refusal`); its arm is the portable math's
