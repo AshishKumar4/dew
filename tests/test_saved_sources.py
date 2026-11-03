@@ -120,8 +120,8 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     """Two real processes export a decoder whose kernels span both, every layer's attention extended by
     DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
     projection folded as it is written: each reads one tensor home at a time, together, so neither host's
-    resident pages rise during the export by half the model (1.4 to 4.3 MB of 31 MB on armada), where the
-    pool reading the whole tree home first rises past half (18 to 37 MB), and the same measure over that
+    resident pages rise during the export by half the model (2.0 to 5.5 MB of 31 MB on armada), where the
+    pool reading the whole tree home first rises past half (23 to 39 MB), and the same measure over that
     tree held home rises at least half of it on each host, so the measure sees the bytes in that run
     (`saved_export_worker.resident_growth`, a decoder of 256 KiB tensors): tracemalloc never saw the
     buffers a tensor is read home into, and held a 1.3 MB decoder's export to its own fixed cost, which
