@@ -1757,13 +1757,23 @@ def _forward_kernels(op, ba, config) -> dict:
             for guarded in ("", "_guarded")}
 
 
+FORWARD_LAUNCHES = [(*case, launches) for case in FORWARD_GATE
+                    for launches in (("walk",) if case[2] is template.Kept.SPLIT else ("plain", "guarded"))]
+"""Each forward gate case by the launches it compiles: an inference forward's plain walks, folded and natural,
+apart from its guarded ones and the plain walks they rerun inside a guard's branch
+(`attention_mosaic_forward.plain_launches`), each set its own kernels, so no case compiles every launch of the
+walk's program (a case 256 wide took 120 s on a CPU); a training forward's whole walk, its launches one
+program."""
+
+
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks", "launches"), FORWARD_LAUNCHES)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks,
+                                                              launches):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
     wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
-    model's decision ptxas's (`mosaic_failures`)."""
+    model's decision ptxas's (`mosaic_failures`), its `launches` (`FORWARD_LAUNCHES`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1772,9 +1782,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
     query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
     hooked = _gated_hooks(hooks, queries, width)
-
-    def forward(query, key, value):
-        return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
+    walked = launches == "walk"
 
     with generation.assumed(generation_name):
         zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
@@ -1783,6 +1791,19 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
         ba = op.bind(*args, residuals=training, interpret=False)
         config = op.derived(ba, generation.gpu_target())
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
+
+        def forward(query, key, value):
+            if walked:
+                return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
+            # The launches of the set alone, each as the walk runs it (`plain_launches`).
+            alone = attention_mosaic_forward.plain_launches(
+                query, key, value, spans, hooked, scale=op.scale, natural=op.natural, tiles=config,
+                interpret=False, rows=training is template.Kept.OUTPUT)
+            chosen = [run for name, run in alone.items() if ("guarded" in name or "again" in name)
+                      == (launches == "guarded")]
+            assert chosen, f"the inference walk has no {launches} launch"
+            return [run() for run in chosen]
+
         found = compile_mosaic_kernels(
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
             generation_name)

@@ -172,17 +172,46 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, widt
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
-                   out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-                   sources: jax.Array | None = None):
-    """`MosaicForward`'s launch without residuals, at `tiles`, under the default's guards over whole launches
-    (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a block of the family's swizzled value
-    columns at a time: its walk carries its shifted and unshifted sums and forms both tiles' products a step
-    (`algebra.stepped`), four `[block_q, Dv]` fp32 tiles beside its logits, which a block of the columns
-    holds within a consumer's registers (ledger 1617). Each block's output is exact on its own (its rows'
-    shifts its own columns' room, `algebra.room`); the rare launch takes its logits once a block. An output
-    hook reads a row's whole output, so where there is one the blocks store theirs in fp32 and the hook runs
-    on the rows they make in XLA (`template.output_hooked`, the reference's own), rounded once after it.
+                   masked: bool = False, **walk):
+    """`MosaicForward`'s launch without residuals (`_inference_walk`), its launches walked by the algebra's
+    guards (`algebra.walked_launches`)."""
+    spec, launch, kept, finished, _ = _inference_walk(query, key, value, spans, hooks, masked=masked, **walk)
+    return finished(algebra.walked_launches(spec, launch, kept, masked=masked))
+
+
+def plain_launches(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+                   **walk) -> dict[str, Callable[[], tuple]]:
+    """Each launch the inference walk may take (`algebra.launch_forms`), by name, as a function that runs it
+    alone, its guarded rows none: what a resource gate lowers a launch at a time, each compiling its own
+    kernel, where the walk's program compiles every one."""
+    spec, launch, _, _, rows_shape = _inference_walk(query, key, value, spans, hooks, **walk)
+    live = jnp.zeros(rows_shape, bool)
+
+    def alone(form: algebra.Forward, guarded: bool, again: bool) -> tuple:
+        return launch(form, live if guarded else None, again)[0]
+
+    def name(form: algebra.Forward, guarded: bool, again: bool) -> str:
+        parts = ["natural" if form.natural else "folded", *(["guarded"] * guarded), *(["again"] * again)]
+        return "_".join(parts)
+
+    return {name(*launched): functools.partial(alone, *launched) for launched in algebra.launch_forms(spec)}
+
+
+def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+                    scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
+                    out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
+                    sources: jax.Array | None = None):
+    """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
+    `algebra.walked_launches` takes them, `finished`, its outputs from the walk's, and the shape of its rows
+    `[B, H, S·Qp]` (a guard's live rows): `MosaicForward`'s launch without residuals, at `tiles`, under the
+    default's guards over whole launches (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a
+    block of the family's swizzled value columns at a time: its walk carries its shifted and unshifted sums
+    and forms both tiles' products a step (`algebra.stepped`), four `[block_q, Dv]` fp32 tiles beside its
+    logits, which a block of the columns holds within a consumer's registers (ledger 1617). Each block's
+    output is exact on its own (its rows' shifts its own columns' room, `algebra.room`); the rare launch takes
+    its logits once a block. An output hook reads a row's whole output, so where there is one the blocks store
+    theirs in fp32 and the hook runs on the rows they make in XLA (`template.output_hooked`, the reference's
+    own), rounded once after it.
 
     With `rows`, the training forward that keeps its output for the backward's D (`takes_output_residuals`):
     the output and the residuals every mainloop's training forward gives, from the plain launch's finished
@@ -278,19 +307,24 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                    for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
         return (*taken, *plain[len(guarded):])
 
-    out, *finished = algebra.walked_launches(spec, launch, kept, masked=masked)
-    if splits > 1:
-        # A split launch's slices along the query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its rows
-        # `[B, H, S, Q]`, each slice's maxima and denominators its own, for a merge (`attention_decode`).
-        out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])[:, :, :call.queries, :, :value.shape[3]]
-        maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :call.queries]
-                          for array in finished[0])
-        return out, maximum, total
-    out = out[:, :call.queries, :, :value.shape[3]]
-    if not rows:
-        return out
-    maximum, total = (array[:, :, :call.queries] for array in finished[0])
-    return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+    def finished(walked: tuple):
+        out, *rows_of = walked
+        if splits > 1:
+            # A split launch's slices along the query axis (`_launch`'s `splits`): `[B, S, Q, H, Dv]`, its
+            # rows `[B, H, S, Q]`, each slice's maxima and denominators its own, for a merge
+            # (`attention_decode`).
+            out = out.reshape(out.shape[0], splits, -1, *out.shape[2:])
+            out = out[:, :, :call.queries, :, :value.shape[3]]
+            maximum, total = (array.reshape(*array.shape[:2], splits, -1)[..., :call.queries]
+                              for array in rows_of[0])
+            return out, maximum, total
+        out = out[:, :call.queries, :, :value.shape[3]]
+        if not rows:
+            return out
+        maximum, total = (array[:, :, :call.queries] for array in rows_of[0])
+        return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+    return spec, launch, kept, finished, (query.shape[0], query.shape[2], splits * call.query.shape[1])
 
 
 def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
