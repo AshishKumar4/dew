@@ -188,7 +188,7 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         scan = nn.scan(later, variable_axes={stacked: 0},
                        variable_carry='cache' if shared is not None else False,
                        variable_broadcast=DenyList(mapped), split_rngs={'params': False, 'dropout': True},
-                       length=len(steps))
+                       length=len(steps), metadata_params={nn.PARTITION_NAME: None})
         run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         x, logits = run(model, x)

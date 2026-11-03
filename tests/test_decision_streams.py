@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import TINY_DECODER
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
@@ -159,7 +160,7 @@ def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_stat
     read adds nothing), while the state's states move with that stream, which they read though it
     follows them."""
     objective = in_streams(layout)
-    variables = jax.jit(objective.init)(jax.random.key(0))
+    variables = nn.unbox(jax.jit(objective.init)(jax.random.key(0)))
     asked = examples(layout)[0].questions
     first, streams = states_of(objective, variables, "one two three", asked)
     other, _ = states_of(objective, variables, "six five four", asked)
@@ -259,7 +260,7 @@ def test_a_row_in_streams_reads_its_backbone_at_the_runs_progress():
     width, dtype = DecisionModel.head_size(backbone)
     objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LETTERED,
                                   head=LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     example = examples(LETTERED)[0]
     rows = LETTERED.rows(TOKENIZER, SPECIALS, example.state, example.questions)
     inputs = DecisionInputs.collate(rows, SPECIALS.pad, attention=LETTERED.attention)

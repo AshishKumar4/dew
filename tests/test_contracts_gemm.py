@@ -10,7 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, OWN_FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
@@ -299,15 +300,14 @@ def group_peaks(x, groups: int, features: int):
 
 @pytest.mark.parametrize(("groups", "edge"), list(itertools.product((1, 2), EDGES)))
 def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
-    """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s grouped
-    convolution, a custom VJP whose backward is the float convolution's transpose at the dequantized
-    operands): every order it takes finite wherever float64 is a normal float32 and the convolution of the
-    operands quantized to int8 and back (each example's scale, each output feature's; a grouped input first
-    over each example's peak in each group, restored on that group's outputs) is, its reverse mode the float
-    convolution's transpose at the dequantized operands, as the seam declares, and a derivative of that
-    through the quantization, the scales' included (`quantized_convolution`); it takes no
-    forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
-    running."""
+    """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s
+    `quantized_training`, a surrogate whose derivative is the float convolution's at the dequantized
+    operands): every order finite wherever float64 is a normal float32 and the convolution of the operands
+    quantized to int8 and back (each example's scale, each output feature's; a grouped input first over
+    each example's peak in each group, restored on that group's outputs) is, its forward derivative the
+    float convolution's at the dequantized operands, as the seam declares, its reverse mode that
+    derivative's transpose, and a second derivative one of that through the quantization, the scales'
+    included (`quantized_convolution`)."""
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
@@ -326,7 +326,37 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
     (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
     assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution of {groups} {edge}",
-                    truth_fn=plain, plain_fn=plain, without=OWN_FORWARD_ORDERS)
+                    truth_fn=plain, plain_fn=plain)
+
+
+def test_a_quantized_convolutions_second_derivative_reads_its_scales():
+    """The quantized convolution's gradient in its kernel, differentiated in its input (a mixed second
+    derivative): the gradient reads the input quantized, whose scale (each example's absolute maximum)
+    moves with the input, so the derivative goes through it, as the independent oracle's does
+    (`quantized_convolution`): on par with the oracle against its float64 truth (check 1)."""
+    from dew.nn.conv import Conv
+    from dew.quantization import Quantization
+
+    quantized = Quantization().apply(Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False))
+
+    def mixed(convolution):
+        def run(x, kernel, along_x, cotangent):
+            def kernel_gradient(x):
+                return jax.grad(lambda k: jnp.sum(convolution(x, k) * cotangent))(kernel)
+            return jax.jvp(kernel_gradient, (x,), (along_x,))[1]
+        return run
+
+    def dew_convolution(x, kernel):
+        return quantized.apply({"params": {"kernel": kernel}}, x)
+
+    def oracle(x, kernel):
+        return quantized_convolution(x, kernel, 1)
+
+    def draw(seed):
+        return tuple(normal_draw(2000 + seed, (1, 6, 6, 4), (3, 3, 4, 8), (1, 6, 6, 4), (1, 6, 6, 8)))
+
+    assert_as_exact(jax.jit(mixed(dew_convolution)), jax.jit(mixed(oracle)), draw,
+                    "a quantized convolution's mixed second derivative", seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)

@@ -29,6 +29,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from one_draw import assert_as_exact_as_the_reference
 from tool_support import REPO_ROOT, load
 
@@ -267,7 +268,7 @@ def test_dews_diffusion_reference_trains_dews_own_loss_on_its_batchs_draws(monke
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     runner = load("reference_runs/diffusion")
     counted = runner.counting_objective((8, 8, 3), "float32", "xla")
-    variables = counted.init(jax.random.key(0))
+    variables = nn.unbox(counted.init(jax.random.key(0)))
     trained = runner.fixed_draws(counted, variables, None)
     images = np.random.default_rng(0).integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
     levels, noise = runner.draws(0, 2, 4, (8, 8, 3))

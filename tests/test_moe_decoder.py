@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from recording import RecordingTracker
 from sharded import assert_sharded
 from token_support import repeated_token_batch
@@ -57,7 +58,7 @@ def test_an_expert_layer_and_a_dense_layer_agree_at_one_expert():
     what makes the router's weight the only difference between them."""
     tokens = jax.random.normal(jax.random.key(0), (2, 3, 8))
     sparse = SparseMLP(num_experts=1, top_k=1, hidden_features=16, out_features=8)
-    variables = sparse.init(jax.random.key(1), tokens)
+    variables = nn.unbox(sparse.init(jax.random.key(1), tokens))
     kernels = variables["params"]["experts"]
 
     gated = GatedMLP(hidden_features=16, out_features=8)
@@ -75,7 +76,7 @@ def test_the_router_runs_in_fp32_under_a_bfloat16_model():
     tokens = jnp.asarray(jax.random.normal(jax.random.key(0), (2, 3, 8)), jnp.bfloat16)
     sparse = SparseMLP(num_experts=4, top_k=2, hidden_features=16, out_features=8,
                        dtype=jnp.bfloat16)
-    variables = sparse.init(jax.random.key(1), tokens)
+    variables = nn.unbox(sparse.init(jax.random.key(1), tokens))
     weights, _ = sparse.apply(variables, tokens, method=lambda module, x: module.gate(x))
 
     assert variables["params"]["gate"]["kernel"].dtype == jnp.float32

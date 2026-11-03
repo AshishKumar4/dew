@@ -7,12 +7,57 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dew requires its JAX build 0.12.0.1.post46: Mosaic GPU's layout inference computes each
+  shared-memory-to-registers transfer check once, and a Pallas Mosaic GPU scratch ref can state that it is
+  plain (`plgpu.PlainTransform()`), so Kimi delta attention's kernels lower and compile for sm90 in seconds
+  where the layout search had run past ten minutes (docs/installation.md lists each fix). The `cuda12` and
+  `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 changed Python alone, and their native code is
+  the same.
+- A step compiled ahead with its frontier (`--trainer.compile-ahead.frontier`) lists, where the plan or the
+  frontier reaches the remat ladder's top ('full'), its sibling that keeps what 'minimal' saves in pinned host
+  memory ('minimal_offloaded') at the same split. It holds as many device bytes as 'full', so the planner
+  never climbs to it; it trades recompute for host transfers, which only the GPUs' timing can choose. On an
+  H100, an 8-layer Qwen3.5-4B step at 2 x 2048 tokens ran 101.6 ms under 'full' and 113.6 ms offloaded.
+- API change: a model's `init` returns each parameter whose logical axes its module names in Flax's
+  partitioning box (`nn.LogicallyPartitioned`), declared where the module draws it
+  (`nn.with_logical_partitioning`, `dew.nn.sharding.declared`, `Dense(kernel_axes=...)`), as Flax's
+  partitioning and MaxText read them. Every Dew entry (the trainer, objectives, `Pretrained`, LoRA,
+  generation, export, checkpoints) takes boxed and plain trees alike; code that reads the arrays of an
+  `init` itself calls `nn.unbox(variables)` first. The process-wide `@logical_axes` table of trailing
+  module names is gone: a parameter takes the axes its own module names, and no model's names place
+  another's (a user model's own `gate` took Dew's MoE router's axes once that was imported). A run
+  reads its objective's draw once for the table its placement and Muon read
+  (`Objective.parameter_axes`); placements are unchanged for every catalogued model but where the old
+  table named a parameter by another module's name (attention's qk-norm scales lost MLA's 'index',
+  Gemma 4's router scale is 'embed', the hash router's token table is whole on every device).
+- A program Dew compiles is keyed on the concrete mesh it is called under, so a mesh of one shape over
+  other devices compiles its own and runs on its devices.
+- A flat `NormalAttention`'s projections declare `[embed, heads]` and their output `[heads, embed]`,
+  the matrices Muon steps, where they took the headed form's three axes.
+- A model an adapter targets unlike along a scanned run of like layers draws afresh, each layer's
+  factors at its own rank.
 - A layout that keeps the optimizer state or the EMA in pinned host memory (`Layout(host=...)`) now brings
   it to the device a chunk at a time as the step commits: the leaves the commit reads together, under AdamW
   one parameter's moments and average, each chunk stored back as soon as it is updated. It used to fetch the
   whole state at once, and XLA held all of it beside the parameters and the gradient, so a whole
   Qwen3.5-4B's AdamW step with its moments on the host never fit a GH200. The memory planner's derived
   footprint counts what a commit stages.
+- `ChunkAdaptation(carry="run")` keeps a continuum level's in-context steps across documents and updates: a
+  row's documents step one level in turn, and each update carries its rows' mean step into the `carried`
+  collection, which the run saves and resumes bit for bit. The per-document reset stays the default.
+- A chain of continuum levels (`CausalTransformer(continuum=(ContinuumLevel(...), ...))`), Nested Learning's
+  multi-frequency memory, steps each level in context at its own window and rate
+  (`ChunkAdaptation(window=(16, 64), rate=(1e-2, 2e-3))`), damped or not. A chain's levels live in
+  `continuum_0`, `continuum_1`, ...; a single level keeps `continuum`.
+- `ChunkAdaptation(layers=...)` steps a pretrained decoder's own feed-forward blocks in context, chunk by chunk
+  through its decode cache (`dew.objectives.lm.stacking`, section 7.3's ad-hoc level stacking), so continued
+  pre-training trains the blocks' starts through their steps. A prefix run's blocks, and a batch's, are read
+  whole: a chunk that a block crosses reads it to its end before the cache holds it. The blocks are read and
+  written wherever the store keeps them, a run's bank included (`StackView.stored_layer`).
+- `dew.eval.continual`: a continual run's accuracy matrix, forgetting and backward transfer, and a language
+  model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
+- An evaluation's outputs, and every tree `collective_host` reads home on one process, come home through
+  their devices' pinned host memory where they have it, in one transfer (`dew._coordination.pinned_get`).
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
   curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and
@@ -80,7 +125,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   read of the training stream after its first is agreed over the coordination service only where its
   shares may run out apart, so a global order, arrays handed whole and a handed map dataset step without a
   round a step.
-- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
+- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
+  on Linux Dew's build of it, 14.0.0.post1 from Dew's package index, which registers the facts of a deep term
+  with shared subterms in linear time rather than cubic (a recurrence chunk's rewrite 243 s on 14.0.0, 9.2 s).
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
   traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.

@@ -25,6 +25,7 @@ import numpy as np
 from dew.cache import dew_cache_dir
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS, Loading
+from dew.data.declared import Declared
 from dew.data.generation import (
     GENERATION_SCHEMA,
     DependencyManifest,
@@ -389,10 +390,12 @@ class _Writer:
     def _records(self):
         @lru_cache(maxsize=2)
         def opened(shard: int) -> ArrayRecords:
-            return ArrayRecords(
-                (self.root.child(f"shards/{self.writer}/{shard:06d}.array_record").url,),
-                self.cache._mirror_options(),
-            )
+            # Read once its upload completed, by the declaration its segment published, so Dew's mirror
+            # holds the copy the publication checks (`dew.data.generation._sealed`), not another beside it.
+            declaration = json.loads(_checked(self.root, self.futures[shard].result()))["shard"]
+            # The mirror's own options, its budget among them, on the declared store as on the reader.
+            store = Store(self.root.child(declaration["path"]).url, self.cache._mirror_options())
+            return ArrayRecords((store.url,), store.storage_options, declared=(Declared(store, declaration),))
 
         return opened
 

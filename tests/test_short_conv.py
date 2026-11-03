@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     assert_as_exact,
@@ -79,23 +78,35 @@ def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True, se
     return out, tuple(found)
 
 
+FP32_SEEDS = 8
+"""The fp32 conv's check-1 seeds, the gate's fewest."""
+
+
 def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
     return short_conv.conv(x, weights, shift, None if valid is None else valid.astype(jnp.int8), segments,
                            parts, activation=activation, eps=1e-6, dtype=jnp.dtype(dtype),
                            interpret=jax.default_backend() != "gpu")
 
 
+TANGENT_SEEDS = 8
+"""The declared draws of the conv's forward-mode tangent on the kernels against XLA's (check 1), sized by
+`seeds_for`: the fewest for which XLA's tangent compared with itself resolves the factor."""
+
+
 @pytest.mark.parametrize("staged", ["jit", "remat"])
 def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
     """`jax.jvp` of the conv on the kernels (interpreted off a GPU), a normalised piece among its pieces,
     staged by a jit or by a remat as a layer's `nn.remat` stages it: its tangent XLA's conv's
-    (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64. Its selector once
-    routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom VJP raised
-    (row 2395)."""
+    (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64 (check 1). Its
+    selector once routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom
+    VJP raised (row 2395)."""
     parts = ((64, 32), (64, None))
-    x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True)
-    tangents = tuple(jnp.asarray(np.random.default_rng(3 + index).normal(size=t.shape), t.dtype)
-                     for index, t in enumerate((x, weights, shift)))
+
+    def draw(seed):
+        x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True, seed=seed)
+        rng = np.random.default_rng(1000 + seed)
+        tangents = (jnp.asarray(rng.normal(size=t.shape), t.dtype) for t in (x, weights, shift))
+        return (x, weights, shift, *tangents)
 
     def kernels(x, weights, shift):
         return kernel_conv(x, weights, activation=True, shift=shift, valid=None, segments=None, parts=parts,
@@ -104,16 +115,14 @@ def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
     def xla(x, weights, shift):
         return xla_conv1d(x, weights, activation=True, bias=shift, parts=parts, dtype=x.dtype)
 
-    def tangent(pieces, *primals_and_tangents):
-        rule = jax.jit(pieces) if staged == "jit" else jax.checkpoint(pieces)
-        return jax.jvp(rule, primals_and_tangents[:3], primals_and_tangents[3:])[1]
+    def tangent(pieces):
+        def run(*primals_and_tangents):
+            rule = jax.jit(pieces) if staged == "jit" else jax.checkpoint(pieces)
+            return jax.jvp(rule, primals_and_tangents[:3], primals_and_tangents[3:])[1]
+        return run
 
-    mine = tangent(kernels, x, weights, shift, *tangents)
-    theirs = tangent(xla, x, weights, shift, *tangents)
-    with jax.enable_x64(new_val=True):
-        exact = tangent(xla, *widened((x, weights, shift, *tangents)))
-    for index, (found, reference, value) in enumerate(zip(mine, theirs, exact, strict=True)):
-        assert_as_exact_as_the_reference(found, reference, value, f"{staged} piece {index}")
+    assert_as_exact(tangent(kernels), tangent(xla), draw, f"the conv's tangent on the kernels, {staged}",
+                    seeds=TANGENT_SEEDS)
 
 
 def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None):
@@ -138,18 +147,6 @@ def row_truth(x, weights, parts, grads, segments):
     return pieces, (dx, dtaps, *rows[0][1][2:])
 
 
-def assert_follows_xla(got, want, exact, label):
-    """A piece or gradient as XLA computes it: a bf16 one rounded where XLA rounds it, apart only where
-    their fp32 sums straddle a rounding (`assert_rounds_where_the_reference_does`), an fp32 one within
-    fp32 reassociation of the largest value."""
-    assert got.dtype == want.dtype, (label, got.dtype, want.dtype)
-    if want.dtype == jnp.bfloat16:
-        assert_rounds_where_the_reference_does(got, want, exact, label)
-        return
-    apart, scale = (float(np.abs(np.asarray(a, np.float64)).max()) for a in (got - want, exact))
-    assert within(apart, 1e-5 * scale), (label, apart, scale)
-
-
 @pytest.mark.parametrize("dtype, out", [(jnp.bfloat16, jnp.bfloat16), (jnp.bfloat16, jnp.float32),
                                          (jnp.float32, jnp.float32)])
 @pytest.mark.parametrize("shape, parts, taps, bias, valid, packed", [
@@ -163,22 +160,46 @@ def assert_follows_xla(got, want, exact, label):
     ((2, 9), ((48, None),), 2, True, False, False),
 ])
 def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
-    """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them:
-    bf16 values rounded where XLA rounds them, fp32 ones within fp32 reassociation, at lengths that
-    leave runs and a tile partly past the end, and over packed documents that start inside a window."""
-    x, weights, shift, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+    """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
+    lengths that leave runs and a tile partly past the end, and over packed documents that start inside a
+    window: bf16 pieces and the projection's bf16 gradient rounded where XLA rounds them, and every fp32 leaf
+    (a call's of fp32 pieces, and the taps' and bias's gradients, fp32 sums over every token whatever the
+    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1)."""
     segments = documents(*shape) if packed else None
-    grads = cotangents(x, parts, out)
+    _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
+
+    def drawn(seed):
+        x, weights, shift, _ = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid,
+                                        seed=seed)
+        return x, weights, shift, cotangents(x, parts, out, seed=seed + 1)
+
+    # The leaves check 1 holds: every one of an fp32 call, the taps' and bias's gradients of a bf16 one.
+    wide = jnp.dtype(out) == jnp.float32
+
+    def held(found):
+        pieces, grads = found
+        return (pieces, grads) if wide else grads[1:]
+
+    def conv(fn):
+        return lambda x, weights, shift, grads: held(run(fn, x, weights, shift, kept, parts, out, grads,
+                                                         segments=segments))
+
+    def exact(x, weights, shift, grads):
+        return held(truth(x, weights, shift, kept, parts, grads, segments=segments))
+
+    assert_as_exact(jax.jit(conv(kernel_conv)), jax.jit(conv(xla_conv1d)), drawn,
+                    f"the conv to {jnp.dtype(out).name} {jnp.dtype(dtype).name} {shape} {parts}",
+                    seeds=FP32_SEEDS, truth_fn=exact)
+    if wide:
+        return
+    x, weights, shift, grads = drawn(0)
     got, got_grads = run(kernel_conv, x, weights, shift, kept, parts, out, grads, segments=segments)
     want, want_grads = run(xla_conv1d, x, weights, shift, kept, parts, out, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
-    for number, (piece, reference, value) in enumerate(zip(got, want, exact, strict=True)):
+    exact_pieces, exact_grads = truth(x, weights, shift, kept, parts, grads, segments=segments)
+    for number, (piece, reference, value) in enumerate(zip(got, want, exact_pieces, strict=True)):
         assert piece.dtype == jnp.dtype(out)
-        assert_follows_xla(piece, reference, value, f"piece {number}")
-    for name, grad, reference, value in zip(("x", "taps", "bias"), got_grads, want_grads, exact_grads,
-                                            strict=True):
-        if grad is not None:
-            assert_follows_xla(grad, reference, value, f"d{name}")
+        assert_rounds_where_the_reference_does(piece, reference, value, f"piece {number}")
+    assert_rounds_where_the_reference_does(got_grads[0], want_grads[0], exact_grads[0], "dx")
 
 
 def test_padding_tokens_are_zero_and_pass_no_gradient():

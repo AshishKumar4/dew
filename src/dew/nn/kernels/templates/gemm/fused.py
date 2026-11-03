@@ -337,9 +337,9 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
         if block_shape is None or index_map is None:
             return Refusal('value_unblocked', f"a {array.shape} side array has no block")
         named = []
-        for block, index, size in zip(block_shape, index_map(1, 2), array.shape, strict=True):
-            if index in (1, 2) and block == probe[index - 1] and size == shape[index - 1]:
-                named.append(PROLOGUE_AXES[index - 1])
+        for block, axis, size in zip(block_shape, _followed(index_map), array.shape, strict=True):
+            if axis is not None and block == probe[axis] and size == shape[axis]:
+                named.append(PROLOGUE_AXES[axis])
             elif size == 1 and block == 1:
                 named.append(None)
             else:
@@ -391,11 +391,11 @@ def _axes(consumer, values, acc) -> tuple | Refusal:
         if block_shape is None or index_map is None:
             return Refusal('value_unblocked', f"a captured {leaf.shape} array has no block")
         named = []
-        for block, index, size in zip(block_shape, index_map(1, 2), leaf.shape, strict=True):
-            if index not in (1, 2) or block != probe[index - 1] or size != acc.shape[index - 1]:
+        for block, axis, size in zip(block_shape, _followed(index_map), leaf.shape, strict=True):
+            if axis is None or block != probe[axis] or size != acc.shape[axis]:
                 return Refusal(
                     'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile")
-            named.append(AXES[index - 1])
+            named.append(AXES[axis])
         axes.append(tuple(named))
     if _reads_position(tiled, value_specs, values, probe):
         return Refusal('reads_position', "the consumer reads its tile's position")
@@ -421,10 +421,22 @@ def _specs(consumer, values, acc, block: tuple):
 
 
 def _is_tile(spec, probe: tuple) -> bool:
-    """Whether `spec` is the probe tile at its own place: a block of `probe` at (row, column)."""
+    """Whether `spec` is the probe tile at its own place: a block of `probe` at (row, column), its index map
+    the identity (`_followed`)."""
     block_shape, index_map = _block_and_map(spec)
-    return block_shape is not None and index_map is not None and tuple(block_shape) == probe and tuple(
-        index_map(1, 2)) == (1, 2)
+    return (block_shape is not None and index_map is not None and tuple(block_shape) == probe
+            and _followed(index_map) == (0, 1))
+
+
+def _followed(index_map) -> tuple[int | None, ...]:
+    """Which launch axis each block index of `index_map` is, read off its program over the two launch
+    indices: an index that is a launch index itself names its axis, any other (one computed from them, a
+    constant) none. What it gives at one point proves nothing of the map: (row, column) -> (row * row,
+    column) gives (1, 2) at (1, 2)."""
+    closed = jax.make_jaxpr(index_map)(jnp.int32(0), jnp.int32(0))
+    invars = closed.jaxpr.invars
+    return tuple(next((axis for axis, var in enumerate(invars) if out is var), None)
+                 for out in closed.jaxpr.outvars)
 
 
 def _block_and_map(spec):

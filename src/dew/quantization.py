@@ -68,14 +68,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import core, linen as nn
+from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.batch import Coordinates
+from dew.batch import Coordinates, unboxed
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
+from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
+from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -345,8 +348,9 @@ class LinearProducts(nn.Module):
     def applied_kernel(self, name: str) -> jax.Array:
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
-        frozen FP8 site's is its codes decoded."""
-        return getattr(self, name).get_variable("params", "kernel")
+        frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
+        (`nn.with_logical_partitioning`)."""
+        return meta.unbox(getattr(self, name).get_variable("params", "kernel"))
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
@@ -580,20 +584,13 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     return product * scales * row_scales.T
 
 
-@jax.custom_jvp
-def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
-                       dgrad_scale: jax.Array) -> jax.Array:
-    """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
-    `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
-    gradient for the kernel, which is frozen. Forward mode (`jax.jvp`, MeanFlow's
-    target) takes the input's tangent times the decoded kernel
-    (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
-    reverse mode runs the FP8 input gradient (`_frozen_fp8_tangent`)."""
+def _frozen_fp8_value(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
+                      dgrad_scale: jax.Array) -> jax.Array:
+    """`frozen_fp8_product`'s value: the FP8 rows' product."""
     return _fp8_rows(x, forward, forward_scale)
 
 
-@frozen_fp8_product.defjvp
-def _frozen_fp8_tangent(primals, tangents):
+def _frozen_fp8_tangent(primals, tangents, value):
     """The product's tangent along `x`'s, the packed leaves frozen whatever their tangents: the
     direction times the decoded forward rows in float32 at the highest precision, a linear map whose
     transpose is the FP8 input gradient, in `x`'s dtype (`generation.linear_map`). Its residuals are
@@ -613,7 +610,15 @@ def _frozen_fp8_tangent(primals, tangents):
         return _fp8_rows(cotangent, rows, row_scales).astype(like.dtype)
 
     residuals = (forward, forward_scale, dgrad, dgrad_scale, jnp.zeros((0,), x.dtype))
-    return frozen_fp8_product(*primals), linear_map(tangent, transposed, residuals, tangents[0])
+    return linear_map(tangent, transposed, residuals, tangents[0])
+
+
+frozen_fp8_product = surrogate(_frozen_fp8_value, _frozen_fp8_tangent)
+"""`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as `frozen_fp8_leaves`: FP8 products
+forward and for `x`'s gradient, and no gradient for the kernel, which is frozen. A surrogate
+(`dew.nn.derivatives.surrogate`): forward mode (`jax.jvp`, MeanFlow's target) takes the input's tangent
+times the decoded kernel (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
+reverse mode runs the FP8 input gradient (`_frozen_fp8_tangent`)."""
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
@@ -624,7 +629,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
-        product = product + module.get_variable("params", "bias").astype(jnp.float32)
+        product = product + meta.unbox(module.get_variable("params", "bias")).astype(jnp.float32)
     dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
     return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
 
@@ -881,6 +886,7 @@ class InputQuantization:
     def packed(self, frozen: Variables) -> Variables:
         """The `QUANTIZATION` leaves of `frozen_fp8`, packed from the kernels
         the `frozen` tree holds at their scopes (`frozen_fp8_leaves`)."""
+        frozen = unboxed(frozen)
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
@@ -1007,6 +1013,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     """
     from dew import _coordination, cache
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
+
+    variables = unboxed(variables)
 
     def planned() -> dict:
         return {"tokens": tokens,
@@ -1208,10 +1216,13 @@ def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., 
     return convolved
 
 
-def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
+def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool, collect: bool = True):
     """`operand` quantized as Qwix's training forward quantizes it (0.1.8
     `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
-    configuration quantizes nothing."""
+    configuration quantizes nothing; its calibration recorded where its
+    configuration collects it, unless `collect` is off (a derivative's
+    recomputation, which records nothing: collecting records the calibration
+    it is given)."""
     conv_general = _qwix("qwix._src.core.conv_general")
     qarray = _qwix("qwix._src.core.qarray")
     numerics = _qwix("qwix._src.core.numerics")
@@ -1225,8 +1236,8 @@ def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
     if getattr(config, f"{side}_disable_channelwise_axes"):
         how = dataclasses.replace(how, channelwise_axes=[])
     calibration = qarray.calibrate(operand, how)
-    if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
-        calibration = collect(calibration)
+    if collect and (collected := getattr(config, f"{side}_collect_quant_stat")) is not None:
+        calibration = collected(calibration)
     scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
     return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
 
@@ -1250,16 +1261,21 @@ def _grouped_convolution_gradient() -> type:
     importing Qwix here keeps it optional."""
     qwix = _qwix()
 
-    @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
-    def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
-                        dimension_numbers, feature_group_count, batch_group_count, out_sharding):
-        return _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
-                           dimension_numbers, feature_group_count, batch_group_count, out_sharding)[0]
-
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                         feature_group_count, batch_group_count, out_sharding, residuals, g):
+                         feature_group_count, batch_group_count, out_sharding, primals, tangents, value):
+        """The float convolution's tangent at the operands the forward dequantized (`_qt_forward`'s, read
+        from its value, not quantized again), which reverse mode transposes into Qwix's float backward; and
+        the quantized operands' own tangent, their codes' none and their scales' the calibration's
+        derivative, so a derivative of this one goes through each operand's quantization, its scale
+        included, as Qwix's computes it."""
+        _, quantized = value
+        numbers = jax.lax.conv_dimension_numbers(primals[0].shape, primals[1].shape, dimension_numbers)
+
+        def quantize(lhs, rhs):
+            return (_qt_operand(lhs, config, numbers, for_lhs=True, collect=False),
+                    _qt_operand(rhs, config, numbers, for_lhs=False, collect=False))
         operands = [qwix.dequantize(operand) if isinstance(operand, qwix.QArray) else operand
-                    for operand in residuals]
+                    for operand in quantized]
 
         def convolve(lhs, rhs):
             # A bf16 module's kernel meets Dew's float32 grouped input
@@ -1269,10 +1285,13 @@ def _grouped_convolution_gradient() -> type:
                 lhs.astype(dtype), rhs.astype(dtype), window_strides, padding, lhs_dilation, rhs_dilation,
                 dimension_numbers, feature_group_count, batch_group_count)
 
-        _, transpose = jax.vjp(convolve, *operands)
-        return transpose(g)
+        return jax.jvp(convolve, tuple(operands), tuple(tangents))[1], jax.jvp(quantize, tuple(primals),
+                                                                              tuple(tangents))[1]
 
-    grouped_conv_qt.defvjp(_qt_forward, straight_through)
+    # The integer convolution, differentiated as the float one at its dequantized operands: a surrogate,
+    # whose value carries the quantized operands so the forward quantizes once (a static-scale
+    # activation's running statistics update once a step).
+    quantized_training = surrogate(_qt_forward, straight_through, nondiff_argnums=tuple(range(2, 11)))
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's
@@ -1346,9 +1365,9 @@ def _grouped_convolution_gradient() -> type:
             else:
                 dtype = None
             config = self._create_conv_general_qt_config(rule, op_id, lhs, rhs)
-            convolved = grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation,
-                                        rhs_dilation, dimension_numbers, feature_group_count,
-                                        batch_group_count, out_sharding)
+            convolved, _ = quantized_training(lhs, rhs, config, window_strides, padding, lhs_dilation,
+                                              rhs_dilation, dimension_numbers, feature_group_count,
+                                              batch_group_count, out_sharding)
             return convolved if dtype is None else convolved.astype(dtype)
 
     return GroupedConvolutionGradient
@@ -1701,10 +1720,10 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
+def _serving_parameters(parameters: Variables, shaped: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
-    shapes = flatten_dict(abstract)
+    shapes = flatten_dict(shaped)
     quantized = {}
     for path, parameter in flatten_dict(parameters).items():
         host = isinstance(parameter, np.ndarray)
@@ -1743,6 +1762,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     place the weights with a mesh and layout before quantizing. Resident
     JAX parameters keep their placement through Qwix's operations.
     """
+    # A draw boxes the parameters its modules declare the axes of; Qwix quantizes their values.
+    variables = unboxed(variables)
     rules = _rules(spec, training=False)
     served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):
@@ -1754,8 +1775,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
                 scope.put_variable(collection, name, value)
         return served.clone(parent=scope)(*args, **kwargs)
 
-    _, abstract = jax.eval_shape(core.init(initialized), jax.random.key(0), variables)
-    parameters = _serving_parameters(variables["params"], abstract["params"])
+    _, abstracted = unboxed(abstract(core.init(initialized), jax.random.key(0), variables))
+    parameters = _serving_parameters(variables["params"], abstracted["params"])
     return served, {**variables, "params": parameters}
 
 

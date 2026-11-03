@@ -32,6 +32,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.batch import leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 
@@ -40,9 +41,16 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import generation
 from .kernels.templates.gemm import template
-from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
+from .precision import (
+    at_least_fp32,
+    capped_logits,
+    exact_float32,
+    float32_dot_general,
+    float32_einsum,
+    rounded_operand,
+)
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import logical_axes
+from .sharding import declared
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -258,6 +266,8 @@ class Router(nn.Module):
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
+    kernel_axes: LogicalAxes | None = None
+    """Its kernel's logical axes, as its owner declares them where it makes it."""
     def setup(self):
         if self.group_score not in ('top2', 'max'):
             raise ValueError(
@@ -314,22 +324,25 @@ class Router(nn.Module):
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
         self.kernel = self.param(
-            'kernel', normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
-            (self.in_features, self.num_experts), jnp.float32)
+            'kernel', declared(normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
+                               self.kernel_axes), (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
-                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
+                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, declared(jnp.zeros, ('exp',)),
                 (self.num_experts,), jnp.float32)
         if self.media_bias:
             self.bias_vl = self.variable(
-                EXPERT_BIAS_COLLECTION, 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
+                EXPERT_BIAS_COLLECTION, 'media_bias', declared(jnp.zeros, ('exp',)), (self.num_experts,),
+                jnp.float32)
         if self.hash_vocab is not None:
             if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
                     "balancing bias, no expert groups and no routing blocks")
+            # A token's experts, read by token: whole on every device.
             self.tid2eid = self.variable(
-                EXPERT_BIAS_COLLECTION, 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
+                EXPERT_BIAS_COLLECTION, 'tid2eid', declared(jnp.zeros, (None, None)),
+                (self.hash_vocab, self.top_k), jnp.int32)
 
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
@@ -393,12 +406,10 @@ class Router(nn.Module):
         `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
         (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
         past each other, where the references' float32 routers multiply in IEEE float32. A
-        `logit_softcap` caps them."""
+        `logit_softcap` caps them (`capped_logits`)."""
         logits = float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                                 precision=exact_float32(self.precision))
-        if self.logit_softcap is None:
-            return logits
-        return jnp.tanh(logits / self.logit_softcap) * self.logit_softcap
+        return capped_logits(logits, self.logit_softcap)
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -465,13 +476,72 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
     return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
 
 
-def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+BANKED_EXPERTS = 'banked_experts'
+"""The collection a run over a bank in device memory hands its experts' kernels in: each `ExpertLinear`'s
+kernel the bank's whole `[layers, experts, in, out]` and the layer read (`experts_apart`, `at_iteration`),
+read where it lies (`Layered`)."""
+
+
+class Layered(struct.PyTreeNode):
+    """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
+    layer read, which the GEMM template reads where it lies (`template.gemm`'s `layer`) rather than as a
+    slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
+    an H100)."""
+
+    stack: jax.Array
+    layer: jax.Array
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return self.stack.dtype
+
+
+def _expert_kernel(path: tuple[str, ...]) -> bool:
+    """Whether a run's parameter at `path` is an `ExpertMLP`'s expert kernel (`EXPERT_AXES`)."""
+    return len(path) >= 3 and path[-1] == 'kernel' and path[-2] in EXPERT_AXES and path[-3] == 'experts'
+
+
+def _layered(value) -> bool:
+    return isinstance(value, Layered)
+
+
+def holds_experts(params: Mapping) -> bool:
+    """Whether a banked run's `params` hold an `ExpertMLP`'s expert kernels (`experts_apart`)."""
+    return any(map(_expert_kernel, leaves_by_path(params)))
+
+
+def experts_apart(variables: Mapping[str, Mapping]) -> dict:
+    """A banked run's `params` and `BANKED_EXPERTS` collections with its experts' kernels moved from the
+    first to the second, at their paths, so the run reads the rest a layer at a time and hands the kernels
+    whole to every layer (`at_iteration`)."""
+    params: dict = {}
+    moved: dict = {}
+    for keys, leaf in leaves_by_path(variables.get('params', {})).items():
+        node = moved if _expert_kernel(keys) else params
+        for key in keys[:-1]:
+            node = node.setdefault(key, {})
+        node[keys[-1]] = leaf
+    return {'params': params, BANKED_EXPERTS: moved}
+
+
+def at_iteration(variables: Mapping[str, Mapping], layer: jax.Array) -> dict:
+    """The `BANKED_EXPERTS` collection with `layer`, the layer of the run read, beside each kernel, as
+    its `ExpertLinear` reads them (`Layered`)."""
+    def indexed(tree: Mapping) -> dict:
+        if 'kernel' in tree:
+            return {**tree, 'layer': layer}
+        return {key: indexed(value) for key, value in tree.items()}
+
+    return {BANKED_EXPERTS: indexed(variables.get(BANKED_EXPERTS, {}))}
+
+
+def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
-    dispatches.
+    dispatches. A `Layered` kernel is read at its layer of its stack, in place.
 
     Operands cast to `dtype` (flax's promotion when None), every contraction
     accumulates in at least fp32 and rounds once to the compute dtype, so a
@@ -499,11 +569,12 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
-    compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    resolved = precision
+    stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
+    compute = canonicalize_dtype(x, stack, dtype=dtype)
     xla = implementation == 'xla'
     with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
-        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
+        return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
+                             layer=layer)
 
 
 
@@ -511,11 +582,13 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
 class ExpertLinear(nn.Module):
     """One matrix per expert, `[exp, in_features, features]`; `ExpertMLP`
     reads the kernel and projects tokens sorted by expert through
-    `expert_projection`."""
+    `expert_projection`. `kernel_axes` are its logical axes, as its owner
+    declares them where it makes it."""
     num_experts: int
     in_features: int
     features: int
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
+    kernel_axes: LogicalAxes | None = None
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -523,13 +596,18 @@ class ExpertLinear(nn.Module):
         return projection_flops(lengths, self.in_features, self.features)
 
     def setup(self):
+        if self.has_variable(BANKED_EXPERTS, 'kernel'):
+            # A scanned decode over a bank hands the run's stack and the iteration's layer.
+            self.kernel = Layered(self.get_variable(BANKED_EXPERTS, 'kernel'),
+                                  self.get_variable(BANKED_EXPERTS, 'layer'))
+            return
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
-            normal_kernel(self.init_std, nn.initializers.variance_scaling(
+            declared(normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
-                batch_axis=(0,)))['kernel_init'],
+                batch_axis=(0,)))['kernel_init'], self.kernel_axes),
             (self.num_experts, self.in_features, self.features), jnp.float32)
 
 
@@ -721,16 +799,26 @@ def _dispatched[Parameters](
     # binary reducer, and JAX wraps this one's add in a sharding constraint).
     if mesh.shape.get(STAGE_AXIS, 1) > 1 and STAGE_AXIS not in mesh.manual_axes:
         manual.add(STAGE_AXIS)
-    stored = []
-    for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
+    def spec(leaf: jax.Array, axes: LogicalAxes) -> P:
         kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
                 for entry in logical_spec(axes, leaf.shape)]
-        stored.append(P(*(entry if entry else None for entry in kept)))
+        return P(*(entry if entry else None for entry in kept))
+
+    # A kernel read in place from a bank (`Layered`) holds its experts on its stack's second dimension.
+    stored, experts = [], []
+    for parameter, axes in zip(jax.tree.leaves(parameters, is_leaf=_layered), parameter_axes, strict=True):
+        if _layered(parameter):
+            stack = spec(parameter.stack, (None, *axes))
+            stored += [stack, P()]
+            experts.append(stack[1:])
+        else:
+            stored.append(spec(parameter, axes))
+            experts.append(stored[-1])
     held = jax.tree.unflatten(jax.tree.structure(parameters), stored)
     if exchanging:
-        if any(not spec or EXPERT_AXIS not in mesh_axes(spec[0]) for spec in stored):
+        if any(not entry or EXPERT_AXIS not in mesh_axes(entry[0]) for entry in experts):
             raise LayoutRefused("exchange dispatch holds each device's own experts, so every "
-                             "expert parameter splits its first dimension over the expert "
+                             "expert parameter splits its expert dimension over the expert "
                              f"axis; the rule table places them {stored}")
         inner = functools.partial(_exchange_shard, project, num_experts=num_experts,
                                   shards=shards, output_dtype=output_dtype, capacity=capacity)
@@ -738,14 +826,27 @@ def _dispatched[Parameters](
         inner = functools.partial(_sorted_locally, project, num_experts=num_experts)
 
     def body(x, indices, parameters, input_weights):
-        def gathered(leaf: jax.Array, spec: P) -> jax.Array:
-            for dimension, entry in enumerate(spec):
-                axes = tuple(axis for axis in mesh_axes(entry)
-                             if not (exchanging and dimension == 0 and axis == EXPERT_AXIS))
-                if axes:
-                    leaf = jax.lax.all_gather(leaf, axes, axis=dimension, tiled=True)
-            return leaf
-        return inner(x, indices, jax.tree.map(gathered, parameters, held), input_weights)
+        def gathers(spec: P) -> list[tuple[int, tuple[str, ...]]]:
+            """The dimensions a parameter of `spec` gathers over the manual axes, but its experts under
+            the exchange."""
+            named = [(dimension, tuple(axis for axis in mesh_axes(entry)
+                                       if not (exchanging and dimension == 0 and axis == EXPERT_AXIS)))
+                     for dimension, entry in enumerate(spec)]
+            return [(dimension, axes) for dimension, axes in named if axes]
+
+        def gathered(parameter, spec):
+            if _layered(parameter):
+                layer_spec = P(*spec.stack[1:])
+                if not gathers(layer_spec):
+                    return parameter
+                # A gathered kernel is a new array whatever is read: its layer's alone is gathered.
+                parameter = jax.lax.dynamic_index_in_dim(parameter.stack, parameter.layer, keepdims=False)
+                spec = layer_spec
+            for dimension, axes in gathers(spec):
+                parameter = jax.lax.all_gather(parameter, axes, axis=dimension, tiled=True)
+            return parameter
+
+        return inner(x, indices, jax.tree.map(gathered, parameters, held, is_leaf=_layered), input_weights)
 
     # The kernels carry no manual-axis type, so this map does not check them;
     # MaxText hosts its gmm the same way.
@@ -936,12 +1037,13 @@ class ExpertMLP(nn.Module):
         else:
             self.gate_proj = expert(in_features=self.out_features,
                                     features=self.hidden_features, init_std=self.init_std,
-                                    name='gate_proj')
+                                    name='gate_proj', kernel_axes=EXPERT_AXES['gate_proj'])
         self.up_proj = expert(in_features=self.out_features,
                               features=self.hidden_features, init_std=self.init_std,
-                              name='up_proj')
+                              name='up_proj', kernel_axes=EXPERT_AXES['up_proj'])
         self.down_proj = expert(in_features=self.hidden_features,
                                 features=self.out_features, name='down_proj',
+                                kernel_axes=EXPERT_AXES['down_proj'],
                                 init_std=(self.init_std if self.output_init_std is None
                                           else self.output_init_std))
 
@@ -976,7 +1078,8 @@ class ExpertMLP(nn.Module):
         kernels = tuple(getattr(self, name).kernel for name in names)
         # One compute dtype for every projection, named rather than
         # inferred inside the dispatch, where the parameters may be widened.
-        compute = expert_compute_dtype(x, *kernels, dtype=self.dtype)
+        compute = expert_compute_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
+                                            for kernel in kernels), dtype=self.dtype)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
             tuple(EXPERT_AXES[name] for name in names), num_experts=self.num_experts, dispatch=self.dispatch,
@@ -986,23 +1089,6 @@ class ExpertMLP(nn.Module):
         return self._combine(slots, weights)
 
 
-@logical_axes({
-    ("gate",): ("embed", "exp"),
-    # A sparse layer's experts are stacked on one leaf, so the expert
-    # dimension is named here and the longer path wins over the dense
-    # projection of the same name.
-    **{("experts", name): axes for name, axes in EXPERT_AXES.items()},
-    # The shared branch is one dense gated MLP beside the experts, sharded
-    # like the dense layers' own.
-    ("shared_experts", "gate_proj"): ("embed", "mlp"),
-    ("shared_experts", "up_proj"): ("embed", "mlp"),
-    ("shared_experts", "down_proj"): ("mlp", "embed"),
-    ("shared_expert_gate",): ("embed", None),
-    # Kimi K3's latent projections around the routed experts: the experts
-    # themselves run at the latent width under the expert names above.
-    ("routed_expert_down_proj",): ("embed", None),
-    ("routed_expert_up_proj",): (None, "embed"),
-})
 class SparseMLP(nn.Module):
     """A router over `num_experts` MLPs, `top_k` of them per token.
 
@@ -1093,9 +1179,9 @@ class SparseMLP(nn.Module):
                            block_experts=self.block_experts,
                            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
                            logit_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
-                           hash_vocab=self.hash_vocab,
-                           init_std=self.init_std,
-                           precision=self.precision, name='gate')
+                           hash_vocab=self.hash_vocab, init_std=self.init_std,
+                           # Its experts split as the experts it chooses do.
+                           kernel_axes=("embed", "exp"), precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -1109,8 +1195,10 @@ class SparseMLP(nn.Module):
         if self.latent_features is not None:
             dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                       dot_general=float32_dot_general)
-            self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
-            self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
+            self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj',
+                                                 kernel_axes=("embed", None))
+            self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj',
+                                               kernel_axes=(None, "embed"))
             if self.latent_norm is not None:
                 self.routed_expert_norm = self.latent_norm(name='routed_expert_norm')
         if self.shared_gate and self.shared is None:
@@ -1120,7 +1208,7 @@ class SparseMLP(nn.Module):
             if self.shared_gate:
                 self.shared_expert_gate = Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
-                    name='shared_expert_gate', **normal_kernel(self.init_std),
+                    name='shared_expert_gate', **normal_kernel(self.init_std), kernel_axes=("embed", None),
                     dot_general=float32_dot_general)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:

@@ -9,6 +9,7 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 import dataclasses
 import itertools
 import json
+import logging
 import os
 
 import lane_environment
@@ -141,6 +142,25 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
 
 
+def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_split(tmp_path, monkeypatch):
+    """A step whose plan is the remat ladder's top ('full') lists, past it, the sibling that keeps what
+    'minimal' saves in pinned host memory in place of recomputing it ('minimal_offloaded') at the plan's
+    split: as many device bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses
+    (row 1932). The run, which times nothing, is left at 'full'."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None, remat="full")
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, frontier=True)
+    plan = record(ahead.plan, "plan")
+    (sibling,) = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    assert plan["remat"] == remat_record(REMAT_POLICIES["full"])
+    assert sibling["remat"] == remat_record(REMAT_POLICIES["minimal_offloaded"])
+    assert sibling["fits"] is True and sibling["split"] == plan["split"]
+    assert trainer.plan == ahead.plan
+
+
 def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
     """A step compiled for compile-only GPUs takes autotuning off (`deviceless_options`), its programs' bytes
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
@@ -183,6 +203,25 @@ def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refuse
     with Compiles("step") as compiles, pytest.raises(ValueError):
         compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     assert compiles.count == 0
+
+
+def test_a_run_compiled_ahead_on_gpus_given_no_capacity_hears_they_state_no_memory(tmp_path, monkeypatch,
+                                                                                    caplog):
+    """A run that sets its remat, compiled ahead on GPUs given no capacity, whose memory nothing states,
+    has no rung judged ("unstated", one answer for the walk and the footprint, `memory.judged`; rows 3667,
+    3668), compiles at its own rung alone, and hears once that its devices state no memory, not that its
+    layout cannot be judged ("unknown")."""
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    plan = record(ahead.plan, "plan")
+    derived = listed(plan["derived"], "derived", read=record, what="derived rungs")
+    assert compiles.count == 1 and [entry["label"] for entry in derived] == ["unstated"]
+    assert len([entry for entry in caplog.records if entry.name == "dew.training.planning"]) == 1
 
 
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):

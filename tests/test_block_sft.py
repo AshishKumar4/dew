@@ -16,6 +16,7 @@ import numpy as np
 import optax
 import pytest
 from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
+from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import as_given, assert_as_exact, stacked_on_host
 from safetensors.numpy import load_file
@@ -88,7 +89,7 @@ def test_the_block_objectives_head_takes_the_fit_ladders_tile():
 
 def reference_variables(loaded, name):
     values, _ = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
-    return objective(loaded, variables=values).init(jax.random.key(0))
+    return nn.unbox(objective(loaded, variables=values).init(jax.random.key(0)))
 
 
 def trainer_update(obj, batch, run_key, optimizer):
@@ -242,7 +243,7 @@ def test_official_sft_loss_and_every_parameter_gradient(source):
     """
     loaded, batch, step, reference = source
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     (loss, aux), gradient = jax.value_and_grad(
         lambda values: obj.scalar_loss(values, batch, step), has_aux=True)(variables)
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
@@ -259,7 +260,7 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
     loaded, batch, step, _ = source
     obj = objective(loaded, stop_gradient_from_denoiser_to_encoder=True)
     gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(
-        jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))))
+        jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0)))))
     expected = reference_variables(loaded, "detached_gradient.safetensors")
     assert_tree_close(gradient, expected, 1e-4)
     full = reference_variables(loaded, "gradient.safetensors")
@@ -279,14 +280,14 @@ def test_both_self_conditioning_branches_match_the_official_adapter(source, prob
     # Every row's self-conditioning is the probability's, not the reference's mixed draw.
     tape = {name: value for name, value in step.tape.items() if name != "self conditioning"}
     step = step.replace(tape=tape)
-    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0)))), batch, step)
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
 
 def test_loss_weights_apply_after_independent_row_normalization(source):
     loaded, batch, step, reference = source
     obj = objective(loaded, encoder_loss_weight=0.3, decoder_loss_weight=2.7)
-    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0)))), batch, step)
     expected = 0.3 * reference["encoder_loss"].mean() + 2.7 * reference["canvas_loss"].mean()
     np.testing.assert_allclose(loss, expected, atol=1e-5, rtol=0)
     canvas_mass = reference["selected_mask"].sum(axis=(1, 2))
@@ -307,7 +308,7 @@ def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(so
     extension = DifferentialExtension(((0, (0, 1)),), anneal_steps=10)
     obj = BlockDiffusionObjective(loaded.model.clone(text=loaded.model.text.with_dex(extension)),
                                   prompt_length=4, num_canvases=2)
-    variables = obj.init(jax.random.key(0))
+    variables = nn.unbox(obj.init(jax.random.key(0)))
     started, halfway = (float(obj.scalar_loss(variables, batch, replace(
         step, committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5))
     assert started != halfway
@@ -320,7 +321,7 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
     pass is exp of the denoising loss per target."""
     loaded, batch, step, reference = source
     obj = objective(loaded)
-    scored = obj.evaluate(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    scored = obj.evaluate(jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0)))), batch, step)
     weights = np.asarray(scored.weights)
     np.testing.assert_array_equal(weights, reference["selected_mask"][..., 0].astype(weights.dtype))
     row_means = (np.asarray(scored.losses) * weights).sum(-1) / weights.sum(-1)
@@ -332,7 +333,7 @@ def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
     # Another batch than the reference's: the step draws its own, not the reference's tape.
     step = step.replace(tape=None)
     obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (4, 1))
     mask = jnp.asarray([[0, 0, 1, 1], [0, 0, 0, 1], [1, 1, 1, 1], [0, 0, 0, 0]], bool)
     valid = jnp.ones_like(tokens, bool).at[2, 4:6].set(False)
@@ -354,7 +355,7 @@ def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
     step = step.replace(tape=None)
     obj = BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=4,
                                   canvas_size=2, variables=loaded.variables)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     mask = jnp.tile(jnp.asarray([0, 0, 1, 1, 0, 0, 0, 1], bool), (64, 1))
     batch = {"text": jnp.tile(jnp.arange(1, 13, dtype=jnp.int32), (64, 1)), "canvas_mask": mask}
     scored = jax.jit(obj.evaluate)(variables, batch, step)
@@ -375,7 +376,7 @@ def test_the_model_the_trainer_substitutes_is_the_one_the_losses_run(source):
     entropies to the uniform distribution's."""
     loaded, batch, step, _ = source
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     before = float(obj.scalar_loss(variables, batch, step)[0])
     (program,) = obj.program_key()
     obj.substitute([program.module.clone(text=program.module.text.clone(final_logit_softcap=1e-6))])
@@ -398,7 +399,7 @@ def text_run(source):
     rows = math.lcm(2, jax.device_count())
     batch = jax.tree.map(lambda value: np.concatenate([value] * (rows // 2), axis=0), original_batch)
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     return obj, batch, dataset(batch), jax.random.key(int(reference["run_seed"])), variables
 
 
@@ -466,7 +467,7 @@ def loaded_image_source():
     # The loaded source itself, whose weights and end-of-sequence ids the objective takes, its text
     # processor left out as the objective's tests read token ids.
     obj = BlockDiffusionObjective(loaded, prompt_length=8, processor=None)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(3), ema=None)
     return loaded, inputs, obj, variables, step
 
@@ -474,7 +475,7 @@ def loaded_image_source():
 def test_model_inputs_text_matches_raw_loss_and_gradients(source):
     loaded, batch, step, _ = source
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     evaluate = jax.jit(jax.value_and_grad(lambda values, data: obj.scalar_loss(values, data, step)[0]))
     raw = evaluate(variables, batch)
     prepared = evaluate(variables, {**batch, "text": ModelInputs(jnp.asarray(batch["text"]))})
@@ -589,13 +590,14 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
-    assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
+    assert_tree_close(nn.unbox(restored.init(jax.random.key(0))), resumed.variables, 0)
     # The published task's loss under the run's draws for the unrepeated rows.
     started = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(started.key, 0), ema=None,
                 **example_fields(started, 0, 1, {"text": inputs}))
     original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
-    restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
+    fresh = nn.unbox(restored.init(jax.random.key(0)))
+    restored_loss = restored.scalar_loss(fresh, {"text": inputs}, step)[0]
     np.testing.assert_array_equal(restored_loss, original_loss)
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
     key = jax.random.key(11)
@@ -621,7 +623,7 @@ def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
         return "self_attn" in path
 
     obj = objective(loaded, variables=freeze(loaded.variables, attention))
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     assert set(variables) >= {"params", FROZEN}
     kept = [path for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])]
     assert kept and all("self_attn" in jax.tree_util.keystr(path) for path in kept)
@@ -651,7 +653,7 @@ def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source)
     loaded, _, step, _ = source
     step = step.replace(tape=None)
     obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     roles = [Role.USER] * 3 + [Role.ASSISTANT] * 3
     rows = ResponseCanvases(prompt_length=4, canvas_size=2, count=2, eos_id=7, pad_id=0).flat_map(
         {"text": np.asarray([5, 0, 6, 8, 9, 3], np.int32), ROLES_KEY: np.asarray(roles, np.int8)})
@@ -730,7 +732,7 @@ def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
     by module path, which the same draws give when those passes are called directly."""
     loaded, batch, step, _ = source
     obj = objective(loaded)
-    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    variables = jax.tree.map(jnp.asarray, nn.unbox(obj.init(jax.random.key(0))))
     _, aux = obj.scalar_loss(variables, batch, step.replace(qk_stats=True))
     assert aux.qk_stats is not None
     expected = merged(sown_passes(obj, variables, batch, step))

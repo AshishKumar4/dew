@@ -28,7 +28,7 @@ A checkpoint saves the stream's position, so a resumed run continues where it st
 
 ## Objective
 
-A Flax Linen module describes a computation and holds no variables. `model.init(key, sample)` creates the variables, and `model.apply(variables, inputs)` runs the computation with them. An `Objective` connects a model to the trainer: `init` returns the variables and `loss` returns the quantity to minimize.
+A Flax Linen module describes a computation and holds no variables. `model.init(key, sample)` creates the variables, and `model.apply(variables, inputs)` runs the computation with them. A Dew model's `init` returns each parameter whose axes its module names in Flax's partitioning box (`nn.LogicallyPartitioned`), as Flax's partitioning reads them; Dew takes boxed and plain trees alike, and code that reads the arrays itself unboxes them first (`nn.unbox(variables)`). An `Objective` connects a model to the trainer: `init` returns the variables and `loss` returns the quantity to minimize.
 
 ```python
 class Regression(Objective):

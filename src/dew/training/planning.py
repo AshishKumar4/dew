@@ -45,17 +45,17 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
-    device_memory,
     deviceless_options,
     head_fused_of,
     head_tile_of,
+    judged,
     local_devices,
     recompute_more,
     recompute_record,
     remat_half,
     remat_more,
+    remat_offloaded,
     rung_record,
-    stated,
     step_fits,
     temporaries_factor,
 )
@@ -518,11 +518,24 @@ def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> di
     return {"launch": identity, "config": repr(config), "kernels": kernels}
 
 
+def rewrite_record(made) -> dict[str, JSON]:
+    """A region the algebra pass rewrote as a compile traced its program (`dew.algebra.program.AlgebraReport`,
+    `report.rewrites`): its equations, the sets admitted and the matches each fired, its iterations, nodes and
+    limits, its price before and after, its seconds, and the roots its splice took."""
+    fired: dict[str, JSON] = dict(made.fired)
+    limits: list[JSON] = list(made.limits)
+    admitted: list[JSON] = list(made.admitted)
+    return {"equations": made.equations, "admitted": admitted, "fired": fired, "iterations": made.iterations,
+            "nodes": made.nodes, "limits": limits, "limited": made.limited, "before": made.before,
+            "after": made.after, "seconds": made.seconds, "spliced": made.spliced}
+
+
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
-    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    """A kernel a compile found spilling, or a launch whose program's block XLA refused (`report.Miss`), its
+    launch's config by its text."""
     return {"kernel": miss.kernel, "op": miss.op,
             "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
-            "frame": miss.frame, "stepped": miss.stepped}
+            "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass
@@ -603,13 +616,14 @@ class FitSearch[LossT, EffectsT]:
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the search then finds its split there.
         self.derived_start(candidates[-1])
-        seen, held = len(report.misses()), set(report.refused_launches())
+        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
-        self.kernels = {"spills": spills, "refused": refused}
+        rewrites: list[JSON] = [rewrite_record(made) for made in report.rewrites()[traced:]]
+        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
@@ -620,11 +634,13 @@ class FitSearch[LossT, EffectsT]:
         offline (`dew.training.ahead.compile_ahead`'s frontier). A rung at as many microbatches as one below
         it recomputes more for none fewer, which no speed favours, so it is not compiled; a remat rung takes
         the run's own head again (`recompute_more`), so a rung may fit at fewer than the one before it, and
-        the search reads the ladder to its end, or until a rung fits at the fewest. The objective is left
-        at the last rung read, the run's to restore."""
+        the search reads the ladder to its end, or until a rung fits at the fewest. Where the plan or the
+        last rung found is the ladder's top, its sibling that offloads the residuals it would recompute
+        (`remat_offloaded`) is compiled at its split too: as many device bytes, another speed (row 1932).
+        The objective is left at the last rung read, the run's to restore."""
         # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
         self.resumed = None
-        fewer, found = list(candidates[:candidates.index(split)]), []
+        fewer, found, plan = list(candidates[:candidates.index(split)]), [], self.current()
         while fewer and self.onward(lambda: recompute_more(self.objective, self.base)):
             asked = len(self.probes)
             fewest = planned(fewer, 0, self.fits_here, lambda: False,
@@ -633,6 +649,10 @@ class FitSearch[LossT, EffectsT]:
                 found.append(next(probe for probe in self.probes[asked:]
                                   if probe.fits and probe.split == fewest))
                 fewer = fewer[:fewer.index(fewest)]
+        last = found[-1].split if found and found[-1].rung == self.current() else (
+            split if not found and self.current() == plan else None)
+        if last is not None and remat_offloaded(self.objective) and self.fits_here(last):
+            found.append(self.probes[-1])
         return tuple(found)
 
     def derived_start(self, split: int) -> None:
@@ -664,16 +684,18 @@ class FitSearch[LossT, EffectsT]:
     def walked(self, split: int, until: str | None = None) -> tuple[str, bool]:
         """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
         fits the devices, each rung read appended to `derived`: the label the walk ends on, and whether
-        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one,
-        where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
+        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one
+        ("unknown"), where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not
+        read; where no device states memory to judge a rung against (`judging`), it reads none
+        ("unstated")."""
         assert self.derive is not None
         narrow, label = self.narrow, "refuses"
-        if not stated([device_memory(device, self.capacity) for device in local_devices(self.mesh)]):
+        if not self.judging():
             # A device that states no memory leaves every rung unjudged (`admitted`), so no footprint is
             # traced for it.
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
-                                 "label": "unknown", "terms": None})
-            return "unknown", narrow
+                                 "label": "unstated", "terms": None})
+            return "unstated", narrow
         while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
@@ -700,7 +722,8 @@ class FitSearch[LossT, EffectsT]:
         never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
         from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
         nothing, and traces nothing for it: no rung below its own is known. A layout the derivation cannot
-        judge (`walked`'s "unknown") is told so."""
+        judge (`walked`'s "unknown"), and devices that state no memory to judge it against ("unstated"), are
+        told so."""
         entries = self.objective.program_key()
         if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
@@ -726,11 +749,20 @@ class FitSearch[LossT, EffectsT]:
             _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
                          "recomputes less: leave the remat unset and the run compiles there first", own,
                          found)
+        elif label == "unstated":
+            _log.warning("the run sets remat %s, and its devices state no memory to judge a rung by (a CPU, "
+                         "or a compile-only GPU given no capacity), so it says nothing of a rung that "
+                         "recomputes less", own)
         elif label == "unknown":
             # The derivation reads per-device residuals only where each split axis is data or fsdp (row 2615).
             _log.warning("the run sets remat %s, and the derivation cannot judge its layout's footprint (a "
                          "tensor, sequence, stage or expert axis), so it says nothing of a rung that "
                          "recomputes less", own)
+
+    def judging(self) -> bool:
+        """Whether this process's devices judge a derived footprint (`memory.judged`) at the search's
+        capacity: where one does not, every rung is unknown and no footprint is traced."""
+        return all(judged(device, self.capacity) for device in local_devices(self.mesh))
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -809,17 +841,17 @@ class FitSearch[LossT, EffectsT]:
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        judged = None if candidate.footprint is None else derived_headroom(
+        foreseen = None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=judged)
-        if judged is not None and (judged >= 0) != fit:
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
+        if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
             footprint = candidate.footprint
             _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
                          "compile %s with %s, its temporaries %s bytes against a derived peak of %s "
                          "(derived terms %s); the compile decides, and the derivation is to fix",
-                         probe.named(), "fits" if judged >= 0 else "does not fit", judged,
+                         probe.named(), "fits" if foreseen >= 0 else "does not fit", foreseen,
                          "" if footprint is None or footprint.exact else " (its peak a bound from below)",
                          "fits" if fit else "does not fit", headroom, probe.temp,
                          None if footprint is None else footprint.peak,

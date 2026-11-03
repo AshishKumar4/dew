@@ -13,10 +13,12 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype
-from flax.typing import Dtype
+from flax.typing import Dtype, PrecisionLike
 
+from .dense import Dense
 from .kernels import norm_swiglu
-from .precision import at_least_fp32, rms_statistics, rms_weighted, rounded_to
+from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
+from .sharding import LogicalAxes, declared
 
 
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
@@ -269,6 +271,8 @@ class RMSNorm(nn.Module):
     implementation: str = 'auto'
     activation: Callable[[jax.Array], jax.Array] | None = None
     groups: int = 1
+    scale_axes: LogicalAxes | None = None
+    """The scale's logical axes, as its owner declares them where it makes it; None declares none."""
 
     def __call__(self, x, *, axes=None):
         """The norm of `x`. `axes`, `x`'s logical axes, place the fused kernel on a mesh."""
@@ -297,7 +301,7 @@ class RMSNorm(nn.Module):
         dtype = self.dtype if self.dtype is not None else x.dtype
         scale = self.param(
             'scale',
-            nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
+            declared(nn.initializers.zeros if self.scale_offset else nn.initializers.ones, self.scale_axes),
             (x.shape[-1],), jnp.float32) if self.with_scale else None
         if self.groups == 1:
             return stream_rms_normalized(x, branch, scale, self.epsilon, dtype, self.scale_offset,
@@ -323,14 +327,17 @@ class RMSNorm(nn.Module):
 
 class NormGate(nn.Module):
     """A norm's low-rank gate: `fc2(silu(fc1(y)))` of the normed `y`, unbiased, `rank` wide between
-    (A.X-K2's AXK2GateMLP, modeling_axk2.py:72-84)."""
+    (A.X-K2's AXK2GateMLP, modeling_axk2.py:72-84), both maps Dew's projections at the model's
+    `precision`."""
 
     rank: int
     dtype: Dtype | None = None
+    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, y):
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         return dense(y.shape[-1], name='fc2')(nn.silu(dense(self.rank, name='fc1')(y)))
 
 
@@ -343,6 +350,7 @@ class GatedRMSNorm(nn.Module):
     rank: int
     norm: Callable[..., RMSNorm]
     dtype: Dtype | None = None
+    precision: PrecisionLike = None
 
     def __call__(self, x, *, axes=None):
         return self.seam(x, axes=axes)[1]
@@ -351,7 +359,7 @@ class GatedRMSNorm(nn.Module):
     def seam(self, x, branch=None, *, axes=None):
         """The residual seam of its norm (`RMSNorm.seam`), its normed output gated."""
         stream, normed = self.norm(name='norm').seam(x, branch, axes=axes)
-        gate = NormGate(self.rank, dtype=self.dtype, name='mlp')(normed)
+        gate = NormGate(self.rank, dtype=self.dtype, precision=self.precision, name='mlp')(normed)
         wide = at_least_fp32(normed.dtype)
         return stream, (normed.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(normed.dtype)
 

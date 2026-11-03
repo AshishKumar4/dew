@@ -19,8 +19,8 @@ def test_token_lookup_preserves_linen_forward_and_parameter_layout(dtype, vocab)
     model = TokenEmbedding(vocab, 3, dtype=dtype)
     reference = nn.Embed(vocab, 3, dtype=dtype)
     ids = jnp.asarray([[0, 0, vocab - 1]], jnp.int32)
-    variables = reference.init(jax.random.key(4), ids)
-    native = model.init(jax.random.key(4), ids)
+    variables = nn.unbox(reference.init(jax.random.key(4), ids))
+    native = nn.unbox(model.init(jax.random.key(4), ids))
     assert jax.tree.structure(native) == jax.tree.structure(variables)
     for actual, expected in zip(jax.tree.leaves(native), jax.tree.leaves(variables), strict=True):
         np.testing.assert_array_equal(actual, expected)
@@ -36,7 +36,7 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     ids = jnp.asarray([0, 0, 0, 0, 1], jnp.int32)
     small = 2.0 ** (-8 if dtype == jnp.bfloat16 else -11)
     cotangent = jnp.asarray([[1, -1], [small, -small], [small, -small], [-1, 1], [2, 3]], dtype)
-    variables = model.init(jax.random.key(5), ids)
+    variables = nn.unbox(model.init(jax.random.key(5), ids))
 
     def loss(parameters):
         outputs = model.apply({"params": parameters}, ids)
@@ -56,7 +56,7 @@ def test_token_lookup_takes_forward_mode_and_nested_derivatives(dtype):
     over reverse is the gather's own; its gradient still accumulates in the table's dtype (the test above)."""
     model = TokenEmbedding(5, 3, dtype=dtype)
     ids = jnp.asarray([[0, 4, 4, 2]], jnp.int32)
-    table = model.init(jax.random.key(6), ids)["params"]["embedding"]
+    table = nn.unbox(model.init(jax.random.key(6), ids))["params"]["embedding"]
     direction = jax.random.normal(jax.random.key(7), table.shape, table.dtype)
 
     def lookup(table):
@@ -93,7 +93,7 @@ def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx)
     ids = np.asarray([[0, vocab - 1, 0], [vocab - 1, 0, vocab - 1]])
     cotangent = np.random.default_rng(7).integers(-8, 8, (*ids.shape, 3)).astype(np.float32)
     model = TokenEmbedding(vocab, 3, padding_idx=padding_idx)
-    variables = model.init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(4), jnp.asarray(ids, jnp.int32)))
 
     def loss(parameters):
         return jnp.sum(model.apply({"params": parameters}, jnp.asarray(ids, jnp.int32)) * cotangent)
@@ -141,7 +141,7 @@ def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family)
     model, lookup, name = choices[family]
     ids = jnp.asarray([0, 0, 0, 0, 1], jnp.int32)
     cotangent = jnp.asarray([[1, -1], [2**-8, -2**-8], [2**-8, -2**-8], [-1, 1], [2, 3]], dtype)
-    variables = model.init(jax.random.key(5), ids, method=lookup)
+    variables = nn.unbox(model.init(jax.random.key(5), ids, method=lookup))
 
     def loss(params):
         outputs = model.apply({"params": params}, ids, method=lookup)
@@ -178,7 +178,7 @@ class DenseObjective(Objective):
                       nn.Dense(1, param_dtype=jnp.float64 if parameter_kind == "float64" else jnp.bfloat16))
 
     def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.ones((1, 2), self.compute_dtype))
+        return nn.unbox(self.model.init(key, jnp.ones((1, 2), self.compute_dtype)))
 
     def reference_loss(self, params, batch):
         prediction = self.model.apply({"params": params}, batch["x"])
@@ -436,7 +436,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                                   num_heads=2, mlp_features=16, max_seq_len=8,
                                   mixture={"experts": 2, "top_k": 1, "bias": True})
-        initial = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4), jnp.int32))
+        initial = nn.unbox(model.init(jax.random.PRNGKey(1), jnp.ones((1, 4), jnp.int32)))
         initial["moe"] = jax.tree.map(lambda x: x.astype(bias_dtype), initial["moe"])
         objective = LMObjective(model, 4, variables=initial, head_chunks=1,
                                 balance=ExpertBalance(balance_rate=.02, aux_loss_alpha=.1, seq_aux=False))

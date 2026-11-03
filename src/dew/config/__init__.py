@@ -61,7 +61,7 @@ from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics, numerics_of
-from dew.nn.sharding import Link
+from dew.nn.sharding import Link, abstract
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
@@ -282,9 +282,10 @@ def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str])
     is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
     if not modules:
         return ()
+    from dew.batch import unboxed
     from dew.optim import parameter_name
 
-    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    trained = unboxed(abstract(lambda: objective.init(jax.random.key(0))))["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
     return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
 

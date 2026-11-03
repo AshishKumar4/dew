@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import dataset
+from flax import linen as nn
 
 from dew.batch import FROZEN
 from dew.lora import LoRA
@@ -53,7 +54,7 @@ def sampled(softcap=None, temperature=0.7, adapted=False):
             (1, 4), jnp.int32)), key=1)
         model, variables = adapter.model, adapter.variables
     obj = LMObjective(model, PROMPT + NEW - 1, variables=variables)
-    params = obj.init(jax.random.key(0))
+    params = nn.unbox(obj.init(jax.random.key(0)))
     if softcap is not None:
         # Large enough logits that the cap bends them.
         params = jax.tree.map(lambda leaf: leaf * 3.0, params)

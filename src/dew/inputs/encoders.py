@@ -26,6 +26,7 @@ from dew.batch import FROZEN, Variables
 from dew.inputs.condition import ConditionEncoder, ConditionWork
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
+from dew.nn.sharding import drawn_axes
 from dew.nn.text_checkpoints import DEFAULT_MODEL, DEFAULT_T5_MODEL
 from dew.nn.text_encoders import (
     CLIPTextTransformer,
@@ -121,6 +122,11 @@ class _TextTower(ConditionEncoder[str, TextContext]):
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         return ConditionWork.of_tokens(self.transformer, tokens, self.transformer.emb_features)
+
+    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        """The transformer's draw over a row of token ids and its mask (`ConditionEncoder.parameter_axes`)."""
+        ids = jnp.zeros((1, 2), jnp.int32)
+        return drawn_axes(self.transformer.init, ids, jnp.ones_like(ids))
 
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])

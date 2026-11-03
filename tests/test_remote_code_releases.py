@@ -31,9 +31,9 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
     path, label = FIXTURES / name / 'released.npz', f'{name} {site}'
     seeds = declared_seeds(path)[label]
-    vocabulary = json.loads((FIXTURES / name / 'config.json').read_text())['vocab_size']
+    config = json.loads((FIXTURES / name / 'config.json').read_text())
     drawn, reference, truth = indexed_recording(
-        recording(path), label, seeds, inputs_of=lambda seed: draw(site, seed, vocabulary),
+        recording(path), label, seeds, inputs_of=lambda seed: draw(site, seed, config),
         truth_fn=remote_code_site(source, site, wide=True))
     forward = remote_code_site(source, site)
     assert_as_exact(lambda index, inputs: forward(inputs), reference, drawn, label, seeds=seeds,
@@ -41,21 +41,26 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
 
 
 OPENED = {"lfm3-tiny": "transformers==5.18.0", "lfm3-biased-tiny": "transformers==5.18.0",
-          "mimo-v2-tiny": "transformers==5.1.0"}
+          "lfm3-vl-tiny": "transformers==5.18.0", "mimo-v2-tiny": "transformers==5.1.0"}
 """Each fixture whose export opens through its release's code, by the transformers that code runs under,
 which the whole suite's run overlays on the suite's own for its check alone (`release_env`): LFM3's
-native export carries it (`DecoderFamily.release_code`); MiMo-V2's, which transformers holds no class
-for, is a released source Dew loads and saves, which keeps the code its config names (`Pretrained.code`)."""
+native export carries it (`DecoderFamily.release_code`); MiMo-V2's and LFM3-VL's, which transformers
+holds no class for, are released sources Dew loads and saves, which keep the code their configs name
+(`Pretrained.code`)."""
 
-SAVED = ("mimo-v2-tiny",)
+SAVED = ("mimo-v2-tiny", "lfm3-vl-tiny")
 """The fixtures also exported as a released source's save: their release's code and `auto_map` beside
 them."""
+
+SAVED_ONLY = ("lfm3-vl-tiny",)
+"""The fixtures exported as a released source's save alone: a wrapper, which no native family exports."""
 
 
 @pytest.mark.parametrize(("name", "saved"), [
     pytest.param(name, saved, marks=pytest.mark.release_env(requirement),
                  id=f"{name}-{'saved' if saved else 'native'}")
-    for name, requirement in OPENED.items() for saved in ((False, True) if name in SAVED else (False,))])
+    for name, requirement in OPENED.items()
+    for saved in ((True,) if name in SAVED_ONLY else (False, True) if name in SAVED else (False,))])
 def test_an_export_opens_through_its_releases_own_code_as_the_release_does(name, saved, tmp_path,
                                                                            monkeypatch):
     """A Dew export of the fixture (`PretrainedDecoder.from_model(...).save`) opens offline through the

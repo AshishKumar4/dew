@@ -6,10 +6,11 @@ name: CI
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands. base/kernels runs on no push while it
-    # consolidates (owner, 2026-11-01): one run there by hand (workflow_dispatch) and one review once it is
-    # declared complete, then its per-push run returns.
-    branches: [ "main", "ci/**" ]
+    # ci/** is where a branch goes for its own run before it lands. base/kernels runs on every push: its template
+    # lanes push there with no tests first, and this run, every lint gate among it, is their check (owner,
+    # 2026-11-02: base gathered 85 pyright errors while its per-push run was off); a red one is paged to the lanes
+    # whose files the push changed (the land queue's base-ci).
+    branches: [ "main", "ci/**", "base/kernels" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:

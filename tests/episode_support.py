@@ -10,6 +10,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import optax
+from flax import linen as nn
 from tool_policy import (
     ANSWER_NINE,
     ANSWER_SIXTEEN,
@@ -118,7 +119,7 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
     collector = EpisodeCollector(
-        TextGeneration(model, objective.init(jax.random.key(0))),
+        TextGeneration(model, nn.unbox(objective.init(jax.random.key(0)))),
         harness or Harness(),
         verify,
         PROMPT,

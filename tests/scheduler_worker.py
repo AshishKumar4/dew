@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from flax import linen as nn
 
 TINY_SHARD = 256
 TASKS = 8
@@ -61,7 +62,7 @@ def main() -> None:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
                               mixture=mixture)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
 
     def drawn(task, sample, version):
         draw = int(task.id) * 10 + sample + (process if args.vary else 0)

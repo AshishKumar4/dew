@@ -27,6 +27,7 @@ from tool_policy import ToolPolicy
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.loading import place
 from dew.inference.serving import Server
+from dew.interop.decoder_parts import decoder_axes
 from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -35,6 +36,7 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.protocols import held_groups
+from dew.nn.sharding import boxed
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
 
@@ -71,7 +73,7 @@ def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
     from dew.nn.progress import END, Progress
 
     model = decoder().clone(max_seq_len=128).with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
 
     def at(updates: int | None) -> TextGeneration:
         progress = END if updates is None else Progress(jnp.asarray(updates, jnp.int32))
@@ -119,7 +121,7 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
                                                  max_seq_len=64, attention_bias=True, attention_impl="xla",
                                                  dtype=jnp.float64))
         x = jnp.arange(32, dtype=jnp.float64).reshape(1, 4, 8) / 32
-        variables = model.init(jax.random.key(0), x)
+        variables = nn.unbox(model.init(jax.random.key(0), x))
         # Dyadic weights make the projection sums exact, so a different dot
         # width cannot hide a wrong slice behind a floating-point bound.
         for index, name in enumerate(("q_proj", "k_proj", "v_proj")):
@@ -189,7 +191,8 @@ def test_a_dropped_server_frees_its_weights_without_a_collection():
         # Drawn under jit, as a run draws them: an eager `init` leaves its own cyclic scope
         # holding what it drew, which is flax's to drop, not the server's.
         model = decoder().clone(max_seq_len=128)
-        params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+        init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
+        params = init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
         bound = TextGeneration(model, params, RunProcessor(Digits()),
                                sampling=Sampling(temperature=0, eos_token_ids=None))
         server = Server.from_task(bound, slots=2, capacity=128)
@@ -328,7 +331,7 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
             output_gate=case == "output_gate")
         tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
         variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                                 model.init(jax.random.key(13), tokens))
+                                 nn.unbox(model.init(jax.random.key(13), tokens)))
         packed = inference_projections(model, variables)
         expected = jax.jit(model.apply)(variables, tokens)
         actual = jax.jit(model.apply)(packed, tokens)
@@ -580,7 +583,7 @@ def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
         return table
 
     model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
-    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32)))
     bound = TextGeneration(model, params, None, sampling=Sampling(temperature=0.5, eos_token_ids=None))
     server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
     server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
@@ -715,7 +718,7 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
 
     model = build_model("multimodal_transformer", dtype="float32").with_cache_capacity(128)
     args, fields = tiny_inputs("multimodal_transformer", jax.random.key(0))
-    params = model.init(jax.random.key(1), *args, **fields)
+    params = nn.unbox(model.init(jax.random.key(1), *args, **fields))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
@@ -760,7 +763,7 @@ def parallel_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTra
 def hybrid_task(stack=hybrid_model):
     """A hybrid `stack`'s greedy task (`hybrid_model`'s by default), over drawn weights."""
     model = stack()
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     return TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=EOS))
 
@@ -835,7 +838,7 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
-    task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+    task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                           sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
@@ -888,7 +891,7 @@ def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix
     beside its keys, in a paged pool's pages too, so a shared prefix's pages
     carry theirs. Over a pool of pages every row is the lone task call's."""
     model = decoder().clone(max_seq_len=128, **fields)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
@@ -907,7 +910,7 @@ def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     a dense or a paged cache, its slots hold no prediction cache, and every
     row is the lone task call's."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
@@ -943,10 +946,11 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     def drawn(seed):
         """The lone calls' and the mesh server's rows over the weights `seed` draws."""
         bound = task()
-        bound = bound.bind(bound.model.init(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
+        bound = bound.bind(nn.unbox(bound.model.init(jax.random.key(seed), jnp.ones((1, 2), jnp.int32))))
         alone = [bound(prompt, budget, key=index).host()
                  for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-        placed = bound.bind(place(bound.variables, mesh, layout))
+        with boxed(decoder_axes(bound.model)):
+            placed = bound.bind(place(bound.variables, mesh, layout))
         server, tickets = served_alongside(placed, slots=8, admission=8, **options)
         assert_sharded(placed.variables["params"], server.mesh)
         assert server.groups == jax.device_count() // mesh.tensor
@@ -1008,7 +1012,8 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
         model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                                   mlp_features=32, max_seq_len=128, dtype="float32",
                                   mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
-        params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
+        if params is None:
+            params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
         return TextGeneration(
             model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
         )
@@ -1016,9 +1021,9 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     lone = generation("global", None)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    served = generation(
-        dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
-    )
+    with boxed(decoder_axes(lone.model)):
+        placed = place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    served = generation(dispatch, placed)
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
                                        decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
@@ -1124,7 +1129,7 @@ def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it
     from dew.inference.projections import inference_projections, packed_owned, unpacked
 
     model = decoder().clone(num_layers=2, max_seq_len=128)
-    whole = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    whole = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     split = freeze(whole, lambda path: not ("layers_0" in path and {"k_proj", "v_proj"} & set(path)))
     packed = packed_owned(model, jax.tree.map(jnp.array, split))
     assert PACKED_FROZEN in packed and PACKED_FROZEN not in thaw(packed)

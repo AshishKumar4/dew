@@ -22,18 +22,19 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
+from dew.batch import unboxed
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import accumulated, capped_logits, float32_dot_general
 from dew.nn.rope import sinusoid_frequencies, sinusoids
+from dew.nn.sharding import abstract
 from dew.registry import from_record
 
 from .activations import activation
 from .conv import Conv
 from .norms import LayerNorm, RMSNorm
-from .sharding import logical_axes
 from .vision import TowerBase, TowerGeometry
 from .vision.gemma4 import clipped_linear
 
@@ -142,7 +143,6 @@ def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: P
                              dot_general=float32_dot_general)
 
 
-@logical_axes({("linear",): ("embed", "mlp")})
 class AudioLinear(nn.Module):
     """Gemma 4's clippable linear in the audio tower's layout: the `dense` map
     under `linear` and its bounds beside it, as the reference nests them
@@ -154,7 +154,8 @@ class AudioLinear(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        return clipped_linear(self, self.dense(self.features, name="linear"), x, self.use_clipped_linears)
+        return clipped_linear(self, self.dense(self.features, name="linear", kernel_axes=("embed", "mlp")), x,
+                              self.use_clipped_linears)
 
 
 def _clippable(config: Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
@@ -610,9 +611,9 @@ def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     features = (
         config.input_feat_size if isinstance(config, Gemma3nAudio) else config.subsampling_conv_channels[0]
     )
-    template = jax.eval_shape(config.build().init, jax.random.key(0),
-                              jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
-                              jax.ShapeDtypeStruct((1, 16), jnp.bool_))
+    template = unboxed(abstract(config.build().init, jax.random.key(0),
+                                       jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
+                                       jax.ShapeDtypeStruct((1, 16), jnp.bool_)))
     return {tuple(str(k.key) for k in path): value.shape
             for path, value in jax.tree_util.tree_leaves_with_path(template)}
 

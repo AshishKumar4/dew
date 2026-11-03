@@ -6,6 +6,7 @@ saw into --out and asserts nothing, so the invariants stay in the test that read
 from __future__ import annotations
 
 import numpy as np
+from flax import linen as nn
 from multiprocess_worker import TINY, continuation_prompts
 from process_support import serve_mode, worker_parser
 
@@ -30,7 +31,7 @@ def mode_prefix_generation(args) -> dict:
 
     rank, processes = jax.process_index(), jax.process_count()
     model = block_model(1, full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     mesh = MeshSpec(fsdp=args.fsdp_size).build(jax.devices())
     placed = jax.device_put(params, Layout(min_shard=TINY).shardings(mesh, params))
     task = TextGeneration(model, placed, prefix=3)

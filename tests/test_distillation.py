@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, widened
@@ -69,7 +70,7 @@ def fixture_objective(arrays: dict, **overrides) -> tuple[DistillationObjective,
     settings = {"alpha": META["alpha"], "temperature": META["temperature"], "beta": META["beta"],
                 "features": [tuple(pair) for pair in META["pairs"]], **overrides}
     objective = DistillationObjective(student, teacher, **settings)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     if PROJECTIONS in params["params"]:
         projections = {name: jnp.asarray(arrays[name]) for name in params["params"][PROJECTIONS]}
         params["params"] = {**params["params"], PROJECTIONS: projections}
@@ -292,7 +293,7 @@ def test_a_student_that_reads_the_runs_progress_is_passed_it_and_the_teacher_rea
     def losses(student_model: CausalTransformer, teacher_model: CausalTransformer) -> list[float]:
         objective = DistillationObjective(LMObjective(student_model, SEQ, ema_decay=None),
                                           LMObjective(teacher_model, SEQ, ema_decay=None))
-        params = objective.init(jax.random.key(0))
+        params = nn.unbox(objective.init(jax.random.key(0)))
         return [float(objective.scalar_loss(params, batch, dataclasses.replace(
             step_at(), committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5)]
 
@@ -310,7 +311,7 @@ def test_a_pair_of_equal_widths_needs_no_projection():
     student = LMObjective(student_model, SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     objective = DistillationObjective(student, teacher, features=[(1, 2)], beta=1.0)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     assert PROJECTIONS not in params["params"]
 
     batch = fixture_batch(fixture())
@@ -365,7 +366,7 @@ def test_a_layer_the_model_does_not_have_is_named_at_init():
     student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
     with pytest.raises(ValueError):
-        DistillationObjective(student, teacher, features=[(0, 5)]).init(jax.random.key(0))
+        nn.unbox(DistillationObjective(student, teacher, features=[(0, 5)]).init(jax.random.key(0)))
 
 
 def test_beta_without_pairs_and_weights_outside_their_range_are_refused():
@@ -389,7 +390,7 @@ def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher
     teacher = LMObjective(CausalTransformer(**{**META["teacher"], "vocab_size": teacher_vocab}), SEQ,
                           ema_decay=None, head_chunks=1)
     objective = DistillationObjective(student, teacher)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     tokens = jnp.zeros_like(fixture_batch(fixture())[TEXT_KEY])
     with pytest.raises(ValueError):
         objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
@@ -404,7 +405,7 @@ def test_a_student_with_the_router_balance_loss_is_refused():
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
     objective = DistillationObjective(student, teacher)
     with pytest.raises(ValueError):
-        objective.scalar_loss(objective.init(jax.random.key(0)), fixture_batch(arrays), step_at())
+        objective.scalar_loss(nn.unbox(objective.init(jax.random.key(0))), fixture_batch(arrays), step_at())
 
 
 # --------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from flax.core import unfreeze
 from model_support import decoder
 
@@ -20,7 +21,7 @@ from dew.objectives.routing import ExpertBalance, RoutedStatistics
 def routed(request):
     model = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True), qk_norm=False,
                             num_nextn_predict_layers=request.param)
-    variables = unfreeze(dict(LMObjective(model, 8).init(jax.random.key(0))))
+    variables = unfreeze(dict(nn.unbox(LMObjective(model, 8).init(jax.random.key(0)))))
     params = variables["params"]
     embedding = jnp.zeros_like(params["embed_tokens"]["embedding"])
     params["embed_tokens"]["embedding"] = (embedding.at[:, 1].set(1)

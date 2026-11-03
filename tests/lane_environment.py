@@ -73,6 +73,15 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
         cpu_devices = MESH_DEVICES
+        # Under XLA:CPU's default schedule a launch of the simulated devices can reach its collectives
+        # on different device groups in different orders, which then wait on each other for good: a
+        # pipeline of two stages over two tensor shards (tests/test_run_option_matrix.py's staged lm
+        # run) aborted in about one run in ten, its devices split between the stage permute and the
+        # tensor and data all-gathers. Under its memory-optimized schedule it held 0 of 60 runs, the
+        # default 3 of 30 in the same batch, no slower (armada jobs 20261103013431-f98757ad and
+        # 20261103014328-bb1be83e). The cause inside XLA:CPU is open; Dew's products are unchanged, the
+        # setting the CPU lane's alone.
+        flags.append("--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
     else:
         if accelerator == "cuda":
             flags.extend(REPEATABLE_GPU_FLAGS)

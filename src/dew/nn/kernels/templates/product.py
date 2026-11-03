@@ -5,7 +5,7 @@ caller asked for, and keeps the declaration through every mainloop and its VJP's
 
 import dataclasses
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +16,11 @@ from dew.nn.precision import asks_default_precision
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
 
+EIGHT = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
+"""The FP8 dtypes the kernels multiply (testing.md, FP8 products): each code exact in bfloat16, so its
+products exact as a 16-bit operand's, its running sum promoted into fp32 every depth step
+(`Product.promoted`), as Hopper's FP8 tensor cores sum within a step in a narrower accumulator."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Product:
@@ -23,7 +28,9 @@ class Product:
     exact, fp32's are TF32 on the tensor cores. `promoted` adds each depth step's partial into the fp32
     accumulator apart, the IEEE sums a precision above the default asks of an fp32 output, since the tensor
     cores truncate each add within a step; a 16-bit output's one rounding hides the difference.
-    `refusal` says why the kernels do not compute the product, None where they do."""
+    `refusal` says why the kernels do not compute the product, None where they do. An FP8 product
+    (`EIGHT`) is always promoted, each 128-deep step's partial added into the fp32 accumulator apart: the
+    FP8 contract's budget is met so (testing.md, FP8 products)."""
     compute: jnp.dtype
     promoted: bool
     refusal: str | None
@@ -38,7 +45,8 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
     their fp32 products are TF32, which only the default precision asks for."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, promoted(above=above, outputs=outputs), _refusal(compute, operands, above))
+    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
+                   _refusal(compute, operands, above))
 
 
 def promoted(*, above: bool, outputs: tuple) -> bool:
@@ -50,9 +58,11 @@ def promoted(*, above: bool, outputs: tuple) -> bool:
 def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
-    if jnp.result_type(compute, *operands, jnp.float32) != jnp.dtype(jnp.float32):
+    # An operand fp32 holds is no complex one and none wider (8-bit floats promote implicitly to nothing).
+    if any(jnp.issubdtype(dtype, jnp.complexfloating) or jnp.dtype(dtype).itemsize > 4
+           for dtype in (compute, *operands)):
         return "an operand fp32 does not hold, and the kernels sum gradients in fp32"
-    if compute in HALF:
+    if compute in HALF or compute in EIGHT:
         return None
     if compute != jnp.dtype(jnp.float32):
         return f"the kernels do not multiply in {compute.name}"
@@ -69,8 +79,12 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     set (an fp32 [128, 128] by [128, N] product is 2.32e-6 from float64 at N a multiple of 128, 1.25e-6
     at N = 300), which a tile's shape would otherwise choose. float64 runs on this path alone, under
     `jax.enable_x64` for its own ops; the kernels' refusal of x64 (`declared`) is their int32 offsets'.
-    Any other product is `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are
-    exact."""
+    An FP8 product is its codes' in bfloat16, each exact there, accumulated in fp32: the FP8 contract's
+    reference arm, the dequantized product with fp32 sums (testing.md, FP8 products). Any other product is
+    `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact."""
+    if product.compute in EIGHT:
+        return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
+                                   preferred_element_type=jnp.float32)
     if product.compute == jnp.dtype(jnp.float32) and product.promoted:
         with jax.enable_x64(new_val=True):
             wide = jax.lax.dot_general(lhs.astype(jnp.float64), rhs.astype(jnp.float64), dimension_numbers,
@@ -135,3 +149,35 @@ class Exact:
     @property
     def shape(self) -> tuple:
         return self.value.shape
+
+
+@jax.tree_util.register_pytree_node_class
+class Scaled:
+    """A register operand stored scaled, its product taken back by `2**exponent` (traced: an fp16 part held
+    at its tile's, or each row's, largest magnitude's scale): a mainloop issues its product into an
+    accumulator of its own, which no unscaled product shares, and restores it. A pytree of both, so a
+    branch's parts leave it (`lax.cond`)."""
+
+    def __init__(self, value: jax.Array, exponent: jax.Array):
+        self.value, self.exponent = value, exponent
+
+    def tree_flatten(self):
+        return (self.value, self.exponent), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        del aux
+        return cls(*children)
+
+    @property
+    def shape(self) -> tuple:
+        return self.value.shape
+
+
+class Blocks:
+    """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
+    block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time
+    (`operands.Issuer.summed`), where unrolled ptxas held every block's at once."""
+
+    def __init__(self, name: str, left: Callable, right: Callable, count: int):
+        self.name, self.left, self.right, self.count = name, left, right, count

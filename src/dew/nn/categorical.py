@@ -31,9 +31,9 @@ from jax.custom_derivatives import SymbolicZero
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["brier", "cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative",
-           "label_entry", "log_probs", "partition", "probabilities", "ranked_probability", "rescaled",
-           "segment_log_partition", "smoothed", "soft_cross_entropy", "spherical", "target_loss",
-           "token_log_probs"]
+           "label_entry", "label_logit", "label_terms", "log_probs", "partition", "probabilities",
+           "ranked_probability", "rescaled", "segment_log_partition", "smoothed", "soft_cross_entropy",
+           "spherical", "target_loss", "token_log_probs"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -82,8 +82,9 @@ def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None 
     and Tschannen's (arXiv:2610.31642, eq. 7): each other class's probability, and at the label minus
     their sum, so the row's derivative sums to zero. The label's `p - 1` collapses to 0 once its margin
     over the other classes passes the dtype's precision (eq. 4; 16.6 in float32), while the others'
-    probabilities stay until they underflow."""
-    return _label_loss(widened(logits, where), labels)
+    probabilities stay until they underflow. A label outside the row takes the log partition, its
+    derivative the row's probabilities (`label_terms`)."""
+    return label_terms(widened(logits, where), labels)[0]
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
@@ -108,17 +109,35 @@ def partition(logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return peak, jnp.sum(shifted, axis=-1), shifted
 
 
+def label_logit(logits: jax.Array, labels: jax.Array) -> jax.Array:
+    """Each row's logit at its label over the last axis, 0 for a label outside the row's columns, which
+    picks none: a padding id past the vocabulary, or another tile's or shard's column."""
+    columns = logits.shape[-1]
+    inside = (labels >= 0) & (labels < columns)
+    return jnp.where(inside, jnp.take_along_axis(
+        logits, jnp.clip(labels, 0, columns - 1)[..., None], axis=-1)[..., 0], 0.0)
+
+
 @jax.custom_jvp
-def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
+def label_terms(logits: jax.Array, labels: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each row's label cross entropy over the last axis and its log partition, of logits taken as they
+    are (`widened` by the callers): the one rule of the family for both, whose derivatives are the
+    label's (`label_derivative`) and the row's probabilities, the probabilities taken once from the
+    row's partition (`partition`). `cross_entropy` and the whole-logits head
+    (`dew.objectives.lm.chunked.logits_cross_entropy`) read it. A label outside the row
+    (`label_logit`) takes the log partition, its derivative the probabilities."""
     peak, mass, _ = partition(logits)
-    return target_loss(peak, mass, jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0])
+    return target_loss(peak, mass, label_logit(logits, labels)), peak + jnp.log(mass)
 
 
-@_label_loss.defjvp
-def _label_loss_tangent(primals, tangents):
+@label_terms.defjvp
+def _label_terms_tangent(primals, tangents):
     logits, labels = primals
-    derivative = label_derivative(jax.nn.softmax(logits, axis=-1), labels)
-    return _label_loss(logits, labels), jnp.sum(derivative * tangents[0], axis=-1)
+    losses, log_partition = label_terms(logits, labels)
+    _, mass, shifted = partition(logits)
+    probability = shifted / mass[..., None]
+    return (losses, log_partition), (jnp.sum(label_derivative(probability, labels) * tangents[0], axis=-1),
+                                     jnp.sum(probability * tangents[0], axis=-1))
 
 
 def label_entry(share: jax.Array, others: jax.Array) -> jax.Array:
@@ -146,10 +165,11 @@ def label_derivative(probability: jax.Array, labels: jax.Array) -> jax.Array:
 def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-sum_k t_k log p_k` over the last axis against the distribution `targets`, a class of no target
     mass contributing nothing, whatever its log probability. Its derivative in `logits`, `p T - t` for
-    target mass `T`, is `p (T - t) - t (1 - p)`, the most probable class's `1 - p` the other classes'
-    probability summed, and the class of the most target mass's `T - t` the other classes' targets
-    summed: a label's confident one-hot target keeps it as `cross_entropy` does (arXiv:2610.31642,
-    eq. 7), where `p - t` rounds to 0, and targets as confident as the logits keep its sum 0."""
+    target mass `T`, is `p (T - t) - t (1 - p)`, each class's `1 - p` by the label's rule (`label_entry`:
+    past a half, the other classes' probability summed), and the class of the most target mass's `T - t`
+    the other classes' targets summed: a one-hot target's derivative is `cross_entropy`'s, bit for bit
+    (arXiv:2610.31642, eq. 7), where `p - t` rounds to 0, and targets as confident as the logits keep its
+    sum 0."""
     return _soft_loss(widened(logits, where), targets)
 
 
@@ -173,8 +193,11 @@ def _soft_loss_tangent(primals, tangents):
     if isinstance(d_logits, SymbolicZero):
         return value, tangent
     probability = jax.nn.softmax(logits, axis=-1)
+    # Each class's `1 - p`, the label's rule: only a class past a half, the most probable, takes the others'
+    # sum, the rest `1 - p` rounded once.
     top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
-    rest = jnp.where(top, jnp.sum(jnp.where(top, 0.0, probability), axis=-1, keepdims=True), 1 - probability)
+    others = jnp.sum(jnp.where(top, 0.0, probability), axis=-1, keepdims=True)
+    rest = -label_entry(probability, jnp.where(top, others, 0.0))
     mass = jnp.where(targets > 0, targets, 0).astype(probability.dtype)
     # `T - t`, the other classes' target mass: summed directly for the class that holds most of it, whose
     # difference would round, as `rest` is for the most probable class.

@@ -19,6 +19,7 @@ import numpy as np
 import optax
 import pytest
 import selection_margins
+from flax import linen as nn
 from model_support import largest_difference
 from reference_error import as_given, assert_as_exact, without_ynn
 
@@ -122,7 +123,7 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     draws and the reference arm."""
     run, solver = stepped
     ids = batch()["text"][:, :-1]
-    initialized = jax.jit(lambda key: plain.init(key, ids))
+    initialized = jax.jit(lambda key: nn.unbox(plain.init(key, ids)))
     objective = objective_for(plain)
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
@@ -180,8 +181,8 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
     plain = model_for(shape, scan_layers=scan)
     remat = plain.clone(remat='full')
     ids = batch()["text"][:, :-1]
-    variables = plain.init(jax.random.key(0), ids)
-    recomputed = remat.init(jax.random.key(0), ids)
+    variables = nn.unbox(plain.init(jax.random.key(0), ids))
+    recomputed = nn.unbox(remat.init(jax.random.key(0), ids))
     assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
     assert largest_difference(variables, recomputed) == 0
     stepped = training_step(plain)
@@ -215,8 +216,8 @@ def test_remat_prefills_and_appends_the_same_cache(shape, scan):
     plain = model_for(shape, scan_layers=scan)
     remat = plain.clone(remat='full')
     ids = batch()["text"][:2]
-    plain_vars = plain.init(jax.random.key(0), ids[:, :2], decode=True)
-    remat_vars = remat.init(jax.random.key(0), ids[:, :2], decode=True)
+    plain_vars = nn.unbox(plain.init(jax.random.key(0), ids[:, :2], decode=True))
+    remat_vars = nn.unbox(remat.init(jax.random.key(0), ids[:, :2], decode=True))
     for start, end in [(0, 5), (5, 6), (6, 8)]:
         expected, cache = plain.apply(plain_vars, ids[:, start:end],
                                        decode=True, mutable=["cache"])
@@ -277,7 +278,7 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     program on the same values (that the two policies train alike is
     `test_recomputed_blocks_train_the_same_model`'s)."""
     model = model_for("shared", scan_layers=True, remat=saved_remat)
-    variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
+    variables = nn.unbox(model.init(jax.random.key(0), batch()["text"][:, :-1]))
     run, optimizer = training_step(model)
     moved, opt_state, _, _, _ = run(
         variables, optimizer.init(variables["params"]), batch(), jax.random.key(3))
@@ -286,7 +287,7 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     checkpoints.save(1, state, None)
     checkpoints.wait()
     resumed_model = model.clone(remat='full' if saved_remat is None else None)
-    template_vars = resumed_model.init(jax.random.key(8), batch()["text"][:, :-1])
+    template_vars = nn.unbox(resumed_model.init(jax.random.key(8), batch()["text"][:, :-1]))
     template = train_state(0, template_vars, optimizer.init(template_vars["params"]),
                            jax.random.key(0))
     template = jax.tree.map(lambda value: jax.ShapeDtypeStruct(
@@ -336,7 +337,7 @@ def against_full(scan):
     """`full`'s decoder, its draws, and its step compiled once for every policy: the reference arm and,
     in float64, the truth."""
     full = model_for("dense", scan_layers=scan, remat='full')
-    initialized = jax.jit(lambda key: full.init(key, batch()["text"][:, :-1]))
+    initialized = jax.jit(lambda key: nn.unbox(full.init(key, batch()["text"][:, :-1])))
 
     def draw(seed):
         return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))

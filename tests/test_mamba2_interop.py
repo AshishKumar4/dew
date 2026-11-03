@@ -1,21 +1,17 @@
-"""A `Mamba2ForCausalLM` checkpoint through `dew.interop.mamba2` against the
-transformers 5.16.1 logits in tests/fixtures/hf/mamba2-tiny.
-
-Observed on CPU: fp32 logits to 9.4e-07 on logits of magnitude 1.7,
-tolerance 1e-5; a bfloat16 run of the same weights to 1.5e-02 from the fp32
-reference and 2.9e-02 from the reference's own bfloat16 forward (which sits
-2.3e-02 from its fp32), tolerance 1e-1 on each.
-"""
+"""A `Mamba2ForCausalLM` checkpoint through `dew.interop.mamba2` against transformers' own model of it
+(tests/fixtures/hf/mamba2-tiny), and state-spaces/mamba2-130m against its port, each held by check 1 over
+seeded rows of tokens from Dew's float64 load."""
 
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from safetensors.numpy import load_file, save_file
+from ssd_support import MAMBA2_130M_HF, mamba2_130m, mamba2_130m_logits, mamba2_interop_draw
 
 from dew.interop.mamba2 import config_from_hf
 from dew.interop.pretrained import Pretrained
@@ -28,19 +24,43 @@ def tensors():
     return load_file(FIXTURE / "model.safetensors")
 
 
-def largest(left, right) -> float:
-    return float(np.max(np.abs(np.asarray(left, np.float32) - np.asarray(right, np.float32))))
+FIXTURE_SEEDS = 16
+"""The fixture's check-1 seeds."""
 
 
-def test_the_public_loader_reads_the_fixture(tensors):
-    """`Pretrained.load` dispatches the `mamba2` model type through the
-    decoder family table and reproduces the reference logits, its config's
-    unbounded time step written as transformers writes an infinity."""
-    source = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
-    ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
-    logits = source.model.apply(source.variables, ids)
-    reference = np.load(FIXTURE / "logits.npy")
-    assert largest(logits, reference) < 1e-5
+def fixture_tokens(seed):
+    """Two rows of 12 token ids of the fixture's vocabulary of 32."""
+    return (np.random.default_rng([seed, 2003]).integers(0, 32, (2, 12)).astype(np.int32),)
+
+
+def assert_logits_of_the_fixture(path: Path, label: str) -> None:
+    """The checkpoint at `path`, loaded (`Pretrained.load`), on par with transformers' fp32 model of the
+    fixture over seeded rows of tokens, its truth the load in float64 (check 1)."""
+    import torch
+    import transformers
+
+    port = transformers.Mamba2ForCausalLM.from_pretrained(FIXTURE, dtype=torch.float32).eval()
+    loaded = Pretrained.load(path, dtype="float32", attention_impl="reference")
+    with jax.enable_x64(new_val=True):
+        wide = Pretrained.load(path, dtype="float64", param_dtype="float64", attention_impl="reference")
+
+    def reference(ids):
+        with torch.no_grad():
+            return port(torch.from_numpy(np.asarray(ids).astype(np.int64))).logits.numpy()
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(wide.model.apply(wide.variables, jnp.asarray(ids)))
+
+    assert_as_exact(jax.jit(lambda ids: loaded.model.apply(loaded.variables, ids)), as_given(reference),
+                    fixture_tokens, label, seeds=FIXTURE_SEEDS, truth_fn=truth)
+
+
+def test_the_public_loader_reads_the_fixture():
+    """`Pretrained.load` dispatches the `mamba2` model type through the decoder family table, its config's
+    unbounded time step written as transformers writes an infinity: its logits on par with transformers'
+    model of the fixture (check 1)."""
+    assert_logits_of_the_fixture(FIXTURE, "the fixture's logits")
 
 
 @pytest.mark.parametrize("bound", [{"__float__": "NaN"}, {"__float__": "nan"}, {"__float__": "inf"},
@@ -118,9 +138,8 @@ def mamba_ssm_config() -> dict:
 
 
 def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors):
-    """mamba_ssm's tensor names differ from the port's in the embedding
-    alone. The load reproduces the reference logits within the fixture's
-    fp32 bound, and a save writes the port's names and config."""
+    """mamba_ssm's tensor names differ from the port's in the embedding alone: the load's logits on par
+    with transformers' model of the fixture (check 1), and a save writes the port's names and config."""
     source = tmp_path / "ssm"
     source.mkdir()
     (source / "config.json").write_text(json.dumps(mamba_ssm_config()))
@@ -130,51 +149,44 @@ def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
     loaded.save(tmp_path / "saved")
 
-    logits = loaded.model.apply(loaded.variables, jnp.asarray(np.load(FIXTURE / "input_ids.npy")))
-    assert largest(logits, np.load(FIXTURE / "logits.npy")) < 1e-5
+    assert_logits_of_the_fixture(source, "mamba_ssm's names loaded")
     assert sorted(load_file(tmp_path / "saved" / "model.safetensors")) == sorted(tensors)
     saved = json.loads((tmp_path / "saved" / "config.json").read_text())
     assert config_from_hf(saved) == config_from_hf(json.loads((FIXTURE / "config.json").read_text()))
 
 
-MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
-MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+INTEROP = Path(__file__).resolve().parent / "fixtures" / "mamba2" / "interop_seeded.npz"
+"""transformers' bf16 and float64 logits of state-spaces/mamba2-130m's port on seeded rows of tokens, recorded
+(tools/mamba2_reference.py's `write_interop`)."""
 
 
 @pytest.mark.network
 def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
-    """state-spaces/mamba2-130m (mamba_ssm config and names, pickles on
-    main, loaded from SFconvertbot's refs/pr/1) against transformers 5.16.1
-    running AntonV/mamba2-130m-hf in fp32 on CPU, on two prompts cut to a
-    common 13 tokens.
-
-    Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
-    equal; tolerance 1e-3, about twice that. In bfloat16 Dew hands the scan
-    the conv's bf16 output, as the reference's own bfloat16 forward does, and
-    is held to that forward's RMS distance from the fp32 logits
-    (`assert_as_exact_as_the_reference`).
-    """
+    """state-spaces/mamba2-130m (mamba_ssm config and names, pickles on main, loaded from SFconvertbot's
+    refs/pr/1) against transformers 5.17.0's port of it (AntonV/mamba2-130m-hf) over seeded rows of tokens
+    ('interop', `ssd_support.mamba2_interop_draw`), from float64 (check 1), its truth Dew's float64 load,
+    which the recorder held to the port's float64 twin at every seed: in fp32 on par with the port running
+    in fp32 on CPU, and in bfloat16, Dew handing the scan the conv's bf16 output as the port's own
+    bfloat16 forward does, on par with that forward, recorded."""
     import torch
     import transformers
-    tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
-    prompts = ["The capital of France is Paris, and the capital of Germany is",
-               "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
-    rows = [tokenizer(prompt)["input_ids"] for prompt in prompts]
-    ids = np.asarray([row[:min(map(len, rows))] for row in rows], np.int32)
+
     port = transformers.Mamba2ForCausalLM.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF,
                                                           dtype=torch.float32).eval()
-    with torch.no_grad():
-        reference = port(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
 
-    fp32 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
-    bf16 = Pretrained.load("state-spaces/mamba2-130m", revision=MAMBA2_130M,
-                           dtype="bfloat16", param_dtype="bfloat16")
+    def ported(index, inputs):
+        del index
+        with torch.no_grad():
+            ids = torch.from_numpy(np.asarray(inputs["ids"]).astype(np.int64))
+            return {"logits": port(ids).logits.numpy()}
 
-    logits = np.asarray(fp32.model.apply(fp32.variables, ids), np.float32)
-    assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
-    assert largest(logits, reference) < 1e-3
-    assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
-    with torch.no_grad():
-        theirs = port.to(torch.bfloat16)(torch.from_numpy(ids.astype(np.int64))).logits.float().numpy()
-    mine = np.asarray(bf16.model.apply(bf16.variables, ids), np.float32)
-    assert_as_exact_as_the_reference(mine, theirs, reference, "bf16 logits against the fp32 port's")
+    seeds = declared_seeds(INTEROP)["interop"]
+    draw, recorded, truth = indexed_recording(
+        recording(INTEROP), "interop", seeds, inputs_of=mamba2_interop_draw,
+        truth_fn=jax.jit(mamba2_130m_logits(mamba2_130m(jnp.float64))))
+    fp32 = mamba2_130m_logits(mamba2_130m(jnp.float32))
+    assert_as_exact(jax.jit(lambda index, inputs: fp32(inputs)), as_given(ported), draw,
+                    "fp32 logits against the port's in fp32", seeds=seeds, truth_fn=truth)
+    bf16 = mamba2_130m_logits(mamba2_130m(jnp.bfloat16))
+    assert_as_exact(jax.jit(lambda index, inputs: bf16(inputs)), recorded, draw,
+                    "bf16 logits against the port's recorded in bfloat16", seeds=seeds, truth_fn=truth)
