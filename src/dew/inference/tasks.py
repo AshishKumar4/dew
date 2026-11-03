@@ -466,7 +466,8 @@ class SavedRunTask:
                  trust: Sequence[str] = ()) -> Self:
         """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
         (`default_step`, `SavedRun.pinned`) or at `step`. `trust` names the packages outside Dew the run's
-        record may import, as `trust_remote_code` does in transformers."""
+        record may import, and the sources whose own code its load may run (a media processor's,
+        `dew.registry.trusts_source`), as `trust_remote_code` does in transformers."""
         run = SavedRun.pinned(directory, step, trust)
         return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
                                          param_dtype=param_dtype))

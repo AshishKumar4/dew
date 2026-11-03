@@ -337,6 +337,11 @@ class LocalTracker(_OwnedTracker):
         logged, nonfinite values read back as floats. A tracker over a run's directory reads the
         run's reports this way, its final validation's scores among them (`Trainer.fit` logs them
         under the run's last step); a journal no report wrote yet holds none."""
+        return [(step, values) for step, _, values in self.timed()]
+
+    def timed(self) -> list[tuple[int, float, dict[str, float]]]:
+        """`scalars`, each report with the wall-clock second it was logged at (`time.time()`) between
+        its step and its values, which a run's reports against the time it took read as a curve."""
         self._check()
         journal = self.directory / 'scalars.jsonl'
         if not journal.exists():
@@ -346,7 +351,7 @@ class LocalTracker(_OwnedTracker):
             for line in handle:
                 row = record(json.loads(line), 'scalars journal row')
                 values = record(row['scalars'], 'scalars')
-                reports.append((integer(row['step'], 'step'),
+                reports.append((integer(row['step'], 'step'), reported_number(row['time'], 'time'),
                                 {name: reported_number(value, name) for name, value in values.items()}))
         return reports
 

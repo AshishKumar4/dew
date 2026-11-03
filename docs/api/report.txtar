@@ -112,6 +112,7 @@ class LocalTracker(directory: str | Path, *, plots: bool = False)  [dew.training
   .plot(self, *metrics: str, smooth: int = 1, y_label: str | None = None, y_range: tuple[float, float] | None = None) -> Figure
   .plot_files(self) -> list[Path]
   .scalars(self) -> list[tuple[int, dict[str, float]]]
+  .timed(self) -> list[tuple[int, float, dict[str, float]]]
 class MLflowTracker(experiment: str, name: str | None = None, *, uri: str | None = None)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
@@ -153,7 +154,7 @@ class Objective()  [dew.objectives.base]
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
-  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]
@@ -247,7 +248,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .placement(self, layout: Layout) -> Layout
   .predict(self, params: Variables, batch: Batch, step: Step, *, train: bool, layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]
   .preview(self, params: Variables, batch: Batch, step: Step, *, scored: Artifacts | None = None) -> Artifacts | None
-  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
+  .program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (), donate_argnames: tuple[str, ...] = (), holds: tuple[DeviceStep | AutoEncoder | Guidance | Stepping, ...] = (), modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None)
   .program_key(self) -> tuple[ProgramModule, ...]
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]
@@ -512,6 +513,110 @@ dew.config.sweep.OptunaSearch
   seed: int = 0
 dew.config.sweep.RandomSearch
   seed: int = 0
+dew.config.world_model.TokenizerConfig
+  run: str
+  step: int | str | None = None
+dew.config.world_model.WorldModelRunConfig
+  model: ModelConfig = (lambda: ModelConfig('dew.objectives.world_model:CausalTokenizer'))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  tokenizer: Annotated[TokenizerConfig, tyro.conf.subcommand('tokenizer')] | None = None
+dew.decision.config.DecisionRunConfig
+  model: ModelConfig = (lambda: ModelConfig('causal_transformer', {}))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
+  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  loop_steps: int | None = None
+  loop_layers: tuple[int, int] | None = None
+  loop_backprop_steps: int | None = None
+  loop_remat: bool = False
+  pretrained: str = 'convaiinnovations/laya'
+  subfolder: str | None = None
+  revision: str | None = None
+  remat: str | None = None
+  head: JointShape | Letters | None = None
+  calibrate: bool = True
+  max_len: int | None = None
+  head_max_len: int | None = None
+  option_tokens: int | None = None
+  max_state_tokens: int | None = None
+  segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
+  reads: Annotated[Reads, record_argument(Reads)] | None = None
+  parallel: bool | None = None
+  unit: Unit | None = None
+  order: RowOrder | None = None
+  split: Literal['part', 'question', 'whole'] | None = None
+  framing: Framing | None = None
+  context_layers: tuple[int, ...] | None = None
+  context_frozen: bool = True
+  context_length: int = 256
+  context_encoder: ContextEncoder = 'table'
+  context_form: Literal['idefics', 'shared'] = 'idefics'
+dew.decision.config.JointShape
+  width: int = 1024
+  routing_layers: int = 2
+  layers: int = 4
+  heads: int = 16
+  feedforward: int = 4096
+dew.decision.config.Letters
+  labels: Labels = dew.decision.layout.Labels()
+  count: int | None = None
+  untied: bool = False
+dew.objectives.rl.config.EnvConfig
+  name: str
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+  count: int | None = None
+  episode_length: int | None = None
+  action_repeat: int = 1
+dew.objectives.rl.config.EnvRunConfig
+  model: ModelConfig = (lambda: ModelConfig('dew.objectives.rl.dreamer:WorldModel'))()
+  data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
+  validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
+  data_seed: int = 0
+  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
+  trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
+  objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
+  env: Annotated[EnvConfig, tyro.conf.subcommand('env')] | None = None
+  rollout: RolloutConfig = dew.objectives.rl.config.RolloutConfig()
+  teacher: Annotated[TeacherConfig, tyro.conf.subcommand('teacher')] | None = None
+  pretrained: str | None = None
+  episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = builtins.dict()
+dew.objectives.rl.config.EpisodesConfig
+  steps: int
+  env: EnvConfig | None = None
+  reached: tuple[str, ...] = ()
+  drawn: bool = False
+dew.objectives.rl.config.RolloutConfig
+  name: str = 'dreamer'
+  fields: JsonDict = builtins.dict()
+  defaults: JsonDict = builtins.dict()
+dew.objectives.rl.config.TeacherConfig
+  run: str
+  step: int | str | None = None
+  demonstrates: bool = False
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew.cli.main.Export]

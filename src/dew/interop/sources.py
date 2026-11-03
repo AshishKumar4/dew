@@ -77,8 +77,9 @@ class SourceReference:
     revision: str | None = None
     subfolder: str | None = None
     remote_code: bool = False
-    """Whether its load runs the source's own code (`Pretrained.load(trust_remote_code=True)`), as a
-    processor reloaded from this record runs its own again (`pretrained.load_processor`)."""
+    """Whether its load ran the source's own code (`Pretrained.load(trust_remote_code=True)`), which a
+    processor reloaded from this record runs again only where the process trusts the source
+    (`pretrained.load_processor`, `dew.registry.trusts_source`)."""
 
     def __post_init__(self):
         folder = Path(self.subfolder or "")

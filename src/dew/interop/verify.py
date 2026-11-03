@@ -457,8 +457,9 @@ def _refuse(model_type: str, detail: str) -> ValueError:
 
 class ProbeUnavailable(ValueError):
     """An unregistered type whose probe cannot run: its config does not shrink by the standard sizes,
-    or transformers builds or runs no shrunken model of it. Neither tier 2 nor tier 3 can qualify such
-    a source without the probe (ledger 1595)."""
+    or transformers builds or runs no shrunken model of it. Tier 2 cannot map such a source; tier 3 may
+    qualify it on its full config, each program it runs proven causal (`torchax_fallback.qualified`,
+    ledger 1595)."""
 
 
 def _unavailable(model_type: str, detail: str) -> ProbeUnavailable:

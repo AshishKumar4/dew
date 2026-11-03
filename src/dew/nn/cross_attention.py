@@ -356,8 +356,14 @@ class CrossAttention:
         return self.intermediate_size or decoder.mlp_widths[index]
 
     def flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
-        """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`)."""
-        return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths)
+        """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`), its gated norms' maps
+        included as the layer routes (`decoder_block.gate_flops`), as its norms are built (`block`)."""
+        from .backbones.decoder_block import gate_flops
+
+        gates = 0.0 if decoder.ngpt is not None else gate_flops(
+            decoder.norms, GatedCrossAttention.norms, decoder.emb_features, lengths,
+            routed=index in decoder.sparse_layers)
+        return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths) + gates
 
     def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
         """None: the block's matrices are its own, which train with it."""
@@ -446,6 +452,8 @@ class GatedCrossAttention(nn.Module):
     """
 
     reads_layer: ClassVar[bool] = False
+    norms: ClassVar[tuple[str, ...]] = ("input_layernorm", "post_attention_layernorm")
+    """The norms the block builds by name (`norm`): before its attention, and before its feed-forward."""
     """It reads the context with an attention of its own (`CrossBlocks`)."""
 
     norm: Callable[..., nn.Module] | None
@@ -519,7 +527,7 @@ class GatedCrossAttention(nn.Module):
         # A context of several documents is read by each document's own tokens alone (`CrossContext`).
         documents = ({} if context is None or context.segments is None
                      else {"segment_ids": context.queries, "key_segment_ids": context.segments})
-        output = attention(self._normed("input_layernorm", x), embeddings,
+        output = attention(self._normed(self.norms[0], x), embeddings,
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
                            cache_dtype=x.dtype if self.dtype is None else self.dtype, **documents)
         present = _present(stream, context, lengths)
@@ -530,7 +538,7 @@ class GatedCrossAttention(nn.Module):
                            ngpt=self.ngpt, precision=self.precision)
 
         stream = joined(stream, "alpha_cross_attn", output)
-        hidden = self.feedforward(name="mlp")(self._normed("post_attention_layernorm", read(stream)))
+        hidden = self.feedforward(name="mlp")(self._normed(self.norms[1], read(stream)))
         return joined(stream, "alpha_dense", hidden)
 
     def _normed(self, name: str, x: jax.Array) -> jax.Array:

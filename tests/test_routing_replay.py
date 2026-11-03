@@ -31,7 +31,8 @@ from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Ses
 from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
-SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64}
+SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64, 'own routing': 8,
+         'own keyed routing': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -89,6 +90,11 @@ def replayed(obj):
     return jax.jit(lambda params, tokens, routed: replayed_log_probs(obj, params, tokens, (routed, None)))
 
 
+def natively(obj):
+    """`obj`'s own log-probabilities, its routers choosing, as a function of a replay's draw."""
+    return jax.jit(lambda params, tokens, routed: obj.per_token_log_probs(params, tokens))
+
+
 @pytest.mark.parametrize("scan", [False, True])
 def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(scan):
     """The rollout ran an older policy in bf16; the trainer runs the update in
@@ -134,10 +140,10 @@ def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
     np.testing.assert_array_equal(replayed, recorded)
 
 
-def parallel_routed(mixed: bool) -> LMObjective:
+def parallel_routed(mixed: bool, dtype=None) -> LMObjective:
     """Two layers routing at several sites: a parallel mixer (`dew.nn.mixers.parallel`) of attention beside
     a routed MLP (`experts`) and a routed feed-forward on each, or, `mixed`, the first layer's mixer a
-    routed MLP of its own (Nemotron-H's slot) and the second the parallel one."""
+    routed MLP of its own (Nemotron-H's slot) and the second the parallel one; at `dtype`."""
     from dew.nn.mixers import AttentionMixer
     from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 
@@ -151,7 +157,7 @@ def parallel_routed(mixed: bool) -> LMObjective:
               if mixed else {"mixer": parallel})
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1, mlp_features=64,
-        max_seq_len=SEQ_LEN, mixture=Mixture(experts=EXPERTS, top_k=TOP_K), **layout)
+        max_seq_len=SEQ_LEN, mixture=Mixture(experts=EXPERTS, top_k=TOP_K), dtype=dtype, **layout)
     return LMObjective(model, SEQ_LEN)
 
 
@@ -183,8 +189,9 @@ def keyed_record(chosen: dict[str, np.ndarray], shift: int = 0) -> dict[str, np.
 def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
     """Layers that route in a parallel mixer's branch, in a mixer of their own and in their feed-forward
     replay a record keyed by site path (`LayerInputs.experts`): each router chooses its own entry's
-    experts, one off its own choice on every token, and a record of each site's own choice changes
-    nothing, bit for bit. A single record, which names no site, is refused there (ledger 3574)."""
+    experts, one off its own choice on every token, and a record of each site's own choice scores the
+    tokens as the router's own run does, on par from that run's float64 truth over drawn models and
+    tokens (check 1). A single record, which names no site, is refused there (ledger 3574)."""
     obj = parallel_routed(mixed)
     params = obj.init(jax.random.key(0))
     tokens = tokens_of(2)
@@ -192,17 +199,24 @@ def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
     assert sorted(native) == sorted([FEEDFORWARD_ROUTES, f"{MIXER_ROUTES}/experts",
                                      *([MIXER_ROUTES] if mixed else [])])
     shifted = keyed_record(native, shift=1)
-    replayed = site_choices(obj, params, tokens, routes=(shifted, None))
-    for site, chosen in replayed.items():
+    under_record = site_choices(obj, params, tokens, routes=(shifted, None))
+    for site, chosen in under_record.items():
         # The layers holding the site: the first's mixer, the second's branch, both feed-forwards.
         held = [index for index in range(2) if (site != MIXER_ROUTES or index == 0)
                 and (site != f"{MIXER_ROUTES}/experts" or not mixed or index == 1)]
         assert np.all(chosen[:, :, held] != native[site][:, :, held]), site
         np.testing.assert_array_equal(chosen[:, :, held], shifted[site][:, :-1, held], err_msg=site)
-    np.testing.assert_array_equal(replayed_log_probs(obj, params, tokens, (keyed_record(native), None)),
-                                  obj.per_token_log_probs(params, tokens))
     with pytest.raises(ValueError):
         obj.token_scores(params, tokens, routes=(shifted[FEEDFORWARD_ROUTES], None))
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
+
+    def draw(seed):
+        params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(2, seed=1000 + seed)
+        return params, tokens, keyed_record(site_choices(obj, params, tokens))
+
+    label = f"own keyed routing, {'mixed' if mixed else 'parallel'}"
+    assert_as_exact(replayed(obj), natively(obj), draw, label, seeds=SEEDS['own keyed routing'],
+                    truth_fn=natively(parallel_routed(mixed, jnp.float64)))
 
 def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
     """GPT OSS's experts, which a mixture builds under swigluoai (`Mixture.build`), replay a record
@@ -225,12 +239,17 @@ def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
 
 
 def test_replaying_a_forwards_own_routing_changes_nothing():
+    """A record of the router's own choice, replayed, scores the tokens as the router's own run does: on
+    par from that run's float64 truth over drawn models and tokens (check 1)."""
     obj = objective(scan=True)
-    params = nn.unbox(obj.init(jax.random.key(0)))
-    tokens = tokens_of(2)
-    routed = engine_layout(choices(obj, params, tokens), 2)
-    np.testing.assert_array_equal(replayed_log_probs(obj, params, tokens, (routed, None)),
-                                  obj.per_token_log_probs(params, tokens))
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
+
+    def draw(seed):
+        params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(2, seed=1000 + seed)
+        return params, tokens, engine_layout(choices(obj, params, tokens), 2)
+
+    assert_as_exact(replayed(obj), natively(obj), draw, "own routing", seeds=SEEDS['own routing'],
+                    truth_fn=natively(objective(scan=True, dtype=jnp.float64)))
 
 
 def test_the_gate_keeps_its_gradient_under_replay():

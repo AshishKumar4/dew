@@ -87,6 +87,8 @@ from dew.registry import (
     record_fields,
     resolve_dtype,
     towers,
+    trust_sources,
+    trusts_source,
 )
 from dew.sampling.text import Sampling, with_ids_of
 
@@ -431,7 +433,7 @@ class Pretrained:
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
              modeling_overrides: Mapping[str, object] | None = None,
-             trust_remote_code: bool = False, text_only: bool = False,
+             trust_remote_code: bool | None = None, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
              precision: Numerics | str | None = None, scan_layers: bool = False,
              step: int | str | None = None, ema: bool | None = None) -> Self:
@@ -481,8 +483,12 @@ class Pretrained:
         are assembled from their declared backbone and head components.
 
         `trust_remote_code=True` lets tier 2 run the repository's own modeling code (its
-        `auto_map`) for a model_type transformers has no class for (`dew.interop.verify`), and `save`
-        writes it beside the weights (`code`).
+        `auto_map`) for a model_type transformers has no class for (`dew.interop.verify`), and a media
+        processor its own processor code (LFM3-VL's), and `save` writes it beside the weights (`code`);
+        the process then trusts the source (`dew.registry.trusts_source`), so a processor reloaded from its
+        record runs that code too (`load_processor`). None, the default, runs it where the process
+        already trusts the source: a task or run loaded with `trust=(name,)` or `--trust name`
+        (`dew.inference.load`, `dew train`). False never runs it.
 
         Called on a specific kind (`PretrainedDecoder.load`), it refuses a source of
         another kind and names that kind.
@@ -514,7 +520,8 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir = released_run(name_or_dir, step=step, ema=ema, mesh=mesh, layout=layout)
+        name_or_dir, trust_remote_code = _released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
+                                                          mesh=mesh, layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -1331,6 +1338,28 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     return None
 
 
+def _released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:
+    """The source a load reads, itself or a saved run's release (`released_run`), and whether the load
+    runs its own code (`_runs_code`): a trusted run's release is trusted with it, as the processor's
+    record names the release."""
+    runs = _runs_code(str(name_or_dir), asked)
+    released = released_run(name_or_dir, **release)
+    if runs and released != name_or_dir:
+        trust_sources((str(released),))
+    return released, runs
+
+
+def _runs_code(name: str, asked: bool | None) -> bool:
+    """Whether a load of `name` runs the source's own code: as `asked`, or, where None, as the process
+    trusts the source (`dew.registry.trusts_source`). A load asked to run it trusts the source for the
+    process, so a processor reloaded from its record runs that code too (`load_processor`)."""
+    if asked is None:
+        return trusts_source(name)
+    if asked:
+        trust_sources((name,))
+    return asked
+
+
 def load_processor(source: sources.SourceReference, model: nn.Module) -> Processor | None:
     """Reload the recorded processor from its source, beside `model`.
 
@@ -1338,8 +1367,14 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     as a typed record, not its translated fields. Reading that source's config
     and translating its wrapper derives a media processor's geometry again
     without loading the model's weights. A composite's metadata codec selects
-    the native component's config, as it does for the initial load.
+    the native component's config, as it does for the initial load. A record whose
+    load ran the source's own code (`SourceReference.remote_code`) runs it again
+    only where the process trusts the source (`dew.registry.trusts_source`): a record
+    arrives from the Hub, and its flag alone never runs code.
     """
+    if source.remote_code and not trusts_source(source.name):
+        raise ValueError(f"{source.name}'s processor runs the source's own code, which this process does not "
+                         f"trust: load with trust=({source.name!r},) or --trust {source.name}")
     directory = source.metadata()
     if source.remote_code:
         # The source's own modules beside its files, as its load ran them (`sources.remote_code`).
@@ -1730,6 +1765,8 @@ type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedR
 def source_route(config: Mapping[str, object], *,
                  verified: Callable[..., verify.VerifiedMapping | verify.Unmapped] = verify.verify_mapping,
                  admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None,
+                 qualified: Callable[[Mapping[str, object], verify.ProbeUnavailable], TorchAdmission]
+                 | None = None,
                  remote: Path | None = None, pinned: sources.SourceReference | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
@@ -1739,6 +1776,7 @@ def source_route(config: Mapping[str, object], *,
     and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
+    None), and `qualified` whether it runs one whose probe cannot run (`torchax_fallback.qualified` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
     modeling code the load opted into running (`trust_remote_code`), and `pinned` the repository, Hub
     commit and folder it was fetched at, which a verification of that code is recorded under."""
@@ -1753,7 +1791,8 @@ def source_route(config: Mapping[str, object], *,
         from dew.interop import torchax_fallback
 
         torchax_fallback.refuse_quantized(config)
-        return TorchRoute(torchax_fallback.qualified(config, unavailable))
+        qualify = torchax_fallback.qualified if qualified is None else qualified
+        return TorchRoute(qualify(config, unavailable))
     match verdict:
         case verify.VerifiedMapping() as mapping:
             return VerifiedRoute(mapping)

@@ -22,7 +22,7 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
-from dew._distributions import row_draw, wellformed
+from dew._distributions import counted, row_draw, wellformed
 from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
@@ -620,13 +620,19 @@ class Speculative:
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int) -> Draws:
-        depths = ops.propose is not None and ops.embed is not None and ops.depths
-        if ops.verify is None or not (depths or ops.draft is not None):
-            raise ValueError("speculative decoding drafts with the model's prediction depths or "
-                             "its block drafter, and this model has neither; load a checkpoint "
-                             "with MTP or DSpark weights or choose another strategy")
+        refuse_undrafted(ops)
         return continuations(start, n, lambda drawn: _speculate(
             state, drawn, ops, transform, stopping, budget, self))
+
+
+def refuse_undrafted(ops: DecodeOps) -> None:
+    """Refuse a decode that has nothing to draft with: speculative blocks (`block_step`) draft with the
+    model's prediction depths or its block drafter, and verify with the model."""
+    depths = ops.propose is not None and ops.embed is not None and ops.depths
+    if ops.verify is None or not (depths or ops.draft is not None):
+        raise ValueError("speculative decoding drafts with the model's prediction depths or "
+                         "its block drafter, and this model has neither; load a checkpoint "
+                         "with MTP or DSpark weights or choose another strategy")
 
 
 def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.Array:
@@ -657,7 +663,7 @@ class _Drafted(NamedTuple):
 
 
 def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepState,
-             keys: jax.Array, base: jax.Array, active: jax.Array, budget: int,
+             keys: jax.Array, base: jax.Array, active: jax.Array, budget: int | jax.Array,
              transform, stopping) -> _Drafted:
     """One block's candidates: an ordinary target draw, then the draft's,
     chained through the prediction depths or drawn as a block drafter's pass
@@ -724,7 +730,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
 
 
 def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
-              step: StepState, active: jax.Array, budget: int) -> tuple[jax.Array, jax.Array]:
+              step: StepState, active: jax.Array, budget: int | jax.Array) -> tuple[jax.Array, jax.Array]:
     """How many candidates the block keeps, and the token it ends on.
 
     A candidate the draft never offered was not rejected, so the block ends
@@ -737,7 +743,8 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     for at in range(1, block_size):
         ratio = (categorical.token_log_probs(targets[at], candidates[at])
                  - categorical.token_log_probs(drafts[at], candidates[at]))
-        uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
+        # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
+        uniform = jax.vmap(jax.random.uniform)(counted(keys[:, block_size + at]))
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
     matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)).astype(jnp.int32)
@@ -771,9 +778,10 @@ def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement
 
 
 def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated: jax.Array,
-               budget: int, stopping, matched: jax.Array) -> tuple[StepState, jax.Array, jax.Array]:
+               budget: int | jax.Array, stopping, matched: jax.Array
+               ) -> tuple[StepState, jax.Array, jax.Array, jax.Array]:
     """The `StepState` the block's kept slots leave, how many each row keeps,
-    and which rows ended.
+    which rows ended, and which a criterion finished in this block.
 
     A row keeps its accepted prefix and the token after it, within its
     budget. The slots are committed one at a time, so every criterion sees
@@ -790,7 +798,7 @@ def _committed(block_size: int, step: StepState, emitted: jax.Array, terminated:
         fired = stopping(walked, emitted[:, at])
         ended, live = ended | (fired.ended & kept), live & ~(fired.done & kept)
     walked = dataclasses.replace(walked, active=live & ~ended & (walked.step < budget))
-    return walked, walked.step - step.step, ended
+    return walked, walked.step - step.step, ended, active & ~live
 
 
 def _written(out: Draws, emitted: jax.Array, behavior: jax.Array, original: jax.Array, keep: jax.Array,
@@ -813,14 +821,44 @@ class _SpeculativeCarry(NamedTuple):
     out: Draws
 
 
+class Block(NamedTuple):
+    """What one speculative block leaves (`block_step`): the target state after its emitted tokens, the
+    `StepState` they leave, its `plan.block + 1` slots of tokens per row with both log probabilities
+    each records, the slots each row keeps, which rows ended so far, and which a criterion finished in
+    this block."""
+
+    state: DecoderState
+    step: StepState
+    tokens: jax.Array
+    behavior: jax.Array
+    raw: jax.Array
+    kept: jax.Array
+    terminated: jax.Array
+    stopped: jax.Array
+
+
 def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
            slots: jax.Array, index: jax.Array):
+    """`block_step` over `_speculate`'s carry, its kept slots written at their response positions."""
+    block = block_step(carry.state, carry.step, carry.out.terminated, plan, ops, transform, stopping, budget)
+    out = _written(carry.out, block.tokens, block.behavior, block.raw, block.kept, carry.step, slots, index,
+                   block.terminated)
+    return _SpeculativeCarry(block.state, block.step, out), None
+
+
+def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan: Speculative,
+               ops: DecodeOps, transform, stopping, budget: int | jax.Array) -> Block:
     """One speculative block: draft `plan.block` candidates, verify them,
     accept the longest prefix the test allows, and emit what follows it,
-    replaying the accepted prefix into the cache saved before the block."""
+    replaying the accepted prefix into the cache saved before the block: the
+    step both speculative loops take, `Speculative`'s scan and the server's
+    (`dew.inference.serving_kernel`). `budget` caps each row's draws, one
+    for every row or a row's own (`[rows]`). A decode with nothing to draft
+    with is refused (`refuse_undrafted`)."""
+    refuse_undrafted(ops)
     verify, block_size = ops.verify, plan.block
     assert verify is not None
-    state, step = carry.state, carry.step
+    slots = jnp.arange(block_size + 1)[None, :]
     active, saved, rows = step.active, state.cache, step.rows
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
@@ -842,13 +880,12 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
 
     emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
-    committed, count, terminated = _committed(block_size, step, emitted, carry.out.terminated, budget,
-                                              stopping, matched)
+    committed, count, terminated, stopped = _committed(block_size, step, emitted, terminated, budget,
+                                                       stopping, matched)
     checkify.check(
         jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
         "the model produced an emitted position without a distribution to score")
     keep = slots < count[:, None]
-    out = _written(carry.out, emitted, behavior, original, keep, step, slots, index, terminated)
 
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
     assert seen is not None
@@ -878,7 +915,7 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
                                     state.logits))
-    return _SpeculativeCarry(following, committed, out), None
+    return Block(following, committed, emitted, behavior, original, keep, terminated, stopped)
 
 
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,

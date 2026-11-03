@@ -24,7 +24,7 @@ from process_support import fresh
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.options import compiled_with, owned_program, program
+from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
 from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
@@ -521,6 +521,23 @@ def test_a_program_its_caller_owns_is_released_with_its_caller():
     gc.collect()
     assert released() is None
     assert program(jnp.sum) is program(jnp.sum)
+
+
+def test_a_fetched_program_runs_the_executable_of_its_first_call():
+    """A program a host loop calls every step (`Fetched`) answers as the program does for arguments of its
+    first call's shapes and dtypes, however their values change; arguments of another shape are refused
+    where the program itself would compile for them; and a program with a static argument, whose
+    executable takes the dynamic arguments alone, is refused at once."""
+    doubled = owned_program(lambda x: x * 2.0)
+    fetched = Fetched(doubled)
+    for value in (1.0, 3.0):
+        np.testing.assert_array_equal(np.asarray(fetched(jnp.full(3, value))), np.full(3, 2 * value))
+    with pytest.raises(TypeError):
+        fetched(jnp.ones(4))
+    np.testing.assert_array_equal(np.asarray(doubled(jnp.ones(4))), np.full(4, 2.0))
+    with pytest.raises(ValueError):
+        Fetched(owned_program(lambda scale, x: scale * x, static_argnums=0))
+
 
 def test_a_program_within_another_takes_the_enclosing_programs_options():
     """A program called within another trace (a kernel's own program inside a step) is the enclosing
