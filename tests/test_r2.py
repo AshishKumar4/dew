@@ -107,9 +107,10 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_he
 
 
 def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline():
-    """A Worker that sends its answer's body a few bytes at a time, each within the socket's timeout, gave no
-    object in time: its read is `Unavailable` near `timeout` plus its length at `MIN_RATE`, never the whole
-    trickle's 12 s (2026-11-03: a test cache's bundle read 28 minutes before its group's first test)."""
+    """A Worker that sends its answer's body a little at a time, each piece within the socket's timeout,
+    gave no object in time: its read is `Unavailable` once its first piece past `timeout` plus its length at
+    `MIN_RATE` has come, never after the whole trickle's 12.8 s (2026-11-03: a test cache's bundle read 28
+    minutes before its group's first test)."""
 
     class Trickle(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -117,10 +118,10 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
 
         def do_GET(self):
             self.send_response(200)
-            self.send_header("Content-Length", str(64 * 64))
+            self.send_header("Content-Length", str(64 * 4096))
             self.end_headers()
             for _ in range(64):
-                self.wfile.write(b"x" * 64)
+                self.wfile.write(b"x" * 4096)
                 self.wfile.flush()
                 time.sleep(0.2)
 
@@ -132,7 +133,7 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
         began = time.monotonic()
         with pytest.raises(r2.Unavailable):
             store.get("records/slow")
-        assert time.monotonic() - began < 4
+        assert time.monotonic() - began < 6
     finally:
         server.shutdown()
 

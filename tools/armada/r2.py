@@ -130,7 +130,7 @@ class Body:
     def whole(self) -> bytes:
         """The rest of the body."""
         parts = []
-        # In pieces of a few socket reads each, so a slow body is given up near its deadline.
+        # In pieces a sixteenth of a second long at MIN_RATE, so a slow body is given up near its deadline.
         while part := self.read(2 ** 16):
             parts.append(part)
         return b"".join(parts)
