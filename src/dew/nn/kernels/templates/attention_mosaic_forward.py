@@ -865,13 +865,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
-    # Each launch named apart, so its compile reports and profile rows say which it is; a launch over a block
-    # of the value columns by the block's width, every block's one kernel (the name is a static of its
-    # lowering, `_launched`: named by its first column, a width 256 compiled four, train 505's review).
+    # Each launch named apart, so its compile reports and profile rows say which it is.
     kind = "peaks" if peaks else "training" if training else "forward"
-    block_width = column_width or value.shape[-1]
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
-            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}")
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
