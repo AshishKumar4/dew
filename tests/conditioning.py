@@ -23,11 +23,6 @@ import numpy as np
 from check1_statistics import Finding, GateFailure
 
 
-def scales(scale) -> list:
-    """A rounding scale's leaves, a non-floating output's None among them (`rounding_scale`)."""
-    return jax.tree.leaves(scale, is_leaf=lambda leaf: leaf is None)
-
-
 def float_leaf(leaf) -> bool:
     """Whether `leaf` holds floats, bfloat16's among them, as JAX's dtypes read it."""
     return jnp.issubdtype(jnp.result_type(leaf), jnp.floating)
@@ -48,33 +43,17 @@ class Weighed:
     """Each floating leaf's heavy elements (`_heavy`), a mask, None for a leaf of none: its residuals
     judged as a leaf of their own beside the light ones' (`classed`)."""
 
-    def widths(self) -> tuple[int, ...]:
-        """Each judged leaf's row width (`_Draws.widths`, `row_factor`), a class's the fewest of its values
-        any row holds, at least one: a heavy class of one value a row is a row of one."""
-        found = []
-        truths = jax.tree.leaves(self.truth)
-        for truth, mask in zip(truths, self.heavy or [None] * len(truths), strict=True):
-            width = int(np.shape(truth)[-1]) if np.ndim(truth) >= 2 else 0
-            if mask is None:
-                found.append(width)
-                continue
-            for counts in (np.sum(mask, axis=-1), np.sum(~mask, axis=-1)):
-                held = counts[counts > 0]
-                found.append(int(held.min()) if held.size else width)
-        return tuple(found)
-
-    def classed(self, tree, masked: bool = True):
-        """`tree`, of the truth's structure, each floating leaf with heavy elements (`heavy`) split into
-        `{"heavy": ..., "light": ...}`, the other class's elements zero in each where `masked` (sizes, not
-        masked, stay whole in each), so each class is judged as its own leaf, pooled and by rows, a row of
-        no heavy element as it was."""
+    def classed(self, tree):
+        """`tree`, of the truth's structure (its leaves by the truth's treedef, a structural None kept out),
+        each floating leaf with heavy elements (`heavy`) split into its classes, each class's rows compacted
+        by the count of its values a row: `{"heavy": {k: [rows of k heavy values, k]}, "light": {...}}`,
+        so each class is judged as its own leaves, every row at its own width (`row_factor`) and its RMS
+        over its own values; a leaf of rank one splits into its classes' values, of no rows."""
         if self.heavy is None:
             return tree
-        leaves, structure = jax.tree.flatten(tree, is_leaf=lambda leaf: leaf is None)
-        split = [leaf if mask is None or leaf is None
-                 else {"heavy": np.where(mask, leaf, 0.0) if masked else leaf,
-                       "light": np.where(mask, 0.0, leaf) if masked else leaf}
-                 for leaf, mask in zip(leaves, self.heavy, strict=True)]
+        structure = jax.tree.structure(self.truth)
+        split = [leaf if mask is None or leaf is None else _compacted(np.asarray(leaf), mask)
+                 for leaf, mask in zip(structure.flatten_up_to(tree), self.heavy, strict=True)]
         return structure.unflatten(split)
 
     def weighed(self, tree, arm: str):
@@ -88,12 +67,13 @@ class Weighed:
         structure = jax.tree.structure(self.truth)
         paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(self.truth)]
         leaves = structure.flatten_up_to(jax.device_get(tree))
-        for path, leaf, true in zip(paths, leaves, jax.tree.leaves(self.truth), strict=True):
+        truths = structure.flatten_up_to(self.truth)
+        for path, leaf, true in zip(paths, leaves, truths, strict=True):
             if np.shape(leaf) != np.shape(true):
                 raise AssertionError(f"{arm}, {path}: its shape is {np.shape(leaf)}, the truth's "
                                      f"{np.shape(true)}")
         weighed = []
-        for path, leaf, true, scale in zip(paths, leaves, jax.tree.leaves(self.truth), scales(self.scale),
+        for path, leaf, true, scale in zip(paths, leaves, truths, structure.flatten_up_to(self.scale),
                                            strict=True):
             if scale is None:
                 # A leaf of no float (an index, a count) is judged as it is.
@@ -127,9 +107,11 @@ def heavy_masks(runs) -> list:
     from the light rest (`Weighed.classed`): an error moved onto them never hides behind the rest's."""
     totals = None
     for ran, true in runs:
+        structure = jax.tree.structure(true)
         squares = [np.square(np.asarray(arm, np.float64) - np.asarray(truth, np.float64))
                    if float_leaf(truth) and np.ndim(truth) else None
-                   for arm, truth in zip(jax.tree.leaves(ran), jax.tree.leaves(true), strict=True)]
+                   for arm, truth in zip(structure.flatten_up_to(ran), structure.flatten_up_to(true),
+                                         strict=True)]
         totals = squares if totals is None else [None if total is None else total + square
                                                  for total, square in zip(totals, squares, strict=True)]
     masks = []
@@ -164,4 +146,19 @@ class Conditioning:
         zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if float_leaf(leaf) else leaf, truth)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if float_leaf(leaf) else None, truth)
         weighing = Weighed(truth, scale, zeros, ones, self.heavy)
-        return dataclasses.replace(weighing, ones=weighing.classed(ones, masked=False))
+        return dataclasses.replace(weighing, ones=weighing.classed(ones))
+
+
+def _compacted(leaf: np.ndarray, mask: np.ndarray) -> dict:
+    """`leaf`'s heavy (`mask`) and light values apart, each class's rows grouped by how many of its values
+    a row holds, each group `[its rows, that count]` in row order (`Weighed.classed`); a leaf of rank one
+    gives each class's values."""
+    if leaf.ndim < 2:
+        return {"heavy": leaf[mask], "light": leaf[~mask]}
+    rows, chosen = leaf.reshape(-1, leaf.shape[-1]), mask.reshape(-1, mask.shape[-1])
+    classes = {}
+    for name, held in (("heavy", chosen), ("light", ~chosen)):
+        counts = held.sum(axis=-1)
+        classes[name] = {int(count): rows[counts == count][held[counts == count]].reshape(-1, int(count))
+                         for count in np.unique(counts[counts > 0])}
+    return classes

@@ -1093,11 +1093,10 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
 
 def _judged_leaves(dew, weighing) -> tuple[list[str], tuple[int, ...]]:
     """The names and row widths of the leaves check 1 judges of Dew's arm `dew`: its own, or with a
-    `weighing` each floating leaf's heavy and light classes (`Weighed.classed`, `Weighed.widths`)."""
+    `weighing` each floating leaf's classes, each compacted by its values a row (`Weighed.classed`)."""
     judged = dew if weighing is None else weighing.classed(jax.device_get(dew))
-    widths = (tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0 for leaf in jax.tree.leaves(dew))
-              if weighing is None else weighing.widths())
-    return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(judged)], widths
+    return ([jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(judged)],
+            tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0 for leaf in jax.tree.leaves(judged)))
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
@@ -2090,7 +2089,9 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
-    span = (1 + REDRAW) * seeds
+    # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
+    # reference's own beside them where unpaired, so no two runs share a draw.
+    span = (1 + REDRAW) * max(seeds, conditioning or 0)
     for run in range(first, first + runs):
         base = run * 2 * span
 

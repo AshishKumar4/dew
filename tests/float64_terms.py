@@ -5,6 +5,7 @@ own module, a seam of the gate's: it reads a program's jaxpr and nothing of a ch
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import weakref
 from typing import Protocol
@@ -90,15 +91,11 @@ def float64_terms(fn, *args):
     order are the walk's, compiled where the walk dispatched each alone."""
     closed, tree = _traced(fn, args)
     leaves = jax.tree.leaves(args)
-    # The device its inputs are placed on runs the evaluation, so a branch its platform picks is that one's.
-    placed = PLACED.set(_device_of(leaves))
-    try:
+    with evaluated_on(leaves):
         if _static(closed.jaxpr):
             values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
         else:
             values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
-    finally:
-        PLACED.reset(placed)
     return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
                                                    for energy, value in zip(energies, values, strict=True)])
 
@@ -135,28 +132,52 @@ def _platform_picked(jaxpr) -> frozenset:
 
 
 PLACED: contextvars.ContextVar = contextvars.ContextVar("float64_terms_placed", default=None)
-"""The device the evaluation runs on (`_device_of` its inputs, `float64_terms`), None for JAX's default."""
+"""The device the evaluation in progress runs on (`evaluated_on`), None outside one."""
 
 
-def _device_of(leaves):
-    """The device `leaves`' evaluation runs on: the first placed array's, as jit runs them, else JAX's default
-    device."""
-    placed = next((leaf for leaf in leaves if isinstance(leaf, jax.Array)), None)
-    return jax.devices()[0] if placed is None else min(placed.devices(), key=lambda device: device.id)
+@contextlib.contextmanager
+def evaluated_on(leaves):
+    """The scope of an evaluation of `leaves` (every evaluator's entry: `float64_terms`,
+    `rounding_bound.rounding_scale`): the device it runs on, as jit would run them, the first committed
+    array's, else JAX's default device (its `jax_default_device`, else its first), so a branch its
+    platform picks is that device's (`_platform`) and every compiled evaluation is keyed by it
+    (`_target`)."""
+    committed = next((leaf for leaf in leaves if isinstance(leaf, jax.Array) and leaf.committed), None)
+    default = jax.config.jax_default_device
+    if committed is not None:
+        device = min(committed.devices(), key=lambda device: device.id)
+    elif default is None or isinstance(default, str):
+        device = jax.devices(default)[0]
+    else:
+        device = default
+    token = PLACED.set(device)
+    try:
+        yield device
+    finally:
+        PLACED.reset(token)
+
+
+def _placed():
+    """The device the evaluation in progress runs on (`evaluated_on`); none outside one is refused, as no
+    branch its platform picks can be read there."""
+    device = PLACED.get()
+    if device is None:
+        raise RuntimeError("float64_terms evaluates within `evaluated_on`, which names the device it runs on")
+    return device
 
 
 def _platform(equation):
-    """A `platform_index` equation's index on the device the evaluation runs on (`PLACED`), read concretely,
-    so the branch it picks is one static step even within a compiled run (`_compiled`, keyed by that
-    device's platform)."""
-    with jax.default_device(PLACED.get() or jax.devices()[0]), jax.ensure_compile_time_eval():
+    """A `platform_index` equation's index on the device the evaluation runs on (`evaluated_on`), read
+    concretely, so the branch it picks is one static step even within a compiled run (`_compiled`, keyed
+    by that device's platform)."""
+    with jax.default_device(_placed()), jax.ensure_compile_time_eval():
         return np.asarray(equation.primitive.bind(**equation.params))
 
 
 def _target() -> str:
-    """The platform the evaluation runs on (`PLACED`), which a compiled evaluation's key holds: a branch its
-    platform picks is read into the program it compiles (`_platform`)."""
-    return (PLACED.get() or jax.devices()[0]).platform
+    """The platform the evaluation runs on (`evaluated_on`), which every compiled evaluation's key holds: a
+    branch its platform picks is read into the program it compiles (`_platform`)."""
+    return _placed().platform
 
 
 def _traced(fn, args):

@@ -85,7 +85,7 @@ def test_a_fault_on_the_elements_a_program_computes_well_is_decided_weighed():
         assert_as_exact(jax.jit(biased), jax.jit(reference), draw, "a biased product, unweighted",
                         seeds=WEIGHED_SEEDS)
     failure = failed(biased, "a biased product beside an amplified value")
-    light = [finding for finding in failure.findings if finding.leaf.endswith("['light']")]
+    light = [finding for finding in failure.findings if "['light']" in finding.leaf]
     assert light and {finding.rule for finding in light} <= {"pooled", "row"}
     assert all(finding.leaf.startswith("a biased product beside an amplified value, conditioned")
                for finding in failure.findings)
@@ -107,7 +107,7 @@ def test_an_error_moved_onto_the_amplified_element_fails_decided():
         return jnp.concatenate([amplified(a, 2 * big), a[:, 1:] * b[:, 1:]], axis=-1)
 
     failure = failed(moved, "an error moved onto the amplified element")
-    heavy = [finding for finding in failure.findings if finding.leaf.endswith("['heavy']")]
+    heavy = [finding for finding in failure.findings if "['heavy']" in finding.leaf]
     # A row of one heavy value is held by the gate's factor for one (NARROW_FACTORS): the pooled check
     # decides.
     assert heavy and {finding.rule for finding in heavy} == {"pooled"}

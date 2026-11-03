@@ -28,7 +28,7 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
-from float64_terms import SUMS, _evaluated, _static
+from float64_terms import SUMS, _evaluated, _static, _target, evaluated_on
 
 EXACT = frozenset({
     "neg", "abs", "max", "min", "select_n", "reshape", "broadcast_in_dim", "transpose", "squeeze",
@@ -129,7 +129,8 @@ def rounding_scale(fn, *args, seed: int = 0):
     tree = jax.tree.structure(jax.eval_shape(fn, *args))
     # Traced in the caller's arithmetic (its default matmul precision among it), replayed in float64's own.
     traced = str(jax.config.jax_default_matmul_precision)
-    with jax.enable_x64(new_val=True), jax.default_matmul_precision("highest"):
+    with evaluated_on(jax.tree.leaves(args)), jax.enable_x64(new_val=True), \
+            jax.default_matmul_precision("highest"):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in jax.tree.leaves(args)]
         consts = [_widened(value) for value in closed.consts]
         key = jax.random.key(seed)
@@ -137,7 +138,7 @@ def rounding_scale(fn, *args, seed: int = 0):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
                                                          for leaf in jax.tree.leaves(args)),
-                         traced)
+                         traced, _target())
             held = SCALES.setdefault(fn, {})
             if signature not in held:
                 jaxpr = closed.jaxpr
