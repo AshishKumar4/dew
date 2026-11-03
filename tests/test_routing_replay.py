@@ -570,10 +570,11 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
         assert isinstance(read, Mapping) and sorted(read) == sorted(record)
         for site, held in second.routed_experts.items():
             np.testing.assert_array_equal(read[site], held, err_msg=site)
-    with pytest.raises(TypeError):
-        second.routed_experts[FEEDFORWARD_ROUTES] = second.routed_experts[FEEDFORWARD_ROUTES]
+    held = second.routed_experts
     with pytest.raises(ValueError):
-        second.routed_experts[FEEDFORWARD_ROUTES][0, 0, 0] = 0
+        held[FEEDFORWARD_ROUTES] = held[FEEDFORWARD_ROUTES]
+    with pytest.raises(ValueError):
+        held[FEEDFORWARD_ROUTES][0, 0, 0] = 0
     short = {**second.routed_experts, FEEDFORWARD_ROUTES: second.routed_experts[FEEDFORWARD_ROUTES][:-1]}
     for refused in (short, {}):
         with pytest.raises(ValueError):
