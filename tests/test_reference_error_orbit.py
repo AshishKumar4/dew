@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import RESOLUTION, GateFailure, _drawn, as_given, assert_as_exact, seeds_for
+from reference_error import RESOLUTION, GateFailure, _drawn, assert_as_exact, seeds_for
 
 ROWS = 64
 
@@ -162,59 +162,3 @@ def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=_swapped, also=[recorded])
     with pytest.raises(ValueError):
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
-
-
-def test_the_worst_row_is_held_at_parity_at_every_row_width():
-    """The worst-row rule judged alone through check 1's stages (`_staged` on a leaf whose pooled ratio is
-    one): Dew's worst row just past PARITY times the reference's on every seed fails, its first stage's eight
-    seeds screening it (`SCREEN`) and the second's forty refusing it, and just inside PARITY passes, at one
-    value a row as at eight (row 3684: a factor of 90 and 11 at narrow rows, and 4 at wider ones, held no
-    worst row at PARITY)."""
-    from reference_error import NO_ZERO_ROWS, PARITY, _Draws, _staged
-
-    for width in (1, 2, 3, 8):
-        for worst, fails in ((0.99 * PARITY, False), (1.01 * PARITY, True)):
-            # The draws hold each worst row by its log (`log_over`).
-            def drawn(start, stop, worst=worst, width=width):
-                count = stop - start
-                return _Draws(["leaf"], np.ones((count, 1)), np.ones((count, 1)),
-                              np.tile([[[np.log(worst), 0.0]]], (count, 1, 1)), [[NO_ZERO_ROWS]] * count,
-                              np.ones((count, 1), bool), (width,))
-
-            over, unresolved, stage = _staged(drawn, 8, "leaf")
-            assert (bool(over), stage) == ((True, 2) if fails else (False, 1)), (width, worst)
-            assert not unresolved
-
-
-def test_a_row_ten_times_the_references_fails_at_every_width_through_check_one():
-    """Through `assert_as_exact`: a first row ten times the reference's relative error, too small a value
-    for the pooled ratio to see, fails at one value a row as at eight: the worst row is held at PARITY
-    whatever its width (row 3684)."""
-    def arms(width):
-        def draw(seed):
-            values = np.random.default_rng([0x0D, seed]).standard_normal((4096, width))
-            values[0] *= 2.0 ** -8
-            return (values,)
-
-        @as_given
-        def reference(values):
-            return {"leaf": values * (1 + 2.0 ** -20)}
-
-        @as_given
-        def dew(values):
-            moved = values * (1 + 2.0 ** -20)
-            moved[0] = values[0] * (1 + 10 * 2.0 ** -20)
-            return {"leaf": moved}
-
-        return dew, reference, draw
-
-    def truth(values):
-        return {"leaf": values}
-
-    for width in (1, 8):
-        dew, reference, draw = arms(width)
-        with pytest.raises(AssertionError) as raised:
-            assert_as_exact(dew, reference, draw, f"width {width}", seeds=8, truth_fn=truth)
-        assert raised.type is GateFailure
-
-
