@@ -161,13 +161,13 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
 
 
 def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_of_its_judge(ci, tmp_path):
-    """Once a site runs as map tasks, the durations record holds no whole run of it: its test's seconds are what
-    one of its tasks took, its judge's pooling among them. A map task armada has not measured (a later one its
-    judge has not asked for since) weighs its units at the rate of the site's map tasks armada measured, which
-    its first stage, run every time, always is; so a later wave's 8-seed tasks of a site whose first 4 seeds took
-    40 s weigh 80 s each, and armada gives the wave containers for what they take, never the 2 s judge's seconds
-    over the site's seeds (2026-11-03: 267 later tasks of about 85 s each, weighed under 1 s, were given 48
-    containers and ran 10 minutes)."""
+    """Once a site runs as map tasks, the durations record holds no whole run of it: its test's seconds are
+    what one of its tasks took, its judge's pooling among them. A map task armada has not measured (a later
+    one its judge has not asked for since) weighs its units at the rate of the site's map tasks armada
+    measured, which its first stage, run every time, always is; so a later wave's 8-seed tasks of a site
+    whose first 4 seeds took 40 s weigh 80 s each, and armada gives the wave containers for what they take,
+    never the 2 s judge's seconds over the site's seeds (2026-11-03: 267 later tasks of about 85 s each,
+    weighed under 1 s, were given 48 containers and ran 10 minutes)."""
     site_checkout(tmp_path)
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
