@@ -27,6 +27,7 @@ MODELS = {
 """Each model's expert shapes: its hidden width, an expert's intermediate width, its experts and top-k."""
 
 TOKENS = (1, 2, 4, 8, 16, 32, 64)
+"""A decode step's tokens, the default; `--tokens` names others (a prefill's or a small batch's)."""
 ROUTES = ("mosaic_gpu", "triton", "cutlass", "xla")
 ROUTINGS = 32
 """The routings drawn a cell, each call its own."""
@@ -61,6 +62,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--models", default=",".join(MODELS))
+    parser.add_argument("--tokens", default=",".join(map(str, TOKENS)))
     args = parser.parse_args()
     device = jax.devices()[0].device_kind
     with open(args.out, "w") as out:
@@ -74,7 +76,7 @@ def main() -> None:
                                               jnp.bfloat16),
                        "down": jnp.asarray(rng.normal(size=(experts, inter, hidden)) / np.sqrt(inter),
                                            jnp.bfloat16)}
-            for tokens in TOKENS:
+            for tokens in map(int, args.tokens.split(",")):
                 rows = tokens * top_k
                 sizes = [jnp.asarray(drawn) for drawn in routings(tokens, experts, top_k, seed=tokens)]
                 for projection, w in weights.items():
