@@ -568,17 +568,17 @@ def test_the_worst_row_passes_heavy_tailed_equal_arms_and_fails_one_twice_the_re
 
 def test_equal_arms_whose_worst_rows_take_turns_pass_where_one_seeds_maximum_failed_them():
     """Through `assert_as_exact` (row 3684): two arms each a value off by its own seed's noise, a first row of
-    1/64 the leaf's so it is every arm's worst row on every seed, Dew's noise there 20 times its other rows'
+    1/64 the leaf's so it is every arm's worst row on every seed, Dew's noise there 40 times its other rows'
     on seed 0 and the reference's 3 times on seeds 1 to 20. Dew's worst row is past PARITY times the
     reference's on fewer seeds than the reverse, so the pair passes; the worst row over every seed held at
     four times the reference's worst failed it by its one seed."""
     def draw(seed):
         rng = np.random.default_rng([3684, seed])
-        values = rng.standard_normal((64, 8))
-        values[0] *= 2.0 ** -6
-        mine, theirs = rng.standard_normal((2, 64, 8))
+        values = rng.standard_normal((256, 8))
+        values[0] = 2.0 ** -6
+        mine, theirs = rng.standard_normal((2, 256, 8))
         if seed == 0:
-            mine[0] *= 20.0
+            mine[0] *= 40.0
         elif seed <= 20:
             theirs[0] *= 3.0
         return values, mine, theirs

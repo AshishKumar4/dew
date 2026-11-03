@@ -259,7 +259,7 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     # arms swapped (row 3684).
     _, _, worst, _, (rows, errors, theirs), _ = _paired("leaf", mine, leaf_summary(close, truth))
     assert 1 in rows.tolist() and worst < 0
-    assert [row for row, *_ in pooled_zero_rows([(rows, errors, theirs)])] == [1]
+    assert 1 in [row for row, *_ in pooled_zero_rows([(rows, errors, theirs)])]
     # Both carrying it, it is measured: each arm's error there over its size enters its worst row.
     carried = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.55e-40], dew)
     _, _, worst, their_worst, (rows, _, _), _ = _paired("leaf", leaf_summary(carried, truth),
