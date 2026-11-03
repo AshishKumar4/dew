@@ -81,14 +81,15 @@ shapes, dtypes and weak types and the matmul precision it traced under, held whi
 class TapRule:
     """The walk's rule of a tapped evaluation (`float64_terms.Rule`): each primitive evaluated in float64,
     its parameters' dtypes widened, and each floating result it rounds moved by `scale` times its rounding's
-    bound (module docstring) times a standard normal draw of its own, keyed by `key` folded with the walk's
-    path to it (`at`); `scale` 0 the untapped evaluation."""
+    bound (module docstring) times a standard normal draw of its own, keyed by `key`, a uint64 counter mixed
+    with the walk's path to it (`at`); `scale` 0 the untapped evaluation."""
 
     key: jax.Array
     scale: float
 
     def at(self, index: int) -> TapRule:
-        return TapRule(jax.random.fold_in(self.key, index & 0x7FFFFFFF), self.scale)
+        return TapRule(_mixed(self.key + _GOLDEN * (jnp.asarray(index, jnp.int64).astype(jnp.uint64) + 1)),
+                       self.scale)
 
     def primitive(self, equation, inputs: list) -> list:
         name, params = equation.primitive.name, dict(equation.params)
@@ -114,16 +115,31 @@ class TapRule:
                 tapped.append(value)
                 continue
             unit = _unit(name, params, dtype)
-            draw = _normal(jax.random.fold_in(self.key, index), jnp.shape(value))
+            draw = _normal(_mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64))), jnp.shape(value))
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
 
 
+_GOLDEN = np.uint64(0x9E3779B97F4A7C15)
+"""The 64-bit golden ratio, the step between the counters `_mixed` turns into independent words."""
+
+
+def _mixed(x: jax.Array) -> jax.Array:
+    """SplitMix64's finalizer of uint64 `x`: a word each bit of `x` reaches half the time (Steele, Lea and
+    Flood, "Fast splittable pseudorandom number generators", 2014), the taps' counter-based generator."""
+    x = (x ^ (x >> 30)) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> 27)) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> 31)
+
+
 def _normal(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """Standard normal float64 draws of `shape` keyed by `key`, by Box and Muller's transform of two uniform
-    draws: exact normals of the few cheap operations a program holding a draw at every rounding compiles in
-    a second, where `jax.random.normal`'s inverse error function compiled for minutes."""
-    bits = jax.random.bits(key, (2, *shape), jnp.uint64)
+    """Standard normal float64 draws of `shape` keyed by `key`, a uint64 word: two uniform draws an element,
+    each counter's mixed word (`_mixed`), by Box and Muller's transform. A program holding a draw at every
+    rounding compiles in seconds, where `jax.random`'s threefry keys and inverse error function at each
+    took minutes."""
+    count = int(np.prod(shape))
+    counters = jnp.arange(2 * count, dtype=jnp.uint64).reshape((2, *shape))
+    bits = _mixed(key + _GOLDEN * (counters + 1))
     # Each uniform in (0, 1] from the top 53 bits, so the logarithm is finite.
     uniform = ((bits >> 11).astype(jnp.float64) + 1) * 2.0 ** -53
     return jnp.sqrt(-2 * jnp.log(uniform[0])) * jnp.cos(2 * jnp.pi * uniform[1])
@@ -144,9 +160,7 @@ def rounding_scale(fn, *args, seed: int = 0):
             jax.default_matmul_precision("highest"):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in jax.tree.leaves(args)]
         consts = [_widened(value) for value in closed.consts]
-        # The taps draw their bits by XLA's RngBitGenerator, each rounding's key folded by threefry (`rbg`):
-        # a program's every rounding drawing by threefry alone compiled for minutes.
-        key = jax.random.key(seed, impl="rbg")
+        key = _mixed(jnp.asarray(seed, jnp.uint64))
         if _static(closed.jaxpr):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
@@ -174,7 +188,7 @@ def _scaled(jaxpr, tapped, key):
     relative to its largest displacement, so no square overflows and a nonfinite displacement stays
     nonfinite."""
     plain = tapped(key, 0.0)
-    draws = [tapped(jax.random.fold_in(key, draw + 1), 1.0) for draw in range(DRAWS)]
+    draws = [tapped(_mixed(key + _GOLDEN * jnp.asarray(draw + 1, jnp.uint64)), 1.0) for draw in range(DRAWS)]
     scales = []
     for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True)):
         if not jnp.issubdtype(var.aval.dtype, jnp.floating):
