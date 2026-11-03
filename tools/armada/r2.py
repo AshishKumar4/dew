@@ -20,6 +20,7 @@ import contextlib
 import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,10 @@ CONTRACT = json.loads(Path(__file__).with_name("r2.json").read_text())
 MAX_BYTES: int = CONTRACT["max_bytes"]
 """The largest body the Worker takes or gives."""
 KEY = re.compile(CONTRACT["key"])
+MIN_RATE = 2 ** 20
+"""The slowest an answer's body may arrive, in bytes a second, past the request's `timeout`: one slower is
+given up as `Unavailable`, as a stalled one is by the socket's own timeout (2026-11-03: a test cache's bundle
+read 28 minutes before its group's first test, every wait within the socket's timeout)."""
 
 
 class R2Error(Exception):
@@ -94,16 +99,20 @@ def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes |
 
 class Body:
     """An answer's body as it arrives, read at most `limit` bytes in all: past them a ValueError, and an end
-    before the length the Worker announced, or a connection cut while reading, `Unavailable`."""
+    before the length the Worker announced, a connection cut while reading, or a body arriving slower than
+    `MIN_RATE` past `timeout` seconds, `Unavailable`."""
 
-    def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str):
+    def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str, timeout: float):
         self.stream, self.left, self.what = stream, limit, what
         announced = {name.lower(): value for name, value in headers.items()}.get("content-length")
         self.owed = None if announced is None else int(announced)
+        self.ends = time.monotonic() + timeout + (limit if self.owed is None else self.owed) / MIN_RATE
 
     def read(self, size: int = -1) -> bytes:
         """At most `size` bytes more (all the rest, under -1); b"" at the body's end."""
         wanted = self.left + 1 if size < 0 else min(size, self.left + 1)
+        if time.monotonic() > self.ends:
+            raise Unavailable(f"{self.what} arrived slower than {MIN_RATE} bytes a second")
         try:
             data = self.stream.read(wanted)
         except (OSError, http.client.HTTPException) as error:
@@ -121,7 +130,8 @@ class Body:
     def whole(self) -> bytes:
         """The rest of the body."""
         parts = []
-        while part := self.read(2 ** 20):
+        # In pieces of a few socket reads each, so a slow body is given up near its deadline.
+        while part := self.read(2 ** 16):
             parts.append(part)
         return b"".join(parts)
 
@@ -138,9 +148,9 @@ class Reply:
 
 @dataclass(frozen=True)
 class Store:
-    """The Worker at `url`, asked with `token` under the caller's `user_agent`, each request bounded by
-    `timeout` seconds and sent by `send` (`urllib_send`, else a caller's own, such as a pooled one).
-    Immutable, so threads share one."""
+    """The Worker at `url`, asked with `token` under the caller's `user_agent`, each wait for it bounded by
+    `timeout` seconds and each answer's body to arrive at `MIN_RATE` past them, sent by `send` (`urllib_send`,
+    else a caller's own, such as a pooled one). Immutable, so threads share one."""
 
     url: str
     token: str
@@ -177,7 +187,7 @@ class Store:
                           Unavailable if status == 429 or status >= 500 else Refused)
                 raise raised(f"the R2 Worker answered {status} to {what}")
             answer = (None if method == "HEAD" or status in (304, 404) else
-                      Body(stream, given, limit, f"the answer to {what}"))
+                      Body(stream, given, limit, f"the answer to {what}", self.timeout))
             yield Reply(status, dict(given), answer)
 
     def get(self, key: str, limit: int = MAX_BYTES) -> bytes | None:
