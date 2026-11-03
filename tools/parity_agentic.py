@@ -167,7 +167,8 @@ def main() -> None:
     offpolicy = helper.compute_offpolicy_metrics(old, behavior, mask)
     out.update(offpolicy_kl=np.float32(offpolicy["kl"]), offpolicy_k3_kl=np.float32(offpolicy["k3_kl"]))
 
-    scaled = lightning.normalize_advantages_by_rollout(advantages, mask, ROLLOUTS, num_trained_rows=len(ROLLOUTS))
+    scaled = lightning.normalize_advantages_by_rollout(advantages, mask, ROLLOUTS,
+                                                        num_trained_rows=len(ROLLOUTS))
     current = torch.tensor(CURRENT).requires_grad_()
     per_rollout, _ = core.compute_policy_loss_vanilla(old, current, scaled, mask, "token-sum", config, None)
     per_rollout.backward()

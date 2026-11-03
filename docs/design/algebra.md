@@ -27,7 +27,7 @@ checked-in output yet. The text stays as the design to resume.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
-| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `reuse`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
+| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
 - **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
@@ -299,7 +299,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `stable`, `error_free` |
+| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets registered: `identities`, `stable`, `linear`, `joined` (`reuse`, `decoupled` and `error_free`, §1, are not registered yet) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
@@ -461,9 +461,9 @@ class Mode(Enum):
 
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "linear", "identities", "reuse", "decoupled", "stable", ...
+    name: str                                # "identities", "stable", "linear", "joined"
     rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
-    modes: frozenset[Mode]                   # linear, identities, reuse: both; the rest: DEV
+    modes: frozenset[Mode]                   # identities, linear, joined: both; stable: DEV
     ruleset: egglog.Ruleset
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
 
