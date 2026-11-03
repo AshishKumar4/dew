@@ -80,11 +80,15 @@ class HeadedObjective(Objective[Loss, Effects]):
         return head if self.head_fused else None
 
     def head_program(self, model: nn.Module) -> ProgramModule:
-        """`model` as a trained module of the step's program with this objective's head: its tile, and
-        fused where the loss fuses a tiled head the model holds as one matrix."""
-        fused = (self.fuses_head() and self.head_fused and self.head_tile is not None and reads_states(model)
-                 and isinstance(model, AffineHead) and self._head_matrices.get(id(model), (None, True))[1])
-        return ProgramModule(model, self.head_tile, trained=True, head_fused=fused)
+        """`model` as a trained module of the step's program with this objective's head: the tile its
+        backward takes, where the model holds its head as one matrix (none where it keeps its whole
+        logits, a head no matrix alone is, `chunked.head_cross_entropy`), and fused where the loss fuses
+        it."""
+        matrix = (reads_states(model) and isinstance(model, AffineHead)
+                  and self._head_matrices.get(id(model), (None, True))[1])
+        tile = self.head_tile if matrix else None
+        fused = self.fuses_head() and self.head_fused and tile is not None
+        return ProgramModule(model, tile, trained=True, head_fused=fused)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)

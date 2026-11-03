@@ -1978,7 +1978,8 @@ GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tes
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
                   "tests/sampling_gate.py", "tests/test_sampling_gate.py",
                   "tests/learning_gate.py", "tests/test_learning_gate.py", "tests/one_draw.py",
-                  "tests/float64_terms.py"})
+                  "tests/float64_terms.py", "tests/conditioning.py", "tests/site_draws.py",
+                  "tests/rounding_bound.py", "tests/test_weighed_check.py", "tests/arm_arithmetic.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
 compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t

@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import (
+    BaseExpr,
     Expr,
     String,
     StringLike,
@@ -239,7 +240,7 @@ class Region[Node: (Term, Skeleton)]:
         return list(seen.values())
 
 
-def key(term: Expr | Skeleton) -> Hashable:
+def key(term: BaseExpr | Skeleton) -> Hashable:
     """`term` as a dictionary's key: its declaration, which egglog builds it from, equal wherever two terms
     are (its text is black's formatting of it, about a millisecond a term: a third of a gemma3n training
     step's pass); a skeleton's form (`Skeleton`)."""

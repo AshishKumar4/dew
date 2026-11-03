@@ -106,6 +106,29 @@ Forward and training counters remain separate in prefetched batch metadata;
 the training sum rides the existing interval's single metric read, without an
 extra transfer or a hidden full-FT assumption for LoRA.
 
+## Recurrence templates against fla and mamba_ssm, 2026-11
+
+Device milliseconds, the template against the kernel it replaces, each pair in one job on the same operands. The delta-rule rows come from `tools/benchmark_recurrence_mosaic.py` (shapes in `tools/benchmark_recurrence.py`'s `SHAPES`, one row of 4,096 tokens, bf16):
+
+```
+PYTHONPATH=src:tools python tools/benchmark_recurrence_mosaic.py --arm <mosaic|port> \
+    --shape <qwen3.5-27b-gdn|kimi-linear-kda> --pass <forward|training> --repeats 20
+```
+
+| Operation | GPU | Shape | Template | Reference | Receipt |
+|---|---|---|---:|---:|---|
+| Gated DeltaNet, forward | H100 80GB HBM3 | qwen3.5-27b-gdn (16 key, 48 value heads of 128) | 0.364 ms | fla port 0.514 ms | JS-solvefed-h100-92eacee68 |
+| Gated DeltaNet, forward and gradient | H100 80GB HBM3 | qwen3.5-27b-gdn | 2.46 ms | fla port 3.12 ms | JS-train80-h100-db2c4aca0 |
+| Kimi delta attention, forward | A100 SXM4 | kimi-linear-kda (32 heads of 128, a decay a key dimension) | 5.06 ms | fla port 8.81 ms | JS-kdacells-a100-a928ea2b4 |
+| Kimi delta attention, forward and gradient | A100 SXM4 | kimi-linear-kda | 11.12 ms | fla port 15.92 ms | batch-window-a100-b2ad84c61 |
+
+The selective scan row is the template's forward (`templates/recurrence/selective.py`, chunk 32, 16 states) against mamba_ssm's `selective_scan_fn` built from its PyPI source for the same GPU, in one job:
+
+| Operation | GPU | Shape | Template | Reference | Receipt |
+|---|---|---|---:|---:|---|
+| Mamba-1 selective scan, forward | H100 80GB HBM3 | 8 × 2048 × 5120 | 0.742 ms | mamba_ssm 1.311 ms | JS-selbar2-h100-894dfdf30 |
+| Mamba-1 selective scan, forward | A100 SXM4 | 8 × 2048 × 5120 | 1.389 ms | mamba_ssm 2.970 ms | JS-selbar-a100-894dfdf30 |
+
 ## Multi-GPU training and serving, 2026-10-21
 
 These rows come from one booking each of an 8x A100-SXM4-40GB node and a 4x H100 SXM 80GB node, both NVLink. Each training row is one run. MFU is the model's training FLOPs over the step time and the GPUs' summed bf16 peak: 312 TFLOP/s per A100 and 989 per H100. The convention is the one in [Model FLOPs, hardware FLOPs and real tokens](#model-flops-hardware-flops-and-real-tokens).
@@ -2395,16 +2418,20 @@ kernels, 1.26 ms of them a decode step against vLLM's 0.50, and 8.1 ms an
 admission (32 admissions of 8 prompts).
 
 The largest admission item was the prefill's attention. Admission left-pads
-its prompts and writes their keys compactly, so the cache prefill builds the
-cursor mask. `kernel_for_materialized_mask`, a rule meant for training
-(cuDNN's bias backward refuses odd lengths), sent that mask to xla, which
-cost two dense dots, a softmax and four mask transposes, 3.7 ms an
-admission. A cache call over more than one query now gives the mask to cuDNN
-as its bias wherever cuDNN runs; training, single-token decode, CPU and the
-deterministic-ops CUDA lane are unchanged. Over 28 layers in isolation it
-takes 4.0 against 6.2 ms, and the device's busy time per run went from
-2212.6 to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128 (two
-traced runs each, the same in both).
+its prompts and writes their keys compactly, so the cache prefill then built
+the cursor mask, and `kernel_for_materialized_mask`, a rule meant for
+training (cuDNN's bias backward refuses odd lengths), sent that mask to xla,
+which cost two dense dots, a softmax and four mask transposes, 3.7 ms an
+admission. Giving the mask to cuDNN as its bias took 4.0 against 6.2 ms over
+28 layers in isolation, and the device's busy time per run went from 2212.6
+to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128 (two traced
+runs each, the same in both). Today the prefill builds no mask: its rows'
+padding reaches the attention selector as key validity, which FlashAttention
+takes (an H100 and an L4, 2026-11-02). A cache call that does build its mask
+over more than one query, a mixed serving step's prompt pieces or a verified
+draft, runs forward only and gives it to cuDNN as its bias wherever cuDNN
+runs (`attention.mask_kernel`); training, single-token decode, CPU and the
+deterministic-ops CUDA lane keep xla's rule.
 
 It is not bitwise, because cuDNN rounds at other points than xla's dots and
 softmax. I measured the error under tests/reference_error.py's rule, against
@@ -2421,8 +2448,8 @@ bf16 near-tie. Teacher-forced through the fp32 model, the two chosen tokens'
 logits are a median 0.64 bf16 spacings apart at their magnitude and at most
 2.78; 77% are under one spacing and 98% under two. The fp32 argmax is the
 xla prefill's choice in 31 rows and cuDNN's in 23.
-`a_padded_prefill_attends_through_cudnn_where_it_runs` in `tests/test_causal_transformer.py`, a cell of
-`tests/test_gpu_models.py`, checks the routing. The distances apply `tests/reference_error.py`'s
+`a_padded_prefill_is_on_par_with_the_full_pass` in `tests/test_causal_transformer.py`, a cell of
+`tests/test_gpu_models.py`, holds the padded prefill on par with the full pass. The distances apply `tests/reference_error.py`'s
 `distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
 under `jax.default_matmul_precision("highest")` over the same tokens.
 

@@ -203,11 +203,261 @@ def test_an_elastic_stream_without_workers_reads_its_share_of_one_readers_batche
         assert held == [one[step][0::2], one[step][1::2]]
 
 
-def test_an_elastic_stream_refuses_loading_workers_and_elastic_and_per_share_positions_each_other(tmp_path):
-    """A streamed elastic read refuses loading workers, which read a stream's shards each their own;
-    elastic and per-share positions each refuse the other's read."""
+@pytest.mark.parametrize(("saved", "resumed"), [((2, 2), (1, 3)), ((1, 3), (2, 0))],
+                         ids=["2-readers-2-workers-to-1-reader-3-workers",
+                              "1-reader-3-workers-to-2-readers-none"])
+def test_an_elastic_stream_in_loading_workers_reads_one_readers_order_and_resumes_on_any_count(
+        tmp_path, saved, resumed):
+    """Loading workers read an elastic stream in its order, each reading the whole stream and keeping its
+    groups of a batch's count of records, so every reader's rows are those one reader reads without them,
+    whatever the count of either; and the position readers save in workers of one count, the stream's own,
+    resumes readers of another count in another count of workers in the batches one reader reads from
+    there (row 1896)."""
+    # Three shards, which loading workers that dealt a stream's shards between them would read apart.
+    urls = []
+    for shard in range(3):
+        path = tmp_path / f"ids-{shard}.jsonl"
+        path.write_text("".join(json.dumps({"id": 32 * shard + index}) + "\n" for index in range(32)))
+        urls.append(str(path))
+
+    def ids(*, elastic: bool) -> Pipeline:
+        chain = Pipeline(Files(tuple(urls), format="jsonl")).repeat().filter(odd).batch(BATCH)
+        return (chain.elastic() if elastic else chain).read("streamed")
+
+    one = [np.asarray(batch["id"]).tolist()
+           for batch in itertools.islice(reader(ids(elastic=False), 0, 1), 5)]
+    (readers, workers), (again, more) = saved, resumed
+
+    def opened(count: int, loaders: int):
+        loading = Loading(workers=loaders, threads=2, read_buffer=2, worker_buffer=2)
+        return [compile(ids(elastic=True), loading=loading, seed=3).train(DataPartition(index, count))
+                for index in range(count)]
+
+    def assert_one_readers(shares, count, step):
+        held = [np.asarray(next(share)["id"]).tolist() for share in shares]
+        assert held == [one[step][index::count] for index in range(count)]
+
+    shares = opened(readers, workers)
+    try:
+        for step in range(3):
+            assert_one_readers(shares, readers, step)
+        states = {share.get_state() for share in shares}
+    finally:
+        for share in shares:
+            share.close()
+    assert len(states) == 1
+    (state,) = states
+    shares = opened(again, more)
+    try:
+        for share in shares:
+            share.set_state(state)
+        for step in range(3, 5):
+            assert_one_readers(shares, again, step)
+    finally:
+        for share in shares:
+            share.close()
+
+
+def test_an_elastic_stream_of_one_file_reads_one_order_whatever_its_workers(tmp_path):
+    """One JSON-lines file, which a stream subdivides into as many shards as its readers' workers ask for and
+    deals in its seed's order, reads an elastic stream in one order on any count of loading workers: every
+    worker reads it whole, cut as one reader without workers cuts it, so a position saved in two workers
+    resumes in none and in three, past a pass's end, in the rows one reader reads (row 1896)."""
+    path = str(tmp_path / "ids.jsonl")
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(40)))
+
+    def chain(*, elastic: bool) -> Pipeline:
+        read = Pipeline(Files(path, format="jsonl")).repeat().filter(odd).batch(BATCH)
+        return (read.elastic() if elastic else read).read("streamed")
+
+    def opened(loaders: int):
+        loading = Loading(workers=loaders, threads=2, read_buffer=2, worker_buffer=2)
+        return compile(chain(elastic=True), loading=loading, seed=3).train(DataPartition(0, 1))
+
+    one = [np.asarray(batch["id"]).tolist()
+           for batch in itertools.islice(reader(chain(elastic=False), 0, 1), 6)]
+    saved = opened(2)
+    try:
+        assert [np.asarray(next(saved)["id"]).tolist() for _ in range(2)] == one[:2]
+        state = saved.get_state()
+    finally:
+        saved.close()
+    for loaders in (0, 3):
+        resumed = opened(loaders)
+        try:
+            resumed.set_state(state)
+            assert [np.asarray(next(resumed)["id"]).tolist() for _ in range(4)] == one[2:6], loaders
+        finally:
+            resumed.close()
+
+
+def test_an_elastic_stream_of_a_volatile_source_in_loading_workers_is_refused(tmp_path):
+    """Each loading worker reads an elastic stream whole and keeps its groups by their place in it, so a
+    source a fetch reads differently in each (`Volatile`) would move one worker's groups against another's:
+    in loading workers it is refused before any reads, and without them it reads (row 1896)."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(32)))
+    chain = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat().map(Fetched()).filter(odd)
+             .batch(BATCH).elastic().read("streamed"))
     with pytest.raises(ValueError):
-        compile(jsonl_ids(tmp_path), loading=Loading(workers=2), seed=3).train(DataPartition(0, 2))
+        compile(chain, loading=Loading(workers=2), seed=3).train(DataPartition(0, 1))
+    assert len(listed(compile(chain, loading=READ, seed=3).train(DataPartition(0, 1)), 2)) == 2
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_an_elastic_streams_chunk_counts_hold_every_row_it_handed_on(tmp_path, workers):
+    """A stream's shards chunked within each shard count their chunks where the workers read them; an
+    elastic stream's position carries them past each batch it handed on, so the chunks a record counts are
+    every chunk read once a batch is taken, and a resume holds them (row 1896)."""
+    from dew.data.text import Chunks
+
+    for shard in range(2):
+        (tmp_path / f"docs-{shard}.jsonl").write_text("".join(
+            json.dumps({"text": list(range(4 * index, 4 * index + 4))}) + "\n" for index in range(8)))
+    urls = tuple(str(tmp_path / f"docs-{shard}.jsonl") for shard in range(2))
+    chain = (Pipeline(Files(urls, format="jsonl"), name="docs").flat_map(Chunks(2)).interleave(2).repeat()
+             .batch(4).elastic().read("streamed"))
+    loading = Loading(workers=workers, threads=2, read_buffer=2, worker_buffer=2)
+    data = compile(chain, loading=loading, seed=3)
+    opened = data.train(DataPartition(0, 1))
+    try:
+        listed(opened, 1)
+        assert data.statistics()["data/chunks_per_record/docs"] == 2.0
+        state = opened.get_state()
+    finally:
+        opened.close()
+    resumed = data.train(DataPartition(0, 1))
+    try:
+        resumed.set_state(state)
+        assert data.statistics()["data/chunks_per_record/docs"] == 2.0
+        listed(resumed, 1)
+        assert data.statistics()["data/chunks_per_record/docs"] == 2.0
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_an_elastic_stream_restored_and_saved_again_resumes_where_it_was(tmp_path, workers):
+    """A position restored and saved again before any row is read is the one restored: a stream's rows
+    taken past its position inside a group stay taken, so its next resume reads on from there and repeats
+    none, inside a group of rows its filter thinned (row 1896)."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(60)))
+
+    chain = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat()
+             .filter(lambda row: int(row["id"]) % 3 != 0, identity="no-thirds").batch(4).elastic()
+             .read("streamed"))
+    loading = Loading(workers=workers, threads=2, read_buffer=2, worker_buffer=2)
+    whole = [np.asarray(batch["id"]).tolist()
+             for batch in itertools.islice(compile(chain, loading=loading, seed=3).train(DataPartition()), 4)]
+    first = compile(chain, loading=loading, seed=3).train(DataPartition())
+    try:
+        next(first)
+        saved = first.get_state()
+    finally:
+        first.close()
+    again = compile(chain, loading=loading, seed=3).train(DataPartition())
+    try:
+        again.set_state(saved)
+        saved_again = again.get_state()
+    finally:
+        again.close()
+    last = compile(chain, loading=loading, seed=3).train(DataPartition())
+    try:
+        last.set_state(saved_again)
+        assert [np.asarray(next(last)["id"]).tolist() for _ in range(3)] == whole[1:4]
+    finally:
+        last.close()
+
+
+@pytest.mark.parametrize("within", [False, True], ids=["after-the-stream", "within-each-shard"])
+def test_an_elastic_stream_without_workers_counts_chunks_as_an_ordinary_read_does(tmp_path, within):
+    """Without loading workers an elastic stream's chunk counters hold each row as it is handed on, as a
+    read that is not elastic counts them, chunked after the stream or within each shard (before an
+    interleave), a batch ending inside a document's chunks included, before and after a resume: documents
+    of one, three and five chunks, the first's dropped, so the first batch holds three chunks of the
+    second and one of the third (row 1896)."""
+    from dew.data.text import Chunks
+
+    (tmp_path / "docs.jsonl").write_text("".join(
+        json.dumps({"text": list(range(100 * index, 100 * index + length))}) + "\n"
+        for index, length in enumerate((2, 6, 10, 6))))
+
+    def statistics(elastic: bool) -> list[float]:
+        chain = Pipeline(Files(str(tmp_path / "docs.jsonl"), format="jsonl"), name="docs").flat_map(Chunks(2))
+        chain = chain.interleave(1) if within else chain
+        chain = chain.filter(lambda row: int(row["text"][0]) >= 100, identity="no-first").batch(4)
+        data = compile((chain.elastic() if elastic else chain).read("streamed"), loading=READ, seed=3)
+        opened = data.train(DataPartition())
+        found = []
+        try:
+            next(opened)
+            found.append(data.statistics()["data/chunks_per_record/docs"])
+            state = opened.get_state()
+        finally:
+            opened.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(state)
+            found.append(data.statistics()["data/chunks_per_record/docs"])
+            next(resumed)
+            found.append(data.statistics()["data/chunks_per_record/docs"])
+        finally:
+            resumed.close()
+        return found
+
+    assert statistics(elastic=True) == statistics(elastic=False)
+
+
+def test_an_elastic_stream_with_no_written_workers_of_a_volatile_source_reads(tmp_path):
+    """A read's own `.workers(0)` is no loading workers whatever its loading's default: an elastic stream of a
+    volatile source reads under it, and one written `.workers(1)` is refused (row 1896)."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(32)))
+
+    def chain(count: int) -> Pipeline:
+        return (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat().map(Fetched())
+                .workers(count).filter(odd).batch(BATCH).elastic().read("streamed"))
+
+    loading = Loading(workers=2, threads=2, read_buffer=2, worker_buffer=2)
+    assert len(listed(compile(chain(0), loading=loading, seed=3).train(DataPartition()), 2)) == 2
+    with pytest.raises(ValueError):
+        compile(chain(1), loading=READ, seed=3).train(DataPartition())
+
+
+@pytest.mark.parametrize(("saved", "resumed"), [(2, 0), (0, 2), (2, 3)])
+def test_an_elastic_stream_saved_inside_a_group_resumes_on_another_count_of_workers(tmp_path, saved, resumed):
+    """A position saved inside a group whose rejected records came before its rows, as a worker's group
+    hands them on, resumes on another count of workers, none of them included, in the batches an unbroken
+    read reads: ids 0 to 31 with 0, 5 and 7 rejected, batches of four, saved after the first, its group
+    [4, 5, 6, 7] handed on as 5's and 7's markers, then 4 and 6 (row 1896)."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(32)))
+    chain = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl"))
+             .filter(lambda row: int(row["id"]) not in (0, 5, 7), identity="no-0-5-7").batch(4).elastic()
+             .read("streamed"))
+
+    def opened(workers: int):
+        loading = Loading(workers=workers, threads=2, read_buffer=2, worker_buffer=2)
+        return compile(chain, loading=loading, seed=3).train(DataPartition())
+
+    whole = opened(saved)
+    try:
+        batches = [np.asarray(next(whole)["id"]).tolist() for _ in range(4)]
+    finally:
+        whole.close()
+    first = opened(saved)
+    try:
+        assert np.asarray(next(first)["id"]).tolist() == batches[0]
+        state = first.get_state()
+    finally:
+        first.close()
+    again = opened(resumed)
+    try:
+        again.set_state(state)
+        assert [np.asarray(next(again)["id"]).tolist() for _ in range(3)] == batches[1:]
+    finally:
+        again.close()
+
+
+def test_elastic_and_per_share_positions_refuse_each_others_read():
+    """Elastic and per-share positions each refuse the other's read."""
     shared = reader(stream(elastic=False), 0, 2)
     listed(shared, 1)
     elastic = reader(stream(), 0, 2)

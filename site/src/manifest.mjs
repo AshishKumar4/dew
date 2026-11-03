@@ -25,7 +25,6 @@ export const groups = [
 			{ source: 'docs/installation.md', slug: 'getting-started/installation', label: 'Installation' },
 			{ source: 'docs/getting-started.md', slug: 'getting-started/quickstart', label: 'Quickstart' },
 			{ source: 'docs/key-concepts.md', slug: 'getting-started/key-concepts', label: 'Key concepts' },
-			{ source: 'docs/from-flaxdiff.md', slug: 'getting-started/from-flaxdiff', label: 'Coming from FlaxDiff' },
 		],
 	},
 	{

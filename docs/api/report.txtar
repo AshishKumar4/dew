@@ -176,6 +176,7 @@ class Objective()  [dew.objectives.base]
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
+  .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
   .towers(self) -> tuple[Held, ...]
   .training_flops(self, model, batch: Batch) -> float
   .unfuse_head(self) -> str | None
@@ -269,6 +270,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
+  .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
   .towers(self) -> tuple[Held, ...]
   .training_flops(self, model, batch: Batch) -> float
   .unfuse_head(self) -> str | None

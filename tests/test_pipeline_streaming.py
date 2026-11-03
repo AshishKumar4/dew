@@ -52,6 +52,15 @@ def extracted(tmp_path_factory):
     return {family: root / archive / inside for family, (archive, inside) in PIPELINES.items()}
 
 
+def assert_same_bits(found, expected) -> None:
+    """`found` holds `expected`'s bits, compared byte by byte so a difference is reported by its count and
+    first places: pytest's report of two unequal byte strings diffs them whole, which ran past two hours
+    on a walk's images (row 3709)."""
+    found, expected = np.asarray(found), np.asarray(expected)
+    assert (found.dtype, found.shape) == (expected.dtype, expected.shape)
+    np.testing.assert_array_equal(found.reshape(-1).view(np.uint8), expected.reshape(-1).view(np.uint8))
+
+
 @pytest.mark.parametrize("family", ["flux", "z_image", "wan"])
 def test_a_streamed_pipeline_samples_what_the_eager_one_does(extracted, family):
     """The conditioner and the autoencoder hold the placed leaves, so a
@@ -106,7 +115,39 @@ def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extr
     prepared = lean_task.prepare(conditions=encoded(directory, conditioner, PROMPTS, {}),
                                  unconditional=encoded(directory, conditioner, [blank], {}), key=3, steps=2)
     walked = lean_task(prepared, key=3).host().images
-    assert np.asarray(walked).tobytes() == np.asarray(prompted).tobytes()
+    assert_same_bits(walked, prompted)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("family", ["sd", "xl", "sd3", "flux", "z_image", "wan"])
+def test_a_pipeline_loaded_without_its_text_encoder_places_its_denoiser_as_the_whole_one(extracted, family):
+    """Over an FSDP mesh a pipeline loaded without its text encoder places every leaf it holds as the
+    whole pipeline places it: its denoiser drawn over the shapes its encoder's draw states
+    (`ConditionEncoder.drawn`), not placed by shapes alone (row 3709)."""
+    placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
+    whole, lean = (load_diffusion_source(str(extracted[family]), dtype="float32", attention_impl="xla",
+                                         text=text, **placement) for text in (True, False))
+    held = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(whole.variables)}
+    placed = jax.tree_util.tree_leaves_with_path(lean.variables)
+    assert placed
+    for path, leaf in placed:
+        assert leaf.sharding == held[path], jax.tree_util.keystr(path)
+
+
+@pytest.mark.mesh
+def test_a_projected_lean_pipeline_places_as_the_whole_one_in_any_context(extracted):
+    """An XL pipeline, whose second CLIP tower's pooled state its composition projects, loaded without its
+    text encoder in its stored dtypes (`param_dtype="auto"`) inside a mesh and the layout's axis rules,
+    places its denoiser as the whole pipeline does: its encoder's draw is unboxed without a constraint
+    (`dew.batch.unboxed`) and its projection drawn whatever dtypes the load keeps (row 3709)."""
+    mesh = MeshSpec(fsdp=jax.device_count())
+    placement = {"mesh": mesh, "layout": LAYOUT, "param_dtype": "auto"}
+    with jax.set_mesh(mesh.build(jax.devices())), nn.logical_axis_rules(LAYOUT.axis_rules):
+        whole, lean = (load_diffusion_source(str(extracted["xl"]), dtype="float32", attention_impl="xla",
+                                             text=text, **placement) for text in (True, False))
+    held = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(whole.variables)}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(lean.variables):
+        assert leaf.sharding == held[path], jax.tree_util.keystr(path)
 
 
 @pytest.mark.mesh
@@ -133,9 +174,9 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     rows = len(PROMPTS)
     own = lean_task.prepare(conditions=jax.tree.map(lambda leaf: leaf[:rows], prompted.conditions),
                             unconditional=prompted.unconditional, key=3, steps=2)
-    assert np.asarray(own.noise).tobytes() == np.asarray(prompted.noise).tobytes()
+    assert_same_bits(own.noise, prompted.noise)
     walked = lean_task(own, key=3).host().images
-    assert np.asarray(walked).tobytes() == np.asarray(task(prompted, key=3).host().images).tobytes()
+    assert_same_bits(walked, task(prompted, key=3).host().images)
     alone = encoded(directory, ENCODED[family], PROMPTS, placement)["conditioning"]
     with jax.enable_x64(new_val=True):
         truth = encoded(directory, ENCODED[family], PROMPTS, {}, widened=True)["conditioning"]

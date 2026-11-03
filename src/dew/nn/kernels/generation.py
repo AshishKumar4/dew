@@ -143,8 +143,9 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
     generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
-    multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; 'fp32': IEEE
-    fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup MMA, Blackwell's
+    multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
+    operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
+    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup MMA, Blackwell's
     tensor memory columns (PTX ISA, tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and
     the VMEM a kernel may raise its limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block
     into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
@@ -170,19 +171,26 @@ class Architecture:
 # CUDA-core lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on
 # TU10x, GA10x, AD10x, GH100 and GB10x/GB20x -> 256. GeForce parts of sm86 and sm89 sum 16-bit products in
 # fp32 at half the rate (the GA102 and Ada whitepapers), which their catalogued peaks give
-# (`GpuTarget.tensor_rate`).
+# (`GpuTarget.tensor_rate`). FP8 operands multiply natively at twice the 16-bit rate where the family's
+# tensor instructions take them: Ada's and consumer Blackwell's mma.sync (L4 242.5 TF over 58 SMs x
+# 2040 MHz -> 2048), Hopper's warpgroup MMA (H100 SXM 1979 -> 8192) and Blackwell's tcgen05 (B200 4500 ->
+# 16384). Hopper's mma.sync takes none (an m16n8k32 e4m3 assembles to F2FP unpacks and HMMA.16816 on
+# sm_90a; the kernel challenge's judge-facts.md:127), nor does Ampere's: there an FP8 product runs as a
+# 16-bit one.
 _AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
+_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256})
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
 _TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
-                       wgmma=True, tma=True, dependent_launch=True)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
+                       resident_threads=2048, wgmma=True, tma=True, dependent_launch=True)
 # Blackwell's tcgen05 family.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
+                          resident_threads=2048,
                           tmem_columns=512, tma=True, dependent_launch=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
-_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, tma=True,
-                                   dependent_launch=True)
+_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+                                   tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
@@ -204,7 +212,7 @@ def architecture(generation: str) -> Architecture | None:
     if (major, minor) == (7, 5):
         return _TURING
     if major == 8:
-        return _AMPERE if minor == 0 else _AMPERE_CONSUMER
+        return {0: _AMPERE, 9: _ADA}.get(minor, _AMPERE_CONSUMER)
     if (major, minor) == (9, 0):
         return _HOPPER
     if major in (10, 11):
@@ -223,6 +231,17 @@ def family(generation: str) -> str | None:
 
 
 @dataclasses.dataclass(frozen=True)
+class Streamed:
+    """One part's device-memory read against its bytes, measured cold (tools/device_facts.py: one kernel
+    streaming N bytes after the L2 is evicted, the least-squares line over 1 MiB to 1 GiB): `fixed` seconds
+    before the stream (launch and first byte) and `bytes_per_second` after, the plateau a long transfer
+    reaches, below what the memory clock and bus give."""
+
+    fixed: float
+    bytes_per_second: float
+
+
+@dataclasses.dataclass(frozen=True)
 class GpuTarget:
     """One generation's device prefixes, dense peaks, block memory and measured kernel row.
 
@@ -236,11 +255,14 @@ class GpuTarget:
     device's own where it reports them (`gpu_target`), which a launch sizes its
     programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
     `memory_bandwidth` are the canonical device's boost clock and device-memory
-    bytes per second, a real device's own likewise. Every other fact a kernel's
+    bytes per second, a real device's own likewise; `streams` maps device-kind
+    prefixes to the stream a part was measured to reach (`streamed`), which
+    prices its device bytes (`memory_rate`). Every other fact a kernel's
     cost model reads (`dew.nn.kernels.templates.cost`) is its instruction
     family's (`architecture`): its tensor rates, warpgroup MMA and tensor memory. A row
-    states a device's datasheet alone: its peaks, which MFU reads, and what a
-    compile-only target of it needs. This table and `architecture` are the one
+    states a device's datasheet, its peaks, which MFU reads, and what a compile-only
+    target of it needs, beside the few facts measured on the part itself. This
+    table and `architecture` are the one
     place a choice is keyed on the hardware; any other code reads their facts, a
     library's support rule the compute capability (`capability`), and a launch
     config its launch's rule from those facts (`dew.nn.kernels.tuning`), as
@@ -251,12 +273,13 @@ class GpuTarget:
     device_kind: str
     shared_limit: int | None = None
     # Out of the hash (still compared), so a target keys a cache: a template's launches lowered once each
-    # (`mainloop._lowered_once`).
+    # (`mainloop.lowered_once`).
     dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict, hash=False)
     aliases: tuple[str, ...] = ()
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
+    streams: Mapping[str, Streamed] = dataclasses.field(default_factory=dict, hash=False)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -307,10 +330,27 @@ class GpuTarget:
     def device_kind_prefixes(self) -> tuple[str, ...]:
         return tuple(self.dense_peaks)
 
+    def _part[Fact](self, by_part: Mapping[str, Fact]) -> Fact | None:
+        """The fact `by_part` states for this device, under the longest device-kind prefix it starts with."""
+        keys = [prefix for prefix in by_part if self.device_kind.startswith(prefix)]
+        return by_part[max(keys, key=len)] if keys else None
+
     @property
     def peaks(self) -> Mapping[str, float]:
-        keys = [prefix for prefix in self.dense_peaks if self.device_kind.startswith(prefix)]
-        return self.dense_peaks[max(keys, key=len)] if keys else {}
+        return self._part(self.dense_peaks) or {}
+
+    @property
+    def streamed(self) -> Streamed | None:
+        """The stream this device's part was measured to reach (`streams`); None for a part no one
+        measured."""
+        return self._part(self.streams)
+
+    @property
+    def memory_rate(self) -> float | None:
+        """Device-memory bytes a second a long transfer streams at: the part's measured plateau (`streamed`),
+        else its clocks' bandwidth (`memory_bandwidth`)."""
+        streamed = self.streamed
+        return self.memory_bandwidth if streamed is None else streamed.bytes_per_second
 
     @property
     def bf16_peak(self) -> float | None:
@@ -388,7 +428,9 @@ TARGETS = {target.generation: target for target in (
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6),
+              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # tools/device_facts.py on an A100-SXM4-40GB (FS-DEVICEFACTS2-a100, 1.555 TB/s by its clocks).
+              streams={'NVIDIA A100-SXM4-40GB': Streamed(6.04e-6, 1.486e12)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
@@ -405,7 +447,13 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
-              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6),
+              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # tools/device_facts.py on an H100 SXM and a GH200 (FS-DEVICEFACTS2-h100 and -gh200); the H200's
+              # the same line through the kernel challenge's best read at each size, 16.8 MB to 805 MB,
+              # cold L2 under graph replay (judge-facts.md:3-18).
+              streams={'NVIDIA H100 80GB HBM3': Streamed(1.87e-6, 3.190e12),
+                       'NVIDIA GH200 480GB': Streamed(2.51e-6, 3.812e12),
+                       'NVIDIA H200': Streamed(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,

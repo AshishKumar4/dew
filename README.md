@@ -26,6 +26,7 @@ Dew is not at 1.0 yet, so APIs and checkpoint formats can still change. [Models]
 
 - [Getting started](#getting-started)
 - [Features](#features)
+- [Kernels and the algebra engine](#kernels-and-the-algebra-engine)
 - [Models](#models)
 - [Training](#training)
 - [Diffusion and sampling](#diffusion-and-sampling)
@@ -211,6 +212,24 @@ DPO and GRPO train with the same `Trainer` as pretraining. `dew.rl` has PPO's ad
 `attention_impl` selects the attention kernel. `AttentionImpl` in [`dew/nn/attention.py`](https://github.com/AshishKumar4/dew/blob/main/src/dew/nn/attention.py) names every kernel and states the order in which `"auto"`, the default, picks one each time it traces an attention call.
 
 The kernel never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
+
+## Kernels and the algebra engine
+
+Dew's attention, linear recurrence and grouped GEMM kernels are templates: one algorithm per operation, written once in Pallas and lowered through Mosaic GPU on Hopper's wgmma and Ampere's mma.sync, or through Pallas-Triton on other GPUs. Each call's kernel configuration is derived from the device's facts and the call's shape, so the default path needs no tuning. An opt-in tuner, `Trainer(tune_kernels=True)`, is off by default. Where an existing kernel is still measured faster at a shape, Dew keeps it for that shape and records the measurement: FlashAttention 3 for 16-bit attention on the H100, FlashAttention 2 on mma.sync GPUs, XLA for fp32 attention and for dense GEMM, and CUTLASS for part of the grouped GEMM on the H100. The template takes over each of these once it is faster.
+
+Measured against the kernels the templates replace:
+
+| Operation | GPU | Shape | Dew | Reference |
+|---|---|---|---:|---:|
+| Mamba-1 selective scan, forward | H100 | 8 × 2048 × 5120 | 0.742 ms | mamba_ssm 1.311 ms |
+| Kimi delta attention, forward | A100 | Kimi Linear, 32 heads of 128, 4096 tokens | 5.06 ms | fla 8.81 ms |
+| Kimi delta attention, forward and gradient | A100 | Kimi Linear, 32 heads of 128, 4096 tokens | 11.12 ms | fla 15.92 ms |
+| Gated DeltaNet, forward | H100 | Qwen3.5-27B | 0.364 ms | fla 0.514 ms |
+| Gated DeltaNet, forward and gradient | H100 | Qwen3.5-27B | 2.46 ms | fla 3.12 ms |
+
+Attention is still slower than FlashAttention 3 and 2 at the shapes where those stay in use, and dense GEMM is 1.9 to 2.9 times slower than cuBLAS on the A100 across its forward and gradients. [Performance](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md#recurrence-templates-against-fla-and-mamba_ssm-2026-11) has each row's command and receipt.
+
+The algebra engine rewrites each program Dew compiles before XLA sees it, using an [egglog](https://github.com/egraphs-good/egglog) e-graph. It merges matching reductions into one pass, moves scales through contractions, and merges products that share an operand. A rewrite that reorders floating-point arithmetic is applied only where the operands' bounds are known, and the accurate numerics admit exact rewrites only. Every rewrite and every kernel is held to the same accuracy gate as the rest of Dew: its RMS error from a float64 reference within 1.5 times the reference implementation's, and, where an operation has a certified rounding bound, every element of every step within that bound ([testing](https://github.com/AshishKumar4/dew/blob/main/docs/design/testing.md#numerical-accuracy)).
 
 ## Models
 

@@ -529,6 +529,12 @@ review's measurement, the median over 200 sums, was 37 units in the sum's last p
 wherever the pooled ratio does not see it."""
 
 
+def row_factor(width: int) -> float:
+    """The worst-row rule's factor for rows of `width` values: NARROW_FACTORS' at one or two, else ROW_FACTOR;
+    every path of check 1 reads its rows' factor here (a weighed class's rows by the class's values a row)."""
+    return NARROW_FACTORS.get(width, ROW_FACTOR)
+
+
 PREVIOUS_TAILS = (5e-4, 5e-4)
 """The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
 

@@ -1,10 +1,10 @@
 # Working on Dew
 
-Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, the numerical contracts and GPU landing. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
+Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, numerical contracts and native qualification. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
 
-- Read the affected module, its callers, tests, and relevant design section before editing. Check JAX, Flax, Optax, Orbax, Grain, and the reference implementation for an existing primitive.
+- Read the affected module, its callers, tests and relevant design section before editing.
 - Activations cross layer-to-kernel interfaces as `[batch, time, heads, head_dim]`. A kernel adapts to that layout; layer code does not permute activations for a kernel. Other tensors keep their own meaning.
 
 ## Parallel work and integration
@@ -15,9 +15,8 @@ Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-a
 ## Verification
 
 - Run the affected test files with pytest's cache enabled. Let the coordinating agent run integration suites; capture complete output and exit status once instead of rerunning a suite to recover failure names.
-- In a worktree, pytest uses its configured source path; run scripts with `PYTHONPATH=src` so they import that worktree. Use the project's environment and commands documented in `CONTRIBUTING.md`.
 - Run heavy work (the full suite, type checks, builds, benchmarks, training) on remote CPU and GPU runners, not on a developer's workstation.
-- A shell pipeline's last command succeeding does not prove tests passed. Stop integration on a failed check; fix and rerun the affected behavior.
+- A shell pipeline's last command succeeding does not prove tests passed. Capture the test process's exit status. Fix and rerun affected behavior after a failed check. The coordinator handles failing heads under the maintainers' landing rules.
 
 ## Performance investigations
 
@@ -29,8 +28,8 @@ Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-a
 - Use compile-time JAX naming inside compiled code. Inspect compilation, shapes, static arguments, and executable reuse before blaming missing JIT or replacing kernels.
 - Cache deterministic work before random transformations unless frozen augmentation is intentional. Preserve record order, randomness, restart position, sharding, and buffer memory bounds.
 - Profile the actual execution configuration. Label diagnostic variants; preserve native reports and missing-data warnings rather than presenting unavailable counters as zero.
-- Report MFU as model FLOPs on real tokens over wall time, and name the precision and peak each utilization figure uses. A run below 50% MFU is profiled and its three largest losses fixed; the target is 50–60% or more on every workload that matters.
-- The bar for a kernel is the best existing implementation for that operation on that device, measured in the same session at real training shapes. Write a custom kernel when the supplied one is the bottleneck. Use open projects as design references and keep their licence notices for anything ported.
+- Report MFU as model FLOPs on real tokens over wall time. Name the precision and peak used by each utilization figure. Profile a run below 50% MFU and fix its three largest losses.
+- Apply the [kernel-template comparison requirements](docs/design/kernel-templates.md#1-the-bar-with-the-comparison-defined). Use open projects as design references and keep their licence notices for anything ported.
 - Claim a speed comparison only for the workload and hardware that were measured.
 
 ## Reporting

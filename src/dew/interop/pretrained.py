@@ -1201,20 +1201,27 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text, stored=stored))
-    # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables; one
-    # loaded without its text encoder encodes nothing to draw its denoiser over, and is placed by shapes.
-    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming and text else {})}):
+    # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables, one loaded
+    # without its text encoder as one loaded with it (`pipeline_axes`).
+    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming else {})}):
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
 
 def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str | None, ...]]:
     """The axes a loaded pipeline's parameters are drawn in: its denoiser's draw over its encoders'
-    parameters' shapes, and each encoder's own table (`DiffusionObjective.denoiser_axes`, `tower_axes`)."""
+    parameters' shapes, and each encoder's own table (`DiffusionObjective.denoiser_axes`, `tower_axes`).
+    An encoder loaded without its weights (`load_diffusion_source(text=False)`) lends its draw's shapes
+    (`ConditionEncoder.drawn`), so its denoiser is placed as the pipeline's that holds them: placed by
+    shapes alone, its contractions summed in another order, the two walked apart (row 3709)."""
     from dew.objectives.diffusion import DiffusionObjective
 
-    objective = DiffusionObjective(loaded)
-    encoders = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
-                            loaded.variables["encoders"])
+    held = loaded.variables["encoders"]
+    encoders = {keyword: jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                                      held[keyword] if keyword in held else unboxed(encoder.drawn()))
+                for keyword, encoder in loaded.inputs.encoders}
+    # The objective over the pipeline as it would hold every encoder: one held without its text encoder
+    # trains nothing (`DiffusionObjective`), and draws here alone.
+    objective = DiffusionObjective(replace(loaded, variables={**loaded.variables, "encoders": encoders}))
     return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
 
 
