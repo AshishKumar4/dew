@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING
 
 import jax
 from flax import linen as nn
@@ -17,6 +18,9 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import scaled
 from dew.nn.protocols import ProjectionGroup, ReadsTrain, Routes, RoutesBySite, RoutesExperts, declared_groups
+
+if TYPE_CHECKING:
+    from dew.nn.mla import MLAMixer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,6 +167,21 @@ class ParallelMixer(MixerBase):
     @property
     def keeps_triton_gemm(self) -> bool:
         return any(branch.mixer.keeps_triton_gemm for branch in self.branches)
+
+    @property
+    def draws_init_std(self) -> bool:
+        return all(branch.mixer.draws_init_std for branch in self.branches)
+
+    @property
+    def drops_attention(self) -> bool:
+        return all(branch.mixer.drops_attention for branch in self.branches)
+
+    def publishes(self, kv_shared: bool) -> bool:
+        return any(branch.mixer.publishes(kv_shared) for branch in self.branches)
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+        return tuple(indexed for branch in self.branches for indexed in branch.mixer.indexed_mixers)
 
     @property
     def keeps_cache(self) -> bool:

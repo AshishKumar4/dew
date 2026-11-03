@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 from ..dex import HeadOutputs
 from ..mixers import AttentionMixer
-from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 
 if TYPE_CHECKING:
@@ -45,11 +44,11 @@ def _lm_engine(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
     if model.initializer_range is not None:
         for layer_type, kind in sorted(kinds.items()):
             mixer = kind.mixer or model.mixer
-            if mixer is not None and not isinstance(mixer, (AttentionMixer, Mamba2Mixer)):
+            if mixer is not None and not mixer.draws_init_std:
                 raise ValueError(
                     f"initializer_range draws the attention and mamba2 mixers' "
-                    f"projections; {layer_type!r} runs {type(mixer).__name__}, "
-                    f"which keeps its own initializers")
+                    f"projections (`MixerBase.draws_init_std`); {layer_type!r} runs "
+                    f"{type(mixer).__name__}, which keeps its own initializers")
     elif model.depth_scaled_init:
         raise ValueError("depth_scaled_init scales initializer_range's std; set it")
 
@@ -62,8 +61,9 @@ def _dropout(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]) -> Non
             raise ValueError(f"{field} must be within [0, 1), got {rate}")
     if model.attention_dropout_rate:
         for kind in kinds.values():
-            if not isinstance(kind.mixer or model.mixer or AttentionMixer(), AttentionMixer):
-                raise ValueError("attention_dropout_rate requires ordinary attention mixers")
+            if not (kind.mixer or model.mixer or AttentionMixer()).drops_attention:
+                raise ValueError("attention_dropout_rate requires mixers that drop attention probabilities "
+                                 "(`MixerBase.drops_attention`): ordinary attention, or layers of it")
 
 def _classic(model: CausalTransformer):
     """Raise `ValueError` for norm, position and feed-forward combinations that no supported

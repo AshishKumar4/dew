@@ -94,6 +94,12 @@ class MLPMixer(MixerBase):
                              'media_bias and a branch beside a dense feed-forward need a decoder '
                              'feed-forward slot')
 
+    @property
+    def draws_init_std(self) -> bool:
+        """A dense slot's projections draw at the context's standard deviations (`feedforward`); a routed
+        slot's are its mixture's."""
+        return self.mixture is None
+
     def generation_refusal(self) -> str | None:
         """Its mixture's (`Mixture.generation_refusal`), where the slot is routed."""
         return None if self.mixture is None else self.mixture.generation_refusal()

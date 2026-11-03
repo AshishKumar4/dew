@@ -24,6 +24,7 @@ from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, wi
 from reference_error import (
     as_given,
     assert_as_exact,
+    equations,
     torch_with_gradients,
     widened,
     with_gradients,
@@ -1585,3 +1586,61 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
                     f"{dtype} {pairs} {scale} {packed} rotary", seeds=SEEDS['rotary'])
 
 
+
+
+def test_a_gated_norms_maps_run_at_the_models_precision():
+    """A norm gated by a low-rank map of its own output (`NormSpec.gate_rank`, A.X-K2's) maps it with Dew's
+    projections at the model's precision, as every other projection (ledger 3626): a model at 'highest'
+    traced where JAX's own default stands (the suite's environment names 'highest'), the gate's two
+    products, rank 3 wide between, ask for it."""
+    from dew.nn.backbones.decoder_block import NormSpec
+
+    model = tiny(num_layers=1, precision="highest", norms={"input_layernorm": NormSpec(gate_rank=3)})
+    ids = jnp.ones((1, 4), jnp.int32)
+    width = TINY_DECODER["emb_features"]
+    with jax.default_matmul_precision("default"):
+        variables = model.init(jax.random.key(0), ids)
+        # The products an accelerator runs (`equations`), where a CPU sums a float32 product in float64.
+        program = jax.make_jaxpr(model.apply)(variables, ids)
+    gates = [equation.params["precision"] for equation in equations(program, platform="cuda")
+             if equation.primitive.name == "dot_general"
+             and {tuple(var.aval.shape) for var in equation.invars} & {(width, 3), (3, width)}]
+    assert len(gates) == 2
+    assert all(precision == (jax.lax.Precision.HIGHEST,) * 2 for precision in gates), gates
+
+
+def test_a_parallel_layer_reads_its_branches_initializers_and_indexers():
+    """A parallel layer (`ParallelMixer`) is what its branches are (ledger 3629): of attention beside
+    Mamba-2 (Falcon-H1's) or beside a dense feed-forward, it draws at lm-engine's `initializer_range` as
+    its branches do, where it was refused as a mixer keeping its own initializers; of attention beside
+    attention it drops attention probabilities at `attention_dropout_rate`; one of a CSA2 Full layer
+    publishes what its later layers read (`MixerBase.publishes`); and a latent attention branch carrying
+    an indexer is the decoder's indexed mixer, which an indexer's training reads."""
+    from dew.nn.deepseek_v4 import DeepseekV4Mixer
+    from dew.nn.mixers.mamba2 import Mamba2Mixer
+    from dew.nn.mixers.mlp import MLPMixer
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
+    from dew.nn.mla import MLAMixer
+
+    def beside(name, mixer):
+        return ParallelMixer(branches=(ParallelBranch(name, mixer, 1.0, 1.0),
+                                       ParallelBranch("attention", AttentionMixer(), 1.0, 1.0)))
+
+    ids = jnp.ones((1, 4), jnp.int32)
+    mamba = Mamba2Mixer(num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=4)
+    for mixer in (beside("mamba", mamba), beside("mlp", MLPMixer(intermediate_size=16))):
+        tiny(num_layers=1, initializer_range=0.02, mixer=mixer).init(jax.random.key(0), ids)
+    tiny(num_layers=1, attention_dropout_rate=0.1, mixer=beside("other", AttentionMixer())).init(
+        jax.random.key(0), ids)
+    with pytest.raises(ValueError):
+        tiny(num_layers=1, attention_dropout_rate=0.1, mixer=beside("mamba", mamba)).init(
+            jax.random.key(0), ids)
+    full = DeepseekV4Mixer(compressor="csa2", compress_rate=4, index_topk=2, index_n_heads=2,
+                           index_head_dim=16)
+    assert beside("full", full).publishes(kv_shared=False)
+    assert not beside("mamba", mamba).publishes(kv_shared=False)
+    latent = MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4, v_head_dim=8,
+                      index_n_heads=2, index_head_dim=8)
+    indexed = tiny(num_layers=1, mixer=ParallelMixer(branches=(
+        ParallelBranch("mamba", mamba, 1.0, 1.0), ParallelBranch("latent", latent, 1.0, 1.0))))
+    assert indexed.indexed_mixers == (latent,)
