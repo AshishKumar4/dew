@@ -517,6 +517,10 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     label = f"{case.name} {layout}, {steps} step(s)"
+    # Each arm's steps on the cell's own batch in its own order, run first, so each compiles here as `fit`
+    # compiles its own and not under the draws' contexts: what `fit` is checked against.
+    own = (next(batches(case, encoder)()), np.arange(width))
+    ran = {} if judging() else {arm: stepped(*own) for arm, stepped in drawn.items()}
     assert_as_exact(drawn[layout], drawn["one device"], draw, label, seeds=seeds, truth_fn=truth,
                     orders=orders)
     fits = f"{label}: fit's own steps and placement"
@@ -532,27 +536,26 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     def checked(start: int, stop: int) -> list[str]:
         """The arms whose fit a map task of seeds `start` to `stop` checks: each beside the draw it is
         placed with, so no task trains both."""
-        ran = [arm for arm, (_, _, seed) in arms.items() if start <= seed < stop]
-        for arm in ran:
-            assert_fits_as_drawn(case, tmp_path, arms[arm][0], arms[arm][1], copied(), steps, drawn[arm],
-                                 (next(batches(case, encoder)()), np.arange(width)), placed=arm == layout)
-        return ran
+        placed = [arm for arm, (_, _, seed) in arms.items() if start <= seed < stop]
+        for arm in placed:
+            assert_fits_as_drawn(case, tmp_path, arms[arm][0], arms[arm][1], copied(), steps, ran[arm],
+                                 placed=arm == layout)
+        return placed
 
     if not record_units(fits, checked):
         checked(0, seeds)
 
 
-def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: int, stepped, own, *,
-                         placed: bool):
-    """`fit`'s own `steps` steps of `case` on `mesh` from `state`, on the cell's own batch in its own order
-    (`own`), leave the variables, momentum and EMA the drawn steps (`stepped`) leave, bit for bit: what
-    check 1 judges is the run's. Where `placed`, the state it returns, and the one an Adam step holds
+def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: int, ours, *, placed: bool):
+    """`fit`'s own `steps` steps of `case` on `mesh` from `state`, on the cell's own batch in its own order,
+    leave the variables, momentum and EMA the drawn steps leave on it (`ours`), bit for bit: what check 1
+    judges is the run's. Where `placed`, the state it returns, and the one an Adam step holds
     (`place`), keep the layout's placement: no parameter sharded on a 1-wide fsdp axis, each fsdp leaf its
     shard of the global parameter (a pipelined leaf stacked by stage, each stage on its own devices), and
     the optimizer's state and the EMA following the parameters without the optimizer or the model ever
     describing a layout."""
     run, fitted = run_case(case, tmp_path, mesh, devices=devices, state=state, steps=steps)[:2]
-    ours, stored = stepped(*own), run.stored(fitted)
+    stored = run.stored(fitted)
     for name, tree in ours.items():
         held = jax.device_get(getattr(stored, name))
         assert jax.tree.structure(tree) == jax.tree.structure(held), name
