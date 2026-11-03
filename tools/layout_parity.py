@@ -1181,7 +1181,7 @@ def _cache_name(kind: str, case, seed: int) -> tuple[str, dict[str, Any]]:
         digest.update(array.tobytes())
     from dew.nn.precision import wide_cpu_arithmetic
 
-    inputs = {"schema": CACHE_SCHEMA, "kind": kind, "case": dataclasses.asdict(case), "seed": seed,
+    inputs = {"schema": CACHE_SCHEMA, "kind": kind, "case": case.record(), "seed": seed,
               "batch": digest.hexdigest(), "jax": jax.__version__,
               "jaxlib": importlib.metadata.version("jaxlib"),
               "x64": jax.config.jax_enable_x64, "wide_cpu_arithmetic": wide_cpu_arithmetic(),
