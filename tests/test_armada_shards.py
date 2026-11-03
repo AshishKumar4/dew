@@ -130,9 +130,10 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
     shards(units=20, per_task=8) of at most 8 of its 20 units, none later, each its test's own group,
     `<test>.draws-<start>-<stop>`, and one judge waiting on them by their names, whose row is the site's,
     `<file>#<test>`; the file's own row sets the site aside, weighed and cut without its seconds. A map
-    task weighs what armada measured it at, else its units at the site's recorded seconds over the units a
-    whole run takes (a check-1 site's declared seeds, a `shards` test's units); the judge, its row's
-    pooling as armada measured it, else the target; a cold plan adds what a cold task pays to each."""
+    task weighs what armada measured it at, else its units at the rate of the site's measured map tasks,
+    else its units at the site's recorded seconds over the units a whole run takes (a check-1 site's
+    declared seeds, a `shards` test's units); the judge, its row's pooling as armada measured it, else the
+    target; a cold plan adds what a cold task pays to each."""
     site_checkout(tmp_path, site)
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"]
     check1 = site is SITE
@@ -148,16 +149,56 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
         (ci.site_task("3.12", "tests/test_site.py", "test_site"), "tests/test_site.py", "test_site", None,
          names, 30.0, False)]
     assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", entry["name"]) for entry in entries)
-    # Weighed by what armada measured: a map task under its task's name, the judge under its row's.
+    # Weighed by what armada measured: a map task under its task's name, the judge under its row's, and an
+    # unmeasured map task at the measured ones' rate.
     measured = {names[0]: 7.0, "3.12:tests/test_site.py#test_site": 3.0}
     weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": measured})}
-    assert [weighed[name] for name in names] == [7.0, *(per_unit * (stop - start)
+    first = spans[0][1] - spans[0][0]
+    assert [weighed[name] for name in names] == [7.0, *(7.0 / first * (stop - start)
                                                           for start, stop in spans[1:])]
     assert weighed[ci.site_task("3.12", "tests/test_site.py", "test_site")] == 3.0
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
     cold = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"}
     assert [cold[name] for name in names] == [(stop - start) * per_unit + ci.COLD_SECONDS
                                               for start, stop in spans]
+
+
+def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_of_its_judge(ci, tmp_path):
+    """Once a site runs as map tasks, the durations record holds no whole run of it: its test's seconds are
+    what one of its tasks took, its judge's pooling among them. A map task armada has not measured (a later
+    one its judge has not asked for since) weighs its units at the rate of the site's map tasks armada
+    measured, which its first stage, run every time, always is; so a later wave's 8-seed tasks of a site
+    whose first 4 seeds took 40 s weigh 80 s each, and armada gives the wave containers for what they take,
+    never the 2 s judge's seconds over the site's seeds."""
+    site_checkout(tmp_path)
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
+    spans = [(0, 4), (4, 12), (12, 20)]
+    names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
+    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": {names[0]: 40.0}})}
+    assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
+
+
+def test_a_weighed_sites_units_are_map_tasks_of_their_own_past_its_unweighted_ones(ci, tmp_path):
+    """A check-1 site that declares a weighed check, check1_shards(seeds=4, per_task=8, conditioning=2,
+    conditioning_per_task=3), plans its unweighted units as without it (0 to 20, in tasks of at most 8) and
+    its weighed check's 10 units past them (20 to 30, (1 + REDRAW) times 2) in tasks of at most 3, every one
+    later (armada's `later`, drawn only where its judge asks), each unmeasured task of them weighing the
+    target, and one judge waiting on all of them."""
+    written(tmp_path, {"test_site.py": "import pytest\n"
+                                       "@pytest.mark.check1_shards(seeds=4, per_task=8, conditioning=2, "
+                                       "conditioning_per_task=3)\n"
+                                       "def test_site():\n    pass\n"})
+    assert ci.sites("tests/test_site.py") == {"test_site": ci.Mark(units=20, per_task=8, line=2, timed=4,
+                                                                   weighed=10, weighed_per_task=3)}
+    entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12" and entry["split"]]
+    spans = [(0, 4), (4, 12), (12, 20), (20, 23), (23, 26), (26, 29), (29, 30)]
+    maps = [entry for entry in entries if "after" not in entry]
+    assert [(entry["split"], entry.get("later", False)) for entry in maps] == [
+        (f"test_site.draws-{start}-{stop}", start >= 4) for start, stop in spans]
+    assert all(entry["weight"] == 30.0 for entry in maps[3:])
+    (judge,) = [entry for entry in entries if "after" in entry]
+    assert judge["after"] == [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
 
 
 def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp_path):
@@ -463,3 +504,20 @@ def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_t
     assert ci.measured_cut(timings, "3.12", "tests/test_site.py") == (2.0, 1)
     assert ci.borrowed(timings, "3.14")["rows"] == {**timings["rows"], "3.14:tests/test_site.py": 2.0,
                                                     "3.14:tests/test_site.py#test_site": 5.0}
+
+
+def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorded(ci):
+    """A check-1 site's map task that runs twice the target is a slow test to report, though main's record
+    holds the site's test (its whole run's time): it names its map task and the fix, fewer units a task,
+    where the site's judge and a recorded test of a file's own row pass unreported (row 3729: a map task ran
+    1,366 s, and nothing said so)."""
+    test = "tests/test_site.py::test_site"
+    rows = [{"name": "3.12:tests/test_site.py#test_site.draws-0-512", "tests": {test: 240.0}},
+            {"name": "3.12:tests/test_site.py#test_site.draws-512-1024", "tests": {test: 60.0}},
+            {"name": "3.12:tests/test_site.py#test_site", "tests": {test: 240.0}},
+            {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}}]
+    base = {test: 300.0, "tests/test_other.py::test_old": 240.0}
+    assert ci.slow({"rows": rows}, 120.0, base) == [
+        {"test": test, "file": "tests/test_site.py", "seconds": 240.0, "target": 120.0,
+         "map_task": "3.12:tests/test_site.py#test_site.draws-0-512",
+         "fix": "fewer units a task (per_task, conditioning_per_task)"}]

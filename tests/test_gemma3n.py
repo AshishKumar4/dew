@@ -321,13 +321,15 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                     seeds=UPDATE_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_the_dense_decoders_gradient_is_the_references():
     """The gemma3n-tiny decoder's loss gradient, its AltUp coefficients past the clip and its MLPs
     without the gaussian top-k (sparsity 0 in every layer), on par with the reference's from its
     float64 one over drawn rows (check 1): the composition of every layer's backward, AltUp's and the
     per-layer inputs' included, where the reference's own float32 gradient resolves. With the 0.95
     top-k it does not (`test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does`
-    says why), and the top-k's backward is held by the sparse MLP's sites."""
+    says why), and the top-k's backward is held by the sparse MLP's sites. Its DENSE_SEEDS took 190 s in
+    one task; CI draws them in map tasks of 128, about 50 s apiece on armada (11-03)."""
     import optax
     import torch
 

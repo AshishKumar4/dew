@@ -33,7 +33,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, record, strings, text
+from dew._records import boolean, integer, record, strings
 from dew.batch import EXAMPLES_CONSUMED, Batch
 from dew.data.analysis import (
     _LOCAL,
@@ -120,17 +120,18 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
-    Tagged,
     TokenBudget,
     TokenSplit,
     Windows,
     Workers,
     accounts,
+    as_member,
     children,
     consumed_by,
     consumed_forward,
     examples_bound,
     joined,
+    member_of,
     members_held,
 )
 from dew.data.plan import Manifest
@@ -665,11 +666,10 @@ class _Groups:
         consumed, refused = [count for count, _ in held], [part for _, part in held]
         # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
         # of where the group's rows are all one member's.
-        tags = [row.get(MEMBER) for row in rows]
-        members = [members_held(row, None if tag is None else text(tag, "a row's mixture member"))
-                   for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
+        tags = [member_of(row) for row in rows]
+        members = [members_held(row, tag) for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
         alike = bool(tags) and tags[0] is not None and len(set(tags)) == 1
-        common = text(tags[0], "a row's mixture member") if alike else None
+        common = tags[0] if alike else None
         counted_by = any(MEMBERS in row or MEMBER in row for row in rows if CONSUMED in row)
         rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
         columns = {name: [row[name] for row in rows] for name in rows[0]}
@@ -1014,13 +1014,13 @@ class _ConsumedAt:
     def __call__(self, document: Batch) -> Batch:
         length = len(document[self.field])
         laid = {}
-        for name in ACCOUNTS:
+        for name, count in zip(ACCOUNTS, accounts(document), strict=True):
             held = np.zeros(length, np.int32)
             if length:
-                held[-1] = integer(document.get(name, 0), f"a row's {name}")
+                held[-1] = count
             laid[name] = held
         if self.documents is not None:
-            member = None if MEMBER not in document else text(document[MEMBER], "a row's mixture member")
+            member = member_of(document)
             ids = np.full(length, self.documents.laid(member, members_held(document, member)), np.int64)
             if length:
                 ids[-1] = -ids[-1]
@@ -1458,7 +1458,7 @@ class _Build:
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
-            mapped = [parent.map(Tagged(key).record) if tagged else parent
+            mapped = [parent.map(functools.partial(as_member, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
@@ -1468,7 +1468,8 @@ class _Build:
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
-            streams = [stream.map(Tagged(key)) for key, stream in zip(keys, streams, strict=True)]
+            streams = [stream.map(functools.partial(as_member, member=key))
+                       for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
         if source.tokens is not None:

@@ -293,6 +293,26 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
             np.testing.assert_array_equal(output, expected)
 
 
+def test_a_released_program_drops_its_executables_and_compiles_again():
+    """`options.release` drops every live program's executables, which jit's cache clearing never reaches
+    (XLA:CPU maps each one's code into the process, and a program keeps them for as long as it lives): the
+    executable a call compiled is freed once nothing else holds it, and the next call takes a new one (a
+    compile, or a load from the persistent compilation cache) and computes what the first did."""
+    from dew.nn.kernels import options
+
+    def doubled_sine(x):
+        return jnp.sin(x) * 2.0
+
+    run = program(doubled_sine)
+    x = jnp.arange(8.0)
+    first = run(x)
+    held = weakref.ref(run.executable(x))
+    options.release()
+    gc.collect()
+    assert held() is None
+    np.testing.assert_array_equal(run(x), first)
+
+
 def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     """Two threads calling one program at two shapes each lower their own executable while the other
     does, as jit's calls do: each tracing waits for the other's, which a call that held the program for

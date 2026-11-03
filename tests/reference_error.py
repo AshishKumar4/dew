@@ -734,18 +734,18 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
 
 
 def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
-    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host: each entry times
-    each of its signs, summed in blocks of SKETCH_BLOCK over chunks of 2^16 entries, the last block padded
-    with zeros."""
+    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host, the last block
+    padded with zeros: a block's entries summed by each sign byte's value (`np.bincount`) times its eight
+    signs (`_BYTE_SIGNS`), one order of its exact products, within gamma(SKETCH_BLOCK) (ledger 2807)."""
     partials = []
-    for start in range(0, flat.size, 1 << 16):
-        chunk = flat[start:start + (1 << 16)]
+    for start in range(0, flat.size, 1 << 12):
+        chunk = flat[start:start + (1 << 12)]
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
-        # order, so the first byte holds bits 0 to 7.
+        # order, so the first byte holds bits 0 to 7. An entry's bins: its block's, its byte's, the value's.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
-        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
-        np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
-        partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
+        bins = (np.arange(chunk.size)[:, None] // SKETCH_BLOCK * 4 + np.arange(4)) * 256 + words
+        summed = np.bincount(bins.reshape(-1), np.repeat(chunk, 4), -(-chunk.size // SKETCH_BLOCK) * 1024)
+        partials.append((summed.reshape(-1, 256) @ _BYTE_SIGNS).reshape(-1, SKETCH))
     return np.concatenate(partials)
 
 
@@ -1565,7 +1565,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 
 
 def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
-              weighed: dict | None = None) -> bool:
+              weighed: dict | None = None, offset: int = 0) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
     `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
     (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
@@ -1574,7 +1574,7 @@ def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = N
         draws = [drawn_for(index)(start, stop) for index in range(references)]
         held = (weighed or {}).get("of")
         return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
-    return record_units(label, payload, upto=upto,
+    return record_units(label, payload, upto=upto, offset=offset,
                         phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
 
 
@@ -1719,20 +1719,22 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
               library_fn, library_row, library_leaves, also, terms, examples: bool) -> None:
     """`assert_as_exact`'s site with `conditioning` (tests/conditioning.py): the unweighted check over its
     own `seeds`, whole, and where it stays undecided the weighed check over `conditioning` seeds, its heavy
-    elements classed over the draws it takes, alike in every process that runs it; a map task records
-    both checks' draws, the weighed ones up to its own units, which its judge pools where it defers."""
-    span = (1 + REDRAW) * conditioning
+    elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
+    tasks draw each check's units apart, the weighed check's past the unweighted one's in the plan's units
+    (tools/armada/ci.py `draws_of`), and its judge pools the weighed check's where it defers."""
+    plain, span = (1 + REDRAW) * seeds, (1 + REDRAW) * conditioning
 
     def weighed():
         _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
                      truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                      library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span)), upto=span)
+                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span)), upto=span,
+                     offset=plain)
 
     try:
-        assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                        library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
-                        also=also, terms=terms, examples=examples)
+        _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                     library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
+                     also=also, terms=terms, examples=examples, weighing=None, upto=plain)
     except Inconclusive:
         weighed()
     else:
@@ -1741,8 +1743,8 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
 
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
-                 library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None
-                 ) -> None:
+                 library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
+                 offset: int = 0) -> None:
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (tests/
     conditioning.py: built of the site's compiled reference and truth where it draws, never in its judge),
     a map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
@@ -1786,7 +1788,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed):
+    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset):
         return
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:

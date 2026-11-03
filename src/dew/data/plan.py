@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     from dew.batch import Batch
     from dew.data.sources.tokens import TokenFiles
 
+_RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a new run that reads its data "
+            "afresh: `--pretrained <run directory>` on the command line or in run.json, or its state "
+            "restored (`Checkpoints.restore`) and given to `fit(state=)`")
+"""How a run whose saved data position this Dew cannot read goes on: every such refusal names both routes
+(row 3534)."""
+
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     return json.dumps(
@@ -501,8 +507,7 @@ def _by_member(iterator: JSON, plan: Plan) -> JSON:
         raise ValueError(
             "this run's mixture is bounded in examples and its position was saved before Dew counted a "
             "mixture's members where their rows are delivered, under a shuffle, repeat or take of batches, "
-            "whose position the translation does not place the members' counter beneath; resume with the Dew "
-            "that wrote it, or go on from its weights as a new run (`--pretrained <run directory>`)")
+            f"whose position the translation does not place the members' counter beneath; {_RESUMED}")
 
     def laid(branch: JSON) -> JSON:
         """The mixture's layouts past its mix, each document a token is of (`DOCUMENT`): none of the tokens
@@ -832,10 +837,7 @@ class Plan:
             raise ValueError(
                 f"the saved data position was written under data plan version {saved.get('version')!r}, "
                 f"and this Dew reads plans by version {current['version']!r}, which makes other rows or "
-                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; resume with the Dew "
-                "that wrote it, or go on from its weights as a new run that reads its data afresh: "
-                "`--pretrained <run directory>` on the command line or in run.json, or its state restored "
-                "(`Checkpoints.restore`) and given to `fit(state=)`"
+                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; {_RESUMED}"
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(

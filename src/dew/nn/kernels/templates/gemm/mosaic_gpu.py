@@ -135,7 +135,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       1.7x the shared memory a FLOP (SHAPE1-a100: 0.887 of its time). A tile its registers or a block
       cannot stage busy (`holds`, `resources.tile_registers`) gives way to the next narrower or shorter one.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
-      rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
+      rows a tile must divide (not grouped) take no whole role for each, where a group averages fewer rows
+      than their roles (grouped), or where no tile of them holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
       a tile, one at least; a wave is all of them.
@@ -188,8 +189,13 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         return min(tiles, key=lambda tile: (1 / tile.block_m + 1 / tile.block_n, -tile.block_n), default=None)
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
-    # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
-    whole = grouped or rows % (family.role_rows * family.consumers) == 0
+    # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
+    # whose groups average fewer rows than the consumers' roles (a decode step's experts, a few routed rows
+    # each): its accumulator a role's rows, its registers a share more programs a multiprocessor hold,
+    # where the family's full set held rows no group has (row 3622: deepseek-v3's one-token experts at
+    # 2 x 64 rows ran one program a multiprocessor at 48% of DRAM's peak, FS-3622-NCU1-h100).
+    roles = family.role_rows * family.consumers
+    whole = rows >= roles if grouped else rows % roles == 0
     return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
                  for programs in range(family.programs(consumers), 0, -1)
                  if (tile := tiled(consumers, programs)) is not None), None)

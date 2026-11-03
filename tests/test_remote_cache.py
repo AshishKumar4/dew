@@ -3,12 +3,12 @@ programs one bundle, against a stand-in for the dew-xla-cache Worker and against
 JAX's cache directory is the boundary: a program JAX compiles is a `<key>-cache` file there, which
 `compiled` writes as JAX does where a test needs no real compilation."""
 
+import http.client
 import http.server
 import json
 import socket
 import threading
 import time
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
@@ -118,10 +118,11 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
+    # Each request the cache's sender makes of the URL (r2's, over http.client).
     opened = []
-    open_ = urllib.request.OpenerDirector.open
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open",
-                        lambda self, *args, **kwargs: (opened.append(args), open_(self, *args, **kwargs))[1])
+    request = http.client.HTTPConnection.request
+    monkeypatch.setattr(http.client.HTTPConnection, "request",
+                        lambda self, *args, **kwargs: opened.append(args) or request(self, *args, **kwargs))
     cache = remote_cache.RemoteCache(tmp_path, f"http://127.0.0.1:{port}", "token", "jax/cpu")
     began = time.monotonic()
     for index in range(10):

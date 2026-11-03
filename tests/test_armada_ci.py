@@ -307,8 +307,9 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
-    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer. A test running
-    past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
+    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer, its stacks written
+    only once its task is past its deadline (test_armada_deadlines). A test running past the old ten minutes
+    through a task is green with no dump (armada receipt in the head's review)."""
     (tmp_path / "tests/test_timer.py").write_text(
         "def test_no_dump_timer(request):\n"
         "    assert request.config.getini('faulthandler_timeout') == 0\n")
@@ -1050,11 +1051,11 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     the file's record and the split plugin its collected tests alike, the marked tests one weight at
     the first one's place in node-id order (Main, 2026-11-02: the joint release's fit and the admitted
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
-    yet joins its setup's tests all the same, weighing nothing where the record names one of them, so the
-    plan, reading the record, cuts where the task does (Main, 2026-11-02: a marked pair waited on the record
-    to share its fixture); its setup's group keeps the place of its first recorded test, where the plan has
-    it, though the new test comes first. A test the record lacks, alone or a new setup's, weighs nothing too,
-    so the recorded tests keep the plan's groups. A mark written
+    yet joins its setup's tests all the same (Main, 2026-11-02: a marked pair waited on the record to share
+    its fixture), its setup's group keeping the place of its first recorded test, where the plan has it,
+    though the new test comes first. A test the record lacks, alone or a new setup's, weighs its file's mean,
+    so the task's cut may part from the plan's: each test still runs in one group, and its file's groups run,
+    never reused, until the record names it (`record`'s `unkeyed`). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1092,7 +1093,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
     assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
-    # A new lone test, or a new setup's pair, before recorded a, b, c rides, weightless, in the first group.
+    # A new lone test, or a new setup's pair, before recorded a, b, c weighs their mean: the task cuts the
+    # file by it, the plan by the record, and the file's groups are not reused.
     files = {"lone": ("0x", "1a", "2b", "3c"), "group": ("0y", "0z", "1a", "2b", "3c")}
     for name, tests in files.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1106,12 +1108,16 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     commit(tmp_path, "files whose new tests come before their recorded ones")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert all(row["exitCode"] == 0 for row in rows)
-    for name, new in (("lone", ["0x"]), ("group", ["0y", "0z"])):
+    cuts = {"lone": (("0x", "1a"), ("2b", "3c"), ()), "group": (("0y", "0z"), ("1a", "2b"), ("3c",))}
+    for name, cut in cuts.items():
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)
-            for group, tests in ((1, (*new, "1a")), (2, ("2b",)), (3, ("3c",)))}
+            for group, tests in enumerate(cut, start=1)}
         assert [ci.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
             [node[name, test]] for test in ("1a", "2b", "3c")]
+        common = ci.shared("3.12")
+        assert [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)] == [
+            None, None, None]
     for misplaced in ("pytestmark = pytest.mark.shared_setup('plan')\n",
                       "@pytest.mark.shared_setup(NAME)\n"):
         (tmp_path / "tests/test_refused.py").write_text(
@@ -1641,31 +1647,6 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
             (tmp_path / path).write_text(source)
         assert run() == runs, path
         assert run() == runs, path
-
-
-def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
-    """A hang is graded: the task interrupts pytest at its deadline, short of
-    armada's own timeout, kills its process group where the interrupt is not
-    heard, and writes a red row for each of its files, the one that finished
-    first included."""
-    (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
-    # A hang that ignores ^C, beside a child that holds pytest's output open:
-    # neither may keep the task from writing its verdict.
-    (tmp_path / "tests/test_hangs.py").write_text(
-        "import signal, subprocess, sys, time\n"
-        "def test_forever():\n"
-        "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
-        "    signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-        "    time.sleep(600)\n")
-    interpreter(tmp_path, "3.12")
-    out = tmp_path / "verdict.json"
-    began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
-    # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
-    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
-    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
-    assert {name: row["exitCode"] for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
 
 
 def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
