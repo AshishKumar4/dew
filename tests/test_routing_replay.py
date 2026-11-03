@@ -34,7 +34,7 @@ from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64, 'own routing': 8,
-         'own keyed routing': 8, 'keyed pack': 64}
+         'own keyed routing': 8, 'keyed pack': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
