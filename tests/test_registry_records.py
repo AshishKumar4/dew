@@ -195,3 +195,14 @@ def test_a_protocol_typed_field_reads_its_record_and_keeps_a_value_built_for_it(
     record = json.loads(json.dumps(to_record(process, Process)))
     assert type(from_record(Process, record).weighting) is type(process.weighting)
     assert from_record(Process, {**record, "weighting": process.weighting}).weighting is process.weighting
+
+
+def test_a_linen_models_config_reads_a_field_against_the_annotation_its_own_module_resolves():
+    """A linen model's constructor is written by Flax's dataclass transform, in Flax's namespace rather than
+    the model's module: a run's config of EDM2's U-Net reads its levels' channel multipliers against
+    `Sequence[int]`, which edm2's module imports under `from __future__ import annotations`, and builds the
+    U-Net with them."""
+    from dew.registry import ModelConfig
+
+    model = ModelConfig("edm2_unet", {"model_channels": 32, "channel_mult": [1, 2]}).build()
+    assert tuple(model.channel_mult) == (1, 2)
