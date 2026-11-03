@@ -727,18 +727,22 @@ class InContextMemory(LinearProducts):
         # IEEE products: the recurrence's state carries each one's rounding through the document.
         precision = exact_float32(self.precision)
         transfer = _transfers(matrices, precision)
-        # Each token's steps from the chunk's start, M_t ... M_0, and the weights each token's own
-        # update (u_s on both S and W) reaches S and W with at each later token.
+        # Each token's steps from the chunk's start, M_t ... M_0, which carry the start's S and W, and the
+        # weights each token's own update (u_s on both S and W) reaches S and W with at each later token:
+        # each token's S one sum over the start's S and the updates, its W over the start's S and W and
+        # the updates.
         composed = jnp.einsum("btij,bjk->btik", transfer[:, :, 0], matrices[:, 0], precision=precision)
         reaching = transfer.sum(-1)
+        momentum_weights = jnp.concatenate([composed[..., 0, :1], reaching[..., 0]], axis=-1)
+        state_weights = jnp.concatenate([composed[..., 1, :], reaching[..., 1]], axis=-1)
 
-        def reached(row: int, leaf: jax.Array) -> jax.Array:
-            return jnp.einsum("bts,bs...->bt...", reaching[..., row], leaf, precision=precision)
+        def summed(weights: jax.Array, *starts: jax.Array) -> jax.Array:
+            *held, updates = starts
+            stacked = jnp.concatenate([*(leaf[:, None] for leaf in held), updates], axis=1)
+            return jnp.einsum("bts,bs...->bt...", weights, stacked, precision=precision)
 
-        moment = jax.tree.map(lambda s0, u: _scaled(composed[..., 0, 0], s0) + reached(0, u), momentum,
-                              update)
-        states = jax.tree.map(lambda s0, w0, u: _scaled(composed[..., 1, 0], s0)
-                              + _scaled(composed[..., 1, 1], w0) + reached(1, u), momentum, state, update)
+        moment = jax.tree.map(functools.partial(summed, momentum_weights), momentum, update)
+        states = jax.tree.map(functools.partial(summed, state_weights), momentum, state, update)
         # Each token reads its own state, or with commit per chunk the state the chunk entered.
         read, mapped = (states, 0) if self.commit == "token" else (state, None)
         reads = jax.vmap(jax.vmap(functools.partial(self._read, head), in_axes=(mapped, 0, 0)))(
@@ -922,11 +926,6 @@ def _momentum_step(mu: jax.Array, theta: jax.Array, momentum: jax.Array, gradien
 def _state_step(a: jax.Array, state: jax.Array, momentum: jax.Array) -> jax.Array:
     """`a W + S` for a head's leaf `[B, ...]` and its rows' kept shares `[B]`."""
     return _lead(a, state) * state + momentum
-
-
-def _scaled(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
-    """`leaf` `[B, ...]` times `scalars` `[B, C]`, broadcast to `[B, C, ...]`."""
-    return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - 1)) * leaf[:, None]
 
 
 def _transfers(matrices: jax.Array, precision: PrecisionLike) -> jax.Array:
