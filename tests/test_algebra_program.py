@@ -3,6 +3,7 @@ the resident training step jit their function rewritten, under the switch the ga
 the bodies of nested programs, scans, loops, conditionals and checkpoints are rewritten in place; products
 (`dot_general`) are terms the rules read; and each rewrite is recorded in the one kernel report."""
 
+import dataclasses
 import gc
 import os
 import subprocess
@@ -19,7 +20,7 @@ from test_algebra import count, rows, two_sums
 from dew import algebra
 from dew.algebra import cost, program, terms
 from dew.nn.kernels import generation, options
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import cost as kernel_cost, report
 from dew.nn.precision import FP32_SUMS
 
 
@@ -461,6 +462,37 @@ def test_an_uncatalogued_gpu_prices_forms_by_its_own_facts():
     with generation.assumed(unseen):
         priced = cost.target()
     assert (priced.generation, priced.multiprocessors, priced.memory_bandwidth) == ("sm121", 48, 273e9)
+
+
+@pytest.mark.parametrize(("generation_name", "speedup"), [("sm90", 2), ("sm80", 1)])
+def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generation_name, speedup):
+    """An FP8 product's seconds on a GPU: a bf16 product's halved where its tensor cores multiply FP8
+    (Hopper's warpgroup MMA), a bf16 product's where its codes are unpacked into 16-bit products (an A100's
+    mma.sync), and on no GPU the CUDA cores' (row 3612)."""
+    target = generation.TARGETS[generation_name]
+
+    def seconds(dtype):
+        priced, unpriced = kernel_cost.units(cost.product_work(4096, 4096, 4096, dtype=dtype),
+                                             kernel_cost.rates(target, device=True))
+        assert not any(unpriced)
+        return max(priced)
+
+    assert seconds(jnp.float8_e4m3fn) == pytest.approx(seconds(jnp.bfloat16) / speedup)
+
+
+def test_device_memory_is_priced_at_the_parts_measured_stream():
+    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.streamed`,
+    tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
+    reaches; a part no one measured, at its clocks' (row 3612)."""
+    hopper = generation.TARGETS["sm90"]
+
+    def memory_rate(device_kind, clocked):
+        target = dataclasses.replace(hopper, device_kind=device_kind, memory_bandwidth=clocked)
+        return kernel_cost.rates(target, device=True)[-1]
+
+    (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
+    assert measured is not None and measured < 4.0e12
+    assert memory_rate("NVIDIA H100 PCIe", 2.0e12) == 2.0e12
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
