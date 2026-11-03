@@ -63,6 +63,46 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["changed"]}
 
 
+def test_new_tests_spread_across_a_split_files_groups_and_their_groups_run_until_the_record_names_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A split file's tests the durations record lacks weigh its tests' mean, so 40 new parametrized ids
+    spread across its two groups rather than one group taking them all (2026-11-03: ~190 new ids, weighed
+    nothing, packed into one group past its deadline); and each group's row is kept with no key, so no
+    later run reuses it, while the plan's cut, which reads the record alone, can differ. Once the record
+    names every test, plan and task cut alike and each group's green row is reused."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    interpreter(tmp_path, "3.12")
+    name = "tests/test_split.py"
+    olds = "".join(f"def test_old_{letter}():\n    pass\n\n\n" for letter in "abcd")
+    written(tmp_path, {"test_split.py": "import pytest\n\n\n@pytest.mark.parametrize('case', range(40))\n"
+                                        "def test_new(case):\n    pass\n\n\n" + olds})
+    old = {f"{name}::test_old_{letter}": 50.0 for letter in "abcd"}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(old))
+
+    def ran() -> list[dict]:
+        rows = []
+        for group in ("1/2", "2/2"):
+            out = tmp_path / f"group-{group[0]}.json"
+            ci.task("3.12", [name], group, out, 600.0)
+            rows += json.loads(out.read_text())["rows"]
+        assert all(row["exitCode"] == 0 for row in rows), rows
+        return rows
+
+    def reused() -> list[bool]:
+        common = ci.shared("3.12")
+        return [ci.reused("3.12", name, group, common) is not None for group in ("1/2", "2/2")]
+
+    groups = ran()
+    new = [sum(node.split("::")[1].startswith("test_new") for node in row["tests"]) for row in groups]
+    assert sum(new) == 40 and all(10 <= count <= 30 for count in new), new
+    assert reused() == [False, False]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**old, **{node: 50.0 for row in groups for node in row["tests"]}}))
+    ran()
+    assert reused() == [True, True]
+
+
 def test_what_a_conftest_starts_before_any_test_is_every_files_input(ci, tmp_path, monkeypatch,
                                                                      cache_worker):
     """A Python child a conftest starts before the first test, which no test file owns, runs for every

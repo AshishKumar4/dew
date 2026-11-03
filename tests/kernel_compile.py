@@ -118,11 +118,11 @@ class Report:
 def reports(estimates: dict[str, str], binaries: list[report.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
     """Each kernel's `Report` of its total shared memory from its binary (`binaries`, `report.binaries`)
-    and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`), paired by the
-    kernel's name and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its
-    registers and spills are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel
-    (`_estimates` pairs them by the program's order): one past the shared memory its binary's launch asks
-    for, or none where it asks for some, is another kernel's, and raises, as two binaries of one launch do."""
+    and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`, its module's,
+    `_estimates`), paired by the kernel's name and launch (`report.launch_name`), with its module
+    (`modules`, its kernel hash): its registers and spills are its PTX's as the GPU compiles it
+    (`inherited`). An estimate past the shared memory its binary's launch asks for, or none where it asks
+    for some, is another kernel's, and raises, as two binaries of one launch do."""
     found: dict[str, report.Binary] = {}
     for binary in binaries:
         if found.setdefault(report.launch_name(binary.kernel, binary.launch), binary) != binary:
@@ -313,14 +313,19 @@ def kernel_modules(calls: list) -> dict[str, str]:
 
 def _estimates(calls: list, printed: str) -> dict[str, str]:
     """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`report.launch_name`), from
-    what its lowering printed: Pallas prints one a kernel as it lowers it, in the order JAX lowers them,
-    which `calls` keep (`kernel_calls`: each kernel once, a function's where its first call is, one no run
-    reaches too); a lowering JAX cached prints none, its kernels' estimates kept by their module from the
-    lowering that printed them (`ESTIMATES`)."""
+    what its lowering printed: Pallas prints one each time it lowers a kernel, in the order JAX lowers them,
+    which `calls` keep (`kernel_calls`: each call of a module, a function's where its first call is, one no
+    run reaches too). Calls of one module (a kernel hash, `call.config`: a launch over each block of the
+    value columns) print one estimate each where each lowers, or one between them where the later reuse the
+    first's lowering; either way every call of a module takes that module's estimate. A lowering JAX cached
+    prints none, its kernels' estimates kept by their module from the lowering that printed them
+    (`ESTIMATES`)."""
     printed_estimates = ["Resources(" + part for part in printed.split("Resources(")[1:]]
+    modules = list(dict.fromkeys(call.config for call in calls))
     if len(printed_estimates) == len(calls):
-        for call, estimate in zip(calls, printed_estimates, strict=True):
-            ESTIMATES[call.config] = estimate
+        ESTIMATES.update(zip((call.config for call in calls), printed_estimates, strict=True))
+    elif len(printed_estimates) == len(modules):
+        ESTIMATES.update(zip(modules, printed_estimates, strict=True))
     return {report.launch_name(call.name, call.launch): ESTIMATES[call.config] for call in calls
             if call.config in ESTIMATES}
 

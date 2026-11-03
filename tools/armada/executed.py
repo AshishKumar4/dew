@@ -12,8 +12,10 @@ What the recorder logs is everything the process executed, read, imported and st
 writes how collection found each file (`DEW_COLLECTED`), which accounts for a file whose every test the
 selection set aside, and which tests carry the marks a row names (`whole_suite`, `release_env`)."""
 
+import faulthandler
 import json
 import os
+import signal
 import sys
 
 import lifetime
@@ -22,6 +24,23 @@ from session import MARKS
 
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
+
+# Every thread's stack written to the file DEW_STACKS names, which the task puts in its row when its
+# deadline passes, on the SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call
+# site, one in collection or a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03:
+# a group stalled 28 minutes in a read with no deadline, its row saying only that no tests ran). A file of its
+# own, so no output after it pushes it out of the row. No timer: a dump that kills the process, as walking a
+# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped. This
+# process's id beside it, which `tested` sends the signal to: pytest's own, past a launcher before it (a
+# release check's `uv run`, which passes no SIGUSR2 on), written whole once the dump is registered, as the
+# signal ends a process that has not registered it. Taken out of the environment, so no pytest a test starts
+# writes over either.
+if stacks := os.environ.pop("DEW_STACKS", None):
+    faulthandler.register(signal.SIGUSR2, file=os.open(stacks, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
+                          all_threads=True)
+    with open(f"{stacks}.part", "w") as pid:
+        pid.write(str(os.getpid()))
+    os.replace(f"{stacks}.part", f"{stacks}.pid")
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none

@@ -512,17 +512,6 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
 
 
-def launch_forms(spec: Forward) -> tuple[tuple[Forward, bool, bool], ...]:
-    """Every launch `walked_launches` may take of `spec` unmasked, each its form, whether its rows are guarded
-    and whether it walks the plain launch again inside a guard's branch (`again`): the plain launch, and
-    under headroom the guarded one and that rerun; the natural form's (`unfolded`) alike where the logits
-    fold. A resource gate lowers each alone."""
-    forms = (spec, unfolded(spec)) if spec.base2 else (spec,)
-    return tuple((form, guarded, again) for form in forms
-                 for guarded, again in ((False, False), *(((True, False), (False, True)) if form.headroom
-                                                          else ())))
-
-
 NATURAL_EXPONENT_REACH = 150.0
 """The largest `|k|` `natural_exp` hands `power2`: its reduced exponent's integral part, its argument held to
 [-150, 128] (every fp32 exponential outside is zero or infinite), rounded up by at most one."""

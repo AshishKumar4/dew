@@ -1,6 +1,6 @@
 # Working on Dew
 
-Read `CONTRIBUTING.md` first: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, numerical contracts and native qualification. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
+For repository implementation rules, read `CONTRIBUTING.md`: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, numerical contracts and native qualification. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
 

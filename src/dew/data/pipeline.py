@@ -9,7 +9,7 @@ import math
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
+from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, overload, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -75,6 +75,12 @@ COUNTING = (*ACCOUNTS, MEMBER, MEMBERS)
 
 type Members = Mapping[str, int]
 """The source examples a row completes by mixture member (`MEMBERS`)."""
+
+
+def member_of(row: Batch) -> str | None:
+    """The mixture member `row` was drawn from (`MEMBER`), none for a row of none or of several: every read
+    of a row's member."""
+    return None if MEMBER not in row else text(row[MEMBER], "a row's mixture member")
 
 
 def members_of(row: Batch) -> Members:
@@ -184,7 +190,7 @@ def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> 
     bound's marks, `MarkConsumed`) completes them as its member's."""
     if given is None or isinstance(given, (bytes, Rejected)) or not any(name in given for name in COUNTING):
         return step(given)
-    member = None if MEMBER not in given else text(given[MEMBER], "a row's mixture member")
+    member = member_of(given)
     unseen = {name: column for name, column in given.items() if name not in COUNTING}
     outputs = tuple(as_member(made, member) for made in step(unseen))
     if CONSUMED not in given:
@@ -207,27 +213,24 @@ def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> 
     return (*rest, carried)
 
 
-@dataclasses.dataclass(frozen=True)
-class Tagged:
-    """A mixture member's records, each saying it is the member's of `key` (`MEMBER`): a row as its field,
-    a rejected row's marker as its `member` (`record`)."""
+@overload
+def as_member(made: Batch, member: str | None) -> Batch: ...
 
-    key: str
 
-    def __call__(self, row: Batch) -> Batch:
-        return {**row, MEMBER: self.key}
-
-    def record(self, given: Record) -> Record:
-        if given is None or isinstance(given, bytes):
-            return given
-        if isinstance(given, Rejected):
-            return dataclasses.replace(given, member=self.key)
-        return self(given)
+@overload
+def as_member(made: Record, member: str | None) -> Record: ...
 
 
 def as_member(made: Record, member: str | None) -> Record:
     """A step's output of a mixture member's row as that member's (`MEMBER`, `Rejected.member`), the
-    examples it completes its member's where it first holds counts (the bound's marks)."""
+    examples it completes its member's where it first holds counts (the bound's marks): a mixture tags each
+    member's records so (`functools.partial(as_member, member=key)`). A record of raw bytes holds no field
+    to say it, so a member's bytes, whose examples a mixture counting its members' would credit to none,
+    are refused, not passed on untagged: a mixture's members are decoded before the mix, and a member's
+    rows stay rows."""
+    if isinstance(made, bytes) and member is not None:
+        raise TypeError(f"mixture member {member!r} gives raw byte records, which carry no member, while the "
+                        "run counts its members' examples: decode each member's records before the mix")
     if member is None or made is None or isinstance(made, bytes):
         return made
     if isinstance(made, Rejected):

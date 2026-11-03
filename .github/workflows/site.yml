@@ -1,7 +1,9 @@
-# Builds dewml.dev on every change to what it is made of, and fails on a broken
-# link, a notebook without its outputs, a public module without an API page or
-# a registered model family the model list does not name. A ci/** push builds
-# and checks it beside CI and keeps the build as its artifact `site`.
+# Builds dewml.dev on every change to what it is made of, and fails on generated
+# pages out of step with their docs, tutorials and posts, a broken link, a
+# notebook without its outputs, a public module without an API page or a
+# registered model family the model list does not name. A ci/** push builds
+# and checks it beside CI and keeps the build as its artifact `site`; a red
+# build holds a deploy, never a train, which publishes on CI alone.
 #
 # Deploys are manual, from that artifact of the commit main is at:
 #   gh run download <run> -n site -D site/dist && (cd site && pnpm run deploy)
@@ -45,6 +47,12 @@ jobs:
       with:
         fetch-depth: 0  # the pages' last-updated dates come from git
     - uses: ./.github/actions/site
+    - name: Check site content
+      working-directory: .
+      run: |
+        node site/scripts/sync-docs.mjs --check
+        node site/scripts/render-notebooks.mjs --check
+        node site/scripts/render-posts.mjs --check
     - uses: astral-sh/setup-uv@v6
     - run: pnpm build
     - run: pnpm live:check

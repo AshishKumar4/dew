@@ -7,11 +7,13 @@ region of its own, and kept bodies, never unrolled. Each rewrite is recorded in 
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import functools
 import inspect
 import math
+import threading
 import time
 import weakref
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
@@ -48,9 +50,10 @@ class Saturation:
 class AlgebraReport:
     """What one region's rewrite did: the equations it read, the sets admitted and the matches each fired,
     its limits, its iterations and nodes, whether a limit stopped it, the region's price before and after in
-    seconds (`cost.model`), the rewrite's own seconds, and the roots whose cheaper form the program took
-    (`spliced`, `_splices`: a picked form that does not land, a value another window's form made or a form of
-    another type, is none)."""
+    seconds (`cost.model`), the seconds this program's rewrite of it took, the roots whose cheaper form the
+    program took (`spliced`, `_splices`: a picked form that does not land, a value another window's form made
+    or a form of another type, is none), and whether an earlier window of its structure derived its forms
+    (`reused`, `_derived`: its seconds a lookup's)."""
 
     equations: int
     admitted: tuple[str, ...]
@@ -63,6 +66,7 @@ class AlgebraReport:
     after: float
     seconds: float
     spliced: int = 0
+    reused: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -203,16 +207,78 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
     writing the value it replaces under its own name, so readers of either read one value."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
-    for window, yielded in _windows(jaxpr):
-        done = _region(window, accurate=accurate, saturation=saturation)
+    windows = _windows(jaxpr)
+    target = cost.target() if windows else None
+    for window, yielded in windows:
+        began = time.perf_counter()
+        done, reused = _derived(window, accurate, saturation, target)
+        seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
         # Recorded once its splice lands: what the program took, not what the extraction picked.
-        kernel_report.record_rewrite(dataclasses.replace(done.report, spliced=len(landed)))
+        kernel_report.record_rewrite(dataclasses.replace(done.report, spliced=len(landed), seconds=seconds,
+                                                         reused=reused))
     if not spliced:
         return jaxpr
     return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
                                      for kept in spliced.get(id(equation), [equation])]))
+
+
+WINDOWS_HELD = 4096
+"""The windows' derivations a process keeps (`_derived`), its least recently read dropped past them: the
+distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner traced over its compiles, each
+33 ms on average to derive again; row 3764)."""
+
+_DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
+"""Each window's rewrite by what derived it (`_derived`), the least recently read first."""
+
+_HOLDING = threading.Lock()
+"""Held while `_DERIVED` is read or written: compiles trace on several threads."""
+
+
+def structure(window: jcore.Jaxpr) -> Hashable:
+    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
+    type and placement, the sharding and memory its forms' values take); each equation's primitive, its
+    parameters as a region holds them (`terms.parameters_key`), whether it is protected
+    (`terms.protected`), its operands (an input's or an earlier output's position, or a literal's value and
+    type) and its outputs' types; and which values it yields. Two windows of one structure, their values
+    named apart, derive one rewrite: every layer of a stack's, every compile's of one step."""
+    position = {var: index for index, var in enumerate(window.invars)}
+
+    def operand(atom) -> Hashable:
+        if isinstance(atom, jcore.Literal):
+            value = np.asarray(atom.val)
+            return value.dtype, value.shape, value.tobytes(), atom.aval
+        return position[atom]
+
+    equations = []
+    for equation in window.eqns:
+        equations.append((terms.parameters_key(equation.primitive, equation.params),
+                          terms.protected(equation), tuple(map(operand, equation.invars)),
+                          tuple(var.aval for var in equation.outvars)))
+        position.update({var: len(position) for var in equation.outvars})
+    return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
+
+
+def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
+             target: generation.GpuTarget | None) -> tuple[Rewrite, bool]:
+    """`window`'s rewrite (`_region`) and whether an earlier window derived it: one derivation for each
+    structure (`structure`), numerics' forms, saturation and target it is priced for (`cost.target`, which
+    the pricing reads where it runs), the process's latest `WINDOWS_HELD` kept. The planner's candidates and
+    a resumed run's relowering trace one step's program again and again, each window of it as the last
+    trace's."""
+    key = (structure(window), accurate, saturation, target)
+    with _HOLDING:
+        done = _DERIVED.get(key)
+        if done is not None:
+            _DERIVED.move_to_end(key)
+            return done, True
+    done = _region(window, accurate=accurate, saturation=saturation)
+    with _HOLDING:
+        _DERIVED[key] = done
+        if len(_DERIVED) > WINDOWS_HELD:
+            _DERIVED.popitem(last=False)
+    return done, False
 
 
 def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
