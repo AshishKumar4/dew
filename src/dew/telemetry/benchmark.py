@@ -156,7 +156,7 @@ def carried[S](step: Callable[[S], S], state: S, count: int, *, each: bool = Fal
 @dataclasses.dataclass(frozen=True)
 class Comparison:
     """What `compared` measured: each pair's ratio of the first call's seconds to the second's, the median
-    ratio and its interval (`median_rank`), and the second call against itself (its A/A), whose interval is
+    ratio and its interval (`_median_rank`), and the second call against itself (its A/A), whose interval is
     the placement's own noise: a difference is one where `interval` lies apart from 1 and outside `alone`."""
 
     ratios: tuple[float, ...]
@@ -165,10 +165,10 @@ class Comparison:
     alone: tuple[float, float]
 
 
-def median_rank(count: int, level: float) -> int:
+def _median_rank(count: int, level: float) -> int:
     """The rank k whose k-th smallest and k-th largest of `count` values hold their median with chance at
     least `level`: the largest k with 2 P(Bin(count, 1/2) < k) <= 1 - level, the sign test inverted, which
-    holds for values drawn independently from any one continuous distribution, whatever it is. Raises
+    holds wherever each value falls on either side of the median as an independent fair coin. Raises
     `ValueError` where no rank does: `count` values hold their median at most at 1 - 2^(1 - count)."""
     allowed = (1 - Fraction(level)) * 2 ** count
     below, rank = 0, 0
@@ -186,15 +186,17 @@ def median_rank(count: int, level: float) -> int:
 def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int = 400, warmup: int = 3,
                 level: float = 0.95) -> Comparison:
     """`first` against `second`, each timed as `samples` times one call, in `pairs` interleaved pairs whose
-    order swaps each pair (a call that runs second in a pair runs on whatever the first left), and
-    `second` against itself in as many pairs, read as the median of each pair's ratio of seconds and the
-    interval its pairs' order statistics give it at `level` (`median_rank`): only paired ratios carry from
-    one machine to another, and one-sided runs of an unchanged call moved -0.6% to +0.6% (the kernel
-    challenge's measurements, row 3616). The bootstrap's percentile interval it took before held the A/A's
-    median 93.0% of the time at 95% over 24 pairs, and this one 96.8% (3,000 runs on armada, row 3793).
-    The caller binds each call to fresh inputs where its time depends on its data (a MoE's routing).
-    Raises `ValueError` where `pairs` reach no interval at `level`."""
-    rank = median_rank(pairs, level)
+    order a fair coin picks each pair (a call that runs second in a pair runs on whatever the first left),
+    and `second` against itself in as many pairs, read as the median of each pair's ratio of seconds and
+    the interval its pairs' order statistics give it at `level` (`_median_rank`): only paired ratios carry
+    from one machine to another, and one-sided runs of an unchanged call moved -0.6% to +0.6% (the kernel
+    challenge's measurements, row 3616). The coin makes the A/A's ratios fall above and below 1 as
+    independent fair coins, however the timings depend on one another, so its interval holds 1 with chance
+    at least `level`, exactly; the pair's holds its median ratio so where its pairs are independent. The
+    caller binds each call to fresh inputs where its time depends on its data (a MoE's routing). Raises
+    `ValueError` where `pairs` reach no interval at `level`."""
+    rank = _median_rank(pairs, level)
+    coins = np.random.default_rng()
     for _ in range(warmup):
         jax.block_until_ready(first())
         jax.block_until_ready(second())
@@ -206,8 +208,8 @@ def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int =
 
     def paired(left: Callable[[], T], right: Callable[[], T]) -> np.ndarray:
         ratios = []
-        for index in range(pairs):
-            if index % 2:
+        for flipped in coins.integers(0, 2, pairs):
+            if flipped:
                 right_seconds, left_seconds = timed(right), timed(left)
             else:
                 left_seconds, right_seconds = timed(left), timed(right)
@@ -249,4 +251,4 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "Comparison", "benchmark", "carried", "compared", "median_rank", "samples"]
+__all__ = ["Benchmark", "Comparison", "benchmark", "carried", "compared", "samples"]
