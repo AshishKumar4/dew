@@ -1484,17 +1484,18 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
     return []
 
 
-def task_files(out: Path) -> tuple[Path, Path, Path, Path]:
+def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
-    has exited (`record`); how collection found each file (executed.py); pytest's report; and the files the
-    durations record does not wholly name (split.py)."""
-    log, collection, report, unrecorded = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json"))
-    for stale in (report, log, collection, unrecorded):
+    has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
+    durations record does not wholly name (split.py); and pytest's process id once its stacks can be dumped
+    (executed.py)."""
+    log, collection, report, unrecorded, dumped = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "dumped.pid"))
+    for stale in (report, log, collection, unrecorded, dumped):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
-    return log, collection, report, unrecorded
+    return log, collection, report, unrecorded, dumped
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1514,7 +1515,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    log, collection, report, unrecorded = task_files(out)
+    log, collection, report, unrecorded, dumped = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1528,7 +1529,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded)})
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_DUMPED": str(dumped)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1551,9 +1552,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     except subprocess.TimeoutExpired:
         expired = True
         # Every thread's stack as pytest stands at its deadline, written to its output before the interrupt
-        # below (executed.py registers SIGUSR2).
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(done.pid, signal.SIGUSR2)
+        # below: sent to pytest itself, whose id executed.py wrote as it registered SIGUSR2, past any launcher
+        # between (a release check's uv), and to nothing where pytest had not registered it yet.
+        if dumped.is_file():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(dumped.read_text()), signal.SIGUSR2)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):

@@ -32,6 +32,13 @@ if lifetime.log is None:
 # fd 2, on a copy of it that capture leaves alone. No timer: a dump that kills the process, as walking a
 # running thread may, comes only once the task is past its deadline, and a healthy run is never dumped.
 faulthandler.register(signal.SIGUSR2, file=os.dup(sys.stderr.fileno()), all_threads=True)
+# This process's id, where `tested` reads whom to send it: pytest's own, not a launcher's before it (a release
+# check's `uv run`, which passes no SIGUSR2 on), and none before the dump is registered, as the signal would
+# end an unregistered process. Written whole, then named, so no read finds part of it.
+if dumped := os.environ.get("DEW_DUMPED"):
+    with open(f"{dumped}.part", "w") as pid:
+        pid.write(str(os.getpid()))
+    os.replace(f"{dumped}.part", dumped)
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none
