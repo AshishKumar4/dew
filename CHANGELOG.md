@@ -58,7 +58,7 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
 - An evaluation's outputs, and every tree `collective_host` reads home on one process, come home through
   their devices' pinned host memory where they have it, in one transfer (`dew._coordination.pinned_get`).
-- Tutorial 13 trains a first-person racing drone with SkyDreamer's recipe (DreamerV3 with an informed world
+- Tutorial 14 trains a first-person racing drone with SkyDreamer's recipe (DreamerV3 with an informed world
   model) from its camera image, the body rates and rotor speeds it senses and the flight plan's next gates,
   by collective thrust and body rates, and flies it against the untrained policy from the same starts. A SkyDreamer race takes a level of randomization per track (`SkyRace.ramp`, one
   level or a tuple in `Sky.tracks`' order), and a curriculum draws each of the scene's looks for its ramp's
