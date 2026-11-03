@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import test_attention_accurate_form as accurate_form
+import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
@@ -139,6 +140,9 @@ def test_the_attention_kernels_run_on_this_gpu():
           for name, softcap in (("plain", None), ("softcap", decode.SOFTCAP))),
         Cell("the decode kernel's attention differentiates as the folded attention",
              decode.attention_the_decode_kernel_takes_differentiates_as_the_folded_attention),
+        *(Cell(f"a verify block of {drafts} through the route is on par",
+               functools.partial(decode_template.a_verify_block_through_the_route_is_on_par, drafts))
+          for drafts in (4, 8, 16)),
     ])
 
 

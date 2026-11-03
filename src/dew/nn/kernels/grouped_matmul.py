@@ -989,17 +989,15 @@ class MosaicTgmm(_Mosaic):
         depth, _, width = self._generated_extents(ba)
         tiles = depth // tile.block_m * (width // tile.block_n)
         steps = -(-ba.arguments['tokens'].shape[0] // tile.block_k)
-        multiprocessors = _multiprocessors(target)
-        return tail_of.balanced(tiles, steps, multiprocessors, handoff_steps=mosaic_gpu.handoff_steps(
-            tile, multiprocessors=multiprocessors, target=target)) is not None
+        return tail_of.balanced(tiles, steps, _multiprocessors(target),
+                                handoff_steps=mosaic_gpu.handoff_steps(tile, target)) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
-        multiprocessors = _multiprocessors(target)
-        step = mosaic_gpu.step_seconds(tile, multiprocessors=multiprocessors, target=target)
         return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
                                       rows=ba.arguments['tokens'].shape[0], depth=depth, width=width,
-                                      multiprocessors=multiprocessors, step_seconds=step,
+                                      multiprocessors=_multiprocessors(target),
+                                      step_seconds=mosaic_gpu.step_seconds(tile, target),
                                       bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
 
     # A split tile runs the fp32 partials' call at its tile unsplit (`mosaic_gpu.tgmm`): its legality,
