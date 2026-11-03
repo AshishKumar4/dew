@@ -99,6 +99,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -109,6 +110,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1526,7 +1528,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_DEADLINE": f"{deadline:.1f}",
                                               "DEW_UNRECORDED": str(unrecorded)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
@@ -1549,6 +1550,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         expired = True
+        # Every thread's stack as pytest stands at its deadline, written to its output before the interrupt
+        # below (executed.py registers SIGUSR2).
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(done.pid, signal.SIGUSR2)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):

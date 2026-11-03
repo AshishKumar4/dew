@@ -307,8 +307,9 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
-    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer. A test running
-    past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
+    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer, its stacks written
+    only once its task is past its deadline (test_armada_deadlines). A test running past the old ten minutes
+    through a task is green with no dump (armada receipt in the head's review)."""
     (tmp_path / "tests/test_timer.py").write_text(
         "def test_no_dump_timer(request):\n"
         "    assert request.config.getini('faulthandler_timeout') == 0\n")

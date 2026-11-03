@@ -15,6 +15,7 @@ selection set aside, and which tests carry the marks a row names (`whole_suite`,
 import faulthandler
 import json
 import os
+import signal
 import sys
 
 import lifetime
@@ -24,18 +25,13 @@ from session import MARKS
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
 
-STACKS_MARGIN = 5.0
-"""How long before its task's deadline (DEW_DEADLINE, ci.py's `tested`) pytest writes its threads' stacks."""
-
-# Every thread's stack written once, a little before the task's deadline, to the stderr the task reads into
-# its row, so a stall names its call site, one in collection or a fixture's setup too, which pytest's report
-# of the interrupt cannot (2026-11-03: a group stalled 28 minutes in a read with no deadline, its row saying
-# only that no tests ran). Armed here, before pytest captures fd 2, on a copy of it that capture leaves
-# alone; taken from the environment so no process this one starts dumps too. A dump that kills the process,
-# as walking a running thread may, comes a few seconds before the interrupt would.
-if deadline := os.environ.pop("DEW_DEADLINE", None):
-    faulthandler.dump_traceback_later(max(float(deadline) - STACKS_MARGIN, float(deadline) / 2),
-                                      file=os.dup(sys.stderr.fileno()))
+# Every thread's stack written to the stderr the task reads into its row when its deadline passes, on the
+# SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call site, one in collection or
+# a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03: a group stalled 28 minutes
+# in a read with no deadline, its row saying only that no tests ran). Registered here, before pytest captures
+# fd 2, on a copy of it that capture leaves alone. No timer: a dump that kills the process, as walking a
+# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped.
+faulthandler.register(signal.SIGUSR2, file=os.dup(sys.stderr.fileno()), all_threads=True)
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none
