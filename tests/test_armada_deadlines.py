@@ -54,8 +54,8 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path, capfd):
     """A run that ends within its deadline is never dumped, however close to it it ends: the stacks are the
-    deadline's alone, never a timer's before it, which could kill a healthy multithreaded run mid-dump and read
-    it red as a whole-file failure (row 3738)."""
+    deadline's alone, never a timer's before it, which could kill a healthy multithreaded run mid-dump and
+    read it red as a whole-file failure (row 3738)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_close.py": "import time\n\n\ndef test_close():\n    time.sleep(7)\n"})
     ci.task("3.12", ["tests/test_close.py"], "", tmp_path / "rows.json", 10.0, cache="off")
