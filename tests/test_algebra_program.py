@@ -603,62 +603,65 @@ def test_the_pass_holds_no_body_past_its_life():
 
 
 
-def _graphs_built(monkeypatch) -> list:
-    """The regions the pass builds an e-graph for from here on (`program.graphed`), each one saturation."""
-    built: list = []
-    graphed = program.graphed
 
-    def counted(region):
-        built.append(region)
-        return graphed(region)
-
-    monkeypatch.setattr(program, "graphed", counted)
-    return built
+def _rewrites(fn, operands_) -> tuple:
+    """The rewrites the pass records as `fn` traces over `operands_` (`report.rewrites`)."""
+    with report.refusals():
+        jax.make_jaxpr(algebra.rewritten(fn))(*operands_)
+        return report.rewrites()
 
 
-def test_a_window_of_one_structure_is_derived_once_across_the_programs_a_process_compiles(monkeypatch):
+def test_a_window_of_one_structure_is_derived_once_across_the_programs_a_process_compiles():
     """Two programs whose windows have one structure, their values named apart (every compile a planner makes
     of one step, a resumed run's relowering, every layer of a stack), take one derivation: the second
-    program's window is rewritten as the first's, its e-graph never built again (row 3764). Its shapes are
-    this test's alone, so no other test in the process has derived its structure."""
-    built = _graphs_built(monkeypatch)
-    x, y, a = rows(7, (3, 40), (3, 40), (3, 40))
-    first = jax.make_jaxpr(algebra.rewritten(two_sums))(x, y, a)
-    second = jax.make_jaxpr(algebra.rewritten(lambda x, y, a: two_sums(y, x, a)))(x, y, a)
-    assert (reductions(first), reductions(second), len(built)) == (1, 1, 1)
-    np.testing.assert_allclose(jax.jit(algebra.rewritten(two_sums))(y, x, a), two_sums(y, x, a), rtol=1e-6)
+    program's window is rewritten with the first's forms, reused, not saturated again (row 3764), and
+    computes what its program computes (check 1)."""
+    shapes = ((3, 40), (3, 40), (3, 40))
+
+    def swapped(x, y, a):
+        return two_sums(y, x, a)
+
+    _rewrites(two_sums, rows(7, *shapes))
+    [made] = _rewrites(swapped, rows(7, *shapes))
+    assert (made.reused, made.spliced) == (True, 1)
+    assert_as_exact(jax.jit(algebra.rewritten(swapped)), jax.jit(swapped), lambda seed: rows(seed, *shapes),
+                    "a reused window's forms", seeds=8)
 
 
-def test_windows_apart_in_a_literal_or_a_shape_are_derived_apart(monkeypatch):
-    """A window's derivation is keyed by all it reads: programs of one structure but a literal (a power of two
-    and another scale) or an operand's shape take a derivation each, and each computes its own program."""
-    built = _graphs_built(monkeypatch)
-
+def test_windows_apart_in_a_literal_or_a_shape_are_derived_apart():
+    """A window's derivation is keyed by all it reads: after a program of one structure, another of a
+    different literal (a scale that is no power of two) or a different operand's shape derives its own, and
+    each computes what its program computes (check 1)."""
     def scaled(scale):
         def sums(x, y, a):
             x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
             return jnp.sum(scale * a * x, axis=-1) + jnp.sum(scale * a * y, axis=-1)
         return sums
 
-    for scale, width in ((0.5, 44), (0.3, 44), (0.5, 52)):
-        operands_ = rows(8, (3, width), (3, width), (3, width))
-        np.testing.assert_allclose(jax.jit(algebra.rewritten(scaled(scale)))(*operands_),
-                                   scaled(scale)(*operands_), rtol=1e-6)
-    assert len(built) == 3
+    _rewrites(scaled(0.5), rows(8, (3, 44), (3, 44), (3, 44)))
+    for scale, width in ((0.3, 44), (0.5, 52)):
+        shapes = ((3, width),) * 3
+        assert not any(made.reused for made in _rewrites(scaled(scale), rows(8, *shapes)))
+        assert_as_exact(jax.jit(algebra.rewritten(scaled(scale))), jax.jit(scaled(scale)),
+                        lambda seed, shapes=shapes: rows(seed, *shapes), f"scale {scale} at {width}", seeds=8)
 
 
-def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_devices(monkeypatch):
-    """A window's values' placement is part of what derives it: one program traced over one device's values
-    and again over values an explicit mesh shards takes a derivation each, and the sharded one runs and
-    computes what its program computes (the matrix's explicit layouts after their one-device reference)."""
+def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_devices():
+    """A window's values' placement is part of what derives it: after one program over one device's values,
+    the same program over values an explicit mesh shards derives its own, whose forms take its mesh, and
+    computes what its program computes (check 1; the matrix's explicit layouts after their one-device
+    reference)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
-    built = _graphs_built(monkeypatch)
-    operands_ = rows(9, (4, 56), (4, 56), (4, 56))
-    whole = jax.jit(algebra.rewritten(two_sums))(*operands_)
+    shapes = ((4, 56), (4, 56), (4, 56))
+    _rewrites(two_sums, rows(9, *shapes))
     mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
+
+    def placed(seed):
+        split = NamedSharding(mesh, P("data", None))
+        return tuple(jax.device_put(operand, split) for operand in rows(seed, *shapes))
+
     with jax.set_mesh(mesh):
-        placed = [jax.device_put(operand, NamedSharding(mesh, P("data", None))) for operand in operands_]
-        sharded = jax.jit(algebra.rewritten(two_sums))(*placed)
-    assert len(built) == 2
-    np.testing.assert_allclose(np.asarray(sharded), np.asarray(whole), rtol=1e-6)
+        assert not any(made.reused for made in _rewrites(two_sums, placed(9)))
+        assert_as_exact(jax.jit(algebra.rewritten(two_sums)), jax.jit(two_sums), placed,
+                        "an explicit mesh's window", seeds=8)
