@@ -84,15 +84,16 @@ def handed_off(count: int):
         program = jax.lax.axis_index("x")
         ready = pl.get_global(plgpu.SemaphoreType.REGULAR((2,)))
 
+        # Program 0 signals first and program 1 waits first, so each hop waits on the other's signal.
         def round_trip(_, carry):
             @pl.when(program == 0)
             def _():
                 plgpu.semaphore_signal(ready.at[1], memory_scope="gpu")
-                plgpu.semaphore_wait(ready.at[0], memory_scope="gpu")
+
+            plgpu.semaphore_wait(ready.at[program], memory_scope="gpu")
 
             @pl.when(program == 1)
             def _():
-                plgpu.semaphore_wait(ready.at[1], memory_scope="gpu")
                 plgpu.semaphore_signal(ready.at[0], memory_scope="gpu")
             return carry
 

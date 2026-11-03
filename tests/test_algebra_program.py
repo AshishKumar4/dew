@@ -477,7 +477,8 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
         assert not any(unpriced)
         return max(priced)
 
-    assert seconds(jnp.float8_e4m3fn) == pytest.approx(seconds(jnp.bfloat16) / speedup)
+    # Exact: each mode's price is the same FLOPs over the same facts, its rate a power of two apart.
+    assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
