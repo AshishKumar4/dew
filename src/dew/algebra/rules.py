@@ -367,6 +367,33 @@ def _joined() -> Ruleset:
         name="joined")
 
 
+CONTRACTED = {"mul": "fmul", "add": "fadd", "sub": "fsub"}
+"""A fused multiply-add's names (`_contracted`): its multiply's and the add's or subtract's that reads it,
+each bound as the primitive it names (its params'), the multiply priced nothing beside its reader
+(`cost.work`)."""
+
+
+def _contracted() -> Ruleset:
+    """A multiply an add or a subtract reads first, contracted into it as a fused multiply-add: the compiler
+    fuses the two into one instruction rounding the product once (NVPTX's `fma`), so the pair costs one
+    operation an element where the multiply has no other reader. A multiply another node reads too (a scaled
+    tile whose maximum is taken) is made on its own and its reader's add is one more: the contracted multiply
+    is a class the multiply's is not, which its contracted reader alone reads, and each add contracts one
+    product (the first operand, an add's either by commuting it). Each rewrite binds the primitives it
+    replaces, so it rounds as the form it replaces."""
+    x, y, z = vars_("x y z", Term)
+    multiplied, added = vars_("multiplied added", i64)
+    fused = x.binary(CONTRACTED["mul"], y, multiplied)
+    return ruleset(
+        rewrite(x.binary("mul", y, multiplied).binary("add", z, added)).to(
+            fused.binary(CONTRACTED["add"], z, added)),
+        rewrite(z.binary("add", x.binary("mul", y, multiplied), added)).to(
+            fused.binary(CONTRACTED["add"], z, added)),
+        rewrite(x.binary("mul", y, multiplied).binary("sub", z, added)).to(
+            fused.binary(CONTRACTED["sub"], z, added)),
+        name="contracted")
+
+
 def _identities() -> Ruleset:
     """Commutativity of addition and multiplication: each rounds as the form it replaces."""
     x, y = vars_("x y", Term)
@@ -387,6 +414,8 @@ def register(rules: Rules) -> None:
 
 
 register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", aid=True))
+register(Rules("contracted", "exact", _contracted(), aid=True,
+               receipt="docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721"))
 register(Rules("stable", "bounded", _stable(), dev=True,
                receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba"))
 register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))

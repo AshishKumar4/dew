@@ -29,7 +29,7 @@ import sympy
 from egglog import declarations as decl
 from jax import lax
 
-from dew.algebra import carry, rules, terms
+from dew.algebra import carry, cost, rules, terms
 
 SHAPES = ((), (2,), (3,), (2, 3), (3, 2), (2, 2), (2, 3, 2), (2, 2, 3))
 """The universe of shapes each term of a rule takes."""
@@ -91,7 +91,9 @@ def _binary(name: str, x, y):
         return np.maximum(x, y) if name == "max" else np.minimum(x, y)
     if x.shape and y.shape and x.shape != y.shape:
         raise Inadmissible(f"{name} of {x.shape} and {y.shape}")
-    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.divide}[name](x, y)
+    # A fused multiply-add's names (`rules.CONTRACTED`) are their primitives' over the reals.
+    real = cost.PRIMITIVES.get(name, name)
+    return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.divide}[real](x, y)
 
 
 def _dot(x, y, params):
