@@ -1,34 +1,44 @@
 """The sketch a recording keeps of each float64 truth leaf (tests/reference_error.py `truth_sketch`): its
-definition, bit for bit."""
+definition, within the rounding any host may take it at (`sketch_rounding`)."""
 
 import math
 
 import numpy as np
 import pytest
 
+DRAWN = {
+    "float64": lambda rng, size: rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size),
+    "float32": lambda rng, size: rng.standard_normal(size).astype(np.float32),
+    "float16": lambda rng, size: rng.standard_normal(size).astype(np.float16),
+    "int32": lambda rng, size: rng.integers(-(1 << 31), (1 << 31) - 1, size, dtype=np.int32),
+    "bool": lambda rng, size: rng.integers(0, 2, size).astype(bool),
+}
+"""A truth of each dtype the sketch takes (it reads every one as float64): a float64 truth's magnitudes
+across 60 decades, so a block's rounding is its largest entries' and the others' vanish in it."""
 
-@pytest.mark.parametrize("size", [1, 63, 64, 65, (1 << 16) + 70])
-def test_a_truths_sketch_is_its_signed_block_sums_summed_exactly(size):
-    """The sketch a recording keeps is its definition, bit for bit: each entry times each of its SKETCH
-    signs (its sign word's bits), summed in blocks of SKETCH_BLOCK in order (a block past the end padded
-    with zeros), the blocks' sums summed exactly, over chunks of 2^16 entries; at a block's and a
-    chunk's edges, with signed zeros and subnormals among the entries, so a recorded sketch stays a
-    recomputed truth's."""
-    from reference_error import SKETCH, SKETCH_BLOCK, _sign_bits, truth_sketch
+
+@pytest.mark.parametrize("dtype", DRAWN)
+@pytest.mark.parametrize("size", [1, 63, 64, 65, 3000, (1 << 16) + 70])
+def test_a_truths_sketch_is_its_signed_sums_within_any_hosts_rounding(size, dtype):
+    """The sketch a recording keeps is its definition, each entry times each of its SKETCH signs (its sign
+    word's bits, +1 where set), every block of SKETCH_BLOCK summed (a block past the end padded with
+    zeros) and the blocks' sums summed exactly: within `sketch_rounding` of the signed products' exact
+    sum, the most any order of a block's sum may round by, which the gate allows each of two sketches
+    (`indexed_recording`). At a block's and a host chunk's edges, with signed zeros and subnormals among
+    a floating truth's entries, so a recorded sketch stays a recomputed truth's."""
+    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
 
     rng = np.random.default_rng(size)
-    truth = rng.normal(size=size)
-    truth[::7] = -0.0
-    truth[1::11] = 2.0 ** -1060
+    truth = DRAWN[dtype](rng, size)
+    if np.issubdtype(truth.dtype, np.floating):
+        truth[::7] = -0.0
+        truth[1::11] = np.finfo(truth.dtype).smallest_subnormal
+    values = truth.astype(np.float64)
     signs = ((_sign_bits(size, 5)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
-    blocks = []
-    for start in range(0, size, 1 << 16):
-        chunk = truth[start:start + (1 << 16), None] * signs[start:start + (1 << 16)]
-        chunk = np.concatenate([chunk, np.zeros((-len(chunk) % SKETCH_BLOCK, SKETCH))])
-        blocks.append(chunk.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-    stacked = np.concatenate(blocks)
-    defined = np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
-    np.testing.assert_array_equal(truth_sketch(truth, 5), defined)
+    exact = np.asarray([math.fsum(column) for column in (values[:, None] * signs).T.tolist()])
+    sketch = truth_sketch(truth, 5)
+    assert sketch.shape == (SKETCH,)
+    assert np.all(np.abs(sketch - exact) <= sketch_rounding(math.fsum(np.abs(values).tolist())))
 
 
 def test_a_devices_block_sums_are_the_hosts_where_each_block_sums_exactly():

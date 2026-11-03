@@ -2107,30 +2107,6 @@ def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
                                                              np.asarray([1.0]))]) == []
 
 
-def test_a_truth_sketch_is_its_signed_sums_bit_for_bit():
-    """`truth_sketch` is its definition, bit for bit: each entry times its seed's SKETCH signs (bit k of
-    its word, +1 where set), summed in float64 in blocks of SKETCH_BLOCK in order and the blocks summed
-    exactly, at sizes off and on a block's edge and past one chunk of 2^16 entries."""
-    import math
-
-    from reference_error import SKETCH, SKETCH_BLOCK, _sign_bits, truth_sketch
-
-    for size in (1, SKETCH_BLOCK - 1, 5 * SKETCH_BLOCK, (1 << 16) + 77):
-        values = np.random.default_rng(size).standard_normal(size) * 10.0 ** np.random.default_rng(
-            size + 1).uniform(-30, 30, size)
-        bits = _sign_bits(size, seed=3)
-        signs = np.where((bits[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & np.uint64(1), 1.0, -1.0)
-        products = values[:, None] * signs
-        blocks = []
-        for start in range(0, size, 1 << 16):
-            chunk = products[start:start + (1 << 16)]
-            padded = np.concatenate([chunk, np.zeros((-len(chunk) % SKETCH_BLOCK, SKETCH))])
-            blocks.append(padded.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-        expected = [math.fsum(column) for column in np.concatenate(blocks).T.tolist()]
-        assert truth_sketch(values, seed=3).tolist() == expected
-
-
-
 def _bits(value):
     """`value` held to its bits: an array's or a float's dtype, shape and bytes (a NaN's and a zero's sign
     included), a summary's field by field, a tuple's item by item."""
