@@ -40,13 +40,11 @@ from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel
 
-INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
-                        ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
-                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
-"""The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
-and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
-dimension (`key_backward`'s), and an fp32 call's under the run's fast forms. Interpreted, the whole grid took
-5.4 times these (7828 against 1452 seconds)."""
+INTERPRETED_GRADIENT: set[tuple] = set()
+"""The gradient's cases the CPU interprets, each a check-1 site of its own (`interpreted_gradient`): the fast
+backward's launches over a ragged chunk, two key blocks and two key heads' groups, packed documents, its
+forward's memories kept and recomputed, under a decay a key dimension (`key_backward`'s), and an fp32 call's
+under the run's fast forms. Interpreted, the whole grid took 5.4 times these (7828 against 1452 seconds)."""
 
 REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
 """The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
@@ -74,63 +72,64 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-LONG: set[tuple] = set()
-"""The interpreted gradient's cases each a test of their own (`drawn_apart`), which
-`test_the_mosaic_gradient_is_as_exact_as_its_reference`'s grid leaves out."""
-
-
-def drawn_apart(case: str, dtype: str, remat: str) -> Callable:
-    """A long gradient case's test: the case taken out of the general test's grid (`LONG`) and its check 1 run
-    by the test it decorates, a check-1 site of its own (its `check1_shards` mark). Whole, these cases took
-    122 to 225 seconds (train 270's CI on 66a222273, ledger 2127) and 483 to 653 (train 479's on e82eab19a);
-    a map task of 80 seeds of the three 256-seed cases took 525 s, one of 15 of the two 128-seed cases 159 s
-    (other-shards at 77a98366c), so each case is a site apart."""
-    LONG.add((case, dtype, remat))
+def interpreted_gradient(case: str, dtype: str, remat: str) -> Callable:
+    """An interpreted gradient case's test, its one declaration: the case among `INTERPRETED_GRADIENT` and
+    its check 1 (`the_mosaic_gradient_is_as_exact_as_its_reference`) run by the test it decorates, a check-1
+    site of its own (its `check1_shards` mark). Whole, these cases took 122 to 225 seconds (train 270's CI on
+    66a222273, ledger 2127), 483 to 653 (train 479's on e82eab19a) and 474 (the recomputed one, train 521's
+    on e65403fc9); a map task of 80 seeds of the three 256-seed cases took 525 s, one of 15 of the two
+    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart."""
+    INTERPRETED_GRADIENT.add((case, dtype, remat))
 
     def check():
-        _holds_check_1(case, DTYPES[dtype], remat)
+        the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat)
 
     return lambda test: functools.update_wrapper(check, test)
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=20)
-@drawn_apart('packed documents', 'bf16', 'kept')
+@interpreted_gradient('packed documents', 'bf16', 'kept')
 def test_a_packed_bf16_gradient_is_as_exact_as_its_reference():
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at packed documents in bf16, from the forward's
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` at packed documents in bf16, from the forward's
     memories kept: a task of 32 seeds took 122 s (grad-shards at 61f6e8d39)."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=32)
-@drawn_apart('a ragged length', 'bf16', 'kept')
+@interpreted_gradient('a ragged length', 'bf16', 'kept')
 def test_a_ragged_bf16_gradient_is_as_exact_as_its_reference():
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, from the forward's
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, from the forward's
     memories kept."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=32)
-@drawn_apart('one sequence', 'bf16', 'kept')
+@interpreted_gradient('one sequence', 'bf16', 'kept')
 def test_a_bf16_gradient_over_one_sequence_is_as_exact_as_its_reference():
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at one sequence in bf16, from the forward's
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` at one sequence in bf16, from the forward's
     memories kept."""
 
 
+@pytest.mark.check1_shards(seeds=256, per_task=24)
+@interpreted_gradient('a ragged length', 'bf16', 'recomputed')
+def test_a_recomputed_ragged_bf16_gradient_is_as_exact_as_its_reference():
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, its forward's memories
+    recomputed under a remat rung (`recomputing`)."""
+
+
 @pytest.mark.check1_shards(seeds=128, per_task=16)
-@drawn_apart('a decay a key dimension', 'bf16', 'kept')
+@interpreted_gradient('a decay a key dimension', 'bf16', 'kept')
 def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` under a decay a key dimension in bf16, from the
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` under a decay a key dimension in bf16, from the
     forward's memories kept."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=12)
-@drawn_apart('a ragged length', 'fp32', 'kept')
+@interpreted_gradient('a ragged length', 'fp32', 'kept')
 def test_a_ragged_fp32_gradient_is_as_exact_as_its_reference():
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in fp32, from the forward's
+    """`the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in fp32, from the forward's
     memories kept: 5.1 s a seed."""
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(
-    [case for case in GRADIENT_GRID if case not in LONG], INTERPRETED_GRADIENT - LONG))
-def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
+def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
     backward (`mainloop_backward.gradients`, fla's DAG; under a decay a key dimension fla_kda's,
@@ -142,11 +141,6 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
     gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
-    _holds_check_1(case, dtype, remat)
-
-
-def _holds_check_1(case, dtype, remat):
-    """The gradient case's check 1 (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     hooks = case_hooks(case)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
@@ -198,7 +192,7 @@ def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
     recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
     the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
     give, whose check 1 against recorded fla holds both
-    (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
     from fla_sites import LEAVES, ruled, sites
 
     case = 'a decay a key dimension'

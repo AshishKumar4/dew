@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew._records import JSON
+    from dew.interop.sources import SourceReference
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -63,9 +64,9 @@ class Case:
     """The fields of the model the case builds (`trunk`'s), over the checkpoint config's where it names
     one."""
     hf_config: str | None = None
-    """A checkpoint's config.json, or the directory holding it, whose family's translation
-    (`dew.interop.hf_decoders.translate_config`) is the decoder's fields, `config`'s over them
-    (`trunk_fields`)."""
+    """A checkpoint, a local directory (or its config.json) or a Hub repo (`repo@revision` pins one,
+    `dew.interop.sources.SourceReference.parse`), whose config's translation is the decoder's fields,
+    `config`'s over them (`trunk_fields`, `checkpoint_fields`)."""
     dtype: str | None = None
     """Compute dtype, written into the model's `dtype` field; None takes the run's --dtype."""
     matmul_precision: str | None = None
@@ -135,13 +136,16 @@ class Case:
         return "causal_transformer" if wrapped else self.architecture
 
     def trunk_fields(self) -> dict[str, object]:
-        """The fields `trunk` is built from: the checkpoint config's (`checkpoint_fields`) where the case
-        names one (`hf_config`), `config`'s fields over them."""
+        """The fields `trunk` is built from: the checkpoint's (`checkpoint_fields`) where the case names one
+        (`hf_config`), `config`'s fields over them."""
         if self.hf_config is None:
             return dict(self.config)
-        path = Path(self.hf_config)
-        read = json.loads((path / "config.json" if path.is_dir() else path).read_text())
-        return {**checkpoint_fields(read), **self.config}
+        from dew.interop.sources import SourceReference
+
+        # A checkpoint's config.json names the directory holding it.
+        named = Path(self.hf_config)
+        source = SourceReference.parse(str(named.parent) if named.is_file() else self.hf_config)
+        return {**checkpoint_fields(source), **self.config}
 
     def resolved(self) -> "Case":
         """The case with its checkpoint's fields in `config` (`trunk_fields`), naming no checkpoint: what a
@@ -192,15 +196,26 @@ class Case:
                 f"{mesh_label(self.mesh)}{order}")
 
 
-def checkpoint_fields(config: Mapping[str, object]) -> dict[str, object]:
-    """The decoder fields Dew builds from a checkpoint's Hugging Face config: a decoder's own, a wrapper's
-    language model as a text-only load reads it (`decoder_config`), or DiffusionGemma's trunk, the causal
-    text tower its assembly builds (`diffusion_gemma.text_config`), which a text-only load does not take."""
-    from dew.interop import diffusion_gemma
+def checkpoint_fields(source: "SourceReference") -> dict[str, object]:
+    """The decoder fields Dew builds from a checkpoint's Hugging Face config, a local directory's or a Hub
+    repo's at its revision (`source`), of which nothing else is read but its tensors' names, from their
+    headers, where a quantized wrapper's selection needs them: a decoder's own, a wrapper's language model
+    as a text-only load reads it (`decoder_config`: its head policy and overrides, its quantized selection
+    renamed with its tensors, ledgers 3006, 3138), or DiffusionGemma's trunk, the causal text tower its
+    assembly builds (`diffusion_gemma.text_config`), which a text-only load does not take."""
+    from dew.interop import diffusion_gemma, sources
     from dew.interop.hf_decoders import decoder_config, translate_config
 
+    # One snapshot, the config's and the headers' commit alike (`snapshot(weights=False)`).
+    root = source.metadata()
+    config = json.loads((root / "config.json").read_text())
+
+    def inventory():
+        stored = sources.stored_tensors(source, root)
+        return None if stored is None else stored.keys()
+
     trunk = (diffusion_gemma.text_config(config) if config.get("model_type") == "diffusion_gemma"
-             else decoder_config(config))
+             else decoder_config(config, inventory))
     return dict(translate_config(trunk))
 
 

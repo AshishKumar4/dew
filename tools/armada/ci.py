@@ -181,6 +181,9 @@ NEWEST_FILES = (
     # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
+    # Host allocations a test bounds by tracemalloc's peak, which moves on 3.14: a pool's export peaked past
+    # half its model on 3.14 in CI's process, green there standalone.
+    "tests/test_saved_sources.py", "tests/test_mixture_scale.py",
 )
 """The files the newest Python runs whole on a pushed run: those its changes broke before, and
 the ones around the same machinery. It imports every other test file there (`COLLECT`), and runs
@@ -188,8 +191,9 @@ every file on the daily run. The list is kept by hand, from those breaks, becaus
 derive it: the test cache records the checkout's files a run executed and read (executed.py),
 while each break lived in the standard library's or a dependency's behaviour under the new
 Python (PEP 649's lazy annotations read through tyro, forkserver as the default start method,
-threads ended at interpreter exit), which no record sees; and the plan runs where the records'
-token is not. Across 34 suite runs no file was red on 3.14 alone."""
+threads ended at interpreter exit, a process's allocations under tracemalloc), which no record
+sees; and the plan runs where the records' token is not. A file red on the newest Python alone is
+found by the daily run, which the land queue reads, and joins the list."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_SECONDS = 6.0
@@ -1149,34 +1153,28 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     row, and no draw runs. A map task weighs what armada measured it at, under its task's name
     (`site_task`), else its units at the rate of the site's map tasks of its kind that armada measured
     (`rate`: its first stage runs every time, so a later task its judge has not asked for since weighs what
-    its seeds take), else, before any ran, its units at the site's recorded seconds over the units a whole
-    run takes at least (`Mark`), else the target; a judge, its row's pooling as armada measured it, else the
-    target. A judge
+    its seeds take), else the target: armada keeps the measures of the tasks a run named, so a site the last
+    run reused has none, and the durations record times its judge's pooling, no measure of its draws
+    (`folded`); a judge, its row's pooling as armada measured it, else the target. A judge
     names no row: armada reads one whose map tasks did not all pass red under its task's name, naming them,
     which a named row would leave not graded."""
     measured = timings.get("rows", {})
-    record = durations_record()
     entries = []
     for name, held in sorted(marked.items()):
         for test in sorted(held):
             if (name, test) in kept:
                 continue
             mark = held[test]
-            whole = sum(seconds for node, seconds in record.items()
-                        if node.split("::")[0] == name and session.test_name(node) == test)
             spans = draws_of(mark)
             maps = []
             for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
-                # A weighed check's units cost their own: unmeasured, and none of them measured, a task of
-                # them weighs the target.
+                # A weighed check's units cost their own, at the rate of those of them armada measured.
                 weighed = start >= mark.units
                 kind = [span for span in spans if (span[0] >= mark.units) == weighed]
                 each = rate(python, name, test, kind, measured)
-                weight = measured.get(task_name) or (
-                    each * (stop - start) if each is not None
-                    else target if weighed else whole * (stop - start) / mark.timed or target)
+                weight = measured.get(task_name) or (each * (stop - start) if each is not None else target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
@@ -2072,8 +2070,8 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     nowhere, ran 46 of its ~70 tests and was cut off every run). A reused row (the test cache) carries the
     times of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else
     writes the record. A site its file's marks shard (`sites`) keeps its entries: its judge's row times
-    its pooling, no measure of its draws, which the site's recorded seconds weigh before armada times its
-    map tasks (`site_entries`), and a judge armada did not run is a row of its task's name."""
+    its pooling, no measure of its draws, so its map tasks are weighed by armada's measures of them, never
+    by the record (`site_entries`), and a judge armada did not run is a row of its task's name."""
     changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
                                  capture_output=True, text=True).stdout.split())
     rows: dict[str, list[dict]] = {}

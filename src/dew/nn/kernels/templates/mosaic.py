@@ -147,9 +147,10 @@ def dependent(entry: Callable, interpret) -> Callable:
     own, so it is ordered against any launch as without it, and once its own work is done it lets the next
     such launch start (`launch_dependents`), whose launch and setup then overlap this one's last programs'
     tails. Triggered at the work's end, not its start: a trigger at entry let a dependent's programs take the
-    multiprocessors this launch's later waves needed, each waiting there on this launch to finish (an H100's
-    recurrence launches: wall time per call 0.6 to 1.0% above no dependent launch, JS bisect2-h100,
-    CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
+    multiprocessors this launch's later waves needed, each waiting there on this launch to finish (an H100
+    SXM's recurrence launches, wall time per call: Qwen3.5-27B's GDN forward and Nemotron-H 30B's SSD
+    training 1.0 and 1.1% above no dependent launch at entry, within 0.5% of it at the end, pdl-sxm at
+    b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
     (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
     or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
     `entry` as it is."""

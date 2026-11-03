@@ -1758,6 +1758,34 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("generation_name", GATED)
+def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width):
+    """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
+    slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
+    `width` wide, two rows of 4096 keys, lowered and compiled by ptxas for `generation_name` on this CPU
+    (tests/kernel_compile.py): every launch within its shared memory and spilling nothing (`mosaic_failures`),
+    where the forward gate's prefill calls derive their own tiles."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys = 2, 4096
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.bfloat16)
+    spans = template.spans(1, keys, rows, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+
+    def decode(query, key, value):
+        return attention_decode.attend(query, key, value, spans)
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)), {})],
+                                       generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
 def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
