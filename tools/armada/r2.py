@@ -21,9 +21,7 @@ import http.client
 import json
 import re
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,18 +61,13 @@ def valid(key: str) -> bool:
             and ".." not in key.split("/"))
 
 
-class _Unredirected(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_OPENER = urllib.request.build_opener(_Unredirected)
-
-
 class Stream(Protocol):
-    """An answer's body as a sender gives it: read in pieces, then closed."""
+    """An answer's body as a sender gives it: read in pieces, each what one receive gives, then closed."""
 
-    def read(self, size: int = -1) -> bytes: ...
+    def read1(self, size: int, seconds: float) -> bytes:
+        """At most `size` bytes, what one receive gives, waiting at most `seconds` for it (past them a
+        TimeoutError); b"" at the body's end."""
+        ...
 
     def close(self) -> None: ...
 
@@ -85,16 +78,34 @@ Sender = Callable[[str, str, Mapping[str, str], "bytes | None", float], tuple[in
 while it is read, raise an OSError (or http.client's HTTPException); everything else is the `Store`'s."""
 
 
+class _Answer:
+    """An http.client answer as a `Stream`: each read one receive of its socket, bounded as asked."""
+
+    def __init__(self, connection: http.client.HTTPConnection, sock, response: http.client.HTTPResponse):
+        self.connection, self.sock, self.response = connection, sock, response
+
+    def read1(self, size: int, seconds: float) -> bytes:
+        self.sock.settimeout(seconds)
+        return self.response.read1(size)
+
+    def close(self) -> None:
+        self.response.close()
+        self.connection.close()
+
+
 def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes | None,
                 timeout: float) -> tuple[int, Mapping[str, str], Stream]:
-    """The standard library's sender: a connection a request, which a caller that runs before any
-    environment exists (ci.py, remote_cache) can use."""
-    request = urllib.request.Request(url, data=body, method=method, headers=dict(headers))
-    try:
-        response = _OPENER.open(request, timeout=timeout)
-    except urllib.error.HTTPError as error:  # an answer whose status is no success is still an answer
-        return error.code, dict(error.headers), error
-    return response.status, dict(response.headers), response
+    """The standard library's sender: a connection a request, following no redirect, which a caller that
+    runs before any environment exists (ci.py, remote_cache) can use. Its socket is held from the request
+    on, so each read of the answer's body waits as long as the `Body` reading it allows."""
+    parts = urllib.parse.urlsplit(url)
+    opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    connection = opened(parts.hostname, parts.port, timeout=timeout)
+    connection.request(method, f"{parts.path or '/'}{f'?{parts.query}' if parts.query else ''}", body=body,
+                       headers=dict(headers))
+    sock = connection.sock
+    response = connection.getresponse()
+    return response.status, dict(response.headers), _Answer(connection, sock, response)
 
 
 class Body:
@@ -103,34 +114,40 @@ class Body:
     `MIN_RATE` past `timeout` seconds, `Unavailable`."""
 
     def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str, timeout: float):
-        self.stream, self.left, self.what = stream, limit, what
+        self.stream, self.left, self.what, self.timeout = stream, limit, what, timeout
         announced = {name.lower(): value for name, value in headers.items()}.get("content-length")
         self.owed = None if announced is None else int(announced)
         self.ends = time.monotonic() + timeout + (limit if self.owed is None else self.owed) / MIN_RATE
 
     def read(self, size: int = -1) -> bytes:
-        """At most `size` bytes more (all the rest, under -1); b"" at the body's end."""
-        wanted = self.left + 1 if size < 0 else min(size, self.left + 1)
-        if time.monotonic() > self.ends:
-            raise Unavailable(f"{self.what} arrived slower than {MIN_RATE} bytes a second")
+        """At most `size` bytes more, what one receive gives (all the rest, under -1); b"" at the body's end.
+        Each receive waits at most the request's timeout and what is left of the body's deadline."""
+        if size < 0:
+            return self.whole()
+        if size == 0 or self.owed == 0:
+            return b""
+        slow = f"{self.what} arrived slower than {MIN_RATE} bytes a second"
+        left = self.ends - time.monotonic()
+        if left <= 0:
+            raise Unavailable(slow)
         try:
-            data = self.stream.read(wanted)
+            data = self.stream.read1(min(size, self.left + 1), min(self.timeout, left))
         except (OSError, http.client.HTTPException) as error:
-            raise Unavailable(f"{self.what} was cut short: {error}") from error
+            raise Unavailable(slow if time.monotonic() >= self.ends
+                              else f"{self.what} was cut short: {error}") from error
         if len(data) > self.left:
             raise ValueError(f"{self.what} is past its {self.left + len(data) - 1}-byte bound")
         self.left -= len(data)
         if self.owed is not None:
             self.owed -= len(data)
-            # A read that came back short ended at the connection's end: the body stopped before its length.
-            if self.owed > 0 and len(data) < wanted:
+            # The connection's end before the length it announced: the body stopped short.
+            if not data and self.owed > 0:
                 raise Unavailable(f"{self.what} ended {self.owed} bytes before its announced length")
         return data
 
     def whole(self) -> bytes:
         """The rest of the body."""
         parts = []
-        # In pieces a sixteenth of a second long at MIN_RATE, so a slow body is given up near its deadline.
         while part := self.read(2 ** 16):
             parts.append(part)
         return b"".join(parts)
