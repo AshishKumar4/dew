@@ -146,18 +146,25 @@ def _persistent(program: _Program, spec: algebra.Forward, layout: "_Layout", *re
 
     def consumer(index, at_tile, walk, store, *, active):
         del store
-        if read.walks is not None and not active:
-            # A masked launch's tile it does not walk: its outputs there unread (`algebra.walked_launches`).
-            return
         row, head, tile = at_tile
         at = program.persistent_tile(tile)
         block = _Block.of(at, row, head, at.query_tile(tiles_q) * block_q, queries)
-        status, out_view, finished = block.inference(refs.written, finishes)
-        _consumer(at, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view, status,
-                  refs.q_smem.at[index], refs.q_loaded.at[index], refs.out_smem.at[index],
-                  refs.row_smem.at[index], None, {"values": (refs.v, None)}, turn, (), block.first,
-                  read.spans, read.hooked, read.guard, (row, head, lax.div(head, group)), hooks=hooks,
-                  residuals=None, interpret=interpret, finished=finished, walker=walk)
+
+        def walked():
+            status, out_view, finished = block.inference(refs.written, finishes)
+            _consumer(at, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view, status,
+                      refs.q_smem.at[index], refs.q_loaded.at[index], refs.out_smem.at[index],
+                      refs.row_smem.at[index], None, {"values": (refs.v, None)}, turn, (), block.first,
+                      read.spans, read.hooked, read.guard, (row, head, lax.div(head, group)), hooks=hooks,
+                      residuals=None, interpret=interpret, finished=finished, walker=walk)
+
+        if read.walks is None or active:
+            walked()
+        else:
+            # A masked launch's tile it names whose slice holds no key stores its empty walk's start, as the
+            # grid's program does (`kept` and the slices' merge read it); a tile it names not, nothing (its
+            # outputs unread, `algebra.walked_launches`).
+            pl.when(read.walks[row, lax.div(block.first, block_q)] != 0)(walked)
 
     family.persist(streams, (heads * count * batch,), scheduled, consumer, consumers=1, axis="programs",
                    outputs=(), interpret=interpret)
