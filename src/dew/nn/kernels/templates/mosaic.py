@@ -30,6 +30,7 @@ from jax import lax, numpy as jnp
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
@@ -867,13 +868,34 @@ def swizzle_transforms(dtype, swizzle: int) -> tuple:
     return TILING((TILE_ROWS, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
 
 
+def plain(shape: tuple, dtype):
+    """A shared-memory block laid out plainly, neither tiled nor swizzled, stated so (`plgpu.PlainTransform`):
+    one read at row offsets no tiling divides, which layout inference would otherwise search every tiling
+    and swizzle for, each subview of it apart (a Kimi delta attention intra launch's out of its fuel at 32-
+    and 64-key blocks on an H100)."""
+    return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
+
+
+def synced(interpret: bool) -> None:
+    """The warpgroup's threads past their shared-memory reads and writes before any goes on: a tile one thread
+    wrote that another reads, or one written again that another still reads (a walk's scratch tile). Mosaic
+    GPU's loads and stores order no other thread's, and `plgpu.commit_smem`'s async-proxy fence exists from
+    sm90 on (an A100's LLVM selects no `fence.proxy.async`); interpreted, a load and a store take the whole
+    tile at once."""
+    if interpret:
+        return
+    plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
+
+
 def staged(shape: tuple, dtype, swizzle: int | None = None):
     """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
     them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
     which inference does not take for a block whose products contract over fewer elements than the widest
     swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so); plain where
     `UNSWIZZLED`."""
-    if swizzle is None or swizzle == UNSWIZZLED:
+    if swizzle == UNSWIZZLED:
+        return plain(shape, dtype)
+    if swizzle is None:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
