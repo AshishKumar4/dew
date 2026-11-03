@@ -455,11 +455,12 @@ def auto_part(spec: jax.sharding.PartitionSpec,
               mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> jax.sharding.PartitionSpec:
     """`spec` over `mesh`'s Auto axes alone, which is what a sharding
     constraint may name: an array's type carries its Explicit axes
-    (`MeshSpec.explicit`), placed by the operations that made it."""
-    explicit = set(mesh.explicit_axes)
-    if not explicit:
+    (`MeshSpec.explicit`), placed by the operations that made it, and a
+    Manual axis is a `shard_map`'s own (DiLoCo's replicas)."""
+    auto = set(mesh.auto_axes)
+    if auto == set(mesh.axis_names):
         return spec
-    kept = [tuple(axis for axis in mesh_axes(entry) if axis not in explicit) for entry in spec]
+    kept = [tuple(axis for axis in mesh_axes(entry) if axis in auto) for entry in spec]
     return jax.sharding.PartitionSpec(*(axes[0] if len(axes) == 1 else axes or None for axes in kept))
 
 
