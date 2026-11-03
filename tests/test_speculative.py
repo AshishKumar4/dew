@@ -19,7 +19,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decoder
-from whole_suite import timed
 
 from dew.sampling import Sampling, Speculative, decoding, generate
 
@@ -99,25 +98,39 @@ LONGROPE_DRAFTING = {"depth": (longrope_predictor, 1), "drafter": (longrope_draf
 decode runs (`decode_ops`): a prediction depth's, and a block drafter's, which runs none."""
 
 
-PAST_TARGET = {"greedy": {"dspark": 124}}
-"""The greedy-walk cases a group's 120 s target sends to the whole suite (`timed`), each its seconds on
-armada at 5163cd0bd: the drafter's, whose crossing its cheaper siblings hold every train, a block across
-the change answering each token as the walk does and the crossing reseeding the drafter's windows (each
-`[drafter]`)."""
+def greedy_walk(model, params, prompts, steps: int) -> np.ndarray:
+    """The greedy walk's `steps` tokens after each of `prompts`: the prompt's prefill, then a token at a
+    time, each its last logits' argmax, through the decode the decode loops run (`decode_ops`), one
+    compiled step a token."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    ops = decode_ops(model, params, 0, 0)
+
+    def step(state, _):
+        token = jnp.argmax(state.logits, axis=-1).astype(prompts.dtype)
+        return ops.advance(state, token, jnp.ones(token.shape[0], bool)), token
+
+    @jax.jit
+    def walk(prompts):
+        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+        return jnp.moveaxis(jax.lax.scan(step, state, None, length=steps)[1], 0, 1)
+
+    return np.asarray(walk(prompts))
 
 
-@pytest.mark.parametrize("kind", timed(PAST_TARGET, "greedy", ["attention", "recurrent", "dspark"]))
+@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
-    walk, each row's crossing inside a block."""
+    walk (`greedy_walk`), each row's crossing inside a block."""
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
-    walked, speculated = (generate(model, params, prompts, 6, key=jax.random.key(1),
-                                   sampling=Sampling(temperature=0), strategy=strategy)
-                          for strategy in (None, Speculative(block=3)))
-    np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
+    speculated = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
+                          strategy=Speculative(block=3))
+    walked = greedy_walk(model, params, prompts, 6)
+    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
@@ -155,7 +168,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
 
     build, depths = LONGROPE_DRAFTING[drafting]
     model = build()
-    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((2, 5), jnp.int32))
+    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((2, 3), jnp.int32))
 
     def walk(model, params):
         """The prompt's prefill, then the stretch a token at a time, each token's logits."""
