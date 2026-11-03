@@ -52,14 +52,15 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
 
 
-def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path, capfd):
+def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
     """A run that ends within its deadline is never dumped, however close to it it ends: the stacks are the
     deadline's alone, never a timer's before it, which could kill a healthy multithreaded run mid-dump and
-    read it red as a whole-file failure (row 3738)."""
+    read it red as a whole-file failure (row 3738). A test failing at 7 s of a 10 s deadline keeps its own
+    failure in its row, and no thread's stack."""
     interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_close.py": "import time\n\n\ndef test_close():\n    time.sleep(7)\n"})
+    written(tmp_path, {"test_close.py": "import time\n\n\ndef test_close():\n    time.sleep(7)\n"
+                                        "    assert False, 'its own failure'\n"})
     ci.task("3.12", ["tests/test_close.py"], "", tmp_path / "rows.json", 10.0, cache="off")
     [row] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert row["exitCode"] == 0, row["output"]
-    assert "(most recent call first)" not in capfd.readouterr().out
-
+    assert row["kind"] == "nodes" and "its own failure" in row["output"]
+    assert "(most recent call first)" not in row["output"]
