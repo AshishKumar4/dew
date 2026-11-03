@@ -270,8 +270,8 @@ def test_a_summarized_recording_and_dews_rows_are_sized_alike_at_a_site_with_ter
     assert raised.type is GateFailure and {finding.rule for finding in raised.value.findings} == {"row"}
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw,
-                                        lambda drawn: (computed(**drawn, index=0), truth(**drawn)), summary=True)
+        recorded = recorder.record_case(
+            "site", draw, lambda drawn: (computed(**drawn, index=0), truth(**drawn)), summary=True)
     seeds = int(recorded["site.seeds"])
     drawn, recorded_reference, recorded_truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
                                                                   truth_fn=lambda inputs: truth(**inputs))
