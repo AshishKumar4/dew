@@ -19,8 +19,8 @@ verdicts.
 Usage, from the checkout: python tools/gate_null_runs.py <class> --seeds K --runs N --chunk C
     [--paired] [--orders K] [--fault NAME]
 or, for the worst-row rule's controls (`row_controls`): python tools/gate_null_runs.py <rows a draw>
-    --rows <values a row> --seeds K --runs N --chunk C, printing its red runs and the site statistic's
-    quantiles
+    --rows <values a row> --seeds K --runs N --chunk C [--amplified], printing its red runs and the site
+    statistic's quantiles
 """
 
 import argparse
@@ -506,23 +506,31 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     return verdicts
 
 
-def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tuple[list, list[float]]:
+def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
+                 amplified: bool = False) -> tuple[list, list[float]]:
     """Check 1's verdicts (`_staged`) on its worst-row rule alone for equally exact pairs as sites run it,
     `runs` runs from `chunk`'s own stream: both arms on one truth, so each row's size is shared; `rows`
     rows a draw of `width` values, truths and errors standard normal, the arms' errors independent; the
-    pooled ratio exactly one, so only the rows decide. Each run's verdict, and its site statistic, the
+    pooled ratio exactly one, so only the rows decide; with `amplified`, one element a row amplified by
+    2^k, k uniform over 0 to 24 in each arm apart, the heavy-tailed rows one element rules. Each run's
+    verdict, and its site statistic, the
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
     from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _staged, _verdict
 
-    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk])
+    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified)])
     span = (1 + REDRAW) * seeds
     verdicts, statistics = [], []
     for _ in range(runs):
         truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
-        worst = np.stack([(np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
-                           / truth).max(axis=1) for _ in range(2)], axis=-1)[:, None, :]
+        arms = []
+        for _ in range(2):
+            errors = rng.standard_normal((span, rows, width))
+            if amplified:
+                errors[..., 0] *= 2.0 ** rng.integers(0, 25, (span, rows))
+            arms.append((np.sqrt(np.mean(np.square(errors), axis=2)) / truth).max(axis=1))
+        worst = np.stack(arms, axis=-1)[:, None, :]
 
         def drawn(start, stop, worst=worst):
             count = stop - start
@@ -554,20 +562,24 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--chunk", type=int, default=0)
     parser.add_argument("--orders", type=int, help="judge an orbit class's rows over this many orders")
+    parser.add_argument("--amplified", action="store_true", help="with --rows, one element a row amplified "
+                        "by 2^k, k uniform over 0 to 24, in each arm apart")
     parser.add_argument("--paired", action="store_true", help="run both arms on the same draws, as a site "
                         "does: Dew the reference at another order (REORDERED), or with --fault its fault")
     options = parser.parse_args(argv)
     from reference_error import _drawn, null_runs, seeds_for
 
+    if options.amplified and options.rows is None:
+        parser.error("--amplified is the worst-row controls' (--rows)")
     if options.rows is not None:
         if options.today or options.paired or options.orders or options.fault or options.seeds is None:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
-                                            options.chunk)
+                                            options.chunk, options.amplified)
         import numpy as np
 
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
-                          "chunk": options.chunk, "runs": len(verdicts),
+                          "amplified": options.amplified, "chunk": options.chunk, "runs": len(verdicts),
                           "reds": sum(verdict != "pass" for verdict, _ in verdicts),
                           "quantiles": {str(tail): float(np.quantile(statistics, 1 - tail))
                                         for tail in (5e-4, 1e-4)}}), flush=True)
