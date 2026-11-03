@@ -114,9 +114,19 @@ class TapRule:
                 tapped.append(value)
                 continue
             unit = _unit(name, params, dtype)
-            draw = jax.random.normal(jax.random.fold_in(self.key, index), jnp.shape(value), jnp.float64)
+            draw = _normal(jax.random.fold_in(self.key, index), jnp.shape(value))
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
+
+
+def _normal(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """Standard normal float64 draws of `shape` keyed by `key`, by Box and Muller's transform of two uniform
+    draws: exact normals of the few cheap operations a program holding a draw at every rounding compiles in
+    a second, where `jax.random.normal`'s inverse error function compiled for minutes."""
+    bits = jax.random.bits(key, (2, *shape), jnp.uint64)
+    # Each uniform in (0, 1] from the top 53 bits, so the logarithm is finite.
+    uniform = ((bits >> 11).astype(jnp.float64) + 1) * 2.0 ** -53
+    return jnp.sqrt(-2 * jnp.log(uniform[0])) * jnp.cos(2 * jnp.pi * uniform[1])
 
 
 def rounding_scale(fn, *args, seed: int = 0):
