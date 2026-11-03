@@ -103,9 +103,10 @@ def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_n
     under 4. And it lies above the A/A's: a sleep returns no sooner than asked, so a pair's ratio falls to
     2, the arms' geometric middle, only where its faster call is delayed 12 ms past its sleep, and an
     A/A's rises to 2 only where one of its calls is, so the intervals meet only where a run holds 16 such
-    delays. Calls like its faster one on armada, beside up to eight busy processes on a container's four
-    CPUs, held at most 7 in each of 1,112 spans of 480, so at most 14 in a run's 258 calls, which two spans
-    hold (row 3793): an interval apart from 1 and from the A/A's is a difference the
+    delays. Calls like its faster one on armada held such delays in bursts: counted over spans of 480
+    calls, a run's time, a negative binomial by their moments gives a run 16 of them with chance 1.8e-5
+    beside eight busy processes on a container's four CPUs, under FALSE_RED / 4, and 3e-7 beside three
+    (row 3793's measurement): an interval apart from 1 and from the A/A's is a difference the
     placement does not make (row 3616, the kernel challenge's method: one-sided runs moved -0.6% to +0.6%
     whatever the change)."""
     from dew.telemetry.benchmark import compared
