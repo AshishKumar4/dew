@@ -46,7 +46,7 @@ const resolution = `${replays[0].width}×${replays[0].height}`;
 const moe = JSON.parse(readPublic('examples', 'moe-mesh', 'moe-mesh.json'));
 const lora = JSON.parse(readPublic('examples', 'sd15-lora', 'manifest.json'));
 const videos = Object.values(JSON.parse(readPublic('gallery', 'wan-2.1', 'manifest.json')).clips) as { video: string; poster: string; prompt: string }[];
-// FlyDreamer's pilot, filmed by tutorial 13's own run, its scores as the tutorial printed them (tools/tutorial_film.py).
+// FlyDreamer's pilot, filmed by tutorial 14's own run, its scores as the tutorial printed them (tools/tutorial_film.py).
 type Score = { policy: string; race: string; gates: number; steps: number; episode: number };
 const flight = JSON.parse(readPublic('gallery', 'flydreamer', 'manifest.json')) as
 	{ video: string; poster: string; width: number; height: number; seconds: number; notebook: string; scores: Score[] };

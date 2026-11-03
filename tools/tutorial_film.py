@@ -9,7 +9,7 @@ notebook and the Dew commit it installed, and the scores its evaluation cell pri
 the notebook's own outputs. Nothing is typed by hand, so a re-run notebook gives a new manifest by
 running this again. A film or poster over its limit fails, writing nothing.
 
-    python tools/tutorial_film.py tutorials/13-camera-only-drone-racing.ipynb flydreamer
+    python tools/tutorial_film.py tutorials/14-camera-only-drone-racing.ipynb flydreamer
 
 needs imageio with its ffmpeg (imageio-ffmpeg) and Pillow.
 """
