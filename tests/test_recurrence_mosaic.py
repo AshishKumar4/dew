@@ -261,16 +261,30 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
 
 SHARDED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16')}
 """The interpreted forward's cases whose recorded sites declare 256 seeds on the CPU (`fla_sites`, sized by
-the gate's rule against fla's own spread): together 840 s a whole run, past a CI task's share, so their draws
-are sharded over map tasks (`check1_shards`); the others declare 128 and run whole."""
+the gate's rule against fla's own spread): a map task of 128 seeds of all three took 1045 to 1071 s on main's
+CI (Main, 2026-11-02), so each case is a check-1 site of its own, sharded over map tasks of 16
+(`check1_shards`)."""
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=128)
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, SHARDED_FORWARD))
-def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at the cases of 256 recorded seeds
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either forms
     (`SHARDED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+    the_mosaic_forward_is_as_exact_as_its_reference('one sequence', jnp.float32)
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length
+    (`SHARDED_FORWARD`)."""
+    the_mosaic_forward_is_as_exact_as_its_reference('a ragged length', jnp.bfloat16)
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents
+    (`SHARDED_FORWARD`)."""
+    the_mosaic_forward_is_as_exact_as_its_reference('packed documents', jnp.bfloat16)
 
 
 KEYED_FORWARD = {('a decay a key dimension', 'bf16'), ('a decay a key dimension, packed', 'bf16')}
