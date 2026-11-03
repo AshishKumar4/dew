@@ -134,7 +134,9 @@ def rounding_scale(fn, *args, seed: int = 0):
             jax.default_matmul_precision("highest"):
         leaves = [jnp.asarray(_widened(leaf)) for leaf in jax.tree.leaves(args)]
         consts = [_widened(value) for value in closed.consts]
-        key = jax.random.key(seed)
+        # The taps draw their bits by XLA's RngBitGenerator, each rounding's key folded by threefry (`rbg`):
+        # a program's every rounding drawing by threefry alone compiled for minutes.
+        key = jax.random.key(seed, impl="rbg")
         if _static(closed.jaxpr):
             signature = (jax.tree.structure(args), tuple((np.shape(leaf), jnp.result_type(leaf),
                                                           getattr(jax.typeof(leaf), "weak_type", False))
