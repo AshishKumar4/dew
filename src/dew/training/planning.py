@@ -862,13 +862,18 @@ class FitSearch[LossT, EffectsT]:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
             # the need the compile found, which a sourced rule is to reach.
             footprint = candidate.footprint
+            # The derived temporaries are what admission judges (`derived_headroom`): the gradient's peak,
+            # or the staged commit's fields beside the gradients where they hold more.
             _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
-                         "compile %s with %s, its temporaries %s bytes against a derived peak of %s "
-                         "(derived terms %s); the compile decides, and the derivation is to fix",
+                         "compile %s with %s, its temporaries %s bytes against derived temporaries of %s "
+                         "(its peak %s, its staged commit %s; derived terms %s); the compile decides, and "
+                         "the derivation is to fix",
                          probe.named(), "fits" if foreseen >= 0 else "does not fit", foreseen,
                          "" if footprint is None or footprint.exact else " (its peak a bound from below)",
                          "fits" if fit else "does not fit", headroom, probe.temp,
+                         None if footprint is None else footprint.temporaries,
                          None if footprint is None else footprint.peak,
+                         None if footprint is None else footprint.staged,
                          None if probe.derived is None else probe.derived.record())
         return options, candidate, executable, probe
 

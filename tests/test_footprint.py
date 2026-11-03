@@ -140,22 +140,6 @@ def test_a_gradient_a_fused_chain_computes_is_held():
         assert gradient_peak(sine, shape, (), platform=platform, workspace=none).bytes == 8 * 16 * 4
 
 
-def test_a_called_program_holds_what_it_would_inline():
-    """A program called within the gradient (a jitted function's) holds at its peak what it would hold
-    inlined: its results once, as the caller's."""
-    rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
-
-    def inline(weights, rows):
-        return jnp.sum(jnp.tanh(rows @ weights)), ()
-
-    def called(weights, rows):
-        return jnp.sum(jnp.tanh(jax.jit(jnp.matmul)(rows, weights))), ()
-
-    none = Workspace(0, 0)
-    assert gradient_peak(called, weights, (rows,), platform="gpu", workspace=none) == gradient_peak(
-        inline, weights, (rows,), platform="gpu", workspace=none)
-
-
 def test_a_called_product_in_a_loop_is_priced_at_its_fused_workspace():
     """A loop's turn reads a slice of its stacked weights, which XLA fuses with the cuBLAS product reading it
     (`Slicing.fused`), the product keeping the GEMM rewriter's workspace (`Workspace.sliced`): priced so

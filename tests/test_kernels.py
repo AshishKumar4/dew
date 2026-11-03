@@ -532,6 +532,88 @@ def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
+MAPPED_FLASH_SEEDS = 32
+"""The mapped flash call's declared draws (check 1), dense and packed alike."""
+
+MAPPED_DOCUMENTS = (40, 1, 0, 55)
+"""The packed mapped call's documents' lengths, one empty and one a single token."""
+
+
+def _mapped(attend, packed: bool, rowwise: bool = False):
+    """`attend` (the flash module, or "truth" for the float64 oracle) over three rows, mapped by `jax.vmap`
+    as a model whose rows step their own weights maps its decoder (dew.objectives.lm.stacking), or with
+    `rowwise` called a row at a time and stacked: each row's output and its query, key and value gradients
+    under its cotangent. Packed, the oracle reads each document alone (`exact_attention` anchored)."""
+    starts = np.concatenate([[0], np.cumsum(MAPPED_DOCUMENTS)]).astype(np.int32)
+    documents = [slice(begin, end) for begin, end in itertools.pairwise(starts) if end > begin]
+
+    def truth(q, k, v):
+        if not packed:
+            return exact_attention(q, k, v, keep=kept(q.shape[1], k.shape[1], causal=True), anchored=True)
+        return jnp.concatenate([exact_attention(q[None, at], k[None, at], v[None, at], anchored=True,
+                                                keep=kept(*(at.stop - at.start,) * 2, causal=True))[0]
+                                for at in documents])
+
+    def flash(q, k, v):
+        if not packed:
+            return attend.flash_mha(q, k, v, is_causal=True)
+        return attend.flash_mha_varlen(q, k, v, starts, max(MAPPED_DOCUMENTS), is_causal=True)
+
+    row = with_gradients(truth if attend == "truth" else flash)
+    if rowwise:
+        return jax.jit(lambda *rows: jax.tree.map(lambda *each: jnp.stack(each),
+                                                  *(row(*(x[at] for x in rows)) for at in range(3))))
+    return jax.jit(jax.vmap(row))
+
+
+def _mapped_draw(packed: bool, batch: int = 2, length: int = 128, heads: tuple[int, int] = (4, 2)):
+    """A seed's bf16 queries `[3, ..., H, 64]`, keys and values of their own heads (`heads`) and the
+    output's cotangent, three mapped rows: of a batch of `batch` rows of `length` tokens, or of the packed
+    documents' 96 (`MAPPED_DOCUMENTS`)."""
+    rows = (3, sum(MAPPED_DOCUMENTS)) if packed else (3, batch, length)
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.PRNGKey(seed), 4)
+        return tuple(jax.random.normal(stream, (*rows, count, 64), jnp.float32).astype(jnp.bfloat16)
+                     for stream, count in zip(streams, (heads[0], heads[1], heads[1], heads[0]), strict=True))
+
+    return draw
+
+
+def a_mapped_flash_call_is_each_rows_own(without_deterministic_ops):
+    """Under `jax.vmap` the flash kernel's dense and packed calls fold the mapped axis into their own and run
+    once, a group of them the kernel's grid holds a call: each mapped row's output and query, key and value
+    gradients on par with the same row's own call (check 1, both from the float64 oracle mapped alike,
+    rows sized by their float64 terms). The fold is the claim; the kernel's exactness against the xla
+    kernel is its other cells'."""
+    flash = flash_here()
+    # Three mapped calls of 32,768 rows fold one a call, the kernel's 65,535 rows holding no two.
+    for packed, draw, label in ((False, _mapped_draw(packed=False), "dense"),
+                                (True, _mapped_draw(packed=True), "packed"),
+                                (False, _mapped_draw(packed=False, batch=32_768, length=1, heads=(1, 1)),
+                                 "dense past the kernel's grid")):
+        assert_as_exact(_mapped(flash, packed), _mapped(flash, packed, rowwise=True), draw,
+                        f"the mapped flash call, {label}", seeds=MAPPED_FLASH_SEEDS,
+                        truth_fn=_mapped("truth", packed), terms=True)
+
+
+def a_fold_holds_the_kernels_grid_and_its_offsets(without_deterministic_ops):
+    """The mapped calls a kernel call folds (`dew_flash_attn._mapped_groups`): as many as keep its rows
+    within the 65,535 its grid holds and a packed fold's tokens within its int32 offsets, at least one:
+    eight calls of 1,000 rows at once, three of 32,768 one a call, four packed of 2^30 tokens one a call,
+    and two of 70,000 rows one a call. A map over no call, dense or packed, launches none: its output and
+    its query, key and value gradients are empty along the mapped axis, each of one call's shape."""
+    flash = flash_here()
+    assert flash._mapped_groups(8, 1_000) == [(0, 8)]
+    assert flash._mapped_groups(3, 32_768) == [(0, 1), (1, 2), (2, 3)]
+    assert flash._mapped_groups(4, 2, 2 ** 30) == [(0, 1), (1, 2), (2, 3), (3, 4)]
+    assert flash._mapped_groups(2, 70_000) == [(0, 1), (1, 2)]
+    for packed in (False, True):
+        rows = _mapped_draw(packed)(0)
+        empty = _mapped(flash, packed)(*(x[:0] for x in rows))
+        assert [x.shape for x in empty] == [(0, *x.shape[1:]) for x in (rows[0], *rows[:3])]
+
+
 def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
     """A bidirectional window over more keys than queries (256 queries over 512 keys, 32 each side)
     keeps the keys `structural_mask` centres on each query's row, Dew's contract, whichever kernel

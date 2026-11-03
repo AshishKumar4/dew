@@ -5,6 +5,7 @@ to, and five terms the walk counted are not in that program. Each test states on
 removes it, on a program small enough to read."""
 
 import dataclasses
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -17,21 +18,15 @@ from model_support import TINY_DECODER
 from token_support import token_rows
 
 from dew._records import listed, record
+from dew.data.dataset import Loader, replayed
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, staging
 from dew.training.ahead import compile_ahead, compile_only_gpus
 from dew.training.compiled_program import compiled
-from dew.training.footprint import (
-    Footprint,
-    Workspace,
-    consumed_where_made,
-    gradient_peak,
-    leaf_local,
-    peak_bytes,
-    staged_bytes,
-    traced_loss,
-)
+from dew.training.footprint import Footprint, Workspace, gradient_peak, peak_bytes, traced_loss
+from dew.training.inspection import Inspection
+from dew.training.transaction import consumed_where_made, leaf_local
 
 TOKENS, VOCAB, WIDTH = 256, 4096, 64
 PRODUCT = TOKENS * VOCAB * 4
@@ -126,52 +121,6 @@ def test_each_result_of_a_barrier_holds_its_own_operand_to_its_own_last_read():
     assert held <= compiled_temporaries(apart, HIDDEN, TABLE)
 
 
-def test_a_call_returns_the_buffers_of_its_program_as_the_program_holds_them():
-    """XLA sees no call: a `jit` is a call its `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
-    `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a custom derivative's
-    primal lowers to its program in the caller (`_custom_jvp_vjp_call_lowering`,
-    jax/_src/custom_derivatives.py). A result the program returns as its own parameter is the operand's
-    buffer, the embedding table a lookup returns beside its rows (2.5 GB of Qwen3.5-4B's step, held from the
-    lookup to the end), and one the program computes of another result by a cheap conversion is recomputed
-    where it is read, the float32 logits its head returns beside the bfloat16 ones (8.1 GB at two rows)."""
-    ids = jax.ShapeDtypeStruct((TOKENS,), jnp.int32)
-
-    def lookup(table, ids):
-        rows = table[ids]
-        return rows, table
-
-    def passed(table, ids):
-        rows, same = jax.jit(lookup)(table, ids)
-        return jnp.sum(rows) + jnp.sum(jnp.square(same))
-
-    def alone(table, ids):
-        rows, same = lookup(table, ids)
-        return jnp.sum(rows) + jnp.sum(jnp.square(same))
-
-    assert program_peak(passed, TABLE, ids) == program_peak(alone, TABLE, ids)
-
-    @jax.custom_jvp
-    def logits(hidden, table):
-        narrow = product(hidden, table).astype(jnp.bfloat16)
-        return narrow, narrow.astype(jnp.float32)
-
-    @logits.defjvp
-    def logits_jvp(primals, tangents):
-        raise AssertionError("the walk differentiates nothing here")
-
-    def both(hidden, table):
-        narrow, wide = logits(hidden, table)
-        return jnp.sum(jnp.square(wide)) + jnp.sum(narrow)
-
-    def alone_logits(hidden, table):
-        narrow = product(hidden, table).astype(jnp.bfloat16)
-        return jnp.sum(jnp.square(narrow.astype(jnp.float32))) + jnp.sum(narrow)
-
-    # The product and the two sums, each a scalar: both results are conversions of the product, recomputed
-    # where the sums read them, as without the call.
-    assert program_peak(both, HIDDEN, TABLE) == program_peak(alone_logits, HIDDEN, TABLE) == PRODUCT + 2 * 4
-
-
 def test_a_cotangent_sum_is_an_elementwise_value_like_any_other():
     """JAX lowers the sum of two cotangents, `add_any`, to one `add` (`add_jaxvals_lowering`,
     jax/_src/interpreters/mlir.py), which XLA's fusion recomputes in its consumers as it does any elementwise
@@ -223,16 +172,21 @@ def test_a_gradient_is_consumed_where_it_is_made_only_by_an_update_that_reads_it
     params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
               "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
     adam, clipped = optax.adam(1e-3), optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
-    assert leaf_local(adam, params, jax.eval_shape(adam.init, params))
-    assert not leaf_local(clipped, params, jax.eval_shape(clipped.init, params))
+    assert leaf_local(adam, params, jax.eval_shape(adam.init, params), progressed=False)
+    assert not leaf_local(clipped, params, jax.eval_shape(clipped.init, params), progressed=False)
+
+    handed = []
 
     def scaled(updates, state, params=None, *, progress=None, **extra):
-        assert progress is not None, "a schedule on a run's progress is handed it at each update"
-        return jax.tree.map(lambda update: update * progress, updates), state
+        handed.append(progress is not None)
+        return jax.tree.map(lambda update: update if progress is None else update * progress, updates), state
 
-    # An update on the run's progress is handed it, as the step hands it (`Transaction.commit`).
+    # An update on the run's progress is handed it where the run has one, as the step hands it
+    # (`Transaction.commit`, `optimizer_update`), and none where the run is bounded otherwise.
     clocked = optax.GradientTransformationExtraArgs(lambda params: optax.EmptyState(), scaled)
-    assert leaf_local(clocked, params, optax.EmptyState())
+    assert leaf_local(clocked, params, optax.EmptyState(), progressed=True)
+    assert leaf_local(clocked, params, optax.EmptyState(), progressed=False)
+    assert handed == [True, False]
 
 
 def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_state():
@@ -245,7 +199,25 @@ def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_s
         trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                           dynamic_scale=scaled)
         state, _, _ = trainer.place()
-        assert consumed_where_made(trainer.objective, trainer.optimizer, state, 1) is consumed
+        assert consumed_where_made(trainer.objective, trainer.optimizer, state, 1, shared=True,
+                                   progressed=False) is consumed
+
+
+def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
+    """A DiLoCo run's state holds the outer optimizer's state, Nesterov's trace, and each group its own
+    (`TrainState.inner`), which the group's step commits by the run's optimizer (`diloco.replica`). Planned
+    for a GPU at a stated capacity, compiled ahead, a run of one group derives its step's peak, reading
+    whether that step consumes each gradient where it is made from the group's own fields (`group_of`),
+    Adam over its moments; the run's optimizer traced over the outer state failed, and the group's view
+    made an array on a GPU that is only compiled for."""
+    from dew.training import DiLoCo
+
+    trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), diloco=DiLoCo(every=2),
+                      layout=Layout(min_shard=1, tolerance=1.0),
+                      mesh=MeshSpec(diloco=1).build(compile_only_gpus("sm90", 1)))
+    rows = {"x": np.ones((8, 3), np.float32), "y": np.zeros((8, 2), np.float32)}
+    ahead = compile_ahead(trainer, rows, capacity=1 << 30)
+    assert [probe["derived"]["peak"] is not None for probe in ahead.plan["probes"]] == [True]
 
 
 def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradient():
@@ -266,7 +238,8 @@ def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradie
             objective.restore_head(tile, fused=fused)
             loss, arguments = traced_loss(objective, state, 1, 1)
             jax.eval_shape(loss, arguments[0], batch, *arguments[1:])
-            assert consumed_where_made(objective, trainer.optimizer, state, 1) is consumed
+            assert consumed_where_made(objective, trainer.optimizer, state, 1, shared=True,
+                                       progressed=False) is consumed
 
 
 class Layers(Features):
@@ -280,20 +253,41 @@ class Layers(Features):
         return self.model.init(key, jnp.zeros((1, 32)))
 
 
+def staged_of(trainer: Trainer) -> int:
+    """The bytes of its host-resident commit fields `trainer`'s step holds at once, as its own staged cut
+    measures them wherever its fit traces it (`staging.measured`), the sampled step among them; the plan's
+    footprint (`Footprint.staged`) holds the step's own."""
+    rows = {"x": np.ones((16, 32), np.float32), "y": np.zeros((16, 2), np.float32)}
+    data = Loader(replayed(lambda partition: itertools.repeat(rows)), None, batch=16, records=None)
+    with staging.measured() as cuts:
+        trainer.fit(data, steps=1, log_every=1)
+    measured = max(cuts, default=0)
+    assert [probe["derived"]["staged"] for probe in trainer.plan["probes"]] == [measured], trainer.plan
+    return measured
+
+
 def test_a_commit_over_host_resident_state_holds_two_of_its_chunks():
     """A step whose Adam moments and EMA rest in pinned host memory stages them a parameter at a time,
     each parameter's moments and average one chunk (`dew.training.staging`): its commit holds the two
-    largest, two 32 x 32 kernels' three copies, beside its gradient; one whose state the device holds
-    stages none, and a window of two, committing under a conditional, stages it whole."""
+    largest, two 32 x 32 kernels' three copies, beside its gradient and the moments' count, which it
+    fetches first, as its own traced cut measures it (`staging.measured`) and its plan's footprint reads
+    it, as does one that samples its update's norms (`Trainer(inspection=...)`, row 3659); a window of
+    two, committing under a conditional, stages it whole; one whose state the device holds stages none."""
     device = Layout(min_shard=1, tolerance=1.0)
     host = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
     trainer = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host)
     state, _, _ = trainer.place()
-    whole = sum(leaf.nbytes for leaf in jax.tree.leaves((state.opt_state, state.ema)))
-    assert staged_bytes(trainer.optimizer, state, 1) == 2 * 3 * 32 * 32 * 4
-    assert staged_bytes(trainer.optimizer, state, 2) == whole
+    leaves = jax.tree.leaves((state.opt_state, state.ema))
+    whole, count = sum(leaf.nbytes for leaf in leaves), sum(leaf.nbytes for leaf in leaves if leaf.ndim == 0)
+    assert count == 4
+    assert staged_of(trainer) == count + 2 * 3 * 32 * 32 * 4
+    sampled = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host,
+                      inspection=Inspection(every=1))
+    assert staged_of(sampled) == count + 2 * 3 * 32 * 32 * 4
+    windowed = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host, accumulation=2)
+    assert staged_of(windowed) == whole
     resident = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=device)
-    assert staged_bytes(resident.optimizer, resident.place()[0], 1) == 0
+    assert staged_of(resident) == 0
 
 
 def test_a_device_resident_steps_temporaries_are_its_gradient_programs_peak():

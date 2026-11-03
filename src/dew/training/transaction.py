@@ -59,10 +59,12 @@ from dew.objectives.base import (
 )
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
+from dew.training.compiled_program import gradients_read
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
+from dew.training.memory import head_fused_of, head_tile_of
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.staging import staged
+from dew.training.staging import fetched, in_device, staged
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -243,6 +245,75 @@ COMMIT_FIELDS = ("opt_state", "ema")
 the EMA but where the objective reads it in its forward (`Transaction.fetch`)."""
 
 
+def optimizer_update(optimizer: optax.GradientTransformation, gradient, opt_state, params, *, qk=None,
+                     statistics=None, progress=None) -> tuple:
+    """`optimizer`'s update of `gradient` from `opt_state` over `params`, called as a step's commit calls
+    it (`Transaction.commit`) and as the planner traces it (`leaf_local`): an update taking extra arguments
+    is handed the attention logits' maxima (`qk`), the run's `progress` where it has one (a run bounded in
+    examples), and its loss's `statistics` only where it solves the update's system
+    (`dew.gauss_newton`)."""
+    if not isinstance(optimizer, optax.GradientTransformationExtraArgs):
+        return optimizer.update(gradient, opt_state, params)
+    clocked = {} if progress is None else {"progress": progress}
+    solved = {"statistics": statistics} if solves_equations(opt_state) else {}
+    return optimizer.update(gradient, opt_state, params, qk_stats=qk, **solved, **clocked)
+
+
+def leaf_local(optimizer: optax.GradientTransformation, gradients, state, *, progressed: bool) -> bool:
+    """Whether `optimizer`'s update of `gradients` from `state`, over parameters of their shapes, reads each
+    leaf of `gradients` into results that read no other gradient's leaf: no reduction, product or
+    concatenation across them. Traced as the commit calls it (`optimizer_update`), handed no statistics of
+    attention logits and, `progressed`, the run's progress; one solving its objective's system
+    (`dew.gauss_newton.solves_equations`) reads every leaf into each result. An equation running a program
+    of its own (a call, a loop) is read as reading every operand into each result."""
+    if solves_equations(state):
+        return False
+
+    def update(gradients, state, params, progress):
+        return optimizer_update(optimizer, gradients, state, params,
+                                progress=progress if progressed else None)
+
+    program = jax.make_jaxpr(update)(gradients, state, gradients, jax.ShapeDtypeStruct((), np.float32)).jaxpr
+    leaves = len(jax.tree.leaves(gradients))
+    read = [frozenset([index]) if index < leaves else frozenset() for index in range(len(program.invars))]
+    return all(len(leaves_read) <= 1 for leaves_read in gradients_read(program, read))
+
+
+def pooled_by_mean(stats_shape) -> bool:
+    """Whether a window pools its microbatches' statistics `stats_shape` as a mean, a `Ratio`'s or a
+    scalar's (`Transaction.shared`), summing their gradients as it goes; any other it replays."""
+    return isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
+
+
+def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                          optimizer: optax.GradientTransformation, state: TrainState,
+                                          window: int, *, shared: bool, progressed: bool) -> bool:
+    """Whether the step reads each gradient where it is made into the buffers its state donates, so it
+    holds none beside another (`footprint.gradient_peak`'s `consumed`): with the state it commits
+    (`COMMIT_FIELDS`) in device memory, a window of several microbatches that pools them by mean (`shared`,
+    `pooled_by_mean`) sums each into its accumulator's gradient leaf in device memory, where one that
+    replays them keeps their gradients for the replay; and a window of one updates each by `optimizer`,
+    where its update reads each gradient into its own leaf's results alone (`leaf_local`, `progressed` the
+    run handing it its progress). A dynamically scaled loss commits only once every gradient is known
+    finite, a committed state fetched from the host is fetched behind one barrier over every gradient
+    (`Transaction.past`), and an update that reads them together (clipping by the global norm) holds them
+    all until it has read the last. A head that takes its gradient in the backward a tile at a time
+    (`head_tile`, unfused) has XLA hold the layers' gradients to the step's end: Qwen3.5-4B's step at 2 x
+    2048 tokens under 'minimal', compiled for an H100 at 59.4 GiB, ran every layer's weight gradient and
+    update after the whole backward, 20.1 GB of temporaries against the 10.3 derived, where the whole
+    logits' step ran them beside the backward; on an H100 itself the 13 layers its backward reached last
+    waited (row 3653)."""
+    if head_tile_of(objective) is not None and not head_fused_of(objective):
+        return False
+    if state.scale is not None or not in_device([getattr(state, field) for field in COMMIT_FIELDS]):
+        return False
+    if window > 1:
+        return shared and state.accumulation is not None and in_device(state.accumulation.gradient)
+    params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                     (state.variables["params"], state.opt_state))
+    return leaf_local(optimizer, params, opt_state, progressed=progressed)
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -376,15 +447,16 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
-_GROUPS: contextvars.ContextVar[tuple[int, jax.Array] | None] = contextvars.ContextVar("example_groups",
-                                                                                      default=None)
+_GROUPS: contextvars.ContextVar[tuple[int, int | jax.Array] | None] = contextvars.ContextVar(
+    "example_groups", default=None)
 
 
 @contextlib.contextmanager
-def example_groups(groups: int, group: jax.Array) -> Iterator[None]:
+def example_groups(groups: int, group: int | jax.Array) -> Iterator[None]:
     """Within the block, a step's microbatch is group `group`'s share of `groups` equal ones (DiLoCo's,
     `dew.training.diloco`): its examples are placed and counted among the whole step's (`example_fields`),
-    each group's rows the `group`th share of them, as one run of every row places them."""
+    each group's rows the `group`th share of them, as one run of every row places them. `group` is the
+    traced axis index within a step, and a host integer where a plan reads one group's shapes."""
     token = _GROUPS.set((groups, group))
     try:
         yield
@@ -511,17 +583,15 @@ class Transaction:
         self.size = accumulation
         self.split = split
         stats_shape, self.aux_shape = shapes
-        self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
+        self.shared = pooled_by_mean(stats_shape)
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
     def fetched(self, state: TrainState) -> TrainState:
         """`state` with its host-resident fields (`resting`) brought to the device whole, for an EMA the
         objective reads in its forward."""
-        return dataclasses.replace(state, **{
-            field: jax.device_put(getattr(state, field), jax.tree.map(lambda s: s.with_memory_kind("device"),
-                                                                      placement))
-            for field, placement in self.resting.items()})
+        return dataclasses.replace(state, **{field: fetched(getattr(state, field), placement)
+                                             for field, placement in self.resting.items()})
 
     def past(self, finish: Callable, state: TrainState, gradient, *arguments) -> tuple:
         """`finish(state, *arguments)`, the step's commit and what follows it, its host-resident fields
@@ -753,14 +823,9 @@ class Transaction:
             # The update applies to the parameters the model's constraint projects
             # (`Objective.projected`), and the step stores them projected again.
             stored = self.objective.projected(current.variables["params"], updated=False)
-            if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                clocked = {} if self.bound is None else {"progress": self.progress(current)}
-                # Only an optimizer that solves the update's system reads its statistics (`dew.gauss_newton`).
-                solved = {"statistics": statistics} if solves_equations(current.opt_state) else {}
-                update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk,
-                                                          **solved, **clocked)
-            else:
-                update, opt_state = self.optimizer.update(native, current.opt_state, stored)
+            update, opt_state = optimizer_update(
+                self.optimizer, native, current.opt_state, stored, qk=qk, statistics=statistics,
+                progress=None if self.bound is None else self.progress(current))
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
