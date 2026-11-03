@@ -2107,6 +2107,28 @@ def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
                                                              np.asarray([1.0]))]) == []
 
 
+@pytest.mark.parametrize("size", [1, 63, 64, 65, 3000, (1 << 16) + 70])
+def test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding(size):
+    """`truth_sketch` is within `sketch_rounding` of its definition's exact value, each entry times its
+    seed's SKETCH signs (bit k of its word, +1 where set) and every product summed exactly: the most a
+    block summed in any order may round by, which the gate allows each of two sketches (`_summarized`).
+    Over magnitudes across 60 decades, signed zeros and float64 subnormals, at sizes off and on a block's
+    edge and past a host chunk, where the blocks round (tests/test_truth_sketch.py holds the definition
+    bit for bit where they do not)."""
+    import math
+
+    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+
+    rng = np.random.default_rng(size)
+    values = rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size)
+    values[::7] = -0.0
+    values[1::11] = 2.0 ** -1060
+    signs = ((_sign_bits(size, 3)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
+    exact = np.asarray([math.fsum(column) for column in (values[:, None] * signs).T.tolist()])
+    allowed = sketch_rounding(math.fsum(np.abs(values).tolist()))
+    assert np.all(np.abs(truth_sketch(values, 3) - exact) <= allowed)
+
+
 def _bits(value):
     """`value` held to its bits: an array's or a float's dtype, shape and bytes (a NaN's and a zero's sign
     included), a summary's field by field, a tuple's item by item."""

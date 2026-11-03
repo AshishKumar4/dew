@@ -17,8 +17,9 @@ DRAWN = {
 bits of one scale (float16's every value, its subnormals among them), so each block's 64 signed entries
 sum exactly in float64 in any order: the sketch is then its exact sum, whatever order a host takes a block
 in, and any other sign, block or padding is seen bit for bit. Its rounding where a block does not sum
-exactly is `test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or_empty_truth_apart`'s
-(tests/test_reference_error.py)."""
+exactly is held within `sketch_rounding` by tests/test_reference_error.py
+(`test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding`), where the gate's own comparisons
+are."""
 
 
 @pytest.mark.parametrize("dtype", DRAWN)
