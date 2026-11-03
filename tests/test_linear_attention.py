@@ -42,7 +42,7 @@ from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence as kernel, tuning
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
@@ -446,7 +446,8 @@ def test_the_layer_matches_qwen3_5_gated_delta_net(reference, geometry):
     the projections and the norm."""
     module = layer(geometry)
     variables = layer_params(reference)
-    template = jax.eval_shape(module.init, jax.random.key(0), jnp.zeros((1, 4, geometry["hidden_size"])))
+    sample = jnp.zeros((1, 4, geometry["hidden_size"]))
+    template = nn.unbox(jax.eval_shape(module.init, jax.random.key(0), sample))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
 
     out = module.apply(variables, jnp.asarray(reference["layer.hidden"]))
@@ -848,6 +849,74 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
                           seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
+KEYED = kernel.Hooks(decay='vector')
+RATED = kernel.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+"""The decode step's hooks beside the gated delta net's: Kimi delta attention's decay a key dimension
+(`linear.KEY_STEP`) and Mamba-2's rated scan with its skip (`mamba2.SSD`)."""
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
+@pytest.mark.parametrize("form", ["a decay a key dimension", "a rated decay"])
+def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form, axis, split):
+    """One decode token of Kimi delta attention's decay a key dimension, or of Mamba-2's rated scan with
+    its skip (its queries and keys a group's, its rate and skip a head's), through the step kernel per
+    shard (`linear.stepped_per_shard`, which `kda.py` and `mamba2.py` decode through) over rows split two
+    ways or heads split two ways, idle rows among the drawing ones: its output and state within the float64
+    gate of one device's, from the portable step's in float64 (`recurrence.step_reference`), no operand or
+    state moved between devices (`sharded.assert_runs_per_shard`). Off a GPU the kernel interprets."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    from dew.nn.linear import stepped_per_shard
+
+    rows, heads, groups, width = 4, 4, 2, 32
+    keyed = form == "a decay a key dimension"
+    hooks = KEYED if keyed else RATED
+    active = jnp.asarray([True, False, True, False])
+
+    def draw(seed):
+        rng = np.random.default_rng(3 + seed)
+        reads = heads if keyed else groups
+        unit = [rng.normal(size=(rows, reads, width)) for _ in range(2)]
+        query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+        value = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.float32)
+        beta = jnp.asarray(rng.random((rows, heads)), jnp.float32)
+        state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, jnp.float32)
+        if keyed:
+            decay = jnp.asarray(-rng.random((rows, heads, width)) * 3, jnp.float32)
+            return query, key, value, decay, beta, state, active
+        rate = jnp.asarray(-rng.random(heads) * 3, jnp.float32)
+        skip = jnp.asarray(rng.normal(size=heads), jnp.float32)
+        return query, key, value, rate, beta, state, active, skip
+
+    def stepped(query, key, value, decay_or_rate, beta, state, active, skip=None):
+        if keyed:
+            return stepped_per_shard(hooks, state, query, key, value, decay_or_rate, beta, active)
+        return stepped_per_shard(hooks, state, query, key, value, None, beta, active, rate=decay_or_rate,
+                                 skip=skip)
+
+    def exact(query, key, value, decay_or_rate, beta, state, active, skip=None):
+        with jax.enable_x64(new_val=True):
+            given = {"log_decay": decay_or_rate} if keyed else {"rate": decay_or_rate, "skip": skip}
+            out, _, final = kernel.step_reference(hooks, kernel.Step(
+                jnp.asarray(state, jnp.float64), query=query, key=key, value=value, beta=beta, active=active,
+                **given), dtype=jnp.float64)
+            return np.asarray(out), np.asarray(final)
+
+    def spec(rank: int, at: int):
+        return PartitionSpec(*(axis if dim == at else None for dim in range(rank)))
+
+    # A row-shaped operand split on its rows or its heads; a head's rate and skip on the heads alone.
+    at = {0: 0, 2: 1}[split]
+    per_head = spec(1, 0 if split == 2 else None)
+    specs = [spec(3, at)] * 3 + [spec(3, at) if keyed else per_head, spec(2, at), spec(4, at),
+                                 spec(1, 0 if split == 0 else None), *([] if keyed else [per_head])]
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    assert_runs_per_shard(stepped, draw, specs, mesh, f"{form} decode split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
+
+
 def fused_case(heads, width, rows, dtype, held, seed: int = 0):
     """A gated delta net of `heads` value heads over half as many key heads, `width` wide, and its
     cache after a 5-token prefill of `rows` rows in `dtype` with its recurrent state `held`, and the
@@ -856,7 +925,7 @@ def fused_case(heads, width, rows, dtype, held, seed: int = 0):
     layer = GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
                           head_v_dim=width, dtype=dtype)
     hidden = jax.random.normal(jax.random.key(7 + 2 * seed), (rows, 6, 64), jnp.float32).astype(dtype)
-    variables = layer.init(jax.random.key(8 + 2 * seed), hidden[:, :1])
+    variables = nn.unbox(layer.init(jax.random.key(8 + 2 * seed), hidden[:, :1]))
     variables = {**variables, "params": {**variables["params"], "A_log": jnp.linspace(-1.0, 1.0, heads),
                                          "dt_bias": jnp.linspace(0.5, 1.5, heads)}}
     step = MixerCall(decode=True)
@@ -966,9 +1035,9 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=jnp.bfloat16)
     x = jnp.zeros((2, 1, 64), jnp.bfloat16)
-    unfused = jax.eval_shape(lambda: module.init(jax.random.key(0), x, MixerCall(decode=True)))
+    unfused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
     with assumed("sm80"), chosen(delta_decode="fused"):
-        fused = jax.eval_shape(lambda: module.init(jax.random.key(0), x, MixerCall(decode=True)))
+        fused = jax.eval_shape(lambda: nn.unbox(module.init(jax.random.key(0), x, MixerCall(decode=True))))
     def described(tree):
         return jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), tree)
 

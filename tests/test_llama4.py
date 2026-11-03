@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import fixture_arrays
 from model_support import as_stepped
 from reference_error import assert_as_exact
@@ -85,7 +86,8 @@ def test_decode_matches_prefill_on_both_rules():
         variables = attention_variables(tensors)
         whole = jnp.asarray(module.apply(variables, hidden))
         # The first decode call allocates the cache without writing it.
-        state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **variables}
+        cache = nn.unbox(module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)))
+        state = {**cache, **variables}
         steps = []
         for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, 12)]:
             step, mutated = module.apply(state, hidden[:, start:stop], MixerCall(decode=True),
@@ -111,7 +113,8 @@ def test_a_left_padded_row_scores_its_tokens_as_the_row_alone_cached_or_not():
         variables = attention_variables(tensors)
         alone = np.asarray(module.apply(variables, real))
         uncached = module.apply(variables, padded, MixerCall(metadata))
-        state = {**module.init(jax.random.key(0), padded[:, :1], MixerCall(decode=True)), **variables}
+        cache = nn.unbox(module.init(jax.random.key(0), padded[:, :1], MixerCall(decode=True)))
+        state = {**cache, **variables}
         cached, _ = module.apply(state, padded, MixerCall(metadata, decode=True), mutable=["cache"])
         for got in (uncached, cached):
             assert float(np.max(np.abs(np.asarray(got)[:, 3:] - alone))) < 1e-5, settings
@@ -128,7 +131,7 @@ def test_the_temperature_reads_logical_positions_through_a_cache():
     module = attention(use_rope=False)
     variables = attention_variables(tensors)
     uncached = np.asarray(module.apply(variables, hidden, MixerCall(metadata)))
-    state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **variables}
+    state = {**nn.unbox(module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True))), **variables}
     cached, _ = module.apply(state, hidden, MixerCall(metadata, decode=True), mutable=["cache"])
     assert float(np.max(np.abs(np.asarray(cached) - uncached))) < 1e-5
 
@@ -200,7 +203,7 @@ def drawn_layer(module, stream: int):
     `stream`, and the layer's own weights initialized at `seed`."""
     def draw(seed):
         rows = np.random.default_rng([stream, seed]).standard_normal((2, TUNED_LENGTH, HIDDEN))
-        params = module.init(jax.random.key(seed), jnp.zeros((1, TUNED_LENGTH, HIDDEN)))
+        params = nn.unbox(module.init(jax.random.key(seed), jnp.zeros((1, TUNED_LENGTH, HIDDEN))))
         return rows.astype(np.float32), jax.tree.map(np.asarray, params)
     return draw
 
@@ -261,7 +264,7 @@ def test_a_windowed_kind_tunes_its_temperature_as_written():
 
     @jax.jit
     def cached(hidden, params):
-        state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **params}
+        state = {**nn.unbox(module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True))), **params}
         steps = []
         for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, length)]:
             step, mutated = module.apply(state, hidden[:, start:stop], MixerCall(decode=True),

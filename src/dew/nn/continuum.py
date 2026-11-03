@@ -35,7 +35,6 @@ from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import NormBounds
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import logical_axes
 from dew.quantization import InputQuantizer, LinearProducts, intercepted_nonlinear, rounding_growth
 
 if TYPE_CHECKING:
@@ -59,10 +58,6 @@ class ContinuumLevel:
         activation(self.activation)
 
 
-@logical_axes({
-    ("continuum", "down"): ("embed", "mlp"),
-    ("continuum", "up"): ("mlp", "embed"),
-})
 class Continuum(LinearProducts):
     """The level `ContinuumLevel` describes over `[..., features]` states: `x + up(act(down(x)))`,
     `up` zero at its start."""
@@ -77,7 +72,8 @@ class Continuum(LinearProducts):
         # the feed-forward's `up_proj`, named `down` here, and its output `down_proj`, named `up`.
         self.mlp = GatedMLP(self.level.hidden, self.features, activation(self.level.activation),
                             output_init_std=0.0, linear=Dense, names=("down", "up"), dtype=self.dtype,
-                            precision=self.precision)
+                            precision=self.precision,
+                            named_axes=(("down", ("embed", "mlp")), ("up", ("mlp", "embed"))))
         nn.share_scope(self, self.mlp)
 
     def __call__(self, x: jax.Array) -> jax.Array:

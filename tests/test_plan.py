@@ -42,7 +42,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.state import TrainState, apart
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
 from dew.training.memory import (

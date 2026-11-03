@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from generation_support import INTERPRETS
 from model_support import TINY_DECODER
 from reference_error import assert_as_exact
 
@@ -274,6 +275,57 @@ class Writer(nn.Module):
                 store.write(key, value, positions)
         self.variable("cache", "written", lambda: True)
         return store.read()
+
+
+class Decoder(nn.Module):
+    """One attention module's paged store of `capacity` slots a row: its keys and values written at their
+    slots, then one query a row decoded over the first `lengths` slots of that row (`KVStore.decode`)."""
+
+    layout: KVCache
+    capacity: int
+
+    @nn.compact
+    def __call__(self, key, value, positions, query, lengths):
+        rows, _, heads, width = key.shape
+        store = KVStore.open(self, self.layout, rows, self.capacity, heads, width, key.dtype)
+        if not self.has_variable("cache", "written"):
+            self.variable("cache", "written", lambda: True)
+            return None
+        store.write(key, value, positions)
+        return store.decode(query, lengths, None)
+
+
+@INTERPRETS
+def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
+    """A bf16 pool split between two groups of rows (`KVCache.groups`), which the GPU's Pallas paged kernel
+    turns down, decoded on an H100 by the attention template's decode over the pages (`PAGED`'s template
+    kernel), each row through its own group's part of the pool (`KVStore._absolute`): on par with the
+    reference path over the rows written dense (check 1)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template
+
+    rows, capacity, kv_heads, width = 4, 128, 2, 64
+    lengths = jnp.asarray([128, 70, 9, 101], jnp.int32)
+    decoder = Decoder(KVCache(page_size=64, groups=2), capacity)
+    positions = jnp.broadcast_to(jnp.arange(capacity), (rows, capacity))
+
+    def ours(key, value, query):
+        with generation.assumed("sm90"):
+            cache = decoder.init(jax.random.key(0), key, value, positions, query, lengths)["cache"]
+            return decoder.apply({"cache": cache}, key, value, positions, query, lengths,
+                                 mutable=["cache"])[0]
+
+    def reference(key, value, query):
+        spans = template.spans(1, capacity, rows, lengths=lengths)
+        return template.reference(query[:, None], key, value, spans)[:, 0]
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[:2])
+        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "grouped pool's template decode", seeds=8)
 
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])

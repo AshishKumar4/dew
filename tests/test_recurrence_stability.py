@@ -33,7 +33,6 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
-from whole_suite import timed
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -80,9 +79,14 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
         # The log decay is `rate * dt`: dt the target over each head's rate.
         return dataclasses.replace(operands, beta=target / operands.rate)
     if hooks.gates is not None:
-        # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero.
-        positive = jnp.maximum(-target, 1e-30)
-        gate = jnp.where(positive > 20.0, positive, jnp.log(jnp.expm1(positive)))
+        # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero. Each branch takes
+        # the inputs it selects alone, so an unselected one's derivative (expm1 past fp32's range, a log near
+        # zero's square) never multiplies the zero that unselects it into NaN.
+        live = -target > 1e-30
+        positive = jnp.where(live, -target, 1.0)
+        large = positive > 20.0
+        formed = jnp.where(large, positive, jnp.log(jnp.expm1(jnp.where(large, 1.0, positive))))
+        gate = jnp.where(live, formed, np.log(np.expm1(1e-30)))
         return dataclasses.replace(operands, gate=gate, log_a=jnp.zeros_like(operands.log_a),
                                    bias=jnp.zeros_like(operands.bias))
     shape = operands.log_decay.shape
@@ -363,15 +367,29 @@ TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
                    for name, regime in ACCELERATED]
 
 
-PAST_TARGET = {"gradient": {('rated', 'a fading memory'): 246}}
-"""The gradient's cases whose draws take a group past its two minutes (seconds, train 270's CI on
-66a222273, ledger 2125), which the whole suite runs (`timed`)."""
+LONG_GRADIENT = [('rated', 'a fading memory')]
+"""The gradient's cases past two minutes in one process (246 s, train 270's CI on 66a222273, ledger 2125),
+their check 1's 256 draws run as armada's map tasks and a judge (`check1_shards`), each within two minutes."""
 
 
-@pytest.mark.parametrize('name, regime', timed(PAST_TARGET, "gradient", CASES + TPU_ACCELERATED))
+@pytest.mark.parametrize('name, regime', [case for case in CASES + TPU_ACCELERATED
+                                          if tuple(case.values) not in LONG_GRADIENT])
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
+    _gradient_holds_check_1(name, regime)
+
+
+@pytest.mark.parametrize('name, regime', LONG_GRADIENT)
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_the_chunked_ops_gradient_at_a_long_regime_is_as_exact_as_the_recurrences(name, regime):
+    """`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences` at its long cases (`LONG_GRADIENT`),
+    their draws in map tasks of 64."""
+    _gradient_holds_check_1(name, regime)
+
+
+def _gradient_holds_check_1(name, regime):
+    """A case's gradient check (`test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences`)."""
     hooks = SITES[name]
     assert_finite_and_on_par(
         with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK), regime)),

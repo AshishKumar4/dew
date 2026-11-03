@@ -27,6 +27,7 @@ import selection_margins
 from architecture_cases import CASES, IDS, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, TEXT_VOCAB, VOCAB, Case
 from diffusion_stubs import StubText
 from diffusion_support import images_of
+from flax import linen as nn
 from jepa_cases import MASK
 from map_judge import drawing
 from recording import RecordingTracker
@@ -43,6 +44,7 @@ from dew.diffusion import presets
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention_blocks import Stage
+from dew.nn.sharding import boxed_axes
 from dew.nn.text_checkpoints import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective
@@ -260,20 +262,21 @@ def clears(case: Case, raw, initial, stepped) -> bool:
             and selection_margin(case, stepped(raw), raw["text"]) > selection_margins.MARGIN)
 
 
-def reordered(state, order):
+def reordered(state, order, axes):
     """`state` with its residual stream's units in `order` (`tests/residual_orders.permuted`), its
-    variables and EMA alike: the same function in other coordinates, every contraction inside the
-    model summed in another order. Its momentum starts at zero, which no order moves. An empty
-    `order` is a model with no residual stream to permute, and leaves `state` as it is."""
+    variables and EMA alike, their axes the run's `axes` (`Objective.parameter_axes`): the same function
+    in other coordinates, every contraction inside the model summed in another order. Its momentum
+    starts at zero, which no order moves. An empty `order` is a model with no residual stream to permute,
+    and leaves `state` as it is."""
     if not len(order):
         return state
     assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(state.opt_state)
                if jnp.issubdtype(leaf.dtype, jnp.floating))
-    ema = None if state.ema is None else permuted(state.ema, order)
-    return state.replace(variables=permuted(state.variables, order), ema=ema)
+    ema = None if state.ema is None else permuted(state.ema, order, axes)
+    return state.replace(variables=permuted(state.variables, order, axes), ema=ema)
 
 
-def in_identity_order(stepped: dict, order):
+def in_identity_order(stepped: dict, order, axes):
     """A drawn step's variables, optimizer state and EMA (`drawn_steps`) with the residual stream's
     units taken back out of `order`: each tree that mirrors the parameters (the parameters, the EMA's,
     the optimizer's momentum) permuted by its inverse, so that every order of one draw is judged against
@@ -287,8 +290,8 @@ def in_identity_order(stepped: dict, order):
     def mirrors(node) -> bool:
         return jax.tree.structure(node) == params
 
-    return jax.tree.map(lambda node: permuted({"params": node}, inverse)["params"] if mirrors(node) else node,
-                        stepped, is_leaf=mirrors)
+    return jax.tree.map(lambda node: permuted({"params": node}, inverse, axes)["params"] if mirrors(node)
+                        else node, stepped, is_leaf=mirrors)
 
 
 ORBIT = 4
@@ -331,7 +334,8 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
             trainer, _ = make_trainer(case, directory, mesh, RecordingTracker(), devices)
             built.append(trainer)
         trainer = built[0]
-        start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
+        axes = trainer.objective.parameter_axes
+        start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order, axes)
         # A copy each draw, as each step donates the state it is handed, held as the trainer holds it:
         # a pipelined run stacked by stage (`Trainer.staged`).
         state = trainer.staged(start)
@@ -343,7 +347,8 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
             state, *_ = built[1](state, batch)
         saved = trainer.stored(state)
         return in_identity_order(
-            jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")}), order)
+            jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")}), order,
+            axes)
 
     return stepped
 
@@ -360,17 +365,18 @@ def test_a_residual_order_is_the_same_decoder(case):
     other."""
     model = models.build(case.architecture, **case.config)
     ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
-    initial = jax.jit(model.init)(jax.random.key(0), ids)
+    drawn = jax.jit(model.init)(jax.random.key(0), ids)
+    axes, initial = boxed_axes(drawn), nn.unbox(drawn)
     rng = np.random.default_rng(4)
     variables = jax.tree.map(lambda leaf: leaf + rng.normal(0, 0.1, leaf.shape).astype(leaf.dtype)
                              if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, initial)
-    width = residual_width(variables)
+    width = residual_width(variables, axes)
     with jax.enable_x64(new_val=True):
         wide = widened(variables)
         identity = np.asarray(model.clone(dtype=jnp.float64).apply(wide, ids))
         for seed in (1, 2):
             order = np.random.default_rng([0x0BB17, seed]).permutation(width)
-            reordered = model.clone(dtype=jnp.float64).apply(permuted(wide, order), ids)
+            reordered = model.clone(dtype=jnp.float64).apply(permuted(wide, order, axes), ids)
             roundings = chain_roundings(jax.make_jaxpr(
                 lambda variables: model.clone(dtype=jnp.float64).apply(variables, ids))(wide))
             assert_computes_the_oracle(np.asarray(reordered), identity, f"{case.name} order {seed}",
@@ -480,7 +486,7 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
-    width = residual_width(initial.variables) if case.is_lm else 0
+    width = residual_width(initial.variables, trainer.objective.parameter_axes) if case.is_lm else 0
     one_step = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, 1)
 
     def keyed(key):

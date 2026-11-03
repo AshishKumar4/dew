@@ -42,7 +42,7 @@ from .scan_orders import (
     unscanned,
     zigzag_indices,
 )
-from .sharding import RESIDUAL, constrain, logical_axes
+from .sharding import RESIDUAL, LogicalAxes, constrain, declared
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
 
 # The rotary base every model here rotates with, RoFormer's.
@@ -122,6 +122,11 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
     return (unit * (num_layers // len(unit) + 1))[:num_layers]
 
 
+PATCH_AXES: LogicalAxes = (None, None, None, "embed")
+"""A patch embedding's convolution's logical axes, its taps and channels unnamed, its output the
+embedding's; its bias the embedding's."""
+
+
 class PatchEmbedding(nn.Module):
     """Non-overlapping `patch_size` patches through one convolution, as a
     row-major token sequence `[B, H_P * W_P, embedding_dim]`.
@@ -160,7 +165,9 @@ class PatchEmbedding(nn.Module):
                  strides=(self.patch_size, self.patch_size),
                  use_bias=self.bottleneck is None,
                  dtype=self.dtype,
-                 precision=self.precision)(x)
+                 precision=self.precision,
+                 kernel_init=declared(nn.initializers.lecun_normal(), PATCH_AXES),
+                 bias_init=declared(nn.initializers.zeros_init(), PATCH_AXES[-1:]))(x)
         if self.bottleneck is not None:
             x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
                       dot_general=float32_dot_general)(x)
@@ -169,7 +176,6 @@ class PatchEmbedding(nn.Module):
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
 
 
-@logical_axes({("ada_proj",): ("embed", "modulation")})
 class AdaLNParams(nn.Module):
     """The six adaLN-Zero modulation vectors of one block, `[B, 1, 6 * features]`,
     from the conditioning vector.
@@ -190,10 +196,9 @@ class AdaLNParams(nn.Module):
         if conditioning.ndim == 2:
             conditioning = jnp.expand_dims(conditioning, axis=1)
         return modulation(conditioning, self.features, 6, name="ada_proj", silu=self.silu, zero_init=True,
-                          dtype=self.dtype, precision=self.precision)
+                          dtype=self.dtype, precision=self.precision, kernel_axes=("embed", "modulation"))
 
 
-@logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
     """Patchify through `PatchEmbedding`, gather the tokens into
     raster/hilbert/zigzag order (`scan_ordered`) and add the 2D sincos signal.
@@ -233,7 +238,6 @@ class PatchSequenceEmbed(nn.Module):
         return tokens, inv_idx
 
 
-@logical_axes({("time_embed", "layers_2"): ("mlp", "embed")})
 class ConditioningEmbed(nn.Module):
     """Fourier time embedding + the text projection mean-pooled over the real
     tokens, summed into the single conditioning vector the adaLN modulation
@@ -270,7 +274,7 @@ class ConditioningEmbed(nn.Module):
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
                 Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
-                      dot_general=float32_dot_general),
+                      dot_general=float32_dot_general, kernel_axes=("mlp", "embed")),
             ], name=name)
 
         if self.interval:
@@ -297,8 +301,6 @@ class ConditioningEmbed(nn.Module):
         return cond_emb
 
 
-@logical_axes({("final_ada_proj",): ("embed", "modulation"),
-               ("final_proj",): ("embed", "output")})
 class PatchSequenceOutput(nn.Module):
     """Final norm + zero-init fp32 head + unpatchify for any scan order and
     any (non-square included) patch grid."""
@@ -328,7 +330,8 @@ class PatchSequenceOutput(nn.Module):
             if conditioning.ndim == 2:
                 conditioning = jnp.expand_dims(conditioning, axis=1)
             projected = modulation(conditioning, features, 2, name="final_ada_proj", zero_init=True,
-                                   dtype=self.dtype, precision=self.precision)
+                                   dtype=self.dtype, precision=self.precision,
+                                   kernel_axes=("embed", "modulation"))
             shift, scale = jnp.split(projected, 2, axis=-1)
             x_out = x_out * (1 + scale) + shift
 
@@ -340,6 +343,7 @@ class PatchSequenceOutput(nn.Module):
             # are fp32 while the operands stay in the compute dtype.
             dot_general=fp32_result_dot_general(self.precision),
             kernel_init=nn.initializers.zeros,
+            kernel_axes=("embed", "output"),
             name="final_proj",
         )(x_out)
 

@@ -29,7 +29,7 @@ from jax.typing import DTypeLike
 
 from dew import _records
 from dew._model_types import QWEN35_TYPES
-from dew.batch import Variables
+from dew.batch import Variables, unboxed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
 from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
@@ -76,6 +76,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     DtypeName,
@@ -113,7 +114,8 @@ class Placing(Protocol):
     a leaf at a time, by the layout as `model`, where it places its own tree, refines it
     (`RefinesLayout`); as they are where the load places nothing."""
 
-    def __call__(self, variables: Variables, model: RefinesLayout | None = None) -> Variables: ...
+    def __call__(self, variables: Variables, model: RefinesLayout | None = None,
+                 axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
 
 
 
@@ -520,7 +522,8 @@ class Pretrained:
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
-            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
+            sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
+            selected, fallback,
             modeling_overrides)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
@@ -603,8 +606,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the blocks leave the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the blocks leave the program, so the source's own draws are dead code to XLA; they
+            # join the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: path[0] == "params" and crossing(path))
 
         blocks = owned_program(drawn)(request_key(key))
@@ -638,8 +642,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the extension leaves the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the extension leaves the program, so the source's own draws are dead code to XLA; it
+            # joins the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
                           or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 
@@ -680,9 +685,10 @@ class Pretrained:
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        # A stage-local fit's store is read by its layers' names (`stored_layers`).
-        values = unpacked(self.model, stored_layers(self.model, self.variables if variables is None
-                                                    else variables))
+        # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
+        # fit's store is read by its layers' names (`stored_layers`).
+        values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
+                                                                        else variables)))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -1080,8 +1086,13 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "
                          "fills it places it, so pass no mesh or layout")
 
-    def placed(variables: Variables, model: RefinesLayout | None = None) -> Variables:
-        return place(variables, mesh, _refined(layout, model)) if streaming else variables
+    def placed(variables: Variables, model: RefinesLayout | None = None,
+               axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables:
+        if not streaming:
+            return variables
+        # A loaded tree is plain: the axes it is placed by are its model's draw's (`axes`).
+        with boxed({**current_boxes(), **(axes or {})}):
+            return place(variables, mesh, _refined(layout, model))
 
     return streaming, placed
 
@@ -1183,7 +1194,21 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text, stored=stored))
-    return replace(loaded, variables=placed(loaded.variables), revision=commit)
+    # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables; one
+    # loaded without its text encoder encodes nothing to draw its denoiser over, and is placed by shapes.
+    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming and text else {})}):
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+
+
+def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a loaded pipeline's parameters are drawn in: its denoiser's draw over its encoders'
+    parameters' shapes, and each encoder's own table (`DiffusionObjective.denoiser_axes`, `tower_axes`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    objective = DiffusionObjective(loaded)
+    encoders = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                            loaded.variables["encoders"])
+    return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
 
 
 def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
@@ -1278,7 +1303,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     the loader resolved, the identity a run records to reload the processor
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
-    files from its directory and keeps the wrapper's translated `record`.
+    files from its directory and keeps the wrapper's translated `record`, and runs
+    the source's own processor code where the load ran its code
+    (`SourceReference.remote_code`).
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -1307,6 +1334,9 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     the native component's config, as it does for the initial load.
     """
     directory = source.metadata()
+    if source.remote_code:
+        # The source's own modules beside its files, as its load ran them (`sources.remote_code`).
+        sources.remote_code(source.name, sources.snapshot(source.name, source.revision, weights=False))
     description = _composite_description(directory)
     component = None if description is None else description.backbone
     if component is None:
@@ -1463,14 +1493,29 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
+def _processor_code(directory: Path) -> Mapping[str, object]:
+    """The `auto_map` entries a source's processor files name its own code by (LFM3-VL's processor and
+    its image and video processors, each file's own and its components'), the files `Processor` saves
+    beside a bundle (`Processor.save_pretrained`) and its tokenizer's."""
+    named: dict[str, object] = {}
+    for path in sorted({*directory.glob("*processor*.json"), *directory.glob("tokenizer_config.json")}):
+        record = json.loads(path.read_text())
+        for section in (record, *(value for value in record.values() if isinstance(value, Mapping))):
+            if isinstance(section.get("auto_map"), Mapping):
+                named.update(section["auto_map"])
+    return named
+
+
 def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
                reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
-    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
-    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
-    source, beside the config the load read (`reference`, its component folder), at the metadata
-    snapshot's commit (`root`), never run."""
-    auto_map = config.get("auto_map")
-    if not isinstance(auto_map, Mapping):
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config or its
+    processor's files name it (`auto_map`, `_processor_code`): in the snapshot a verification from parts
+    ran it from, or, of a natively mapped source, beside the config the load read (`reference`, its
+    component folder), at the metadata snapshot's commit (`root`), never run."""
+    model_code = config.get("auto_map")
+    auto_map = {**_processor_code(reference.directory(root)),
+                **(model_code if isinstance(model_code, Mapping) else {})}
+    if not auto_map:
         return None
     if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
         return decoder_parts.SourceCode(remote, None, auto_map)
@@ -1683,7 +1728,8 @@ def source_route(config: Mapping[str, object], *,
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
     or an unregistered model_type no registered family's convention computes and tier 3 does not run
-    (`torchax_fallback.admitted`; tier 3 reads float weights only).
+    (`torchax_fallback.admitted`; tier 3 reads float weights only), or whose shrunken probe cannot run
+    and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
@@ -1693,7 +1739,15 @@ def source_route(config: Mapping[str, object], *,
     decoder_parts.refuse_drafter(config)
     if (route := _native_route(config)) is not None:
         return route
-    match verified(config) if remote is None else verified(config, remote=remote, pinned=pinned):
+    try:
+        verdict = verified(config) if remote is None else verified(config, remote=remote, pinned=pinned)
+    except verify.ProbeUnavailable as unavailable:
+        # No shrunken model runs: tier 3 qualifies the source on its full config, no weights read.
+        from dew.interop import torchax_fallback
+
+        torchax_fallback.refuse_quantized(config)
+        return TorchRoute(torchax_fallback.qualified(config, unavailable))
+    match verdict:
         case verify.VerifiedMapping() as mapping:
             return VerifiedRoute(mapping)
         case verify.Unmapped() as unmapped:
@@ -1999,10 +2053,23 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             params = materialize(params)
         variables = {"params": params}
     if backbone is None:
+        # A readout released alone reads no backbone to draw it over: placed by its shapes alone.
         return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed(variables), directory,
+    return description.bundle(backbone, head, placed(variables, axes=head_axes(head, backbone)), directory,
                               description.tokenizer_folder, **description.fields)
+
+
+def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
+    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
+    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
+    from dew.decision.head import Head
+    from dew.decision.model import DecisionModel
+
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
+    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
+                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
 
 
 def _native_config(config: Mapping[str, object],
@@ -2268,7 +2335,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        return kind(model, placed(variables), processor, config, directory, built, generation_config,
+        return kind(model, placed(variables, axes=decoder_parts.decoder_axes(model)), processor, config,
+                    directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.

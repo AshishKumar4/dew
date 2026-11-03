@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 import torch
+from flax import linen as nn
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
@@ -85,8 +86,8 @@ SEEDS = {"block float32": 512, "block bfloat16": 512, "base": 16, "decode": 16, 
 @functools.cache
 def block_shapes():
     """The block's parameters' shapes, traced once for every draw."""
-    return jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
-                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+    return nn.unbox(jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
+                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32))))["params"]
 
 
 def block_draw(seed, dtype=np.float32):
@@ -213,7 +214,7 @@ def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query
 def model_draw(model: CausalTransformer, *, gated: bool = True):
     """Check 1's draw for `model`: a seed's variables, their gates drawn away from zero where
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     cross = model.cross_attention
     assert cross is not None
@@ -373,7 +374,7 @@ def test_a_decoder_refuses_what_its_blocks_cannot_read():
         with pytest.raises(ValueError):
             CrossAttention(**{"layer_ids": (0,), "context_length": 4, **fields})
     with pytest.raises(ValueError):
-        MODEL.clone(cross_attention=CrossAttention((3,), 4)).init(jax.random.key(0), ids)
+        nn.unbox(MODEL.clone(cross_attention=CrossAttention((3,), 4)).init(jax.random.key(0), ids))
 
 
 def test_cross_flops_count_the_blocks_over_the_context():
@@ -492,7 +493,7 @@ def served_task() -> TextGeneration:
     """model_support's one-layer decoder with a block before its layer, its gates drawn away from
     zero, as a greedy task."""
     model = decoder().clone(max_seq_len=128, cross_attention=SERVED)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     params = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.full_like(leaf, 0.8) if path[-1].key.startswith("alpha_") else leaf, params)
     return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0,
@@ -554,7 +555,7 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
             server.submit(dataclasses.replace(wide, conditioning={
                 CONTEXT: jnp.zeros((1, 2, 6)), CONTEXT_LENGTHS: jnp.asarray([length], jnp.int32)}), 2, key=0)
     model = decoder().clone(max_seq_len=128)
-    plain = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+    plain = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                            RunProcessor(Digits()), sampling=Sampling(temperature=0))
     with pytest.raises(ValueError):
         Server.from_task(plain, slots=2, capacity=128).submit(request(0), 2, key=0)
@@ -748,7 +749,7 @@ def test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pas
     variables = jax.tree_util.tree_map_with_path(
         lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)
                             if path[-1].key.startswith("alpha_") else leaf),
-        model.init(jax.random.key(0), ids))
+        nn.unbox(model.init(jax.random.key(0), ids)))
     table = jnp.asarray(variables["params"]["embed_tokens"]["embedding"])
     encoded = encode_context(model, variables, tokens, lengths, encoder="table")
     assert encoded[CONTEXT].dtype == jnp.bfloat16 and model.context_dtype == jnp.float32
@@ -807,3 +808,18 @@ def test_a_tokens_context_is_present_where_its_document_holds_keys_whatever_thei
     held = holds_keys(CrossDocuments(jnp.asarray(queries), jnp.asarray(keys)))
     np.testing.assert_array_equal(np.asarray(held), member & (queries > 0))
     assert member.any() and not member.all()
+
+
+def test_a_cross_attention_blocks_norms_gate_as_its_layer_routes():
+    """A decoder whose layers gate a norm on their routed layers alone (`NormSpec.gated_layers='routed'`,
+    A.X-K2's feed-forward norm) builds each cross-attention block's norm of that name as its layer routes
+    (ledger 3631): gated in the block of a routed layer, plain in a dense layer's, where the block's norms
+    were refused as norms outside the layers."""
+    from dew.nn.backbones.decoder_block import Mixture, NormSpec
+
+    model = MODEL.clone(mixture=Mixture(experts=4, top_k=2, layers=(2,), expert_features=8),
+                        norms={"post_attention_layernorm": NormSpec(gate_rank=2, gated_layers="routed")})
+    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    gated = {name.split(".")[1] for name in flat_tree(variables)
+             if ".cross_attention.post_attention_layernorm.mlp." in name}
+    assert gated == {"layers_2"}

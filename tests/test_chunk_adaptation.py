@@ -17,6 +17,7 @@ import optax
 import pytest
 from affine_run import Replaying, dataset
 from check1_statistics import GateFailure, Inconclusive
+from flax import linen as nn
 from reference_error import MOST_SEEDS, assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
@@ -122,7 +123,7 @@ def site(dew, reference, drawn, rate: float, scale: float, window: int, label: s
 def variable_shapes(model: CausalTransformer):
     """`model`'s variables' shapes, traced once a model: a site's every draw reads them
     (`drawn_variables`)."""
-    return jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+    return jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32))))
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
@@ -1269,7 +1270,7 @@ def test_a_level_at_its_start_is_the_identity():
     the level standing before it."""
     plain = decoder(None)
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH)), jnp.int32)
-    variables = MODEL.init(jax.random.key(3), tokens)
+    variables = nn.unbox(MODEL.init(jax.random.key(3), tokens))
     without = {**variables, "params": {name: part for name, part in variables["params"].items()
                                        if name != "continuum"}}
     np.testing.assert_array_equal(np.asarray(MODEL.apply(variables, tokens)),
@@ -1351,7 +1352,7 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     trainer(tmp_path / "halves").fit(dataset(_replayed), steps=2, log_every=1, checkpoint_every=2)
     resumed = trainer(tmp_path / "halves").fit(dataset(_replayed), steps=4, log_every=1,
                                                checkpoint_every=2)
-    start = objective.init(jax.random.key(0))["params"]["continuum"]
+    start = nn.unbox(objective.init(jax.random.key(0)))["params"]["continuum"]
     assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),
                               np.asarray(start["up"]["kernel"]))
     for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
@@ -1396,7 +1397,7 @@ def test_what_the_adaptation_cannot_serve_is_refused():
         LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(),
                     samples=Samples(prompt=[1, 2], max_new_tokens=2))
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(select=("sideways",)))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     with pytest.raises(ValueError):
         objective.token_scores(variables, jnp.zeros((1, LENGTH + 1), jnp.int32))
     adapted = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation())
@@ -1411,12 +1412,12 @@ def test_what_the_adaptation_cannot_serve_is_refused():
     for parts, refused in ((("down",), True), (("up",), False)):
         objective = LMObjective(relu, LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
         tokens = jnp.zeros((1, LENGTH + 1), jnp.int32)
+        variables = nn.unbox(objective.init(jax.random.key(0)))
         if refused:
             with pytest.raises(ValueError):
-                objective.token_scores(objective.init(jax.random.key(0)), tokens)
+                objective.token_scores(variables, tokens)
         else:
-            assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
-                                                                        tokens).losses)))
+            assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
     with pytest.raises(ValueError):
         decoder(ngpt=NGPT(std=0.02, alpha=0.05))
 
@@ -1472,7 +1473,7 @@ def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
     straight-through gradient."""
     build, parts, refused = ROUNDED[case]
     objective = LMObjective(build(), LENGTH, adaptation=ChunkAdaptation(select=parts, damped=True))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     # A checkpoint's quantizer reads the scale its variables hold, positive.
     variables = _scaled(variables) if case.startswith("checkpoint") else variables
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
@@ -1495,7 +1496,7 @@ def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refu
                                frozen_fp8=("continuum/up",), measured_on="sm90")
     objective = LMObjective(record.apply(decoder()), LENGTH,
                             adaptation=ChunkAdaptation(select=("down",), damped=True))
-    variables = _scaled(objective.init(jax.random.key(0)))
+    variables = _scaled(nn.unbox(objective.init(jax.random.key(0))))
     codes = traverse_util.flatten_dict(record.packed(variables["params"]))
     params = {path: leaf for path, leaf in traverse_util.flatten_dict(variables["params"]).items()
               if path != ("continuum", "up", "kernel")}
@@ -1579,7 +1580,7 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
     objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)
     assert objective.adaptation == adaptation
     tokens = np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)
-    assert np.all(np.isfinite(np.asarray(objective.token_scores(objective.init(jax.random.key(0)),
+    assert np.all(np.isfinite(np.asarray(objective.token_scores(nn.unbox(objective.init(jax.random.key(0))),
                                                                 tokens).losses)))
 
 

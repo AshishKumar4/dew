@@ -153,7 +153,7 @@ def test_the_estimate_is_the_gradient_in_expectation(layers):
     model, sample, names = SITES[layers]
     objective = Forward(model(), squared, inputs=InputSpec(Field("x", sample)), draws=64)
     plain = Supervised(model(), squared, inputs=InputSpec(Field("x", sample)))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {name: jnp.asarray(value) for name, value in rows(sample).items()}
     estimates = estimated(objective, variables, batch)
     truth = gradient(plain, variables, batch, jax.random.key(0))
@@ -198,7 +198,7 @@ def test_a_language_models_estimate_is_its_configured_objectives():
     rejected in some coordinate of the head."""
     model = TokenLocal()
     objective = ForwardLM(model, seq_len=6, z_loss=0.5, pad_id=0, draws=64, sigma=0.05)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = text()
     estimates = estimated(objective, variables, batch)
     truth = gradient(LMObjective(model, seq_len=6, z_loss=0.5, pad_id=0), variables, batch, jax.random.key(0))
@@ -239,7 +239,7 @@ def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(kind):
     expectation too."""
     model, embedding = tied(kind)
     objective = ForwardLM(model, seq_len=6, draws=4, weight_draws=64, weight_sigma=0.01)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {"text": jnp.asarray(np.random.default_rng(3).integers(2, 7, (8, 7)), jnp.int32)}
     estimates = estimated(objective, variables, batch)
     truth = gradient(LMObjective(model, seq_len=6), variables, batch, jax.random.key(0))
@@ -267,7 +267,7 @@ class TwoTermFit(Objective[TwoTerms]):
         self.model = self.bind_model(Linear())
 
     def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.zeros((1, 3)))
+        return nn.unbox(self.model.init(key, jnp.zeros((1, 3))))
 
     def loss(self, variables, batch, step):
         outputs = self.model.apply(variables, batch["x"])
@@ -289,7 +289,7 @@ def test_statistics_that_are_a_tuple_without_aux_are_estimated_whole():
     whole: over 256 steps' keys the estimates of its two dense layers and its scale are `jax.grad`'s of
     its reduction of both in expectation (the t-test rejects in no coordinate)."""
     objective = ForwardTwoTerms(draws=64)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
     estimates = estimated(objective, variables, batch)
     truth = gradient(TwoTermFit(), variables, batch, jax.random.key(0))
@@ -312,7 +312,7 @@ def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
                                   "qk_rope_head_dim": 8, "v_head_dim": 8, "index_topk": None,
                                   "index_n_heads": 2, "index_head_dim": 16}})
     objective = ForwardLM(model, 16, indexer=IndexerTraining("warmup"), draws=2)
-    start = objective.init(jax.random.key(0))
+    start = nn.unbox(objective.init(jax.random.key(0)))
     tokens = np.random.default_rng(0).integers(0, 64, (8, 17)).astype(np.int32)
     estimate = jax.jit(lambda key: gradient(objective, start, {"text": jnp.asarray(tokens)}, key))(
         jax.random.key(1))
@@ -341,7 +341,7 @@ def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagatio
                               mixture={"experts": 4, "top_k": 2, "bias": True})
     objective = ForwardLM(model, seq_len=8, balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001),
                           draws=2)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {"text": jnp.asarray(np.random.default_rng(5).integers(1, 32, (8, 9)), jnp.int32)}
     estimate = jax.jit(lambda key: gradient(objective, variables, batch, key))(jax.random.key(1))
     assert jax.tree.structure(estimate) == jax.tree.structure(variables["params"])
@@ -359,7 +359,7 @@ def test_a_rematerialized_decoder_is_estimated_as_its_unrolled_twin():
         model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
                                   mlp_features=32, max_seq_len=8, dtype="float32", remat=remat)
         objective = ForwardLM(model, seq_len=6, draws=2)
-        variables = objective.init(jax.random.key(0))
+        variables = nn.unbox(objective.init(jax.random.key(0)))
         return jax.jit(lambda key: gradient(objective, variables, text(), key))(jax.random.key(1))
 
     for full, unrolled in zip(jax.tree.leaves(estimate(REMAT_POLICIES["full"])),
@@ -394,7 +394,7 @@ def test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does(
     reduction, so the two estimates are on par, the split's from the whole's float64 estimate of the same
     jitters (check 1). Drawn by the attempt's key, the halves would jitter otherwise."""
     objective = Forward(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=16)
-    params = objective.init(jax.random.key(0))["params"]
+    params = nn.unbox(objective.init(jax.random.key(0)))["params"]
 
     def draw(seed):
         batch = rows((3,), seed, count=8)
@@ -433,7 +433,7 @@ def test_a_run_trains_without_differentiating_its_model():
         Trainer(Supervised(refusing, squared, inputs=inputs), optax.sgd(0.01), key=0, layout=LAYOUT).fit(
             batches, steps=1)
     objective = Forward(refusing, squared, inputs=inputs)
-    start = objective.init(jax.random.key(0))
+    start = nn.unbox(objective.init(jax.random.key(0)))
     state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=40)
     for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
         assert not np.array_equal(np.asarray(moved), np.asarray(held))
@@ -458,7 +458,7 @@ def test_the_estimate_runs_the_model_at_the_progress_its_loss_read():
     (ledger 2477): a model the progress scales to zero at a run's first step is estimated zero there and
     not at its third, and a run trains it, every step's derivative at its own step's progress."""
     objective = Forward(Progressing(), squared, inputs=InputSpec(Field("x", (3,))))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
 
     def estimate(updates: int) -> list[jax.Array]:
@@ -531,7 +531,7 @@ def test_a_model_that_maps_its_layers_is_refused():
     """A Dense under `nn.vmap` is called inside the map, where a capture outside cannot read it: the
     estimate is refused, naming the unrolled model it needs."""
     objective = Forward(Mapped(), squared, inputs=InputSpec(Field("x", (3,))))
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
     with pytest.raises(ValueError):
         gradient(objective, variables, batch, jax.random.key(0))
@@ -544,7 +544,8 @@ def test_the_estimates_forward_derivative_is_its_reverse_estimate_transposed():
     with jax.enable_x64(new_val=True):
         objective = Forward(Linear(dtype=jnp.float64), lambda outputs, batch: jnp.sum(
             jnp.square(outputs - batch["y"]), -1), inputs=InputSpec(Field("x", (3,))), draws=4)
-        variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), objective.init(jax.random.key(0)))
+        drawn = nn.unbox(objective.init(jax.random.key(0)))
+        variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), drawn)
         batch = {name: jnp.asarray(value, jnp.float64) for name, value in rows((3,)).items()}
         loss = parameter_loss(objective, variables, batch, Step(jnp.asarray(0), jax.random.key(1), None))
         forward = jax.tree.leaves(jax.jacfwd(loss)(variables["params"]))
@@ -563,7 +564,7 @@ def test_a_node_perturbation_estimate_refuses_to_summarize_cotangents():
     from dew.training.transaction import probed_loss
 
     objective = Forward(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=4)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     step = Step(jnp.asarray(0), jax.random.key(1), None, watched=Watched(("Dense",), cotangents=True))
     with pytest.raises(ValueError):
         probed_loss(objective, variables, rows((3,)), step)

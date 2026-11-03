@@ -1,6 +1,6 @@
 """Float-range and nested-derivative contracts of the norms' and precision's seams: the exact GELU, the
-precision seams and default-precision calls, the fused norms and products (ledger 2641; the harness is
-tests/contract_support.py)."""
+precision seams and default-precision calls, the fused norms and products, and the declared derivative
+(`dew.nn.derivatives.surrogate`; ledger 2641; the harness is tests/contract_support.py)."""
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +64,48 @@ def test_the_precision_seams_hold_every_order(edge):
 def plain_rms(x, epsilon: float = 1e-6):
     """x over its root mean square, the RMS norm as written."""
     return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_surrogate_holds_every_order(edge):
+    """`dew.nn.derivatives.surrogate` (a custom JVP: the value one function's, the derivative a declared
+    rule's): a cube rounded to bfloat16, differentiated as the cube's float32 derivative, every order finite
+    wherever float64 is a normal float32 and the plain formula is, its value the rounded cube's bit for bit
+    and its gradient the declared rule's, the same arithmetic, bit for bit; static arguments named out of
+    order reach the value in place and the rule in their positions' order; and a derivative of a
+    derivative meets the declared rule again: the straight-through rounding's (`precision.rounded_operand`)
+    forward derivative of the gradient of its square is twice the direction, unrounded, as the rule
+    declares at every order."""
+    from dew.nn.derivatives import surrogate
+
+    def rounded_cube(x, dtype):
+        return (x * x * x).astype(dtype).astype(x.dtype)
+
+    cube = surrogate(rounded_cube, lambda dtype, primals, tangents, value: 3 * primals[0] ** 2 * tangents[0],
+                     nondiff_argnums=(1,))
+    (x,) = normal_draw(3271, (5,), scale=EDGES[edge] ** (1 / 3))
+    (direction,) = normal_draw(3272, (5,), scale=EDGES[edge] ** (1 / 3))
+    (cotangent,) = normal_draw(3273, (5,))
+    np.testing.assert_array_equal(np.asarray(cube(x, jnp.bfloat16)),
+                                  np.asarray(rounded_cube(x, jnp.bfloat16)))
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: cube(x, jnp.bfloat16).sum())(x)),
+                                  np.asarray(3 * x**2))
+    assert_contract(lambda x: cube(x, jnp.bfloat16), (x,), (direction,), cotangent, f"a surrogate {edge}",
+                    truth_fn=lambda x: x * x * x, plain_fn=lambda x: x * x * x)
+
+    scaled = surrogate(lambda scale, x, dtype: rounded_cube(scale * x, dtype),
+                       lambda scale, dtype, primals, tangents, value: scale * tangents[0],
+                       nondiff_argnums=(2, 0))
+    value, moved = jax.jvp(lambda x: scaled(2.0, x, jnp.bfloat16), (x,), (direction,))
+    np.testing.assert_array_equal(np.asarray(value), np.asarray(rounded_cube(2.0 * x, jnp.bfloat16)))
+    np.testing.assert_array_equal(np.asarray(moved), np.asarray(2.0 * direction))
+
+    def square(x):
+        return jnp.sum(precision.rounded_operand(x, jnp.bfloat16) ** 2)
+
+    unrounded = jnp.full((5,), 1 + 2.0**-12, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(jax.jvp(jax.grad(square), (x,), (unrounded,))[1]),
+                                  np.asarray(2 * unrounded))
 
 
 @pytest.mark.parametrize("edge", EDGES)

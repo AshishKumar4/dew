@@ -426,3 +426,47 @@ def test_gemma4_clipping_matches_reference_forward_and_backward():
         linear.clone(use_clipped_linears=False).apply({"params": {"kernel": kernel}}, inputs)
     )
     assert np.max(np.abs(unclipped - value(kernel, inputs))) > 0.25
+
+
+def test_a_grid_convolution_convolves_each_frames_patch_grid_whatever_the_token_order():
+    """LFM3-VL's gated grid convolution (`GatedGridConv`) over a row of two 3 x 4 frames and padding after
+    them: each token's output is its frame's depthwise 3 x 3 convolution of B * x over the frame's grid,
+    zero past its edges (`jax.lax.conv_general_dilated` over the frame's raster grid), gated by C and
+    mapped back; the tokens shuffled give the same outputs shuffled. Every value is a small integer, so
+    each sum is exact in float32 whatever its order."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+    from dew.nn.mixers.short_conv import GatedGridConv
+
+    height, width, frames, padding, features = 3, 4, 2, 3, 4
+    rng = np.random.default_rng(0x2067)
+    length = frames * height * width + padding
+    x = rng.integers(-2, 3, (1, length, features)).astype(np.float32)
+    rows = np.concatenate([np.repeat(np.arange(height), width)] * frames + [np.zeros(padding, int)])
+    columns = np.concatenate([np.tile(np.arange(width), height)] * frames + [np.zeros(padding, int)])
+    segments = np.concatenate([np.full(height * width, frame + 1) for frame in range(frames)]
+                              + [np.zeros(padding, int)])
+    mixer = GatedGridConv(features)
+    params = jax.tree.map(lambda leaf: jnp.asarray(rng.integers(-2, 3, leaf.shape), jnp.float32),
+                          mixer.init(jax.random.key(0), jnp.asarray(x), MixerCall(AttentionMetadata(
+                              rotary_positions=jnp.zeros((1, length, 2), jnp.int32)))))
+
+    def mixed(order):
+        metadata = AttentionMetadata(
+            coordinates=coordinates(segments=jnp.asarray(segments[order][None], jnp.int32),
+                                    positions=jnp.arange(length)[None]),
+            rotary_positions=jnp.asarray(np.stack([rows[order], columns[order]], -1)[None], jnp.int32))
+        return np.asarray(mixer.apply(params, jnp.asarray(x[:, order]), MixerCall(metadata)))
+
+    weights = params["params"]
+    gate_in, gate_out, value = np.split(x @ np.asarray(weights["in_proj"]["kernel"]), 3, axis=-1)
+    grids = (gate_in * value)[0, :frames * height * width].reshape(frames, height, width, features)
+    convolved = np.asarray(jax.lax.conv_general_dilated(
+        jnp.asarray(grids), weights["spatial_conv"]["kernel"], (1, 1), ((1, 1), (1, 1)),
+        dimension_numbers=("NHWC", "HWIO", "NHWC"), feature_group_count=features))
+    expected = (gate_out[0, :frames * height * width] * convolved.reshape(-1, features)) @ np.asarray(
+        weights["out_proj"]["kernel"])
+    in_order = mixed(np.arange(length))
+    np.testing.assert_array_equal(in_order[0, :frames * height * width], expected)
+    shuffled = rng.permutation(length)
+    np.testing.assert_array_equal(mixed(shuffled), in_order[:, shuffled])

@@ -50,9 +50,10 @@ import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
 from dew.nn.kernels.options import owned_program, program
-from dew.nn.sharding import held_by_stage
+from dew.nn.sharding import abstract, held_by_stage
 from dew.optim import STACKED_STATES
 
 if TYPE_CHECKING:
@@ -143,7 +144,8 @@ class StageLocal:
         stages = mesh.shape.get(STAGE_AXIS, 1)
         if not local or stages == 1:
             return cls((), mesh)
-        shapes = jax.eval_shape(objective.initializer, jax.random.key(0))
+        # The draw's shapes, its tree plain as a run holds it (`dew.batch.unboxed`).
+        shapes = unboxed(abstract(objective.initializer, jax.random.key(0)))
         whole = whole_reading(optimizer, shapes.get("params", {}))
         if whole:
             _log.info("the optimizer holds %s, transforms that may read a parameter whole, so each pipelined "

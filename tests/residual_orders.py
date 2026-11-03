@@ -7,10 +7,10 @@ nothing else. In exact arithmetic the model computes the same function; in
 fp32 it rounds differently. A run under each of K orders is one rounding draw
 of the same computation (tests/reference_error.py's K-order rule).
 
-The residual axes are the ones a module declares 'embed' (dew.nn.sharding)
+The residual axes are the ones a module declares 'embed' where it draws them
+(dew.nn.sharding: the boxes a draw carries, or the run's table in context)
 and, among undeclared parameters, only those named here: the residual
-stream's norms' scales and biases (RESIDUAL_NORMS, the last axis), Gemma
-4's router scale (ROUTER_SCALE), Kimi K3's depth-attention scales and
+stream's norms' scales and biases (RESIDUAL_NORMS, the last axis), Kimi K3's depth-attention scales and
 queries (DEPTH_ATTENTION, [width] and [width, 1]), and Gemma 3n's AltUp:
 its corrected output's scale [width] and the square maps its copies enter
 and leave by (ALTUP_SQUARE, both axes). No
@@ -30,7 +30,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.sharding import declarations, declared_axes, parameter_path
+from dew.batch import unboxed
+from dew.nn.sharding import boxed, boxed_axes, current_boxes, declared_axes, parameter_path
 
 # mHC's small mappings stay replicated; a production 'embed' declaration
 # would change their placement. Their columns concatenate residual streams.
@@ -56,26 +57,21 @@ axes the residual's."""
 LAYER = re.compile(r"layers(_\d+)?")
 """A decoder layer's module, under which a `norm` is a mixer's own, not the final norm."""
 
-ROUTER_SCALE = ("router", "scale")
-"""Gemma 4's router's scale (gemma4_moe.py `Gemma4TextRouter`), [width] over the residual it routes:
-named here ahead of its declaration, which GPT-OSS's router's ("embed", "exp") reaches by its module's
-name (gpt_oss.py `GptOssMLP`)."""
-
 DEPTH_ATTENTION = frozenset({"attention_res", "mlp_res", "output_res"})
 """Kimi K3's depth-attention modules (attention_residuals.py `DepthAttention`): a `scale` [width]
 and a query `kernel` [width, 1]."""
 
 
-def _residual_axes(path, leaf, width: int, declared) -> tuple[int, ...]:
+def _residual_axes(path, leaf, width: int) -> tuple[int, ...]:
     """The axes of a parameter that hold the residual stream's units, none for one that holds none."""
     names = parameter_path(path)
-    axes = None if names[-2:] == ROUTER_SCALE else declared_axes(path, leaf.ndim, declared)
+    axes = declared_axes(path, leaf.ndim)
     if axes is None:
         if names[-2:] in COMPOSITE_RESIDUAL_AXES:
             return (COMPOSITE_RESIDUAL_AXES[names[-2:]],)
         module, name = names[-2:] if len(names) > 1 else ("", names[-1])
         final = module == "norm" and not any(LAYER.fullmatch(outer) for outer in names[:-2])
-        if (name in ("scale", "bias") and (module in RESIDUAL_NORMS or final)) or names[-2:] == ROUTER_SCALE:
+        if name in ("scale", "bias") and (module in RESIDUAL_NORMS or final):
             found = (leaf.ndim - 1,)
         elif module in DEPTH_ATTENTION and name in ("scale", "kernel"):
             found = (leaf.ndim - (1 if name == "scale" else 2),)
@@ -94,24 +90,38 @@ def _residual_axes(path, leaf, width: int, declared) -> tuple[int, ...]:
     return (axes.index("embed"),)
 
 
-def residual_width(variables) -> int:
+def _axes_of(variables, axes):
+    """The context in which `declared_axes` reads `variables`' axes: the boxes a draw carries, beside the
+    table of a run's plain tree (`axes`, `Objective.parameter_axes`) or the one a caller holds (`boxed`)."""
+    return boxed({**current_boxes(), **(axes or {}), **boxed_axes(variables)})
+
+
+def model_axes(model, *inputs):
+    """The axes `model` draws each parameter in (`boxed_axes` of its init traced for shapes alone, over
+    `inputs`, a decoder's two tokens by default): the table of a plain tree of it, a loaded or unboxed
+    one, for `residual_width` and `permuted`."""
+    tokens = (jnp.zeros((1, 2), jnp.int32),)
+    return boxed_axes(jax.eval_shape(model.init, jax.random.key(0), *(inputs or tokens)))
+
+
+def residual_width(variables, axes=None) -> int:
     """The residual stream's width: the 'embed' side of the token embedding
     table. A wrapper's vision tower declares its own, which is not this one
     unless the widths happen to agree; a text-only run never reads it."""
-    declared = declarations(variables["params"])
-    (width,) = {leaf.shape[1] for path, leaf in jax.tree_util.tree_flatten_with_path(variables["params"])[0]
-                if declared_axes(path, leaf.ndim, declared) == ("vocab", "embed")}
+    with _axes_of(variables, axes):
+        (width,) = {leaf.shape[1] for path, leaf in jax.tree_util.tree_flatten_with_path(
+            unboxed(variables)["params"])[0] if declared_axes(path, leaf.ndim) == ("vocab", "embed")}
     return width
 
 
-def permuted(variables, order: np.ndarray):
+def permuted(variables, order: np.ndarray, axes=None):
     """`variables` with the residual stream's units in `order`, each leaf where it is: a device
-    array reordered on its device, a host array on the host."""
+    array reordered on its device, a host array on the host. A plain tree's axes are the run's `axes`
+    (`Objective.parameter_axes`) or the table a caller holds."""
     width = len(order)
-    declared = declarations(variables["params"])
 
     def reorder(path, leaf):
-        for axis in _residual_axes(path, leaf, width, declared):
+        for axis in _residual_axes(path, leaf, width):
             grouped = (np.arange(leaf.shape[axis] // width)[:, None] * width + order).reshape(-1)
             if isinstance(leaf, jax.Array):
                 leaf = jnp.take(leaf, jnp.asarray(grouped), axis=axis)
@@ -119,7 +129,9 @@ def permuted(variables, order: np.ndarray):
                 leaf = np.take(np.asarray(leaf), grouped, axis=axis)
         return leaf
 
-    return {**variables, "params": jax.tree_util.tree_map_with_path(reorder, variables["params"])}
+    with _axes_of(variables, axes):
+        plain = unboxed(variables)
+        return {**plain, "params": jax.tree_util.tree_map_with_path(reorder, plain["params"])}
 
 
 def _grouped(rng, width: int, group: int) -> np.ndarray:
@@ -138,15 +150,15 @@ def order(width: int, seed: int, group: int = 1) -> np.ndarray:
     return _grouped(np.random.default_rng([0x0BB17, width, group, seed]), width, group)
 
 
-def orbit(variables, *rest, group: int = 1):
+def orbit(variables, *rest, group: int = 1, axes=None):
     """Check 1's draw over the residual orbit of `variables` (`assert_as_exact`'s `draw`): seed s gives
     `variables` with the residual stream in `order(width, s, group)`, and the rest of the arguments as
-    they are.
+    they are; a plain tree's axes are `axes` (`model_axes`).
     The truth of each draw is the reference's own float64 run on it, so nothing is permuted back."""
-    width = residual_width(variables)
+    width = residual_width(variables, axes)
 
     def draw(seed):
-        return (permuted(variables, order(width, seed, group)), *rest)
+        return (permuted(variables, order(width, seed, group), axes), *rest)
 
     return draw
 

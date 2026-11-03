@@ -2,9 +2,11 @@
 
 One key, read from the default device: `smXY` from a GPU's compute
 capability, `v5e`/`v5p`/`v6e`/`v4` from a TPU's device kind, and the
-platform name otherwise. A selector names the generations it was measured on
-and sends every other one to its portable path. The measurements are in
-docs/performance.md, "Kernel choices per generation".
+platform name otherwise. Each generation's facts (`GpuTarget`, its
+`Architecture`) are what a selector and a template's derivation read: a GPU
+no row names takes its family's facts, so a selector admits an unseen member
+of a known family by what its family takes, never by a list of measured
+generations.
 """
 
 from __future__ import annotations
@@ -140,15 +142,14 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 @dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
-    generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per
-    clock per multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32';
-    'fp32': IEEE fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup
-    MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and what only a measurement
-    states: the global-memory load latency in multiprocessor clocks and the bytes the L2 serves a
-    multiprocessor a clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise
-    its limit to (`vmem_bytes`), and a grid step's fixed seconds. `tma`: JAX's Mosaic GPU pipelines move
-    a block into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline`
-    and `copy_gmem_to_smem`), where below it they copy by cp.async. A family of None is no template's:
+    generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
+    multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; 'fp32': IEEE
+    fp32 on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup MMA, Blackwell's
+    tensor memory columns (PTX ISA, tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and
+    the VMEM a kernel may raise its limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block
+    into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
+    `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
+    control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
     its devices' facts serve the rest of Dew (MFU's peaks)."""
 
     family: str | None
@@ -156,12 +157,10 @@ class Architecture:
     resident_threads: int = 1536
     wgmma: bool = False
     tma: bool = False
+    dependent_launch: bool = False
     tmem_columns: int | None = None
-    load_latency: float | None = None
-    l2_bytes_per_clock: float | None = None
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
-    grid_step_seconds: float | None = None
 
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
@@ -171,41 +170,27 @@ class Architecture:
 # CUDA-core lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on
 # TU10x, GA10x, AD10x, GH100 and GB10x/GB20x -> 256. GeForce parts of sm86 and sm89 sum 16-bit products in
 # fp32 at half the rate (the GA102 and Ada whitepapers), which their catalogued peaks give
-# (`GpuTarget.tensor_rate`). Global-memory load latency in clocks, a pointer chase's (Luo et al.,
-# "Benchmarking and Dissecting the Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table
-# IV): A100 466.3, H800 478.8, RTX 4090 541.5. L2 bytes a multiprocessor a clock, Dew's streaming probe
-# (L2PROBE, probe_l2.py) over SMs x clock: A100 5.43 TB/s -> 35.7, A10 4.74 -> 38.8, H100 SXM 13.2 -> 54.6.
-# A family no device of which was measured takes its nearest measured family's values, said so below.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048,
-                       load_latency=466.3,
-                       l2_bytes_per_clock=35.7)
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                l2_bytes_per_clock=38.8)
+# (`GpuTarget.tensor_rate`).
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048)
+_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024, load_latency=541.5,
-                       l2_bytes_per_clock=38.8)
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, resident_threads=2048,
-                       wgmma=True, tma=True,
-                       load_latency=478.8, l2_bytes_per_clock=54.6)
-# Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
+                       wgmma=True, tma=True, dependent_launch=True)
+# Blackwell's tcgen05 family.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, resident_threads=2048,
-                          tmem_columns=512, tma=True,
-                          load_latency=478.8, l2_bytes_per_clock=54.6)
-# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
-# and measured values.
+                          tmem_columns=512, tma=True, dependent_launch=True)
+# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, tma=True,
-                                   load_latency=541.5, l2_bytes_per_clock=38.8)
-# A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
-# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
-# and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
-# small DMA (GEMMTPU-GRIDSTEP: v5e 0.1785 us, v6e 0.2835 us). v6e: two 256x256 MXUs, 918 TF over its
-# clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
+                                   dependent_launch=True)
+# A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
+# default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
+# v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20,
-                             grid_step_seconds=1.785e-7),
-         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20, grid_step_seconds=2.835e-7)}
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20),
+         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -253,8 +238,7 @@ class GpuTarget:
     `memory_bandwidth` are the canonical device's boost clock and device-memory
     bytes per second, a real device's own likewise. Every other fact a kernel's
     cost model reads (`dew.nn.kernels.templates.cost`) is its instruction
-    family's (`architecture`): its tensor rates, warpgroup MMA, tensor memory, and
-    the measured values of its load latency and L2 bandwidth. A row
+    family's (`architecture`): its tensor rates, warpgroup MMA and tensor memory. A row
     states a device's datasheet alone: its peaks, which MFU reads, and what a
     compile-only target of it needs. This table and `architecture` are the one
     place a choice is keyed on the hardware; any other code reads their facts, a
@@ -281,6 +265,10 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
+    step_seconds: float | None = None
+    """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
+    predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
+    GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
 
     @property
     def architecture(self) -> Architecture:
@@ -314,28 +302,6 @@ class GpuTarget:
         """A TPU's VMEM capacity in bytes, the most a Mosaic kernel may raise its scoped limit to
         (`vmem_limit_bytes`); None on GPUs and where no rule states it."""
         return self.architecture.vmem_bytes
-
-    @property
-    def grid_step_seconds(self) -> float | None:
-        """A TPU grid step's fixed seconds beside its work (the cost model's step term); None on GPUs,
-        whose pipelined steps the model prices by their latency."""
-        return self.architecture.grid_step_seconds
-
-    @property
-    def load_latency(self) -> float | None:
-        """The global-memory load latency in multiprocessor clocks (the cost model's waiting term): its
-        family's."""
-        return self.architecture.load_latency
-
-    @property
-    def l2_bandwidth(self) -> float | None:
-        """The bytes a second the L2 serves all multiprocessors' loads together (the cost model's L2
-        term): its family's bytes a multiprocessor a clock over its multiprocessors and clock; None where
-        any is unstated, the term then dropped."""
-        rate = self.architecture.l2_bytes_per_clock
-        if rate is None or self.multiprocessors is None or self.clock_hz is None:
-            return None
-        return rate * self.multiprocessors * self.clock_hz
 
     @property
     def device_kind_prefixes(self) -> tuple[str, ...]:
@@ -418,9 +384,11 @@ TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
+    # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
+    # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, triton_gemm_fusions=False),
+              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
@@ -435,7 +403,9 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False),
+              # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
+              # line; its first's 4.80 us lay 17% from it).
+              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -450,7 +420,8 @@ TARGETS = {target.generation: target for target in (
               clock_hz=1965e6, memory_bandwidth=8e12),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
-              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9),
+              aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
+              step_seconds=3.68e-6),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
@@ -471,6 +442,12 @@ def capability(generation: str) -> tuple[int, int] | None:
     if digits == generation or not digits.isdigit():
         return None
     return int(digits[:-1]), int(digits[-1])
+
+
+INTERPRETED_GENERATION = "sm90"
+"""The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
+interpreted bundle's (`templates.bundles.INTERPRETED`, wgmma's); the algebra pass prices a CPU process's
+forms by its facts too (`dew.algebra.cost.target`)."""
 
 
 def gpu_target(identifier: str | None = None) -> GpuTarget:
@@ -502,6 +479,19 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if matches:
         return dataclasses.replace(max(matches, key=lambda entry: entry[0])[1], device_kind=identifier)
     return GpuTarget(identifier, identifier)
+
+
+def built_target(generation: str, multiprocessors: int | None = None) -> GpuTarget:
+    """The GPU a program compiled ahead is built for: the CUDA `generation`'s target (`gpu_target`) with the
+    `multiprocessors` its build states, where it states them (an H100 PCIe's 114 against the canonical H100's
+    132), else the generation's own. What a build's XLA target (`dew.training.ahead.target_config`), its
+    launches (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
+    target = gpu_target(generation)
+    if multiprocessors is None:
+        return target
+    if multiprocessors <= 0:
+        raise ValueError(f"a GPU states a positive count of multiprocessors, not {multiprocessors}")
+    return dataclasses.replace(target, multiprocessors=multiprocessors)
 
 
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:

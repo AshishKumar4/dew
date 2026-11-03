@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
@@ -389,7 +390,7 @@ def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
 
 
 def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
-    from residual_orders import permuted
+    from residual_orders import model_axes, permuted
 
     from dew.interop import Pretrained
 
@@ -398,11 +399,12 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
     order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
     ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
     tool = load('layout_parity')
+    axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), loaded.variables)
         model = loaded.model.clone(dtype=jnp.float64)
         truth = np.asarray(model.apply(wide, ids))
-        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     tool.order_invariance({'logits': reordered}, {'logits': truth},
                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
@@ -413,7 +415,7 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
     16 in a 32-wide decoder, Kimi Delta Attention's dt_bias and short-convolution weights are the
     residual's width too, and permuting them, as a size-matching guess would, changes the function."""
     from model_support import TINY_DECODER
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.registry import mixers
@@ -421,13 +423,13 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
     mixer = mixers.build("kimi_delta_attention", linear_num_heads=2, linear_head_dim=16)
     model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 16, "max_seq_len": 128}, mixer=mixer)
     ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
-    variables = model.init(jax.random.key(4), ids)
+    variables, axes = nn.unbox(model.init(jax.random.key(4), ids)), model_axes(model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
         model = model.clone(dtype=jnp.float64)
         truth = np.asarray(model.apply(wide, ids))
-        order = orders(residual_width(variables), 2, seed=6)[1]
-        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        order = orders(residual_width(variables, axes), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
                                            float(reordered.sum()), float(truth.sum()), roundings=roundings)
@@ -448,18 +450,19 @@ def test_residual_orders_preserve_a_looped_ngpt():
     (`attn_alpha`, `mlp_alpha`) live on the residual stream and are reordered with it, as its norms'
     scales are; left in place, the reordered model computes another function (the 4B release's order 1
     sat at an RMS of 10 from vLLM's log probabilities)."""
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
 
     from dew.interop import Pretrained
 
     loaded = Pretrained.load(FIXTURES / 'hf/dory-tiny', dtype='float32', attention_impl='reference')
     ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
+    axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), loaded.variables)
         model = loaded.model.clone(dtype=jnp.float64)
         truth = np.asarray(model.apply(wide, ids))
-        order = orders(residual_width(loaded.variables), 2, seed=6)[1]
-        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+        order = orders(residual_width(loaded.variables, axes), 2, seed=6)[1]
+        reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
     load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
                                            float(reordered.sum()), float(truth.sum()), roundings=roundings)

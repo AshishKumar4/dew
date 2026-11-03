@@ -50,7 +50,7 @@ from dew.training.compiled_program import (
     dimensions,
     lowering_platform,
 )
-from dew.training.memory import judged
+from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.staging import chunks, flattened
 from dew.training.transaction import COMMIT_FIELDS, attempt_step
@@ -254,8 +254,9 @@ def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
     return total
 
 
-def consumed_where_made(optimizer: optax.GradientTransformation | None, state: TrainState,
-                        window: int) -> bool:
+def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                          optimizer: optax.GradientTransformation | None, state: TrainState,
+                                          window: int) -> bool:
     """Whether the step reads each gradient where it is made into the buffers its state donates, so it
     holds none beside another (`gradient_peak`'s `consumed`): with the state it commits (`COMMIT_FIELDS`,
     the optimizer's and the EMA) in device memory, a window of several microbatches sums each into its
@@ -264,7 +265,14 @@ def consumed_where_made(optimizer: optax.GradientTransformation | None, state: T
     loss commits only once every gradient is known finite, a committed state fetched from the host is
     fetched behind one barrier over every gradient (`Transaction.past`), a window
     that replays its microbatches keeps their gradients for the replay, and an update that reads them
-    together (clipping by the global norm) holds them all until it has read the last."""
+    together (clipping by the global norm) holds them all until it has read the last. A head that takes its
+    gradient in the backward a tile at a time (`head_tile`, unfused) has XLA hold the layers' gradients to
+    the step's end: Qwen3.5-4B's step at 2 x 2048 tokens under 'minimal', compiled for an H100 at 59.4 GiB,
+    ran every layer's weight gradient and update after the whole backward, 20.1 GB of temporaries against
+    the 10.3 derived, where the whole logits' step ran them beside the backward; on an H100 itself the 13
+    layers its backward reached last waited (row 3653)."""
+    if head_tile_of(objective) is not None and not head_fused_of(objective):
+        return False
     if state.scale is not None or not in_device((state.opt_state, state.ema)):
         return False
     if window > 1:
@@ -757,7 +765,8 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
                                             lowering=lowering,
-                                            consumed=consumed_where_made(optimizer, prepared, window))
+                                            consumed=consumed_where_made(objective, optimizer, prepared,
+                                                                         window))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}

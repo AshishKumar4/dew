@@ -15,7 +15,7 @@ from dew._distributions import row_draw
 from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
 from dew.sampling.strategies import draw
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 
 VOCAB = 13
 

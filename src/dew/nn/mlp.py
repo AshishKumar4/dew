@@ -33,7 +33,7 @@ from .joined import joined_dense, joins
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
-from .sharding import MLP_HIDDEN, LogicalAxes, constrain, logical_axes
+from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
@@ -79,14 +79,18 @@ def gaussian_cutoff(x, sparsity: float):
     return mean + std * multiplier
 
 
-@logical_axes({
-    ("gate_proj",): ("embed", "mlp"),
-    ("up_proj",): ("embed", "mlp"),
+MLP_AXES: dict[str, LogicalAxes] = {
+    "gate_proj": ("embed", "mlp"),
+    "up_proj": ("embed", "mlp"),
     # The packed kernel's columns are both halves' hidden widths: a tensor axis splits them flat,
     # which the product's [..., 2, H] (`PACKED_HIDDEN`) redistributes.
-    ("gate_up_proj",): ("embed", "mlp"),
-    ("down_proj",): ("mlp", "embed"),
-})
+    "gate_up_proj": ("embed", "mlp"),
+    "down_proj": ("mlp", "embed"),
+}
+"""The logical axes of a feed-forward's projections, by name, as `GatedMLP` declares them where it makes
+them; a projection of another name (an ungated MLP's own `names`) declares none."""
+
+
 class GatedMLP(nn.Module):
     """Computes the gated feed-forward down_proj(act(gate_proj(x)) * up_proj(x)).
 
@@ -131,6 +135,8 @@ class GatedMLP(nn.Module):
     packed: bool = False
     packed_order: tuple[str, str] = ('gate_proj', 'up_proj')
     linear: Callable[..., nn.Module] = functools.partial(Dense, dot_general=float32_dot_general)
+    """How each projection is built: a factory of `dew.nn.dense.Dense`'s signature, which declares each
+    projection's axes where it draws it (`kernel_axes`)."""
     dropout_rate: float = 0.0
     ngpt: NGPT | None = None
     """The normalized transformer's gains (`dew.nn.ngpt.NGPT`): the gate and the up projection each
@@ -141,6 +147,8 @@ class GatedMLP(nn.Module):
     in_features: int | None = None
     activation_after: bool = False
     names: tuple[str, str] = ('up_proj', 'down_proj')
+    named_axes: tuple[tuple[str, LogicalAxes], ...] = ()
+    """The logical axes of projections under names of the owner's own (`names`), beside `MLP_AXES`."""
     gate_multiplier: float = 1.0
     """A gated MLP's gate projection's output times this before the activation, and `down_multiplier`
     its down projection's output: Falcon-H1's `mlp_multipliers`, each a product rounded once to its
@@ -172,12 +180,15 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
+        axes = {**MLP_AXES, **dict(self.named_axes)}
         if self._gated():
             if self._packed():
                 group = self._group()
-                self.gate_up_proj = dense(sum(group.widths), name=group.packed)
+                self.gate_up_proj = dense(sum(group.widths), name=group.packed,
+                                          kernel_axes=axes.get(group.packed))
             else:
-                self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj')
+                self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj',
+                                       kernel_axes=axes['gate_proj'])
         elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
             raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
         if self._gated() and (self.in_features is not None or self.activation_after
@@ -189,9 +200,10 @@ class GatedMLP(nn.Module):
                              "an ungated or nGPT feed-forward takes neither")
         up, down = ('up_proj', 'down_proj') if self._gated() else self.names
         if not self._packed():
-            self.up_proj = dense(projections[up][1], name=up)
-        self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+            self.up_proj = dense(projections[up][1], name=up, kernel_axes=axes.get(up))
+        self.down_proj = dense(projections[down][1], name=down, kernel_axes=axes.get(down),
+                               **normal_kernel(self.init_std if self.output_init_std is None
+                                               else self.output_init_std))
         if self.activation == XIELU:
             # A learned activation, its parameters under the reference's own name (`act_fn`).
             self.act_fn = Xielu(name='act_fn')
@@ -222,8 +234,12 @@ class GatedMLP(nn.Module):
             return activation(out) if self.activation_after else out
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
-                and self.ngpt is None and self.gate_multiplier == 1.0):
+                and self.ngpt is None):
             gate_up = self._gate_up(x)
+            if gate_up is not None and self.gate_multiplier != 1.0:
+                # The gate half scaled as the halves apart scale it (`scaled`), the up half as it is.
+                gate_up = jnp.stack([scaled(gate_up[..., 0, :], self.gate_multiplier), gate_up[..., 1, :]],
+                                    axis=-2)
             if gate_up is not None:
                 # Both names on the one output: a remat policy that keeps either keeps it whole.
                 if axes is not None:

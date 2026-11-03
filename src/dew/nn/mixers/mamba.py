@@ -44,12 +44,12 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import recurrence_chunk
+from dew.nn.kernels import recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, rows_like, sequence_shards
+from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
@@ -83,8 +83,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
 
     def one_chunk(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
-        decay = jnp.exp(dt_c[..., None] * A)                # [B, C, D, N]
-        decay = jnp.where(reset_c[..., None, None], 0.0, decay)
+        # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
+        decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
+                                                   1.0 - reset_c[..., None, None].astype(work))
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
         # The reference's `combine_fn` (modeling_mamba.py:231-234).
         decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
@@ -97,10 +98,6 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     return out.astype(dtype), final.astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba(nn.Module):
     """The token mixer of a Mamba layer, `MambaMixer` (modeling_mamba.py:285-482).
 
@@ -166,7 +163,7 @@ class Mamba(nn.Module):
         dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
-                             **normal_kernel(self.init_std))
+                             kernel_axes=('embed', 'linear'), **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,
                                       use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         self.x_proj = dense(self.time_step_rank + 2 * self.state_size, use_bias=False, name='x_proj',
@@ -182,8 +179,10 @@ class Mamba(nn.Module):
         # A_log = log(1..N) on every channel, D ones.
         self.A_log = self.param('A_log', _log_state_index, (self.intermediate_size, self.state_size))
         self.D = self.param('D', nn.initializers.ones, (self.intermediate_size,), jnp.float32)
-        self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj', **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+        self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj',
+                              kernel_axes=('attention', 'embed'),
+                              **normal_kernel(self.init_std if self.output_init_std is None
+                                              else self.output_init_std))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):

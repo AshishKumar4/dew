@@ -46,8 +46,20 @@ from typing_extensions import TypeIs, TypeVar
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.batch import (
+    EXAMPLE_ROWS,
+    FROZEN,
+    VALID_ROWS,
+    Batch,
+    PathFilter,
+    Variables,
+    dicts,
+    everything,
+    part,
+    unboxed,
+)
 from dew.distributed.placement import Layout, RefinesLayout
+from dew.nn.derivatives import surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import (
@@ -60,7 +72,7 @@ from dew.nn.precision import (
 )
 from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters, StagedStacks
-from dew.nn.sharding import rows_taken
+from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -659,18 +671,17 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-@jax.custom_jvp
-def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
-    """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`)."""
-    return value
-
-
-@_ruled.defjvp
-def _ruled_jvp(primals, tangents):
-    value, rule, _ = primals
+def _ruled_tangent(primals, tangents, _value) -> jax.Array:
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent."""
+    _, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
-                                    zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+    return moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
+                             zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+
+
+_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+"""`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
+(`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -797,8 +808,9 @@ class Objective(ABC, Generic[Loss, Effects]):
             model = source.model
         else:
             model = source
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
         self.variables = None if variables is OMITTED or variables is None else dicts(
-            unpacked(model, variables))
+            unpacked(model, unboxed(variables)))
         self.processor = None if processor is OMITTED else processor
         return model
 
@@ -994,13 +1006,45 @@ class Objective(ABC, Generic[Loss, Effects]):
             from dew.nn.backbones.layer_names import stored_layers
 
             tree = stored_layers(self, held)
-        elif held is None or self._held_parts:
-            tree = self.fresh_variables(key, held)
+        elif not held or self._held_parts:
+            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so.
+            tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
         tree = self.complete_variables(key, tree)
         return with_projected(tree, functools.partial(self.projected, updated=True))
+
+    @functools.cached_property
+    def parameter_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """The logical axes the objective's modules declare on the parameters they make
+        (`nn.with_logical_partitioning`), by each parameter's path from its collection: one table, read
+        off a fresh draw of every module traced for its shapes alone (`init` given an empty tree under
+        `jax.eval_shape`), which placement, the optimizer and a checkpoint read for a drawn tree and a
+        held one alike. A held tree's leaves are held to the draw's shapes, a leaf of another shape
+        refused by its path: its axes would name another parameter's dimensions. An objective that draws
+        no fresh tree (`fresh_variables`' `NotImplementedError`, its documented answer) holds no draw to
+        read: its held tree is placed by its shapes (`dew.inference.place`), its towers by their tables."""
+        try:
+            drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+        except NotImplementedError:
+            return self.tower_axes()
+        held = self.held_variables()
+        if held is not None and "params" in held:
+            shapes = {jax.tree_util.keystr(path): np.shape(leaf)
+                      for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(drawn)))}
+            for path, leaf in jax.tree_util.tree_leaves_with_path(unboxed(dict(held))):
+                name = jax.tree_util.keystr(path)
+                if name in shapes and shapes[name] != np.shape(leaf):
+                    raise ValueError(f"the held {name} is {np.shape(leaf)}, where the objective's modules "
+                                     f"make it {shapes[name]}")
+        return {**self.tower_axes(), **boxed_axes(drawn)}
+
+    def tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """The axes the frozen towers this objective holds beside its draw were drawn in, by their paths in
+        its variables, each tower's own table (`dew.inputs.ConditionEncoder.parameter_axes`): none for an
+        objective that holds none."""
+        return {}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Draw the tree training starts from when none is held.
@@ -1683,7 +1727,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
     if signature not in kept:
-        variables = jax.eval_shape(objective.init, jax.random.key(0))
+        variables = unboxed(abstract(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
         rest = {name: value for name, value in variables.items() if name != "params"}
 

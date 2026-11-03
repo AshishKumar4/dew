@@ -22,6 +22,7 @@ from flax.traverse_util import flatten_dict
 
 from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
+from dew.batch import unboxed
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
@@ -34,6 +35,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
+from dew.nn.sharding import drawn_axes
 from dew.registry import from_record, to_record
 
 if TYPE_CHECKING:
@@ -1519,6 +1521,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     built from their parts. Gemma 4's layer scalars are read from the
     collection `model.layer_scalar` names.
     """
+    variables = unboxed(variables)
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
@@ -1552,7 +1555,8 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
-    return layout_tensors(packed_layouts(layouts, family.packed, geometry), tree, model.layer_scalar)
+    packed = family.packed if family.packs(config) else ()
+    return layout_tensors(packed_layouts(layouts, packed, geometry), tree, model.layer_scalar)
 
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
@@ -1671,6 +1675,9 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
                         + ('weight' if leaf == 'kernel' else 'bias'))
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
+        if len(parts) == 3 and module == 'self_attn' and leaf == 'sinks':
+            # A layer's learned sink logits, which `dew_path` reads under this name (`_V4_TENSORS`).
+            return f'model.layers.{index}.self_attn.sinks'
         theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
@@ -2039,6 +2046,10 @@ class DecoderFamily:
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""
+    packs: Callable[[Mapping[str, object]], bool] = lambda _config: True
+    """Whether an export under the written config packs them (`packed`): every
+    export, but a family whose config states the layout, MiMo-V2's
+    `attention_projection_layout`, packs where it says so."""
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""
@@ -2164,3 +2175,10 @@ def check_decoder_tree(variables: Mapping[str, object], model) -> None:
     """`check_tree` against a decoder or its media wrapper, whose `init` reads one row of token ids
     (a wrapper's conditioners then build the smallest media their towers take)."""
     check_tree(variables, model, np.zeros((1, 2), np.int32))
+
+
+def decoder_axes(model) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a decoder or its media wrapper draws each parameter in, read off its init traced for
+    shapes alone over one row of token ids (`boxed_axes`): the table a loaded tree of it is placed by,
+    as a run's objective holds its own (`Objective.parameter_axes`)."""
+    return drawn_axes(model.init, np.zeros((1, 2), np.int32))

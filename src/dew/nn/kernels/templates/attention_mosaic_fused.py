@@ -92,13 +92,16 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     q_steps = queries // block_q
     grouped = heads != kv_heads
     leaves, treedef = jax.tree.flatten(spans)
+    # Grouped dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
+    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    groups = mosaic.stacked_groups(shapes)
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         if grouped:
             dq_ref, dkv_ref, *refs = refs
-            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], ((0, 1),))
+            dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
         else:
             dq_ref, dk_ref, dv_ref, *refs = refs
         k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
@@ -171,8 +174,6 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     if not grouped:
         dk, dv = launch(*operands)
         return jax.freeze(dq).sum(axis=0), dk, dv
-    shapes = [gradient.shape] * 2
-    groups = mosaic.stacked_groups(shapes)
     dkv = mosaic.stacked_zeros(shapes, groups)
     launch(*operands, *dkv)
     dk, dv = mosaic.stacked_read(dkv, groups)

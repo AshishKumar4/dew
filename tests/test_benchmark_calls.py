@@ -93,6 +93,29 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     assert "&lt;script&gt;" in slow._repr_html_()
 
 
+def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise():
+    """Two calls compared (`compared`): one sleeping twice the other's time, timed in interleaved,
+    role-swapped pairs, read as their paired ratio, whose bootstrap interval lies well apart from 1 (under
+    2, each call's own dispatch added to both), and the faster call against itself (its A/A) holding 1: an
+    interval apart from 1 and from the A/A's is a difference the placement does not make (row 3616, the
+    kernel challenge's method: one-sided runs moved -0.6% to +0.6% whatever the change)."""
+    from dew.telemetry.benchmark import compared
+
+    def slow():
+        time.sleep(0.004)
+        return jnp.zeros(())
+
+    def fast():
+        time.sleep(0.002)
+        return jnp.zeros(())
+
+    result = compared(slow, fast, pairs=24, warmup=1)
+    low, high = result.interval
+    alone_low, alone_high = result.alone
+    assert 1.5 < low <= high <= 2.0
+    assert alone_low <= 1.0 <= alone_high < low
+
+
 NEIGHBOURED = """
 import ctypes
 import json

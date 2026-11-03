@@ -6,7 +6,7 @@ compiled nothing reads its own peak: its state, its inputs, its temporaries and 
 (cuBLAS, cuDNN, a kernel's scratch), and no compile. `measured` runs the program twice, each in a fresh
 process, the two sharing a JAX compilation cache: the first fills it, and the second loads every program
 it runs from it and reports each local device's high-water as the program exits. A program the second
-needed but did not load from the cache (`dew.telemetry.instrumentation.Compiles` against the cache's
+needed but did not load from the cache (`dew.telemetry.compiles.Compiles` against the cache's
 hits) it compiled, which refuses the measurement: one the cache keeps no entry for compiles every time.
 A probe measures one row a process, so the high-water is that row's.
 
@@ -25,7 +25,8 @@ from pathlib import Path
 MEASURED = """
 import atexit, json, os, runpy, sys
 import jax
-from dew.telemetry.instrumentation import Compiles, compilation_cache_counts, count_compilation_cache
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.telemetry.compiles import Compiles
 stage, out, *argv = sys.argv[1:]
 # The script's own directory first, as `python script.py` puts it, for the modules beside it.
 sys.path[0] = os.path.dirname(os.path.abspath(argv[0]))

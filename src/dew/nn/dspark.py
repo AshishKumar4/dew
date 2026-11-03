@@ -39,7 +39,6 @@ from .inputs import MixerCall
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .protocols import ProjectionGroup
-from .sharding import logical_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,10 +76,6 @@ class DSpark:
                              f"got {self.reads!r}")
 
 
-@logical_axes({
-    ("main_proj",): (None, "embed"),
-    ("confidence",): (None, None),
-})
 class DSparkStage(nn.Module):
     """One drafter stage: its decoder block, the context projection on the
     first, and the norm, Markov head and confidence head on the last.
@@ -103,7 +98,7 @@ class DSparkStage(nn.Module):
         self.layer = self.block(name='block')
         if self.first:
             self.main_proj = Dense(self.emb_features, use_bias=False, dtype=self.dtype,
-                                   precision=self.precision, name='main_proj',
+                                   precision=self.precision, name='main_proj', kernel_axes=(None, 'embed'),
                                    dot_general=float32_dot_general)
             self.main_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
                                      dtype=self.dtype, name='main_norm')
@@ -115,7 +110,7 @@ class DSparkStage(nn.Module):
             self.markov_head = self.param('markov_head', nn.initializers.normal(self.markov_rank ** -0.5),
                                           (self.vocab_size, self.markov_rank), jnp.float32)
             self.confidence = Dense(1, use_bias=False, dtype=at_least_fp32(self.dtype),
-                                    precision=self.precision, name='confidence',
+                                    precision=self.precision, name='confidence', kernel_axes=(None, None),
                                     dot_general=float32_dot_general)
             if self.weighted_head is not None:
                 self.hc_head = HyperHead(spec=self.weighted_head, emb_features=self.emb_features,

@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from flax import linen as nn
 from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
 from process_support import serve_mode, worker_parser
 
@@ -1470,7 +1471,7 @@ def mode_replicated_rollout(args) -> dict:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
                               dtype="float32", attention_impl="xla")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     drawn = np.random.default_rng(rank)
     scored = []
 
@@ -1598,7 +1599,7 @@ def mode_rollout(args) -> dict:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
                               dtype="float32", attention_impl="xla")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     batch = rollout_prompts()
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
@@ -1781,7 +1782,7 @@ def mode_continuations(args) -> dict:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
                               dtype="float32", attention_impl="xla")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
     prompts, lengths = continuation_prompts()
     rows = len(prompts) // processes
@@ -2008,7 +2009,7 @@ def mode_decoding_components(args) -> dict:
                               head_dim=8, mlp_features=32, max_seq_len=12,
                               dtype="float32", attention_impl="xla",
                               num_nextn_predict_layers=1)
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
     prompts, lengths = continuation_prompts()
     rows = len(prompts) // processes
@@ -2104,7 +2105,7 @@ def _meshless_request(model, prompts, mask, asking: int) -> dict:
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, generate
 
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     rows = 1 + 2 * asking
     own = ModelInputs(jnp.asarray(prompts[:rows]), {"attention_mask": jnp.asarray(mask[:rows])})
     answer = generate(model, params, own, 3 + asking, key=jax.random.key(11),

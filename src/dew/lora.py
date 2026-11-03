@@ -49,12 +49,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
 from dew._records import finite
-from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw, unboxed
 from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
@@ -86,7 +87,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS, stored_paths
+from dew.nn.sharding import LOW_RANK_FACTORS, declared, factor_axes, stored_paths
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -210,6 +211,8 @@ class LoRA:
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
+        # A draw boxes the parameters its modules declare the axes of; the adapter reads their values.
+        variables = unboxed(variables)
         if fp8_base is not None:
             model = fp8_base.joined(model)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -665,6 +668,14 @@ class _Branch:
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
         root = self.root
+        if context.method_name == "drawn_like":
+            # A layer draws as its stack says, and apart from layers whose factors differ from its own
+            # (`CausalTransformer.drawn_like`): a scanned run stacks one factor pair over its layers.
+            index = args[0] if args else kwargs["index"]
+            layer = (*root, *module.path, f"layers_{index}")
+            own = tuple(sorted((path[len(layer):], target) for path, target in self.targets.items()
+                               if path[:len(layer)] == layer))
+            return next_fun(*args, **kwargs), own
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
             # this call (`MultiHeadLatentAttention.nonlinear_input`): the
@@ -685,7 +696,7 @@ class _Branch:
             if target is None:
                 return kernel
             child = getattr(module, name)
-            a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
+            a, b = (meta.unbox(child.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
             return _updated(kernel, a, b, _scale(target, self.rslora))
         target = (_stored_target(self.targets, root, module.path)
                   if context.method_name in ("__call__", "_linear") else None)
@@ -700,11 +711,16 @@ class _Branch:
             raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
-            a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
+            a, b = (meta.unbox(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
         else:
+            # Each factor declares its kernel's axes on its side of the rank, as its kernel's box names
+            # them (`nn.get_partition_spec`, empty for a kernel that names none).
             kernel = module.get_variable("params", "kernel")
-            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), FACTOR_DTYPE)
-            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), FACTOR_DTYPE)
+            names, shape = tuple(nn.get_partition_spec(kernel)), meta.unbox(kernel).shape
+            sides = {"lora_A": (*shape[:len(axes)], target.rank), "lora_B": (target.rank, *shape[len(axes):])}
+            a, b = (module.param(factor, declared(init, factor_axes(names, factor, len(sides[factor]))),
+                                 sides[factor], FACTOR_DTYPE)
+                    for factor, init in zip(LOW_RANK_FACTORS, (INIT_A, INIT_B), strict=True))
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
@@ -1066,8 +1082,9 @@ def bound_layouts(model: nn.Module, variables: Variables,
     """
     if layouts:
         return layouts
+    # A draw boxes the kernels its modules declare the axes of; their shapes are their values'.
     derived = {".".join(module): _kernel_layout(module, kernel)
-               for module, kernel in _kernels(variables.get("params", {}), ())
+               for module, kernel in _kernels(unboxed(variables).get("params", {}), ())
                if kernel.ndim == 2}
     if not derived:
         raise ValueError(

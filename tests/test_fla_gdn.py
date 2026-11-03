@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, recurrence, rule_math, through
+from flax import linen as nn
 from gdn_cases import CASES
 from reference_error import (
     FEWEST_SEEDS,
@@ -535,7 +536,7 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs(kind):
              if kind == "gated delta net" else
              KimiDeltaAttention(emb_features=64, num_heads=2, head_dim=64))
     x = jax.random.normal(jax.random.key(29), (1, 72, 64))
-    variables = layer.init(jax.random.key(30), x)
+    variables = nn.unbox(layer.init(jax.random.key(30), x))
     step = MixerCall(decode=True)
     allocated = layer.apply(variables, x[:, :1], step, mutable=["cache"])[1]
     # Two shards' histories, each its own prefill.
@@ -568,7 +569,7 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64,
                           dtype=dtype)
     with row_names_port(port=False):
-        params = layer.init(jax.random.key(29), x)
+        params = nn.unbox(layer.init(jax.random.key(29), x))
 
     def loss(params, *, port):
         with row_names_port(port=port):
@@ -719,7 +720,7 @@ def test_a_bf16_layer_with_wide_keys_runs_on_the_port_in_bf16():
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=256, head_v_dim=64,
                           dtype=jnp.bfloat16)
     x = jnp.ones((1, 64, 64), jnp.bfloat16)
-    params = layer.init(jax.random.key(61), x)
+    params = nn.unbox(layer.init(jax.random.key(61), x))
     out = jnp.asarray(layer.apply(params, x))
     assert out.dtype == jnp.bfloat16 and bool(jnp.all(jnp.isfinite(out)))
 
@@ -754,7 +755,7 @@ def test_a_remat_policy_changes_no_gradient(policy):
     from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    initialize = jax.jit(layer.init)
+    initialize = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
 
     def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)

@@ -25,6 +25,7 @@ from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig, Prepared, RunConfig, SourceOptions, TrainerConfig
 from dew.data.dataset import Loader, replayed
+from dew.nn.sharding import abstract
 from dew.objectives.base import Shown
 from dew.objectives.rl.control import ControlPPOObjective
 from dew.objectives.rl.dreamer import DreamerV3Objective
@@ -264,7 +265,7 @@ class EnvRunConfig(RunConfig):
             raise ValueError(f"an environment run trains an agent that acts in it, a DreamerV3Objective or a "
                              f"ControlPPOObjective, not a {type(objective).__name__}")
         if variables is not None:
-            fresh = jax.eval_shape(lambda key: objective.fresh_variables(key, None), jax.random.key(0))
+            fresh = abstract(lambda key: objective.fresh_variables(key, None), jax.random.key(0))
             if jax.tree.structure(fresh) != jax.tree.structure(variables) or any(
                     np.shape(one) != np.shape(other)
                     for one, other in zip(jax.tree.leaves(fresh), jax.tree.leaves(variables), strict=True)):

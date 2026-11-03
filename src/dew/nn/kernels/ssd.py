@@ -342,7 +342,6 @@ def _ssd_bwd(chunk_size: int, platform: str, residual, cotangent):
 
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
-# decorator loses that binding, so it is built by hand, as chunked_cross_entropy's
-# `_bounded_head` is.
+# decorator loses that binding, so it is built by hand.
 ssd_chunk_scan = jax.custom_vjp(_ssd_scan, nondiff_argnums=(5, 6))
 ssd_chunk_scan.defvjp(_ssd_fwd, _ssd_bwd)

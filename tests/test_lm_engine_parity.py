@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -143,7 +144,7 @@ def test_rigel_shaped_hybrid_matches_lm_engine_forward_losses_and_gradients(refe
         model = hybrid()
         tokens = jnp.asarray(reference["tokens"], jnp.int32)
         params = tree(leaves(reference, "param:"))
-        assert (jax.tree.map(jnp.shape, model.init(jax.random.key(0), tokens)["params"])
+        assert (jax.tree.map(jnp.shape, nn.unbox(model.init(jax.random.key(0), tokens))["params"])
                 == jax.tree.map(jnp.shape, params))
         (total, (logits, lm, aux)), grads = jax.value_and_grad(
             objective(model, tokens), has_aux=True)(params)

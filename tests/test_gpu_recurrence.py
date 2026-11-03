@@ -236,7 +236,7 @@ def test_the_recurrences_run_on_this_gpu():
     templates_finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
     run_cells([
         *(Cell(f"the Mosaic forward is as exact as its reference: {name}",
-               functools.partial(forward.test_the_mosaic_forward_is_as_exact_as_its_reference, *values))
+               functools.partial(forward.the_mosaic_forward_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(forward.FORWARD_GRID, forward.INTERPRETED_FORWARD)),
         *(Cell(f"every hook the Mosaic mainloop takes is as exact as the recurrence: {hooks} {packed}",
                on_its_family(functools.partial(

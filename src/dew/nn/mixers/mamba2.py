@@ -58,6 +58,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.algebra.scan import RESET_DECAY
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
@@ -66,13 +67,12 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence, recurrence_algebra
 from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
-from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
-from dew.nn.linear import DepthwiseConv1d, held_scan, over_sequence, sequence_conv
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.norms import unweighted_rmsnorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, sequence_shards
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
+from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -92,14 +92,21 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
     math.
     """
+    held = None if state is None else jnp.swapaxes(state, -1, -2)
+    out, final = _chunked(x, dt, A, B, C, D, held, chunk_size, starts=starts)
+    return out, jnp.swapaxes(final, -1, -2)
+
+
+def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None):
+    """`chunk_ssd` with its state `[B, H, N, P]`, keys by values, as the recurrence holds it
+    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`)."""
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
-    held = None if state is None else jnp.swapaxes(jnp.asarray(state, work), -1, -2)
-    out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts),
-                       chunk_size=chunk_size, dtype=work)
-    return out, jnp.swapaxes(final, -1, -2)
+    held = None if held is None else jnp.asarray(held, work)
+    return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts),
+                 chunk_size=chunk_size, dtype=work)
 
 
 SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
@@ -137,12 +144,31 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
 
 
+def decoded_ssd(x, dt, A, B, C, D, held=None, starts=None):
+    """`recurrent_ssd` for one decode token through the recurrence's decode step (`linear.decode_step`):
+    the step kernel where the decode selector gives it (`linear.DELTA_DECODE`), the state read and
+    written once, else the portable step. Operands as `recurrent_ssd`'s, the state `[B, H, N, P]` as the
+    step holds it (`_chunked`'s): moved to and from `[P, N]` about each token, the transposes took two
+    thirds of an H100's 0.73 ms token at 128 rows of Mamba-2 2.7B (decode-h100-e6b761042-boundary)."""
+    work = at_least_fp32(jnp.result_type(x, B, C))
+    x, dt, B, C = (jnp.asarray(t[:, 0], work) for t in (x, dt, B, C))
+    batch, heads, head_dim = x.shape
+    held = (jnp.zeros((batch, heads, B.shape[-1], head_dim), work) if held is None
+            else jnp.asarray(held, work))
+    if starts is not None:
+        held = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], jnp.zeros((), work), held)
+    out, final = decode_step(SSD, held, C, B, x, None, dt, None, rate=jnp.asarray(A, work),
+                             skip=jnp.asarray(D, work))
+    return out[:, None], final
+
+
 class MambaRMSNormGated(nn.Module):
     """`MambaRMSNormGated` (modeling_mamba2.py:105-121): the gate first, the
     norm over the whole width after, both in fp32 (`at_least_fp32`), the weight applied to the
     cast-back values. `gate_after` norms first and gates the weighted norm, and `scale_wide` applies the
     weight in at least fp32 before the one cast, Falcon-H1's `FalconH1RMSNormGated` in either order
-    (`norm_before_gate`, modeling_falcon_h1.py:256-282)."""
+    (`norm_before_gate`, modeling_falcon_h1.py:256-282). The norm is the RMS norm's one arithmetic
+    (`rms_statistics`, `rms_weighted`) over each group, the gate broadcast over the norm's output."""
 
     epsilon: float = 1e-5
     groups: int = 1
@@ -157,21 +183,24 @@ class MambaRMSNormGated(nn.Module):
         wide = at_least_fp32(x.dtype)
         if self.groups < 1 or x.shape[-1] % self.groups:
             raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
+        scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
+
+        def grouped(value):
+            return value.reshape(*value.shape[:-1], self.groups, -1)
+
         y = x.astype(wide)
         if not self.gate_after:
             y = y * nn.silu(gate.astype(wide))
-        y = unweighted_rmsnorm(y.reshape(*y.shape[:-1], self.groups, -1), self.epsilon).reshape(y.shape)
-        scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
-        y = y * scale.astype(wide) if self.scale_wide else scale.astype(dtype) * y.astype(dtype)
+        # Weighted wide, or the normalized values cast back before the weight multiplies them.
+        weight, rounded = ((scale.astype(wide), None) if self.scale_wide
+                           else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
+        y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
+                         rounded=rounded).reshape(y.shape)
         if self.gate_after:
             y = y.astype(wide) * nn.silu(gate.astype(wide))
         return y.astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 
@@ -179,9 +208,9 @@ class Mamba2(nn.Module):
     hidden_size`), `state_size` each head's `N`, `n_groups` the distinct B and
     C. `time_step_limit` is the reference's `dt_limit`, by default no clamp.
 
-    The decode state is `ssm_state` `[B, H, P, N]` and `conv_state`
-    `[B, K-1, conv_dim]` in the `cache` collection; a one-token call runs the
-    recurrent step and a longer one the chunked scan from the held state.
+    The decode state is `ssm_state` `[B, H, N, P]` (keys by values, as the recurrence holds it) and
+    `conv_state` `[B, K-1, conv_dim]` in the `cache` collection; a one-token call runs the recurrent step
+    and a longer one the chunked scan from the held state.
     Padded rows (`attention_metadata.valid`) are zeroed before the projection
     (`apply_mask_to_padding_states`) and take a zero step. Packed documents
     (`segment_ids`) run as if alone, as mamba_ssm's `seq_idx` does.
@@ -264,6 +293,7 @@ class Mamba2(nn.Module):
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
             name="in_proj",
+            kernel_axes=("embed", "linear"),
             **normal_kernel(self.init_std),
         )
         self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
@@ -283,7 +313,7 @@ class Mamba2(nn.Module):
             self.norm = MambaRMSNormGated(
                 epsilon=self.norm_eps, groups=self.norm_groups, gate_after=self.norm_order == 'norm_first',
                 scale_wide=self.norm_scale_wide, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj',
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'),
                               use_bias=self.use_bias if self.out_bias is None else self.out_bias,
                               **normal_kernel(self.init_std if self.output_init_std is None
                                               else self.output_init_std))
@@ -344,7 +374,7 @@ class Mamba2(nn.Module):
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
-                        (self.num_heads, self.head_dim, self.state_size),
+                        (self.num_heads, self.state_size, self.head_dim),
                         decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
                         dtype=compute)
         if out is None:
@@ -363,7 +393,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
-    Returns the output `[B, S, H * P]` and the zero-start state leaving it.
+    Returns the output `[B, S, H * P]` and the zero-start state leaving it, `[B, H, N, P]` as `held` is.
 
     Under `axis` the scan runs from zero and the output gains `C_t . exp(acs_t)
     h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
@@ -384,19 +414,19 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
     if length == 1 and axis is None:
-        out, final = recurrent_ssd(xs, step, A, B, C, D, held, starts)
+        out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
-        out, final = chunk_ssd(xs, step, A, B, C, D, held, chunk_size, starts=starts)
+        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts)
     if axis is not None:
         log_decay = A * step                                # [B, S, H]
         if starts is not None:
             log_decay = jnp.where(starts[..., None], RESET_DECAY, log_decay)
         span = recurrence_algebra.Span(jnp.sum(log_decay, axis=1), final)
         entering = recurrence_algebra.entering(span, axis)
-        entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
+        entering = entering.reshape(batch, n_groups, num_heads // n_groups, state_size, head_dim)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
-        carried = float32_einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed)
+        carried = float32_einsum('bsgn,bgknp,bsgk->bsgkp', C, entering, decayed)
         out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 
@@ -436,6 +466,7 @@ class Mamba2Mixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    draws_init_std = True
 
     @property
     def keeps_triton_gemm(self) -> bool:
