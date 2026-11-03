@@ -58,7 +58,7 @@ from dew.objectives.base import (
     with_projected,
 )
 from dew.optim import clips_qk, stepped
-from dew.state import REPLICA_FIELDS, Accumulation, TrainState, apart, together
+from dew.state import Accumulation, TrainState, apart, together
 from dew.training.compiled_program import gradients_read
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.memory import head_fused_of, head_tile_of
@@ -302,18 +302,14 @@ def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     2048 tokens under 'minimal', compiled for an H100 at 59.4 GiB, ran every layer's weight gradient and
     update after the whole backward, 20.1 GB of temporaries against the 10.3 derived, where the whole
     logits' step ran them beside the backward; on an H100 itself the 13 layers its backward reached last
-    waited (row 3653). A DiLoCo run's step commits each replica's own fields, stacked on a first axis
-    (`TrainState.inner`, `diloco.replica`), not the outer optimizer's state: they are what it reads."""
+    waited (row 3653)."""
     if head_tile_of(objective) is not None and not head_fused_of(objective):
         return False
-    stacked = state.inner is not None
-    if stacked:
-        state = dataclasses.replace(state, **{field: getattr(state.inner, field) for field in REPLICA_FIELDS})
     if state.scale is not None or not in_device([getattr(state, field) for field in COMMIT_FIELDS]):
         return False
     if window > 1:
         return shared and state.accumulation is not None and in_device(state.accumulation.gradient)
-    params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape[int(stacked):], leaf.dtype),
+    params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
                                      (state.variables["params"], state.opt_state))
     return leaf_local(optimizer, params, opt_state, progressed=progressed)
 

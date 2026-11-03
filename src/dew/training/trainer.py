@@ -1172,10 +1172,8 @@ class Trainer(Generic[Loss, Effects]):
         footprint = None if shapes is None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), window, prepared, held,
             (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-            lambda: consumed_where_made(self.objective, self.optimizer, prepared, window,
-                                        shared=pooled_by_mean(shapes[0]),
-                                        progressed=self._examples is not None),
-            max(cuts, default=0), capacity)
+            functools.partial(self._consumed, prepared, micro, window, shapes), max(cuts, default=0),
+            capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)
@@ -1184,6 +1182,15 @@ class Trainer(Generic[Loss, Effects]):
             *apart(prepared), given, part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report() if lowering else KernelReport((), ()), footprint, sampled)
+
+    def _consumed(self, prepared: TrainState, micro: Batch, window: int, shapes) -> bool:
+        """Whether the step over `prepared` consumes each gradient where it is made
+        (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
+        (`group_of`), not the outer optimizer's."""
+        with group_of(prepared, micro) as (view, _):
+            return consumed_where_made(self.objective, self.optimizer, view, window,
+                                       shared=pooled_by_mean(shapes[0]),
+                                       progressed=self._examples is not None)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
                   narrow: bool | None = None):

@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterator, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -227,7 +228,7 @@ def group_of(state: TrainState, batch: Batch) -> Iterator[tuple[TrainState, Batc
         view = dataclasses.replace(view, microstep=state.inner.microstep[0])
     share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
         (jnp.shape(leaf)[0] // groups, *jnp.shape(leaf)[1:]) if jnp.ndim(leaf) else (), leaf.dtype), batch)
-    with example_groups(groups, jnp.zeros((), jnp.int32)):
+    with example_groups(groups, np.int32(0)):
         yield view, share
 
 
