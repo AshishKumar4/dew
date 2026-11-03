@@ -1325,7 +1325,7 @@ def _training_reader(
         )
     else:
         if build.elastic:
-            _refuse_inelastic(pipeline, build)
+            _refuse_inelastic(pipeline)
         own_plan = dataclasses.replace(
             plan,
             # An elastic read's order is one reader's at any count, its position every reader's.
@@ -1354,18 +1354,10 @@ def _training_reader(
     return _Host(opened, host) if host else opened
 
 
-def _refuse_inelastic(pipeline: Pipeline, build: _Build) -> None:
-    """Refuse an elastic read (`Pipeline.elastic`) streamed in loading workers, which read a stream's
-    shards each its own, so its order and position would hold only at their count; or whose batch
-    is a token budget's, which takes no fixed share of rows. Indexed, its workers read its inputs
-    in their order (`dew.data.lowering._InputOrder`)."""
-    written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
-    if (_workers(pipeline, build.loading) or written) and build.read == "streamed":
-        raise ValueError(
-            f"{pipeline.name or 'this chain'} is read elastically and streamed, and loading workers read a "
-            "stream's shards each their own, so its order would change with their count: read it by "
-            "index (`.read(\"indexed\")`), or with Loading(workers=0) (elastic streams in workers are "
-            "ledger row 1896)")
+def _refuse_inelastic(pipeline: Pipeline) -> None:
+    """Refuse an elastic read (`Pipeline.elastic`) whose batch is a token budget's, which takes no fixed
+    share of rows. Its loading workers read its inputs in their order, by index or as a stream
+    (`dew.data.elastic_order._InputOrder`, `_StreamOrder`)."""
     if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
         raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
                          "holds no fixed count of them; batch it by rows")
