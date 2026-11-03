@@ -693,15 +693,19 @@ def _marked_kinds(closed) -> list:
     return [equation.params["kind"] for equation in equations(closed) if equation.primitive is marked_call_p]
 
 
-def test_a_protected_span_is_kept_as_traced():
+def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
     """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
-    crosses and whose inside no rule touches: two sums the pass would join stay two, inside their one marked
-    call (docs/design/algebra.md §1.2)."""
+    crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass joins unmarked
+    stay two inside their one marked call, once rewritten and again, a program already rewritten rewritten
+    anew."""
     from dew.nn.derivatives import Protected, marked
 
+    operands_ = rows(11, *SHAPES_MARKED)
+    assert reductions(jax.make_jaxpr(algebra.rewritten(two_sums))(*operands_)) == 1
     spanned = marked(Protected(), two_sums)
-    rewritten = jax.make_jaxpr(algebra.rewritten(spanned))(*rows(11, *SHAPES_MARKED))
-    assert (reductions(rewritten), _marked_kinds(rewritten)) == (2, [Protected()])
+    for rewrite in (algebra.rewritten(spanned), algebra.rewritten(algebra.rewritten(spanned))):
+        rewritten = jax.make_jaxpr(rewrite)(*operands_)
+        assert (reductions(rewritten), _marked_kinds(rewritten)) == (2, [Protected()])
 
 
 @pytest.mark.parametrize("kind", ["Surrogate", "KernelGlue"])
