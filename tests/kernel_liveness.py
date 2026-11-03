@@ -712,9 +712,11 @@ class _Pass:
                 return
         if self._streamed(op, name):
             # An elementwise result whose uses are elementwise in its block (or stores): the compiler
-            # computes it an element at a time beside its consumers, so its operands stay live in its place.
-            self.atoms.of[produced[0]] = [a for o in op.operands for a in self.atoms.of.get(o, ())
-                                       if a is not None]
+            # computes it an element at a time beside its consumers, so its operands stay live in its place:
+            # each atom once, as a chain reading one value twice (the in-launch prefix scan's doublings, a
+            # compensated sum's halves) doubled its list each step, 11.5 GB in the sm80 Kimi delta forward's.
+            operands = (a for o in op.operands for a in self.atoms.of.get(o, ()) if a is not None)
+            self.atoms.of[produced[0]] = list(dict.fromkeys(operands))
             return
         if name == "llvm.insertelement" and len(produced) == 1:
             index = _constant(op.operands[2])
