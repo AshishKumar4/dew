@@ -194,8 +194,12 @@ the kernel's limit, leaving the next test the other half to compile in; None whe
 
 def release() -> None:
     """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
-    walk's traces and compiled runs among them (`float64_terms.released`)."""
+    walk's traces and compiled runs among them (`float64_terms.released`), and those Dew's own programs
+    keep past jit's caches (`dew.nn.kernels.options.release`)."""
+    from dew.nn.kernels import options
+
     float64_terms.released()
+    options.release()
     jax.clear_caches()
     gc.collect()
 
