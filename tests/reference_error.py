@@ -63,17 +63,18 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
-import contextlib
 import dataclasses
 import functools
 import hashlib
 import itertools
 import math
+import time
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import summed_as_run, widened
 from check1_statistics import (
     CONFIDENCE,
     FACTOR,
@@ -107,13 +108,12 @@ from check1_statistics import (
     root_mean,
     shown,
 )
-from conditioning import Conditioning, heavy_masks
+from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
 from map_judge import DRAWS, PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from site_draws import _Draws
 
 from dew.accuracy import distance, reduction_bound, within
-from dew.nn.precision import FP32_SUMS
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -134,21 +134,6 @@ def ieee_fixture(path) -> dict[str, np.ndarray]:
         raise ValueError(f"{path} records {recorded!r} for its matmuls, not 'ieee'; regenerate it "
                          f"with IEEE matmuls")
     return arrays
-
-
-def widened(tree):
-    """`tree` in float64, its integer leaves as they are: the inputs of a float64 truth. A leaf an
-    accelerator holds is widened where it lies, so its truth runs on that device's FP64 units with no host
-    round trip (a decode step's keys and values, a hundred megabytes a draw to the host and back); any other
-    is a host array."""
-    def wide(leaf):
-        if isinstance(leaf, jax.Array) and _floating(leaf.dtype) and all(
-                device.platform != "cpu" for device in leaf.devices()):
-            with jax.enable_x64(new_val=True):
-                return leaf.astype(jnp.float64)
-        return np.asarray(leaf, np.float64 if _floating(leaf.dtype) else leaf.dtype)
-
-    return jax.tree.map(wide, tree)
 
 
 def _stack_draws(trees):
@@ -232,23 +217,6 @@ check 1 between the two across PARITY by host; without the fusions the verdicts 
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
 SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
 because compiler options take no such spelling and that one leaves a scan's reductions fused."""
-
-
-def summed_as_run():
-    """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
-    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
-    (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
-    the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
-    gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
-    sums wide only under the suite's setting is no nearer float64 here than its users' runs are, and
-    no route is kept off a CPU for summing narrower than that setting. The preset is JAX's default dot
-    algorithm in it: every dot of no stated precision takes float32 operands, a bfloat16's exactly,
-    and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
-    them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
-    product sums, stay."""
-    if jax.default_backend() == "cpu":
-        return jax.default_matmul_precision(FP32_SUMS)
-    return contextlib.nullcontext()
 
 
 def without_ynn(fn, **jit_options):
@@ -1075,13 +1043,7 @@ def _conditioning(reference_fn, truth_fn, draw, seeds) -> Conditioning:
             return jax.tree.map(lambda *scale: None if scale[0] is None else np.stack(scale), *each,
                                 is_leaf=lambda leaf: leaf is None)
 
-    def ran_and_true(seed):
-        inputs = draw(seed)
-        with summed_as_run():
-            ran = jax.device_get(reference_fn(*inputs))
-        return ran, jax.device_get(_truth_and_terms(truth_fn or reference_fn, None, inputs)[0])
-
-    return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
+    return conditioned(reference_fn, truth_fn, draw, seeds, scale_of)
 
 
 def _truth_and_terms(truth_fn, terms_fn, inputs):
@@ -1601,12 +1563,18 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
     return terms_fn, dict(also or {})
 
 
-def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None) -> bool:
+def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
+              weighed: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
-    `upto` where given, with its arms' YNNPACK mode (`_mode_of`). False where the process is no map task."""
-    return record_units(label, lambda start, stop: {
-        "draws": [drawn_for(index)(start, stop) for index in range(references)], "refused": _mode_of(arms)},
-        upto=upto)
+    `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
+    (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
+    no map task."""
+    def payload(start, stop):
+        draws = [drawn_for(index)(start, stop) for index in range(references)]
+        held = (weighed or {}).get("of")
+        return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
+    return record_units(label, payload, upto=upto,
+                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
 
 
 def _pooled_draws(label: str, references: int, arms):
@@ -1623,6 +1591,9 @@ def _pooled_draws(label: str, references: int, arms):
         raise PoolRefused(f"{label}: the map tasks ran the arms in different modes: "
                           f"{sorted(map(str, modes))}", held)
     refused = modes.pop()
+    if len({payload.get("heavy") for _, _, payload in pieces}) > 1:
+        raise PoolRefused(f"{label}: the map tasks weighed by different classes (`Conditioning.digest`)",
+                          held)
     pairings = {arm.pairing for arm in _paired_arms(arms)}
     for pairing in pairings:
         pairing.decided, pairing.refused = True, refused
@@ -1755,7 +1726,7 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
         _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
                      truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                      library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                     weighing=_conditioning(reference_fn, truth_fn, draw, range(span)), upto=span)
+                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span)), upto=span)
 
     try:
         assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1771,8 +1742,9 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None
                  ) -> None:
-    """`assert_as_exact`'s judgment of one site under `label`, weighed by `weighing` where given (tests/
-    conditioning.py), a map task recording its range's draws up to `upto` where given."""
+    """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (tests/
+    conditioning.py: built of the site's compiled reference and truth where it draws, never in its judge),
+    a map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     truth_program = _truth_program(truth_fn)
@@ -1787,6 +1759,15 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     truth_fn = truth_program
     # Each range's draws, every reference's, computed once for the stages of them all.
     ranges: dict[tuple[int, int], list[_Draws]] = {}
+    # The site's weighing where it draws (`weighing`), built once, and the seconds that took.
+    weighed: dict[str, object] = {}
+
+    def conditioning_now():
+        if weighing is not None and "of" not in weighed:
+            began = time.perf_counter()
+            weighed["of"] = weighing(reference_fn, truth_fn)
+            weighed["seconds"] = time.perf_counter() - began
+        return weighed.get("of")
 
     def drawn_for(index: int):
         def drawn(start, stop):
@@ -1794,7 +1775,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
             if (start, stop) not in ranges:
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
-                               terms_fn=terms_fn, label=label, examples=examples, conditioning=weighing)
+                               terms_fn=terms_fn, label=label, examples=examples,
+                               conditioning=conditioning_now())
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -1802,7 +1784,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto):
+    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed):
         return
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:

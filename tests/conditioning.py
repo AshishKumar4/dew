@@ -15,11 +15,13 @@ on the well-conditioned rest shows, and one on the amplified elements shows on t
 site's map tasks record both checks' draws, and check 2 is never weighed."""
 
 import dataclasses
+import hashlib
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import summed_as_run, widened
 from check1_statistics import Finding, GateFailure
 
 
@@ -130,6 +132,14 @@ class Conditioning:
     scale_of: Callable
     heavy: list | None = None
 
+    def digest(self) -> str:
+        """The classes' digest (`heavy`, each mask's shape and values), which every map task of a site
+        records and its judge holds one (`reference_error._pooled_draws`)."""
+        found = hashlib.sha256()
+        for mask in self.heavy or []:
+            found.update(b"none" if mask is None else repr(mask.shape).encode() + np.packbits(mask).tobytes())
+        return found.hexdigest()
+
     def at(self, cases) -> dict[int, Weighed]:
         """Each truth's weighing by its id, from `cases` of (truth, its inputs, its seed), a truth held
         twice weighed once."""
@@ -162,3 +172,17 @@ def _compacted(leaf: np.ndarray, mask: np.ndarray) -> dict:
         classes[name] = {int(count): rows[counts == count][held[counts == count]].reshape(-1, int(count))
                          for count in np.unique(counts[counts > 0])}
     return classes
+
+
+def conditioned(reference_fn, truth_fn, draw, seeds, scale_of: Callable) -> Conditioning:
+    """`reference_fn`'s conditioning (`Conditioning`): `scale_of` its rounding scale at a draw, and its heavy
+    elements over `seeds`' draws, each run as its arm runs (`summed_as_run`) beside its float64 truth,
+    `truth_fn`'s or its own, classed alike in every process that runs them (`heavy_masks`)."""
+    def ran_and_true(seed):
+        inputs = draw(seed)
+        with summed_as_run():
+            ran = jax.device_get(reference_fn(*inputs))
+        with jax.enable_x64(new_val=True):
+            return ran, jax.device_get((truth_fn or reference_fn)(*widened(inputs)))
+
+    return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
