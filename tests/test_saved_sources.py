@@ -120,9 +120,10 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     """Two real processes export a decoder whose kernels span both, every layer's attention extended by
     DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
     projection folded as it is written: each reads one tensor home at a time, together, so neither host's
-    resident memory rises during the export by half the model, where the pool reading the whole tree home
-    first rises by all of it, as the same measure over that tree held home shows on each host
-    (`saved_export_worker.resident_growth`, a 31 MB decoder of 256 KiB tensors): tracemalloc never saw the
+    resident pages rise during the export by half the model (1.4 to 4.3 MB of 31 MB on armada), where the
+    pool reading the whole tree home first rises past half (18 to 37 MB), and the same measure over that
+    tree held home rises at least half of it on each host, so the measure sees the bytes in that run
+    (`saved_export_worker.resident_growth`, a decoder of 256 KiB tensors): tracemalloc never saw the
     buffers a tensor is read home into, and held a 1.3 MB decoder's export to its own fixed cost, which
     CI's process state crossed (ledger 3794). The publishing process writes the tensors one process
     writes of the same weights unplaced, byte for byte, though the restored tree's key order may place

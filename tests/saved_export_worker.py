@@ -68,12 +68,13 @@ def _status(field: str) -> int:
 
 @contextlib.contextmanager
 def resident_growth(into: list[int]) -> Iterator[None]:
-    """How far this process's resident memory rises above where it starts within the block, appended to
+    """How far this process's resident pages rise above where they start within the block, appended to
     `into`: Linux's high-water mark (`VmHWM`) reset at the start (/proc/self/clear_refs), after a
     collection and glibc's return of its free pages (`malloc_trim`), so pages a freed allocation left
-    resident do not hide one that reuses them. It counts every allocation the host makes, XLA's buffers
-    a tensor read home is held in among them, which tracemalloc, counting Python's and NumPy's alone,
-    never sees (ledger 3794)."""
+    resident do not hide one that reuses them. The pages XLA's buffers newly take are among them, the
+    buffers a tensor is read home into, which tracemalloc, counting Python's and NumPy's allocations
+    alone, never sees (ledger 3794); storage another allocator keeps from before the block and reuses is
+    not, which the export's test checks against by the same measure over the whole tree held home."""
     gc.collect()
     ctypes.CDLL(None).malloc_trim(0)
     Path("/proc/self/clear_refs").write_text("5")
@@ -122,19 +123,26 @@ def exported(args) -> dict:
         refused = True
     run = SimpleNamespace(objective=SimpleNamespace(saved_task=None))
 
-    def export(exported, name: str) -> None:
+    def restoring(exported) -> None:
+        """`export_run`'s model from here on: `exported`, which the run's restore stands in for."""
         Pretrained.from_saved = classmethod(lambda cls, run, **options: exported)
+
+    def export(name: str) -> None:
         export_run(run, root / name, publishes=rank == 0)
 
     destination = root / f"release{rank}"
-    export(bundle, destination.name)
+    restoring(bundle)
+    export(destination.name)
     # The deeper decoder exported once before it is measured, a copy built apart so nothing the measured
     # one holds is left from it: the measured export finds its programs compiled and its modules imported.
-    export(built(DEEP)[4], f"warm{rank}")
+    # The copy is released, its restore replaced, before the measure starts, not freed within it.
+    restoring(built(DEEP)[4])
+    export(f"warm{rank}")
     _, _, deep, _, deep_bundle = built(DEEP)
+    restoring(deep_bundle)
     growth: list[int] = []
     with resident_growth(growth):
-        export(deep_bundle, f"deep{rank}")
+        export(f"deep{rank}")
     # The same measure over the deeper decoder's whole tree held home, every process taking part as the
     # export's reads do: it sees what a host holding the model holds.
     with resident_growth(growth):
