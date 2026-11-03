@@ -12,8 +12,10 @@ What the recorder logs is everything the process executed, read, imported and st
 writes how collection found each file (`DEW_COLLECTED`), which accounts for a file whose every test the
 selection set aside, and which tests carry the marks a row names (`whole_suite`, `release_env`)."""
 
+import faulthandler
 import json
 import os
+import signal
 import sys
 
 import lifetime
@@ -22,6 +24,14 @@ from session import MARKS
 
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
+
+# Every thread's stack written to the stderr the task reads into its row when its deadline passes, on the
+# SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call site, one in collection or
+# a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03: a group stalled 28 minutes
+# in a read with no deadline, its row saying only that no tests ran). Registered here, before pytest captures
+# fd 2, on a copy of it that capture leaves alone. No timer: a dump that kills the process, as walking a
+# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped.
+faulthandler.register(signal.SIGUSR2, file=os.dup(sys.stderr.fileno()), all_threads=True)
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none

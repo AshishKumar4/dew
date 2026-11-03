@@ -99,6 +99,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -109,6 +110,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -116,7 +118,7 @@ import time
 import tomllib
 import types
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
@@ -1482,6 +1484,19 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
     return []
 
 
+def task_files(out: Path) -> tuple[Path, Path, Path, Path]:
+    """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
+    recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
+    has exited (`record`); how collection found each file (executed.py); pytest's report; and the files the
+    durations record does not wholly name (split.py)."""
+    log, collection, report, unrecorded = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json"))
+    for stale in (report, log, collection, unrecorded):
+        stale.unlink(missing_ok=True)
+    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
+    return log, collection, report, unrecorded
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1499,14 +1514,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
-    # group has exited (`record`).
-    log = out.with_name(f"{out.name}.lifetime.log")
-    collection = out.with_name(f"{out.name}.collected.json")
-    report = out.with_name(f"{out.name}.junit.xml")
-    for stale in (report, log, collection):
-        stale.unlink(missing_ok=True)
-    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
+    log, collection, report, unrecorded = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1519,7 +1527,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
-                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
+                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
+                                              "DEW_UNRECORDED": str(unrecorded)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1541,6 +1550,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         expired = True
+        # Every thread's stack as pytest stands at its deadline, written to its output before the interrupt
+        # below (executed.py registers SIGUSR2).
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(done.pid, signal.SIGUSR2)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
@@ -1587,7 +1600,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
+                     # Long enough to hold a stall's stacks, which come before its interrupt's report.
+                     "output": "\n".join(red + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
@@ -1600,7 +1614,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone.
-        record(python, ran, log, common, network, opened)
+        record(python, ran, log, common, network, opened,
+               set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
 
 
@@ -1651,7 +1666,7 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
-           opened: set[str] | None = None) -> None:
+           opened: set[str] | None = None, unkeyed: Container[str] = ()) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -1676,7 +1691,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
-        key = cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"]) if green else None
+        # A group of a file the durations record does not wholly name (`unkeyed`, split.py) keeps no key: the
+        # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
+        key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
+               if green and name not in unkeyed else None)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
@@ -1686,7 +1704,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             written(record_key(python, row_["name"], held), token, body)
             # The run of exactly these inputs, kept by their key (`green_key`): a green one, or a red one,
             # which replaces a green row of the same inputs so no later run reuses it (a flaky red).
-            ran_on = key if key is not None else None if ran["depends"] is None else cache_key(
+            ran_on = key if key is not None else None if ran["depends"] is None or green else cache_key(
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)

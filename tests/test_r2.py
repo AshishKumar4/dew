@@ -1,9 +1,11 @@
 """tools/armada/r2.py, the R2 Worker's one client, against the stand-in Worker (conftest's cache_worker): an
 object round-trips, a miss is None, a listing pages to its end, a key or a body the Worker's contract refuses
-never reaches it, and an answer cut short is no object."""
+never reaches it, and an answer cut short, or arriving too slowly, is no object."""
 
+import contextlib
 import http.server
 import threading
+import time
 
 import pytest
 from remote_cache import r2
@@ -103,3 +105,38 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_he
             assert (reply.status, reply.headers["Content-Length"], reply.body) == (200, "100", None)
     finally:
         server.shutdown()
+
+
+def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline():
+    """A Worker that sends its answer's body a few bytes at a time, each within the socket's timeout, gave
+    no object in time: its read is `Unavailable` at `timeout` plus its length at `MIN_RATE`, each receive
+    waiting at most what is left of that, never after the whole trickle's 12.8 s (2026-11-03: a test cache's
+    bundle read 28 minutes before its group's first test)."""
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(64 * 64))
+            self.end_headers()
+            # Written until the client gives up on it, which closes the connection.
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                for _ in range(64):
+                    self.wfile.write(b"x" * 64)
+                    self.wfile.flush()
+                    time.sleep(0.2)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=1)
+        began = time.monotonic()
+        with pytest.raises(r2.Unavailable):
+            store.get("records/slow")
+        assert time.monotonic() - began < 3
+    finally:
+        server.shutdown()
+
