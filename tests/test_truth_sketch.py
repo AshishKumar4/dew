@@ -1,34 +1,46 @@
 """The sketch a recording keeps of each float64 truth leaf (tests/reference_error.py `truth_sketch`): its
-definition, bit for bit."""
+definition, bit for bit where every block sums exactly in any order."""
 
 import math
 
 import numpy as np
 import pytest
 
+DRAWN = {
+    "float64": lambda rng, size: rng.integers(-(1 << 40), 1 << 40, size) * 2.0 ** -20,
+    "float32": lambda rng, size: (rng.integers(-(1 << 23), 1 << 23, size) * 2.0 ** -12).astype(np.float32),
+    "float16": lambda rng, size: rng.standard_normal(size).astype(np.float16),
+    "int32": lambda rng, size: rng.integers(-(1 << 31), (1 << 31) - 1, size, dtype=np.int32),
+    "bool": lambda rng, size: rng.integers(0, 2, size).astype(bool),
+}
+"""A truth of each dtype the sketch takes (it reads every one as float64), its entries spanning at most 46
+bits of one scale (float16's every value, its subnormals among them), so each block's 64 signed entries
+sum exactly in float64 in any order: the sketch is then its exact sum, whatever order a host takes a block
+in, and any other sign, block or padding is seen bit for bit. Its rounding where a block does not sum
+exactly is held within `sketch_rounding` by tests/test_reference_error.py
+(`test_a_truths_sketch_is_its_exact_signed_sums_within_its_rounding`), where the gate's own comparisons
+are."""
 
-@pytest.mark.parametrize("size", [1, 63, 64, 65, (1 << 16) + 70])
-def test_a_truths_sketch_is_its_signed_block_sums_summed_exactly(size):
-    """The sketch a recording keeps is its definition, bit for bit: each entry times each of its SKETCH
-    signs (its sign word's bits), summed in blocks of SKETCH_BLOCK in order (a block past the end padded
-    with zeros), the blocks' sums summed exactly, over chunks of 2^16 entries; at a block's and a
-    chunk's edges, with signed zeros and subnormals among the entries, so a recorded sketch stays a
-    recomputed truth's."""
-    from reference_error import SKETCH, SKETCH_BLOCK, _sign_bits, truth_sketch
+
+@pytest.mark.parametrize("dtype", DRAWN)
+@pytest.mark.parametrize("size", [1, 63, 64, 65, 3000, (1 << 16) + 70])
+def test_a_truths_sketch_is_its_signed_sums(size, dtype):
+    """The sketch a recording keeps is its definition, bit for bit where each block sums exactly
+    (`DRAWN`): each entry times each of its SKETCH signs (its sign word's bits, +1 where set), every
+    block of SKETCH_BLOCK summed (a block past the end padded with zeros) and the blocks' sums summed
+    exactly, which is then every product summed exactly. At a block's and a host chunk's edges, with
+    signed zeros among a floating truth's entries, so a recorded sketch stays a recomputed truth's."""
+    from reference_error import SKETCH, _sign_bits, truth_sketch
 
     rng = np.random.default_rng(size)
-    truth = rng.normal(size=size)
-    truth[::7] = -0.0
-    truth[1::11] = 2.0 ** -1060
+    truth = DRAWN[dtype](rng, size)
+    if np.issubdtype(truth.dtype, np.floating):
+        truth[::7] = -0.0
+    if truth.dtype == np.float16:
+        truth[1::11] = np.finfo(np.float16).smallest_subnormal
     signs = ((_sign_bits(size, 5)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
-    blocks = []
-    for start in range(0, size, 1 << 16):
-        chunk = truth[start:start + (1 << 16), None] * signs[start:start + (1 << 16)]
-        chunk = np.concatenate([chunk, np.zeros((-len(chunk) % SKETCH_BLOCK, SKETCH))])
-        blocks.append(chunk.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-    stacked = np.concatenate(blocks)
-    defined = np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
-    np.testing.assert_array_equal(truth_sketch(truth, 5), defined)
+    exact = [math.fsum(column) for column in (truth.astype(np.float64)[:, None] * signs).T.tolist()]
+    assert truth_sketch(truth, 5).tolist() == exact
 
 
 def test_a_devices_block_sums_are_the_hosts_where_each_block_sums_exactly():

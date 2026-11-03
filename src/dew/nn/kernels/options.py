@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import functools
 import threading
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
@@ -159,6 +160,19 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
+_PROGRAMS: weakref.WeakSet[OuterProgram] = weakref.WeakSet()
+"""Every program alive (`OuterProgram`), whose executables `release` drops."""
+
+
+def release() -> None:
+    """Drop every live program's compiled executables (`OuterProgram.released`), as `jax.clear_caches`
+    drops jit's own: XLA:CPU maps each executable's code into the process, and a program keeps up to
+    `OuterProgram.CACHED` of them for as long as it lives, past a cache JAX clears. A process that compiles
+    on and on (a test suite) frees the mappings this way; each program compiles again at its next call."""
+    for program in list(_PROGRAMS):
+        program.released()
+
+
 class OuterProgram:
     """`function` jitted (`jax.jit`, under `arguments`), every compile of it read through the kernel
     templates' reports (`dew.nn.kernels.templates.report.compiled`): where a launch's kernel spills, its
@@ -189,6 +203,13 @@ class OuterProgram:
         # costs its key and one lookup (row 3326).
         self._ready: dict[Hashable, jax.stages.Compiled] = {}
         self._compiling = threading.Lock()
+        _PROGRAMS.add(self)
+
+    def released(self) -> None:
+        """Drop every executable it keeps (`release`), each compiled again at its next call."""
+        with self._compiling:
+            self._ready.clear()
+            self._executables.clear()
 
     def _jitted(self) -> jax.stages.Wrapped:
         """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""

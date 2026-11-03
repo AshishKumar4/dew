@@ -29,7 +29,7 @@ from diffusion_stubs import StubText
 from diffusion_support import images_of
 from flax import linen as nn
 from jepa_cases import MASK
-from map_judge import drawing
+from map_judge import judging, pooled_units, record_units
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -420,8 +420,9 @@ UNET_CELLS = cells_of("unet")
 HIERARCHICAL_MMDIT_CELLS = cells_of("hierarchical_mmdit")
 QWEN35_CELLS = cells_of("causal_transformer+qwen35")
 """The cases whose layout cells' draws run as armada's map tasks (`check1_shards`), each a test of its own
-with the seeds a task draws within 120 s on one core: a map task records its draws alone (70 to 93 s
-fixed, `map_judge.drawing`), its judge runs the cell whole but for them (row 2788)."""
+with the seeds a task draws within 120 s on one core: a map task records its draws (70 to 93 s fixed,
+`map_judge.drawing`), and the one that draws an arm's placed seed checks that arm's `fit` beside them
+(`assert_fits_as_drawn`), so the judge pools records and trains nothing (rows 2788, 3730)."""
 
 SHARDED_CELLS = [*THREE_D_UNET_CELLS, *UNET_CELLS, *HIERARCHICAL_MMDIT_CELLS, *QWEN35_CELLS]
 UNSHARDED_CELLS = [cell for cell in LAYOUT_CELLS if cell not in SHARDED_CELLS]
@@ -512,39 +513,65 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
     mesh = LAYOUTS[layout]
     drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
              layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
-    # A map task of a sharded cell (`map_judge.drawing`) records its draws alone: the fits (each its run
-    # and the state it fitted), their bits and their placement are its judge's, which runs the cell whole
-    # but for the draws it pools.
-    fits = () if drawing() else (
-        run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)[:2],
-        run_case(case, tmp_path, mesh, state=copied(), steps=steps)[:2])
-    # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
-    # the cell's own batch in its own order, whatever selection margin a draw then asks.
-    own = (next(batches(case, encoder)()), np.arange(width))
-    for (run, fitted), stepped in zip(fits, list(drawn.values())[:len(fits)], strict=True):
-        ours, stored = stepped(*own), run.stored(fitted)
-        for name, tree in ours.items():
-            held = jax.device_get(getattr(stored, name))
-            assert jax.tree.structure(tree) == jax.tree.structure(held), name
-            for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
-                mine, theirs = np.asarray(mine), np.asarray(theirs)
-                assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
-                assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
     truth = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps, exact=True)
     # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
-    assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
-                    seeds=seeds, truth_fn=truth, orders=orders)
-    if drawing():
+    label = f"{case.name} {layout}, {steps} step(s)"
+    # Each arm's steps on the cell's own batch in its own order, run first, so each compiles here as `fit`
+    # compiles its own and not under the draws' contexts: what `fit` is checked against.
+    own = (next(batches(case, encoder)()), np.arange(width))
+    ran = {} if judging() else {arm: stepped(*own) for arm, stepped in drawn.items()}
+    assert_as_exact(drawn[layout], drawn["one device"], draw, label, seeds=seeds, truth_fn=truth,
+                    orders=orders)
+    fits = f"{label}: fit's own steps and placement"
+    if judging():
+        # The map tasks ran `fit` on each arm and checked it (`assert_fits_as_drawn`), the one device's
+        # beside the draw of seed 0 and the layout's beside the draw of the last declared seed: the judge
+        # pools their word that each held, and trains nothing.
+        held = sorted(arm for _, _, arms in pooled_units(fits) for arm in arms)
+        assert held == sorted(drawn), f"{fits}: the map tasks held {held}, not every arm"
         return
-    state = fits[1][1]
+    arms = {"one device": (MeshSpec(), 1, 0), layout: (mesh, None, seeds - 1)}
+
+    def checked(start: int, stop: int) -> list[str]:
+        """The arms whose fit a map task of seeds `start` to `stop` checks: each beside the draw it is
+        placed with, so no task trains both."""
+        placed = [arm for arm, (_, _, seed) in arms.items() if start <= seed < stop]
+        for arm in placed:
+            assert_fits_as_drawn(case, tmp_path, arms[arm][0], arms[arm][1], copied(), steps, ran[arm],
+                                 placed=arm == layout)
+        return placed
+
+    if not record_units(fits, checked):
+        checked(0, seeds)
+
+
+def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: int, ours, *, placed: bool):
+    """`fit`'s own `steps` steps of `case` on `mesh` from `state`, on the cell's own batch in its own order,
+    leave the variables, momentum and EMA the drawn steps leave on it (`ours`), bit for bit: what check 1
+    judges is the run's. Where `placed`, the state it returns, and the one an Adam step holds
+    (`place`), keep the layout's placement: no parameter sharded on a 1-wide fsdp axis, each fsdp leaf its
+    shard of the global parameter (a pipelined leaf stacked by stage, each stage on its own devices), and
+    the optimizer's state and the EMA following the parameters without the optimizer or the model ever
+    describing a layout."""
+    run, fitted = run_case(case, tmp_path, mesh, devices=devices, state=state, steps=steps)[:2]
+    stored = run.stored(fitted)
+    for name, tree in ours.items():
+        held = jax.device_get(getattr(stored, name))
+        assert jax.tree.structure(tree) == jax.tree.structure(held), name
+        for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
+            mine, theirs = np.asarray(mine), np.asarray(theirs)
+            assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+            assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
+    if not placed:
+        return
     if mesh.fsdp == 1:
-        assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
+        assert not fsdp_leaves(fitted.variables), "nothing may shard on a 1-wide fsdp axis"
         return
     # The state fit returns, every layer whole, and the one the step holds (`place`), a pipelined run's
     # leaf stacked by stage, each stage's layers on its own devices.
-    placed = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0]
-    for held in (state, placed):
+    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0]
+    for held in (fitted, adam):
         sharded = fsdp_leaves(held.variables)
         assert sharded, "no parameter was sharded over the fsdp axis"
         for param in sharded:
@@ -553,11 +580,11 @@ def assert_trains_on_the_layout_as_on_one_device(case, steps, layout, tmp_path):
                 "shard is not the fsdp axis's part of the global parameter"
     # The optimizer's state and the EMA copy follow the params they track,
     # without the optimizer or the model ever describing a layout.
-    param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
-    assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state[0].trace)]
-    assert {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)} <= set(param_specs)
-    placed_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(placed.variables["params"])]
-    for moment in (placed.opt_state[0].mu, placed.opt_state[0].nu):
+    param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(fitted.variables["params"])]
+    assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(fitted.opt_state[0].trace)]
+    assert {leaf.sharding.spec for leaf in jax.tree.leaves(fitted.ema)} <= set(param_specs)
+    placed_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(adam.variables["params"])]
+    for moment in (adam.opt_state[0].mu, adam.opt_state[0].nu):
         assert placed_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
 
 

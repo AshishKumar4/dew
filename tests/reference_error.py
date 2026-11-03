@@ -734,18 +734,18 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
 
 
 def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
-    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host: each entry times
-    each of its signs, summed in blocks of SKETCH_BLOCK over chunks of 2^16 entries, the last block padded
-    with zeros."""
+    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host, the last block
+    padded with zeros: a block's entries summed by each sign byte's value (`np.bincount`) times its eight
+    signs (`_BYTE_SIGNS`), one order of its exact products, within gamma(SKETCH_BLOCK) (ledger 2807)."""
     partials = []
-    for start in range(0, flat.size, 1 << 16):
-        chunk = flat[start:start + (1 << 16)]
+    for start in range(0, flat.size, 1 << 12):
+        chunk = flat[start:start + (1 << 12)]
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
-        # order, so the first byte holds bits 0 to 7.
+        # order, so the first byte holds bits 0 to 7. An entry's bins: its block's, its byte's, the value's.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
-        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
-        np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
-        partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
+        bins = (np.arange(chunk.size)[:, None] // SKETCH_BLOCK * 4 + np.arange(4)) * 256 + words
+        summed = np.bincount(bins.reshape(-1), np.repeat(chunk, 4), -(-chunk.size // SKETCH_BLOCK) * 1024)
+        partials.append((summed.reshape(-1, 256) @ _BYTE_SIGNS).reshape(-1, SKETCH))
     return np.concatenate(partials)
 
 
