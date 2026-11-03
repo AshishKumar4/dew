@@ -348,7 +348,8 @@ def _span(jaxpr, start: int, stop: int):
                       if not isinstance(var, Literal) and var not in written and var not in reads
                       and var not in platforms]
             written.update(equation.outvars)
-        picked = {var for equation in run for var in equation.invars if var in platforms}
+        picked = {var for equation in run for var in equation.invars
+                  if not isinstance(var, Literal) and var in platforms}
         kept = [var for equation in run for var in equation.outvars
                 if last.get(var, len(jaxpr.eqns)) >= stop]
         freed = [var for var in reads if start <= last.get(var, -1) < stop]
