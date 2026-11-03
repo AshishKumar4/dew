@@ -57,10 +57,6 @@ WITNESS = SITE.replace("@pytest.mark.check1_shards(seeds=4, per_task=8)",
 given them as a check-1 site's map tasks are given their seeds."""
 KINDS = pytest.mark.parametrize("site", [SITE, WITNESS], ids=["check1_shards", "shards"])
 """Each kind of site, the same file."""
-MARKED = pytest.mark.parametrize(("site", "per_unit"), [(SITE, 10.0), (WITNESS, 2.0)],
-                                 ids=["check1_shards", "shards"])
-"""Each kind of site, with the seconds a unit weighs before armada times its map tasks: the site's recorded
-40 s over the 4 seeds a whole check-1 run declares, or over a `shards` test's 20 units."""
 
 RED_SITE = """
 
@@ -121,9 +117,9 @@ def runs(root: Path) -> list[int]:
             for path in (root / "runs-light", root / "runs-draws", root / "runs-judge")]
 
 
-@MARKED
+@KINDS
 def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_waits_on_them(
-        ci, tmp_path, monkeypatch, site, per_unit):
+        ci, tmp_path, monkeypatch, site):
     """A test marked check1_shards(seeds=4, per_task=8) plans map tasks of at most 8 of the 20 seeds check
     1's two stages draw (seeds 0 to (1 + REDRAW) times 4), its first stage's 4 apart and its second's
     later, run only where its judge's first judgement asks for them (armada's `later`), and one marked
@@ -131,9 +127,8 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
     `<test>.draws-<start>-<stop>`, and one judge waiting on them by their names, whose row is the site's,
     `<file>#<test>`; the file's own row sets the site aside, weighed and cut without its seconds. A map
     task weighs what armada measured it at, else its units at the rate of the site's measured map tasks,
-    else its units at the site's recorded seconds over the units a whole run takes (a check-1 site's
-    declared seeds, a `shards` test's units); the judge, its row's pooling as armada measured it, else the
-    target; a cold plan adds what a cold task pays to each."""
+    else the target; the judge, its row's pooling as armada measured it, else the target; a cold plan adds
+    what a cold task pays to each."""
     site_checkout(tmp_path, site)
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"]
     check1 = site is SITE
@@ -143,8 +138,7 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
              entry["weight"], entry.get("later", False)) for entry in entries] == [
         ("3.12-1", "tests/test_site.py", "", ["3.12:tests/test_site.py"], None, 1.0, False),
         *((name, "tests/test_site.py", f"test_site.draws-{start}-{stop}",
-           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, per_unit * (stop - start),
-           check1 and start >= 4)
+           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, 30.0, check1 and start >= 4)
           for name, (start, stop) in zip(names, spans, strict=True)),
         (ci.site_task("3.12", "tests/test_site.py", "test_site"), "tests/test_site.py", "test_site", None,
          names, 30.0, False)]
@@ -159,8 +153,7 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
     assert weighed[ci.site_task("3.12", "tests/test_site.py", "test_site")] == 3.0
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
     cold = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"}
-    assert [cold[name] for name in names] == [(stop - start) * per_unit + ci.COLD_SECONDS
-                                              for start, stop in spans]
+    assert [cold[name] for name in names] == [30.0 + ci.COLD_SECONDS] * len(spans)
 
 
 def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_of_its_judge(ci, tmp_path):
@@ -177,6 +170,21 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
     names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
     weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": {names[0]: 40.0}})}
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
+
+
+def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
+        ci, tmp_path):
+    """A site the last run reused ran no map task, so armada keeps no measure of any (it keeps what a run
+    named); the durations record holds its judge's pooling, 2 s here, no measure of its draws. Each of its
+    map tasks then weighs the target, never the record's seconds over its seeds, which would size a later
+    wave of 85 s tasks as if each took a second."""
+    site_checkout(tmp_path)
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
+    spans = [(0, 4), (4, 12), (12, 20)]
+    names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
+    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {})}
+    assert [weighed[name] for name in names] == [30.0, 30.0, 30.0]
 
 
 def test_a_weighed_sites_units_are_map_tasks_of_their_own_past_its_unweighted_ones(ci, tmp_path):
@@ -479,7 +487,7 @@ def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_nev
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):
     """The durations fold sets a site's judge row aside, its pooling no measure of its draws, and keeps the
-    site's recorded seconds, which weigh its map tasks before armada times them; a judge armada did not run
+    site's recorded seconds as they were; a judge armada did not run
     (a row of its task's name) is no file's. The file's cut reads its own rows, neither a map task's seconds,
     which armada keeps under the task's name, nor its judge's, and a Python without them borrows none. The
     verdict is of the checkout's own commit, so the fold reads its file as unchanged since the verdict ran."""
