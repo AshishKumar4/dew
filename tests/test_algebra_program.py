@@ -645,3 +645,20 @@ def test_windows_apart_in_a_literal_or_a_shape_are_derived_apart(monkeypatch):
         np.testing.assert_allclose(jax.jit(algebra.rewritten(scaled(scale)))(*operands_),
                                    scaled(scale)(*operands_), rtol=1e-6)
     assert len(built) == 3
+
+
+def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_devices(monkeypatch):
+    """A window's values' placement is part of what derives it: one program traced over one device's values
+    and again over values an explicit mesh shards takes a derivation each, and the sharded one runs and
+    computes what its program computes (the matrix's explicit layouts after their one-device reference)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    built = _graphs_built(monkeypatch)
+    operands_ = rows(9, (4, 56), (4, 56), (4, 56))
+    whole = jax.jit(algebra.rewritten(two_sums))(*operands_)
+    mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        placed = [jax.device_put(operand, NamedSharding(mesh, P("data", None))) for operand in operands_]
+        sharded = jax.jit(algebra.rewritten(two_sums))(*placed)
+    assert len(built) == 2
+    np.testing.assert_allclose(np.asarray(sharded), np.asarray(whole), rtol=1e-6)
