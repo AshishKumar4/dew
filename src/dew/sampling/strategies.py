@@ -610,8 +610,10 @@ class Speculative:
     block and the accepted prefix is replayed into it, because a recurrent
     mixer's state is a running summary that no cursor can rewind. The
     prediction cache is rebuilt the same way. A block that continues emits
-    two or more tokens unless the budget ends first, so `ceil(budget / 2)`
-    iterations bound the loop.
+    two or more tokens unless the budget ends first, or one where a row walks
+    across a cache rebuild (`block_step`), in at most `block` blocks, so
+    `ceil(budget / 2)` iterations bound the loop, `ceil((budget + block) / 2)`
+    where the model's caches rebuild.
 
     `confidence` stops the draft after the first candidate to which the
     draft itself gives a probability below `confidence`, as the reference's
@@ -971,6 +973,10 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     empty = Draws(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
                   jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
                   jnp.zeros(rows, bool))
-    out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=-(-budget // 2))[0].out
+    # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
+    # most `block_size` blocks.
+    walks = 0 if ops.rebuild_position is None else min(block_size, budget)
+    blocks = -(-(budget + walks) // 2)
+    out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),
                                raw_log_probs=jnp.where(out.valid, out.raw_log_probs, 0.0))

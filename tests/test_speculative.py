@@ -120,33 +120,22 @@ def greedy_walk(model, params, prompts, steps: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
-def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
+def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, monkeypatch):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
-    walk (`greedy_walk`), each row crossing it in the replay of what a block emits."""
-    model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
-    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompts)
-    speculated = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                          strategy=Speculative(block=3))
-    walked = greedy_walk(model, params, prompts, 6)
-    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
-    np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
-
-
-@pytest.mark.parametrize("kind", ["attention", "dspark"])
-def test_a_speculative_block_across_a_longrope_change_compiles_one_rebuild(kind, monkeypatch):
-    """A block's candidates cross no LongRoPE change: a row they would cross keeps none and draws its one
-    token as the walk does (`strategies.block_step`), so a speculative decode traces the rebuild, a whole
-    prefill of the history, once, in the replay of what its block emits, where the candidates' verify
-    traced it again (ledger 3703: 27 s of the DSpark program's compile on CPU), and still draws the walk."""
+    walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
+    (`strategies.block_step`), crossing in the replay of what the block emits, so a decode traces the
+    rebuild, a whole prefill of the history, once (ledger 3703: the candidates' verify traced it again,
+    27 s of the DSpark program's compile on CPU); a prompt that starts so walks a token a block and still
+    fills its budget."""
     from dew.nn.kernels import options
     from dew.sampling import text
 
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
-    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompts)
-    walked = greedy_walk(model, params, prompts, 6)
+    cases = [(jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32), 6),
+             (jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32), 2)]
+    params = jax.jit(model.init)(jax.random.key(0), cases[0][0])
+    walks = [greedy_walk(model, params, prompts, steps) for prompts, steps in cases]
     rebuilds = []
     rebuilt = text._rebuilt
 
@@ -155,13 +144,16 @@ def test_a_speculative_block_across_a_longrope_change_compiles_one_rebuild(kind,
         return rebuilt(*arguments, **keywords)
 
     monkeypatch.setattr(text, "_rebuilt", counted)
-    # The decode traced afresh, whatever this process compiled before.
-    options.release()
-    jax.clear_caches()
-    speculated = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                          strategy=Speculative(block=3))
-    assert len(rebuilds) == 1
-    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
+    for (prompts, steps), walked in zip(cases, walks, strict=True):
+        # Each decode traced afresh, whatever this process compiled before.
+        options.release()
+        jax.clear_caches()
+        traced = len(rebuilds)
+        speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
+                              sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+        assert len(rebuilds) == traced + 1
+        np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:], walked)
+        np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
 
 def stretch_verified(model, params, depths):
