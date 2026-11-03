@@ -18,8 +18,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   where the layout search had run past ten minutes; and a step compiled ahead for an H100 on a host with
   another GPU attached (an A100) is held to the H100's shared memory, not the attached GPU's, which had
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
-  its body on every Pallas backend (docs/installation.md lists each fix). The `cuda12` and `cuda13` extras keep
-  the post45 CUDA and PJRT plugins: post46 to post49 changed Python alone, and their native code is the same.
+  its body on every Pallas backend (docs/installation.md lists each fix). The `cuda12` and `cuda13` extras
+  keep the post45 CUDA and PJRT plugins: post46 to post49 changed Python alone, and their native code is the
+  same.
 - A step compiled ahead with its frontier (`--trainer.compile-ahead.frontier`) lists, where the plan or the
   frontier reaches the remat ladder's top ('full'), its sibling that keeps what 'minimal' saves in pinned host
   memory ('minimal_offloaded') at the same split. It holds as many device bytes as 'full', so the planner
