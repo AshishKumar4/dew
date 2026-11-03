@@ -130,9 +130,10 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
     shards(units=20, per_task=8) of at most 8 of its 20 units, none later, each its test's own group,
     `<test>.draws-<start>-<stop>`, and one judge waiting on them by their names, whose row is the site's,
     `<file>#<test>`; the file's own row sets the site aside, weighed and cut without its seconds. A map
-    task weighs what armada measured it at, else its units at the site's recorded seconds over the units a
-    whole run takes (a check-1 site's declared seeds, a `shards` test's units); the judge, its row's
-    pooling as armada measured it, else the target; a cold plan adds what a cold task pays to each."""
+    task weighs what armada measured it at, else its units at the rate of the site's measured map tasks,
+    else its units at the site's recorded seconds over the units a whole run takes (a check-1 site's
+    declared seeds, a `shards` test's units); the judge, its row's pooling as armada measured it, else the
+    target; a cold plan adds what a cold task pays to each."""
     site_checkout(tmp_path, site)
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"]
     check1 = site is SITE
@@ -148,10 +149,12 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
         (ci.site_task("3.12", "tests/test_site.py", "test_site"), "tests/test_site.py", "test_site", None,
          names, 30.0, False)]
     assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", entry["name"]) for entry in entries)
-    # Weighed by what armada measured: a map task under its task's name, the judge under its row's.
+    # Weighed by what armada measured: a map task under its task's name, the judge under its row's, and an
+    # unmeasured map task at the measured ones' rate.
     measured = {names[0]: 7.0, "3.12:tests/test_site.py#test_site": 3.0}
     weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": measured})}
-    assert [weighed[name] for name in names] == [7.0, *(per_unit * (stop - start)
+    first = spans[0][1] - spans[0][0]
+    assert [weighed[name] for name in names] == [7.0, *(7.0 / first * (stop - start)
                                                           for start, stop in spans[1:])]
     assert weighed[ci.site_task("3.12", "tests/test_site.py", "test_site")] == 3.0
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
@@ -166,8 +169,7 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
     one its judge has not asked for since) weighs its units at the rate of the site's map tasks armada
     measured, which its first stage, run every time, always is; so a later wave's 8-seed tasks of a site
     whose first 4 seeds took 40 s weigh 80 s each, and armada gives the wave containers for what they take,
-    never the 2 s judge's seconds over the site's seeds (2026-11-03: 267 later tasks of about 85 s each,
-    weighed under 1 s, were given 48 containers and ran 10 minutes)."""
+    never the 2 s judge's seconds over the site's seeds."""
     site_checkout(tmp_path)
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
