@@ -13,6 +13,7 @@ records (check 1, tests/reference_error.py).
 """
 
 import json
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -508,8 +509,11 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
     packed batch, one array a site (`sessions.routing_of`), a call that continues it extending each
     site's record; it reads back from the journal and from verl's rows as written; and GRPO's packed
     scoring replays each site its own entry, scoring the tokens as a direct replay of the keyed record
-    does, on par from its float64 truth over drawn models and tokens (check 1, ledger 3630). A site
-    covering other ids than its draw forwarded, and a record naming no site, are refused."""
+    does, on par from its float64 truth over drawn models and tokens (check 1, ledger 3630). The record a
+    call holds is read only, sites and arrays, and pickles whole; a site covering other ids than its draw
+    forwarded, and a record naming no site, given or read from verl's row, are refused."""
+    import pickle
+
     from dew.inference.rollouts import Draw
     from dew.objectives.rl.grpo import GRPOObjective
     from dew.objectives.rl.records import draw_record, record_json
@@ -551,7 +555,7 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
     batch = pack([Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.0)], SEQ_LEN + 1)
     assert ROUTED_EXPERTS_KEY not in batch
     replayed_record = routing_of(batch)
-    assert isinstance(replayed_record, dict) and isinstance(second.routed_experts, dict)
+    assert isinstance(replayed_record, dict) and isinstance(second.routed_experts, Mapping)
     assert sorted(replayed_record) == sorted(record)
     for site, held in second.routed_experts.items():
         np.testing.assert_array_equal(replayed_record[site][0, :SEQ_LEN], held, err_msg=site)
@@ -559,16 +563,23 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
     written = Draw(second.prompt, second.tokens, second.behavior_log_probs, "length", 0,
                    routed_experts=second.routed_experts)
     journaled = draw_record(json.loads(record_json(written)), Sampling(temperature=1.0)).routed_experts
-    (verl,) = from_verl(json.loads(json.dumps(to_verl([Session("t", "g", 0, 0, (second,), Status.COMPLETED,
-                                                               1.0)]))))
-    for read in (journaled, verl.session.calls[0].routed_experts):
-        assert isinstance(read, dict) and sorted(read) == sorted(record)
+    rows = json.loads(json.dumps(to_verl([Session("t", "g", 0, 0, (second,), Status.COMPLETED, 1.0)])))
+    (verl,) = from_verl(rows)
+    pickled = pickle.loads(pickle.dumps(second)).routed_experts
+    for read in (journaled, verl.session.calls[0].routed_experts, pickled):
+        assert isinstance(read, Mapping) and sorted(read) == sorted(record)
         for site, held in second.routed_experts.items():
             np.testing.assert_array_equal(read[site], held, err_msg=site)
+    with pytest.raises(TypeError):
+        second.routed_experts[FEEDFORWARD_ROUTES] = second.routed_experts[FEEDFORWARD_ROUTES]
+    with pytest.raises(ValueError):
+        second.routed_experts[FEEDFORWARD_ROUTES][0, 0, 0] = 0
     short = {**second.routed_experts, FEEDFORWARD_ROUTES: second.routed_experts[FEEDFORWARD_ROUTES][:-1]}
     for refused in (short, {}):
         with pytest.raises(ValueError):
             Call(second.prompt, second.tokens, second.behavior_log_probs, "length", 0, routed_experts=refused)
+    with pytest.raises(ValueError):
+        from_verl([{**rows[0], "routed_experts": {}}])
 
 
 def test_a_multimodal_mixture_replays_through_its_language_model():

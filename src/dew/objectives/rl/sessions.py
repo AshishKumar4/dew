@@ -37,7 +37,6 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 from __future__ import annotations
 
 import itertools
-import json
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field, fields
@@ -902,17 +901,17 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     routed = {name: [*map(int, value.shape[2:]), value.dtype.name] for name, value in packed.items()
               if name == ROUTED_EXPERTS_KEY or name.startswith(f"{ROUTED_EXPERTS_KEY}/")}
     pool = from_every_process({"routing": routed or None, "support": SUPPORT_KEY in packed})
-    layouts = {json.dumps(share["routing"], sort_keys=True) for share in pool if share["routing"] is not None}
-    if len(layouts) > 1:
+    layouts = [share["routing"] for share in pool if share["routing"] is not None]
+    if any(layout != layouts[0] for layout in layouts[1:]):
         raise ValueError(f"the pool's routed_experts disagree on their sites, [layers, top_k] or dtype: "
-                         f"{sorted(layouts)}")
+                         f"{layouts}")
     if not packed:
         return packed
     shape = np.shape(packed[IDS_KEY])
     filled = dict(packed)
     if layouts and not routed:
         filled.update(_empty_routing(shape, {name: (tuple(held[:-1]), np.dtype(held[-1]))
-                                             for name, held in json.loads(layouts.pop()).items()}))
+                                             for name, held in layouts[0].items()}))
     if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
         filled.update(_empty_support(shape[0], support_capacity))

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.core import FrozenDict
 
 from dew._coordination import agreed, collective_host
 from dew._records import JSON, finite, record as section
@@ -106,12 +107,20 @@ replays it (`dew.nn.inputs.LayerInputs.experts`: `feedforward`, `mixer`, a compo
 
 
 def _routing(record: Routing, forwarded: int) -> Routing:
-    """`record` checked against a draw that forwarded `forwarded` ids (`Routing`), each array read only."""
+    """`record` checked against a draw that forwarded `forwarded` ids (`Routing`), its arrays and its
+    sites read only."""
     if not isinstance(record, Mapping):
         return _routed("routed_experts", record, forwarded)
+    return FrozenDict({site: _routed(f"routed_experts[{site!r}]", value, forwarded)
+                       for site, value in _sited(record).items()})
+
+
+def _sited[Held](record: Mapping[str, Held]) -> Mapping[str, Held]:
+    """A routing record keyed by site (`Routing`), refused unless it names one routed site's path a record,
+    at least one."""
     if not record or not all(isinstance(site, str) and site for site in record):
         raise ValueError("a routing record keyed by site names one routed site's path a record, at least one")
-    return {site: _routed(f"routed_experts[{site!r}]", value, forwarded) for site, value in record.items()}
+    return record
 
 
 def routing_rows(record: Routing) -> int:
@@ -138,7 +147,7 @@ def routing_record(value: object) -> Routing:
     """A routing record `routing_json` wrote, as `Draw` checks it: nested lists of expert ids, or an
     object of them by site."""
     if isinstance(value, Mapping):
-        return {site: np.asarray(held) for site, held in section(value, "routed_experts").items()}
+        return {site: np.asarray(held) for site, held in _sited(section(value, "routed_experts")).items()}
     if not isinstance(value, list):
         raise ValueError(f"routed_experts={value!r}: a routing record is nested lists of expert ids, or an "
                          f"object of them by routed site")

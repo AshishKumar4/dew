@@ -20,7 +20,13 @@ reals = functools.partial(listed, read=finite, what="a list of finite numbers")
 def record_json(value: Episode | Draw) -> str:
     """`value` as JSON, its fields as `asdict` writes them and a draw's routing as nested lists of
     expert ids: the text `episode_from_record` and `draw_record` read back."""
-    return json.dumps(asdict(value), allow_nan=False, default=np.ndarray.tolist)
+    return json.dumps(asdict(value), allow_nan=False, default=_json_leaf)
+
+
+def _json_leaf(value: np.ndarray | Mapping[str, np.ndarray]) -> list | dict[str, np.ndarray]:
+    """A record's leaf JSON writes no other way: an array as nested lists, a routing record keyed by site
+    (`dew.inference.rollouts.Routing`) as an object of them."""
+    return dict(value) if isinstance(value, Mapping) else value.tolist()
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:
