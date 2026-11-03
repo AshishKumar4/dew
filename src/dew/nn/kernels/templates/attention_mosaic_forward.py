@@ -104,9 +104,12 @@ def _persistent(program: _Program, spec: algebra.Forward, layout: tuple, q_ref, 
     first loads go out while its program's consumer finishes the last (`_consumer`, its walk the tile's):
     a launch of a program a query tile paid each program's ring's first tiles and its setup before its
     first product (row 2079's decode at 128 rows of 4096 keys, a program a row and key head: 1024 programs
-    over an H100's 132). `layout` how `_launched` lays its refs out (its read arrays' tree, its outputs'
-    count, its stages' count, whether the output stages through the query's stage, whether it finishes
-    its rows); `shape` its call's batch rows, padded queries, heads and key heads."""
+    over an H100's 132). A masked launch's tile its walks do not name (`_launch`'s `walks`) is inactive,
+    loading and writing nothing: its empty walks' launches of a program a tile took 18 us each at 128 rows
+    of 4096 keys on an H100 PCIe, nine waves of empty programs (ET-DECPROF4-h100). A guarded launch's tiles
+    read its live rows (`_Guard`). `layout` how `_launched` lays its refs out (its read arrays' tree, its
+    outputs' count, its stages' count, whether the output stages through the query's stage, whether it
+    finishes its rows); `shape` its call's batch rows, padded queries, heads and key heads."""
     treedef, outputs, arrays, reuse, finishes = layout
     batch, queries, heads, kv_heads = shape
     family, block_q = program.family, program.tiles.block_q
@@ -114,7 +117,7 @@ def _persistent(program: _Program, spec: algebra.Forward, layout: tuple, q_ref, 
     written, refs = refs[:outputs], refs[outputs:]
     (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
     out_smem = q_smem if reuse else stages[0]
-    spans_of, hooked_of, _, _, table_of, _, sources_of, block_of = treedef.unflatten(read)
+    spans_of, hooked_of, guard_of, _, table_of, walks_of, sources_of, block_of = treedef.unflatten(read)
     named = {"keys": k_ref, "values": v_ref}
     status_ref, out_ref, *finished_refs = written
     turn = functools.partial(family.turn, schedule, 1)
@@ -141,10 +144,16 @@ def _persistent(program: _Program, spec: algebra.Forward, layout: tuple, q_ref, 
 
         shifted = {name: (ref, functools.partial(from_first, tile_of))
                    for name, (ref, tile_of) in views.items()}
-        return hi > lo, hi - lo, shifted, (row, head, tile)
+        walked = hi > lo
+        if walks_of is not None:
+            walked = walked & (walks_of[row, lax.div(at.query_tile(tiles_q) * block_q, block_q)] != 0)
+        return walked, hi - lo, shifted, (row, head, tile)
 
     def consumer(index, at_tile, walk, store, *, active):
-        del store, active
+        del store
+        if walks_of is not None and not active:
+            # A masked launch's tile it does not walk: its outputs there unread (`algebra.walked_launches`).
+            return
         row, head, tile = at_tile
         at = program.persistent_tile(tile)
         first = at.query_tile(tiles_q) * block_q
@@ -155,7 +164,7 @@ def _persistent(program: _Program, spec: algebra.Forward, layout: tuple, q_ref, 
                     else None)
         _consumer(at, spec, index, q_ref.at[row, pl.ds(first, block_q), head], out_ref.at[rows], status,
                   q_smem.at[index], q_loaded.at[index], out_smem.at[index], row_smem.at[index], None,
-                  {"values": (v_ref, None)}, turn, (), first, spans_of, hooked_of, None,
+                  {"values": (v_ref, None)}, turn, (), first, spans_of, hooked_of, guard_of,
                   (row, head, lax.div(head, group)), hooks=hooks, residuals=None, interpret=interpret,
                   finished=finished, walker=walk)
 
@@ -940,9 +949,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     target = generation.gpu_target()
     programs = (query.shape[2] * -(-query.shape[1] // (tiles.consumers * tiles.block_q)) * splits
                 * query.shape[0])
-    persistent = (target.multiprocessors if guard is None and walks is None and not training and not peaks
-                  and tiles.consumers == 1 and target.multiprocessors and programs > target.multiprocessors
-                  else None)
+    persistent = (target.multiprocessors if not training and not peaks and tiles.consumers == 1
+                  and target.multiprocessors and programs > target.multiprocessors else None)
     return _launched(query, key, value,
                      (spans, hooked, guard, anchors, None if table is None else table[0], walks, sources,
                       block),
