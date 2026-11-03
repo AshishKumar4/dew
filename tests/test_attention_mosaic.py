@@ -1797,7 +1797,8 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
                 return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
             # The launches of the set alone, each as the walk runs it (`plain_launches`).
             alone = attention_mosaic_forward.plain_launches(
-                query, key, value, spans, hooked, scale=op.scale, natural=op.natural, tiles=config,
+                query, key, value, spans, template.Hooks() if hooked is None else hooked, scale=op.scale,
+                natural=op.natural, tiles=config,
                 interpret=False, rows=training is template.Kept.OUTPUT)
             chosen = [run for name, run in alone.items() if ("guarded" in name or "again" in name)
                       == (launches == "guarded")]
