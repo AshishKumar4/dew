@@ -75,7 +75,7 @@ from egglog import (
 )
 from jax.extend import core as jcore
 
-from dew.algebra import cost, terms
+from dew.algebra import cost, extract, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Program, Refused, aval
 
@@ -569,7 +569,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule) -> Form
         return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child)), schedule)
 
     model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
-    extracted = graph.extract(root, cost_model=model, extractor="greedy-dag")
+    extracted, _ = extract.extracted(graph, root, model)
     # The pair of its two parts, or one algorithm that gives both (the token loop, where the target prices
     # its steps past every other form's work), read by its projections.
     parts = get_callable_args(extracted, Chunk.pair)

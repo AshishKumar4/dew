@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- The algebra pass (`dew.algebra`) extracts each program's and each template derivation's cheapest forms
+  exactly, as an integer program over the e-graph's nodes, each shared node priced once (`dew.algebra.extract`).
+  It used egglog's greedy DAG extractor, which keeps each class's cheapest node set alone and pays twice for a
+  value a costlier choice would have shared.
 - A step compiled ahead with its frontier (`--trainer.compile-ahead.frontier`) lists, where the plan or the
   frontier reaches the remat ladder's top ('full'), its sibling that keeps what 'minimal' saves in pinned host
   memory ('minimal_offloaded') at the same split. It holds as many device bytes as 'full', so the planner

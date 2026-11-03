@@ -520,9 +520,18 @@ class Extraction:
   time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
   candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
   is always a candidate, so one is always admitted.
-- Extraction reads the e-graph through egglog's serialization. A DAG extractor prices each shared e-class once.
-  egglog's `greedy-dag` is the baseline it has to beat.
-- Ties break by node order in the serialization, which is deterministic with one thread.
+- Extraction is exact (`dew.algebra.extract`): the roots' forms whose nodes together cost least, each shared
+  node priced once, solved as a mixed integer program by HiGHS through SciPy. One binary choice per node; a used
+  class takes one node, a used node's child classes are used, and an order over each cyclic class keeps the
+  choice a DAG. egglog's `greedy-dag` keeps each class's cheapest node set alone, so it pays twice for a value
+  a costlier choice would have shared. The nodes and their prices are the model's own, read through one
+  `greedy-dag` pass that records every node it prices, and the chosen DAG is extracted by egglog with every
+  chosen node free.
+- A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
+  pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
+  beside it. A schedule's seconds are exactly such a level (`Schedule.pieces`, `spanned`), and its tiebreak
+  the next. Each level is solved in turn with the ones before it held at their optimum; a level whose
+  additions are infinite on every DAG (a reading the derivation left) ties, as its prices compare.
 - `fired` comes from the nodes each set's run added, recorded between runs of the sets.
 - The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, and the
   pool-agreed `link_figure` for links, so every process prices with the same numbers. A fact no owner holds is

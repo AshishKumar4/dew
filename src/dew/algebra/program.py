@@ -20,12 +20,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from egglog.egraph import ComparableAdd
 from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
-from dew.algebra import cost, rules, terms
+from dew.algebra import cost, extract, rules, terms
+from dew.algebra.extract import Linear
 from dew.cache import ALGEBRA, Passes
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
@@ -354,7 +354,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     graph.pop()
     before = after
     if changed:
-        _, before = graph.extract(bundle, include_cost=True, cost_model=priced, extractor="greedy-dag")
+        _, before = extract.extracted(graph, bundle, priced)
     picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
               if changed and cost.cheaper(after, before) else {})
     report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
@@ -500,11 +500,11 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
     return Saturated(fired, (nodes, steps), iterations, limited)
 
 
-def extracted[Price: ComparableAdd](graph: EGraph, bundle: terms.Term,
-                                    model: DagCostModel[Price]) -> tuple[list[terms.Term], Price]:
+def extracted[Price: Linear](graph: EGraph, bundle: terms.Term,
+                             model: DagCostModel[Price]) -> tuple[list[terms.Term], Price]:
     """The roots' forms `model` prices cheapest together, each shared value once, and their price (the
-    model's cost: `cost.Seconds` for the program's)."""
-    chosen, price = graph.extract(bundle, include_cost=True, cost_model=model, extractor="greedy-dag")
+    model's cost: `cost.Seconds` for the program's), extracted exactly (`extract.extracted`)."""
+    chosen, price = extract.extracted(graph, bundle, model)
     forms = get_callable_args(chosen, terms.Term.bundle)
     if forms is None:
         raise ValueError(f"extraction chose no bundle of the program's roots: {chosen}")

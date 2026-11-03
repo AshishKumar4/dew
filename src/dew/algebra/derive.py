@@ -56,7 +56,7 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
-from dew.algebra import cost, program, rules, terms
+from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
@@ -660,8 +660,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     bundle = Term.bundle(Vec[Term](*roots) if roots else Vec[Term].empty())
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
-    _, before = graph.extract(declared, include_cost=True, cost_model=cost.model(region, schedule),
-                              extractor="greedy-dag")
+    _, before = extract.extracted(graph, declared, cost.model(region, schedule))
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
     _decoupled_through(graph, region, facts)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
