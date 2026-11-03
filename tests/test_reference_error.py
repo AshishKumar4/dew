@@ -566,6 +566,107 @@ def test_the_worst_row_passes_heavy_tailed_equal_arms_and_fails_one_twice_the_re
     assert over and over[0].rule == "row" and stage == 2
 
 
+def test_equal_arms_whose_worst_rows_take_turns_pass_where_one_seeds_maximum_failed_them():
+    """Through `assert_as_exact` (row 3684): two arms each a value off by its own seed's noise, a first row of
+    1/64 the leaf's so it is every arm's worst row on every seed, Dew's noise there 20 times its other rows'
+    on seed 0 and the reference's 3 times on seeds 1 to 20. Dew's worst row is past PARITY times the
+    reference's on fewer seeds than the reverse, so the pair passes; the worst row over every seed held at
+    four times the reference's worst failed it by its one seed."""
+    def draw(seed):
+        rng = np.random.default_rng([3684, seed])
+        values = rng.standard_normal((64, 8))
+        values[0] *= 2.0 ** -6
+        mine, theirs = rng.standard_normal((2, 64, 8))
+        if seed == 0:
+            mine[0] *= 20.0
+        elif seed <= 20:
+            theirs[0] *= 3.0
+        return values, mine, theirs
+
+    @as_given
+    def dew(values, mine, theirs):
+        return {"leaf": values + 2.0 ** -20 * mine}
+
+    @as_given
+    def reference(values, mine, theirs):
+        return {"leaf": values + 2.0 ** -20 * theirs}
+
+    assert_as_exact(dew, reference, draw, "turns", seeds=8, truth_fn=lambda values, *_: {"leaf": values})
+
+
+def test_a_library_arm_never_holds_dews_worst_row_to_less_than_the_references():
+    """With a library arm (`library_fn`), the reference's worst row stands where the library arm's error is
+    the larger and its worst row the smaller (row 3684): Dew computing the reference's own values, off twice
+    a relative unit on a row of 1/64 of the leaf, beside a library arm off one unit on a row of the leaf's
+    size, larger in squared error, passes, its worst row the reference's on every seed."""
+    def draw(seed):
+        rng = np.random.default_rng([3684, 2, seed])
+        values = rng.standard_normal((64, 8))
+        values[0] *= 2.0 ** -6
+        return values, rng.standard_normal((64, 8))
+
+    @as_given
+    def reference(values, noise):
+        out = values.copy()
+        out[0] += 2.0 * 2.0 ** -20 * values[0] * noise[0]
+        return {"leaf": out}
+
+    @as_given
+    def library(values, noise):
+        out = values.copy()
+        out[1] += 2.0 ** -20 * values[1] * noise[1]
+        return {"leaf": out}
+
+    assert_as_exact(reference, reference, draw, "library budget", seeds=8,
+                    truth_fn=lambda values, _: {"leaf": values}, library_fn=library, library_row=1543,
+                    library_leaves=["['leaf']"])
+
+
+def test_a_row_below_resolution_is_measured_only_where_both_arms_measure_it():
+    """A row below RESOLUTION of its leaf is judged at its own size only where both arms' errors there are
+    under it (`_paired`, row 3684): equally exact arms, each off twice the row's own size there on half the
+    seeds apart and exact on the rest, pass, where the reference alone classifying it put Dew's error into
+    Dew's worst row on every seed it was exact and Dew was not, and never the reverse."""
+    def draw(seed):
+        rng = np.random.default_rng([3684, 3, seed])
+        values = rng.standard_normal((64, 8))
+        values[0] *= 2.0 ** -60
+        return values, rng.standard_normal((64, 8)), rng.standard_normal((64, 8)), rng.integers(0, 2, 2)
+
+    def arm(index):
+        @as_given
+        def run(values, mine, theirs, coins):
+            out = values + 2.0 ** -20 * (mine, theirs)[index] * values
+            out[0] = values[0] * (1 + 2.0 * coins[index])
+            return {"leaf": out}
+        return run
+
+    assert_as_exact(arm(0), arm(1), draw, "tiny rows", seeds=8, truth_fn=lambda values, *_: {"leaf": values})
+
+
+def test_stacked_examples_hold_each_arms_worst_row_over_every_order():
+    """At a site that stacks examples (`examples`) and sweeps an orbit's orders (`orders`), each example's
+    worst row is each arm's worst over the orders before the two pair (`_example_worst_rows`, row 3684): Dew
+    off twice the reference at the draw's own order and the reference twice Dew at the other, both arms' worst
+    equal over the orbit, passes, where the first order alone paired Dew past PARITY on every example."""
+    def draw(seed):
+        rng = np.random.default_rng([3684, 4, seed])
+        return rng.standard_normal((32, 4, 8)), rng.standard_normal((32, 4, 8)), np.zeros(())
+
+    def orders(inputs):
+        values, noise, _ = inputs
+        return [inputs, (values, noise, np.ones(()))]
+
+    def arm(first, second):
+        @as_given
+        def run(values, noise, order):
+            return {"leaf": values + 2.0 ** -20 * (second if order else first) * noise * values}
+        return run
+
+    assert_as_exact(arm(2.0, 1.0), arm(1.0, 2.0), draw, "orders", seeds=8, orders=orders, examples=True,
+                    truth_fn=lambda values, *_: {"leaf": values})
+
+
 def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whole(tmp_path, monkeypatch):
     """armada's map and judge (`DRAWS`, `POOL`): a site whose seeds are sharded across map tasks, each writing
     its draws and judging nothing, is judged over their pooled draws as it is when it draws them itself: a
