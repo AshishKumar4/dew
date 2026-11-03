@@ -16,9 +16,10 @@ A chain is one program of N tiny kernels, each reading the last's output and hel
 optimization barrier (so XLA fuses none), timed whole by the wall clock (`dew.telemetry.benchmark.samples`,
 as XLA launches it, its command buffers at JAX's default) for N from 1 to 64; the line's slope is a launch's
 seconds in a program, its intercept the call's own. A hand-off is one GPU-scope semaphore signal another
-program waits on, as the balanced tail's partials (`templates.mosaic.RingFamily.fixed_up`): two programs pass
-it back and forth K times in one kernel, CUPTI timing it for K from 16 to 1024; the slope over the 2K
-hand-offs is one's seconds, measured where the GPU's ring families run the tail (TMA, sm90 on).
+program waits on, as the balanced tail's partials (`templates.mosaic.RingFamily.fixed_up`): two programs of
+one kernel each signal the other and wait on their own K times, CUPTI timing it for K from 16 to 1024; the
+slope over the K rounds is one hand-off's seconds, measured where the GPU's ring families run the tail (TMA,
+sm90 on).
 """
 
 import argparse
@@ -40,7 +41,7 @@ CHAINS = (1, 2, 4, 8, 16, 32, 64)
 """The kernels each chain launches one after another."""
 
 ROUND_TRIPS = (16, 64, 256, 1024)
-"""The round trips each hand-off kernel's two programs make."""
+"""The rounds each hand-off kernel's two programs make, each one hand-off."""
 
 
 def timed(fn, args, *, flush, warmup: int, repeats: int) -> float:
@@ -84,17 +85,10 @@ def handed_off(count: int):
         program = jax.lax.axis_index("x")
         ready = pl.get_global(plgpu.SemaphoreType.REGULAR((2,)))
 
-        # Program 0 signals first and program 1 waits first, so each hop waits on the other's signal.
+        # Each round both programs signal the other's semaphore and wait on their own: one hand-off a round.
         def round_trip(_, carry):
-            @pl.when(program == 0)
-            def _():
-                plgpu.semaphore_signal(ready.at[1], memory_scope="gpu")
-
+            plgpu.semaphore_signal(ready.at[1 - program], memory_scope="gpu")
             plgpu.semaphore_wait(ready.at[program], memory_scope="gpu")
-
-            @pl.when(program == 1)
-            def _():
-                plgpu.semaphore_signal(ready.at[0], memory_scope="gpu")
             return carry
 
         jax.lax.fori_loop(0, count, round_trip, 0)
@@ -136,7 +130,7 @@ def main() -> None:
     if generation.gpu_target().architecture.tma:
         trips = [(count, timed(handed_off(count), (), flush=lambda: tiny, warmup=args.warmup,
                                repeats=args.repeats)) for count in ROUND_TRIPS]
-        hop, _ = np.polyfit([2 * count for count, _ in trips], [seconds for _, seconds in trips], 1)
+        hop, _ = np.polyfit([count for count, _ in trips], [seconds for _, seconds in trips], 1)
         facts["handoff"] = {"seconds": float(hop), "points": [{"round_trips": count, "seconds": seconds}
                                                               for count, seconds in trips]}
     for name, moved in (("read", 1), ("copy", 2)):
