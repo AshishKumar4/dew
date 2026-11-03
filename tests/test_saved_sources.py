@@ -120,17 +120,23 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     """Two real processes export a decoder whose kernels span both, every layer's attention extended by
     DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
     projection folded as it is written: each reads one tensor home at a time, together, so neither host's
-    allocations during the export peak at half the model, where the pool read the whole tree home
-    first. The publishing process writes the tensors one process writes of the same weights unplaced,
-    byte for byte, though the restored tree's key order may place one in another shard; the other
-    writes the release's small files alone, no weights. Outside the export's scope the write is
+    allocations during the export hold the model. The same decoder at twice each width, its tensors 2 to
+    4 times as large and its names and Python objects the same, peaks less than half its added bytes above
+    the narrower one, each export measured after one of its own: the export's fixed cost, about 600 KB
+    on either Python, which half this 1.3 MB model's bytes left a margin of 4% to CI's process state
+    (ledger 3794), is in both peaks and cancels, and what is left grows with the largest tensor, where
+    the pool reading the whole tree home grows it by every byte added. The publishing process writes
+    the tensors one process writes of the same weights unplaced, byte for byte, though the restored
+    tree's key order may place one in another shard; the other writes the release's small files alone,
+    no weights. Outside the export's scope the write is
     refused rather than left waiting on the other process."""
     publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
                                  fsdp_size=4, run_dir=str(tmp_path))
     for report in (publisher, reader):
         assert report["processes"] == 2 and report["spanning"] > 0
         assert report["refused_outside"]
-        assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
+        assert report["largest_leaf"] <= report["peak"] and report["wide_largest_leaf"] <= report["wide_peak"]
+        assert report["wide_peak"] - report["peak"] < (report["wide_whole"] - report["whole"]) / 2
     assert publisher["differing"] == {} and len(publisher["release"]) > 10
     assert publisher["alone"] == reader["alone"]
     assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]

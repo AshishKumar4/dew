@@ -7,9 +7,10 @@ projection as it is written, and exports it as a saved run's release, the run's 
 (`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards,
 process 0 publishing and the other reading every tensor as it does (`publishes`). Each records the
 files it wrote, the peak of its host allocations during the export (`tracemalloc`, which counts
-NumPy's), and the model's size; outside the export's scope the write is refused. It also writes the
-same weights unplaced, as one process does. Every mode records what it saw into --out and asserts
-nothing.
+NumPy's) and the model's size, and the same of the decoder at twice each width (`WIDER`), each export
+measured after one of its own, so both peaks hold the same fixed cost; outside the export's scope the
+write is refused. It also writes the same weights unplaced, as one process does. Every mode records
+what it saw into --out and asserts nothing.
 
 dew is imported inside the modes, not at module scope, because a JAX backend opened before
 jax.distributed.initialize() would pin the process to its own devices.
@@ -27,7 +28,11 @@ from process_support import serve_mode, worker_parser
 
 FIELDS = {"vocab_size": 512, "emb_features": 64, "num_layers": 8, "num_heads": 4, "num_kv_heads": 2,
           "mlp_features": 128, "max_seq_len": 8}
-"""A decoder of about 1.4 MB in float32, its largest tensor (the embedding) 128 KiB."""
+"""A decoder of about 1.3 MB in float32, its largest tensor (the embedding) 128 KiB."""
+
+WIDER = {**FIELDS, "vocab_size": 1024, "emb_features": 128, "mlp_features": 256}
+"""The decoder at twice each width, about 5.2 MB: the same tensors by name, each 2 to 4 times as large,
+so its export holds the same names and Python objects as `FIELDS`' and only its arrays grow."""
 
 TINY_SHARD = 4
 """Far below the production threshold, so the pool's mesh shards every kernel."""
@@ -64,14 +69,20 @@ def exported(args) -> dict:
     from dew.training import Layout, MeshSpec
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=SHARD)
-    model = models.build("causal_transformer", **FIELDS)
-    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
-    placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
-                                        layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
-    leaves = jax.tree.leaves(placed)
     extension = DifferentialExtension(tuple((layer, (0, 2)) for layer in range(FIELDS["num_layers"])),
                                       anneal_steps=10)
-    bundle = PretrainedDecoder.from_model(model, placed).with_dex(extension, key=0)
+
+    def built(fields):
+        """The decoder of `fields`, its variables, the variables placed across the pool, and its bundle."""
+        model = models.build("causal_transformer", **fields)
+        variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
+        placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
+                                            layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
+        bundle = PretrainedDecoder.from_model(model, placed).with_dex(extension, key=0)
+        return model, variables, placed, bundle
+
+    model, variables, placed, bundle = built(FIELDS)
+    *_, wide, wider = built(WIDER)
     root = Path(args.run_dir)
     rank = jax.process_index()
     try:
@@ -79,13 +90,25 @@ def exported(args) -> dict:
         refused = False
     except RuntimeError:
         refused = True
-    Pretrained.from_saved = classmethod(lambda cls, run, **options: bundle)
     run = SimpleNamespace(objective=SimpleNamespace(saved_task=None))
+
+    def peak_of(exported, name: str) -> int:
+        """The peak of the host's allocations while the pool exports `exported` to `name`."""
+        Pretrained.from_saved = classmethod(lambda cls, run, **options: exported)
+        tracemalloc.start()
+        export_run(run, root / name, publishes=rank == 0)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        return peak
+
+    # Each width exported once before it is measured, a decoder built apart so nothing the measured bundle
+    # holds is left from it: both measured exports find their programs compiled and their modules
+    # imported, and what one holds beyond the other is what the wider arrays add.
+    for index, fields in enumerate((FIELDS, WIDER)):
+        peak_of(built(fields)[3], f"warm{index}_{rank}")
     destination = root / f"release{rank}"
-    tracemalloc.start()
-    export_run(run, destination, publishes=rank == 0)
-    peak = tracemalloc.get_traced_memory()[1]
-    tracemalloc.stop()
+    peak, wide_peak = peak_of(bundle, f"release{rank}"), peak_of(wider, f"wide{rank}")
+    leaves, wide_leaves = jax.tree.leaves(placed), jax.tree.leaves(wide)
     alone = root / f"alone{rank}"
     PretrainedDecoder.from_model(model, variables).with_dex(extension, key=0).save(alone)
     written, own = tensors(destination), tensors(alone)
@@ -97,7 +120,9 @@ def exported(args) -> dict:
             "small_files": sorted(path.name for path in destination.iterdir()
                                   if not path.name.endswith((".safetensors", ".safetensors.index.json"))),
             "peak": peak, "whole": sum(leaf.nbytes for leaf in leaves),
-            "largest_leaf": max(leaf.nbytes for leaf in leaves)}
+            "largest_leaf": max(leaf.nbytes for leaf in leaves), "wide_peak": wide_peak,
+            "wide_whole": sum(leaf.nbytes for leaf in wide_leaves),
+            "wide_largest_leaf": max(leaf.nbytes for leaf in wide_leaves)}
 
 
 def scoped_peaks(modules) -> list[dict]:
