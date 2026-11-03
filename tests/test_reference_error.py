@@ -1580,6 +1580,41 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     assert raised.type is GateFailure
 
 
+def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_terms():
+    """A summarized recording sizes its reference's rows by its truth alone (`leaf_summaries`), so Dew's are
+    sized so too, the site's terms aside (row 3684): a dot that cancels to float64's zero, Dew an ulp or so
+    off it where the recorded reference's sum is exactly zero, fails as a row of float64 zero against the
+    reference's exact zero, as the live reference fails it without terms, where Dew's rows read by its terms
+    held its worst row against a reference's sized otherwise."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    reference = cancelling(split=False)
+
+    def draw(seed):
+        x, w = cancelling_draw(seed)
+        return {"x": np.asarray(x), "w": np.asarray(w)}
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            held = jax.tree.map(np.asarray, reference(inputs["x"], inputs["w"]))
+        truth = jax.tree.map(np.asarray, reference(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
+        return held, truth
+
+    def as_inputs(fn):
+        return lambda inputs: fn(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, as_inputs(reference), summary=True)
+    seeds = int(recorded["site.seeds"])
+    drawn, recorded_reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                         truth_fn=as_inputs(reference))
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lambda index, inputs: as_inputs(cancelling(split=True))(inputs), recorded_reference,
+                        drawn, "summarized", seeds=seeds, truth_fn=truth, terms=True)
+    assert raised.type is GateFailure
+
+
 @pytest.mark.parametrize("planned", [False, True])
 def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
     """A reference recorded on a CPU keeps the larger count a GPU's held-out paired sizing declared,
