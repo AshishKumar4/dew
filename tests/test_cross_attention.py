@@ -814,12 +814,15 @@ def test_a_cross_attention_blocks_norms_gate_as_its_layer_routes():
     """A decoder whose layers gate a norm on their routed layers alone (`NormSpec.gated_layers='routed'`,
     A.X-K2's feed-forward norm) builds each cross-attention block's norm of that name as its layer routes
     (ledger 3631): gated in the block of a routed layer, plain in a dense layer's, where the block's norms
-    were refused as norms outside the layers."""
+    were refused as norms outside the layers; and the blocks' count holds that gate's maps (ledger 3685)."""
     from dew.nn.backbones.decoder_block import Mixture, NormSpec
 
-    model = MODEL.clone(mixture=Mixture(experts=4, top_k=2, layers=(2,), expert_features=8),
-                        norms={"post_attention_layernorm": NormSpec(gate_rank=2, gated_layers="routed")})
+    routed = MODEL.clone(mixture=Mixture(experts=4, top_k=2, layers=(2,), expert_features=8))
+    model = routed.clone(norms={"post_attention_layernorm": NormSpec(gate_rank=2, gated_layers="routed")})
     variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
     gated = {name.split(".")[1] for name in flat_tree(variables)
              if ".cross_attention.post_attention_layernorm.mlp." in name}
     assert gated == {"layers_2"}
+    # The blocks' count adds that one gate's two maps, rank 2 wide, over every token (ledger 3685).
+    lengths, context = np.array([5, 3]), np.array([6, 0])
+    assert model.cross_flops(lengths, context) - routed.cross_flops(lengths, context) == 2 * 2 * 32 * 2 * 8
