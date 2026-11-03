@@ -500,7 +500,7 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
 def test_each_launch_lowers_once_however_many_layers_call_it():
     """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for the GPU the
     test runs on, or off one an H100: each of the template's distinct launches is one Mosaic GPU call in the
-    lowered program, which both layers call (`mainloop._lowered_once`), as many as one layer's. Each call
+    lowered program, which both layers call (`mainloop.lowered_once`), as many as one layer's. Each call
     site traced, lowered and serialized its own kernel: a Qwen3.5-4B step's first update waited 30 minutes
     on its layers' identical kernels (row 2102)."""
     import re
@@ -698,7 +698,7 @@ def resource_floor(name: str) -> float | None:
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
-launches the keys-gated ones (`mainloop._Call.gated_keys`)."""
+launches the keys-gated ones (`mainloop.Call.gated_keys`)."""
 
 
 def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.ShapeDtypeStruct]:
