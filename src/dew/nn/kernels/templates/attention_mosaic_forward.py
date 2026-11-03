@@ -914,7 +914,7 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         written, refs = refs[:len(out_type)], refs[len(out_type):]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if peaks or (reuse and not training) else (stages[0], stages[1:])
-        (spans_of, hooked_of, guard_of, anchors_of, table_of, walks_of, sources_of,
+        (spans_of, hooked_of, guard_of, anchors_of, table_of, _, sources_of,
          block_of) = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         named = {"keys": k_ref} if peaks else {"keys": k_ref, "values": v_ref}
@@ -926,15 +926,6 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
                               for index in range(consumers)])
 
         turn = functools.partial(family.turn, schedule, consumers)
-
-        def run(role):
-            # Both roles of a masked launch's program skip where none of its consumers' query blocks walks
-            # (`walks`): its producer would wait for releases no consumer gives.
-            if walks_of is None:
-                role()
-                return
-            blocks = [lax.div(pair_first + other * block_q, block_q) for other in range(consumers)]
-            pl.when(functools.reduce(jnp.logical_or, [walks_of[row, block] != 0 for block in blocks]))(role)
 
         def consumer(index):
             first = pair_first + index * block_q
@@ -965,15 +956,29 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
                 q_smem.at[index], q_loaded.at[index], out_smem.at[index], row_smem.at[index], streams, views,
                 turn, streamed, first, spans_of, hooked_of, guard_of, (row, head, lax.div(head, group)),
                 hooks=hooks, residuals=residuals, anchors=anchors_of, interpret=interpret, finished=finished)
-            run(walk)
+            walk()
 
         def producer():
-            run(lambda: family.stream(streams, views, *streamed))
+            family.stream(streams, views, *streamed)
 
         family.roles(consumers, consumer, producer)
 
     def entry(*refs):
-        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        def scoped_body():
+            family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+
+        walks_of = treedef.unflatten(refs[3:3 + treedef.num_leaves])[5]
+        if walks_of is None:
+            scoped_body()
+            return
+        # A masked launch's program none of whose consumers' query blocks walks (`walks`) does nothing, its
+        # shared memory's barriers not even set: the two empty launches of a decode step at 128 rows of 4096
+        # keys took 8.2 and 8.0 us of its 0.77 ms where each program set its rings up first (ET-DECODE8-h100).
+        row = lax.axis_index("batch")
+        pair_first = program.query_tile(queries // pair) * pair
+        blocks = [lax.div(pair_first + other * block_q, block_q) for other in range(consumers)]
+        walked = functools.reduce(jnp.logical_or, [walks_of[row, block] != 0 for block in blocks])
+        pl.when(walked)(scoped_body)
 
     out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits, peaks=peaks,
                           training=training, finishes=finishes)
