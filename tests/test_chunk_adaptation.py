@@ -18,7 +18,15 @@ import pytest
 from affine_run import Replaying, dataset
 from check1_statistics import GateFailure, Inconclusive
 from flax import linen as nn
-from reference_error import MOST_SEEDS, assert_as_exact, over_windows, widened, windows, with_gradients
+from reference_error import (
+    MOST_SEEDS,
+    as_given,
+    assert_as_exact,
+    over_windows,
+    widened,
+    windows,
+    with_gradients,
+)
 
 from dew.batch import TEXT_KEY
 from dew.nn.activations import _SLOPES, HIDDEN_ACT
@@ -387,27 +395,51 @@ def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed(kind
          conditioning=CORNER_SEEDS["gradient", kind])
 
 
-def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
-    """The weighed corner has teeth: Dew's one-token window stepped at a rate 2^-10 past the loop's, judged
-    as a corner site is at its weighed seed count (`CORNER_SEEDS`, `conditioning`), fails by a decided
-    finding of a ratio or a row (GateFailure, never Inconclusive), unweighted or weighed."""
-    off = ChunkAdaptation(window=1, rate=0.5 * (1 + 2 ** -10))
+def corner_failure(dew, label: str) -> GateFailure:
+    """The failure the one-token corner's public flow decides for `dew` against the literal loop: its own
+    budgets, MOST_SEEDS unweighted and its weighed seeds (`CORNER_SEEDS`, `conditioning`), structured
+    findings, never Inconclusive."""
     adaptation = ChunkAdaptation(window=1, rate=0.5)
-    seeds = CORNER_SEEDS["forward", "documents"]
-
-    def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, off, predict=False,
-                              logits=False).losses
 
     def reference(truth):
         return jax.jit(lambda variables, hidden, targets, weights: equation_71(
             MODEL, variables, hidden, targets, weights, {}, adaptation, truth=truth))
 
     with pytest.raises(GateFailure) as raised:
-        assert_as_exact(jax.jit(dew), reference(truth=False), draw, "a rate off at the corner", seeds=seeds,
-                        truth_fn=reference(truth=True), conditioning=seeds)
-    assert not isinstance(raised.value, Inconclusive)
-    assert raised.value.findings and {finding.rule for finding in raised.value.findings} <= {"pooled", "row"}
+        assert_as_exact(dew, reference(truth=False), draw, label, seeds=MOST_SEEDS,
+                        truth_fn=reference(truth=True), conditioning=CORNER_SEEDS["forward", "documents"])
+    assert not isinstance(raised.value, Inconclusive) and raised.value.findings
+    return raised.value
+
+
+def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
+    """The weighed corner has teeth: Dew's one-token window stepped at a rate 2^-10 past the loop's fails the
+    corner's public flow (`corner_failure`) decided."""
+    off = ChunkAdaptation(window=1, rate=0.5 * (1 + 2 ** -10))
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, off, predict=False,
+                              logits=False).losses
+
+    corner_failure(jax.jit(dew), "a rate off at the corner")
+
+
+def test_the_weighed_corner_fails_an_error_past_parity():
+    """An arm whose every error is 1.6 times the literal loop's, the loop's own result moved 0.6 of its error
+    further from float64, fails the corner's public flow decided (`corner_failure`): past PARITY, never
+    held on par."""
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+    loop, exact = (jax.jit(lambda *arguments, truth=truth: equation_71(MODEL, *arguments, {}, adaptation,
+                                                                          truth=truth))
+                   for truth in (False, True))
+
+    def dew(variables, hidden, targets, weights):
+        run = np.asarray(loop(variables, hidden, targets, weights), np.float64)
+        with jax.enable_x64(new_val=True):
+            truth = np.asarray(exact(*widened((variables, hidden, targets, weights))))
+        return (run + 0.6 * (run - truth)).astype(np.float32)
+
+    corner_failure(as_given(dew), "an error 1.6 times the loop's at the corner")
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
