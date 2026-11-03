@@ -40,7 +40,7 @@ def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
     the same) drafts and verifies through both branches' caches (ledger 3575)."""
     model = predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = model.init(jax.random.key(0), prompts)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
     drawn = generate(model, params, prompts, 6, key=jax.random.key(1),
                      sampling=Sampling(temperature=0), strategy=Speculative(block=3))
 
@@ -113,7 +113,7 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     walk, each row's crossing inside a block."""
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = model.init(jax.random.key(0), prompts)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
     walked, speculated = (generate(model, params, prompts, 6, key=jax.random.key(1),
                                    sampling=Sampling(temperature=0), strategy=strategy)
                           for strategy in (None, Speculative(block=3)))
@@ -155,7 +155,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
 
     build, depths = LONGROPE_DRAFTING[drafting]
     model = build()
-    params = model.init(jax.random.key(0), jnp.ones((2, 5), jnp.int32))
+    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((2, 5), jnp.int32))
 
     def walk(model, params):
         """The prompt's prefill, then the stretch a token at a time, each token's logits."""
@@ -208,7 +208,7 @@ def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_doe
 
     build, depths = LONGROPE_DRAFTING[drafting]
     model = build()
-    params = model.init(jax.random.key(0), jnp.ones((2, 3), jnp.int32))
+    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((2, 3), jnp.int32))
     width = model.max_seq_len
 
     def floats(state: DecoderState):
@@ -258,7 +258,7 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     that row stays padding."""
     model = predictor()
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
-    params = model.init(jax.random.key(0), prompt)
+    params = jax.jit(model.init)(jax.random.key(0), prompt)
     eos = 4
 
     def script(state, logits):
