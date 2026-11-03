@@ -293,17 +293,19 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     np.testing.assert_allclose(drawn.raw_log_probs[0, 1], scores[0, eos], atol=3e-6, rtol=0)
 
 
-LAW_ROWS, LAW_SEEDS = 512, 8
-"""The law's draws: each seed a call of `LAW_ROWS` copies of one prompt, every row drawn apart."""
+LAW_ROWS, LAW_SEEDS, LAW_TEMPERATURE = 512, 8, 4.0
+"""The law's draws: each seed a call of `LAW_ROWS` copies of one prompt, every row drawn apart, at a
+temperature that spreads the tiny decoder's chances over every token, so each pair is drawn often enough
+to be counted (`sampling_gate.FEWEST_EXPECTED`)."""
 
 
 def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
     """Speculation changes how a token is drawn, never its law: a block's first two tokens, the target's
     own draw and the one its draft proposed after it (accepted at the ratio of the two distributions or
     replaced from their difference), are drawn as the target alone draws them, the pair at the chance the
-    target's float64 run gives the first token times the second's given it, over every pair of a
-    13-token vocabulary (the sampling gate). The draft is the model's own prediction depth, untrained,
-    so it proposes off the target's law and the acceptance has to undo it."""
+    target's float64 run gives the first token times the second's given it, at the sampling's temperature,
+    over every pair of a 13-token vocabulary (the sampling gate). The draft is the model's own prediction
+    depth, untrained, so it proposes off the target's law and the acceptance has to undo it."""
     from reference_error import widened
     from sampling_gate import assert_draws_as_declared
 
@@ -313,16 +315,16 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
     vocab = model.vocab_size
     with jax.enable_x64(new_val=True):
         wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
-        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1])
+        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
         pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
-        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1], axis=-1)
+        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
         chances = np.asarray(first[:, None] * second).reshape(-1)
 
     rows = jnp.broadcast_to(prompt, (LAW_ROWS, 3))
 
     def counts(seed):
-        drawn = generate(model, params, rows, 2, key=jax.random.key(seed), sampling=Sampling(temperature=1.0),
-                         strategy=Speculative(block=3))
+        drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
+                         sampling=Sampling(temperature=LAW_TEMPERATURE), strategy=Speculative(block=3))
         tokens = np.asarray(drawn.tokens)[:, 3:5]
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
