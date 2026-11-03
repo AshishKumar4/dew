@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import MEMBER, Owed, Record, Rejected, accounts, members_of
+from dew.data.pipeline import Owed, Record, Rejected, accounts, member_of, members_of
 
 _log = logging.getLogger(__name__)
 
@@ -245,16 +245,14 @@ class _KeepAccepted:
                 return True
             reason = "zero_targets"
             self.owed.owe(accounts(element)[0])
-            self._of(_member(element)).rejected[reason] += 1
+            self._of(member_of(element)).rejected[reason] += 1
         self.consecutive += 1
-        # What it rejected, its own and its members' (a mixture's counter past the mix).
-        rejected = sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
-        if not self.warned and sum(rejected.values()) / self.counts.attempted > _WARN_OVER:
+        if not self.warned and self._rejected_count() / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
                          self.counts.label, _WARN_OVER * 100, reason)
             self.warned = True
         if self.certain_after is not None and self.consecutive >= self.certain_after:
-            reasons = ", ".join(f"{name} {count}" for name, count in rejected.most_common(3))
+            reasons = ", ".join(f"{name} {count}" for name, count in self._rejected().most_common(3))
             raise ValueError(
                 f"corpus {self.counts.label} rejected its last {self.consecutive} records, every record of "
                 f"two whole passes of what it reads ({reasons}), and its steps reject the same records each "
@@ -262,6 +260,7 @@ class _KeepAccepted:
                 "records: read it with fewer shares, or elastically (`.elastic()`), every reader filtering "
                 "every record")
         if logged_run(self.consecutive, LONG_RUN):
+            rejected = self._rejected()
             reasons = ", ".join(f"{name} {count}" for name, count in rejected.most_common(3))
             # What it kept, which a counter past an objective's expansion reads but counts as no rows.
             kept = self.counts.attempted - sum(rejected.values())
@@ -271,24 +270,29 @@ class _KeepAccepted:
         return False
 
 
+    def _rejected(self) -> Counter:
+        """What it rejected by reason, its own and its members' (a mixture's counter past the mix): merged
+        only where a raise or a log names the reasons, never a row at a time (row 3531)."""
+        return sum((counts.rejected for counts in self.members.values()), self.counts.rejected.copy())
+
+    def _rejected_count(self) -> int:
+        """How many records it rejected, its own and its members', summed without merging their reasons:
+        read at each rejection only until it warns."""
+        return sum(sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
+
     def _delivered(self, element: Batch) -> None:
         """Count a row delivered: under its member where a mixture's last counter credits its members,
         each member the examples its rows complete (`MEMBERS`), the row's own counts its member's."""
         if not self.credits:
             self.counts.delivered(element)
             return
-        own = _member(element)
+        own = member_of(element)
         completed = members_of(element)
         owner = self._of(own)
         for member, examples in completed.items():
             if member != own:
                 self.members[member].accepted += examples
         owner.delivered(element, 0 if own is None else completed.get(own, 0))
-
-
-def _member(row: Batch) -> str | None:
-    """The mixture member `row` was drawn from (`MEMBER`), none for a row of none or of several."""
-    return None if MEMBER not in row else text(row[MEMBER], "a row's mixture member")
 
 
 COUNTER = "dew.corpus_counts"

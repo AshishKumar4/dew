@@ -187,3 +187,38 @@ def test_a_thousand_source_selection_reads_in_order_what_each_position_reads_alo
     assert ordered == [proportions.at(index) for index in range(10_000)]
     for index in (123_456, 7, 9_999, 50_000, 50_001, 3):
         assert selection[index] == proportions.at(index)
+
+
+def test_a_mixtures_rejection_merges_its_members_counts_only_where_a_log_or_refusal_names_them():
+    """A mixture's counter past the mix counts what it rejects of each member's rows under that member's
+    counts, and merges the members' counts by reason only where a log or a refusal names the reasons: once
+    it has warned of its rejections, a rejection costs what it does at ten members, however many the mix
+    holds (row 3531: 5.7 us at 10 members, 156 us at 300)."""
+    from collections import Counter
+
+    from dew.data.mixing import CorpusCounts, _KeepAccepted
+    from dew.data.pipeline import Rejected
+
+    class Merged(Counter):
+        """A member's rejections, which count each merge of them into the mix's."""
+
+        merges = 0
+
+        def __add__(self, other):
+            Merged.merges += 1
+            return super().__add__(other)
+
+        def __radd__(self, other):
+            Merged.merges += 1
+            return Counter.__add__(other, self)
+
+    members = {f"member-{at}": CorpusCounts(f"member-{at}", f"m{at}", rejected=Merged())
+               for at in range(SOURCES)}
+    counter = _KeepAccepted(CorpusCounts("mix", "mix"), None, None, members)
+    for at in range(200):
+        counter(Rejected("short", member=f"member-{at % SOURCES}"))
+    assert counter.warned
+    Merged.merges = 0
+    for at in range(300):
+        counter(Rejected("short", member=f"member-{at % SOURCES}"))
+    assert Merged.merges == 0
