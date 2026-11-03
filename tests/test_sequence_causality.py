@@ -55,8 +55,8 @@ def shifted_left(states):
 
 
 def shifted_right(states):
-    """Each position takes the previous one's state."""
-    return jnp.concatenate([jnp.zeros_like(states[:, :1]), states[:, :-1]], axis=1)
+    """Each position takes the previous one's state (a pad before the first, the last sliced off)."""
+    return jnp.pad(states, ((0, 0), (1, 0), (0, 0)))[:, :-1]
 
 
 ADMITTED = {

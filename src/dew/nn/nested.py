@@ -23,7 +23,7 @@ def staged() -> bool:
     return any(isinstance(trace, partial_eval.DynamicJaxprTrace) for trace in stack)
 
 
-def nested[**P, R](function: Callable[P, R], *, traced: Callable[[core.ClosedJaxpr], None] | None = None,
+def nested[**P, R](function: Callable[P, R], *, traced: Callable[[core.Jaxpr], None] | None = None,
                    **arguments) -> Callable[P, R]:
     """`function` as a nested program (module docstring), under `jax.jit`'s `arguments` (its static
     arguments): within a staging trace (`staged`), its jit, which the enclosing program compiles as its
