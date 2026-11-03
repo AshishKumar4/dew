@@ -27,7 +27,7 @@ from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.precision import Numerics
 from dew.objectives.base import SavedTask
-from dew.registry import dtype_name
+from dew.registry import dtype_name, import_trusted
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -68,7 +68,8 @@ def pipeline(
     selects a run's checkpoint and `revision` pins a Hub source; passing
     `revision` for a run directory or `step` for a source raises
     `ValueError`. `trust` names the packages outside Dew a run's record may
-    import, as `trust_remote_code` does in transformers. `options` selects
+    import, and the sources whose own code a load may run (a media processor's,
+    LFM3-VL's), as `trust_remote_code` does in transformers. `options` selects
     what a source builds, as a run's `--source` options do (`SourceOptions`:
     a wrapper's language model alone, the prediction depths kept, each layer
     kind's attention); a run's record selects its own, so passing them for a
@@ -82,6 +83,9 @@ def pipeline(
     already compiled.
     """
     persist_compilations()
+    # What the caller trusts, a package a run's record names or a source whose own code its load runs
+    # (`dew.registry.trusts_source`), the process trusts from here on.
+    import_trusted(None, trust)
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
     root = epath.Path(source)

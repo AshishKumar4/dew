@@ -9,8 +9,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, FEATURES, Counting, dataset, raw_leaf
+from affine_run import BATCH, FEATURES, Counting, dataset
 from flax import linen as nn
+from recording import bits
 from reference_error import assert_computes_the_oracle
 
 from dew.objectives.base import Aux, Objective, Ratio, Weighted
@@ -71,11 +72,6 @@ def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path
                    layout=Layout(min_shard=1, tolerance=1.0),
                    mesh=MeshSpec(diloco=replicas).build(jax.devices()[:replicas]), diloco=diloco,
                    checkpoints=None if path is None else Checkpoints(str(path)), **options)
-
-
-def values(state) -> list[np.ndarray]:
-    """Every leaf of `state` as NumPy, a key as its data."""
-    return [np.asarray(raw_leaf(leaf)) for leaf in jax.tree.leaves(state)]
 
 
 def params(tree) -> np.ndarray:
@@ -212,10 +208,10 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
         stopped = run(tmp_path / "run").fit(dataset(), steps=3, checkpoint_every=1, log_every=1)
         assert (stopped.inner.accumulation is not None) == (accumulation > 1)
         restored, _, _ = run(tmp_path / "run").place()
-        for mine, theirs in zip(values(stopped), values(restored), strict=True):
+        for mine, theirs in zip(bits(stopped), bits(restored), strict=True):
             np.testing.assert_array_equal(mine, theirs)
         resumed = run(tmp_path / "run").fit(dataset(), steps=5, checkpoint_every=1, log_every=1)
-    for mine, theirs in zip(values(resumed), values(unbroken), strict=True):
+    for mine, theirs in zip(bits(resumed), bits(unbroken), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
 

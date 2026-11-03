@@ -40,6 +40,7 @@ const LABELS = {
 	'10-rl-with-verifiable-rewards': 'RL with verifiable rewards',
 	'11-llms-in-an-agent-harness': 'LLMs in an agent harness',
 	'12-world-models': 'World models',
+	'14-camera-only-drone-racing': 'Vision-based drone racing',
 };
 
 function fence(code) {

@@ -14,6 +14,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from dew.nn import categorical
 from dew.nn.precision import at_least_fp32
 
 
@@ -64,17 +65,19 @@ def twohot_loss(logits: jax.Array, target: jax.Array, bins: jax.Array) -> jax.Ar
     to_below = jnp.where(equal, 1, jnp.abs(bins[below] - target))
     to_above = jnp.where(equal, 1, jnp.abs(bins[above] - target))
     total = to_below + to_above
-    encoded = (jax.nn.one_hot(below, bins.shape[-1]) * (to_above / total)[..., None]
-               + jax.nn.one_hot(above, bins.shape[-1]) * (to_below / total)[..., None])
-    return -jnp.sum(encoded * jax.nn.log_softmax(logits.astype(wide), axis=-1), axis=-1)
+    encoded = (jax.nn.one_hot(below, bins.shape[-1], dtype=wide) * (to_above / total)[..., None]
+               + jax.nn.one_hot(above, bins.shape[-1], dtype=wide) * (to_below / total)[..., None])
+    # The categorical's own soft cross-entropy, its derivative kept where the target is confident.
+    return categorical.soft_cross_entropy(logits.astype(wide), encoded)
 
 
 def unimix_log_probs(logits: jax.Array, unimix: float = 0.01) -> jax.Array:
-    """A categorical's log-probabilities, its softmax mixed with `unimix` of the uniform."""
-    probs = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
-    if unimix:
-        probs = (1 - unimix) * probs + unimix / logits.shape[-1]
-    return jnp.log(probs)
+    """A categorical's log-probabilities, its softmax mixed with `unimix` of the uniform: without the
+    mixture the log-softmax itself, finite wherever the logits are, where the log of a probability that
+    underflowed would be -inf."""
+    if not unimix:
+        return categorical.log_probs(logits)
+    return jnp.log((1 - unimix) * categorical.probabilities(logits) + unimix / logits.shape[-1])
 
 
 def onehot_sample(key: jax.Array, log_probs: jax.Array) -> jax.Array:

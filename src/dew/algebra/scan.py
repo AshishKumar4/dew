@@ -44,6 +44,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import carry, cost, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
+from dew.cache import ALGEBRA
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
 
 Axes = tuple[str, ...]
@@ -282,14 +283,17 @@ def _form(extents: linear_scan.Extents, corrected: bool) -> linear_scan.Form:
     work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for and at
     the products' configured precision, each of which prices the forms (`cost.target`, `cost.product_work`):
     a derivation under one target is no other's."""
-    return _derived_form(extents, corrected, cost.target(), jax.config.jax_default_matmul_precision)
+    return _derived_form(extents, corrected, cost.target(), jax.config.jax_default_matmul_precision,
+                         ALGEBRA.value.checked)
 
 
 @functools.cache
-def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precision) -> linear_scan.Form:
-    """`_form`'s, once for each of its facts, `precision` the configured one its products read."""
+def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precision,
+                  checked: bool) -> linear_scan.Form:
+    """`_form`'s, once for each of its facts, `precision` the configured one its products read, `checked`
+    whether the extractor oracle holds its extraction (`Passes.checked`)."""
     del precision
-    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target))
+    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target), checked=checked)
 
 
 def _magnitude(bound: float | tuple[float, float] | None) -> float | None:

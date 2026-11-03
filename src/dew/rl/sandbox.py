@@ -120,13 +120,17 @@ def launched(command: tuple[str, ...], limits: SandboxLimits,
     process group ends and whose streams close with the block, however it ends (`process_group`).
 
     The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
-    parent-death signal, then execs the command with a minimal environment.
+    parent-death signal, then execs the command with a minimal environment, which carries a measured
+    parent's coverage startup alone.
     """
     launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
+    # A measured parent's coverage startup passes on (`_sandbox_exec.saved_coverage`); nothing else does.
+    traced = {name: os.environ[name] for name in ("COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START")
+              if name in os.environ}
     return process_group(
         [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
          str(os.getpid()), *command], cwd=directory,
-        env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
+        env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", **traced},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 

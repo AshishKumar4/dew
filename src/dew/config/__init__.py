@@ -975,6 +975,21 @@ def takes_dtype(model: ModelConfig) -> bool:
     return isinstance(owner, type) and any(name == "dtype" for name, _, _ in member_fields(owner))
 
 
+def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -> bool:
+    """Whether an objective `now` trains what `before` trained: one class, every argument the same but
+    those its class lets a resume change (`dew.objectives.base.Objective.resumable`), a stated argument
+    the same as the default it states again."""
+    if before is None or now is None or before.name != now.name:
+        return False
+    resumable = objectives[now.name].resumable
+
+    def kept(config: ObjectiveConfig) -> dict:
+        return {name: value for name, value in {**config.defaults, **config.fields}.items()
+                if name not in resumable}
+
+    return kept(before) == kept(now)
+
+
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
     Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
@@ -1501,6 +1516,8 @@ class RunConfig:
         before, now = recorded._fields_record(), self._fields_record()
         changed = sorted(name for name in now.keys() | before.keys()
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
+        if "objective" in changed and _learns_alike(recorded.objective, self.objective):
+            changed.remove("objective")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
         if recorded.trainer.precision != self.trainer.precision:

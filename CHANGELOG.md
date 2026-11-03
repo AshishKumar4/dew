@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
+  node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
+  lower and took twice as long. A template declaration can ask for exact extraction
+  (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
+  optimum.
 - Dew requires its JAX build 0.12.0.1.post47: Mosaic GPU's layout inference computes each
   shared-memory-to-registers transfer check once, and a Pallas Mosaic GPU scratch ref can state that it is
   plain (`plgpu.PlainTransform()`), so Kimi delta attention's kernels lower and compile for sm90 in seconds
@@ -58,6 +63,35 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   model's label scores (`AccuracyMatrix`, `continual_run`, `label_scores`, `label_accuracy`).
 - An evaluation's outputs, and every tree `collective_host` reads home on one process, come home through
   their devices' pinned host memory where they have it, in one transfer (`dew._coordination.pinned_get`).
+- Tutorial 14 trains a first-person racing drone with SkyDreamer's recipe (DreamerV3 with an informed world
+  model) from its camera image, the body rates and rotor speeds it senses and the flight plan's next gates,
+  by collective thrust and body rates, and flies it against the untrained policy from the same starts. A SkyDreamer race takes a level of randomization per track (`SkyRace.ramp`, one
+  level or a tuple in `Sky.tracks`' order), and a curriculum draws each of the scene's looks for its ramp's
+  share of episodes (`dew.rl.flight.drawn_camera`). An environment run resumed under its name may change its
+  rollout, and any run the settings its objective declares (`Objective.resumable`; DreamerV3's `entropy`), so
+  a later phase of training resumes at longer windows and a lower entropy; a Dreamer rollout's checkpoint
+  holds where it owes its updates from and its pace, and a step saved before it held them restores the rest.
+  DreamerV3's two-hot, latent and continue losses are `dew.nn.categorical`'s and optax's.
+- Dreamer 4's world model trains as a run over video, the run kind `world_model`
+  (`dew.config.world_model.WorldModelRunConfig`): a tokenizer stage, then a dynamics stage over a saved
+  tokenizer run, which no record could hold (`TokenizerConfig`, `--tokenizer.run DIR --tokenizer.step N`:
+  the run's directory and a step the run pins as it starts). The run derives the tokenizer's frame from its
+  clips and the dynamics' widths from the tokenizer and the clips' actions, and the objectives read uint8
+  clips as the frames in [-1, 1] they encode (`dew.objectives.world_model.unit_frames`). The idle loader of
+  an environment run is public (`dew.objectives.rl.config.idle`), an episodic split flies the policy's draws
+  in place of its mean with `drawn` (`EpisodesConfig`), the acceptance runs of PPO and DreamerV3
+  (`tools/rl_acceptance.py`) train as environment runs, DreamerV3's `return` scored by its draws and its
+  `greedy_return` beside it, and `LocalTracker.timed` reads a journal's reports with the second each was
+  logged at.
+- Every RL program compiles through Dew's compile point with the options its models and the run hold open
+  (`compiled_with`, a quantized model's int8 GEMM option): a Dreamer or control rollout over an environment is
+  its objective's program (`Objective.program`, which now takes `donate_argnames` and holds the environment it
+  runs), so it is built again when the objective's model is replaced, and a gate race's, a renderer's and a
+  simulator's programs take them too; `simulator_rollout` takes the `models` its policy runs. Their per-step
+  host loops (a simulator's policy step, a race's step, views and scene, a renderer's poses, a server's row
+  state moves) run the executable they fetched once (`dew.nn.kernels.options.Fetched`), building no dispatch
+  key a step; a race keeps its programs for the curriculum it is at and makes them again where it changes.
+  Source that builds an `OuterProgram` outside `dew.nn.kernels.options` is reported (SLOP025).
 - A damped in-context step (`ChunkAdaptation(damped=True)`) now steps `down`, `up` or both, under an affine head,
   a logit softcap or a head transform: its rate d holds d <= rate / (1 + rate L(d)), L(d) its window's
   curvature bound along a step of that rate, settled toward the largest such d, so it never overshoots, and

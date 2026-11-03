@@ -46,8 +46,8 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
         Cell("a plain decode step attends through cuDNN",
              lambda: causal.a_plain_decode_step_attends_through_cudnn_where_it_runs(
                  rng, without_deterministic_ops)),
-        Cell("a padded prefill attends through cuDNN",
-             lambda: causal.a_padded_prefill_attends_through_cudnn_where_it_runs(
+        Cell("a padded prefill is on par with the full pass",
+             lambda: causal.a_padded_prefill_is_on_par_with_the_full_pass(
                  rng, without_deterministic_ops)),
         Cell("a float32 decoder under the accurate policy is as exact as transformers",
              decoders.a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu),

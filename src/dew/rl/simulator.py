@@ -20,7 +20,6 @@ which it puts back where it has a `branch()` (`Branching`), and one with none is
 from __future__ import annotations
 
 import contextlib
-import functools
 from collections.abc import Iterator
 from typing import Protocol, overload, runtime_checkable
 
@@ -30,7 +29,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from typing_extensions import CapsuleType
 
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import Held, program
 from dew.rl.env import (
     Carry,
     Env,
@@ -133,11 +132,8 @@ def received(tree: Handed | Tree) -> jax.Array | Tree:
     return jax.tree.map(taken, tree)
 
 
-@functools.partial(OuterProgram, static_argnums=0)
 def _acted(policy: Policy, params: Params, carry: Carry) -> tuple[jax.Array, Tree, Memory, jax.Array]:
-    """A policy's step from a rollout's carry, compiled once for each policy through Dew's one compile
-    point (`OuterProgram`, which admits its communicators): its action, extras and memory, and the
-    carry's next key."""
+    """A policy's step from a rollout's carry: its action, extras and memory, and the carry's next key."""
     key, act_key = jax.random.split(carry.key)
     action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
     return action, extras, memory, key
@@ -152,25 +148,33 @@ def simulator_start(simulator: Stepped, key: jax.Array, memory: Memory = None) -
 
 
 def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry: Carry, steps: int, *,
-                      reset: bool = True) -> tuple[Carry, Transition]:
-    """`steps` steps of `policy` under `params` in `simulator` from `carry`: the policy jitted, the
-    simulator stepped from the host, each step's `Transition` stacked along a leading step axis
-    `[steps, ...]`, as `env_rollout` records them; the carry's state is the simulator's own, held by it,
-    so the carry holds None there. With `reset`, an episode that ended restarts before the next step,
-    its transition keeping the observation it ended at, which takes a `Simulator`; one that restarts its
-    episodes itself (`DrivenSimulator`) passes False. The policy acts where the simulator's arrays are, its
-    `params` and the carry's key and memory put there whole (a no-op where they already are), replicated
-    over a mesh the observations are laid out on, the observations keeping their layout."""
+                      reset: bool = True, models: tuple[Held, ...] = ()) -> tuple[Carry, Transition]:
+    """`steps` steps of `policy` under `params` in `simulator` from `carry`: the policy compiled as a program
+    (`dew.nn.kernels.options.program`, once for each policy, under the options of the `models` it runs) and
+    fetched once, so no step builds its dispatch key (`OuterProgram.executable`); the simulator stepped
+    from the host, each step's `Transition` stacked along a leading step axis `[steps, ...]`, as
+    `env_rollout` records them; the carry's state is the simulator's own, held by it, so the carry holds
+    None there. With `reset`, an episode that ended restarts before the next step, its transition keeping
+    the observation it ended at, which takes a `Simulator`; one that restarts its episodes itself
+    (`DrivenSimulator`) passes False. The policy acts where the simulator's arrays are, its `params` and
+    the carry's key and memory put there whole (a no-op where they already are), replicated over a mesh
+    the observations are laid out on, the observations keeping their layout."""
     restarting = simulator if isinstance(simulator, Simulator) else None
     if reset and restarting is None:
         raise TypeError("a rollout that restarts ended episodes needs a Simulator, which restarts them")
     held = jax.tree.leaves(carry.observation)[0].sharding
     whole = NamedSharding(held.mesh, PartitionSpec()) if isinstance(held, NamedSharding) else held
     params, key, memory = jax.device_put((params, carry.key, carry.memory), whole)
-    carry = Carry(carry.state, carry.observation, key, memory)
+    carry = Carry(None, carry.observation, key, memory)
     recorded = []
-    for _ in range(steps):
-        action, extras, memory, key = _acted(policy, params, carry)
+    acted = program(_acted, *models, static_argnums=0)
+    acting = acted.executable(policy, params, carry)
+    for step in range(steps):
+        # A carry's types settle with the policy's first step (a memory may leave in other dtypes than it
+        # began in), so the second step's executable is the one every later step runs.
+        if step == 1:
+            acting = acted.executable(policy, params, carry)
+        action, extras, memory, key = acting(params, carry)
         following = received(simulator.step(action))
         following = TimeStep(following.observation, following.reward, following.terminated.astype(bool),
                              following.truncated.astype(bool))

@@ -338,11 +338,10 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     compiled through the kernel templates' reports (`OuterProgram`): one program for each function,
     options and arguments, which every call with the same reuses, so a quantized model and another never
     share one. Every outer program Dew compiles is one of these, a task's, an autoencoder's, a metric's, a
-    load's or a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
-    `step`), but those whose owner keeps them as long as itself: an objective's (`Objective.program`),
-    the RL rollouts', each built over its own environment and policy (`dew.objectives.rl.control`'s and
-    `dew.objectives.rl.dreamer`'s rollouts, `dew.rl.flight.GateRace`'s and `dew.rl.hyperlux`'s programs,
-    `dew.rl.simulator`'s policy step), and a closure's or a bound method's a run makes (`owned_program`)."""
+    load's, a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
+    `step`) or a simulator's, but those whose owner keeps them: an objective's (`Objective.program`, for
+    what runs its modules, a rollout over an environment included), and a closure's or a bound method's a
+    run makes (`owned_program`)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
         function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
@@ -361,6 +360,27 @@ def owned_program[**P, R](function: Callable[P, R], *models: Held,
     would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
     return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
                         **arguments)
+
+
+class Fetched:
+    """`program`, of no static argument, as a host loop that calls it every step runs it: the executable of
+    its first call (`OuterProgram.executable`), which each call after it runs, so none builds the dispatch
+    key a call reads from every argument (`OuterProgram._keyed`, which jit read in C++). A step of the loop
+    keeps the first's shapes, dtypes and placements, and the context it traces in: its executable refuses
+    other arguments, where the program would compile for them. A server's step, one executable for each
+    size of its admission, runs as this does (`dew.inference.serving_kernel.dispatched`)."""
+
+    def __init__(self, program: OuterProgram):
+        if program.numbers or program.names:
+            raise ValueError("an executable takes the arguments that are not static: a program with static "
+                             "arguments is fetched as `OuterProgram.executable` is, by its caller")
+        self.program = program
+        self._executable: jax.stages.Compiled | None = None
+
+    def __call__(self, *args, **kwargs):
+        if self._executable is None:
+            self._executable = self.program.executable(*args, **kwargs)
+        return self._executable(*args, **kwargs)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]

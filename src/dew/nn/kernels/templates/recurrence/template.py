@@ -8,8 +8,7 @@ with as many chunks in flight as every launch's shared memory
 allows a block of the device (`staged_bytes`: each launch's streams and staging tiles as its bundle declares
 them, `planned`, the fast backward's with the forward's where a call takes it). Nothing is
 measured, tabled, swept or ranked: a GPU no row names derives its tiles from its own facts, and a measured
-gap is fixed in the derivation or the kernel. The cost model's estimate (`cost`) reports the derived
-launches' seconds.
+gap is fixed in the derivation or the kernel.
 """
 
 import contextlib
@@ -57,15 +56,15 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `mainloop.forward`'s) runs
     at `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order,
     as planned (`mainloop.Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not
-    built (`mainloop._kernel`); with `backward`, the fast backward's too (`mainloop_backward.gradients`). A
-    `wide` call's output lands in fp32 (`mainloop.forward`'s): planned in the operands' dtype, the SSD's
-    output launch asked 16 KB past its plan (204800 bytes against 188544 on an H100's compile, the resource
-    gate's). A `skip` (`[HV]`, its shape) fused into the output and reverse walk is planned with them: its
-    reverse walk holds a tile more."""
+    built (`mainloop.launch_kernel`); with `backward`, the fast backward's too
+    (`mainloop_backward.gradients`). A `wide` call's output lands in fp32 (`mainloop.forward`'s): planned in
+    the operands' dtype, the SSD's output launch asked 16 KB past its plan (204800 bytes against 188544 on an
+    H100's compile, the resource gate's). A `skip` (`[HV]`, its shape) fused into the output and reverse walk
+    is planned with them: its reverse walk holds a tile more."""
     found: list[mainloop.Launch] = []
 
     def run(q, k, v, g, beta, h0, starts, skip):
-        token = mainloop._PLANNED.set(found)
+        token = mainloop.PLANNED.set(found)
         try:
             out, final, (inverse, kept) = mainloop.kept_forward(
                 q, k, v, g, beta, h0, tiles=tiles, starts=starts, max_segments=max_segments, delta=delta,
@@ -76,7 +75,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
                                             kept=kept, delta=delta, floor=floor, rounded=rounded,
                                             ranged=ranged, skip=skip)
         finally:
-            mainloop._PLANNED.reset(token)
+            mainloop.PLANNED.reset(token)
 
     with contextlib.nullcontext() if target is None else generation.assumed(target):
         jax.eval_shape(run, q, k, v, g, beta, h0, starts, skip)
@@ -134,7 +133,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
 
 
 def ranged(dtype, delta: bool, bound: float | None) -> bool:
-    """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop._Call.ranged`): a 16-bit
+    """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop.Call.ranged`): a 16-bit
     delta rule whose form proves no bound on the inverse's entries."""
     return delta and jnp.dtype(dtype) != jnp.float32 and bound is None
 

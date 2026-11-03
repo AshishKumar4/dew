@@ -2418,16 +2418,20 @@ kernels, 1.26 ms of them a decode step against vLLM's 0.50, and 8.1 ms an
 admission (32 admissions of 8 prompts).
 
 The largest admission item was the prefill's attention. Admission left-pads
-its prompts and writes their keys compactly, so the cache prefill builds the
-cursor mask. `kernel_for_materialized_mask`, a rule meant for training
-(cuDNN's bias backward refuses odd lengths), sent that mask to xla, which
-cost two dense dots, a softmax and four mask transposes, 3.7 ms an
-admission. A cache call over more than one query now gives the mask to cuDNN
-as its bias wherever cuDNN runs; training, single-token decode, CPU and the
-deterministic-ops CUDA lane are unchanged. Over 28 layers in isolation it
-takes 4.0 against 6.2 ms, and the device's busy time per run went from
-2212.6 to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128 (two
-traced runs each, the same in both).
+its prompts and writes their keys compactly, so the cache prefill then built
+the cursor mask, and `kernel_for_materialized_mask`, a rule meant for
+training (cuDNN's bias backward refuses odd lengths), sent that mask to xla,
+which cost two dense dots, a softmax and four mask transposes, 3.7 ms an
+admission. Giving the mask to cuDNN as its bias took 4.0 against 6.2 ms over
+28 layers in isolation, and the device's busy time per run went from 2212.6
+to 2179.2 ms at 64 slots and from 3807.4 to 3745.1 ms at 128 (two traced
+runs each, the same in both). Today the prefill builds no mask: its rows'
+padding reaches the attention selector as key validity, which FlashAttention
+takes (an H100 and an L4, 2026-11-02). A cache call that does build its mask
+over more than one query, a mixed serving step's prompt pieces or a verified
+draft, runs forward only and gives it to cuDNN as its bias wherever cuDNN
+runs (`attention.mask_kernel`); training, single-token decode, CPU and the
+deterministic-ops CUDA lane keep xla's rule.
 
 It is not bitwise, because cuDNN rounds at other points than xla's dots and
 softmax. I measured the error under tests/reference_error.py's rule, against
@@ -2444,8 +2448,8 @@ bf16 near-tie. Teacher-forced through the fp32 model, the two chosen tokens'
 logits are a median 0.64 bf16 spacings apart at their magnitude and at most
 2.78; 77% are under one spacing and 98% under two. The fp32 argmax is the
 xla prefill's choice in 31 rows and cuDNN's in 23.
-`a_padded_prefill_attends_through_cudnn_where_it_runs` in `tests/test_causal_transformer.py`, a cell of
-`tests/test_gpu_models.py`, checks the routing. The distances apply `tests/reference_error.py`'s
+`a_padded_prefill_is_on_par_with_the_full_pass` in `tests/test_causal_transformer.py`, a cell of
+`tests/test_gpu_models.py`, holds the padded prefill on par with the full pass. The distances apply `tests/reference_error.py`'s
 `distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
 under `jax.default_matmul_precision("highest")` over the same tokens.
 

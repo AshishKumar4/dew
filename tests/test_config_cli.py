@@ -515,3 +515,24 @@ def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_reco
                                 "delay": Exponential(init_value=10.0, end_value=1.0, every=4)}
     assert _Schedules.from_dict(json.loads(json.dumps(config.to_dict()))) == config
     assert parse(_Schedules, []).schedules == {}
+
+
+def test_a_python_runs_trust_holds_while_its_file_builds_it(tmp_path):
+    """`--trust` holds before a Python run's file runs (`run_named`), whether or not its chain is
+    recorded: a source the file loads while it builds the run (a source directory beside it, which
+    `dew.registry.trusts_source` reads) is trusted there, so its own code runs where its load reads it."""
+    from dew.cli.main import run_named
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (tmp_path / "trusting_run.py").write_text(
+        "import dataclasses\n"
+        "import numpy as np\n"
+        "from autoencoder_experiment import FEATURES, run as experiment\n"
+        "from dew.data import Memory\n"
+        "from dew.registry import trusts_source\n"
+        f"assert trusts_source({str(source)!r})\n"
+        "rows = [{'x': np.full((FEATURES,), index / 32, np.float32)} for index in range(32)]\n"
+        "run = dataclasses.replace(experiment(), validation=None,\n"
+        "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n")
+    assert run_named(str(tmp_path / "trusting_run.py"), (str(source),)).unrecorded()

@@ -1859,18 +1859,42 @@ def test_a_bare_jit_anywhere_in_the_package_is_reported(tmp_path):
     rollout = ("import functools\n"
                "import jax\n"
                "from jax import jit\n"
-               "from dew.nn.kernels.options import OuterProgram\n"
+               "from sparx.nn.kernels.options import owned_program, program\n"
                "@jax.jit\n"
                "def acted(x): return x\n"
                "stepped = jax.jit(acted)\n"
                "partial = functools.partial(jax.jit, static_argnums=0)\n"
                "imported = jit(acted)\n"
-               "@OuterProgram\n"
-               "def compiled(x): return x\n"
+               "compiled = owned_program(acted)\n"
+               "shared = program(acted)\n"
                "mapped = jax.pmap(acted)\n")
     for package in ("rl", "training", "checkpoints"):
         assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
                         (5, 7, 8, 9, 12))
+    assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
+
+
+def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
+    """SLOP025: a program built as an `OuterProgram` of its own, by a call, a `functools.partial` over it, a
+    decorator or an alias of its name, takes no compiler option, so it is reported in any package of
+    `src/<package>` but the compile point's own module; its name in an annotation, or a program built
+    by `program` or `owned_program`, is not, nor an `OuterProgram` in the tests or the tools."""
+    rollout = ("import functools\n"
+               "from sparx.nn.kernels.options import OuterProgram, OuterProgram as Compiled, owned_program\n"
+               "@OuterProgram\n"
+               "def decorated(x): return x\n"
+               "called = OuterProgram(decorated)\n"
+               "@functools.partial(OuterProgram, static_argnums=0)\n"
+               "def partial(x): return x\n"
+               "aliased = Compiled(decorated, donate_argnums=0)\n"
+               "owned = owned_program(decorated)\n"
+               "def accepts(program: OuterProgram) -> tuple[OuterProgram, ...]:\n"
+               "    return (program,)\n")
+    for package in ("rl", "objectives", "training"):
+        assert_reported(tmp_path / package, f"src/sparx/{package}/rollout.py", rollout, "SLOP025",
+                        (3, 5, 6, 8))
+    point = "from sparx.nn.kernels.options import OuterProgram\nfine = OuterProgram(None)\n"
+    assert _linted(tmp_path / "point", {"src/sparx/nn/kernels/options.py": point}) == []
     assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 

@@ -142,6 +142,9 @@ class Options:
     """The most padded tokens one pass holds."""
     batch_rows: int = 64
     """The most rows one pass holds."""
+    trust: tuple[str, ...] = ()
+    """The packages outside Dew a run's record may import, and the sources whose own code the load may run
+    (a backbone's media processor's), by name (`dew.registry.import_trusted`)."""
 
 
 def loaded(options: Options) -> Decide:
@@ -149,9 +152,10 @@ def loaded(options: Options) -> Decide:
     `param_dtype`, else in the dtype they serve in."""
     param_dtype = options.param_dtype or options.dtype
     if options.run is not None:
-        return Decide.from_run(options.run, dtype=options.dtype, param_dtype=param_dtype)
+        return Decide.from_run(options.run, dtype=options.dtype, param_dtype=param_dtype, trust=options.trust)
     return Decide.from_pretrained(options.model or "convaiinnovations/laya", subfolder=options.subfolder,
-                                  revision=options.revision, dtype=options.dtype, param_dtype=param_dtype)
+                                  revision=options.revision, dtype=options.dtype, param_dtype=param_dtype,
+                                  trust=options.trust)
 
 
 def main(options: Options) -> None:

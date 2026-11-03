@@ -45,8 +45,8 @@ size plus one reservation."""
 @dataclasses.dataclass(frozen=True)
 class Work:
     """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
-    (tensor-core FLOPs by mode: the 16-bit mode's, 16-bit operands summed in fp32, and TF32's, fp32 operands
-    at the default precision, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
+    (tensor-core FLOPs by mode: the 16-bit mode's, 16-bit operands summed in fp32, TF32's, fp32 operands
+    at the default precision, and FP8's, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
     `Precision.HIGHEST`'s FLOPs among them; special-function exponentials; conversions, which run on the
     CUDA cores at their rate until a target states one of their own) and its bytes by level (device memory,
     shared memory), and its span, the dependent steps on its critical path (a loop's iterations, each reading
@@ -63,6 +63,7 @@ class Work:
     shared_bytes: float = 0.0
     tf32_flops: float = 0.0
     span: float = 0.0
+    fp8_flops: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":
         # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
@@ -70,12 +71,14 @@ class Work:
         return Work(self.flops + other.flops, self.operations + other.operations,
                     self.exponentials + other.exponentials, self.conversions + other.conversions,
                     self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
-                    self.tf32_flops + other.tf32_flops, max(self.span, other.span))
+                    self.tf32_flops + other.tf32_flops, max(self.span, other.span),
+                    self.fp8_flops + other.fp8_flops)
 
 
 @functools.cache
 def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, ...]:
-    """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit and TF32 modes, the
+    """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit, TF32 and FP8 modes
+    (FP8's the 16-bit one's where the generation states none, its codes unpacked into 16-bit products), the
     CUDA cores, the special-function units, shared memory and device memory. Each is a multiprocessor's at
     the target's clock, or with `device` the whole device's (its multiprocessors at its clock, the tensor
     cores at its datasheet's dense peak where it states no clock), where a tile walk's device bytes and XLA's
@@ -95,19 +98,21 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
-    return (tensor, rate(target.tensor_rate("tf32")), rate(target.tensor_rate("fp32")),
+    eight = rate(target.tensor_rate("8bit")) or tensor
+    return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
             rate(EXPONENTIALS_PER_CLOCK if cuda else None),
             math.inf if device else rate(SHARED_BYTES_PER_CLOCK if cuda else None),
-            target.memory_bandwidth if device else math.inf)
+            target.memory_rate if device else math.inf)
 
 
 def units(work: Work, at: tuple[float | None, ...]) -> tuple[list[float], tuple[float, ...]]:
-    """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit and TF32
-    modes in turn), the CUDA cores (operations and conversions), the special-function units, shared memory and
-    device memory; and, mode by mode, the work at a rate the target states none of, which no time prices (0
-    where one does)."""
-    tensor, tf32, cuda, special, shared, device = at
-    grouped = (((work.flops, tensor), (work.tf32_flops, tf32)), ((work.operations + work.conversions, cuda),),
+    """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
+    FP8 modes in turn), the CUDA cores (operations and conversions), the special-function units, shared
+    memory and device memory; and, mode by mode, the work at a rate the target states none of, which no time
+    prices (0 where one does)."""
+    tensor, tf32, eight, cuda, special, shared, device = at
+    grouped = (((work.flops, tensor), (work.tf32_flops, tf32), (work.fp8_flops, eight)),
+               ((work.operations + work.conversions, cuda),),
                ((work.exponentials, special),), ((work.shared_bytes, shared),),
                ((work.device_bytes, device),))
     priced = [sum(amount / per_second for amount, per_second in unit if amount and per_second is not None)

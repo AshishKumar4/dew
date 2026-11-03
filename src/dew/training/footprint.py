@@ -735,7 +735,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     `shard_shape`), its parameters whole as those layouts gather them. A layout that splits more than the
     rows (stages, tensor, sequence) derives no residuals, which its compile judges, nor does a step for a
     device whose memory nothing judges at `capacity` (`judged`: a CPU, a compile-only GPU no capacity is
-    given), as its walk ends unknown whatever it derives."""
+    given), whose walk reads no rung ('unstated', `FitSearch.walked`)."""
     mesh = jax.sharding.get_abstract_mesh()
     spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.

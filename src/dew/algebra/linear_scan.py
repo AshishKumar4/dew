@@ -75,7 +75,7 @@ from egglog import (
 )
 from jax.extend import core as jcore
 
-from dew.algebra import cost, terms
+from dew.algebra import cost, extract, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Program, Refused, aval
 
@@ -551,7 +551,7 @@ def _leaves(extents: Extents) -> list:
             for fact in (set_(rows_of(value)).to(i64(rows)), set_(columns_of(value)).to(i64(columns)))]
 
 
-def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule) -> Form:
+def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked: bool = False) -> Form:
     """The chunk's cheapest form (the module's account) under `schedule`: the e-graph saturated under the
     identities, extracted by each node's work (`_work`; a solve, which no node computes until an identity
     rewrites it, costs past every form), and the extracted form priced exactly, its shared nodes once and
@@ -569,7 +569,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule) -> Form
         return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child)), schedule)
 
     model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
-    extracted = graph.extract(root, cost_model=model, extractor="greedy-dag")
+    extracted, _ = extract.cheapest(graph, root, model, checked=checked)
     # The pair of its two parts, or one algorithm that gives both (the token loop, where the target prices
     # its steps past every other form's work), read by its projections.
     parts = get_callable_args(extracted, Chunk.pair)

@@ -346,7 +346,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     states = A.shape[-1]
     padded = -(-length // chunk) * chunk
 
-    pad = functools.partial(mainloop._padded, axis=1, size=padded)
+    pad = functools.partial(mainloop.zero_padded, axis=1, size=padded)
     resets = (jnp.zeros((rows, padded, RESET_WIDTH), jnp.int8) if starts is None else
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
@@ -386,7 +386,7 @@ def _scan_backward(scan: Scan, residuals, grads):
     def leading(t):
         """`t` `[R, T, ...]` with its tokens last, padded to whole blocks: a zero token decays nothing,
         writes nothing and reads nothing."""
-        return mainloop._padded(jnp.moveaxis(t, 1, -1), axis=t.ndim - 1, size=padded)
+        return mainloop.zero_padded(jnp.moveaxis(t, 1, -1), axis=t.ndim - 1, size=padded)
 
     dx, ddt, db, dc, da, dd, dstate = backward(
         leading(x), leading(dt), leading(B), leading(C), _parameters(A, D, scan.channels), entered,

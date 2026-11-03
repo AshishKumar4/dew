@@ -1259,7 +1259,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's skip and cast
     # took 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
     # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
-    # (`mainloop._Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
+    # (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
     # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
     # tile).
     fast = fast_rounding()
