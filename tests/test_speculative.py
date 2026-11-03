@@ -123,15 +123,49 @@ def greedy_walk(model, params, prompts, steps: int) -> np.ndarray:
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
-    walk (`greedy_walk`), each row's crossing inside a block."""
+    walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
+    (`strategies.block_step`), crossing in the replay of what the block emits, so a block's program holds
+    the rebuild, a whole prefill of the history, once: its candidates' verify asks for none (ledger 3703:
+    it held a second, 27 s of the DSpark program's compile on CPU). A prompt that starts so walks a token
+    a block and still fills its budget."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prediction_depths, prefill_state
+
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
-    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompts)
-    speculated = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                          strategy=Speculative(block=3))
-    walked = greedy_walk(model, params, prompts, 6)
-    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
-    np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
+    cases = [(jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32), 6),
+             (jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32), 2)]
+    params = jax.jit(model.init)(jax.random.key(0), cases[0][0])
+    for prompts, steps in cases:
+        speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
+                              sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+        np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
+                                      greedy_walk(model, params, prompts, steps))
+        np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
+
+    # The speculative loop traced over the decode's own operations (`DecodeOps`), its verifies recorded.
+    ops = decode_ops(model, params, 0, prediction_depths(model))
+    verified, asked = ops.verify, []
+    assert verified is not None
+
+    def verify(state, tokens, valid, **options):
+        # Whether the call may rebuild (`strategies.Verify`), which it does unless told not to.
+        asked.append(options.get("rebuilds", True))
+        return verified(state, tokens, valid, **options)
+
+    prompts, steps = cases[0]
+    rows, width = prompts.shape
+
+    def speculate(prompts):
+        state, real = prefill_state(model, params, ModelInputs(prompts), ops)
+        start = decoding.StepState(jnp.concatenate([prompts, jnp.zeros((rows, steps), jnp.int32)], axis=1),
+                                   jnp.arange(width + steps)[None, :] < width, jnp.zeros(rows, jnp.int32),
+                                   real, jax.random.split(jax.random.key(1), rows), prompt_width=width)
+        return Speculative(block=3)(state, start, dataclasses.replace(ops, verify=verify),
+                                    decoding.chain((decoding.Greedy(),)),
+                                    decoding.finish(decoding.Finishing.of(())), steps, 1)
+
+    jax.make_jaxpr(speculate)(prompts)
+    assert asked == [False, True]
 
 
 def stretch_verified(model, params, depths):

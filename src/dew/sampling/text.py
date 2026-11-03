@@ -526,7 +526,9 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     them, the crossing rows marked (`DecoderState.rebuilt`). A call whose
     tokens cross answers each as the walk a token at a time does: those up
     to the change at the short table, over the cache as it stands, and those
-    past it from the rebuilt history.
+    past it from the rebuilt history. A call no row crosses passes
+    `rebuilds=False` and compiles no rebuild: a speculative block's candidates
+    (`strategies.block_step`).
     """
     exposed = isinstance(model, Exposing)
     # The target's forwards read the run's progress where it reads one; a drafter's proposals, which the
@@ -537,7 +539,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     depths = depths or 0
     recorded = [] if blocks is None else ["prediction_inputs"]
 
-    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
+    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
 
@@ -552,7 +554,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         original = rebuild_position(model)
-        if original is not None and history is not None and lengths is not None:
+        if rebuilds and original is not None and history is not None and lengths is not None:
             slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
@@ -599,12 +601,14 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             cache=gather_cache_rows(state.cache, rows))
 
     # `run`'s rebuild reseeds the depths through these ops, bound once they are made.
+    original = rebuild_position(model)
     if blocks is not None:
-        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
+        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1], rebuild_position=original)
     elif not depths or not exposed:
-        made = DecodeOps(advance, reindex, run)
+        made = DecodeOps(advance, reindex, run, rebuild_position=original)
     else:
-        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
+        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths,
+                         rebuild_position=original)
     return made
 
 

@@ -81,8 +81,18 @@ class Draws:
 
 Advance = Callable[[DecoderState, jax.Array, jax.Array], DecoderState]
 Reindex = Callable[[DecoderState, jax.Array], DecoderState]
-Verify = Callable[[DecoderState, jax.Array, jax.Array],
-                  tuple[DecoderState, jax.Array, jax.Array | None]]
+
+
+class Verify(Protocol):
+    """`DecodeOps.verify`: a block of tokens per row behind a validity mask, fed to the model, and the
+    state, every position's logits and hidden states it leaves. A row whose tokens cross
+    `DecodeOps.rebuild_position` rebuilds its caches; without `rebuilds`, a call no row crosses, the
+    program carries no rebuild."""
+
+    def __call__(self, state: DecoderState, tokens: jax.Array, valid: jax.Array, /, *,
+                 rebuilds: bool = True) -> tuple[DecoderState, jax.Array, jax.Array | None]: ...
+
+
 Propose = Callable[[DecoderState, jax.Array, jax.Array | None, jax.Array | None, jax.Array,
                     jax.Array, int, PredictionPhase], tuple[DecoderState, jax.Array, jax.Array]]
 Record = Callable[[DecoderState, jax.Array, jax.Array], DecoderState]
@@ -104,6 +114,9 @@ class DecodeOps:
     `record` appends the states `verify` returned for a stretch's real
     positions to the drafter's windows, and `draft` drafts the next block from
     each row's first token, handing each position's logits to a `choose`.
+    `rebuild_position` is the position past which the model's cached keys go
+    stale (`text.rebuild_position`), a row crossing it rebuilding every cache
+    in `verify`; None where none goes stale.
     """
 
     advance: Advance
@@ -114,6 +127,7 @@ class DecodeOps:
     depths: int = 0
     record: Record | None = None
     draft: DraftBlock | None = None
+    rebuild_position: int | None = None
 
 
 class Strategy(Protocol):
@@ -596,8 +610,10 @@ class Speculative:
     block and the accepted prefix is replayed into it, because a recurrent
     mixer's state is a running summary that no cursor can rewind. The
     prediction cache is rebuilt the same way. A block that continues emits
-    two or more tokens unless the budget ends first, so `ceil(budget / 2)`
-    iterations bound the loop.
+    two or more tokens unless the budget ends first, or one where a row walks
+    across a cache rebuild (`block_step`), in at most `block` blocks, so
+    `ceil(budget / 2)` iterations bound the loop, `ceil((budget + block) / 2)`
+    where the model's caches rebuild.
 
     `confidence` stops the draft after the first candidate to which the
     draft itself gives a probability below `confidence`, as the reference's
@@ -730,12 +746,15 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
 
 
 def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
-              step: StepState, active: jax.Array, budget: int | jax.Array) -> tuple[jax.Array, jax.Array]:
+              step: StepState, active: jax.Array, budget: int | jax.Array, walking: jax.Array
+              ) -> tuple[jax.Array, jax.Array]:
     """How many candidates the block keeps, and the token it ends on.
 
     A candidate the draft never offered was not rejected, so the block ends
     on an ordinary target draw there; only a rejected offer draws from the
-    positive part of `p - q`, the distinction algorithm 1 rests on.
+    positive part of `p - q`, the distinction algorithm 1 rests on. A
+    `walking` row keeps none, offered none, and ends on the target's own
+    draw at its first slot, the walk's token (`block_step`).
     """
     candidates, drafts, offered, ending = (drafted.candidates, drafted.scores,
                                            drafted.offered, drafted.ending)
@@ -747,8 +766,9 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
         uniform = jax.vmap(jax.random.uniform)(counted(keys[:, block_size + at]))
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
-    matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)).astype(jnp.int32)
-    turned_down = matched < available
+    matched = jnp.where(walking, 0, 1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1),
+                                                axis=1)).astype(jnp.int32)
+    turned_down = (matched < available) & ~walking
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
                                 jnp.minimum(matched, block_size - 1)[:, None, None], axis=1)[:, 0]
@@ -854,7 +874,13 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     step both speculative loops take, `Speculative`'s scan and the server's
     (`dew.inference.serving_kernel`). `budget` caps each row's draws, one
     for every row or a row's own (`[rows]`). A decode with nothing to draft
-    with is refused (`refuse_undrafted`)."""
+    with is refused (`refuse_undrafted`).
+
+    A row whose candidates would cross `DecodeOps.rebuild_position` keeps none
+    and draws its one token as the walk does, so the candidates' verify crosses
+    nothing and carries no rebuild, the replay's being the block's one (ledger
+    3703: two rebuilds a block, each a whole prefill, compiled 27 s of DSpark's
+    program): the row walks a token a block until its candidates are past it."""
     refuse_undrafted(ops)
     verify, block_size = ops.verify, plan.block
     assert verify is not None
@@ -863,6 +889,11 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
         jax.random.fold_in(key, count), 2 * block_size + 1))(step.keys, step.step)
+    position, lengths = ops.rebuild_position, state.lengths
+    # The candidates reach `lengths + block_size`, so a row crosses among them where the change is past
+    # its length and before that.
+    walking = (jnp.zeros(rows, bool) if position is None or lengths is None else
+               (lengths <= position) & (position < lengths + block_size))
 
     drafted = _drafted(plan, ops, state, step, keys, base, active, budget,
                        transform, stopping)
@@ -870,13 +901,14 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     proposed = jnp.stack(candidates, axis=1)
     _, verified, _ = verify(
         drafted.state, proposed,
-        jnp.stack([active & (step.step + at < budget) for at in range(block_size)], axis=1))
+        jnp.stack([active & ~walking & (step.step + at < budget) for at in range(block_size)], axis=1),
+        rebuilds=False)
     raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
                                                 for at in range(block_size)]
     targets = [drafted.scores[0]] + [transform(states[at], raw[at])
                                      for at in range(1, block_size + 1)]
 
-    matched, replacement = _accepted(block_size, keys, targets, drafted, step, active, budget)
+    matched, replacement = _accepted(block_size, keys, targets, drafted, step, active, budget, walking)
 
     emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
@@ -941,6 +973,10 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     empty = Draws(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
                   jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32),
                   jnp.zeros(rows, bool))
-    out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=-(-budget // 2))[0].out
+    # Each block emits two tokens a row at least, but a row's walk across a rebuild, one a block over at
+    # most `block_size` blocks.
+    walks = 0 if ops.rebuild_position is None else min(block_size, budget)
+    blocks = -(-(budget + walks) // 2)
+    out = lax.scan(outer, _SpeculativeCarry(state, start, empty), None, length=blocks)[0].out
     return dataclasses.replace(out, behavior_log_probs=jnp.where(out.valid, out.behavior_log_probs, 0.0),
                                raw_log_probs=jnp.where(out.valid, out.raw_log_probs, 0.0))
