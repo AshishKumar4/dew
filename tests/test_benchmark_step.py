@@ -22,6 +22,35 @@ from tools.benchmark_cases import cpu_smoke_cases
 pytestmark = pytest.mark.mesh
 
 
+TINY_QWEN35 = {
+    "model_type": "qwen3_5_text", "attention_bias": False, "attention_dropout": 0.0, "attn_output_gate": True,
+    "dtype": "float32", "full_attention_interval": 4, "head_dim": 16, "hidden_act": "silu", "hidden_size": 64,
+    "intermediate_size": 128, "linear_conv_kernel_dim": 4, "linear_key_head_dim": 16,
+    "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_value_head_dim": 16, "max_position_embeddings": 64,
+    "mlp_only_layers": [], "mtp_num_hidden_layers": 0, "num_attention_heads": 4, "num_hidden_layers": 4,
+    "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "tie_word_embeddings": True, "vocab_size": 128,
+    "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+    "rope_parameters": {"mrope_interleaved": True, "mrope_section": [1, 1, 0], "rope_type": "default",
+                        "rope_theta": 10000000, "partial_rotary_factor": 0.25}}
+"""Qwen3.5's text config at a test's size: a hybrid of gated delta nets and attention, whose translation holds
+records of its layer kinds (`dew.interop.config_records.NativeFields`)."""
+
+
+def test_a_case_of_a_translated_config_is_read_back_as_the_case_it_builds():
+    """A case whose config is a family's translated config is written as the process measuring its peak reads
+    it (`cases_to_json`, `cases_from_json`) and builds the model the case builds: its records written as the
+    fields they state, which the model's declared field types rebuild (row 3742)."""
+    from dew.interop.hf_decoders import translate_config
+    from dew.registry import models, to_record
+
+    step = load("benchmark_step")
+    case = step.Case("causal_transformer", dict(translate_config(TINY_QWEN35)), dtype="float32", batch_size=2,
+                     seq_len=8)
+    [read] = step.cases_from_json(step.cases_to_json([case]))
+    assert (to_record(models.build(read.architecture, **read.config), object)
+            == to_record(models.build(case.architecture, **case.config), object))
+
+
 @pytest.mark.parametrize("architecture, fixed_batch", [
     *[(case.architecture, False) for case in cpu_smoke_cases()], ("causal_transformer", True)])
 def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch, monkeypatch):
