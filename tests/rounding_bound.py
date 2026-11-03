@@ -115,7 +115,8 @@ class TapRule:
                 tapped.append(value)
                 continue
             unit = _unit(name, params, dtype)
-            draw = _normal(_mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64))), jnp.shape(value))
+            tap = _mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64)))
+            draw = _normal(tap, jnp.shape(value))
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
 
