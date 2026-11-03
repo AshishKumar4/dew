@@ -48,4 +48,5 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
     [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert interrupted["kind"] == "deadline"
-    assert "Thread 0x" in interrupted["output"] and "stalled_reading" in interrupted["output"]
+    # faulthandler's dump: each thread's frames, most recent call first, the stalled one's among them.
+    assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
