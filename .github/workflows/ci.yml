@@ -60,8 +60,9 @@ jobs:
       with:
         workflow: ci.yml
 
-  # Lint and the site's checks, and the type check beside them: each installs
-  # dewml as tools/armada/install.sh does, with uv, from uv's cache.
+  # Lint and the type check beside it: each installs dewml as tools/armada/install.sh
+  # does, with uv, from uv's cache. The site's content is the site build's to check
+  # (site.yml), after a train publishes: a red site holds a deploy, never a train.
   lint:
     needs: proven
     if: needs.proven.outputs.run == ''
@@ -93,13 +94,6 @@ jobs:
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
-    - name: The site's toolchain and dependencies
-      uses: ./.github/actions/site
-    - name: Check site content
-      run: |
-        node site/scripts/sync-docs.mjs --check
-        node site/scripts/render-notebooks.mjs --check
-        node site/scripts/render-posts.mjs --check
 
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement
