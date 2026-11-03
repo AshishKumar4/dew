@@ -175,26 +175,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                    masked: bool = False, **walk):
     """`MosaicForward`'s launch without residuals (`_inference_walk`), its launches walked by the algebra's
     guards (`algebra.walked_launches`)."""
-    spec, launch, kept, finished, _ = _inference_walk(query, key, value, spans, hooks, masked=masked, **walk)
+    spec, launch, kept, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, **walk)
     return finished(algebra.walked_launches(spec, launch, kept, masked=masked))
-
-
-def plain_launches(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                   **walk) -> dict[str, Callable[[], tuple]]:
-    """Each launch the inference walk may take (`algebra.launch_forms`), by name, as a function that runs it
-    alone, its guarded rows none: what a resource gate lowers a launch at a time, each compiling its own
-    kernel, where the walk's program compiles every one."""
-    spec, launch, _, _, rows_shape = _inference_walk(query, key, value, spans, hooks, **walk)
-    live = jnp.zeros(rows_shape, bool)
-
-    def alone(form: algebra.Forward, guarded: bool, again: bool) -> tuple:
-        return launch(form, live if guarded else None, again)[0]
-
-    def name(form: algebra.Forward, guarded: bool, again: bool) -> str:
-        parts = ["natural" if form.natural else "folded", *(["guarded"] * guarded), *(["again"] * again)]
-        return "_".join(parts)
-
-    return {name(*launched): functools.partial(alone, *launched) for launched in algebra.launch_forms(spec)}
 
 
 def _whole_rows(live: jax.Array, splits: int) -> jax.Array:
@@ -218,16 +200,15 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
                     sources: jax.Array | None = None):
     """The inference walk's launches: its spec, `launch(form, live, again)` and `kept` as
-    `algebra.walked_launches` takes them, `finished`, its outputs from the walk's, and the shape of its rows
-    `[B, H, S·Qp]` (a guard's live rows): `MosaicForward`'s launch without residuals, at `tiles`, under the
-    default's guards over whole launches (`algebra.walked_launches`). The guarded launch (`_Guard`) runs a
-    block of the family's swizzled value columns at a time: its walk carries its shifted and unshifted sums
-    and forms both tiles' products a step (`algebra.stepped`), four `[block_q, Dv]` fp32 tiles beside its
-    logits, which a block of the columns holds within a consumer's registers (ledger 1617). Each block's
-    output is exact on its own (its rows' shifts its own columns' room, `algebra.room`); the rare launch takes
-    its logits once a block. An output hook reads a row's whole output, so where there is one the blocks store
-    theirs in fp32 and the hook runs on the rows they make in XLA (`template.output_hooked`, the reference's
-    own), rounded once after it.
+    `algebra.walked_launches` takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch
+    without residuals, at `tiles`, under the default's guards over whole launches (`algebra.walked_launches`).
+    The guarded launch (`_Guard`) runs a block of the family's swizzled value columns at a time: its walk
+    carries its shifted and unshifted sums and forms both tiles' products a step (`algebra.stepped`), four
+    `[block_q, Dv]` fp32 tiles beside its logits, which a block of the columns holds within a consumer's
+    registers (ledger 1617). Each block's output is exact on its own (its rows' shifts its own columns' room,
+    `algebra.room`); the rare launch takes its logits once a block. An output hook reads a row's whole output,
+    so where there is one the blocks store theirs in fp32 and the hook runs on the rows they make in XLA
+    (`template.output_hooked`, the reference's own), rounded once after it.
 
     With `rows`, the training forward that keeps its output for the backward's D (`takes_output_residuals`):
     the output and the residuals every mainloop's training forward gives, from the plain launch's finished
@@ -326,7 +307,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         maximum, total = (array[:, :, :call.queries] for array in rows_of[0])
         return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
-    return spec, launch, kept, finished, (query.shape[0], query.shape[2], splits * call.query.shape[1])
+    return spec, launch, kept, finished
 
 
 def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
@@ -865,10 +846,13 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
-    # Each launch named apart, so its compile reports and profile rows say which it is.
+    # Each launch named apart, so its compile reports and profile rows say which it is; a launch over a block
+    # of the value columns by the block's width, every block's one kernel (the name is a static of its
+    # lowering, `_launched`: named by its first column, a width 256 compiled four, train 505's review).
     kind = "peaks" if peaks else "training" if training else "forward"
+    block_width = column_width or value.shape[-1]
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
-            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{block_width}'}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
