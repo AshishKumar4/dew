@@ -1635,24 +1635,16 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                       prefetch=None if call.per_key else prefetch,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
-    out_type, blocks, initials, work = _states_launch(call, tiles, delta, keys, values, batch,
-                                                      sequences.shape[0], stores_corrected)
-    final_landing, after = final_memory_landing(call, bv)
+    out_type, blocks, initials, staging, landing, after, work = _states_launch(
+        call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected)
     launched = launch_kernel(program, call, out_type=out_type,
-                     grid=(value_width // walked_width, sequences.shape[0], call.heads),
-                     grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                     live=lambda at, refs: refs[7][at["sequences"], 1] > 0, work=work,
-                     consumers=walkers,
-                     held=_states_held(call, values, keys, bv),
-                     staging=(*staging_tiles(held,
-                                             (CHUNK, call.block) if call.gated_keys else (call.block, bv)),
-                              column_sums_scratch(call)), once=initials,
-                     landing={**memory_landing(call, bv),
-                              **({"corrected": held.landing(CHUNK, bv)} if stores_corrected else {}),
-                              **final_landing},
-                     after=after,
-                     # Its last write's column sums an fp32 call's alone (`column_sums`).
-                     reduces=held.parts > 1)(
+                             grid=(value_width // walked_width, sequences.shape[0], call.heads),
+                             grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                             live=lambda at, refs: refs[7][at["sequences"], 1] > 0, work=work,
+                             consumers=walkers, held=_states_held(call, values, keys, bv), staging=staging,
+                             once=initials, landing=landing, after=after,
+                             # Its last write's column sums an fp32 call's alone (`column_sums`).
+                             reduces=held.parts > 1)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
     if stores_corrected:
         return launched
@@ -1664,8 +1656,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values: Operand, batch: int,
                    sequences: int, stores_corrected: bool) -> tuple:
     """`_states`' outputs (the memories, the corrected values where it stores them, the final memories),
-    its streamed blocks and its initial memories' at `tiles`, and its `Work` over `sequences`."""
+    its streamed blocks and its initial memories' at `tiles`, its staging and landing tiles and what its
+    final memories' landing waits after (`final_memory_landing`), and its `Work` over `sequences`."""
     width, value_width, walked_width = call.width, call.value_width, tiles.block_v * tiles.walkers
+    bv = tiles.block_v
     held, initial = dataclasses.replace(call.held, rows=call.rows), Operand(batch * call.heads * width, 1,
                                                                             jnp.dtype(jnp.float32))
     out_type = (call.memories.shape(value_width),
@@ -1675,9 +1669,15 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
                            values=((CHUNK, walked_width), values))
     initials = stream_blocks(**{f"initial{i}": ((call.block, walked_width), initial)
                                 for i in range(width // call.block)})
+    staging = (*staging_tiles(held, (CHUNK, call.block) if call.gated_keys else (call.block, bv)),
+               column_sums_scratch(call))
+    final_landing, after = final_memory_landing(call, bv)
+    landing = {**memory_landing(call, bv),
+               **({"corrected": held.landing(CHUNK, bv)} if stores_corrected else {}), **final_landing}
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences
-    return out_type, blocks, initials, Work(flops=4 * CHUNK * width * walked_width * steps, span=steps)
+    return (out_type, blocks, initials, staging, landing, after,
+            Work(flops=4 * CHUNK * width * walked_width * steps, span=steps))
 
 
 def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
