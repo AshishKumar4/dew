@@ -1,6 +1,7 @@
 """The derived forward's kernel against the hand-written one's, compiled for an H100 on the CPU: a derived
 step schedules its two consumers as the hand step does, and a launch that lowers its exponentials exactly
-takes no range reduction of its own (docs/design/algebra.md §6.9)."""
+takes no range reduction of its own (docs/design/algebra.md §6.9); and the derived fp16 forward over raw
+products on par with the reference path (check 1), its time against the hand step's an operator row's."""
 
 import functools
 import re
@@ -8,15 +9,15 @@ import tempfile
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import pytest
+import test_attention_mosaic as mosaic
 from fla_gdn_support import KernelCase
-from generation_support import COMPILES_ON_CPU
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from kernel_compile import _compiled
 
 from dew.algebra import forms
 from dew.nn.attention import scaled_dot_product_attention
-
-pytestmark = COMPILES_ON_CPU
 
 
 @functools.cache
@@ -52,6 +53,7 @@ def _exponentials_before_values(ptx: str) -> int:
     return len(re.findall(r"\bex2\.approx(?:\.ftz)?\.f32\b", before_values))
 
 
+@COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
 def test_a_derived_step_computes_its_softmax_before_it_acquires_its_values(width):
     """A derived fp16 step acquires its value tile where its form first reads it, past its weights, as the
@@ -63,6 +65,7 @@ def test_a_derived_step_computes_its_softmax_before_it_acquires_its_values(width
     assert found[True] >= found[False]
 
 
+@COMPILES_ON_CPU
 def test_an_exactly_lowered_launch_takes_no_range_reduction_of_its_own():
     """A softcap's launch lowers its exponentials exactly (its tanh does): the hand step takes `jnp.exp`
     there as the derived one does, no conversions of each exponent to an integer and back of its own (the
@@ -73,11 +76,12 @@ def test_an_exactly_lowered_launch_takes_no_range_reduction_of_its_own():
     assert found[False] <= found[True]
 
 
-def test_a_derived_step_scales_its_maximum_not_its_logits():
-    """A derived fp16 step over the raw products (a positive scale, `logits_of`) takes their maximum and
-    scales it once, as the hand step does (a positive scale out of a maximum, `rules._linear`): its kernel
-    multiplies no more than the hand one's, where scaling each logit before the maximum took 62 more
-    multiplies a step at Qwen3's tile."""
-    found = {derived: len(re.findall(r"\bmul(?:\.rn)?(?:\.ftz)?\.f32\b", ptx))
-             for derived, ptx in _forward_ptx((2, 4096, 32, 8, 128), "float16", causal=False).items()}
-    assert found[True] <= found[False]
+@INTERPRETS
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_a_derived_fp16_forward_over_raw_products_is_on_par_interpreted(call):
+    """A derived fp16 forward over the raw products at a positive factor (the declaration's extracted step,
+    `logits_of`: the hand step scales its maximum once) through the Mosaic mainloop, interpreted, on par with
+    the reference path (check 1). Its kernel time against the hand step's is an operator row's measurement,
+    never a count of its instructions."""
+    with forms.derived():
+        mosaic._check_forward(call, jnp.float16, mosaic.SHAPES["interpreted"], natural=False, interpret=True)
