@@ -276,15 +276,22 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
 KEYED_FORWARD = {('a decay a key dimension', 'bf16'), ('a decay a key dimension, packed', 'bf16')}
 """The interpreted forward's 16-bit cases under a decay a key dimension, 128 recorded seeds each: 250 s and
 past 600 s a whole run on the CPU (int-g1-each at 7683420535), so their draws are sharded over map tasks
-(`check1_shards`)."""
+(`check1_shards`), each case a site of its own: a task of 8 seeds of both took 117 to 125 s, half of it
+their compiles (keyed-shards at 7e3a5fb48)."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, KEYED_FORWARD))
-def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference(case, dtype):
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at the 16-bit cases of a decay a key dimension
+def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension
     (`KEYED_FORWARD`)."""
-    the_mosaic_forward_is_as_exact_as_its_reference(case, dtype)
+    the_mosaic_forward_is_as_exact_as_its_reference('a decay a key dimension', jnp.bfloat16)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call of packed documents under a decay a
+    key dimension (`KEYED_FORWARD`)."""
+    the_mosaic_forward_is_as_exact_as_its_reference('a decay a key dimension, packed', jnp.bfloat16)
 
 
 @pytest.mark.parametrize(('case', 'dtype'),
