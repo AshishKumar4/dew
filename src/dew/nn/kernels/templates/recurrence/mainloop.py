@@ -1069,13 +1069,18 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
 
             def stage(pair):
                 # The running pair at rows `CHUNK` on; the `CHUNK` rows above it zero, which its shifts read.
+                # A thread reads other threads' rows: the last shift's reads done before the rows are written
+                # again, and the writes made visible before they are read (`mosaic.synced`).
+                mosaic.synced(call.interpret)
                 for half, value in enumerate(pair):
-                    scanned.at[half, pl.ds(CHUNK, CHUNK)][...] = value
+                    plgpu.store(scanned.at[half, pl.ds(CHUNK, CHUNK)], value, optimized=False)
+                mosaic.synced(call.interpret)
                 return lambda shift: tuple(family.tile_of(scanned.at[half, pl.ds(CHUNK - shift, CHUNK)])
                                            for half in (0, 1))
 
+            mosaic.synced(call.interpret)
             for half in (0, 1):
-                scanned.at[half, pl.ds(0, CHUNK)][...] = family.zeros((CHUNK, keys))
+                plgpu.store(scanned.at[half, pl.ds(0, CHUNK)], family.zeros((CHUNK, keys)), optimized=False)
             prefix = algebra.scanned_prefix(_tile(slots, "decays", gates).value(), stage, chunk=CHUNK)
             stage(prefix)
             if not system:
@@ -1096,8 +1101,10 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
                 """The block's keys and separated prefix staged below `SUB` rows of any values (a pair they
                 reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
                 (tiles,) = padded
+                mosaic.synced(call.interpret)
                 for i, value in enumerate((operand("keys")(c), *algebra.separated(*prefix))):
-                    tiles.at[i, pl.ds(algebra.SUB, CHUNK)][...] = value
+                    plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK)], value, optimized=False)
+                mosaic.synced(call.interpret)
                 return lambda e: tuple(family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)])
                                        for i in range(3))
 
@@ -1164,8 +1171,9 @@ def _intra_staged(call: _Call, keys: int, *, system: bool) -> tuple:
                    "prefix": call.gates.landing(CHUNK, keys)}
     # Where the call's pairs do not factor (`_Call.factored`), a key block's keys and prefix halves below a
     # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
-    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),)
-    scanned = plgpu.SMEM((2, 2 * CHUNK, keys), jnp.float32)
+    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
+    scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
     return (_pairing(call, keys), scanned, *padded), landing
 
 
