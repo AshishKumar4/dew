@@ -305,12 +305,12 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
     third of its stalls (NCU-full)."""
     lengths = lengths.astype(jnp.int32)
-    ends = jnp.cumsum(lengths)
+    ends = _prefix_sums(lengths)
     starts = ends - lengths
     rows = jnp.int32(tile)
     first_rows = starts // TMA_ROWS * TMA_ROWS
     counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
-    firsts = jnp.cumsum(counts) - counts
+    firsts = _prefix_sums(counts) - counts
     tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
     ours = (firsts[None] <= tids) & (tids < (firsts + counts)[None])
     group = jnp.argmax(ours, axis=1).astype(jnp.int32)
@@ -318,6 +318,16 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
     columns = (group, block_start, starts[group], ends[group])
     return jnp.stack([jnp.where(found, column, 0) for column in columns], axis=1)
+
+
+def _prefix_sums(values: jax.Array) -> jax.Array:
+    """`values`' inclusive prefix sums, as one sum over a lower-triangular mask: a group count's square is
+    a few hundred thousand integers at most, which XLA fuses into the table's own kernels, where
+    `jnp.cumsum` lowers to reduce-window kernels of its own. The table so took 6.4 to 7.2 us against 18 to
+    20 at 129 and 257 groups, decode to training rows (row 3622, FS-3622-TABLE1-h100), the same table."""
+    count = values.shape[0]
+    held = jnp.arange(count)[None, :] <= jnp.arange(count)[:, None]
+    return jnp.sum(jnp.where(held, values[None, :], 0), axis=1, dtype=values.dtype)
 
 
 TMA_ROWS = 8
