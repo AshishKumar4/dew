@@ -222,12 +222,12 @@ Measured against the kernels the templates replace:
 | Operation | GPU | Shape | Dew | Reference |
 |---|---|---|---:|---:|
 | Mamba-1 selective scan, forward | H100 | 8 × 2048 × 5120 | 0.742 ms | mamba_ssm 1.311 ms |
-| Kimi delta attention, forward | A100 | — | 5.06 ms | fla 8.81 ms |
-| Kimi delta attention, training step | A100 | — | 11.12 ms | fla 15.92 ms |
+| Kimi delta attention, forward | A100 | Kimi Linear, 32 heads of 128, 4096 tokens | 5.06 ms | fla 8.81 ms |
+| Kimi delta attention, forward and gradient | A100 | Kimi Linear, 32 heads of 128, 4096 tokens | 11.12 ms | fla 15.92 ms |
 | Gated DeltaNet, forward | H100 | Qwen3.5-27B | 0.364 ms | fla 0.514 ms |
 | Gated DeltaNet, forward and gradient | H100 | Qwen3.5-27B | 2.46 ms | fla 3.12 ms |
 
-Attention is still slower than FlashAttention 3 and 2 at the shapes where those stay in use, and dense GEMM is 1.9 to 2.9 times slower than cuBLAS on the A100 across its forward and gradients. [Performance](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md) has every measurement and how to reproduce it.
+Attention is still slower than FlashAttention 3 and 2 at the shapes where those stay in use, and dense GEMM is 1.9 to 2.9 times slower than cuBLAS on the A100 across its forward and gradients. [Performance](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md#recurrence-templates-against-fla-and-mamba_ssm-2026-11) has each row's command and receipt.
 
 The algebra engine rewrites each program Dew compiles before XLA sees it, using an [egglog](https://github.com/egraphs-good/egglog) e-graph. It merges matching reductions into one pass, moves scales through contractions, and merges products that share an operand. A rewrite that reorders floating-point arithmetic is applied only where the operands' bounds are known, and the accurate numerics admit exact rewrites only. Every rewrite and every kernel is held to the same accuracy gate as the rest of Dew: its RMS error from a float64 reference within 1.5 times the reference implementation's, and, where an operation has a certified rounding bound, every element of every step within that bound ([testing](https://github.com/AshishKumar4/dew/blob/main/docs/design/testing.md#numerical-accuracy)).
 
