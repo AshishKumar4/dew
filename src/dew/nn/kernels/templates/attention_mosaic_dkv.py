@@ -14,7 +14,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -206,14 +206,14 @@ def _weighed(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, rows
              one_part: bool) -> tuple:
     """A keys-first tile's, or a chunk of its queries': its weights narrowed for dV in the output cotangents'
     dtype (`algebra.value_weights`, the dropped ones, `algebra.drawn`; the dQ program's sums take them
-    undropped), its pulled score cotangents and its hook's pieces (`algebra.pulled`), from its products `s`
+    undropped), its pulled score cotangents and its hook's pieces (`gradient.pulled`), from its products `s`
     and `dp` under its queries' statistics `rows`, its coordinates and its hook's parameters (`_scores`);
     the cotangents the fast form's one part in the queries' dtype where the launch takes it from the
     registers (`one_part`, the fused launch's), narrowed as they are formed: a chunk's at a time, the whole
     tile's fp32 not held to the last chunk."""
     values, queries = dtypes
     exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows, masked=True)
-    logits, pieces = algebra.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
+    logits, pieces = gradient.pulled(cotangents, slopes, seen, walk.kinds, KEY_ROWS)
     if one_part:
         parts = algebra.cotangent_parts(logits * walk.grad_scale, queries, accurate=False)
         logits = mosaic.unscaled_part(*parts)
@@ -338,7 +338,7 @@ def _grading(shares: tuple) -> bool:
     return shares[0][0] == 0
 
 KEY_ROWS = MappingProxyType({Kind.KEY: lambda entries: entries.sum(axis=-1)})
-"""`algebra.pulled`'s sums of a dK/dV tile, its keys its rows (`_dkv_step`): a key's over its row; the dK/dV
+"""`gradient.pulled`'s sums of a dK/dV tile, its keys its rows (`_dkv_step`): a key's over its row; the dK/dV
 program writes no head's or query's gradient (`DKV_GRADS`)."""
 
 

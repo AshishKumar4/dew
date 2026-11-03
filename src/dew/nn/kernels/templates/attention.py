@@ -929,7 +929,7 @@ closes; every kernel's default reads it, so the default switches here."""
 
 ACCURATE = False
 """Whether attention's backward takes its accurate products unless a call says otherwise: False, the fast
-form, the template's own D about each query's anchor (`attention_algebra.split_delta`, not
+form, the template's own D about each query's anchor (`attention_gradient.split_delta`, not
 FlashAttention's rowsum(dO * O)) with each bf16 score cotangent narrowed for one product and dQ at that
 first D, as FlashAttention's arithmetic takes them; True, the cotangents' products to fp32's accuracy and
 dQ at the refined D (`attention_algebra.cotangent_product`, `dq_finish`). The template's accurate form is
@@ -1204,7 +1204,7 @@ def output_split(out: jax.Array) -> Split:
     """The split sums of a forward that keeps its output in place of its anchor's
     (`takes_output_residuals`): its output `[B, Q, H, Dv]` as the normalized sums of every key (shift -1,
     `attention_algebra.split_residuals`), no anchor's own weight and the others' weights 1, so
-    `attention_algebra.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
+    `attention_gradient.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
     -1)."""
     others = jnp.swapaxes(out, 1, 2).astype(jnp.float32)
     rows = jnp.zeros(others.shape[:-1], jnp.float32)
@@ -1272,7 +1272,7 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         starts = nothing - jnp.inf, nothing, nothing
     else:
         # The softmax's initial state: its maximum, denominator and its values' mean's product with the
-        # cotangent, in fp32 (`attention_algebra.off_anchor_start`): `acc0 · dO` itself overflows where the
+        # cotangent, in fp32 (`attention_gradient.off_anchor_start`): `acc0 · dO` itself overflows where the
         # state's sums are near fp32's largest; its mean does not.
         total0 = state.total.astype(jnp.float32)
         over = jnp.where(total0 > 0, 1.0 / jnp.where(total0 > 0, total0, 1.0), 0.0)
@@ -1318,10 +1318,10 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
     gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
     rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
-    query the nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the
+    query the nearer, from the forward's split sums (`attention_gradient.split_delta`) or a first pass of the
     dQ launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
     enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
-    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part of
+    head, query and initial state's gradients (`attention_gradient.refinement`). The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
     two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
@@ -1368,14 +1368,14 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
         # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
         # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
-        # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
+        # Bounded as the launch's own carried factor is (`attention_gradient.below`): the forward's
         # maximum is the state's too, whatever its rounding.
         carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
         factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
+        # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
         moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
         # Its denominator's: D over T in one division, as the reference's derivative of its own division
         # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from

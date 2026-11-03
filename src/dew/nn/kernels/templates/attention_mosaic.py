@@ -429,7 +429,7 @@ general registers (P2R) until the selects that read them (`_anchor_registers`)."
 
 
 def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
-    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `algebra.grad_scores`)
+    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `gradient.grad_scores`)
     across the step, from the compares that form it to the selects that read it: its predicates packed a
     bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
     (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row
@@ -985,7 +985,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
              interpret: bool = False, rounded: bool = True) -> Gradients:
     """The template's backward on this mainloop (`MosaicBackward`, `gradients`) from a training forward's
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
-    split sums (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
+    split sums (`gradient.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
     them, in the form `accurate` names; or the fast form's one launch (`BackwardTiles.fused`,
     `_launch_backward`), a hookless call's derived default outside deterministic mode
     (`MosaicBackward.derived`). Every

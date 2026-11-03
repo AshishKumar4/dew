@@ -757,6 +757,30 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
 
 
+def _key_views(named: dict, row, head, sources, table, *, page: int | None, block_k: int,
+               column_block: tuple[int, int] | None) -> dict:
+    """The views a launch's rings read its keys and values from (`Family.opened`), at batch row `row` and key
+    head `head`: a call's rows of keys at the row its `sources` name (`_views_of`; its own without), a paged
+    pool's where its `table` maps them (`_paged_views`); the values' at their block of the columns where the
+    launch walks one (`column_block`, its first column and width), a step's block index the block's."""
+    if page is None:
+        views = _views_of(named, row if sources is None else sources[row], head)
+    else:
+        views = _paged_views(named, table, row, head, page, block_k)
+    if column_block is None or "values" not in views:
+        return views
+    ref, tile = views["values"]
+    block = column_block[0] // column_block[1]
+
+    def at_columns(j):
+        # A paged tile's pages each at the column block (`mosaic.Pieces`).
+        indices = tile(j)
+        if isinstance(indices, mosaic.Pieces):
+            return mosaic.Pieces((piece[0], block) for piece in indices)
+        return indices[0], block
+    return {**views, "values": (ref, at_columns)}
+
+
 def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
     """A paged call's streams' views (`_views_of`): each pool `[KV, P·page, D]`'s `[P·page, D]` at key head
     `head`, step `j` its key tile `j` where row `row`'s table maps it: of a page of several tiles, the
@@ -867,21 +891,8 @@ def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.For
         spans_of, hooked_of, guard_of, anchors_of, table_of, walks_of, sources_of = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         named = {"keys": k_ref} if peaks else {"keys": k_ref, "values": v_ref}
-        source = row if sources_of is None else sources_of[row]
-        views = (_views_of(named, source, lax.div(head, group)) if page is None
-                 else _paged_views(named, table_of, row, lax.div(head, group), page, block_k))
-        if column_block is not None and "values" in views:
-            # The values' tile at its block of the columns: a step's block index the column block's.
-            ref, tile = views["values"]
-            block = column_block[0] // column_block[1]
-
-            def at_columns(j, tile=tile, block=block):
-                # A paged tile's pages each at the column block (`mosaic.Pieces`).
-                indices = tile(j)
-                if isinstance(indices, mosaic.Pieces):
-                    return mosaic.Pieces((piece[0], block) for piece in indices)
-                return indices[0], block
-            views["values"] = (ref, at_columns)
+        views = _key_views(named, row, lax.div(head, group), sources_of, table_of, page=page, block_k=block_k,
+                           column_block=column_block)
         streams = family.opened(streams, views)
         pair_first = program.query_tile(queries // pair) * pair
         streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]

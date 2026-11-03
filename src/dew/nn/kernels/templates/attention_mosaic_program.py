@@ -459,15 +459,15 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
 
 
 def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
-    """The tiles a backward launch's score-hook pullback forms that vary with its inputs (`algebra.scored`):
-    its output and its slope along each input it differentiates, the logits and each floating parameter of
-    the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or `DKV_GRADS`: the dK/dV launch takes
-    no query's or head's slope, an A100's and an H100's dK/dV under a temperature, a softcap with sinks and
-    ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their slopes priced 4, 4 and 3), but a
-    constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the fast dQ
-    under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced 258);
-    traced, never run, on a tile, each slope along its own input alone, or where the hook takes no forward
-    derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
+    """The tiles a backward launch's score-hook pullback forms that vary with its inputs
+    (`attention_gradient.scored`): its output and its slope along each input it differentiates, the logits and
+    each floating parameter of the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or
+    `DKV_GRADS`: the dK/dV launch takes no query's or head's slope, an A100's and an H100's dK/dV under a
+    temperature, a softcap with sinks and ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their
+    slopes priced 4, 4 and 3), but a constant one (a hook linear in an input slopes 1 along it, which ptxas
+    holds no tile of: the fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled
+    where four slopes priced 258); traced, never run, on a tile, each slope along its own input alone, or
+    where the hook takes no forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
@@ -517,7 +517,8 @@ def transposable(hooks: Hooks) -> bool:
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
     tile shape a program takes (`TILE_SIDES`), which no operation it has no rule for refuses
     (`layout.Untransposable`), and at each one entry at a time in the logits and its floating parameters
-    (`_entrywise`), as the slopes the backward multiplies its cotangents by assume (`algebra.scored`)."""
+    (`_entrywise`), as the slopes the backward multiplies its cotangents by assume
+    (`attention_gradient.scored`)."""
     if not callable(hooks.score_mod):
         return True
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)

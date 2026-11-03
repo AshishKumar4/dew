@@ -9,7 +9,7 @@ import functools
 import jax.numpy as jnp
 
 from dew.algebra import SATURATION, derive
-from dew.nn.kernels.templates import attention_algebra as algebra
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient
 from dew.nn.precision import float32_einsum
 
 
@@ -32,7 +32,7 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     over = per_query(1.0 / jnp.where(total == 0, 1.0, total))
     dropped = products if keep is None else products * keep
     cotangents = e * (((dropped - per_query(anchor)) - per_query(delta)) * over)
-    return e, e * over, algebra.where_seen(seen, cotangents, 0.0)
+    return e, e * over, gradient.where_seen(seen, cotangents, 0.0)
 
 
 @functools.cache
@@ -59,13 +59,13 @@ def softmax_gradients(logits, q, k, values, dout, peak, total, anchor, delta, sl
     gradients their products at
     `scale` (dV from the dropped unnormalized weights against `dO / T`, `value_operands`' order), each product
     Dew's (`float32_einsum`). Returns dQ, dK, dV, and each tile's unnormalized weights and score cotangents,
-    which the template's hook parameters and D's refinement read (`algebra.pulled`, `dq_rows`)."""
+    which the template's hook parameters and D's refinement read (`gradient.pulled`, `dq_rows`)."""
     products = float32_einsum("qd,kd->qk", dout, values, preferred_element_type=jnp.float32)
     e, _, ds = softmax_cotangents(logits, products, peak, total, anchor, delta, keep, seen)
     over = 1.0 / jnp.where(total == 0, 1.0, total)
     # The cotangents at the scale before their products, the reference's order: two keys of 2**127 whose
     # cotangents' quarter cancels in the product overflow it unscaled.
-    scaled = (ds if slope is None else algebra.pulled(ds, (slope,), seen, ())[0]) * scale
+    scaled = (ds if slope is None else gradient.pulled(ds, (slope,), seen, ())[0]) * scale
     dropped = e if keep is None else e * keep
     return (float32_einsum("qk,kd->qd", scaled, k), float32_einsum("qk,qd->kd", scaled, q),
             float32_einsum("qk,qd->kd", dropped, dout * over[:, None]), e, ds)
