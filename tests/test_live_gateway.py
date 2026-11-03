@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from jupyter_client.manager import KernelManager
-from process_support import free_port
+from process_support import free_port, groups
 from tool_support import run_from
 from websockets.asyncio.client import connect
 
@@ -122,10 +122,13 @@ def deleted(port: int, identifier: str) -> int:
 def gateway(tmp_path: Path, idle: int, *options: str, relaunch: str = "slow") -> Iterator[int]:
     """The live gateway's mapping manager (`PLAIN`) served by the real Kernel Gateway on a free port, which it
     yields once it answers: `idle` its live idle time, `options` more of its configuration; its connection
-    files in `tmp_path`."""
+    files in `tmp_path`. Stopped as the checkout stops a process group (`child_groups.stop`), at once: a test
+    claims nothing of the gateway's own shutdown, which waits out a relaunch still in flight and each kernel's
+    shutdown and, on a loaded host, outlasted a bound on it; its kernels, each in a session of its own, end
+    with it (ipykernel's parent poller)."""
     (tmp_path / "plain.py").write_text(PLAIN)
     port, log = free_port(), tmp_path / "gateway.log"
-    served = subprocess.Popen(
+    served = groups.start(
         [sys.executable, "-m", "kernel_gateway", "--KernelGatewayApp.kernel_manager_class=plain.Plain",
          "--KernelGatewayApp.ip=127.0.0.1", f"--KernelGatewayApp.port={port}", *options],
         env={**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(CONTAINER)]),
@@ -140,8 +143,7 @@ def gateway(tmp_path: Path, idle: int, *options: str, relaunch: str = "slow") ->
             time.sleep(0.2)
         yield port
     finally:
-        served.terminate()
-        served.wait(30)
+        assert not groups.stop(served), "the gateway's group still ran after SIGKILL"
 
 
 def test_a_kernel_no_connection_holds_is_culled_once_idle_for_the_live_contracts_idle_time(tmp_path):
