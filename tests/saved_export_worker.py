@@ -6,10 +6,10 @@ pool, extends each of its layers' attention with DEX (`dew.nn.dex`), whose expor
 projection as it is written, and exports it as a saved run's release, the run's restore
 (`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards,
 process 0 publishing and the other reading every tensor as it does (`publishes`). Each records the
-files it wrote, the peak of its host allocations during the export (`tracemalloc`, which counts
-NumPy's), and the model's size; outside the export's scope the write is refused. It also writes the
-same weights unplaced, as one process does. Every mode records what it saw into --out and asserts
-nothing.
+files it wrote and, exporting a deeper decoder (`DEEP`), how far its resident memory rises during the
+export and while it holds that decoder's whole tree home (`resident_growth`), and the decoder's size;
+outside the export's scope the write is refused. It also writes the same weights unplaced, as one
+process does. Every mode records what it saw into --out and asserts nothing.
 
 dew is imported inside the modes, not at module scope, because a JAX backend opened before
 jax.distributed.initialize() would pin the process to its own devices.
@@ -17,8 +17,12 @@ jax.distributed.initialize() would pin the process to its own devices.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import functools
+import gc
 import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,7 +31,12 @@ from process_support import serve_mode, worker_parser
 
 FIELDS = {"vocab_size": 512, "emb_features": 64, "num_layers": 8, "num_heads": 4, "num_kv_heads": 2,
           "mlp_features": 128, "max_seq_len": 8}
-"""A decoder of about 1.4 MB in float32, its largest tensor (the embedding) 128 KiB."""
+"""A decoder of about 1.3 MB in float32, its largest tensor (the embedding) 128 KiB."""
+
+DEEP = {**FIELDS, "num_layers": 32, "emb_features": 128, "mlp_features": 512}
+"""A decoder of about 31 MB in float32 whose largest tensors (the embedding, a feed-forward kernel) are
+256 KiB each, so a host holding one tensor home at a time holds a hundredth of it, and its resident
+memory's own movement during an export (2 to 6 MB on armada) stays far below half of it."""
 
 TINY_SHARD = 4
 """Far below the production threshold, so the pool's mesh shards every kernel."""
@@ -49,12 +58,37 @@ def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
 
 
-def exported(args) -> dict:
-    """The decoder exported placed across the pool, and written unplaced and outside the scope."""
-    import tracemalloc
+def _status(field: str) -> int:
+    """One of this process's memory figures in /proc/self/status (`VmRSS`, `VmHWM`), in bytes."""
+    for line in Path("/proc/self/status").read_text().splitlines():
+        if line.startswith(f"{field}:"):
+            return int(line.split()[1]) * 1024
+    raise ValueError(f"/proc/self/status lists no {field}")
 
+
+@contextlib.contextmanager
+def resident_growth(into: list[int]) -> Iterator[None]:
+    """How far this process's resident memory rises above where it starts within the block, appended to
+    `into`: Linux's high-water mark (`VmHWM`) reset at the start (/proc/self/clear_refs), after a
+    collection and glibc's return of its free pages (`malloc_trim`), so pages a freed allocation left
+    resident do not hide one that reuses them. It counts every allocation the host makes, XLA's buffers
+    a tensor read home is held in among them, which tracemalloc, counting Python's and NumPy's alone,
+    never sees (ledger 3794)."""
+    gc.collect()
+    ctypes.CDLL(None).malloc_trim(0)
+    Path("/proc/self/clear_refs").write_text("5")
+    before = _status("VmRSS")
+    yield
+    into.append(_status("VmHWM") - before)
+
+
+def exported(args) -> dict:
+    """The decoder exported placed across the pool, and written unplaced and outside the scope; and the
+    deeper decoder's export measured, and its whole tree held home."""
     import jax
     import jax.numpy as jnp
+    import numpy as np
+    from jax.experimental import multihost_utils
 
     from dew.inference.banks import HeldBanks
     from dew.interop.pretrained import Pretrained, PretrainedDecoder
@@ -64,14 +98,21 @@ def exported(args) -> dict:
     from dew.training import Layout, MeshSpec
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=SHARD)
-    model = models.build("causal_transformer", **FIELDS)
-    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
-    placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
-                                        layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
+
+    def built(fields):
+        """The decoder of `fields`, its variables, those placed across the pool, every layer's attention
+        extended by DEX, and the placed decoder's bundle."""
+        model = models.build("causal_transformer", **fields)
+        variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
+        placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
+                                            layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
+        extension = DifferentialExtension(tuple((layer, (0, 2)) for layer in range(fields["num_layers"])),
+                                          anneal_steps=10)
+        return model, variables, placed, extension, PretrainedDecoder.from_model(model, placed).with_dex(
+            extension, key=0)
+
+    model, variables, placed, extension, bundle = built(FIELDS)
     leaves = jax.tree.leaves(placed)
-    extension = DifferentialExtension(tuple((layer, (0, 2)) for layer in range(FIELDS["num_layers"])),
-                                      anneal_steps=10)
-    bundle = PretrainedDecoder.from_model(model, placed).with_dex(extension, key=0)
     root = Path(args.run_dir)
     rank = jax.process_index()
     try:
@@ -79,13 +120,28 @@ def exported(args) -> dict:
         refused = False
     except RuntimeError:
         refused = True
-    Pretrained.from_saved = classmethod(lambda cls, run, **options: bundle)
     run = SimpleNamespace(objective=SimpleNamespace(saved_task=None))
+
+    def export(exported, name: str) -> None:
+        Pretrained.from_saved = classmethod(lambda cls, run, **options: exported)
+        export_run(run, root / name, publishes=rank == 0)
+
     destination = root / f"release{rank}"
-    tracemalloc.start()
-    export_run(run, destination, publishes=rank == 0)
-    peak = tracemalloc.get_traced_memory()[1]
-    tracemalloc.stop()
+    export(bundle, destination.name)
+    # The deeper decoder exported once before it is measured, a copy built apart so nothing the measured
+    # one holds is left from it: the measured export finds its programs compiled and its modules imported.
+    export(built(DEEP)[4], f"warm{rank}")
+    _, _, deep, _, deep_bundle = built(DEEP)
+    growth: list[int] = []
+    with resident_growth(growth):
+        export(deep_bundle, f"deep{rank}")
+    # The same measure over the deeper decoder's whole tree held home, every process taking part as the
+    # export's reads do: it sees what a host holding the model holds.
+    with resident_growth(growth):
+        held = [np.array(leaf) if leaf.is_fully_addressable
+                else np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
+                for leaf in jax.tree.leaves(deep)]
+    del held
     alone = root / f"alone{rank}"
     PretrainedDecoder.from_model(model, variables).with_dex(extension, key=0).save(alone)
     written, own = tensors(destination), tensors(alone)
@@ -96,8 +152,8 @@ def exported(args) -> dict:
             "refused_outside": refused, "release": digests(destination), "alone": digests(alone),
             "small_files": sorted(path.name for path in destination.iterdir()
                                   if not path.name.endswith((".safetensors", ".safetensors.index.json"))),
-            "peak": peak, "whole": sum(leaf.nbytes for leaf in leaves),
-            "largest_leaf": max(leaf.nbytes for leaf in leaves)}
+            "exported": growth[0], "held": growth[1],
+            "whole": sum(leaf.nbytes for leaf in jax.tree.leaves(deep))}
 
 
 def scoped_peaks(modules) -> list[dict]:
