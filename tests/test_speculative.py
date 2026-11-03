@@ -161,14 +161,16 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
         """The prompt's prefill, then the stretch a token at a time, each token's logits."""
         ops = decode_ops(model, params, 0, depths)
 
+        def advanced(state, token):
+            state = ops.advance(state, token, jnp.ones(token.shape[0], bool))
+            return state, state.logits
+
         @jax.jit
         def walked(prompts, stretch):
+            # One token a step of a loop, as the decode's own loop carries its state: one program of a
+            # step, whatever the stretch.
             state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
-            logits = []
-            for at in range(stretch.shape[1]):
-                state = ops.advance(state, stretch[:, at], jnp.ones(stretch.shape[0], bool))
-                logits.append(state.logits)
-            return jnp.stack(logits, axis=1)
+            return jnp.moveaxis(jax.lax.scan(advanced, state, stretch.T)[1], 0, 1)
 
         return lambda prompts, stretch: np.asarray(walked(jnp.asarray(prompts), jnp.asarray(stretch)))
 
