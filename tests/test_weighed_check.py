@@ -177,13 +177,34 @@ def test_a_programs_integer_output_has_no_scale_and_its_float_one_does():
 
 
 def test_a_bfloat16_program_is_weighed_at_its_own_rounding():
-    """A bfloat16 product's scale is bfloat16's rounding: of the same values, bfloat16's own, each element's
-    exactly 2^16 times float32's (their unit roundoffs' ratio), the taps drawn alike."""
+    """A bfloat16 product's scale is bfloat16's rounding: of the same values, each element's 2^16 times
+    float32's (their unit roundoffs' ratio), the taps drawn alike, but for the float64 rounding of each
+    displaced value, at most 2^-53 of the product a draw, 2^-36 of it once scaled by 2^16 and doubled for
+    both programs."""
     a, b, _ = draw(0)
     narrow_a, narrow_b = a.astype(jnp.bfloat16), b.astype(jnp.bfloat16)
     _, narrow = rounding_scale(lambda a, b: a * b, narrow_a, narrow_b)
     _, wide = rounding_scale(lambda a, b: a * b, narrow_a.astype(jnp.float32), narrow_b.astype(jnp.float32))
-    np.testing.assert_array_equal(np.asarray(narrow, np.float64), np.asarray(wide, np.float64) * 2.0 ** 16)
+    product = np.abs(np.asarray(narrow_a, np.float64) * np.asarray(narrow_b, np.float64))
+    assert np.all(np.abs(np.asarray(narrow, np.float64) - np.asarray(wide, np.float64) * 2.0 ** 16)
+                  <= 2.0 ** -36 * product)
+
+
+def test_a_reduce_precision_rounds_at_its_stated_significand():
+    """A float32 value rounded to bfloat16's significand in place (`reduce_precision`) is weighed at that
+    format's rounding, as a cast to bfloat16 and back is, not at its float32 storage's."""
+    a, _, _ = draw(0)
+    _, reduced = rounding_scale(lambda a: jax.lax.reduce_precision(a, exponent_bits=8, mantissa_bits=7), a)
+    _, cast = rounding_scale(lambda a: a.astype(jnp.bfloat16).astype(jnp.float32), a)
+    np.testing.assert_array_equal(reduced, cast)
+
+
+def test_a_float16_cast_to_bfloat16_rounds():
+    """A float16 value cast to bfloat16, a format of the same width but fewer significand bits, rounds: its
+    scale is nonzero wherever the value is."""
+    a, _, _ = draw(0)
+    _, scale = rounding_scale(lambda a: a.astype(jnp.bfloat16), a.astype(jnp.float16))
+    assert np.all((np.asarray(scale) > 0) == (a.astype(jnp.float16) != 0))
 
 
 @pytest.mark.mesh(devices=2)

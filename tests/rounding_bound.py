@@ -112,7 +112,7 @@ class TapRule:
             if weight is None:
                 tapped.append(value)
                 continue
-            unit = float(jnp.finfo(dtype).eps) / 2
+            unit = _unit(name, params, dtype)
             draw = jax.random.normal(jax.random.fold_in(self.key, index), jnp.shape(value), jnp.float64)
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
@@ -225,9 +225,21 @@ def _converted(equation, operand, magnitude):
     if not jnp.issubdtype(target, jnp.floating):
         return None
     if jnp.issubdtype(source, jnp.floating):
-        return magnitude if jnp.finfo(target).bits < jnp.finfo(source).bits else None
+        # A narrower significand or exponent rounds (float16 to bfloat16 alike: same width, fewer bits).
+        narrower = (jnp.finfo(target).nmant < jnp.finfo(source).nmant
+                    or jnp.finfo(target).maxexp < jnp.finfo(source).maxexp)
+        return magnitude if narrower else None
     exact = 2.0 ** (jnp.finfo(target).nmant + 1)
     return jnp.where(jnp.abs(jnp.asarray(operand, jnp.float64)) >= exact, magnitude, 0)
+
+
+def _unit(name: str, params, dtype) -> float:
+    """The unit roundoff of the format an equation rounds its result `dtype` to: a reduce_precision's
+    stated significand (`mantissa_bits`), else its result's own (`jnp.finfo`), the format it is stored in
+    being the one it rounds to."""
+    if name == "reduce_precision":
+        return 2.0 ** -(int(params["mantissa_bits"]) + 1)
+    return float(jnp.finfo(dtype).eps) / 2
 
 
 def _terms_count(equation, name, params) -> int:
