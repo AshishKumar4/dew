@@ -32,7 +32,8 @@ import numpy as np
 from egglog import BaseExpr, DagCostModel, EGraph, get_callable_args, get_callable_fn
 from egglog.egraph import ComparableAdd
 from scipy.optimize import milp
-from scipy.sparse import coo_array
+from scipy.sparse import coo_array, csr_array
+from scipy.sparse.csgraph import connected_components
 
 from dew.algebra import terms
 
@@ -210,46 +211,18 @@ def _reachable(classes: Mapping[Hashable, Sequence[Node]], root: Hashable) -> li
 
 def _cyclic(classes: Mapping[Hashable, Sequence[Node]]) -> dict[Hashable, int]:
     """Each class in a cycle of the graph of classes and their nodes' reads, by its strongly connected
-    component (Tarjan's, iterative); a class in no cycle is absent, as no order need hold it."""
-    index: dict[Hashable, int] = {}
-    low: dict[Hashable, int] = {}
-    stack: list[Hashable] = []
-    on_stack: set[Hashable] = set()
-    component: dict[Hashable, int] = {}
-    edges = {owner: sorted({child for node in nodes for child in node.children if child in classes},
-                           key=repr) for owner, nodes in classes.items()}
-    for start in classes:
-        if start in index:
-            continue
-        work = [(start, 0)]
-        while work:
-            owner, position = work.pop()
-            if position == 0:
-                index[owner] = low[owner] = len(index)
-                stack.append(owner)
-                on_stack.add(owner)
-            if position < len(edges[owner]):
-                work.append((owner, position + 1))
-                child = edges[owner][position]
-                if child not in index:
-                    work.append((child, 0))
-                elif child in on_stack:
-                    low[owner] = min(low[owner], index[child])
-                continue
-            if low[owner] == index[owner]:
-                members = []
-                while True:
-                    member = stack.pop()
-                    on_stack.discard(member)
-                    members.append(member)
-                    if member == owner:
-                        break
-                if len(members) > 1 or owner in edges[owner]:
-                    component.update(dict.fromkeys(members, len(component)))
-            if work:
-                parent = work[-1][0]
-                low[parent] = min(low[parent], low[owner])
-    return component
+    component (`scipy.sparse.csgraph.connected_components`); a class in no cycle is absent, as no order need
+    hold it."""
+    owners = list(classes)
+    place = {owner: number for number, owner in enumerate(owners)}
+    edges = {(place[owner], place[child]) for owner, nodes in classes.items() for node in nodes
+             for child in node.children if child in place}
+    rows, columns = zip(*edges, strict=True) if edges else ((), ())
+    graph = csr_array((np.ones(len(rows)), (rows, columns)), shape=(len(owners), len(owners)))
+    _, labels = connected_components(graph, directed=True, connection="strong")
+    sizes = np.bincount(labels, minlength=len(owners))
+    return {owner: int(labels[number]) for number, owner in enumerate(owners)
+            if sizes[labels[number]] > 1 or (number, number) in edges}
 
 
 class _Program:

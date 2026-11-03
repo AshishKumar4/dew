@@ -45,6 +45,7 @@ from dew.algebra.cost import Work
 from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
+from dew.cache import ALGEBRA
 
 
 @function(merge=lambda old, new: old)
@@ -223,8 +224,10 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
     program.saturate(graph, region, (CARRIED,), saturation, facts)
     schedule = cost.fused(cost.target())
-    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule))
-    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule))
+    # The extractor oracle where it is on (`Passes.checked`), as every derivation's (`derive._derived`).
+    checked = ALGEBRA.value.checked
+    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule), checked=checked)
+    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     consts = list(closed.consts)
