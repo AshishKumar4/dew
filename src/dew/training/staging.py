@@ -14,6 +14,8 @@ barriers between the chunks: the same arithmetic in another schedule.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import math
 from collections.abc import Callable, Sequence
 
@@ -21,6 +23,7 @@ import jax
 import jax.extend.core as jcore
 from jax.core import ShapedArray
 
+from dew.distributed.placement import placed_bytes
 from dew.training.compiled_program import bodies, computed, inlined
 
 PURE_CALLS = frozenset({"jit", "pjit", "closed_call", "core_call"})
@@ -58,29 +61,45 @@ def flattened(program: jcore.Jaxpr, operands: Sequence, consts: Sequence = ()) -
     return expanded, [read(value) for value in returned]
 
 
+def elements(value: jcore.Var) -> int:
+    """The elements `value` holds: an array's, a word for any other."""
+    return math.prod(value.aval.shape) if isinstance(value.aval, ShapedArray) else 1
+
+
 def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], sizes: Sequence[int]
            ) -> tuple[list[list[int]], list[frozenset[int]], dict[jcore.Var, frozenset[int]]]:
     """The chunks `fields` (a program's variables, the leaves of its host-resident fields, `sizes` their
     bytes) come to the device in for `equations`, each a list of their indices; which of them each
     equation reads; and which each value the equations make reads. Leaves an operation reads together,
     through every operation between, share a chunk: an elementwise update reads one parameter's moments
-    alone, a norm over the whole state reads every leaf, and an operation with an effect keeps its place
-    among all of them. Groups of leaves are packed in the fields' order up to the larger of the largest
-    group and a `CHUNKS`th of the fields' bytes. A scalar is no chunk's: it comes to the device first."""
+    alone, a norm over the whole state reads every leaf into each update, and an operation with an effect
+    keeps its place among all of them. A summary of the leaves, a scalar made of them or what an operation
+    makes of summaries alone in no more elements than they hold (a sampled step's norms of its update,
+    summed across leaves and stacked into one vector: `dew.training.inspection`), joins no chunks: each
+    is made in its chunk and held, a few words, until the last chunk it reads is made (`staged`'s phases).
+    Groups of leaves are packed in the fields' order up to the larger of the largest group and a
+    `CHUNKS`th of the fields' bytes. A scalar field is no chunk's: it comes to the device first."""
     grouped = {index for index, field in enumerate(fields)
                if isinstance(field.aval, ShapedArray) and field.aval.shape}
     # Each leaf's group: the leaves some operation read together with it, through every one between.
     together = {index: frozenset({index}) for index in grouped}
     reads: dict[jcore.Var, frozenset[int]] = {fields[index]: frozenset({index}) for index in grouped}
+    summaries: set[jcore.Var] = set()
     taking = []
     for equation in equations:
         read = frozenset(grouped) if equation.effects else frozenset().union(
             *(reads.get(value, frozenset()) for value in equation.invars if computed(value)))
-        if len(read) > 1:
+        # Summaries of the leaves combine without holding any leaf: their chunks stay apart.
+        derived = [value for value in equation.invars if computed(value) and reads.get(value)]
+        summarized = (bool(derived) and not equation.effects and all(value in summaries for value in derived)
+                      and sum(map(elements, equation.outvars)) <= sum(map(elements, derived)))
+        if len(read) > 1 and not summarized:
             joined = frozenset().union(*(together[index] for index in read))
             together.update(dict.fromkeys(joined, joined))
         if read:
             reads.update(dict.fromkeys(equation.outvars, read))
+            summaries.update(value for value in equation.outvars
+                             if summarized or (isinstance(value.aval, ShapedArray) and not value.aval.shape))
         taking.append(read)
     groups = sorted(set(together.values()), key=min)
     budget = max([*(sum(sizes[index] for index in group) for group in groups),
@@ -97,6 +116,42 @@ def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], siz
     return cut, taking, reads
 
 
+_MEASURED: contextvars.ContextVar[tuple[list[int], ...]] = contextvars.ContextVar("staged_bytes", default=())
+"""Where `staged` reports, as a step is traced, the bytes of its fields the device holds at once: each
+`measured` the trace runs within (`measured`)."""
+
+
+@contextlib.contextmanager
+def measured():
+    """The bytes of its host-resident fields a commit traced within holds on the device at once, each
+    `staged` region's (a device's share of each leaf: the chunk it computes and the one it fetches as it
+    stores the chunk before, the two largest): the planner's measure of a staged commit is the step's own
+    cut (`dew.training.footprint.Footprint.staged`). A measure within another reports to both."""
+    found: list[int] = []
+    token = _MEASURED.set((*_MEASURED.get(), found))
+    try:
+        yield found
+    finally:
+        _MEASURED.reset(token)
+
+
+def in_device(tree) -> bool:
+    """Whether every leaf of `tree` is in device memory."""
+    return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
+
+
+def on_device(placement):
+    """`placement`, a tree of shardings, each in device memory: where a host-resident leaf a step or an
+    evaluation reads is brought (`fetched`, `staged`)."""
+    return jax.tree.map(lambda sharding: sharding.with_memory_kind("device"), placement)
+
+
+def fetched(tree, placement):
+    """`tree`, host-resident leaves placed by `placement`, brought to the device whole (`on_device`): every
+    fetch of a layout's host fields (`Trainer._fetched`, `Transaction.fetched`)."""
+    return jax.device_put(tree, on_device(placement))
+
+
 def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
     """`fn(resting, *arguments)`, which returns `(kept, others)`, `kept` the new values of the fields
     `resting` (leaves in pinned host memory, placed by `shardings` there) and `others` the rest, with
@@ -104,7 +159,7 @@ def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
     ready, and `kept` returned in host memory, each chunk of it stored as soon as it is made."""
     fields, structure = jax.tree.flatten(resting)
     resting_shardings = structure.flatten_up_to(shardings)
-    onto_device = [sharding.with_memory_kind("device") for sharding in resting_shardings]
+    onto_device = on_device(resting_shardings)
     operands, given = jax.tree.flatten(arguments)
 
     def whole(fetched, operands):
@@ -120,11 +175,16 @@ def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
     variables = program.invars[:len(fields)]
     cut, taking, reads = chunks(equations, variables, [math.prod(field.shape) * field.dtype.itemsize
                                                        for field in fields])
+    if measuring := _MEASURED.get():
+        shares = sorted((placed_bytes([shapes[index] for index in members]) for members in cut), reverse=True)
+        for found in measuring:
+            found.append(min(placed_bytes(shapes), sum(shares[:2])))
     chunk_of = {index: number for number, members in enumerate(cut) for index in members}
     position = {variable: index for index, variable in enumerate(variables)}
 
     def phase(read: frozenset[int]) -> int:
-        return chunk_of[min(read)] if read else -1
+        # An equation runs once the last chunk it reads is on the device (a scalar of each, `chunks`).
+        return max(chunk_of[index] for index in read) if read else -1
 
     def made_in(value) -> int:
         return phase(reads.get(value, frozenset())) if computed(value) else -1

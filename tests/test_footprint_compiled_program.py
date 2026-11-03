@@ -14,6 +14,74 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.training.compiled_program import compiled, deviceless, lowering_platform
 from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
 
+CALL_TOKENS, CALL_VOCAB, CALL_WIDTH = 256, 4096, 64
+CALL_PRODUCT = CALL_TOKENS * CALL_VOCAB * 4
+"""One float32 value over every token and vocabulary column, 4 MiB."""
+
+
+def _logits(hidden, table):
+    """Each token's float32 logits narrowed to bfloat16, and the narrow ones widened again, as a head
+    returns both."""
+    narrow = jax.lax.dot_general(hidden, table, (((1,), (1,)), ((), ()))).astype(jnp.bfloat16)
+    return narrow, narrow.astype(jnp.float32)
+
+
+@jax.custom_jvp
+def _custom_logits(hidden, table):
+    return _logits(hidden, table)
+
+
+@_custom_logits.defjvp
+def _custom_logits_jvp(primals, tangents):
+    raise AssertionError("the walk differentiates nothing here")
+
+
+CALLED = {
+    # A jitted product holds its result once, as the caller's would.
+    "a jitted product": (lambda weights, rows: jnp.sum(jnp.tanh(jax.jit(jnp.matmul)(rows, weights))),
+                         lambda weights, rows: jnp.sum(jnp.tanh(rows @ weights)),
+                         (jax.ShapeDtypeStruct((16, 32), jnp.float32),
+                          jax.ShapeDtypeStruct((8, 16), jnp.float32)),
+                         None),
+    # A program returning its own parameter returns the operand's buffer: the embedding table a lookup
+    # returns beside its rows (2.5 GB of Qwen3.5-4B's step, held from the lookup to the end).
+    "a lookup returning its table": (
+        lambda table, ids: (lambda rows, same: jnp.sum(rows) + jnp.sum(jnp.square(same)))(
+            *jax.jit(lambda table, ids: (table[ids], table))(table, ids)),
+        lambda table, ids: jnp.sum(table[ids]) + jnp.sum(jnp.square(table)),
+        (jax.ShapeDtypeStruct((CALL_VOCAB, CALL_WIDTH), jnp.float32),
+         jax.ShapeDtypeStruct((CALL_TOKENS,), jnp.int32)),
+        None),
+    # A result the program computes of another by a cheap conversion is recomputed where it is read: the
+    # float32 logits a custom derivative's primal returns beside the bfloat16 ones (8.1 GB at two rows), the
+    # product and the two sums alone held.
+    "a custom derivative's logits": (
+        lambda hidden, table: (lambda narrow, wide: jnp.sum(jnp.square(wide)) + jnp.sum(narrow))(
+            *_custom_logits(hidden, table)),
+        lambda hidden, table: (lambda narrow, wide: jnp.sum(jnp.square(wide)) + jnp.sum(narrow))(
+            *_logits(hidden, table)),
+        (jax.ShapeDtypeStruct((CALL_TOKENS, CALL_WIDTH), jnp.float32),
+         jax.ShapeDtypeStruct((CALL_VOCAB, CALL_WIDTH), jnp.float32)),
+        CALL_PRODUCT + 2 * 4),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CALLED))
+def test_a_called_program_holds_what_it_would_inline(case):
+    """XLA sees no call: a `jit` is a call its `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
+    `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a custom derivative's
+    primal lowers to its program in the caller (`_custom_jvp_vjp_call_lowering`,
+    jax/_src/custom_derivatives.py), so `compiled` inlines each (`compiled_program.called`) and a program
+    holds at its peak what it would hold inlined (`CALLED`)."""
+    called, inline, specs, held = CALLED[case]
+
+    def peak(function):
+        return peak_bytes(compiled(jax.make_jaxpr(function)(*specs).jaxpr, "cuda"), "gpu", Workspace(0, 0))
+
+    assert peak(called) == peak(inline)
+    if held is not None:
+        assert peak(called) == held
+
 
 def test_a_shard_map_over_one_device_holds_what_it_would_inline():
     """A `shard_map` whose manual axes are all of size one is its body inline in the program XLA compiles

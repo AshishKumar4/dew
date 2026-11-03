@@ -96,6 +96,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import exported as telemetry_exported, region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
+from dew.training import staging
 from dew.training._fit import (
     Emptied,
     FitPlan,
@@ -194,6 +195,7 @@ from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorde
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
+from dew.training.staging import fetched
 from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
@@ -202,8 +204,10 @@ from dew.training.transaction import (
     PassesProgress,
     Transaction,
     compact_qk,
+    consumed_where_made,
     loss_scale,
     outcome,
+    pooled_by_mean,
     refuse_unpassed_progress,
     with_ema,
 )
@@ -572,8 +576,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return state
         return dataclasses.replace(state, **{
-            field: jax.device_put(getattr(state, field), jax.tree.map(
-                lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
+            field: fetched(getattr(state, field), getattr(shardings, field))
             for field in self.layout.host if fields is None or field in fields})
 
     @ruled
@@ -1153,15 +1156,25 @@ class Trainer(Generic[Loss, Effects]):
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
             *apart(prepared), given, part))
-        if self.tune_kernels and lowering and platforms is None:
-            lowered, launches = tuning.tune(lower, measure=True)
-        else:
-            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered, launches = lower() if lowering else None, launches or "[]"
+        # The bytes its host-resident commit fields hold at once are its own staged cut's
+        # (`staging.measured`): read as the step is traced, by its lowering or, lowering none, a trace alone.
+        staging_measured = (self.step is None and mesh is None
+                            and bool(set(COMMIT_FIELDS) & set(self.layout.host)))
+        with staging.measured() as cuts:
+            if self.tune_kernels and lowering and platforms is None:
+                lowered, launches = tuning.tune(lower, measure=True)
+            else:
+                # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+                lowered, launches = lower() if lowering else None, launches or "[]"
+            if staging_measured and not lowering:
+                jitted.trace(*apart(prepared), given, part)
+        window = split * self.accumulation
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
-            self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
-            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split, self.optimizer,
-            capacity)
+            self.objective, self._model_shapes(micro), window, prepared, held,
+            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
+            consumed_where_made(self.objective, self.optimizer, prepared, window,
+                                shared=pooled_by_mean(shapes[0]), progressed=self._examples is not None),
+            max(cuts, default=0), capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)

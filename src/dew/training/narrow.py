@@ -41,8 +41,12 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select
+from dew.nn.programs import CALLS
 
-_PASSED_THROUGH = ("jit", "pjit", "closed_call", "core_call", "remat2", "checkpoint")
+_PASSED_THROUGH = CALLS - {"custom_jvp_call", "custom_vjp_call"}
+"""The calls whose program a narrowed operand reaches as it is (`_inner`): every call (`CALLS`) but a custom
+derivative's, whose derivative rule, not its primal's program, makes its operand's cotangent, so a cast
+folded into its primal leaves its cotangent the rule's."""
 
 
 def _inner(eqn, index: int):
