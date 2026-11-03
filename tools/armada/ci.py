@@ -1482,6 +1482,19 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
     return []
 
 
+def task_files(out: Path) -> tuple[Path, Path, Path, Path]:
+    """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
+    recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
+    has exited (`record`); how collection found each file (executed.py); pytest's report; and the files the
+    durations record does not wholly name (split.py)."""
+    log, collection, report, unrecorded = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json"))
+    for stale in (report, log, collection, unrecorded):
+        stale.unlink(missing_ok=True)
+    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
+    return log, collection, report, unrecorded
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1499,15 +1512,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
-    # group has exited (`record`).
-    log = out.with_name(f"{out.name}.lifetime.log")
-    collection = out.with_name(f"{out.name}.collected.json")
-    report = out.with_name(f"{out.name}.junit.xml")
-    unrecorded = out.with_name(f"{out.name}.unrecorded.json")
-    for stale in (report, log, collection, unrecorded):
-        stale.unlink(missing_ok=True)
-    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
+    log, collection, report, unrecorded = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
