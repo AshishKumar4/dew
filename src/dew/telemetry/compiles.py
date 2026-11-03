@@ -1,6 +1,6 @@
-"""JAX's events of a trace, a lowering and a backend compile, and their one listener in this process: the blocks
-that count the programs jitted functions need (`Compiles`) and the threads held to running loaded programs alone
-(`executable_only`)."""
+"""JAX's events of a trace, a lowering and a backend compile, and their one listener in this process: the
+blocks that count the programs jitted functions need (`Compiles`) and the threads held to running loaded
+programs alone (`executable_only`)."""
 
 import contextlib
 import threading
