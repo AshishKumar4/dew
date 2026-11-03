@@ -46,6 +46,18 @@ const resolution = `${replays[0].width}×${replays[0].height}`;
 const moe = JSON.parse(readPublic('examples', 'moe-mesh', 'moe-mesh.json'));
 const lora = JSON.parse(readPublic('examples', 'sd15-lora', 'manifest.json'));
 const videos = Object.values(JSON.parse(readPublic('gallery', 'wan-2.1', 'manifest.json')).clips) as { video: string; poster: string; prompt: string }[];
+// FlyDreamer's pilot, filmed by tutorial 13's own run, its scores as the tutorial printed them (tools/tutorial_film.py).
+type Score = { policy: string; race: string; gates: number; steps: number; episode: number };
+const flight = JSON.parse(readPublic('gallery', 'flydreamer', 'manifest.json')) as
+	{ video: string; poster: string; width: number; height: number; seconds: number; notebook: string; scores: Score[] };
+const score = (policy: string, race: string) => {
+	const found = flight.scores.find((entry) => entry.policy === policy && entry.race === race);
+	if (!found) throw new Error(`flydreamer: no ${policy} score on the ${race} race`);
+	return found;
+};
+const flown = { trained: score('trained', 'evaluation'), untrained: score('untrained', 'evaluation'), held: score('trained', 'held_out') };
+const flightTutorial = tutorials.find((entry) => entry.source === flight.notebook);
+if (!flightTutorial) throw new Error(`flydreamer: ${flight.notebook} is no tutorial the site lists`);
 const gallery = JSON.parse(readPublic('gallery', 'dew-176m', 'manifest.json'));
 // The newest tutorials and posts, from their own sources (src/latest.mjs): what a reader who came back looks for.
 const newest = latest(tutorials, posts, 4);
@@ -178,6 +190,16 @@ const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, re
 					<figcaption>Mean reward of the sampled completions at each of the recorded run's {reward.length} updates (<a href="/examples/framework/grpo/tracking/scalars.jsonl">raw log</a>). <a href="/guides/post-training/">SFT, DPO, PPO and Flow-GRPO</a> train with the same <code>Trainer</code>.</figcaption>
 				</figure>
 			</LandingCell>
+		</section>
+
+		<section class="band landing-videos" data-reveal>
+			<h2 class="band-title">Reinforcement learning from pixels</h2>
+			<p class="band-lede">A racing drone learns to fly gates from its 64-pixel camera alone: a Dreamer world model trains on its own flights, and the policy learns inside the model's imagination. The film shows four drones of the trained policy, each through its own camera.</p>
+			<div class="landing-image-grid landing-film"><figure>
+				<video data-lazy-video data-src={`/gallery/flydreamer/${flight.video}`} poster={`/gallery/flydreamer/${flight.poster}`} width={flight.width} height={flight.height} preload="none" muted loop playsinline controls aria-label={`Four drones of the trained policy flying through gates, each through its own camera, ${flight.seconds} seconds`} />
+				<figcaption>On the tutorial's matched evaluation the trained policy passes {flown.trained.gates} gates an episode and flies all {flown.trained.steps} of its {flown.trained.episode} steps; the untrained one passes {flown.untrained.gates} and crashes after {flown.untrained.steps}. On held-out scenes it passes {flown.held.gates}.</figcaption>
+			</figure></div>
+			<p class="framework-note"><a href={`/${flightTutorial.slug}/`}>{flightTutorial.title}</a> · <a href="/gallery/flydreamer/manifest.json">Recording and scores</a></p>
 		</section>
 
 		<section class="band" data-reveal>
