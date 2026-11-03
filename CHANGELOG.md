@@ -12,12 +12,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post47: Mosaic GPU's layout inference computes each
+- Dew requires its JAX build 0.12.0.1.post49: Mosaic GPU's layout inference computes each
   shared-memory-to-registers transfer check once, and a Pallas Mosaic GPU scratch ref can state that it is
   plain (`plgpu.PlainTransform()`), so Kimi delta attention's kernels lower and compile for sm90 in seconds
-  where the layout search had run past ten minutes (docs/installation.md lists each fix). The `cuda12` and
-  `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 and post47 changed Python alone, and their
-  native code is the same.
+  where the layout search had run past ten minutes; and a step compiled ahead for an H100 on a host with
+  another GPU attached (an A100) is held to the H100's shared memory, not the attached GPU's, which had
+  refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
+  its body on every Pallas backend (docs/installation.md lists each fix). The `cuda12` and `cuda13` extras
+  keep the post45 CUDA and PJRT plugins: post46 to post49 changed Python alone, and their native code is the
+  same.
 - A step compiled ahead with its frontier (`--trainer.compile-ahead.frontier`) lists, where the plan or the
   frontier reaches the remat ladder's top ('full'), its sibling that keeps what 'minimal' saves in pinned host
   memory ('minimal_offloaded') at the same split. It holds as many device bytes as 'full', so the planner
