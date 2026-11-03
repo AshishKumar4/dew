@@ -1611,7 +1611,8 @@ def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_te
                                                          truth_fn=as_inputs(reference))
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(lambda index, inputs: as_inputs(cancelling(split=True))(inputs), recorded_reference,
-                        drawn, "summarized", seeds=seeds, truth_fn=truth, terms=True)
+                        drawn, "summarized", seeds=seeds, truth_fn=truth,
+                        terms=lambda index, inputs: as_inputs(reference)(inputs))
     assert raised.type is GateFailure
 
 
