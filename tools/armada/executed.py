@@ -12,8 +12,10 @@ What the recorder logs is everything the process executed, read, imported and st
 writes how collection found each file (`DEW_COLLECTED`), which accounts for a file whose every test the
 selection set aside, and which tests carry the marks a row names (`whole_suite`, `release_env`)."""
 
+import faulthandler
 import json
 import os
+import signal
 import sys
 
 import lifetime
@@ -22,6 +24,13 @@ from session import MARKS
 
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
+
+# Every thread's stack written to DEW_STACKS when the task's deadline passes (ci.py's `stacked` sends
+# SIGUSR2), registered before collection, so a stall in collection or a fixture's setup names its call site
+# too; taken from the environment so no process this one starts writes over it.
+if stacks := os.environ.pop("DEW_STACKS", None):
+    STACKS = open(stacks, "w")  # noqa: SIM115 - faulthandler writes to it until the process ends
+    faulthandler.register(signal.SIGUSR2, file=STACKS, all_threads=True)
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none

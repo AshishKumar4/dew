@@ -99,6 +99,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -109,6 +110,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -139,6 +141,9 @@ SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
 1800)."""
+STACKS_SECONDS = 5.0
+"""How long a task past its deadline waits for its pytest's stacks (`stacked`) before interrupting it."""
+
 
 REPO = Path(__file__).resolve().parents[2]
 HASHED_BY = "3.13"
@@ -1504,7 +1509,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     log = out.with_name(f"{out.name}.lifetime.log")
     collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    for stale in (report, log, collection):
+    stacks = out.with_name(f"{out.name}.stacks.txt")
+    for stale in (report, log, collection, stacks):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
@@ -1519,7 +1525,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
-                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection)})
+                                              "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
+                                              "DEW_STACKS": str(stacks)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1536,11 +1543,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
-    expired = False
+    expired, stalled = False, ""
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        expired = True
+        expired, stalled = True, stacked(done, stacks)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
@@ -1576,7 +1583,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                                                  "collection shows them not all deselected")])
         red += skipped + exited + unaccounted
         if expired:
-            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
+            threads = f"; its threads then:\n{stalled[-6000:]}" if stalled else ""
+            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted{threads}")
         # A failed case with no class path is a file that did not collect, no test of it.
         nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
         whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
@@ -1602,6 +1610,25 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # under its requirement's overlay and on the whole suite's run alone.
         record(python, ran, log, common, network, opened)
     return 0
+
+
+def stacked(process: subprocess.Popen, stacks: Path) -> str:
+    """Every thread's stack of `process`, a task's pytest past its deadline, as faulthandler writes it to
+    `stacks` on SIGUSR2 (executed.py registers it from DEW_STACKS before collection), read once it stops
+    growing, at most STACKS_SECONDS on: what a stall was doing, a read with no deadline in a fixture's setup
+    among them (2026-11-03: a group's 28 minutes left no trace). A dump that kills the process, as a thread
+    walked while it runs may, costs nothing past the deadline but its report. "" where the process wrote
+    none."""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(process.pid, signal.SIGUSR2)
+    ends, size = time.monotonic() + STACKS_SECONDS, -1
+    while time.monotonic() < ends:
+        now = stacks.stat().st_size if stacks.is_file() else 0
+        if now and now == size:
+            break
+        size = now
+        time.sleep(0.5)
+    return stacks.read_text(errors="replace") if stacks.is_file() else ""
 
 
 def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:

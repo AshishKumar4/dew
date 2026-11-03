@@ -811,6 +811,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert (interrupted["kind"], interrupted["failed"]) == ("deadline", [])
 
 
+def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path):
+    """A task interrupted at its deadline reports its pytest's every thread as it stood then, a stall before
+    any test ran included, which pytest's own report of an interrupt cannot give (2026-11-03: a group stalled
+    28 minutes in a read with no deadline during collection, its row saying only that no tests ran)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_stalls.py": "import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
+                                         "stalled_reading()\n\n\ndef test_never():\n    pass\n"})
+    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
+    [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
+    assert interrupted["kind"] == "deadline"
+    assert "its threads then:" in interrupted["output"] and "stalled_reading" in interrupted["output"]
+
+
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     """Branch tracing slows a task several times over: each coverage item runs by COVERAGE_DEADLINE,
     not a CI task's."""
