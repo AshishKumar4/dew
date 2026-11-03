@@ -742,8 +742,7 @@ class FitSearch[LossT, EffectsT]:
         entries = self.objective.program_key()
         if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
-        held, own = [entry.module for entry in entries], self.remat_rung()
-        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
+        held, own = self.configuration(), self.remat_rung()
         lightest = [entry.module.with_remat(None) if entry.trained and isinstance(entry.module, RematChoosing)
                     else entry.module for entry in entries]
         label = found = None
@@ -758,8 +757,7 @@ class FitSearch[LossT, EffectsT]:
                 label, _ = self.walked(split, until=own)
                 found = self.remat_rung()
         finally:
-            self.objective.substitute(held)
-            self.objective.restore_head(tile, fused=fused)
+            self.restore(held)
         if label == "fits" and found != own:
             _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
                          "recomputes less: leave the remat unset and the run compiles there first", own,
