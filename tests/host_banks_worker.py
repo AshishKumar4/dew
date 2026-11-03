@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from flax import linen as nn
 from process_support import serve_mode, worker_parser
 
 VOCAB = 32
@@ -93,7 +94,7 @@ def banked(args) -> dict:
     tokens = jnp.asarray(
         np.random.default_rng(0).integers(1, VOCAB, size=(jax.device_count(), PROMPT)),
         jnp.int32)
-    variables = plain.init(jax.random.key(0), tokens)
+    variables = nn.unbox(plain.init(jax.random.key(0), tokens))
 
     resident = HeldBanks(variables).place(scanned, mesh=mesh, layout=resident_layout)
     on_host = HeldBanks(variables).place(scanned, mesh=mesh, layout=host_layout)

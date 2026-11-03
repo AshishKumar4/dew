@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from moe_support import assert_exchange_across_processes, objective, routing_case
 from one_draw import assert_as_exact_as_the_reference
@@ -45,7 +46,7 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
     x, weights, indices = map(jnp.asarray, routing_case(tokens, 8, top_k, skewed))
     reference = ExpertMLP(8, 12, 8, scale_inputs=scale_inputs, activation=activation,
                           swiglu_limit=limit)
-    parameters = reference.init(jax.random.key(19), x, weights, indices)
+    parameters = nn.unbox(reference.init(jax.random.key(19), x, weights, indices))
     expected = jax.jit(jax.value_and_grad(functools.partial(objective, reference, indices),
                                         (0, 1, 2), has_aux=True))(parameters, x, weights)
     mesh = MeshSpec(expert=shards, fsdp=fsdp).build()
@@ -65,7 +66,7 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
 def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
     model = ExpertMLP(8, 16, 8)
-    parameters = model.init(jax.random.key(19), x, weights, indices)
+    parameters = nn.unbox(model.init(jax.random.key(19), x, weights, indices))
     mesh = MeshSpec(expert=4, fsdp=2).build()
     columns = NamedSharding(mesh, P('expert', None, 'fsdp'))
     parameter_specs = {'params': {
@@ -94,7 +95,7 @@ def test_decoder_exchange_retains_logits_and_expert_bias_observations(parallel):
                                   num_layers=1, mlp_features=12, max_seq_len=4,
                                   qk_norm=False, mixture=mixture)
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(4, 4)
-    parameters = reference.init(jax.random.key(10), tokens)
+    parameters = nn.unbox(reference.init(jax.random.key(10), tokens))
     expected, observations = reference.apply(parameters, tokens, mutable=['router'])
     from dataclasses import replace
     exchanged = reference.clone(mixture=replace(mixture, dispatch='exchange'))
@@ -146,7 +147,7 @@ def test_capacity_drops_the_same_slots_on_every_layout(spec, batch, length, top_
     assert not kept.all()
     routing = jnp.asarray(indices)
     dropless = ExpertMLP(8, 12, 8)
-    parameters = dropless.init(jax.random.key(19), x, weights, routing)
+    parameters = nn.unbox(dropless.init(jax.random.key(19), x, weights, routing))
     gradient = functools.partial(jax.value_and_grad, argnums=(0, 1, 2), has_aux=True)
     expected = jax.jit(gradient(functools.partial(objective, dropless, routing)))(
         parameters, x, np.where(kept, weights, 0).astype(np.float32))
@@ -218,7 +219,7 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
     kept = maxtext_kept(arrays, case)
     x = np.random.default_rng(29).normal(size=(shape["batch"], shape["length"], 8)).astype(np.float32)
     dropless = ExpertMLP(shape["experts"], 12, 8)
-    parameters = dropless.init(jax.random.key(19), x, weights, indices)
+    parameters = nn.unbox(dropless.init(jax.random.key(19), x, weights, indices))
     gradient = functools.partial(jax.value_and_grad, argnums=(0, 1, 2), has_aux=True)
 
     def run(module, values, given):
@@ -269,7 +270,8 @@ def test_value_experts_drop_and_dispatch_as_their_models_routed_mlp(dispatch):
                          mixture=Mixture(experts=8, top_k=2, dispatch=dispatch, capacity_factor=1.0))
     with jax.enable_x64(new_val=True):
         x = jnp.asarray(np.random.default_rng(23).normal(size=(4, 12, 8)))
-        parameters = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), layer.init(jax.random.key(3), x))
+        drawn = nn.unbox(layer.init(jax.random.key(3), x))
+        parameters = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), drawn)
         weights, indices = layer.apply(parameters, x, method=lambda module, x: module.router(x))
         positions, capacity = capacity_positions(indices, 8, 1.0)
         kept = positions < capacity

@@ -292,7 +292,7 @@ class BidirectionalS5Layer(nn.Module):
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
         return Dense(features=self.features, dtype=self.dtype, name="out_proj",
-                     dot_general=float32_dot_general)(y_cat)
+                     kernel_axes=("attention", "embed"), dot_general=float32_dot_general)(y_cat)
 
 
 class SpatialFusionConv(nn.Module):

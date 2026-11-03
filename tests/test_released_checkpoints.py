@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from float64_terms import float64_forward
 from model_support import flat_tree
 from one_draw import assert_as_exact_as_the_reference
@@ -157,7 +158,7 @@ def scoring(bundle, batch):
     rows = np.concatenate(
         [ids, np.full((ids.shape[0], SEQ + 1 - ids.shape[1]), fill, ids.dtype)], axis=1)
     objective = LMObjective(bundle, seq_len=SEQ, ema_decay=None, pad_id=fill)
-    return objective, objective.init(jax.random.key(0)), rows
+    return objective, nn.unbox(objective.init(jax.random.key(0))), rows
 
 
 @pytest.fixture(scope="module")

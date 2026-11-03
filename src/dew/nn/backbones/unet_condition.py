@@ -335,7 +335,8 @@ class UNet2DCondition(nn.Module):
         first = self.stages[0].features
         time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                cosine_first=self.cosine_first)
-        time = embedding(self, time, self.time_features, "time", dtype=self.dtype, precision=self.precision)
+        time = embedding(self, time, self.time_features, "time", dtype=self.dtype, precision=self.precision,
+                         sharded=False)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
@@ -344,7 +345,7 @@ class UNet2DCondition(nn.Module):
                                   cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
             time = time + embedding(self, extra, self.time_features, "additional_time", dtype=self.dtype,
-                                    precision=self.precision)
+                                    precision=self.precision, sharded=False)
         return self.spatial_walk(x, time, conditioning.context, train=train, operations=SpatialForward())
 
     @nn.nowrap

@@ -22,6 +22,7 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+from flax import linen as nn
 from process_support import serve_mode, worker_parser
 
 FIELDS = {"vocab_size": 512, "emb_features": 64, "num_layers": 8, "num_heads": 4, "num_kv_heads": 2,
@@ -64,7 +65,7 @@ def exported(args) -> dict:
 
     PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=SHARD)
     model = models.build("causal_transformer", **FIELDS)
-    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
     placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
                                         layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
     leaves = jax.tree.leaves(placed)

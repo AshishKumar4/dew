@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import decode_through
 from reference_error import (
     assert_as_exact,
@@ -150,7 +151,7 @@ def test_the_layer_matches_mamba2_mixer(seeded_reference):
     weights loaded under Dew's names (check 1 against the recorded mixer)."""
     variables = mamba2_layer_params(mamba2_layer_draw(0))
     width = LAYER_SHAPES["hidden"][-1]
-    template = jax.eval_shape(mamba2_layer().init, jax.random.key(0), jnp.zeros((1, 4, width)))
+    template = nn.unbox(jax.eval_shape(mamba2_layer().init, jax.random.key(0), jnp.zeros((1, 4, width))))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
     assert_recorded_as_exact(seeded_reference, "layer")
 
@@ -396,7 +397,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
         assert_rows_as_exact_over_orders,
         chain_roundings,
     )
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
 
     from dew.nn.kernels import generation
     from dew.nn.kernels.ssd import ssd_kernel_runs
@@ -404,21 +405,22 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     assert ssd_kernel_runs(64, 64, 64, "tpu", dtype=jnp.float32)
     model, devices = ssd_lm(), jax.devices()
     ids = np.asarray(jax.random.randint(jax.random.key(0), (2 * len(devices), 129), 0, 64))
-    variables = jax.device_get(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1])))
-    units = residual_width(variables)
+    variables = jax.device_get(nn.unbox(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1]))))
+    axes = model_axes(model, jnp.asarray(ids[:, :-1]))
+    units = residual_width(variables, axes)
 
     def ordered(result, order):
         """The step's gradients with the residual's units in `order`, and its logits, which no order
         moves."""
         gradients, logits = result
-        return permuted({"params": gradients}, order)["params"], logits
+        return permuted({"params": gradients}, order, axes)["params"], logits
 
     # The float64 oracle runs on the host: a TPU emulates float64.
     with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         wide = stepped(model.clone(dtype=jnp.float64))
         exact = jax.device_get(wide(widened(variables["params"]), ids))
         last = orders(units, 2, seed=0)[-1]
-        found = jax.device_get(wide(permuted(widened(variables), last)["params"], ids))
+        found = jax.device_get(wide(permuted(widened(variables), last, axes)["params"], ids))
         roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables["params"]), ids))
         for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
                                       jax.tree.leaves(ordered(exact, last)), strict=True):
@@ -433,7 +435,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     distances: dict = {}
     with jax.set_mesh(mesh):
         for order in orders(units, ORDERS, seed=1):
-            params = jax.device_put(permuted(variables, order)["params"], whole)
+            params = jax.device_put(permuted(variables, order, axes)["params"], whole)
             truth = jax.tree_util.tree_leaves_with_path(ordered(exact, order))
             found = {"dew": jax.device_get(kernel(params, placed))}
             with generation.assumed("cpu"):

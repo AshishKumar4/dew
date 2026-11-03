@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
@@ -78,7 +79,7 @@ def test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all(rng):
     looped = tiny(loop=Loop(2, step_norm=False))
     deep = tiny(num_layers=4, loop=None)
     ids = tokens(rng)
-    params = looped.init(rng, ids)
+    params = nn.unbox(looped.init(rng, ids))
     np.testing.assert_array_equal(looped.apply(params, ids), deep.apply(unrolled(params, 2), ids))
     ours, cache = decoded(looped, params, ids)
     theirs, deep_cache = decoded(deep, unrolled(params, 2), ids)
@@ -95,7 +96,7 @@ def test_decoding_a_loop_matches_its_prefill(rng, scan_layers):
     assert_as_exact(lambda params, ids: decoded(model, params, ids)[0], passes(model),
                     drawn(model), f'{scan_layers} loop decode', seeds=SEEDS['decode'], truth_fn=wide(model))
     ids = tokens(rng)
-    _, cache = decoded(model, model.init(rng, ids), ids)
+    _, cache = decoded(model, nn.unbox(model.init(rng, ids)), ids)
     assert sorted(cache) == [f'layers_{index}' for index in range(6)]
 
 
@@ -107,7 +108,7 @@ def test_scanned_runs_loop_as_the_plain_layers_do():
 
 def test_backprop_steps_train_through_the_last_passes_alone(rng):
     ids = tokens(rng)
-    params = tiny().init(rng, ids)
+    params = nn.unbox(tiny().init(rng, ids))
 
     def gradient(backprop_steps):
         model = tiny(loop=Loop(3, backprop_steps=backprop_steps))
@@ -163,7 +164,7 @@ def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, sca
     plain = tiny(num_layers=4, loop=loop, scan_layers=scan_layers)
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
     ids = tokens(rng)
-    params = plain.init(rng, ids)
+    params = nn.unbox(plain.init(rng, ids))
     expected, actual = decoded(plain, params, ids), decoded(checkpointed, params, ids)
     jax.tree.map(np.testing.assert_array_equal, actual, expected)
     assert sorted(actual[1]) == [f'layers_{index}' for index in range(8)]
@@ -182,7 +183,7 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
     scanned, they are on par with their prefill (check 1)."""
     looped = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)))
     ids = tokens(rng)
-    params = looped.init(rng, ids)
+    params = nn.unbox(looped.init(rng, ids))
     tree = dict(params['params'])
     shared = {name: value for name, value in tree.items() if not name.startswith('layers_')}
     order = [0, 1, 2, 1, 2, 3]
@@ -207,7 +208,7 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
 def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_was(rng):
     plain = tiny(num_layers=4, loop=None)
     ids = tokens(rng)
-    params = plain.init(rng, ids)
+    params = nn.unbox(plain.init(rng, ids))
     once, twice = plain.with_passes(1, (1, 3)), plain.with_passes(2, (1, 3))
     assert twice.loop == Loop(2, step_norm=False, layers=(1, 3))
     np.testing.assert_array_equal(once.apply(params, ids), plain.apply(params, ids))
@@ -231,7 +232,7 @@ def test_each_pass_of_a_shared_cache_step_starts_from_the_cache_the_step_found(r
     models = [tiny(loop=Loop(2, shared_cache=shared), layer_types=('linear_attention',) * 2, kinds=DELTA_NETS)
               for shared in (True, False)]
     ids = tokens(rng)
-    params = models[0].init(rng, ids)
+    params = nn.unbox(models[0].init(rng, ids))
     prefilled = []
     for model in models:
         made, step = decode_steps(model)

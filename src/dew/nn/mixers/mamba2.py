@@ -72,7 +72,7 @@ from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
-from dew.nn.sharding import logical_axes, sequence_shards
+from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
@@ -201,10 +201,6 @@ class MambaRMSNormGated(nn.Module):
         return y.astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba2(nn.Module):
     """The token mixer of a Mamba-2 layer, `Mamba2Mixer` (modeling_mamba2.py:360-588).
 
@@ -297,6 +293,7 @@ class Mamba2(nn.Module):
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
             name="in_proj",
+            kernel_axes=("embed", "linear"),
             **normal_kernel(self.init_std),
         )
         self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
@@ -316,7 +313,7 @@ class Mamba2(nn.Module):
             self.norm = MambaRMSNormGated(
                 epsilon=self.norm_eps, groups=self.norm_groups, gate_after=self.norm_order == 'norm_first',
                 scale_wide=self.norm_scale_wide, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj',
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'),
                               use_bias=self.use_bias if self.out_bias is None else self.out_bias,
                               **normal_kernel(self.init_std if self.output_init_std is None
                                               else self.output_init_std))

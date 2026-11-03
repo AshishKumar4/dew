@@ -27,7 +27,6 @@ from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, p
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.rope import rotate
-from dew.nn.sharding import logical_axes
 
 TIME_FEATURES = 256
 
@@ -46,16 +45,20 @@ def layer_norm(dtype, epsilon: float = 1e-6):
 
 
 def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
-              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu):
+              precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu,
+              sharded: bool = True):
     """Apply `TimestepEmbedding` or `PixArtAlphaTextProjection` to `x`.
 
     Both are a linear layer, an activation and a second linear layer. The
     activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
-    as `{name}_linear_1` and `{name}_linear_2` in the calling module.
+    as `{name}_linear_1` and `{name}_linear_2` in the calling module, each
+    sharding its output, the model's width, where `sharded`; a model that
+    names no axes of them (the UNet's) leaves them to the shape heuristic.
     """
+    names = (f"{name}_linear_1", f"{name}_linear_2")
+    axes = tuple((layer, (None, "embed")) for layer in names) if sharded else ()
     mlp = GatedMLP(features, features, in_features=x.shape[-1], activation=activation, use_bias=bias,
-                    names=(f"{name}_linear_1", f"{name}_linear_2"), dtype=dtype, precision=precision,
-                    name=name)
+                    names=names, named_axes=axes, dtype=dtype, precision=precision, name=name)
     nn.share_scope(owner, mlp)
     return mlp(x)
 
@@ -123,12 +126,6 @@ def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *,
 # kernels keep that shape and shard their embedding side. The suffixes carry
 # the attention's own name: the scratch MM-DiT declares three-axis `to_q`
 # kernels of its own, and one path suffix holds one set of axes.
-@logical_axes({(module, name): axes for module in ("attn", "attn2")
-               for name, axes in (
-                   *(((name), ("embed", None)) for name in
-                     ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj")),
-                   ("to_out_0", (None, "embed")),
-                   ("to_add_out", (None, "embed")))})
 class JointAttention(nn.Module):
     """Runs the source's `Attention` over an image stream and an optional context.
 

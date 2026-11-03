@@ -34,7 +34,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import CLOSES_WINDOW, FROZEN, Batch, Variables, owned_dicts, select
+from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
 from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import Handed
@@ -79,15 +79,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import (
-    Link,
-    Schedule,
-    boxed,
-    boxed_axes,
-    measured_links,
-    pipeline_microbatches,
-    ruled_boxes,
-)
+from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
     Aux,
     Initializer,
@@ -98,7 +90,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import STACKED_OPTIMIZERS, held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -304,7 +296,8 @@ class Trainer(Generic[Loss, Effects]):
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
-        self._config, self._optimizer = (None, objective.optimizer(optimizer)) if built else (optimizer, None)
+        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
+                                         if built else (optimizer, None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -369,8 +362,6 @@ class Trainer(Generic[Loss, Effects]):
         self._narrow, self._xla_defaults = True, False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
-        # The axes the objective's modules box on their own parameters, as `initial_state` last saw them.
-        self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
         # The rung each newly met shape starts from, as the first compile found the objective: its modules,
         # head tile, XLA option choice and record (`_at_base_rung`); then the rung each shape compiled at, by
@@ -408,13 +399,10 @@ class Trainer(Generic[Loss, Effects]):
         key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
         initialized = initializer(init_key)
-        # Static metadata, the same on every trace of the state: the
-        # placement reads it from here rather than tracing init again.
-        self._boxed = boxed_axes(initialized)
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
+        params = drawn_in(owned_dicts(unboxed(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -431,7 +419,11 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
+        # The optimizer reads the axes the tree boxes (`optim.declaring`), Muon's grouping among them, each
+        # rule a stage-local run's leaves as its layers (`StageLocal.held`).
+        with self._staging.held():
+            opt_state = self.optimizer.init(params["params"])
+        ema = self.objective.ema
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -504,12 +496,6 @@ class Trainer(Generic[Loss, Effects]):
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
-    def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
-        """The optimizer's state of `params`, Muon's grouping reading the axes modules boxed on
-        them in `initialized`, each rule a stage-local run's leaves as its layers (`StageLocal.held`)."""
-        with self._staging.held(boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules))):
-            return self.optimizer.init(params)
-
     @functools.cached_property
     def _staging(self) -> StageLocal:
         """Where the step keeps each pipelined run stacked by stage (`StageLocal.of`); none for a CPU-owned
@@ -520,20 +506,16 @@ class Trainer(Generic[Loss, Effects]):
 
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
-        modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
+        modules boxed, as the optimizer's state was initialized; None for an optimizer given built."""
         if self._config is None:
             return None
-        with self._staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))):
+        with self._staging.held(boxed(self._boxed_axes())):
             return self._config.groups(state.variables["params"])
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
-        """The axes the objective's modules box on their own parameters
-        (`nn.with_logical_partitioning`), which its init returns and the state
-        unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build. A checkpoint records them for its restore."""
-        if self._boxed is None:
-            self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
-        return self._boxed
+        """The axes the objective's modules declare on their parameters (`Objective.parameter_axes`), a
+        drawn tree's and a held one's alike. A checkpoint records them for its restore."""
+        return self.objective.parameter_axes
 
     @ruled
     def shardings(self, state: TrainState) -> Placement[TrainState]:
@@ -547,9 +529,10 @@ class Trainer(Generic[Loss, Effects]):
             return self._staging.placed(state, self._shardings)
 
     def _declared(self):
-        """The context in which the layout reads the axes the objective's
-        modules box, as its rules place them."""
-        return self._staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)))
+        """The context in which the layout, the optimizer and the step read the axes the objective's
+        modules box: every one, which placement filters by its rules (`Layout._declared`), each rule a
+        stage-local run's leaves as its layers (`StageLocal.held`)."""
+        return self._staging.held(boxed(self._boxed_axes()))
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -1445,7 +1428,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._examples is not None)
-        self._optimizer = self.objective.optimizer(built)
+        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -1619,7 +1602,7 @@ class Trainer(Generic[Loss, Effects]):
             # keeps none, and its schedules take the run's own form (`reclocked`).
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
-            with self._staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))):
+            with self._staging.held(boxed(self._boxed_axes())):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)
             supplied, shardings = self._staging.supplied(initial, lambda staged: self._validated(staged)[0])

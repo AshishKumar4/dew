@@ -63,19 +63,20 @@ def decoder_residual_orders():
 
     import jax
     import numpy as np
-    from residual_orders import permuted, residual_width
+    from residual_orders import model_axes, permuted, residual_width
 
     from tools import decoder_export_reference as tool
 
     case = next(case for case in tool.CASES if case.name == "qwen3_next")
     trip = tool.round_trip(case, Path(tempfile.mkdtemp(prefix="null-runs-")))
-    width, apply = residual_width(trip.trained), jax.jit(trip.source.model.apply)
+    axes = model_axes(trip.source.model)
+    width, apply = residual_width(trip.trained, axes), jax.jit(trip.source.model.apply)
 
     def forward(variables, ids):
         return {"logits": apply(variables, ids)}
 
     def draw(seed):
-        return permuted(trip.trained, np.random.default_rng(seed).permutation(width)), trip.ids
+        return permuted(trip.trained, np.random.default_rng(seed).permutation(width), axes), trip.ids
 
     def truth(variables, ids):
         return {"logits": np.asarray(trip.truth, np.float64)}

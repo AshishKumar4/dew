@@ -23,6 +23,7 @@ import numpy as np
 
 from dew._coordination import read_home, writes_weights
 from dew._records import JSON
+from dew.batch import unboxed
 from dew.files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
@@ -164,7 +165,7 @@ def _host_array(leaf) -> np.ndarray:
 
 def flatten(params) -> dict[str, np.ndarray]:
     """The leaves under their '/'-joined names; `_publish` brings each to the host."""
-    leaves, _ = jax.tree_util.tree_flatten_with_path(params)
+    leaves, _ = jax.tree_util.tree_flatten_with_path(unboxed(params))
     return {_leaf_name(path): leaf for path, leaf in leaves}
 
 

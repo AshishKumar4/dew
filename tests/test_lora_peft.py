@@ -65,7 +65,7 @@ def assert_trains_as_peft(adapter, reference, case: str, tmp_path, masks=None):
 
     tokens = jnp.asarray(reference["input_ids"])
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
 
     def loss(moving):
         with given(adapter, masks):
@@ -261,7 +261,8 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     def draw(seed):
         rng = np.random.default_rng(seed)
         x = rng.normal(size=(16, 6, 8)).astype(np.float32)
-        params = jax.tree.map(np.asarray, model.init(jax.random.key(seed), jnp.asarray(x)))["params"]["proj"]
+        drawn = nn.unbox(model.init(jax.random.key(seed), jnp.asarray(x)))
+        params = jax.tree.map(np.asarray, drawn)["params"]["proj"]
         return (x, params["kernel"], params["bias"], rng.normal(size=(6, 8, 4)).astype(np.float32),
                 rng.normal(size=(4, 5, 6)).astype(np.float32), rng.normal(size=(16, 5, 6)).astype(np.float32))
 

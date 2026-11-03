@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import flat_tree
 from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
@@ -258,7 +259,7 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
 
     fused, split = net(fused=True), net(fused=False)
     x = jax.random.normal(jax.random.key(0), (1, 5, 16))
-    variables = fused.init(jax.random.key(1), x)
+    variables = nn.unbox(fused.init(jax.random.key(1), x))
     params = dict(variables["params"])
     qkvz_kernel = np.asarray(params.pop("in_proj_qkvz")["kernel"])
     ba_kernel = np.asarray(params.pop("in_proj_ba")["kernel"])
@@ -338,7 +339,7 @@ def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
     model, variables = fp32_decoder(GEMMA3N, max_seq_len=16)
     ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
     full = jnp.asarray(model.apply(variables, ids))
-    state = model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True)
+    state = nn.unbox(model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True))
     steps = []
     for position in range(ids.shape[1]):
         step, state = model.apply(

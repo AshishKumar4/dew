@@ -20,6 +20,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from lane_environment import outside_suite
+from flax import linen as nn
 
 import dew
 from dew.interop import load_params, save_params
@@ -38,12 +39,12 @@ def params(rng):
         patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1
     )
     x = jax.random.normal(rng, (1, 8, 8, 3))
-    return model.init(
+    return nn.unbox(model.init(
         rng,
         x,
         jnp.ones((1,)),
         TextContext(jnp.ones((1, 77, 768)), jnp.ones((1, 77), bool)),
-    )
+    ))
 
 
 def test_round_trip_keeps_the_tree_and_the_values(params, tmp_path):

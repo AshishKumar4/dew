@@ -24,12 +24,13 @@ compiling its first step, where it is the very program the run compiles first (`
 A run's plan is the fewest microbatches at the least recomputation that fit, which memory decides; which
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
-above it that fits at fewer microbatches than every plan before it, at the fewest that fit there
-(`compile_ahead`'s `frontier`, `FitSearch.above`); tools/benchmark_step.py
-times each on the GPUs, a case at its remat and head tile, a plan of s microbatches as its microbatch's
-rows accumulated s times (`accumulation`), the time it reports a microbatch's, s of them an update; and
-the run names the fastest by its model's remat, `--trainer.split` and `LMObjective.head_tile`. No run
-times plans itself.
+above it that fits at fewer microbatches than every plan before it, at the fewest that fit there, and,
+where the ladder's top ('full') is reached, its sibling that offloads the residuals 'minimal' saves
+('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`);
+tools/benchmark_step.py times each on the GPUs, a case at its remat and head tile, a plan of s
+microbatches as its microbatch's rows accumulated s times (`accumulation`), the time it reports a
+microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.split`
+and `LMObjective.head_tile`. No run times plans itself.
 """
 
 from __future__ import annotations

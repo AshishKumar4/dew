@@ -353,7 +353,7 @@ class JepaPredictor(_JepaStackOptions):
             **self._stack_options(),
         )
         self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
-        self.proj_out = Dense(features=self.emb_features, dtype=self.dtype,
+        self.proj_out = Dense(features=self.emb_features, dtype=self.dtype, kernel_axes=("embed", None),
                               precision=self.precision, name="proj_out", dot_general=float32_dot_general)
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):

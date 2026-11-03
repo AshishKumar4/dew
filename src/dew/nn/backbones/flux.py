@@ -32,7 +32,6 @@ from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, pro
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
-from dew.nn.sharding import logical_axes
 
 from .joint import (
     TIME_FEATURES,
@@ -40,7 +39,6 @@ from .joint import (
     JointAttention,
     TextStream,
     embedding,
-    embedding_axes,
     embedding_flops,
     guided_time,
     layer_norm,
@@ -63,7 +61,6 @@ def flux_positions(rows: int, columns: int, text: int) -> np.ndarray:
     return positions
 
 
-@logical_axes({("proj_mlp",): ("embed", "mlp"), ("proj_fused",): (None, "embed")})
 class FluxSingleBlock(nn.Module):
     """Runs one single-stream block: attention and a feed-forward over the joined sequence.
 
@@ -102,7 +99,7 @@ class FluxSingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype)(x), shift, scale)
         maps = self.projections()
         hidden = gelu_tanh(Dense(maps['proj_mlp'][1], dtype=self.dtype,
-                               precision=self.precision, name="proj_mlp",
+                               precision=self.precision, name="proj_mlp", kernel_axes=("embed", "mlp"),
                                dot_general=float32_dot_general)(normalized))
         attended, _ = JointAttention(
             self.heads, self.head_dim, project=False, dtype=self.dtype, precision=self.precision,
@@ -113,12 +110,9 @@ class FluxSingleBlock(nn.Module):
         # sides are the other way round.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], dtype=self.dtype,
                                          precision=self.precision, name="proj_fused",
-                                         dot_general=float32_dot_general)(joined)
+                                         kernel_axes=(None, "embed"), dot_general=float32_dot_general)(joined)
 
 
-@logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
-               ("proj_out",): ("embed", None),
-               **embedding_axes("timestep_embedder", "guidance_embedder", "text_embedder")})
 class FluxTransformer(TextStream, nn.Module):
     """Runs Diffusers 0.34.0's `FluxTransformer2DModel` behind Dew's model interface.
 
@@ -226,9 +220,10 @@ class FluxTransformer(TextStream, nn.Module):
         dense = {"dtype": self.dtype, "precision": self.precision}
         # `_prepare_latents`' packing: one position per 2x2 patch, channel-major.
         packed = pixel_unshuffle(x).reshape(x.shape[0], rows * columns, 4 * x.shape[3])
-        image = Dense(self.features, name="x_embedder", **dense, dot_general=float32_dot_general)(packed)
+        image = Dense(self.features, name="x_embedder", **dense, kernel_axes=(None, "embed"),
+                      dot_general=float32_dot_general)(packed)
         conditioned = self._conditioning(time, conditioning.guidance, conditioning.pooled)
-        context = Dense(self.features, name="context_embedder", **dense,
+        context = Dense(self.features, name="context_embedder", **dense, kernel_axes=(None, "embed"),
                         dot_general=float32_dot_general)(conditioning.context)
         # `FluxPosEmbed` computes its angles in float64 from the static ids.
         tables = axis_tables(flux_positions(rows, columns, context.shape[1]), self.axes_dims_rope, 10000.0,
@@ -244,7 +239,7 @@ class FluxTransformer(TextStream, nn.Module):
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
         packed = Dense(self.patch_size ** 2 * self.out_channels, name="proj_out", **dense,
-                       dot_general=float32_dot_general)(image)
+                       kernel_axes=("embed", None), dot_general=float32_dot_general)(image)
         return pixel_shuffle(packed.reshape(packed.shape[0], rows, columns, -1))
 
 

@@ -161,7 +161,8 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     mesh = build(compile_only_gpus(generation, count))
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
-    variables = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
+    ids = jnp.ones((1, SEQ_LEN), jnp.int32)
+    variables = jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), ids)))
     shardings = layout.shardings(mesh, variables)
     placed = placed_shapes(variables, shardings)
     report = layout.validate(mesh, placed, capacity=GPU_BYTES)
@@ -217,7 +218,7 @@ class Watched(LMObjective):
 
     def init(self, key, variables=None):
         jax.debug.callback(lambda: INITIALIZED.append(True))
-        return super().init(key, variables)
+        return nn.unbox(super().init(key, variables))
 
 
 def capped(limit: int) -> type[Trainer]:

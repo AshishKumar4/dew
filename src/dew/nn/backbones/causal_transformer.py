@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import flax.core
@@ -122,12 +122,13 @@ from ..protocols import (
     declared_groups,
 )
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
+    REMAT_POLICIES,
     BlockWiring,
     DecoderBlock,
     Mixture,
@@ -165,18 +166,18 @@ _FINAL = "final_residual"
 """The collection the forward sows its stack's output into (`layer_state`)."""
 
 
-@logical_axes({
-    ("embed_tokens",): ("vocab", "embed"),
-    ("embed_positions",): (None, "embed"),
-    ("lm_head",): ("embed", "vocab"),
-    ("head_bias",): ("vocab",),
-    ("embed_tokens_per_layer",): ("vocab", None),
-    ("per_layer_model_projection",): ("embed", "mlp"),
-    # AltUp's copies enter and leave through embed-by-embed projections, one
-    # per copy past the first, named by their index like the layers; a
-    # square kernel takes the shape heuristic the way the other indexed
-    # projections do.
-})
+DECODER_AXES: dict[str, LogicalAxes] = {
+    "embed_tokens": ("vocab", "embed"),
+    "embed_positions": (None, "embed"),
+    "lm_head": ("embed", "vocab"),
+    "head_bias": ("vocab",),
+    "embed_tokens_per_layer": ("vocab", None),
+    "per_layer_model_projection": ("embed", "mlp"),
+}
+"""The logical axes of the decoder's own parameters outside its layers, by name, as it declares them where
+it makes them."""
+
+
 class CausalTransformer(LinearProducts):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
@@ -869,11 +870,13 @@ class CausalTransformer(LinearProducts):
             # hidden_size_per_layer_input slice per layer.
             self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
-                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx)
+                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx,
+                embedding_init=declared(TokenEmbedding.embedding_init,
+                                        DECODER_AXES['embed_tokens_per_layer']))
             self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
-                dtype=self.dtype, precision=self.precision,
-                name='per_layer_model_projection', dot_general=float32_dot_general)
+                dtype=self.dtype, precision=self.precision, name='per_layer_model_projection',
+                dot_general=float32_dot_general, kernel_axes=DECODER_AXES['per_layer_model_projection'])
             self.per_layer_projection_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
@@ -934,7 +937,7 @@ class CausalTransformer(LinearProducts):
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
-                name='lm_head', **normal_kernel(self.initializer_range))
+                kernel_axes=DECODER_AXES['lm_head'], name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
             self.continuum_level = continuum_modules(self.continuum, self.emb_features, self.dtype,
                                                      self.precision)
@@ -948,7 +951,8 @@ class CausalTransformer(LinearProducts):
                 dtype=self.dtype, precision=self.precision, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
-                'head_bias', nn.initializers.zeros_init(), (self.vocab_size,), jnp.float32)
+                'head_bias', declared(nn.initializers.zeros_init(), DECODER_AXES['head_bias']),
+                (self.vocab_size,), jnp.float32)
 
     @nn.nowrap
     def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
@@ -1058,6 +1062,12 @@ class CausalTransformer(LinearProducts):
         context = self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex,
                                      self._dex_start(index), spec.routed)
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
+
+    def drawn_like(self, index: int) -> Hashable:
+        """What layer `index` draws as: its scan key and what its extension starts from (`_dex_start`), so
+        like layers draw under one scan. A method interceptor that gives a layer parameters of its own (an
+        adapter's factors, `dew.lora`) keys it apart where they differ."""
+        return (self.scan_keys[index], self._dex_start(index))
 
     @nn.nowrap
     def _dex_start(self, index: int) -> DexStart | None:
@@ -1825,8 +1835,9 @@ class CausalTransformer(LinearProducts):
         if (self.is_initializing() and stages == 1 and not decode
                 and not self.has_variable('params', f'layers_{first}')):
             # A run draws its layers under one scan where they draw alike: a layer whose start is its own
-            # (DEX's heads and lambda_init, `_dex_start`) draws apart, and its run stacks it after.
-            drawn = tuple((key, self._dex_start(index)) for index, key in enumerate(self.scan_keys))
+            # (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) draws apart, and its run
+            # stacks it after.
+            drawn = tuple(self.drawn_like(index) for index in range(self.num_layers))
             groups = tuple((first + start, count)
                            for start, count in scan_groups(drawn[first:end], self.bank_layers))
             if any(count > 1 for _, count in groups):
@@ -2164,8 +2175,9 @@ class CausalTransformer(LinearProducts):
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.embedding_features or self.emb_features,
             dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
-            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                            else nn.initializers.normal(self.initializer_range)))
+            embedding_init=declared(TokenEmbedding.embedding_init if self.initializer_range is None
+                                    else nn.initializers.normal(self.initializer_range),
+                                    DECODER_AXES['embed_tokens']))
         if self.embedding_features is not None:
             projection = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                            **normal_kernel(self.initializer_range))
@@ -2182,8 +2194,9 @@ class CausalTransformer(LinearProducts):
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
-                embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
-                                else nn.initializers.normal(self.initializer_range)))
+                embedding_init=declared(TokenEmbedding.embedding_init if self.initializer_range is None
+                                        else nn.initializers.normal(self.initializer_range),
+                                        DECODER_AXES['embed_positions']))
             self.decode_cursor = DecodeCursor()
 
     def _final_norm(self):
@@ -2335,6 +2348,15 @@ class CausalTransformer(LinearProducts):
         if kept(DECODER_REMAT[index]) == kept(self.remat):
             return None
         return self.clone(remat=DECODER_REMAT[index])
+
+    @nn.nowrap
+    def recompute_offloaded(self) -> Self | None:
+        """At the ladder's top ('full'), the decoder that keeps what 'minimal' saves in pinned host memory
+        ('minimal_offloaded'): as many device bytes as 'full' (tests/test_remat_rungs.py's `_saved`), the
+        recompute of 'minimal' and its residuals over the host link (row 1932); else None."""
+        if self.remat != DECODER_REMAT[-1]:
+            return None
+        return self.clone(remat=REMAT_POLICIES['minimal_offloaded'])
 
     @nn.nowrap
     def recompute_half(self) -> Self | None:

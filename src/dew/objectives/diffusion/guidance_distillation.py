@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
-from dew.batch import Variables, dicts
+from dew.batch import Variables, dicts, unboxed
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import NoiseScheduler, expand
@@ -80,7 +80,8 @@ class GuidanceDistillationObjective(DiffusionObjective):
             raise ValueError(f"the teacher denoises {built.latent_shape} and the student "
                              f"{self.latent_shape}; they share one latent geometry")
         self.teacher = built
-        self.teacher_variables = dicts(held)
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.teacher_variables = dicts(unboxed(held))
         self.scales = scales
 
     def program_key(self) -> tuple[ProgramModule, ...]:

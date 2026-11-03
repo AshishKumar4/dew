@@ -9,6 +9,8 @@ sharding moves values, never changes them.
 """
 
 
+import importlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,7 @@ from recording import RecordingTracker
 from sharded import assert_sharded
 from token_support import repeated_token_batch, write_token_corpus
 
+from dew.batch import unboxed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
@@ -29,7 +32,7 @@ from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import Link, declarations, declared_axes
+from dew.nn.sharding import Link, boxed, boxed_axes, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -169,10 +172,11 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
                       for shape in shapes if op != "all-gather" or LENGTH in shape)
 
     shardings, text, trained = stepped(MeshSpec(fsdp=2), 2, **delta_layers(fused=fused))
-    declared = declarations(shardings)
-    specs = {jax.tree_util.keystr(path): sharding.spec
-             for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
-             if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **delta_layers(fused=fused))
+    with boxed(LMObjective(model, LENGTH).parameter_axes):
+        specs = {jax.tree_util.keystr(path): sharding.spec
+                 for path, sharding in jax.tree_util.tree_leaves_with_path(shardings)
+                 if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
     if fused:
@@ -202,9 +206,12 @@ def test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_t
     one device trains."""
     shardings, _, (loss, trained) = stepped(mesh, devices)
     model = tiny(max_seq_len=LENGTH, tie_embeddings=False)
-    params = LMObjective(model, LENGTH).init(jax.random.key(0))["params"]
+    objective = LMObjective(model, LENGTH)
+    params = nn.unbox(objective.init(jax.random.key(0)))["params"]
     fsdp = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
-    grouped = Layout(min_shard=TINY_SHARD).shardings(fsdp, params)
+    # The fsdp layout of the same run's table, which the sequence split's trainer places by.
+    with boxed(objective.parameter_axes):
+        grouped = Layout(min_shard=TINY_SHARD).shardings(fsdp, params)
 
     def shares(placement):
         return [sharding.shard_shape(np.shape(leaf))
@@ -223,7 +230,7 @@ def test_the_sequence_axis_shares_the_state_beside_every_split_the_rules_give_it
     a vocabulary of 516 that tensor 4 divides and tensor 4 times sequence 2 does not keeps its
     table split over tensor, and no leaf's tensor split moves when sequence joins the mesh."""
     model = tiny(vocab_size=516, emb_features=256, mlp_features=512)
-    params = LMObjective(model, SEQ_LEN).init(jax.random.key(0))["params"]
+    params = nn.unbox(LMObjective(model, SEQ_LEN).init(jax.random.key(0)))["params"]
 
     def others(placement):
         """Each leaf's axes past the state axes, by dimension."""
@@ -352,7 +359,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
     query = jax.random.normal(jax.random.key(21), (2, 8, 64))
     context = jax.random.normal(jax.random.key(22), (2, length, 96))
-    params = model.init(jax.random.key(23), query, context)["params"]
+    params = nn.unbox(model.init(jax.random.key(23), query, context))["params"]
 
     def compiled(sequence, tensor, link):
         mesh = MeshSpec(sequence=sequence, tensor=tensor).build(jax.devices()[:sequence * tensor])
@@ -403,7 +410,7 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
 
     model = tiny()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
-        model, model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)), key=1)
+        model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))), key=1)
     batch = next(token_batches())
 
     def stepped(frozen_whole: bool):
@@ -561,8 +568,9 @@ def one_step(spec):
     """
     mesh = spec.build()
     objective = LMObjective(tiny(), SEQ_LEN)
-    initial = objective.init(jax.random.key(0))
-    placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
+    initial = nn.unbox(objective.init(jax.random.key(0)))
+    with boxed(objective.parameter_axes):
+        placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
     assert_sharded(placed["params"], mesh)
     batch = shard_batch(mesh, next(token_batches()))
 
@@ -607,12 +615,14 @@ def test_a_dit_steps_under_a_tensor_axis():
     images = jax.random.normal(jax.random.key(1), (BATCH, 8, 8, 3), jnp.float32)
     times = jnp.full((BATCH,), 0.5, jnp.float32)
     layout = Layout(min_shard=TINY_SHARD)
-    shardings = layout.shardings(
-        mesh, jax.eval_shape(model.init, jax.random.key(0), images, times))
+    drawn = jax.eval_shape(model.init, jax.random.key(0), images, times)
+    # The draw boxes the parameters its modules declare the axes of: the table they are placed by.
+    with boxed(boxed_axes(drawn)):
+        shardings = layout.shardings(mesh, unboxed(drawn))
 
     with jax.set_mesh(mesh):
-        placed = jax.jit(model.init, out_shardings=shardings)(
-            jax.random.key(0), images, times)
+        placed = jax.jit(lambda key: unboxed(model.init(key, images, times)), out_shardings=shardings)(
+            jax.random.key(0))
         loss, grads = jax.jit(jax.value_and_grad(
             lambda trainable: jnp.mean(
                 (model.apply({**placed, "params": trainable}, images, times) - images) ** 2)))(
@@ -639,7 +649,7 @@ def test_a_vocabulary_split_head_leaves_the_excluded_column_out_on_every_shard()
         "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1, num_heads=4,
         num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, causal=False)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=4095)(), SEQ_LEN)
-    initial = objective.init(jax.random.key(0))
+    initial = nn.unbox(objective.init(jax.random.key(0)))
     text = jax.random.randint(jax.random.key(2), (BATCH, SEQ_LEN), 0, 4095)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None)
 
@@ -719,7 +729,7 @@ def test_a_convolutions_kernel_gradient_under_a_partly_replicated_layout(name):
     block, spec, rows, outputs = CONV_LAYOUTS[name]
     rng = np.random.default_rng(0)
     x = rng.normal(size=(4, 8, 8, 8)).astype(np.float32)
-    params = block.init(jax.random.key(0), x)["params"]
+    params = nn.unbox(block.init(jax.random.key(0), x))["params"]
     shape = jax.eval_shape(block.apply, {"params": params}, x).shape
     cotangent = rng.normal(size=shape).astype(np.float32)
 
@@ -757,7 +767,7 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
     rng = np.random.default_rng(0)
     x = rng.normal(size=(4, 8, 8, 64)).astype(np.float32)
     conv = Conv(64, (3, 3))
-    params = conv.init(jax.random.key(0), x[:1])["params"]
+    params = nn.unbox(conv.init(jax.random.key(0), x[:1]))["params"]
     alone = conv.apply({"params": params}, x)
     mesh = MeshSpec(fsdp=2, tensor=2).build(jax.devices()[:4])
     with jax.set_mesh(mesh):
@@ -821,3 +831,23 @@ def test_an_async_collective_counts_its_results_not_its_operands():
     assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
                                          ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
     assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_models_own_parameter_takes_no_axes_from_another_models_names():
+    """A parameter takes the axes its own module draws it in, and none from another model's names: with
+    Dew's mixture of experts imported, a user model's three-dimensional `gate` is placed by the shape
+    heuristic as any undeclared parameter is, where a process-wide table of trailing module names gave it
+    the MoE router's two axes and refused it (ledger 1153, 3453)."""
+    importlib.import_module("dew.nn.moe")
+
+    class Experts(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            gate = self.param("gate", nn.initializers.normal(), (2, x.shape[-1], 4))
+            return jnp.einsum("bd,edf->bef", x, gate)
+
+    variables = nn.unbox(Experts().init(jax.random.key(0), jnp.ones((1, 8))))
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    placed = Layout(min_shard=1).shardings(mesh, variables)
+    assert placed["params"]["gate"].spec == P(None, "fsdp")

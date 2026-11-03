@@ -8,11 +8,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.kernels import generation
@@ -556,7 +556,7 @@ def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
     whose projections return float32 results (`fp32_result_dot_general`) returns float32."""
     x = jax.random.normal(jax.random.key(0), (2, 16), jnp.bfloat16)
     layer = GatedMLP(hidden_features=24, out_features=16, dtype=jnp.bfloat16,
-                     linear=functools.partial(nn.Dense, dot_general=fp32_result_dot_general()))
+                     linear=functools.partial(Dense, dot_general=fp32_result_dot_general()))
     assert layer.apply(layer.init(jax.random.key(1), x), x).dtype == jnp.float32
 
 

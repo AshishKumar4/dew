@@ -78,7 +78,7 @@ def favoured():
     Every token then chooses the same experts, so a padding test's counts depend on which
     slots are real and on nothing else.
     """
-    initial = routed(WIDTH).init(jax.random.key(0), jnp.zeros((1, WIDTH - 1), jnp.int32))
+    initial = nn.unbox(routed(WIDTH).init(jax.random.key(0), jnp.zeros((1, WIDTH - 1), jnp.int32)))
     return uniform_gates(favour_expert_zero(initial, 1.0))
 
 
@@ -90,7 +90,8 @@ def routed_by_id():
     choice for a token is its id's pair. The RMS norm before the router keeps each axis's
     direction.
     """
-    variables = routed(WIDTH, layers=1).init(jax.random.key(0), jnp.zeros((1, WIDTH - 1), jnp.int32))
+    model = routed(WIDTH, layers=1)
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, WIDTH - 1), jnp.int32)))
     width = variables["params"]["embed_tokens"]["embedding"].shape[1]
     embedding = np.zeros((VOCAB, width), np.float32)
     gate = np.zeros((width, EXPERTS), np.float32)
@@ -224,7 +225,7 @@ def test_tokens_that_train_nothing_add_nothing_to_a_policy_runs_router_counts(ki
     no trained token counts nothing, so the biases move exactly as they move for the trained
     rows alone (the invariant rows 17 and 18 hold for LM)."""
     obj = objective(kind, favoured(), 2)
-    variables = obj.init(jax.random.key(1))
+    variables = nn.unbox(obj.init(jax.random.key(1)))
     rows = 2 * jax.device_count()
     plain = drawn(kind, 3, rows)
     _, plain_aux = obj.scalar_loss(variables, plain, step_for(variables))
@@ -263,7 +264,7 @@ def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
     built = rebuilt.build(model=routed(WIDTH), seq_len=WIDTH - 1, **derived)
     policy = built.actor if kind == "ppo" else built
     assert policy.balance == balance
-    variables = built.init(jax.random.key(1))
+    variables = nn.unbox(built.init(jax.random.key(1)))
     loss, aux = built.scalar_loss(variables, drawn(kind, 3, 2), step_for(variables))
     assert bool(jnp.isfinite(loss))
     assert aux.effects is not None

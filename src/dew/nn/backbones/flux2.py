@@ -37,13 +37,11 @@ from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
-from dew.nn.sharding import logical_axes
 
 from .joint import (
     DoubleStreamBlock,
     TextStream,
     embedding,
-    embedding_axes,
     embedding_flops,
     guided_time,
     layer_norm,
@@ -67,7 +65,6 @@ def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:
     return positions
 
 
-@logical_axes({("to_qkv_mlp_proj",): ("embed", None), ("proj_fused",): (None, "embed")})
 class Flux2SingleBlock(nn.Module):
     """Runs one `Flux2SingleTransformerBlock` over the joined sequence.
 
@@ -103,7 +100,7 @@ class Flux2SingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
         maps = self.projections()
         projected = Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name="to_qkv_mlp_proj",
+                          precision=self.precision, name="to_qkv_mlp_proj", kernel_axes=("embed", None),
                           dot_general=float32_dot_general)(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
@@ -122,11 +119,9 @@ class Flux2SingleBlock(nn.Module):
         # fused output map.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
                                          precision=self.precision, name="proj_fused",
-                                         dot_general=float32_dot_general)(joined)
+                                         kernel_axes=(None, "embed"), dot_general=float32_dot_general)(joined)
 
 
-@logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
-               ("proj_out",): ("embed", None), **embedding_axes("timestep_embedder", "guidance_embedder")})
 class Flux2Transformer(TextStream, nn.Module):
     """Runs Diffusers 0.40.0's `Flux2Transformer2DModel` behind Dew's model interface.
 
@@ -213,9 +208,9 @@ class Flux2Transformer(TextStream, nn.Module):
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
         dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
-        image = Dense(self.features, name="x_embedder", **dense,
+        image = Dense(self.features, name="x_embedder", **dense, kernel_axes=(None, "embed"),
                       dot_general=float32_dot_general)(x.reshape(batch, rows * columns, -1))
-        context = Dense(self.features, name="context_embedder", **dense,
+        context = Dense(self.features, name="context_embedder", **dense, kernel_axes=(None, "embed"),
                         dot_general=float32_dot_general)(conditioning.context)
 
         # `Flux2TimestepGuidanceEmbeddings`: the time's sinusoids through two
@@ -246,7 +241,8 @@ class Flux2Transformer(TextStream, nn.Module):
         image = joined[:, context.shape[1]:]
         scale, shift = modulation("norm_out")
         image = modulate(layer_norm(self.dtype, self.eps)(image), shift, scale)
-        out = Dense(self.out_channels, name="proj_out", **dense, dot_general=float32_dot_general)(image)
+        out = Dense(self.out_channels, name="proj_out", **dense, kernel_axes=("embed", None),
+                    dot_general=float32_dot_general)(image)
         return out.reshape(batch, rows, columns, self.out_channels)
 
 
