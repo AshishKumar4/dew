@@ -80,11 +80,11 @@ from check1_statistics import (
     FEWEST_SEEDS,
     LOG_ZERO,
     LOWER_TAIL,
-    NARROW_FACTORS,
     PARITY,
     PREVIOUS_TAILS,
     REDRAW,
     ROW_FACTOR,
+    SCREEN,
     UPPER_TAIL,
     Finding,
     GateFailure,
@@ -105,7 +105,6 @@ from check1_statistics import (
     log_sum,
     pooled_zero_rows,
     root_mean,
-    shown,
 )
 from float64_terms import float64_terms
 from map_judge import DRAWS, PoolRefused, ask_later, judging, pooled_units, record_units
@@ -722,7 +721,7 @@ class _Draws:
     reference's; `log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
     `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
-    width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
+    width (its last axis's length, 0 for a leaf of no rows)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
@@ -1495,21 +1494,27 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
-        paired = draws.of_example_rows(index) if contained else None
-        if paired is not None and (found_rows := _paired_rows(paired, factor)) < tails[0]:
-            # A site that stacks examples: each example's worst row against the reference's on it.
+        # Dew's worst row against the reference's on the same draw: each example's at a site that stacks them,
+        # else each seed's (`_paired_rows`). The first stage's few seeds screen (SCREEN), the final verdict
+        # judges at the tail.
+        examples_rows = draws.of_example_rows(index) if contained else None
+        rows = (examples_rows if examples_rows is not None
+                else draws.worst[:, index, 0] - draws.worst[:, index, 1])
+        drawn_as = "examples" if examples_rows is not None else "seeds"
+        found_rows = _paired_rows(rows)
+        above, below = int(np.sum(rows > math.log(PARITY))), int(np.sum(rows < -math.log(PARITY)))
+        if found_rows < tails[0]:
             over.append(Finding(
-                leaf, "row", float(np.quantile(paired, 1 - tails[0])),
-                f"{leaf}: dew's worst row is past {factor} times the reference's on the same example on "
-                f"{int(np.sum(paired > math.log(factor)))} of {len(paired)} examples, the reference's past "
-                f"it on {int(np.sum(paired < -math.log(factor)))} (p {found_rows:.1e}; `_paired_rows`)"))
-        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        if paired is None and not my_row <= math.log(factor) + their_row:
-            over.append(Finding(leaf, "row", my_row - their_row,
-                                f"{leaf}: the worst row over {count} seeds is {shown(my_row)} from float64 "
-                                f"over its size, the reference's {shown(their_row)}, allowed "
-                                f"{shown(math.log(factor) + their_row)} ({factor} times it)"))
+                leaf, "row", float(np.quantile(rows, 1 - tails[0])),
+                f"{leaf}: dew's worst row is past {PARITY} times the reference's on the same draw on {above} "
+                f"of {len(rows)} {drawn_as}, the reference's past it on {below} (p {found_rows:.1e}; "
+                "`_paired_rows`)"))
+        elif contained and not typical and found_rows < SCREEN:
+            unresolved.append(Finding(
+                leaf, "inconclusive", float(np.quantile(rows, 1 - tails[0])),
+                f"{leaf}: inconclusive: dew's worst row is past {PARITY} times the reference's on {above} of "
+                f"{len(rows)} {drawn_as}, the reference's on {below} (p {found_rows:.1e}, under {SCREEN}), "
+                "judged again over the second stage's draws"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1545,12 +1550,11 @@ def _staged(drawn, seeds: int, label: str, *,
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
-leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
-stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
+"""The environment variable naming a file each check-1 judgement appends its stage and its verdict to,
+one JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
+def _logged(label: str, stage: int, verdict: str, ynn: str | None = None) -> None:
     import json
     import os
 
@@ -1558,8 +1562,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn:
     if path:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
-                                  "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
+                                  "label": label, "stage": stage, "verdict": verdict, "ynn": ynn}) + "\n")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1688,9 +1691,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
-    pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
-    those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
-    two values); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
+    pooled over the site's declared seeds, within PARITY times the reference's, and its worst row within
+    PARITY times the reference's on the same draw, on no more of the seeds than the reverse
+    (`_paired_rows`); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
     measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
     over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of
     squared errors, not seed by seed); every value finite.
@@ -1711,7 +1714,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     the rows of float64 zero and the sizing stay the draw's own order's. A row that nearly cancels
     rounds worst at some orders and well at others, so one order's worst row is no measure of it, and
     the reference's luckiest order would fail an equally exact Dew; over the orbit Dew's worst is held
-    within ROW_FACTOR of the reference's worst at any of the same orders, which is as strict as the
+    against the reference's worst at any of the same orders, which is as strict as the
     reference is spread over them: a Dew worse than the reference at every order still fails, and one
     the reference is exact against at every order fails at any order it is not.
 
@@ -1771,7 +1774,6 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     truth_program = _truth_program(truth_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
-    narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
@@ -1789,7 +1791,6 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples)
                 ranges[start, stop] = draws if further else [draws]
-                narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
 
@@ -1800,8 +1801,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:
         drawn_for = pooled
-        narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
-    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms)
+    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], arms)
 
 
 def _site_terms(terms_fn, terms, draw, truth, truth_program):
@@ -1817,19 +1817,14 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
         float64_terms, terms_fn)
 
 
-def _narrow(draws: _Draws) -> list[str]:
-    """The leaves of rows of one or two values (NARROW_FACTORS)."""
-    return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
-
-
-def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms) -> None:
+def _verdicts(drawn_for, seeds: int, labels: list[str], arms) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
     `index`, judged under `labels[index]`), each logged (STAGES_LOG); a GateFailure where any leaf is
     over, else an Inconclusive where any is left unresolved."""
     overs, unresolveds = [], []
     for index, named in enumerate(labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
+        _logged(named, stage, _verdict(over, unresolved), _mode_of(arms))
         overs += over
         unresolveds += unresolved
     if overs:

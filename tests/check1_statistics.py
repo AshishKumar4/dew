@@ -13,18 +13,9 @@ import numpy as np
 FACTOR = 2.0
 
 ROW_FACTOR = 4.0
-"""How far Dew's worst row may sit from float64 against the reference's worst
-row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS').
-An RMS over every entry averages a few wrong rows into a
-large tensor, so each comparison also holds Dew's worst row to the
-reference's. The worst of many rows is an extreme value, not an average,
-and parts further by chance: over the suite's 3,660 comparisons whose rows
-differ from float64 at all (99 files), Dew's worst row over the
-reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
-exported logits). A row that differs rather than rounds moves further: the
-suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
-with its sinks zeroed, put their worst rows at 7.1 and 3,419 times the
-reference's."""
+"""How far Dew may sit from a row of float64 zero against the reference's own error on that row
+(`pooled_zero_rows`), and the one-draw rule's worst-row factor (tests/one_draw.py). Check 1's worst row is
+held at PARITY, not by a factor (`_paired_rows`)."""
 
 
 PARITY = 1.5
@@ -54,6 +45,12 @@ the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it t
 decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
+SCREEN = 0.05
+"""Where check 1's first stage draws the second for a worst row (`_paired_rows`): its sign test's p-value
+under SCREEN, short of LOWER_TAIL. The first stage's few seeds cannot reach LOWER_TAIL (at 8 seeds a sign
+test's least p-value is 2^-8, 3.9e-3), so a worst row above the reference's there is judged over the
+second's REDRAW times as many; the final verdict fails only at LOWER_TAIL over every seed, so the screen
+adds no false red."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -487,46 +484,22 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
             if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
-def _paired_rows(paired: np.ndarray, factor: float) -> float:
-    """The paired worst-row test's p-value at a site that stacks examples: of the examples whose worst rows'
-    log ratio (`_example_worst_rows`) lies past `factor` either way, the count with Dew's past `factor`
-    times the reference's against Binomial(n, 1/2). Under equal exactness the two arms are exchangeable on
-    each example, so its ratio is as likely past `factor` as under its inverse whatever their own spread
-    (the known null, distribution-free): Dew whose worst rows sit past `factor` times the reference's on more
-    examples than the reverse is refused, where a maximum over a leaf's every row against the reference's is
-    an extreme of two heavy-tailed samples and no measure of either (ledger 2469)."""
+def _paired_rows(paired: np.ndarray) -> float:
+    """Check 1's worst-row test, its p-value: `paired` holds a leaf's paired worst rows, each the log of
+    Dew's worst row over the reference's on the same draw (a seed's, or at a site that stacks examples an
+    example's, `_example_worst_rows`), a row's error over its own size; of those past PARITY either way,
+    the count with Dew's past PARITY times the reference's against Binomial(n, 1/2). Under equal exactness
+    the two arms are exchangeable on each draw, so its ratio is as likely past PARITY as under its inverse
+    whatever their own spread (the known null, distribution-free): its false-red rate is at most the tail
+    it is read at for every tail of the rows' errors, light or heavy, narrow rows of one value among them,
+    where a maximum over a leaf's rows and seeds against the reference's is an extreme of two heavy-tailed
+    samples and no measure of either (ledger 2469; row 3684: a factor on that maximum failed equally exact
+    pairs on 6% of runs where one element a row dominated). Dew whose worst rows sit past PARITY times the
+    reference's on more draws than the reverse is refused, as BIBLE §7 holds a worst row at PARITY."""
     from scipy import stats
 
-    above, below = int(np.sum(paired > math.log(factor))), int(np.sum(paired < -math.log(factor)))
+    above, below = int(np.sum(paired > math.log(PARITY))), int(np.sum(paired < -math.log(PARITY)))
     return float(stats.binom.sf(above - 1, above + below, 0.5)) if above else 1.0
-
-
-NARROW_FACTORS = {1: 90.0, 2: 11.0}
-"""The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR. At either width
-ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
-runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
-near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
-the row whose truth is smallest. Each factor sits above the 1 - 1e-4 quantile of the factor that would
-fail equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
-`row_controls`, through `_staged` itself), at every layout measured, 16 to 4,096 rows a draw and 8 to 512
-declared seeds: that quantile is 40 to 53 at one value and 7 to 8 at two (10,000 to 600,000 runs a
-layout), so 90 and 11 stand about 1.7 and 1.4 times above it, at measured rates near 2e-5 and at most
-3.3e-5; 28,000 fresh runs at the 16-row and 256-row layouts bound them within LOWER_TAIL at 99.9% (at
-most 4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over 16 to 2,048
-rows, a point rate, bounded within LOWER_TAIL at 256 rows and 8 seeds (80,000 runs) and not at 2,048. The
-rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L times as often.
-
-The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
-times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
-judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
-that stage exists to judge on real findings. Check 2 (tests/certified.py `assert_certified`) holds
-each element within its own operation's certified bound where a site runs it, which resolves such an
-error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
-Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
-with n and with the sum's cancellation (for standard normal terms, the smallest error it flagged in a
-review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
-128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
-wherever the pooled ratio does not see it."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)

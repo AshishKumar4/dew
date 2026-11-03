@@ -513,21 +513,57 @@ def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_it
         assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
 
 
-def test_the_paired_worst_row_refuses_a_row_far_off_on_some_examples_and_passes_equally_exact_arms():
-    """At a site that stacks examples, each example's worst row is held to the reference's on the same
-    example (`_paired_rows`, ledger 2469): equally exact arms, their worst rows' log ratios symmetric however
-    wide (a spread of 1.0 and 2.0), pass; Dew ten times the reference's on a fifth of 512 examples of such
-    spread is refused at LOWER_TAIL; and two examples past the factor, both Dew's, are no finding."""
-    from reference_error import LOWER_TAIL, ROW_FACTOR, _paired_rows
+def test_the_paired_worst_row_refuses_a_row_far_off_on_some_draws_and_passes_equally_exact_arms():
+    """Each draw's worst row is held to the reference's on the same draw (`_paired_rows`, ledger 2469):
+    equally exact arms, their worst rows' log ratios symmetric however wide (a spread of 1.0 and 2.0), pass;
+    Dew ten times the reference's on a fifth of 512 draws of such spread is refused at LOWER_TAIL; and two
+    draws past PARITY, both Dew's, are no finding."""
+    from reference_error import LOWER_TAIL, _paired_rows
 
     rng = np.random.default_rng([2469, 512])
     for spread in (1.0, 2.0):
         null = rng.normal(0.0, spread, 512)
-        assert _paired_rows(null, ROW_FACTOR) >= LOWER_TAIL
+        assert _paired_rows(null) >= LOWER_TAIL
         off = null.copy()
         off[::5] += math.log(10.0)
-        assert _paired_rows(off, ROW_FACTOR) < LOWER_TAIL
-    assert _paired_rows(np.asarray([3.0, 3.0, 0.0]), ROW_FACTOR) >= LOWER_TAIL
+        assert _paired_rows(off) < LOWER_TAIL
+    assert _paired_rows(np.asarray([3.0, 3.0, 0.0])) >= LOWER_TAIL
+
+
+def test_the_worst_row_passes_heavy_tailed_equal_arms_and_fails_one_twice_the_references_every_seed():
+    """Check 1's worst row through its stages (`_staged`), on a leaf whose pooled ratio is one (row 3684):
+    equally exact arms whose rows' errors are heavy-tailed, one element a row amplified by 2^k for k uniform
+    over 0 to 24 in each arm apart, pass on every one of 64 runs, where the worst row over the seeds held
+    at four times the reference's worst failed such pairs on about 6% of runs (one draw's amplified element
+    past four times the other arm's every one); and Dew's worst row twice the reference's on every seed fails,
+    which four times passed."""
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+
+    def staged(worst):
+        def drawn(start, stop):
+            count = stop - start
+            return _Draws(["leaf"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
+                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (8,))
+        return _staged(drawn, 8, "leaf")
+
+    rng = np.random.default_rng([3684, 64])
+    reds = 0
+    for _ in range(64):
+        # 40 seeds of 16 rows of 8 values, each arm's errors standard normal with one element a row
+        # amplified, over a shared standard normal truth; each seed's worst row by its log over its size.
+        truth = np.sqrt(np.mean(np.square(rng.standard_normal((40, 16, 8))), axis=2))
+        arms = []
+        for _ in range(2):
+            errors = rng.standard_normal((40, 16, 8))
+            errors[..., 0] *= 2.0 ** rng.integers(0, 25, (40, 16))
+            arms.append(np.log((np.sqrt(np.mean(np.square(errors), axis=2)) / truth).max(axis=1)))
+        over, unresolved, _ = staged(np.stack(arms, axis=-1)[:, None, :])
+        reds += bool(over or unresolved)
+    assert reds == 0
+    twice = np.zeros((40, 1, 2))
+    twice[..., 0] = math.log(2.0)
+    over, _, stage = staged(twice)
+    assert over and over[0].rule == "row" and stage == 2
 
 
 def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whole(tmp_path, monkeypatch):
@@ -1387,7 +1423,7 @@ def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     there is ordinary rounding judged at the row's own size, as at every row, and passes; four thousand
     units off fails the worst-row rule. The row is held against the reference's worst row over the leaf,
     not its own error on the row, which is exact: the zero rows' rule failed Dew at four units, the
-    worst-row rule admits Dew's row up to ROW_FACTOR times the leaf's worst."""
+    worst-row rule admits Dew's row up to PARITY times the leaf's worst on the same draw."""
     dew, reference = _tiny_row(4)
     assert_as_exact(dew, reference, _draw, "tiny row", seeds=8)
     further, reference = _tiny_row(4000)
