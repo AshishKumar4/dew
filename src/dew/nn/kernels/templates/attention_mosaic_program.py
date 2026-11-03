@@ -737,10 +737,20 @@ class _Program[T: (Tiles, BackwardTiles)]:
     causal: bool
     queries: int | None = None
     splits: int = 1
+    tile: jax.Array | None = None
+    """The query tile a persistent launch's program walks now (its grid's `q_tiles` index, the slice's
+    included: `persistent_tile`); None where its grid places it (`lax.axis_index`)."""
+
+    def persistent_tile(self, tile) -> "_Program":
+        """This program at a persistent launch's query tile `tile` (`tile`)."""
+        return dataclasses.replace(self, tile=tile)
+
+    def _tile_index(self):
+        return lax.axis_index("q_tiles") if self.tile is None else self.tile
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(lax.axis_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+        return lax.rem(self._tile_index(), self.splits) if self.splits > 1 else jnp.int32(0)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -753,7 +763,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order."""
-        index = lax.axis_index("q_tiles")
+        index = self._tile_index()
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index
