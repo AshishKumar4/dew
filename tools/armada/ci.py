@@ -116,7 +116,7 @@ import time
 import tomllib
 import types
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
@@ -1504,7 +1504,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     log = out.with_name(f"{out.name}.lifetime.log")
     collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    for stale in (report, log, collection):
+    unrecorded = out.with_name(f"{out.name}.unrecorded.json")
+    for stale in (report, log, collection, unrecorded):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
@@ -1520,7 +1521,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_DEADLINE": f"{deadline:.1f}"})
+                                              "DEW_DEADLINE": f"{deadline:.1f}",
+                                              "DEW_UNRECORDED": str(unrecorded)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1602,7 +1604,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone.
-        record(python, ran, log, common, network, opened)
+        record(python, ran, log, common, network, opened,
+               set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set())
     return 0
 
 
@@ -1653,7 +1656,7 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
 
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
-           opened: set[str] | None = None) -> None:
+           opened: set[str] | None = None, unkeyed: Container[str] = ()) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -1678,7 +1681,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
-        key = cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"]) if green else None
+        # A group of a file the durations record does not wholly name (`unkeyed`, split.py) keeps no key: the
+        # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
+        key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
+               if green and name not in unkeyed else None)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
@@ -1688,7 +1694,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             written(record_key(python, row_["name"], held), token, body)
             # The run of exactly these inputs, kept by their key (`green_key`): a green one, or a red one,
             # which replaces a green row of the same inputs so no later run reuses it (a flaky red).
-            ran_on = key if key is not None else None if ran["depends"] is None else cache_key(
+            ran_on = key if key is not None else None if ran["depends"] is None or green else cache_key(
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
