@@ -79,8 +79,9 @@ DRAWN_APART = {256: [('packed documents', 'bf16', 'kept'), ('a ragged length', '
 """The interpreted gradient's cases past two minutes in one process, by their recorded sites' declared seeds:
 whole, 122 to 225 seconds (train 270's CI on 66a222273, ledger 2127) and 483 to 653 (train 479's on
 e82eab19a, the fast backward taking an fp32 call under the run's fast forms and fla_kda's form a decay a key
-dimension), each seed 0.5 to 5 seconds of the interpreter's. Each runs as armada's map tasks of seeds and
-their judge (`check1_shards`), every seed drawn and judged as one process would."""
+dimension). Each case runs as a check-1 site of its own, armada's map tasks of seeds and their judge
+(`check1_shards`), every seed drawn and judged as one process would: a task of 80 seeds of the three
+256-seed cases took 525 s, one of 15 of the two 128-seed cases 159 s (other-shards at 77a98366c)."""
 
 LONG = {case for cases in DRAWN_APART.values() for case in cases}
 
@@ -102,22 +103,39 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     _holds_check_1(case, dtype, remat)
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[256], set(DRAWN_APART[256])))
-@pytest.mark.check1_shards(seeds=256, per_task=80)
-def test_a_long_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 256 recorded seeds
-    (`DRAWN_APART`), their draws in map tasks of 80 (70 s at their 0.9 s a seed): the 64 a task first marked
-    planned 1020 map tasks over the run's Pythons, past armada's 1000 a judges' job (`ci.MAX_INPUTS`)."""
-    _holds_check_1(case, dtype, remat)
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_a_packed_bf16_gradient_is_as_exact_as_its_reference():
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at packed documents in bf16, from the forward's
+    memories kept (`DRAWN_APART`)."""
+    _holds_check_1('packed documents', jnp.bfloat16, 'kept')
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[128], set(DRAWN_APART[128])))
-@pytest.mark.check1_shards(seeds=128, per_task=15)
-def test_a_long_key_decay_or_fp32_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
-    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 128 recorded seeds, a
-    decay a key dimension's and an fp32 call's (`DRAWN_APART`), their draws in map tasks of 15 (77 s at the
-    fp32 call's 5.1 s a seed; 12 a task planned past armada's 1000, as the test above's 64)."""
-    _holds_check_1(case, dtype, remat)
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_a_ragged_bf16_gradient_is_as_exact_as_its_reference():
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in bf16, from the forward's
+    memories kept (`DRAWN_APART`)."""
+    _holds_check_1('a ragged length', jnp.bfloat16, 'kept')
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=32)
+def test_a_bf16_gradient_over_one_sequence_is_as_exact_as_its_reference():
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at one sequence in bf16, from the forward's
+    memories kept (`DRAWN_APART`)."""
+    _holds_check_1('one sequence', jnp.bfloat16, 'kept')
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` under a decay a key dimension in bf16, from the
+    forward's memories kept (`DRAWN_APART`)."""
+    _holds_check_1('a decay a key dimension', jnp.bfloat16, 'kept')
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=12)
+def test_a_ragged_fp32_gradient_is_as_exact_as_its_reference():
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at a ragged length in fp32, from the forward's
+    memories kept (`DRAWN_APART`): 5.1 s a seed."""
+    _holds_check_1('a ragged length', jnp.float32, 'kept')
 
 
 def _holds_check_1(case, dtype, remat):
