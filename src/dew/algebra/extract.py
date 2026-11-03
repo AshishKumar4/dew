@@ -70,8 +70,8 @@ class Dearer(ValueError):
     """A greedy extraction priced above the exact optimum where the oracle holds it to it (`cheapest`)."""
 
 
-def cheapest[Price: Linear](graph: EGraph, root: BaseExpr, model: DagCostModel[Price], *, exact: bool = False,
-                            checked: bool = False) -> tuple[BaseExpr, Price]:
+def cheapest[Root: BaseExpr, Price: Linear](graph: EGraph, root: Root, model: DagCostModel[Price], *,
+                                         exact: bool = False, checked: bool = False) -> tuple[Root, Price]:
     """`root`'s form under `model` and its price: egglog's greedy DAG extraction, or the exact one
     (`extracted`) where the caller asks (`exact`). `checked`, the oracle, holds a greedy choice to the
     exact optimum and refuses one dearer at any level (`Dearer`), which then asks for the exact extraction:
@@ -105,14 +105,25 @@ def _dearer(price: Linear, optimum: Linear) -> bool:
     return False
 
 
-def extracted[Price: Linear](graph: EGraph, root: BaseExpr,
-                             model: DagCostModel[Price]) -> tuple[BaseExpr, Price]:
+def extracted[Root: BaseExpr, Price: Linear](graph: EGraph, root: Root,
+                                          model: DagCostModel[Price]) -> tuple[Root, Price]:
     """`root`'s cheapest form under `model` and its price, each shared node once (the module's account)."""
     nodes, owner, greedy = recorded(graph, root, model)
     chosen = solved(nodes, owner, greedy, model.identity)
     keys = {node.key for node in chosen}
-    forced = DagCostModel(marginal_cost=lambda _, node: int(terms.key(node) not in keys), identity=0)
+    forced = DagCostModel(marginal_cost=lambda _, node: _Outside(int(terms.key(node) not in keys)),
+                          identity=_Outside(0))
     return graph.extract(root, cost_model=forced, extractor="greedy-dag"), _priced(chosen, model.identity)
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class _Outside:
+    """A forced extraction's price (`extracted`): the nodes it takes outside the chosen DAG."""
+
+    count: int
+
+    def __add__(self, other: _Outside) -> _Outside:
+        return _Outside(self.count + other.count)
 
 
 def recorded[Price: Linear](graph: EGraph, root: BaseExpr,
