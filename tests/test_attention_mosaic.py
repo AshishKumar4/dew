@@ -1758,12 +1758,13 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 FORWARD_LAUNCHES = [(*case, launches) for case in FORWARD_GATE
-                    for launches in (("walk",) if case[2] is template.Kept.SPLIT else ("plain", "guarded"))]
+                    for launches in (("walk",) if case[2] is template.Kept.SPLIT
+                                     else ("plain", "guarded", "again"))]
 """Each forward gate case by the launches it compiles: an inference forward's plain walks, folded and natural,
-apart from its guarded ones and the plain walks they rerun inside a guard's branch
-(`attention_mosaic_forward.plain_launches`), each set its own kernels, so no case compiles every launch of the
-walk's program (a case 256 wide took 120 s on a CPU); a training forward's whole walk, its launches one
-program."""
+its guarded ones and the plain walks they rerun inside a guard's branch, each role apart
+(`attention_mosaic_forward.plain_launches`), so no case compiles every launch of the walk's program (a case
+256 wide took 120 s on a CPU, its guarded launches and their reruns 116 to 185); a training forward's whole
+walk, its launches one program."""
 
 
 @COMPILES_ON_CPU
@@ -1800,8 +1801,9 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
                 query, key, value, spans, template.Hooks() if hooked is None else hooked, scale=op.scale,
                 natural=op.natural, tiles=config,
                 interpret=False, rows=training is template.Kept.OUTPUT)
-            chosen = [run for name, run in alone.items() if ("guarded" in name or "again" in name)
-                      == (launches == "guarded")]
+            roles = {name: next((role for role in ("guarded", "again") if role in name), "plain")
+                     for name in alone}
+            chosen = [run for name, run in alone.items() if roles[name] == launches]
             assert chosen, f"the inference walk has no {launches} launch"
             return [run() for run in chosen]
 
