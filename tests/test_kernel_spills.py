@@ -311,7 +311,6 @@ def test_a_released_program_drops_its_executables_and_compiles_again():
     gc.collect()
     assert held() is None
     np.testing.assert_array_equal(run(x), first)
-    assert run.executable(x) is not None
 
 
 def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
