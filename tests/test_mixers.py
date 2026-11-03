@@ -196,10 +196,11 @@ def documents_alone(model, tokens, documents=DOCUMENTS):
 
 
 def pulled(forward, variables, cotangent):
-    """`forward`'s logits and the variables' gradient under `cotangent`, at the logits' dtype, pulled
-    back through the gate (`reference_error.with_gradients`)."""
-    logits_dtype = jax.eval_shape(forward, variables).dtype
-    return with_gradients(forward)(variables, cotangent.astype(logits_dtype))
+    """`forward`'s logits and the variables' gradient under `cotangent`, pulled back through the gate
+    (`reference_error.with_gradients`) from one trace of `forward`: the logits held at the cotangent's
+    dtype, the draws' float32 or the truth's float64 (the gate widens a draw's inputs for it), which
+    holds every value they take, and the cotangent pulled back at the logits' own."""
+    return with_gradients(lambda variables: forward(variables).astype(cotangent.dtype))(variables, cotangent)
 
 
 def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
