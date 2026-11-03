@@ -231,7 +231,8 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
     `rule`, where given, evaluates every primitive in place of the terms
     arithmetic (`Rule`): the walk, its calls' bodies, scans, loops, branches
     and maps, is the same, each equation's rule its own (`Rule.at`), and no
-    value carries an energy."""
+    value carries an energy. A rule a compiled run takes is a pytree of JAX's,
+    passed in as its values are (`_span`)."""
     from jax.extend.core import Literal
 
     wanted, last, runs = _layout(jaxpr)
@@ -246,13 +247,13 @@ def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=No
     def energy(var):
         return None if isinstance(var, Literal) else energies.get(var)
 
-    spans = runs if compiling and rule is None else [(index, index + 1) for index in range(len(jaxpr.eqns))]
+    spans = runs if compiling else [(index, index + 1) for index in range(len(jaxpr.eqns))]
     for start, stop in spans:
         run = jaxpr.eqns[start:stop]
         if stop - start > 1:
             # A static run of the walk's steps, compiled once (`_span`), the values it reads in.
             reads, written, freed, runner = _span(jaxpr, start, stop)
-            outputs, made = runner([read(var) for var in reads], [energy(var) for var in reads])
+            outputs, made = runner([read(var) for var in reads], [energy(var) for var in reads], rule)
         else:
             (equation,) = run
             inputs = [read(var) for var in equation.invars]
@@ -330,8 +331,8 @@ def _span(jaxpr, start: int, stop: int):
     """`jaxpr`'s run of static steps `start` to `stop`, read once a program (`_traced`) and span: the
     variables it reads from before it and those it keeps for after it (an output, or a later step's
     input), those whose last reader it holds, which go after it, and its steps evaluated as the walk
-    evaluates them (`_applied`), compiled, from the read variables' values and energies to the kept
-    ones'."""
+    evaluates them (`_applied`), compiled, from the read variables' values and energies and the walk's
+    rule (`_evaluated`'s, None for none) to the kept ones'."""
     from jax.extend.core import Literal
 
     key = (jaxpr, start, stop, _target())
@@ -355,16 +356,17 @@ def _span(jaxpr, start: int, stop: int):
         freed = [var for var in reads if start <= last.get(var, -1) < stop]
         marks = [any(var in wanted for var in equation.outvars) for equation in run]
 
-        def evaluate(read_values, read_energies):
+        def evaluate(read_values, read_energies, rule):
             values = dict(zip(reads, read_values, strict=True))
             energies = dict(zip(reads, read_energies, strict=True))
             for var in picked:
                 values[var], energies[var] = _platform(platforms[var]), None
-            for equation, mark in zip(run, marks, strict=True):
+            for index, (equation, mark) in enumerate(zip(run, marks, strict=True), start=start):
                 inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
                 given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
                 with equation.ctx.manager:
-                    outputs, made = _applied(equation, inputs, given, mark)
+                    outputs, made = _applied(equation, inputs, given, mark,
+                                             rule=None if rule is None else rule.at(index))
                 values.update(zip(equation.outvars, outputs, strict=True))
                 energies.update(zip(equation.outvars, made, strict=True))
             return [values[var] for var in kept], [energies[var] for var in kept]
