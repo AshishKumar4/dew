@@ -111,16 +111,17 @@ def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths,
 
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
-                 dtype: Dtype | None,
+                 dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
                  routed: bool | None = None) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
-    it runs. 'layer' keeps torch's exact variance, the reference decoders'
-    formula; 'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`),
-    whose mean and square reduce in one pass, which the vision towers run."""
+    it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
+    exact variance, the reference decoders' formula; 'fast_layer' is flax's
+    E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
+    in one pass, which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
@@ -131,7 +132,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                 RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
                 scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
             if gated and spec.gate_rank is not None:
-                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, name=name)
+                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
         if spec.gate_rank is not None:
@@ -800,7 +801,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms, routed=self.routed)
+            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None

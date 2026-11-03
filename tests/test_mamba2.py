@@ -450,3 +450,40 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
                                     np.sqrt(np.mean(np.square(theirs), axis=1)), f"the step's {name}")
         assert_rows_as_exact_over_orders(mine, theirs, f"the step's {name} row by row",
                                          sizes=distances[name, "size"])
+
+
+@pytest.mark.parametrize("scale_wide", [False, True], ids=["weighted-narrow", "weighted-wide"])
+def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
+    """Falcon-H1's gated norm (`MambaRMSNormGated`, modeling_falcon_h1.py:256-282) over two groups computes
+    as the RMS norm's arithmetic orders it (`rms_statistics`, `rms_weighted`), where the module computes
+    in float64 over fp32 inputs (ledger 3627), bit for bit: norm first, each group normalized in fp32 and
+    weighted, the weighted norm rounded to fp32 before a gate broadcast over it multiplies it; gate first,
+    over a gate broadcasting the input's leading axis, the norm of the gated values' shape."""
+    from dew.nn.mixers.mamba2 import MambaRMSNormGated
+    from dew.nn.precision import rms_statistics
+
+    rng = np.random.default_rng(0x3627)
+    with jax.enable_x64(new_val=True):
+        x = jnp.asarray(rng.normal(size=(2, 4, 8)), jnp.float32)
+        gate = jnp.asarray(rng.normal(size=(2, 4, 1)), jnp.float32)
+        weight = jnp.asarray(rng.normal(size=(8,)), jnp.float32)
+        norm = MambaRMSNormGated(groups=2, gate_after=True, scale_wide=scale_wide, dtype=jnp.float64)
+        out = norm.apply({"params": {"weight": weight}}, x, gate)
+        grouped = x.reshape(2, 4, 2, 4)
+        normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(x.shape)
+        weighted = (normalized * weight if scale_wide
+                    else normalized.astype(jnp.float64) * weight.astype(jnp.float64))
+        expected = (weighted.astype(jnp.float32) * jax.nn.silu(gate)).astype(jnp.float64)
+        assert out.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+        # The gate-first order over a gate that broadcasts the input's leading axis: the norm takes the
+        # gated values' shape.
+        wide = jnp.asarray(rng.normal(size=(2, 4, 8)), jnp.float32)
+        first = MambaRMSNormGated(groups=2, scale_wide=scale_wide, dtype=jnp.float64)
+        gated = x[:1] * jax.nn.silu(wide)
+        grouped = gated.reshape(2, 4, 2, 4)
+        normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(gated.shape)
+        expected = (normalized * weight if scale_wide
+                    else normalized.astype(jnp.float64) * weight.astype(jnp.float64)).astype(jnp.float64)
+        np.testing.assert_array_equal(np.asarray(first.apply({"params": {"weight": weight}}, x[:1], wide)),
+                                      np.asarray(expected))
