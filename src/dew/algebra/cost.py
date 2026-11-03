@@ -19,7 +19,7 @@ import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew.algebra.extract import Level
-from dew.algebra.rules import shape
+from dew.algebra.rules import CONTRACTED, shape
 from dew.algebra.terms import Region, Term, integer, key, text
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
@@ -105,6 +105,9 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
         elements = made(graph, args[:1], held)
         special = text(args[1]) in EXPONENTIALS
         return Work(exponentials=elements) if special else Work(operations=elements)
+    if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
+        # Its reader's fused multiply-add computes it (`rules._contracted`).
+        return Work()
     for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2))):
         if (args := get_callable_args(node, constructor)) is not None:
             return Work(operations=made(graph, [args[index] for index in operands], held))
@@ -307,6 +310,9 @@ def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> Dag
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
 
+PRIMITIVES = {contracted: name for name, contracted in CONTRACTED.items()}
+"""The primitive each of a fused multiply-add's names binds (`rules.CONTRACTED`)."""
+
 RISK = {"log": 1.0, "sub": 1e-3}
 """What a node of the stable proposal (`stable`) costs beside its time, in seconds: a logarithm whose value
 is rounded into what follows it, a difference that may cancel its operands' digits. A proposal, not a choice:
@@ -322,8 +328,8 @@ def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> Da
         done = work(graph, node, region, bytes_per_element, held)
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
-                # Each operation's name follows its first operand.
-                risk = RISK.get(text(args[1]), 0.0)
+                # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
+                risk = RISK.get(PRIMITIVES.get(text(args[1]), text(args[1])), 0.0)
                 return Seconds(done, schedule, risk)
         return Seconds(done, schedule)
 
