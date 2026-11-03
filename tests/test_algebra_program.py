@@ -602,3 +602,81 @@ def test_the_pass_holds_no_body_past_its_life():
     gc.collect()
     assert held() is None
 
+
+
+
+def _rewrites(fn, operands_) -> tuple:
+    """The rewrites the pass records as `fn` traces over `operands_` (`report.rewrites`)."""
+    with report.refusals():
+        jax.make_jaxpr(algebra.rewritten(fn))(*operands_)
+        return report.rewrites()
+
+
+def test_a_window_of_one_structure_is_derived_once_across_the_programs_a_process_compiles():
+    """Two programs whose windows have one structure, their values named apart (every compile a planner makes
+    of one step, a resumed run's relowering, every layer of a stack), take one derivation: the second
+    program's window is rewritten with the first's forms, reused, not saturated again (row 3764), and
+    computes what its program computes (check 1)."""
+    shapes = ((3, 40), (3, 40), (3, 40))
+
+    def swapped(x, y, a):
+        return two_sums(y, x, a)
+
+    _rewrites(two_sums, rows(7, *shapes))
+    [made] = _rewrites(swapped, rows(7, *shapes))
+    assert (made.reused, made.spliced) == (True, 1)
+    assert_as_exact(jax.jit(algebra.rewritten(swapped)), jax.jit(swapped), lambda seed: rows(seed, *shapes),
+                    "a reused window's forms", seeds=8)
+
+
+def test_windows_apart_in_a_literal_or_a_shape_are_derived_apart():
+    """A window's derivation is keyed by all it reads: after a program of one structure, another of a
+    different literal (a scale that is no power of two) or a different operand's shape derives its own, and
+    each computes what its program computes (check 1)."""
+    def scaled(scale):
+        def sums(x, y, a):
+            x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+            return jnp.sum(scale * a * x, axis=-1) + jnp.sum(scale * a * y, axis=-1)
+        return sums
+
+    _rewrites(scaled(0.5), rows(8, (3, 44), (3, 44), (3, 44)))
+    for scale, width in ((0.3, 44), (0.5, 52)):
+        shapes = ((3, width),) * 3
+        assert not any(made.reused for made in _rewrites(scaled(scale), rows(8, *shapes)))
+        assert_as_exact(jax.jit(algebra.rewritten(scaled(scale))), jax.jit(scaled(scale)),
+                        lambda seed, shapes=shapes: rows(seed, *shapes), f"scale {scale} at {width}", seeds=8)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_devices():
+    """A window's values' placement is part of what derives it: after one program over one device's values,
+    the same program over values an explicit mesh shards derives its own, whose forms take its mesh, and
+    computes what its program computes (check 1; the matrix's explicit layouts after their one-device
+    reference)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+
+    shapes = ((4, 56), (4, 56), (4, 56))
+    _rewrites(two_sums, rows(9, *shapes))
+    mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
+
+    def placed(seed):
+        split = NamedSharding(mesh, P("data", None))
+        return tuple(jax.device_put(operand, split) for operand in rows(seed, *shapes))
+
+    with jax.set_mesh(mesh):
+        assert not any(made.reused for made in _rewrites(two_sums, placed(9)))
+        assert_as_exact(jax.jit(algebra.rewritten(two_sums)), jax.jit(two_sums), placed,
+                        "an explicit mesh's window", seeds=8)
+
+
+
+def test_a_region_holds_its_own_copy_of_a_literal_a_captured_scalar_views():
+    """A literal may view a NumPy scalar its function captured, which its caller may change after a region is
+    derived and kept for the later programs of its structure (`program._derived`): the region holds its own
+    value, its type kept, not the caller's storage."""
+    captured = np.array(0.5, np.float32)
+    closed = jax.make_jaxpr(lambda x: jnp.sum(captured * jnp.tanh(x)))(jnp.ones((3, 8), jnp.float32))
+    region = terms.region(closed)
+    captured[...] = 4.0
+    [held] = region.literals
+    assert (float(held), np.asarray(held).dtype) == (0.5, np.float32)

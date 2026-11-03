@@ -500,6 +500,12 @@ def rebuild_position(model: nn.Module) -> int | None:
     return model.cache_rebuild_position if isinstance(model, Serving) else None
 
 
+def crosses(original: int, lengths: jax.Array, following: jax.Array) -> jax.Array:
+    """The rows a call taking them from `lengths` tokens to `following` carries past `original`, the
+    position past which the model's cached keys go stale (`rebuild_position`)."""
+    return (lengths <= original) & (following > original)
+
+
 def _refuse_generation(model: nn.Module) -> None:
     """Refuse a model that says why a generation loop cannot continue its rows (`Generating`)."""
     refusal = model.generation_refusal() if isinstance(model, Generating) else None
@@ -538,6 +544,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
               if depths is not None and isinstance(model, BlockDrafting) and model.dspark else None)
     depths = depths or 0
     recorded = [] if blocks is None else ["prediction_inputs"]
+    original = rebuild_position(model)
 
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
@@ -553,12 +560,12 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 method="states_and_logits" if exposed else None, capture_intermediates=False, **at)
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
-        original = rebuild_position(model)
-        if rebuilds and original is not None and history is not None and lengths is not None:
+        if original is not None and history is not None and lengths is not None:
             slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
-            crossing = (lengths <= original) & (following > original)
+            # A call its caller says no row crosses (`rebuilds` off) compiles no rebuild.
+            crossing = crosses(original, lengths, following) if rebuilds else jnp.zeros(lengths.shape, bool)
             # A crossing row's tokens up to the change, which the walk answers at the short table
             # (its rotary reads a row's last real place); the rest come from the rebuilt history.
             before = slots < original
@@ -574,7 +581,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
                                     (answer, fresh[1], fresh[2], context), ordinary)
 
-            answer, cache, drafts, context = jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
+            answer, cache, drafts, context = (jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
+                                              if rebuilds else ordinary)
             lengths, rebuilt = following, crossing
         else:
             answer, updated = append(valid)
@@ -601,14 +609,13 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             cache=gather_cache_rows(state.cache, rows))
 
     # `run`'s rebuild reseeds the depths through these ops, bound once they are made.
-    original = rebuild_position(model)
+    crossed = None if original is None else functools.partial(crosses, original)
     if blocks is not None:
-        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1], rebuild_position=original)
+        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1], crosses=crossed)
     elif not depths or not exposed:
-        made = DecodeOps(advance, reindex, run, rebuild_position=original)
+        made = DecodeOps(advance, reindex, run, crosses=crossed)
     else:
-        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths,
-                         rebuild_position=original)
+        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths, crosses=crossed)
     return made
 
 

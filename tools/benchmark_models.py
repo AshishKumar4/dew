@@ -169,7 +169,7 @@ def decoder_objective(
         case "grpo":
             return GRPOObjective(model, case.seq_len, **objective_keywords(case, GRPOObjective))
         case "mdlm":
-            vocab = _count(case.config, "vocab_size", case.architecture)
+            vocab = _count(case.trunk_fields(), "vocab_size", case.architecture)
             return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len,
                                             **objective_keywords(case, MaskedDiffusionObjective))
 
@@ -203,11 +203,12 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
                                if value is not None and key in declared})
 
     sample_key = "video" if case.frames else "image"
+    fields = case.trunk_fields()
+    trunk = built(case.trunk, fields)
 
     if case.canvas is not None:
         prompt, width, count = canvas_split(case)
-        model = DiffusionGemma(text=built("causal_transformer", case.config),
-                               canvas_length=width)
+        model = DiffusionGemma(text=trunk, canvas_length=width)
         if case.decoder_objective != "lm":
             raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
                              f"it names decoder_objective={case.decoder_objective!r}")
@@ -217,15 +218,14 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.
-        model = MultimodalTransformer(
-            built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=jnp.float64 if widened else resolve_dtype(dtype))
+        model = MultimodalTransformer(trunk, tower, projector, family, token,
+                                      dtype=jnp.float64 if widened else resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
-        objective = decoder_objective(case, built(case.architecture, case.config))
+        objective = decoder_objective(case, trunk)
     elif case.predictor is not None:
-        model = built(case.architecture, case.config)
-        patch = case.config.get("patch_size", 16)
+        model = trunk
+        patch = fields.get("patch_size", 16)
         if not isinstance(patch, int):
             raise ValueError(f"{case.architecture}'s patch_size is {patch!r}, not an int")
         grid = (case.image_size // patch, case.image_size // patch)
@@ -234,7 +234,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
             MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
-        model = built(case.architecture, case.config)
+        model = trunk
         preset = presets.EDM(regime="pixel")
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
@@ -303,7 +303,7 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
     """
     _, _, _, token = media_values(case)
     images = images_per_row(case)
-    vocab = case.config.get("vocab_size")
+    vocab = case.trunk_fields().get("vocab_size")
     if not isinstance(vocab, int) or token >= vocab:
         raise ValueError(
             f"a media row marks its slots with token {token}, which is not in "
@@ -328,7 +328,7 @@ def global_batch(case: Case, seed: int = 0) -> Batch:
     rng = np.random.default_rng(seed)
     batch: Batch = {}
     if case.is_lm:
-        vocab = case.config["vocab_size"]
+        vocab = case.trunk_fields()["vocab_size"]
         if not isinstance(vocab, int):
             raise ValueError(f"{case.architecture}'s vocab_size is {vocab!r}, not an int")
         width = case.seq_len + 1
