@@ -219,9 +219,8 @@ jobs:
     # again. A land-queue train's run (ci/batch-*, ci/fix-*) takes a group of
     # its own: a train whose base moved under it runs its suite on to its end,
     # which seeds the test cache for the train composed again, beside that
-    # train's run, never ahead of it (2026-11-03: train 521's test job queued
-    # 434 s behind moot 519's), as a staged train's runs beside the testing
-    # one's. armada's priorities share the fleet among them, and its one line
+    # train's run, never ahead of it, as a staged train's runs beside the
+    # testing one's. armada's priorities share the fleet among them, and its one line
     # of waiting holders gives a gang's ranks their containers in turn
     # (armada#49). Any other run takes `armada`, one at a time. A base/<producer>
     # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
