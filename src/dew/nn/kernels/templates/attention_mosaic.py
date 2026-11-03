@@ -125,7 +125,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
         past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
-        queries, keys = ba.arguments["query"].shape[1], self.keys
+        queries, keys = ba.arguments["query"].shape[1], _keys(ba)
         padded_queries, padded_keys = _padded(queries, keys, config)
         return 1 - queries * keys / (padded_queries * padded_keys)
 
@@ -186,7 +186,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
-        reach = max(walked * 2, query.shape[1], self.keys)
+        reach = max(walked * 2, query.shape[1], _keys(ba))
         sizes = [size for size in extents(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
@@ -311,7 +311,7 @@ class MosaicForward(_Mainloop[Tiles]):
         def tiles(rows: int, walked: int, consumers: int) -> Tiles:
             return Tiles(rows, walked, 2, consumers, family.name)
 
-        config = _derived(family, query.dtype, query.shape[1], self.keys, tiles,
+        config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                           lambda config: self._launch_legal(ba, config, target), overlapped=True)
         return None if config is None else self._relaunched(ba, config, target)
 
@@ -366,7 +366,7 @@ class MosaicForward(_Mainloop[Tiles]):
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
         value_width = config.columns or value_width
-        steps = _padded(query.shape[1], self.keys, config)[1] // config.block_k
+        steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
@@ -499,6 +499,13 @@ def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     if page % tile == 0:
         return True
     return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
+
+
+def _keys(ba: tokamax.BoundArguments) -> int:
+    """A call's keys, from its arrays: its key rows, or a paged call's table's slots, its pages a row times
+    its pools' page (`forward`'s `table`)."""
+    page = _page(ba)
+    return ba.arguments["key"].shape[1] if page is None else ba.arguments["table"].shape[1] * page
 
 
 def _page(ba: tokamax.BoundArguments) -> int | None:
