@@ -181,6 +181,9 @@ NEWEST_FILES = (
     # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
+    # Host allocations a test bounds by tracemalloc's peak, which 3.14's object sizes move: a pool's export
+    # peaked past half its model on 3.14 alone.
+    "tests/test_saved_sources.py", "tests/test_mixture_scale.py",
 )
 """The files the newest Python runs whole on a pushed run: those its changes broke before, and
 the ones around the same machinery. It imports every other test file there (`COLLECT`), and runs
@@ -188,8 +191,9 @@ every file on the daily run. The list is kept by hand, from those breaks, becaus
 derive it: the test cache records the checkout's files a run executed and read (executed.py),
 while each break lived in the standard library's or a dependency's behaviour under the new
 Python (PEP 649's lazy annotations read through tyro, forkserver as the default start method,
-threads ended at interpreter exit), which no record sees; and the plan runs where the records'
-token is not. Across 34 suite runs no file was red on 3.14 alone."""
+threads ended at interpreter exit, the sizes of its objects under tracemalloc), which no record
+sees; and the plan runs where the records' token is not. A file red on the newest Python alone is
+found by the daily run, which the land queue reads, and joins the list."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_SECONDS = 6.0
