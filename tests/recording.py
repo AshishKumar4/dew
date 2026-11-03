@@ -1,10 +1,14 @@
-"""A tracker that keeps everything a run reports, for a test to read back, and an observer that preempts
-the run it observes."""
+"""A tracker that keeps everything a run reports, for a test to read back, an observer that
+preempts the run it observes, and a run's state as arrays for a bit-for-bit comparison."""
 
 import dataclasses
 import os
 import signal
 from collections.abc import Callable
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 
 from dew.state import TrainState
 from dew.training.observe import Observe
@@ -45,3 +49,10 @@ class Preempting(Observe):
 def preempting(at: int, **observed) -> Preempting:
     """`Preempting` after step `at`."""
     return Preempting(at_step=at, **observed)
+
+
+def bits(state) -> list[np.ndarray]:
+    """Every leaf of a run's state on the host, a key as its raw bits, for a bit-for-bit comparison."""
+    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+            for leaf in jax.tree.leaves(state)]
+
