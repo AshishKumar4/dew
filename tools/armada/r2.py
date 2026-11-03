@@ -20,6 +20,7 @@ import contextlib
 import http.client
 import json
 import re
+import socket
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator, Mapping
@@ -81,7 +82,8 @@ while it is read, raise an OSError (or http.client's HTTPException); everything 
 class _Answer:
     """An http.client answer as a `Stream`: each read one receive of its socket, bounded as asked."""
 
-    def __init__(self, connection: http.client.HTTPConnection, sock, response: http.client.HTTPResponse):
+    def __init__(self, connection: http.client.HTTPConnection, sock: socket.socket,
+                 response: http.client.HTTPResponse):
         self.connection, self.sock, self.response = connection, sock, response
 
     def read1(self, size: int, seconds: float) -> bytes:
