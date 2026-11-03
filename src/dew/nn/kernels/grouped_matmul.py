@@ -999,7 +999,7 @@ class MosaicTgmm(_Mosaic):
         return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
                                       rows=ba.arguments['tokens'].shape[0], depth=depth, width=width,
                                       multiprocessors=multiprocessors, step_seconds=step,
-                                      bandwidth=target.memory_bandwidth)
+                                      bandwidth=target.memory_rate)
 
     # A split tile runs the fp32 partials' call at its tile unsplit (`mosaic_gpu.tgmm`): its legality,
     # registers and launch are that call's.

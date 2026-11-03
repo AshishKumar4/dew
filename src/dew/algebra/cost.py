@@ -24,6 +24,7 @@ from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.product import EIGHT
 from dew.nn.precision import asks_default_precision, precision_names
 
 EXPONENTIALS = frozenset({"exp", "exp2", "log", "log2", "log1p", "expm1", "tanh", "logistic", "sin", "cos",
@@ -109,7 +110,7 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
     return Work()
 
 
-_MODES = {"16bit": "flops", "tf32": "tf32_flops", "fp32": "operations"}
+_MODES = {"16bit": "flops", "tf32": "tf32_flops", "8bit": "fp8_flops", "fp32": "operations"}
 """The `Work` field a product's mode's FLOPs are told in (`generation.Architecture`'s modes; IEEE fp32 is
 the CUDA cores')."""
 
@@ -121,9 +122,9 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
     """The mode a product of operands of `dtypes` at `precision` multiplies in, and its passes: its dot
     algorithm's where it names one of the tensor cores' (its passes, an X3's three), by its preset's name
     or, a `jax.lax.DotAlgorithm` (which JAX names no preset), by its fields (16-bit precision types, its
-    primitive operations), as JAX lowers both to one algorithm; 16-bit operands' 16-bit mode, fp32
-    operands' TF32 at the default precision (the product declaration's, `product.declared`) and IEEE fp32
-    above it; any other operand's on the CUDA cores."""
+    primitive operations), as JAX lowers both to one algorithm; 16-bit operands' 16-bit mode, FP8 operands'
+    8-bit mode (`product.EIGHT`), fp32 operands' TF32 at the default precision (the product declaration's,
+    `product.declared`) and IEEE fp32 above it; any other operand's on the CUDA cores."""
     # A dot algorithm is a named tuple itself: one, not a pair of precisions.
     written = precision if isinstance(precision, tuple) and not isinstance(
         precision, jax.lax.DotAlgorithm) else (precision,)
@@ -138,6 +139,8 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
             return ("tf32" if found.group(1) == "TF32" else "16bit"), int(found.group(2) or 1)
     if dtypes and all(dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)) for dtype in dtypes):
         return "16bit", 1
+    if dtypes and all(dtype in EIGHT for dtype in dtypes):
+        return "8bit", 1
     if dtypes == {jnp.dtype(jnp.float32)} and asks_default_precision(precision, configured=True):
         return "tf32", 1
     return "fp32", 1
