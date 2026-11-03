@@ -148,7 +148,7 @@ from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import Sample, Speculative
+from dew.sampling.strategies import Sample, Speculative, Strategy
 from dew.sampling.text import Generation, Sampling, check_inputs, decoded_rows, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
@@ -734,17 +734,7 @@ class Server:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
-        if not isinstance(strategy, Sample | Speculative):
-            raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
-                             "batch-wide")
-        plan = strategy if isinstance(strategy, Speculative) else None
-        if plan is not None and mesh is not None:
-            raise ValueError("speculative rows check each block's draws between its model calls, and jax's "
-                             "checkify carries no check into the shard_map a model on a mesh may run "
-                             "(jax-ml/jax#40907); serve speculation on one device")
-        if plan is not None and (chunk is not None or prefix_cache):
-            raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
-                             "own prefill; serve without chunk and prefix_cache")
+        plan = _served_plan(strategy, mesh, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
@@ -1244,6 +1234,25 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
+                 prefix_cache: bool) -> Speculative | None:
+    """The speculative blocks a server's rows draw (`Dense.plan`), or None where they sample a token a step
+    (`Sample`); a beam search, and speculation where its rows cannot run it, refused by name."""
+    if not isinstance(strategy, Sample | Speculative):
+        raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
+                         "batch-wide")
+    if isinstance(strategy, Sample):
+        return None
+    if mesh is not None:
+        raise ValueError("speculative rows check each block's draws between its model calls, and jax's "
+                         "checkify carries no check into the shard_map a model on a mesh may run "
+                         "(jax-ml/jax#40907); serve speculation on one device")
+    if chunk is not None or prefix_cache:
+        raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
+                         "own prefill; serve without chunk and prefix_cache")
+    return strategy
 
 
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,
