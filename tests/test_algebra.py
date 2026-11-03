@@ -75,6 +75,20 @@ def test_each_rule_holds_its_right_side_to_its_left_side():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
 
 
+def test_a_compensated_sums_residual_survives_a_rewritten_program():
+    """What a user of an error-free transform relies on (`dew.nn.precision.compensated_add`): its low word,
+    which reassociation would cancel, is what the program computes once rewritten and rewritten again. The
+    protection itself is proven against a control the pass does rewrite
+    (test_algebra_program.py's protected span)."""
+    def compensated(a, b):
+        return precision.compensated_add((a, jnp.zeros_like(a)), (b, jnp.zeros_like(b)))[1]
+
+    a, b = jnp.asarray([1e8], jnp.float32), jnp.asarray([1.0], jnp.float32)
+    low = float(jax.jit(compensated)(a, b)[0])
+    for rewrite in (algebra.rewritten(compensated), algebra.rewritten(algebra.rewritten(compensated))):
+        assert float(jax.jit(rewrite)(a, b)[0]) == low != 0.0
+
+
 def test_a_complex_programs_literals_are_read_by_the_rules():
     """A program of complex values, its literals complex (`1 + 0j` a unit, as a complex weight's update
     writes them), rewritten: the facts its literals state are read whatever their dtype, and it computes
