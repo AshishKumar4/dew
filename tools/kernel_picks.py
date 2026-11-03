@@ -26,10 +26,10 @@ import jax
 import jax.numpy as jnp
 import optax
 import tokamax
+from benchmark_cases import checkpoint_fields
 
 from dew import cache
 from dew.interop import sources
-from dew.interop.hf_decoders import decoder_config, translate_config
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
 from dew.objectives.lm import LMObjective
@@ -38,22 +38,9 @@ from dew.training._lowering import Lowered
 
 
 def model_of(arguments) -> CausalTransformer:
-    """The decoder a checkpoint's config.json translates to, in `--dtype`: a
-    local directory's, or a Hub repo's, of which nothing else is read but its
-    tensors' names, from their headers, where a quantized wrapper's selection
-    needs them."""
-    # One snapshot, the config's and the headers' commit alike (`snapshot(weights=False)`).
-    source = sources.SourceReference(arguments.config, arguments.revision)
-    root = source.metadata()
-    config = json.loads((root / "config.json").read_text())
-
-    def inventory():
-        stored = sources.stored_tensors(source, root)
-        return None if stored is None else stored.keys()
-
-    # A wrapper's decoder as its load reads it: the wrapper's head policy and overrides, its quantized
-    # selection renamed with its tensors (ledgers 3006, 3138).
-    fields = dict(translate_config(decoder_config(config, inventory)))
+    """The decoder a checkpoint's config.json translates to (`checkpoint_fields`: a local directory's, or a
+    Hub repo's at `--revision`), in `--dtype`."""
+    fields = checkpoint_fields(sources.SourceReference(arguments.config, arguments.revision))
     return CausalTransformer(**{**fields, "dtype": jnp.dtype(arguments.dtype)})
 
 
