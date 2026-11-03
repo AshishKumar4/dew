@@ -1582,38 +1582,49 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
 
 def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_terms():
     """A summarized recording sizes its reference's rows by its truth alone (`leaf_summaries`), so Dew's are
-    sized so too, the site's terms aside (row 3684): a dot that cancels to float64's zero, Dew an ulp or so
-    off it where the recorded reference's sum is exactly zero, fails as a row of float64 zero against the
-    reference's exact zero, as the live reference fails it without terms, where Dew's rows read by its terms
-    held its worst row against a reference's sized otherwise."""
+    sized so too, the site's terms aside (row 3684): on a row whose truth nearly cancels (a difference of
+    1e-6 of terms of one), Dew ten times the recorded reference's error there fails, where Dew's row read
+    over its terms' size and the reference's over its truth's put Dew's worst row under the reference's."""
     from tool_support import load
 
     recorder = load("recorded_references")
-    reference = cancelling(split=False)
+
+    def program(a, b, c, noises):
+        return {"rows": jnp.concatenate([a[:1] - b[:1], c[1:]])}
+
+    def arm(scale, index):
+        @as_given
+        def run(a, b, c, noises):
+            out = np.concatenate([a[:1] - b[:1], c[1:]])
+            out[0] += scale * noises[index, 0]
+            out[1:] += 2.0 ** -24 * c[1:] * noises[index, 1:]
+            return {"rows": out}
+        return run
 
     def draw(seed):
-        x, w = cancelling_draw(seed)
-        return {"x": np.asarray(x), "w": np.asarray(w)}
+        rng = np.random.default_rng([3684, 6, seed])
+        a = rng.standard_normal((64, 8))
+        b = a.copy()
+        b[0] -= 1e-6 * rng.standard_normal(8)
+        return {"a": a, "b": b, "c": rng.standard_normal((64, 8)), "noises": rng.standard_normal((2, 64, 8))}
+
+    reference, dew = arm(1e-7, 0), arm(1e-6, 1)
 
     def evaluate(inputs):
-        with jax.enable_x64(new_val=False):
-            held = jax.tree.map(np.asarray, reference(inputs["x"], inputs["w"]))
-        truth = jax.tree.map(np.asarray, reference(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
-        return held, truth
+        return jax.tree.map(np.asarray, reference(**inputs)), program(**inputs)
 
     def as_inputs(fn):
-        return lambda inputs: fn(inputs["x"], inputs["w"])
+        return lambda inputs: fn(**inputs)
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, as_inputs(reference), summary=True)
+        recorded = recorder.record_case("site", draw, evaluate, as_inputs(program), summary=True)
     seeds = int(recorded["site.seeds"])
     drawn, recorded_reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
-                                                         truth_fn=as_inputs(reference))
+                                                         truth_fn=as_inputs(program))
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(lambda index, inputs: as_inputs(cancelling(split=True))(inputs), recorded_reference,
-                        drawn, "summarized", seeds=seeds, truth_fn=truth,
-                        terms=lambda index, inputs: as_inputs(reference)(inputs))
-    assert raised.type is GateFailure
+        assert_as_exact(lambda index, inputs: as_inputs(dew)(inputs), recorded_reference, drawn, "summarized",
+                        seeds=seeds, truth_fn=truth, terms=lambda index, inputs: as_inputs(program)(inputs))
+    assert raised.type is GateFailure and {finding.rule for finding in raised.value.findings} == {"row"}
 
 
 @pytest.mark.parametrize("planned", [False, True])
