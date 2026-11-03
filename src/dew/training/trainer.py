@@ -1172,8 +1172,8 @@ class Trainer(Generic[Loss, Effects]):
         footprint = None if shapes is None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), window, prepared, held,
             (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-            functools.partial(self._consumed, prepared, micro, window, shapes), max(cuts, default=0),
-            capacity)
+            functools.partial(self._consumes_where_made, prepared, micro, window, shapes),
+            max(cuts, default=0), capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)
@@ -1183,7 +1183,7 @@ class Trainer(Generic[Loss, Effects]):
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 
-    def _consumed(self, prepared: TrainState, micro: Batch, window: int, shapes) -> bool:
+    def _consumes_where_made(self, prepared: TrainState, micro: Batch, window: int, shapes) -> bool:
         """Whether the step over `prepared` consumes each gradient where it is made
         (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
         (`group_of`), not the outer optimizer's."""
