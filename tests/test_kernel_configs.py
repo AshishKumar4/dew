@@ -375,14 +375,16 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
                "mixtral down": (4096, 14336, 4096, 8), "deepseek-v3 up": (4096, 7168, 2048, 256),
+               "deepseek-v3 decode down": (64, 2048, 7168, 256),
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
                "qwen3.5-4b down": (24576, 9216, 2560, 1), "qwen3.5-4b key": (24576, 2560, 1024, 1),
                "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1)}
 """Real projections' extents `(rows, depth, width, groups)` for the GEMM mainloops' compile gate, over which
 the derived tiles move: MoE expert products (Qwen3-30B-A3B's, Mixtral's and DeepSeek-V3's: rows a few tiles a
-group, or less than one, a wide and a deep product), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training
-step at its 24,576 rows a device: its widest, deepest, narrow key and narrowest gate products, its HLO
-10-28), and a kernel gradient of 64 output rows, which one consumer computes."""
+group, or less than one, a wide and a deep product, and a decode step's, 8 tokens' top-8 rows over 256
+experts), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training step at its 24,576 rows a device: its widest,
+deepest, narrow key and narrowest gate products, its HLO 10-28), and a kernel gradient of 64 output rows,
+which one consumer computes."""
 
 PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
@@ -493,12 +495,15 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows; one consumer runs alone,
-                    # a cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    # Each consumer keeps its share of the derived tile's rows, at as many of its stages as
+                    # the block holds (a one-consumer tile's deeper ring past two consumers' rows); one
+                    # consumer runs alone, a cluster being two consumers' (`mosaic_gpu.Tiles`).
                     rows_ = config.block_m // config.warpgroups * consumers
-                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_,
-                                               cluster=config.cluster if consumers > 1 else 1)
-                    if launch.legal(ba, tile, target):
+                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
+                                                  cluster=config.cluster if consumers > 1 else 1)
+                              for stages in range(config.stages, 1, -1))
+                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
