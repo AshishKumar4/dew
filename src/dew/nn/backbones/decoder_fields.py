@@ -1,14 +1,23 @@
-"""The decoder's field validation: each field, or pair of fields, a `CausalTransformer` cannot build
-is refused when it sets up, by `refuse_unbuildable`, naming the field the caller set."""
+"""The decoder's fields: each read into the value the decoder holds as it is made (`settle_fields`),
+and each field, or pair of fields, a `CausalTransformer` cannot build refused when it sets up, by
+`refuse_unbuildable`, naming the field the caller set."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import flax.core
+
+from dew.registry import from_record, read_arguments
+
+from ..activations import Situ
 from ..dex import HeadOutputs
-from ..mixers import AttentionMixer
+from ..mixers import AttentionMixer, MixerBase
 from ..mixers.mlp import MLPMixer
+from ..rope import rope_scaling_from_record
+from .decoder_block import NORM_SITES, remat_policy
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -324,3 +333,55 @@ def _streams(model: CausalTransformer):
     if hc is not None and hc.single_pass and model.mtp_hyper_connections:
         raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
                          "streams, which no stream prediction depth reads")
+
+
+def settle_fields(model: CausalTransformer) -> None:
+    """`model`'s fields as the decoder holds them, set as it is made (`CausalTransformer.__post_init__`):
+    each sequence a tuple, each field a config states as a record read into its value, its norms' and
+    kinds' tables frozen (a module's fields are static to jit, so hashable), and its remat a policy;
+    a norm the decoder builds none of, a mixer that is no mixer value, and a continuum over nGPT are
+    refused."""
+    if model.layer_types is not None:
+        object.__setattr__(model, "layer_types", tuple(model.layer_types))
+    object.__setattr__(model, "embedding_zero_ids", tuple(model.embedding_zero_ids))
+    if model.kv_shared_layers is not None:
+        object.__setattr__(model, "kv_shared_layers",
+                           tuple(int(index) for index in model.kv_shared_layers))
+    if isinstance(model.mlp_features, (tuple, list)):
+        object.__setattr__(model, "mlp_features", tuple(int(width) for width in model.mlp_features))
+    if model.activation_sparsity_pattern is not None:
+        object.__setattr__(model, "activation_sparsity_pattern",
+                           tuple(float(fraction) for fraction in model.activation_sparsity_pattern))
+    # A value arrives as a record from a config and as itself from code,
+    # and `models.build` already reads one; reading every field that holds
+    # a record here too, as its annotation declares (`read_arguments`),
+    # means the plain constructor takes the same records, as a test or a
+    # notebook writes them. A bare rotary record and SiTU's betas name no
+    # class, so their own readers take them.
+    records = {field.name: getattr(model, field.name) for field in dataclasses.fields(model)
+               if field.name not in ("rope_scaling", "mlp")
+               and isinstance(getattr(model, field.name), Mapping)}
+    for name, value in read_arguments(type(model), records).items():
+        object.__setattr__(model, name, value)
+    if isinstance(model.rope_scaling, Mapping):
+        object.__setattr__(model, 'rope_scaling', rope_scaling_from_record(model.rope_scaling))
+    if isinstance(model.mlp, Mapping):
+        # A config states SiTU's betas as a record in the activation's place.
+        object.__setattr__(model, "mlp", from_record(Situ, model.mlp))
+    if model.norms is not None:
+        unknown = sorted(set(model.norms) - set(NORM_SITES))
+        if unknown:
+            raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
+                             f"it builds {list(NORM_SITES)}")
+        # Frozen, because a module's fields are static to jit and a plain
+        # dict cannot be hashed.
+        object.__setattr__(model, "norms", flax.core.freeze(dict(model.norms)))
+    if model.kinds is not None:
+        object.__setattr__(model, "kinds", flax.core.freeze(dict(model.kinds)))
+    if model.mixer is not None and not isinstance(model.mixer, MixerBase):
+        raise ValueError(
+            f"mixer is a mixer value, its record, or None, not {model.mixer!r}")
+    if model.continuum is not None and model.ngpt is not None:
+        raise ValueError("a continuum level reads the final norm's states, which a normalized "
+                         "transformer (ngpt) does not have")
+    object.__setattr__(model, "remat", remat_policy(model.remat))
