@@ -131,7 +131,7 @@ def exported(args) -> dict:
     # The deeper decoder exported once before it is measured, a copy built apart so nothing the measured
     # one holds is left from it: the measured export finds its programs compiled and its modules imported.
     export(built(DEEP)[4], f"warm{rank}")
-    *_, deep, deep_bundle = built(DEEP)
+    _, _, deep, _, deep_bundle = built(DEEP)
     growth: list[int] = []
     with resident_growth(growth):
         export(deep_bundle, f"deep{rank}")
