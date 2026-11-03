@@ -1,6 +1,6 @@
 """Float-range and nested-derivative contracts of the recurrences' seams: the chunked delta rule, its ports
-and template, the decode step, the SSD port and the TPU scan, the short convolution (ledger 2641; the
-harness is tests/contract_support.py)."""
+and template, the decode step, the SSD port and the TPU scan, the short convolution, and the chunk forms
+`dew.algebra.scan` derives (ledger 2641; the harness is tests/contract_support.py)."""
 
 import functools
 import itertools
@@ -13,6 +13,7 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
+from dew.algebra import SATURATION, forms as algebra_forms, scan
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates import mosaic_sm90
 from dew.nn.kernels.templates.recurrence import mainloop, selective
@@ -253,10 +254,12 @@ def test_the_selective_scan_holds_its_orders(edge):
                     plain_fn=plain, without=REVERSE_ONLY)
 
 
+@pytest.mark.parametrize("derived", [False, True], ids=["hand-written", "derived"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_chunked_op_holds_every_order(edge):
+def test_the_chunked_op_holds_every_order(edge, derived):
     """The chunked op (`recurrence_chunk.chunk`: its kernel a product, `_per_product`, differentiated
-    through the portable math, and the skip `D v`, `recurrence.skipped`, each through
+    through the portable math, its forms the hand-written ones or those derived from the token update behind
+    the switch, `dew.algebra.forms.derived`, and the skip `D v`, `recurrence.skipped`, each through
     `generation.linear_tangent`), the gated delta rule with a decay a head, its queries scaled, and the skip,
     from a zero memory: every order of its output finite wherever float64 is a normal float32 and the rule a
     token at a time with its skip is (`plain_delta_rule`, in float64 the truth), at queries, keys and values
@@ -271,7 +274,8 @@ def test_the_chunked_op_holds_every_order(edge):
 
     def chunked(query, key, value, g, beta, skip):
         operands = recurrence_chunk.Chunk(query, key, value, log_decay=g, beta=beta, skip=skip)
-        return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
+        with algebra_forms.derived(derived):
+            return recurrence_chunk.chunk(hooks, operands, chunk_size=4)[0]
 
     def recurrent(query, key, value, g, beta, skip):
         out, _ = plain_delta_rule(query, key, value, g, beta, jnp.zeros((1, 2, 8, 8), query.dtype),
@@ -390,3 +394,62 @@ def test_the_short_conv_holds_every_order(edge):
 
     assert_contract(kernel, primals, direction, cotangent, f"the short conv {edge}", truth_fn=plain,
                     plain_fn=plain)
+
+
+def _gated(h, q, k, v, g, beta):
+    """The delta rule decayed per key, each key's old value corrected toward the new one: `g` a scalar (the
+    gated delta rule) or a vector of the keys' own (Kimi's delta attention)."""
+    del q
+    decayed = jnp.exp(g)[..., None] * h if g.ndim else jnp.exp(g) * h
+    return decayed + beta * jnp.outer(k, v - k @ decayed)
+
+
+def _read(h, q, k, v, g, beta):
+    del k, v, g, beta
+    return q @ h
+
+
+# Near float32's largest a chunk's corrections' overlaps (keys' products near 2^126 against states as large)
+# overflow at entries the token recurrence's float64 keeps normal, as fla's chunked form's do at the same
+# entries (ledger 2470, `precedent_chunked`).
+@pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
+@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
+def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge):
+    """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
+    key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
+    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order,
+    forward mode among them, finite wherever float64 is a normal float32 and the token-by-token scan's are,
+    at unit queries, keys and values and at ones whose products near float32's least normal."""
+    tokens, chunk, keys_, values = 24, 8, 4, 6
+    draws = jax.random.split(jax.random.key(3311 + per_key), 7)
+    scale = EDGES[edge]
+    q, k, v = (jax.random.normal(d, (tokens, n)) * scale for d, n in zip(draws[:3], (keys_, keys_, values),
+                                                                         strict=True))
+    g = -jax.nn.softplus(jax.random.normal(draws[3], (tokens, keys_) if per_key else (tokens,)))
+    beta = jax.nn.sigmoid(jax.random.normal(draws[4], (tokens,)))
+    axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
+            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
+    forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
+                                       state=((keys_, values), jnp.float32)), saturation=SATURATION)
+
+    def derived(q, k, v, g, beta):
+        values_ = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        state, outputs = forms.init({}), []
+        for index in range(tokens // chunk):
+            part = {name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
+            prepared = forms.prepare(part)
+            outputs.append(forms.mapped(prepared, state))
+            state = forms.step(state, prepared)
+        return jnp.concatenate(outputs)
+
+    def tokenwise(q, k, v, g, beta):
+        def one(h, token):
+            h = _gated(h, *token)
+            return h, _read(h, *token)
+        return jax.lax.scan(one, jnp.zeros((keys_, values), q.dtype), (q, k, v, g, beta))[1]
+
+    primals = (q, k, v, g, beta)
+    direction = tuple(jax.random.normal(draws[5], x.shape) for x in primals)
+    cotangent = jax.random.normal(draws[6], (tokens, values))
+    assert_contract(derived, primals, direction, cotangent, f"the derived delta rule {edge}",
+                    truth_fn=tokenwise, plain_fn=tokenwise)

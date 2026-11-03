@@ -26,6 +26,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
+from flax import linen as nn
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for, with_gradients
 from residual_orders import order
 from sharded import collectives
@@ -111,7 +112,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
                               tie_embeddings=tied, dtype=dtype, qk_norm=False,
                               attention_impl='reference')
     ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     bias = jax.random.normal(jax.random.key(3), (97,), jnp.float32) / 17
     variables['params']['head_bias'] = bias
     with jax.default_matmul_precision(EXERCISED[dtype]):
@@ -214,7 +215,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
         vocab_size=97, emb_features=32, num_layers=1, num_heads=2, mlp_features=32, max_seq_len=8,
         head_bias=True, tie_embeddings=False, dtype=dtype, qk_norm=False, attention_impl='reference'))
     ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     variables[QUANTIZATION]['lm_head'][INPUT_SCALES[kind]] = jnp.asarray(0.37, jnp.float32)
     with jax.default_matmul_precision(EXERCISED[dtype]):
         logits = model.apply(variables, ids)
@@ -257,7 +258,7 @@ def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(
                               mlp_features=32, max_seq_len=8, tie_embeddings=tied, dtype=jnp.bfloat16,
                               qk_norm=False, attention_impl='reference')
     ids = jnp.asarray([[2, 7, 3], [11, 4, 9]], jnp.int32)
-    variables = model.init(jax.random.key(0), ids)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
     with jax.default_matmul_precision('default'):
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
@@ -469,7 +470,8 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
 
     def draw(seed):
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)
-        return adjusted(model.init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1])), tokens
+        drawn = nn.unbox(model.init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]))
+        return adjusted(drawn), tokens
 
     variables, _ = draw(0)
     objective, wide = objective_of(model, variables), objective_of(wide_model, variables)
@@ -670,7 +672,7 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     model = small_model(tie_embeddings=tie_embeddings, dtype=dtype)
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
-    variables = model.init(rng, ids)
+    variables = nn.unbox(model.init(rng, ids))
     # The model's own table, whose product the whole logits round as the chunks do.
     table = chunked.head_table(model, variables)
 
@@ -710,7 +712,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     once, as the chunked head's does.
     """
     model, wide = small_model(), small_model(dtype=jnp.float64)
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(0), seed), 3)
@@ -1107,7 +1109,7 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     model, wide = (small_model(dtype=dtype, tie_embeddings=tie_embeddings, final_logit_softcap=30.)
                    for dtype in (jnp.float32, jnp.float64))
 
-    init = jax.jit(model.init)
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
 
     def draw(seed):
         ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (4, 16), 0, 97)
@@ -1614,7 +1616,7 @@ def test_a_projected_head_is_scored_as_one_matrix_as_its_exact_head_scores(fused
     and the table's) and in the final states are on par with the exact head's whole logits
     (`logits_from_hidden`), check 1 with that head in float64 the truth."""
     ids = jnp.asarray([[2, 7, 3, 5], [11, 4, 9, 1]], jnp.int32)
-    variables = PROJECTED.init(jax.random.key(0), ids)
+    variables = nn.unbox(PROJECTED.init(jax.random.key(0), ids))
     shape = PROJECTED.apply(variables, ids, method='hidden_states').shape
 
     def draw(seed):

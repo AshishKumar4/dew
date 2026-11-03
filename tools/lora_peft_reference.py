@@ -179,7 +179,7 @@ def write_orders(out: Path) -> None:
         adapter = LoRA.load(decoder.model, decoder.variables, FIXTURE / case / "adapter",
                             layouts=decoder.layouts)
         whole, residual_inputs = adapter_orders(adapter)
-        drawn = orders(residual_width(whole), ORDERS, ORDER_SEED)
+        drawn = orders(residual_width(whole, drawn_axes(adapter)), ORDERS, ORDER_SEED)
         (out / case).mkdir(parents=True, exist_ok=True)
         np.save(out / case / "orders.npy", drawn)
         masks = None
@@ -196,6 +196,19 @@ def write_orders(out: Path) -> None:
         print(f"{out / case}: {len(drawn)} orders, residual branch inputs {sorted(residual_inputs)}")
 
 
+def drawn_axes(adapter) -> dict:
+    """The axes the adapted model draws each parameter in (`dew.nn.sharding.boxed_axes`), its factors in
+    the box its kernel's axes give it, by its path in the thawed tree an order permutes (`thaw`: the draw
+    holds its base frozen): the table `residual_orders` reads a plain tree's axes from."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import thaw
+    from dew.nn.sharding import abstract, boxed_axes
+
+    return boxed_axes(thaw(abstract(adapter.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32))))
+
+
 def adapter_orders(adapter) -> tuple[dict, set[str]]:
     """The adapter's frozen base and its factors as one `{"params": ...}` tree, which an order
     permutes whole (tests/residual_orders.py, the factors' residual sides read off their declared
@@ -204,14 +217,16 @@ def adapter_orders(adapter) -> tuple[dict, set[str]]:
     import jax
 
     from dew.batch import thaw
-    from dew.nn.sharding import declarations, declared_axes, parameter_path
+    from dew.nn.sharding import boxed, declared_axes, parameter_path
 
     whole = thaw(adapter.variables)
-    declared = declarations(whole["params"])
-    residual_inputs = {
-        "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
-        for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
-        if parameter_path(path)[-1] == "lora_A" and declared_axes(path, leaf.ndim, declared)[0] == "embed"}
+    with boxed(drawn_axes(adapter)):
+        # A factor whose kernel names no axes reads no residual unit.
+        residual_inputs = {
+            "model." + ".".join(parameter_path(path)[:-1]).replace("layers_", "layers.")
+            for path, leaf in jax.tree_util.tree_leaves_with_path(whole["params"])
+            if parameter_path(path)[-1] == "lora_A"
+            and (declared_axes(path, leaf.ndim) or (None,))[0] == "embed"}
     return whole, residual_inputs
 
 
@@ -225,8 +240,11 @@ def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
 
     from dew.batch import freeze
     from dew.lora import FACTORS
+    from dew.nn.sharding import boxed
 
-    variables = freeze(permuted(whole, order), lambda path: path[-1] in FACTORS)
+    axes = drawn_axes(adapter)
+    with boxed(axes):
+        variables = freeze(permuted(whole, order, axes), lambda path: path[-1] in FACTORS)
     if masks is None:
         return variables, None
     return variables, {key: mask[..., order] if key in residual_inputs else mask

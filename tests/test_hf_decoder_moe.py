@@ -9,6 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import fixture_ids, transformers_arms, transformers_model
 from model_support import flat_tree, stepped_outputs
 from reference_error import (
@@ -500,7 +501,8 @@ def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
     config = translate_config({**fixture_config("deepseek-v4-tiny"), "num_attention_heads": 16,
                                "head_dim": 64, "o_groups": 8, "o_lora_rank": 64})
     model = models.build("causal_transformer", config)
-    params = jax.jit(model.init)(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))["params"]
+    init = jax.jit(lambda *args: nn.unbox(model.init(*args)))
+    params = init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))["params"]
     kernels = [leaf for path, leaf in flat_tree(params).items() if "o_a_proj" in path]
     assert kernels and all(kernel.shape == (8, 128, 64) for kernel in kernels)
     low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], 128 * 64 - 1)

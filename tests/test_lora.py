@@ -39,13 +39,13 @@ from test_joined import row_joins
 from torch_layout import node
 
 from dew import lora
-from dew.batch import FROZEN, merge, thaw
+from dew.batch import FROZEN, merge, thaw, unboxed
 from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
-from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
+from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, drawn_axes, parameter_path
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -153,7 +153,7 @@ def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, referen
     adapter = _rebound(loaded, decoder.model, dropout=0.0)
     tokens = jnp.asarray(reference["input_ids"])
     objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     assert sorted(params) == [FROZEN, "params"]
     assert all(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(params["params"]))
 
@@ -198,6 +198,22 @@ def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
     for before, after in zip(*leaves[FROZEN], strict=True):
         np.testing.assert_array_equal(before, after)
     assert all(np.any(before != after) for before, after in zip(*leaves["params"], strict=True))
+
+
+def test_an_adapter_whose_targets_differ_along_a_scanned_run_draws_its_model_afresh(decoder):
+    """A model an adapter targets unlike along a run of like layers, a factor pair of its own a layer
+    (ranks a module or a layer apart, a module adapted in some layers alone), draws its every parameter
+    afresh as its scanned forward reads them: its draw keeps those layers apart, as the forward keeps a
+    held tree's apart by its leaves (`StackView.layer_structures`), where it drew the run under one scan
+    that stacks one pair over all of them and refused it."""
+    adapter = LoRA(rank=2, modules=("q_proj",)).apply(decoder.model, decoder.variables, key=0)
+    first = next(path for path in adapter.targets if "layers_0" in path)
+    targets = {**adapter.targets, first: Target(rank=4, alpha=8.0)}
+    differing = Adapter.bound(decoder.model, adapter.variables, targets, adapter.rslora, adapter.dropout,
+                              adapter.layouts)
+    drawn = unboxed(jax.eval_shape(differing.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+    ranks = {path: np.shape(_subtree(drawn, (*path, "lora_A")))[-1] for path in targets}
+    assert ranks == {path: target.rank for path, target in targets.items()}
 
 
 def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, reference, tmp_path):
@@ -458,22 +474,26 @@ def test_an_adapters_factors_take_their_kernels_axes_on_each_side_of_the_rank(lo
     factors took the module's two kernel axes as they stood, so `lora_B`'s rank was named the
     kernel's input and split over fsdp."""
     variables = loaded.variables
-    declared = declarations(variables)
+    # The adapted model draws each factor in the box its kernel's axes give it: the run's table.
+    table = boxed_axes(jax.eval_shape(loaded.model.init, jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     factors = {"/".join(parameter_path(path)[-2:]): (path, leaf)
                for path, leaf in jax.tree_util.tree_leaves_with_path(variables)
                if parameter_path(path)[-1] in lora.FACTORS and "layers_0" in parameter_path(path)}
-    assert {name: declared_axes(path, leaf.ndim, declared) for name, (path, leaf) in factors.items()} == {
+    with boxed(table):
+        declared = {name: declared_axes(path, leaf.ndim) for name, (path, leaf) in factors.items()}
+    assert declared == {
         "q_proj/lora_A": ("embed", ADAPTER_RANK), "q_proj/lora_B": (ADAPTER_RANK, "heads"),
         "v_proj/lora_A": ("embed", ADAPTER_RANK), "v_proj/lora_B": (ADAPTER_RANK, "kv"),
         "down_proj/lora_A": ("mlp", ADAPTER_RANK), "down_proj/lora_B": (ADAPTER_RANK, "embed")}
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    placed = Layout(min_shard=1).shardings(mesh, variables)
+    with boxed(table):
+        placed = Layout(min_shard=1).shardings(mesh, variables)
+        muon = muon_weight_dimension_numbers(variables["params"])
     specs = {"/".join(parameter_path(path)[-2:]): sharding.spec
              for path, sharding in jax.tree_util.tree_leaves_with_path(placed)
              if "/".join(parameter_path(path)[-2:]) in factors and "layers_0" in parameter_path(path)}
     assert specs["q_proj/lora_A"][0] == specs["v_proj/lora_A"][0] == "fsdp", specs
     assert all(not spec or spec[0] is None for name, spec in specs.items() if name.endswith("lora_B")), specs
-    muon = muon_weight_dimension_numbers(variables["params"])
     for name, (path, _) in factors.items():
         numbers = muon
         for key in path[1:]:
@@ -492,15 +512,17 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
     factors = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, adapter.variables["params"])
-    numbers = muon_weight_dimension_numbers(factors)
-    assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
-    optimizer = OPTIMIZER_MAP["muon"](1e-3)
     tokens = jnp.asarray(reference["input_ids"])
+    # The axes the adapted model draws its factors in, as a run's table holds them.
+    with boxed(drawn_axes(adapter.model.init, tokens)):
+        numbers = muon_weight_dimension_numbers(factors)
+        assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
+        optimizer = OPTIMIZER_MAP["muon"](1e-3)
 
-    def loss(moving):
-        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
+        def loss(moving):
+            return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
 
-    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+        updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
     moved = optax.apply_updates(factors, updates)
     for path, before in jax.tree_util.tree_leaves_with_path(factors):
         after = node(moved, tuple(key.key for key in path))
@@ -584,7 +606,7 @@ def clipped_adapter_case():
     from dew.nn.vision.gemma4 import Gemma4ClippableLinear
 
     model = _BranchHost(Gemma4ClippableLinear(12, use_clipped_linears=True))
-    variables = model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32))
+    variables = nn.unbox(model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32)))
     limits = variables["constants"]["proj"]
     limits.update(input_min=jnp.float32(-0.7), input_max=jnp.float32(0.7),
                   output_min=jnp.float32(-1), output_max=jnp.float32(1))
@@ -663,7 +685,7 @@ def test_field_only_linear_subclasses_train_their_adapter():
     inputs = jnp.asarray(np.random.default_rng(9).standard_normal((4, 6)), jnp.float32)
     for projection in (FieldDense(5), FieldFlaxDense(5)):
         model = _BranchHost(projection)
-        variables = model.init(jax.random.key(3), inputs)
+        variables = nn.unbox(model.init(jax.random.key(3), inputs))
         adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
         gradient = jax.grad(lambda params, bound=adapter: jnp.sum(jnp.square(bound.model.apply(
             {**bound.variables, "params": params}, inputs))))(adapter.variables["params"])
@@ -685,7 +707,7 @@ def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors
 
     model = _BranchHost(OpaqueArithmetic(5) if arithmetic else OpaqueCall(5))
     inputs = jnp.ones((4, 6), jnp.float32)
-    variables = model.init(jax.random.key(3), inputs)
+    variables = nn.unbox(model.init(jax.random.key(3), inputs))
     adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
     with pytest.raises(TypeError):
         adapter.model.apply(adapter.variables, inputs)
@@ -727,7 +749,7 @@ def test_the_branch_reads_a_keyword_input():
     branch has to read `inputs` from kwargs where the call passes it there."""
     model = _BranchHost(nn.Dense(4), keyword=True)
     x = jnp.asarray(np.random.RandomState(0).randn(2, 3), jnp.float32)
-    adapter, adapted, adapted_tree, merged = _adapted(model, model.init(jax.random.key(0), x))
+    adapter, adapted, adapted_tree, merged = _adapted(model, nn.unbox(model.init(jax.random.key(0), x)))
     node = adapted_tree["params"]["proj"]
     expected = (jnp.einsum("bi,ij->bj", x, node["kernel"]) + node["bias"]
                 + adapter.scale(adapter.targets[("params", "proj")])
@@ -748,9 +770,9 @@ def test_a_multi_axis_target_contracts_the_sorted_axes(features):
     model = _BranchHost(nn.DenseGeneral(4, axis=(-1, -2)))
     x = jnp.asarray(np.random.RandomState(1).randn(2, 3, features), jnp.float32)
     adapter, adapted, adapted_tree, merged = _adapted(
-        model, model.init(jax.random.key(0), x), contracted=2)
+        model, nn.unbox(model.init(jax.random.key(0), x)), contracted=2)
     node = adapted_tree["params"]["proj"]
-    created = adapted.init(jax.random.key(9), x)["params"]["proj"]
+    created = nn.unbox(adapted.init(jax.random.key(9), x))["params"]["proj"]
     assert created["lora_A"].shape == (3, features, 2)
     assert created["lora_B"].shape == (2, 4)
     expected = jnp.einsum("bij,ijk->bk", x, node["kernel"]) + node["bias"] + (
@@ -909,7 +931,7 @@ def _registry_decoder():
     config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
                                               "dtype": "float32", "attention_impl": "reference"})
     model = config.build()
-    return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    return config, model, nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
 
 
 REGISTRY_SEEDS = 16
@@ -981,7 +1003,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     rows = 2 * jax.device_count()
     inputs = np.asarray(jax.random.normal(jax.random.key(1), (rows, 6)))
     adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(
-        model, model.init(jax.random.key(0), inputs), key=0)
+        model, nn.unbox(model.init(jax.random.key(0), inputs)), key=0)
     rebuilt = ModelConfig.from_model(adapter.model).build()
 
     class Squared(Objective):
@@ -995,7 +1017,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
         def init(self, key, variables=None):
             if variables is not None:
                 return variables
-            return self.model.init(key, inputs) if self.variables is None else self.variables
+            return nn.unbox(self.model.init(key, inputs)) if self.variables is None else self.variables
 
         def loss(self, variables, batch, step):
             return squared_output(self.model, variables, batch["x"])
@@ -1020,7 +1042,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     first.checkpoints.wait()
 
     resumed = trainer(Squared(rebuilt), tmp_path / "split")
-    template = factors(Squared(rebuilt).init(jax.random.key(3)))
+    template = factors(nn.unbox(Squared(rebuilt).init(jax.random.key(3))))
     assert {leaf.dtype for leaf in template.values()} == {jnp.dtype(jnp.float32)}
     restored, _, _ = resumed.place()
     assert int(restored.step) == 2
@@ -1458,7 +1480,7 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
     plain = dataclasses.replace(config, lora=None).build()
     key = jax.random.key(config.trainer.key)
-    drawn = plain.model_variables(plain.init(key))
+    drawn = plain.model_variables(nn.unbox(plain.init(key)))
     for before, after in zip(jax.tree.leaves(drawn["params"]), jax.tree.leaves(state.variables[FROZEN]),
                              strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))

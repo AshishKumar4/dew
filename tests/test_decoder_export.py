@@ -92,6 +92,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
@@ -104,7 +105,7 @@ from reference_error import (
     distance,
     within,
 )
-from residual_orders import orders, permuted, residual_width
+from residual_orders import model_axes, orders, permuted, residual_width
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
@@ -236,8 +237,9 @@ def test_transformers_reads_the_trained_export(trip, tmp_path):
         return
     forward = jax.jit(trip.source.model.apply)  # one compile for every order
     mine, theirs = [], [distance(trip.theirs, trip.truth)]
-    for k, order in enumerate(orders(residual_width(trip.trained), ORDERS, tool.SEED)):
-        variables, export = permuted(trip.trained, order), tmp_path / str(k)
+    axes = model_axes(trip.source.model)
+    for k, order in enumerate(orders(residual_width(trip.trained, axes), ORDERS, tool.SEED)):
+        variables, export = permuted(trip.trained, order, axes), tmp_path / str(k)
         mine.append(distance(np.asarray(forward(variables, trip.ids)), trip.truth))
         if k == 0:
             continue
@@ -1045,7 +1047,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
     ids = np.load(FIXTURES / fixture / "input_ids.npy")
     if dense:
         model = model.clone(per_layer_input_dim=None, per_layer_input_vocab=None)
-        variables = unfreeze(model.init(jax.random.key(11), jnp.asarray(ids)))
+        variables = unfreeze(nn.unbox(model.init(jax.random.key(11), jnp.asarray(ids))))
     else:
         variables = unfreeze(loaded.variables)
     for index in range(model.num_layers):

@@ -19,7 +19,14 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.batch import Coordinates, prefix_sum
-from dew.nn.attention import AttentionImpl, mask_kernel, reference_only, scaled_dot_product_attention
+from dew.nn.attention import (
+    AttentionImpl,
+    attention_case,
+    mask_kernel,
+    reference_only,
+    scaled_dot_product_attention,
+)
+from dew.nn.attention_kernels import ATTENTION
 from dew.nn.attention_masks import (
     alibi_bias,
     causal_attention_mask,
@@ -65,7 +72,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
-from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
@@ -260,21 +267,18 @@ GATE_ACTIVATIONS = {
 }
 """The output gate's activations (`MixerContext.output_gate_activation`)."""
 
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    # The output gate's own projection (`gate_projection='own'`) is per head
-    # like the query's; the longer suffix outranks the MLP's `gate_proj`.
-    ("self_attn", "gate_proj"): ("embed", "heads"),
-    ("o_proj",): ("attention", "embed"),
-    # DEX's projections of a chosen subset of heads, which no head split divides, its lambda, and the
-    # heads and lambda_init it holds: whole on every device (`dew.nn.dex`).
-    ("dex_projection",): (None, None, None),
-    ("dex_lambda",): (),
-    ("dex_heads",): (None,),
-    ("dex_lambda_init",): (),
-})
+ATTENTION_AXES: dict[str, LogicalAxes] = {
+    "q_proj": ("embed", "heads"),
+    "k_proj": ("embed", "kv"),
+    "v_proj": ("embed", "kv"),
+    # The output gate's own projection (`gate_projection='own'`) is per head like the query's.
+    "gate_proj": ("embed", "heads"),
+    "o_proj": ("attention", "embed"),
+}
+"""The logical axes of an attention layer's projections, by name, as `CausalSelfAttention` declares them
+where it makes them; a packed projection (`qkv_proj`) declares none."""
+
+
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
     RMSNorm and a fixed-size KV cache.
@@ -391,12 +395,12 @@ class CausalSelfAttention(nn.Module):
                                  "KV-sharing or keys-are-values layer does not project")
             self.qkv_proj = dense(sum(group.widths), name=group.packed)
         else:
-            self.q_proj = dense(projections['q_proj'][1], name='q_proj')
+            self.q_proj = dense(projections['q_proj'][1], name='q_proj', kernel_axes=ATTENTION_AXES['q_proj'])
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
         if not self.ctx.kv_shared and not self._packed():
-            self.k_proj = dense(projections['k_proj'][1], name='k_proj')
+            self.k_proj = dense(projections['k_proj'][1], name='k_proj', kernel_axes=ATTENTION_AXES['k_proj'])
             if self.ctx.value_experts is not None:
                 # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`), run
                 # under the layer's routed MLP, without which a decoder's fields refuse them.
@@ -407,10 +411,13 @@ class CausalSelfAttention(nn.Module):
                     mixture=mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
                     precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
-                self.v_proj = dense(projections['v_proj'][1], name='v_proj')
+                self.v_proj = dense(projections['v_proj'][1], name='v_proj',
+                                    kernel_axes=ATTENTION_AXES['v_proj'])
         if 'gate_proj' in projections:
-            self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False)
-        self.o_proj = dense(projections['o_proj'][1], name='o_proj', use_bias=(
+            self.gate_proj = dense(projections['gate_proj'][1], name='gate_proj', use_bias=False,
+                                   kernel_axes=ATTENTION_AXES['gate_proj'])
+        self.o_proj = dense(projections['o_proj'][1], name='o_proj', kernel_axes=ATTENTION_AXES['o_proj'],
+                            use_bias=(
             self.ctx.attention_bias if self.ctx.o_proj_bias is None else self.ctx.o_proj_bias),
             **normal_kernel(self.ctx.init_std if self.ctx.output_init_std is None
                             else self.ctx.output_init_std))
@@ -530,12 +537,18 @@ class CausalSelfAttention(nn.Module):
                     raise ValueError("a DEX layer's chosen heads and lambda_init are its variables, which "
                                      "a layer built without them reads from the variables it is given")
                 return jnp.asarray(value, dtype)
-            return self.variable(DEX_COLLECTION, name, drawn).value
+            # Whole on every device, as DEX's parameters are.
+            # A head list is one axis, a scalar none.
+            rank = 1 if isinstance(value, tuple) else 0
+            return self.variable(DEX_COLLECTION, name, declared(drawn, (None,) * rank)).value
 
+        # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
+        # every device (`dew.nn.dex`).
         self.dex_projection = self.param(
-            'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+            'dex_projection', declared(nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                                       (None, None, None)),
             (dex.count, self.value_dim, self.value_dim), jnp.float32)
-        self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
+        self.dex_lambda = self.param('dex_lambda', declared(nn.initializers.zeros, ()), (), jnp.float32)
         self.dex_heads = held('dex_heads', () if start is None else start.heads, jnp.int32)
         self.dex_lambda_init = held('dex_lambda_init', 0.0 if start is None else start.lambda_init,
                                     jnp.float32)
@@ -1346,6 +1359,8 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+        if self._one_work_list(store, query):
+            return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots)
         if self._pages(store, query[0, :rows], windowed=False):
             decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
                                    self.ctx.attn_logit_softcap)
@@ -1372,6 +1387,38 @@ class CausalSelfAttention(nn.Module):
             softcap=self.ctx.attn_logit_softcap)
         return jnp.concatenate([decoded.reshape(1, rows, *decoded.shape[2:]),
                                 prefilled.reshape(1, -1, *prefilled.shape[2:])], axis=1)
+
+    def _one_work_list(self, store: KVStore, query) -> bool:
+        """Whether a mixed call's attention runs as one work list through the attention template (`_worked`):
+        where the attention selector takes the template for the call's queries over its cache
+        (`attention_kernels.ATTENTION`) and the template reads the cache's rows (`KVStore.attends_rows`)."""
+        if self.ctx.attention_sinks or not store.attends_rows(query, self.ctx.attn_logit_softcap):
+            return False
+        keys = jax.ShapeDtypeStruct((1, self.ctx.max_seq_len, self.ctx.num_kv_heads, self.ctx.head_dim),
+                                    query.dtype)
+        case = attention_case(query, keys, dtype=self.ctx.dtype, precision=self.ctx.precision,
+                              force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
+                              softcap=self.ctx.attn_logit_softcap, named=self.ctx.attention_impl)
+        return select(ATTENTION, case, None if self.ctx.attention_impl == 'auto'
+                      else self.ctx.attention_impl).kernel == 'template'
+
+    def _worked(self, store: KVStore, query, index, positions, prompt, slots) -> jax.Array:
+        """A mixed call's attention as one work list (ledger 3623): its decoding rows' one query each and its
+        prompt pieces' queries, a batch row each, `[rows + pieces, W]`, through the attention template's
+        decode over the cache's rows where they lie (`KVStore.attend_rows`): a decoding row over its row's
+        filled slots (`held_reads`), a piece's query over its row's slots up to its own (its prefix and its
+        own earlier keys, written this step), a padding query over none. No mask, no row copied."""
+        rows, (pieces, width) = index.shape[0], prompt.shape
+        # A padding piece's row is past the cache's; it reads row 0 over no key.
+        sources = jnp.concatenate([jnp.arange(rows, dtype=jnp.int32), jnp.where(slots < rows, slots, 0)])
+        decoding = jnp.pad(query[0, :rows, None], ((0, 0), (0, width - 1), (0, 0), (0, 0)))
+        queries = jnp.concatenate([decoding, query[0, rows:].reshape(pieces, width, *query.shape[2:])])
+        decoded = jnp.zeros((rows, width), jnp.int32).at[:, 0].set(held_reads(index, positions))
+        ends = jnp.concatenate([decoded, jnp.where(prompt >= 0, prompt + 1, 0)])
+        spans = template.KeySpans(jnp.zeros_like(ends), ends, None, None, keys=self.ctx.max_seq_len)
+        out = store.attend_rows(queries, spans, sources, self.ctx.attn_logit_softcap)
+        return jnp.concatenate([out[:rows, :1].reshape(1, rows, *out.shape[2:]),
+                                out[rows:].reshape(1, pieces * width, *out.shape[2:])], axis=1)
 
     def _decode_attention(self, query, key, value, positions, starts=None, sinks=None):
         """One query a row `[rows, 1, heads, head_dim]` over its row of the

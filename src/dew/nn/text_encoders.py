@@ -54,7 +54,7 @@ from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared
 from dew.nn.text_checkpoints import DEFAULT_MODEL
 from dew.registry import resolve_dtype
 
@@ -135,7 +135,6 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                         norm_bias=norm_bias, dtype=dtype, precision=precision, name=name)
 
 
-@logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
 class CLIPTextTransformer(nn.Module):
     """The text tower of CLIP, param layout and defaults of `CLIPTextConfig`.
 
@@ -175,9 +174,11 @@ class CLIPTextTransformer(nn.Module):
 
     def setup(self):
         embed = functools.partial(TokenEmbedding, features=self.hidden_size, dtype=self.dtype)
-        self.token_embedding = embed(self.vocab_size, name="token_embedding")
-        self.position_embedding = embed(self.max_position_embeddings,
-                                        name="position_embedding")
+        table = TokenEmbedding.embedding_init
+        self.token_embedding = embed(self.vocab_size, name="token_embedding",
+                                     embedding_init=declared(table, ("vocab", "embed")))
+        self.position_embedding = embed(self.max_position_embeddings, name="position_embedding",
+                                        embedding_init=declared(table, (None, "embed")))
         self.layers = [
             self._layer(name=f"layers_{index}")
             for index in range(self.num_layers)]
@@ -278,7 +279,6 @@ class CLIPVisionTransformer(nn.Module):
         return CLIPTowerOutput(sequence, pooled)
 
 
-@logical_axes({("text_projection",): ("embed", "output"), ("visual_projection",): ("embed", "output")})
 class CLIP(nn.Module):
     """Both towers and their projection heads, `CLIPModel` in the reference.
 
@@ -293,7 +293,7 @@ class CLIP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        dense = functools.partial(Dense, self.projection_dim, use_bias=False,
+        dense = functools.partial(Dense, self.projection_dim, use_bias=False, kernel_axes=("embed", "output"),
                                   dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.text_projection = dense(name="text_projection")
         self.visual_projection = dense(name="visual_projection")
@@ -595,7 +595,6 @@ whose tanh GELU (transformers' `NewGELUActivation`) gates wi_1 by wi_0, the
 feed-forward SD3.5 and Flux run."""
 
 
-@logical_axes({("embed_tokens",): ("vocab", "embed")})
 class T5EncoderTransformer(nn.Module):
     """The T5 encoder stack: token embedding, pre-norm blocks of
     bidirectional relative-bias attention and feed-forward, a final RMS norm,
@@ -668,8 +667,9 @@ class T5EncoderTransformer(nn.Module):
                 "feed-forward this tower implements; 'relu' and 'gated-gelu' are")
         # Both tables are read in the compute dtype, as the reference reads its own
         # tables in the dtype the model runs in, so the residual stream starts there.
-        self.embed_tokens = TokenEmbedding(self.vocab_size, self.d_model, dtype=self.dtype,
-                                           name="embed_tokens")
+        self.embed_tokens = TokenEmbedding(
+            self.vocab_size, self.d_model, dtype=self.dtype, name="embed_tokens",
+            embedding_init=declared(TokenEmbedding.embedding_init, ("vocab", "embed")))
         self.relative_attention_bias = [
             TokenEmbedding(self.num_buckets, self.num_heads, dtype=self.dtype,
                            name=f"relative_attention_bias_{index}")

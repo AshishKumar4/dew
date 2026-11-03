@@ -166,23 +166,23 @@ def dot_algorithm(named: jax.lax.DotAlgorithmPreset | str | None) -> jax.lax.Dot
 def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
                 algorithm: jax.lax.DotAlgorithmPreset | None = None) -> jnp.dtype:
     """The dtype Muon's Newton-Schulz takes its operands in: an `algorithm`'s own, where one states the
-    iteration's products (`BF16_BF16_F32`'s bfloat16, `TF32_TF32_F32`'s and `F32_F32_F32`'s float32, which
-    a platform that has not the algorithm refuses in JAX's own words, and a complex update, whose
-    products no real algorithm holds, refuses by name); else the run's numerics'
-    (`dew.nn.kernels.generation.numerics`), each product at its precision (`Numerics.matmul`): bfloat16 in
-    its fast forms, as Jordan's Muon (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate; float32 in
-    its accurate ones, TF32 products on a GPU at the default precision and IEEE float32 under the accurate
-    preset (`--precision accurate`); complex64 for a complex update; and float32 for a spectral
-    preconditioning, whose norm is an SVD of float32 operands.
+    iteration's products (`BF16_BF16_F32`'s bfloat16, `TF32_TF32_F32`'s and `F32_F32_F32`'s float32, which a
+    platform that has not the algorithm refuses in JAX's own words, and a complex update, whose products no
+    real algorithm holds, refuses by name); else the run's numerics' (`dew.nn.kernels.generation.numerics`),
+    each product at its precision (`Numerics.matmul`): bfloat16 in its fast forms, as Jordan's Muon
+    (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate; float32 in its accurate ones, TF32 products on
+    a GPU at the default precision and IEEE float32 under the accurate preset (`precision="accurate"`);
+    complex64 for a complex update; and float32 for a spectral preconditioning, whose norm is an SVD of
+    float32 operands.
 
     The fast forms' bfloat16, where optax iterates in its momentum's own float32: the quintic brings the
     singular values only near one, roughly within 0.7 to 1.2 (optax `orthogonalize_via_newton_schulz`), far
-    coarser than bfloat16's rounding. A Qwen3.5-4B decision fine-tune on one H100 (node job
-    LR-h100-muon-2752c at 699d038ca, 8192 tokens a step) stepped in 844 ms with its iteration in bfloat16
-    (`BF16_BF16_F32`), 1287 ms at TF32 (`TF32_TF32_F32`) and 4641 ms at IEEE float32 (`F32_F32_F32`), against
-    AdamW's 495 ms, its loss at each of 30 steps within 0.07 of the float32 iteration's (0.02 on average).
-    Accumulated, its update's microbatch takes 860 ms against 516 and the others about AdamW's: an update
-    of 65,536 tokens 9.4% over AdamW's and one of 262,144 2.5% (`dew.optim.muon`; ledger 2685, 2752)."""
+    coarser than bfloat16's rounding. A Qwen3.5-4B decision fine-tune on one H100 (node job LR-h100-muon-2752c
+    at 699d038ca, 8192 tokens a step) stepped in 844 ms with its iteration in bfloat16 (`BF16_BF16_F32`), 1287
+    ms at TF32 (`TF32_TF32_F32`) and 4641 ms at IEEE float32 (`F32_F32_F32`), against AdamW's 495 ms, its loss
+    at each of 30 steps within 0.07 of the float32 iteration's (0.02 on average). Accumulated, its update's
+    microbatch takes 860 ms against 516 and the others about AdamW's: an update of 65,536 tokens 9.4% over
+    AdamW's and one of 262,144 2.5% (`dew.optim.muon`; ledger 2685, 2752)."""
     from dew.nn.kernels.generation import numerics
 
     if jnp.issubdtype(dtype, jnp.complexfloating):

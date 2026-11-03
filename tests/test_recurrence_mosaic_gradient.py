@@ -10,23 +10,25 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from reference_error import with_gradients
+from test_recurrence_chunk import chunk_on
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
-    SEEDS,
     SHAPES,
+    case_hooks,
     draw,
     geometry,
     interpreted,
     on_the_mainloop,
+    recorded_site,
     refuses_its_gradient,
     template_call,
 )
-from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
@@ -39,21 +41,18 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
                         ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
-                        ('packed documents', 'bf16', 'kept')}
+                        ('packed documents', 'bf16', 'kept'), ('a decay a key dimension', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
-and two key heads' groups, packed documents, its forward's memories kept and recomputed, and an fp32
-call's gradient refused. Interpreted, the whole grid took 5.4 times these (7828 against 1452
-seconds)."""
-
-GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
-"""The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
+and two key heads' groups, packed documents, its forward's memories kept and recomputed, under a decay a key
+dimension (`key_backward`'s), and an fp32 call's under the run's fast forms. Interpreted, the whole grid took
+5.4 times these (7828 against 1452 seconds)."""
 
 REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
 """The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
 checkpoint saves (`decoder_block.RematPolicy.save`, None for no checkpoint): the forward's memories kept,
 recomputed in the backward, or kept by their names under a checkpoint saving the delta rule's (row 2023)."""
 
-GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES]
+GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in SHAPES]
 """The gradient's cases, the CPU's (`INTERPRETED_GRADIENT`) and the GPU flow's."""
 
 
@@ -74,25 +73,56 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
-                               'one sequence-bf16-kept': 122}}
-"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
-ledger 2127), which the whole suite runs (`timed`)."""
+DRAWN_APART = {256: [('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
+                     ('one sequence', 'bf16', 'kept')],
+               128: [('a decay a key dimension', 'bf16', 'kept'), ('a ragged length', 'fp32', 'kept')]}
+"""The interpreted gradient's cases past two minutes in one process, by their recorded sites' declared seeds:
+whole, 122 to 225 seconds (train 270's CI on 66a222273, ledger 2127) and 483 to 653 (train 479's on
+e82eab19a, the fast backward taking an fp32 call under the run's fast forms and fla_kda's form a decay a key
+dimension), each seed 0.5 to 5 seconds of the interpreter's. Each runs as armada's map tasks of seeds and
+their judge (`check1_shards`), every seed drawn and judged as one process would."""
+
+LONG = {case for cases in DRAWN_APART.values() for case in cases}
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
-    GRADIENT_GRID, INTERPRETED_GRADIENT)))
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(
+    [case for case in GRADIENT_GRID if case not in LONG], INTERPRETED_GRADIENT - LONG))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
-    backward (`mainloop_backward.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from
+    backward (`mainloop_backward.gradients`, fla's DAG; under a decay a key dimension fla_kda's,
+    `key_backward`) against recorded fla-core's (`fla_sites`: chunk_gated_delta_rule's, chunk_kda's), from
     the forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under
     a checkpoint saving the delta rule's names kept by them. A call the template refuses is checked refused
     and its gradient on the mainloop's rule (`on_the_mainloop`). A gradient the fast backward does not take,
-    an fp32 call's or one whose launches the device does not hold (`Mosaic.trains`), the rule refuses as it is
-    traced: the delta rule's selector gives it the port or the portable math, whose check 1
+    an fp32 call's outside the run's fast forms (`mainloop_backward.fast_backward_form`) or one whose launches
+    the device does not hold (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector
+    gives it the port or the portable math, whose check 1
     test_recurrence_chunk holds (row 1926: no kernel falls back inside itself)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
+    _holds_check_1(case, dtype, remat)
+
+
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[256], set(DRAWN_APART[256])))
+@pytest.mark.check1_shards(seeds=256, per_task=80)
+def test_a_long_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 256 recorded seeds
+    (`DRAWN_APART`), their draws in map tasks of 80 (70 s at their 0.9 s a seed): the 64 a task first marked
+    planned 1020 map tasks over the run's Pythons, past armada's 1000 a judges' job (`ci.MAX_INPUTS`)."""
+    _holds_check_1(case, dtype, remat)
+
+
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(DRAWN_APART[128], set(DRAWN_APART[128])))
+@pytest.mark.check1_shards(seeds=128, per_task=15)
+def test_a_long_key_decay_or_fp32_gradient_case_is_as_exact_as_its_reference(case, dtype, remat):
+    """`test_the_mosaic_gradient_is_as_exact_as_its_reference` over the long cases of 128 recorded seeds, a
+    decay a key dimension's and an fp32 call's (`DRAWN_APART`), their draws in map tasks of 15 (77 s at the
+    fp32 call's 5.1 s a seed; 12 a task planned past armada's 1000, as the test above's 64)."""
+    _holds_check_1(case, dtype, remat)
+
+
+def _holds_check_1(case, dtype, remat):
+    """The gradient case's check 1 (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    hooks = case_hooks(case)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
     bound = {'max_segments': PACKED_DOCUMENTS} if SHAPES[case].get('packed') else {}
@@ -110,7 +140,6 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
 
         return traced
 
-    truth = with_gradients(restarted(functools.partial(token_by_token, hooks), case))
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
         return
@@ -119,8 +148,47 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     if not trained(sample, hooks):
         refuses_its_gradient(compiled(on), *draws(0))
         return
-    assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
-                    f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+    recomputed, saved = REMATS[remat]
+
+    def rule(given: Chunk):
+        run = functools.partial(on, **bound)
+        if saved is not None:
+            run = jax.checkpoint(run, policy=RematPolicy(save=saved).checkpoint_policy())
+        return run(given)
+
+    def under(run):
+        def traced(*arguments):
+            with recomputing(recomputed):
+                return run(*arguments)
+
+        return traced
+
+    the_template_is_as_exact_as_fla(rule, recorded_site(case, dtype),
+                                    label=f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}',
+                                    under=under)
+
+
+def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
+    """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
+    recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
+    the forward kept (row 3591), over one draw of its recorded site: bitwise the gradient its kept memories
+    give, whose check 1 against recorded fla holds both
+    (`test_the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    from fla_sites import LEAVES, ruled, sites
+
+    case = 'a decay a key dimension'
+    on = on_the_mainloop(case_hooks(case), case, jnp.bfloat16)
+    arrays = sites()[recorded_site(case, jnp.bfloat16)].arrays(0)
+
+    def under(names):
+        def run(given):
+            with recomputing(names):
+                return ruled(on, given, LEAVES)
+        return run
+
+    found = (jax.tree.leaves(jax.jit(under(names))(arrays)) for names in ((), ('delta_memory',)))
+    for leaf, a, b in zip(LEAVES, *found, strict=True):
+        assert np.array_equal(np.asarray(a), np.asarray(b)), leaf
 
 
 WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]
@@ -134,11 +202,11 @@ WALKS = interpreted(WALK_GRID, INTERPRETED_WALKS)
 def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     """The states and reverse launches with two value blocks of a sequence and head a program, one a
     consumer role (`Tiles.walkers`, warpgroup MMA's bundle, which the derivation gives a call whose walks
-    fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
-    the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
-    stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100) skips it."""
+    fill more than a wave), on par from float64 with recorded fla-core's forward, or forward and gradient
+    (`fla_sites`), over the case's draws (check 1, truth the recurrence a token at a time's): each role's
+    columns, staging and stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100)
+    skips it."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    shape = {**geometry(case), 'value_width': 64}
     tiles = mainloop.Tiles(32, 1, walkers=2)
 
     def walked(given: Chunk):
@@ -146,15 +214,11 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
                            tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
                            family=bundles.of('sm90', jnp.bfloat16))
 
-    reference = functools.partial(chunk_on, 'fla', hooks)
-    truth = functools.partial(token_by_token, hooks)
+    site = f"walk/{'cpu' if mainloop.family_of() is None else 'gpu'}"
     if product == 'forward':
-        assert_as_exact(jax.jit(walked), jax.jit(reference), functools.partial(draw, jnp.bfloat16, **shape),
-                        f'a two-role walk, {case}', seeds=SEEDS, truth_fn=jax.jit(truth))
+        the_template_is_as_exact_as_fla(walked, site, ('out', 'final'), f'a two-role walk, {case}')
         return
-    draws = functools.partial(drawn, jnp.bfloat16, **shape)
-    assert_as_exact(with_gradients(walked), with_gradients(reference), draws,
-                    f'a two-role walk\'s gradient, {case}', seeds=SEEDS, truth_fn=with_gradients(truth))
+    the_template_is_as_exact_as_fla(walked, site, label=f'a two-role walk\'s gradient, {case}')
 
 
 def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
@@ -208,6 +272,24 @@ def test_the_rated_scan_rounds_where_mamba_ssm_does(case):
         else:
             found = jax.grad(lambda dt: jnp.sum(scanned(dt)[0].astype(jnp.float32) * dy))(dt)[0, 0, 0]
     assert float(found) == value, f"{case}: {float(found)!r} where mamba_ssm's is {value!r}"
+
+
+def test_the_rated_scans_skip_reaches_the_output_in_the_dtype_its_caller_asks():
+    """A rated scan's (Mamba2's SSD) 16-bit call on the template under the run's fast forms, interpreted off
+    a GPU, its output asked in float32 (Mamba-2's mixer asks it so, unrounded for the earlier shards' state it
+    adds, `mamba2.chunk_ssd`): with no state term (`B = C = 0`) each output is its skip's product `x D` in
+    float32, at `x = D = 129/128` 16641/16384, which a bfloat16 output rounds to 130/128."""
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    rows, length, heads, states, width = 1, 64, 1, 64, 64
+    x = jnp.full((rows, length, heads, width), 129 / 128, jnp.bfloat16)
+    B = C = jnp.zeros((rows, length, heads, states), jnp.bfloat16)
+    dt = jnp.full((rows, length, heads), 0.5, jnp.float32)
+    skip = jnp.full((heads,), 129 / 128, jnp.float32)
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        out, _ = chunk_on('mosaic_gpu', hooks, Chunk(C, B, x, beta=dt, rate=jnp.zeros((heads,), jnp.float32),
+                                                     skip=skip), chunk_size=64, dtype=jnp.float32)
+    assert out.dtype == jnp.float32
+    assert bool(jnp.all(out == jnp.float32(129 / 128) * jnp.float32(129 / 128)))
 
 
 def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:

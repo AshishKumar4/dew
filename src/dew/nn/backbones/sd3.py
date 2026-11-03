@@ -31,14 +31,12 @@ from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, pro
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import sincos_grid, sinusoid_frequencies
 from dew.nn.scan_orders import unpatchify
-from dew.nn.sharding import logical_axes
 
 from .joint import (
     TIME_FEATURES,
     DoubleStreamBlock,
     TextStream,
     embedding,
-    embedding_axes,
     embedding_flops,
     layer_norm,
     modulate,
@@ -65,8 +63,6 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     return jnp.asarray(sincos_grid(frequencies, columns, rows, dtype=np.float32)[None])
 
 
-@logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),
-               **embedding_axes("timestep_embedder", "text_embedder")})
 class SD3Transformer(TextStream, nn.Module):
     """Runs Diffusers 0.34.0's `SD3Transformer2DModel` behind Dew's model interface.
 
@@ -180,7 +176,7 @@ class SD3Transformer(TextStream, nn.Module):
                        + embedding(self, conditioning.pooled, self.features, "text_embedder", **dense))
 
         context = Dense(self.caption_projection_dim, name="context_embedder", **dense,
-                        dot_general=float32_dot_general)(
+                        kernel_axes=(None, "embed"), dot_general=float32_dot_general)(
             conditioning.context)
         for index in range(self.num_layers):
             image, context = self._block(index, name=f"transformer_blocks_{index}")(
@@ -189,7 +185,7 @@ class SD3Transformer(TextStream, nn.Module):
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
         image = Dense(patch * patch * self.out_channels, name="proj_out", **dense,
-                      dot_general=float32_dot_general)(image)
+                      kernel_axes=("embed", None), dot_general=float32_dot_general)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 

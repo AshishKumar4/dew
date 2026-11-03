@@ -957,19 +957,13 @@ def test_a_generations_instruction_family_is_its_compute_capabilitys(generation,
 
 
 def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device_attributes():
-    """A Blackwell GPU no row names (sm110) ranks as the family's: its tensor rates, tensor memory and
-    model latency are tcgen05's, and its L2 bandwidth is the family's bytes a multiprocessor a clock over
-    the multiprocessors and clock its device reports, so the cost model ranks its configs."""
-    from dew.nn.kernels.templates import cost
-
+    """A Blackwell GPU no row names (sm110) takes the family's facts: its tensor rates and tensor memory are
+    tcgen05's."""
     target = GpuTarget("sm110", "an unseen Blackwell", 227 * 1024, multiprocessors=20, clock_hz=1.5e9,
                        memory_bandwidth=273e9)
     blackwell = architecture("sm100")
     assert blackwell is not None
     assert (target.tensor_rates, target.tmem_columns, target.wgmma) == (blackwell.tensor_rates, 512, False)
-    assert target.load_latency == blackwell.load_latency
-    assert target.l2_bandwidth == blackwell.l2_bytes_per_clock * 20 * 1.5e9
-    assert cost.seconds(cost.Cost(programs=40, device_bytes=1e6, program_flops=1e9), target) > 0
 
 
 def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():

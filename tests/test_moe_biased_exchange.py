@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from moe_support import assert_exchange_across_processes, reference_case, training_shardings, training_step
 
 from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
@@ -22,7 +23,7 @@ def test_biased_exchange_keeps_every_selected_expert_and_requires_its_mesh():
     # All routes land on one owner; later rounds must retain the excess.
     indices = jnp.tile(jnp.asarray([0, 1], jnp.int32), (16, 1))
     reference = GptOssExperts(8, 12, 4)
-    variables = reference.init(jax.random.key(0), x, weights, indices)
+    variables = nn.unbox(reference.init(jax.random.key(0), x, weights, indices))
     variables['params']['gate_up_proj_bias'] = jnp.asarray(rng.normal(size=(4, 24)), jnp.float32)
     variables['params']['down_proj_bias'] = jnp.asarray(rng.normal(size=(4, 8)), jnp.float32)
     expected = jnp.asarray(reference.apply(variables, x, weights, indices))
@@ -49,7 +50,7 @@ def test_biased_exchange_preserves_all_gradients_and_idle_experts(dtype, expert,
                np.argsort(rng.normal(size=(24, 4)), axis=-1)[:, :2])
         indices = jnp.asarray(ids, jnp.int32)
         model = GptOssExperts(8, 12, 4, dtype=dtype)
-        variables = model.init(jax.random.key(0), x, weights, indices)
+        variables = nn.unbox(model.init(jax.random.key(0), x, weights, indices))
         master = jnp.float64 if dtype == jnp.float64 else jnp.float32
         variables = jax.tree.map(lambda value: value.astype(master), variables)
         bias = rng.normal(scale=2, size=(4, 24))
@@ -116,7 +117,7 @@ def test_biased_exchange_padding_never_creates_an_expert_contribution(tokens):
     weights = jnp.asarray(rng.uniform(.1, .9, size=(tokens, 2)), jnp.bfloat16)
     indices = jnp.asarray(np.argsort(rng.normal(size=(tokens, 4)), axis=-1)[:, :2], jnp.int32)
     model = GptOssExperts(8, 12, 4, dtype=jnp.bfloat16)
-    variables = model.init(jax.random.key(0), x, weights, indices)
+    variables = nn.unbox(model.init(jax.random.key(0), x, weights, indices))
     variables['params']['gate_up_proj_bias'] = jnp.asarray(rng.normal(size=(4, 24)), jnp.float32)
     variables['params']['down_proj_bias'] = jnp.asarray(rng.normal(size=(4, 8)), jnp.float32)
     results = []
@@ -177,7 +178,7 @@ def test_decoder_mixture_can_select_biased_expert_exchange():
                               mlp_features=12, max_seq_len=4, qk_norm=False,
                               mlp='swigluoai', mixture=mixture)
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(4, 4)
-    variables = model.init(jax.random.key(19), tokens)
+    variables = nn.unbox(model.init(jax.random.key(19), tokens))
     expected = jnp.asarray(model.apply(variables, tokens))
     exchanged = model.clone(mixture=replace(mixture, dispatch='exchange'))
     with jax.set_mesh(MeshSpec(expert=2, fsdp=4).build()):

@@ -99,12 +99,15 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     columns = width // consumers
     q_steps = queries // block_q
     leaves, treedef = jax.tree.flatten(spans)
+    # dK's and dV's zeros one ref of both, the program's views and the host's read of one grouping.
+    shapes = [(batch, keys_padded, kv_heads, width)] * 2
+    groups = mosaic.stacked_groups(shapes)
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dkv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
-        dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], ((0, 1),))
+        dk_ref, dv_ref = mosaic.stacked_views([dkv_ref], groups)
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
@@ -124,7 +127,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             family.loaded(((k_ref.at[keys_view], k_smem, loads.at[0]),
                            (v_ref.at[keys_view], v_smem, loads.at[1])), issued=share == 0)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first + share * (
-                block_k // consumers), shape=(block_q, block_k // consumers))
+                block_k // consumers), shape=(block_q, block_k // consumers), tile_keys=block_k)
             mine = pl.ds(share * columns, columns)
             smem = out_smem.at[share]
 
@@ -169,8 +172,6 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
     dq = jax.new_ref(jnp.zeros((batch, queries, heads, width), jnp.float32))
-    shapes = [(batch, keys_padded, kv_heads, width)] * 2
-    groups = mosaic.stacked_groups(shapes)
     dkv = mosaic.stacked_zeros(shapes, groups)
     launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq, *dkv)
     dk, dv = mosaic.stacked_read(dkv, groups)

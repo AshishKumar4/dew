@@ -12,6 +12,7 @@ import json
 
 import jax
 from decision_support import decision_rows
+from flax import linen as nn
 from objective_data import IMAGES, SEQ_LEN, first
 from rl_cases import packed
 
@@ -67,7 +68,7 @@ def with_teacher(kind):
     its teacher the recipe's own objective at initialization."""
     config = diffusion(guidance=None, ema_decay=None)
     base = config.build()
-    drawn = base.init(jax.random.key(0))
+    drawn = nn.unbox(base.init(jax.random.key(0)))
     teacher = base.model_variables(drawn)
     shared = (base.model, base.process, base.inputs)
     built = {

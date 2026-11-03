@@ -26,7 +26,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import meta
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
@@ -34,6 +33,7 @@ from dew.cache import INTERCEPTED
 
 from .kernels.templates.gemm import template
 from .precision import accumulated, biased, float32_dot_general
+from .sharding import declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
 """Whether Qwix is installed (`dew.quantization`'s extra), whose rules a layer's product may fall under."""
@@ -98,14 +98,14 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
 
 
 def _reshaped(init, flat_shape):
-    """`init` drawn at `flat_shape` and reshaped to the shape asked of it, a boxed draw (a
-    partitioned initializer's) reshaped inside its box, as flax's DenseGeneral draws."""
+    """`init` drawn at `flat_shape` and reshaped to the shape asked of it, a boxed draw (a partitioned
+    initializer's) reshaped inside its box, whose names are the reshaped kernel's: the reshape maps over
+    the draw's values, so no constraint the names would apply meets the flat draw."""
     def drawn(rng, shape, dtype=jnp.float32):
-        value = init(rng, tuple(int(size) for size in flat_shape(shape)), dtype)
-        if isinstance(value, meta.AxisMetadata):
-            return meta.replace_boxed(value, jnp.reshape(value.unbox(), shape))
-        return jnp.reshape(value, shape)
+        flat = init(rng, tuple(int(size) for size in flat_shape(shape)), dtype)
+        return jax.tree.map(lambda value: jnp.reshape(value, shape), flat)
     return drawn
+
 
 
 def _promoted(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, bias: Array | None):
@@ -139,7 +139,11 @@ class _LinearEnvelope(nn.Module):
 
 
 class Dense(_LinearEnvelope, nn.Dense):
-    """Flax's Dense, its bias added by `biased` (the module docstring)."""
+    """Flax's Dense, its bias added by `biased` (the module docstring). `kernel_axes` are its kernel's
+    logical axes, `[inputs, features]`, which its module declares where it builds it, and its bias takes
+    the features' (`declared`); None declares none."""
+
+    kernel_axes: tuple[str | None, ...] | None = None
 
     def product_owned(self) -> bool:
         """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
@@ -148,9 +152,11 @@ class Dense(_LinearEnvelope, nn.Dense):
 
     def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]
-        kernel = self.param('kernel', self.kernel_init, (width, self.features), self.param_dtype)
-        bias = (self.param('bias', self.bias_init, (self.features,), self.param_dtype)
-                if self.use_bias else None)
+        axes = self.kernel_axes
+        kernel = self.param('kernel', declared(self.kernel_init, axes), (width, self.features),
+                            self.param_dtype)
+        bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
+                           (self.features,), self.param_dtype) if self.use_bias else None)
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         return _biased(self, inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), bias, lambda bias: bias)
 
@@ -172,7 +178,11 @@ def _members(init, batched: int, flat_shape):
 
 class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
     """Flax's DenseGeneral, its bias added by `biased` (the module docstring), and a batched kernel
-    drawn a batch member at a time (`_members`)."""
+    drawn a batch member at a time (`_members`). `kernel_axes` are its kernel's logical axes, `[batch
+    dims, contracted, features]`, and its bias takes the batch dims' and the features' (`declared`);
+    None declares none."""
+
+    kernel_axes: tuple[str | None, ...] | None = None
 
     def _linear(self, inputs: Array) -> jax.Array:
         features, batch_dims = _axes(self.features), _axes(self.batch_dims)
@@ -187,12 +197,15 @@ class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
             """`shape` as `[inputs, features]`, the contracted axes and the features each flattened."""
             return np.prod(shape[:len(shape) - len(features)]), np.prod(shape[-len(features):])
 
-        drawn = _members(self.kernel_init, batched, flat) if batched else _reshaped(self.kernel_init, flat)
+        axes = self.kernel_axes
+        init = declared(self.kernel_init, axes)
+        drawn = _members(init, batched, flat) if batched else _reshaped(init, flat)
         shape = batch_shape + tuple(inputs.shape[dim] for dim in axis) + features
         kernel = self.param('kernel', drawn, shape, self.param_dtype)
+        bias_axes = None if axes is None else (*axes[:batched], *axes[len(axes) - len(features):])
         bias = self.param(
-            'bias', _reshaped(self.bias_init, lambda shape: (np.prod(shape[:batched])
-                                                             * np.prod(shape[-len(features):]),)),
+            'bias', _reshaped(declared(self.bias_init, bias_axes),
+                              lambda shape: (np.prod(shape[:batched]) * np.prod(shape[-len(features):]),)),
             batch_shape + features, self.param_dtype) if self.use_bias else None
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         contracted = tuple(range(batched, batched + len(axis)))

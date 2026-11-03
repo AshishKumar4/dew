@@ -761,6 +761,41 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+@INTERPRETS
+@pytest.mark.parametrize(("rows", "depth", "width"), [(1408, 128, 128), (200, 256, 640)])
+def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, depth, width):
+    """A dense forward product on a Hopper part of 8 multiprocessors whose 11 or 10 output tiles leave its
+    last wave at most half full (`tail.balanced`, `gmm`'s dense tail): its tail's steps balanced over the
+    programs, each program's partial fixed up across them, through an RMS norm's prologue and a bias's
+    epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a tile does
+    not divide. The template's interpreted route launches one program, so this calls the kernel (row 3587)."""
+    assert tail.balanced(-(-rows // COOPERATIVE.block_m) * (width // COOPERATIVE.block_n),
+                            depth // COOPERATIVE.block_k, 8) is not None
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(depth, width)) / np.sqrt(depth), jnp.bfloat16),
+                jnp.asarray(rng.uniform(0.5, 2.0, size=(rows,)), jnp.float32),
+                jnp.asarray(rng.normal(size=(depth,)), jnp.float32),
+                jnp.asarray(rng.normal(size=(width,)), jnp.float32))
+
+    def dew(x, w, ms, nw, b):
+        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32), tiles=COOPERATIVE,
+                              transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=8,
+                              interpret=grouped_matmul.INTERPRETED, dense=True, prologue=normed,
+                              prologue_operands=(ms, nw), prologue_axes=(("rows",), ("depth",)),
+                              epilogue=biased, epilogue_operands=(b,), epilogue_axes=(("columns",),))
+
+    def plain(x, w, ms, nw, b, wide=jnp.float32, out=jnp.bfloat16):
+        h = normed(x, ms, nw).astype(wide)
+        return biased(jnp.dot(h, w.astype(wide), preferred_element_type=wide), b).astype(out)
+
+    with generation.assumed("sm90"):
+        assert_as_exact(dew, jax.jit(plain), draw, f"balanced dense forward {rows}x{depth}x{width}",
+                        seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 def a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
@@ -822,6 +857,80 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
         with pytest.raises(ValueError):
             template.gemm(x, w, jnp.asarray([8]), prologue=normed, prologue_operands=((operand, axes),),
                           out_dtype=jnp.float32)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name):
+    """A bias of each group's own, `[G, N]` on the axes `('groups', 'columns')` (an expert's,
+    kernel-templates.md §3, Appendix C row 10): the template's output and its gradient through the bias, a
+    sum over each group's rows, on par with the program that adds each row its group's bias over the draws
+    (check 1), truth in float64, where the side operand's groups axis was refused (row 3642)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, *_ = _draw(seed)
+        rng = np.random.default_rng(seed + 3000)
+        return x, w, jnp.asarray(rng.normal(size=(len(SIZES), WIDTH)), jnp.float32)
+
+    def dew(x, w, b):
+        def loss(b):
+            # The groups axis reaches the hook as rows: each row's tile of its group's bias.
+            out = template.gemm(x, w, sizes, epilogue=biased_row,
+                                epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.float32,
+                                interpret_on_cpu=True)
+            return jnp.sum(out[:ROUTED] ** 2), out
+        (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
+        return out[:ROUTED], grad
+
+    def plain(x, w, b, wide=jnp.float32):
+        def loss(b):
+            # The matrix in the rows' dtype, as the template multiplies it.
+            matrix = w.astype(x.dtype).astype(wide)
+            product = jax.lax.ragged_dot(x.astype(wide), matrix, sizes, preferred_element_type=wide)
+            out = product + jnp.repeat(b.astype(wide), sizes, axis=0, total_repeat_length=ROWS)
+            return jnp.sum(out[:ROUTED] ** 2), out
+        (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
+        return out[:ROUTED], grad
+
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a per-group bias", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64))
+
+
+FP8_SHAPES = [(64, 256, 128), (40, 384, 256)]
+"""An FP8 product's decode and serving shapes, rows by depth by columns: a few rows (a decode step's), the
+depth a whole promotion's 128 or more."""
+
+
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2], ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize(("rows", "depth", "width"), FP8_SHAPES)
+def test_an_fp8_product_holds_check_1_under_its_contract(rows, depth, width, dtype):
+    """An FP8 product through the template on an H100 (`template.gemm` of FP8 codes, the matrix K-major
+    `[N, K]` as Hopper's FP8 tensor cores read it, `transpose_rhs`), its rows' and columns' scales applied
+    after: on par with the dequantized product with fp32 sums (`quantization._fp8_rows`'s, check 1's
+    reference arm) from the float64 product of the operands as quantized (testing.md, FP8 products: no FP8
+    floor; row 3620)."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        values = rng.normal(size=(rows, depth))
+        matrix = rng.normal(size=(width, depth))
+        row_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(rows, 1)), jnp.float32)
+        column_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(1, width)), jnp.float32)
+        return (jnp.asarray(values, dtype), jnp.asarray(matrix, dtype), row_scales, column_scales)
+
+    def dew(values, matrix, row_scales, column_scales):
+        product = template.gemm(values, matrix, None, transpose_rhs=True, out_dtype=jnp.float32,
+                                interpret_on_cpu=True)
+        return product * row_scales * column_scales
+
+    def dequantized(values, matrix, row_scales, column_scales, wide=jnp.float32):
+        product = jnp.dot(values.astype(wide), matrix.astype(wide).T, preferred_element_type=wide,
+                          precision=jax.lax.Precision.HIGHEST)
+        return product * row_scales.astype(wide) * column_scales.astype(wide)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        assert_as_exact(jax.jit(dew), jax.jit(dequantized), draw, f"an {jnp.dtype(dtype).name} product",
+                        seeds=SEEDS, truth_fn=functools.partial(dequantized, wide=jnp.float64))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -904,6 +1013,70 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
 
     with generation.assumed(generation_name):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, f"fused {consumer.__name__}",
+                        seeds=SEEDS, truth_fn=truth)
+
+
+def _moved_columns(columns: int, block: int):
+    """A consumer adding to the product a residual's column block `c * c - c` at the product's column block
+    `c` (blocks of `block` columns), as a custom fusion whose pull rule says so: block 1 reads block 0, while
+    at the classifier's one-point probe (1, 2) the map reads (1, 2), the identity's."""
+    from jax.experimental.pallas import fuser as pallas_fuser
+
+    def moved(column):
+        return column * column - column
+
+    @pallas_fuser.custom_fusion
+    def added(prod, residual):
+        # The order traced from an iota, so the fusion's body closes over no constant.
+        count = columns // block
+        order = moved(jnp.arange(count))
+        blocks = residual.reshape(residual.shape[0], count, block)[:, order].reshape(residual.shape)
+        return prod + blocks
+
+    @added.def_pull_block_spec
+    def _(transforms):
+        (out,) = transforms
+
+        def residual_index(*indices):
+            row, column = out.block_index_transform(*indices)
+            return row, moved(column)
+
+        return out, out.replace(block_index_transform=residual_index)
+
+    @added.def_eval_rule
+    def _(ctx, prod, residual):
+        del ctx
+        return (prod + residual,)
+
+    return added
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_consumer_reading_its_side_off_the_tile_keeps_the_programs_value(generation_name):
+    """A consumer whose residual is read at another column block than the product's, by a map that agrees
+    with the identity at one point (`_moved_columns`): the fused product keeps the unfused program's value
+    on every element (check 1), the consumer refused the epilogue, its map proved not the identity
+    (`fused._followed`), where a map read at (1, 2) alone was taken for the tile and the kernel added each
+    block's own residual (row 3636)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, _, _, u, *_ = _draw(seed)
+        return x, w, u[:, :WIDTH].astype(jnp.float32)
+
+    def fusing(x, w, r):
+        return _moved_columns(WIDTH, 64)(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), r)
+
+    def unfused(x, w, r):
+        return _moved_columns(WIDTH, 64).fun(template.gemm(x, w, sizes, out_dtype=jnp.float32), r)
+
+    def truth(x, w, r):
+        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+        product = jax.lax.ragged_dot(x, matrix, sizes, preferred_element_type=x.dtype)
+        return _moved_columns(WIDTH, 64).fun(product, r.astype(x.dtype))
+
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "a residual off the tile",
                         seeds=SEEDS, truth_fn=truth)
 
 
@@ -1331,8 +1504,8 @@ def test_a_kernel_gradient_its_consumers_feed_holds_check_1(exact_sums):
 @pytest.mark.parametrize("generation_name", generations("sm80"))
 def test_an_ampere_kernel_gradient_at_a_two_row_warp_step_holds_check_1(generation_name):
     """On an A100, through the template, a kernel gradient pinned to a tile whose four warps split two
-    along its rows (`mosaic_sm80.Mma.for_tile` at 128 x 128) stepping 32 rows, its transposed stage's row
-    atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
+    along its rows (`mosaic_sm80.MmaIssuer.specialized` at 128 x 128) stepping 32 rows, its transposed stage's
+    row atom (`Mma.transposed_rows`), which the launch's legality takes: each group a tile of its own, groups
     of no whole step, an empty one and one of a row among them, on par with XLA's over the draws (check 1),
     truth float64's."""
     tiles = mosaic_gpu.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync")
@@ -1628,12 +1801,14 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
     (jnp.float32, DEFAULT, (jnp.float32,), False, None),
     (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
     (jnp.int8, DEFAULT, (jnp.float32,), False, "int8"),
+    (jnp.float8_e4m3fn, DEFAULT, (jnp.bfloat16,), True, None),
+    (jnp.float8_e5m2, DEFAULT, (jnp.float32,), True, None),
 ])
 def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
                                                                    refused):
-    """A precision above the default promotes each depth step's partial where an output is fp32; the
-    kernels refuse fp32 products above the default (they multiply in TF32) and a dtype they do not
-    multiply in."""
+    """A precision above the default promotes each depth step's partial where an output is fp32, and an
+    FP8 product always (testing.md, FP8 products); the kernels refuse fp32 products above the default
+    (they multiply in TF32) and a dtype they do not multiply in."""
     declared = product.declared(compute, precision, outputs=outputs)
     assert declared.promoted is promoted
     assert (declared.refusal is None) is (refused is None)

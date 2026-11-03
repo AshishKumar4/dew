@@ -13,7 +13,7 @@ from flax import linen as nn
 
 from dew._records import integer, record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw
+from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -309,7 +309,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
-        self.variables = dicts(held)
+        # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
+        self.variables = dicts(unboxed(held))
         self.label_smoothing = label_smoothing
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")

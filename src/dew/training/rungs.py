@@ -31,7 +31,7 @@ from jaxlib.xla_client import LoadedExecutable
 from dew import cache
 from dew._records import JSON, json_value, record
 from dew.files import write_atomically
-from dew.nn.kernels.generation import gpu_target
+from dew.nn.kernels.generation import assumption, gpu_target
 from dew.nn.sharding import trace_context
 from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.memory import device_memory
@@ -74,7 +74,10 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     settings = sorted(os.environ.get('XLA_FLAGS', '').split())
     allocator = sorted(f"{name}={value}" for name, value in os.environ.items()
                        if name.startswith(('XLA_PYTHON_CLIENT_', 'TF_GPU_ALLOCATOR')))
-    target = repr(gpu_target()) if jax.default_backend() == 'gpu' else jax.default_backend()
+    # The GPU its kernels are chosen for: this process's, or the one a CPU host builds for (`assumed`), so two
+    # builds for two GPUs of a generation (their multiprocessors) never share a record.
+    target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
+              else jax.default_backend())
     named = step.__qualname__ if isinstance(step, types.FunctionType) else type(step).__qualname__
     # A module's configuration as its repr reads it, a function field by its name: the address
     # Python prints beside one is this process's alone.

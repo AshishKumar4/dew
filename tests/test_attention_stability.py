@@ -1,6 +1,7 @@
 """The attention template's stability suite (bible §6): on inputs at fp32's edges, every attention form on
 every mainloop (the Triton one interpreted, the plain-JAX one, the decode kernel) gives a finite output
-and finite gradients wherever the reference does, and never ties values the reference keeps apart. Each
+and finite gradients wherever the float64 truth rounded to their dtype is, and never ties values the
+reference keeps apart. Each
 family fixes an adversarial structure (logits a ulp apart, near fp32's largest, a weight of exp(-87) on a
 value of 2^126, rows that see nothing) and draws its values by seed, against the reference written apart
 from Dew (`attention_oracle.exact_attention`), its float64 truth's derivative anchored
@@ -9,7 +10,7 @@ gradients zero. The accurate form (natural logits, `template.NATURAL`'s other fo
 accurate form, `template.ACCURATE`'s) holds check 1 (`reference_error.assert_as_exact`) on every family,
 as exact as the reference. The default, which folds log2(e) into the scale where the scale allows and
 takes FlashAttention's arithmetic for the backward's products and dQ (about the template's own anchored
-D, not FlashAttention's rowsum(dO * O)), is finite wherever the reference is and holds the exact-zero
+D, not FlashAttention's rowsum(dO * O)), is finite wherever the rounded truth is and holds the exact-zero
 claims (`assert_finite`, `_held_empty`; the owner's ruling, 2026-10-23) on every family but the fold's
 documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, §3, the exponent's
 forms), which the accurate form alone runs. Its error at these inputs is no claim, and it ties values the
@@ -32,8 +33,7 @@ import numpy as np
 import pytest
 from attention_oracle import exact_attention
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import as_given, assert_as_exact, with_gradients
-from whole_suite import timed
+from reference_error import as_given, assert_as_exact, widened, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -474,7 +474,7 @@ def _large_keys(seed):
     # One query a row of zeros over eight keys near fp32's largest, so every logit is 0 and the eight weigh
     # alike, their values drawn: the keys' weighted sum overflows fp32 even at the softmax's scale of 1/4,
     # where their weighted mean does not, and the query's gradient is the cotangents' sum against the keys
-    # (`algebra.DqSums.keyed`).
+    # (`attention_gradient.DqSums.keyed`).
     key = np.zeros((ROWS, 8, 1, 16), np.float32)
     key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 8, 1))
     value, dout = _normal(seed + 1, (ROWS, 8, 1, 16), (ROWS, 1, 1, 16))
@@ -484,8 +484,8 @@ def _large_keys(seed):
 def _far_maximum_in_a_later_tile(seed: int, rows: int = 64):
     # One query a row over 64 keys in two tiles of 32: the first tile's keys 88 to 92 nats below the second
     # tile's, which hold the row's maximum, so the first tile's weights are subnormal beside the maximum
-    # the backward walks at: a dQ pass's running sums over its first tile (`algebra.DqSums`) take only
-    # those, and must stay finite and exact when the maximum's tile joins them.
+    # the backward walks at: a dQ pass's running sums over its first tile (`attention_gradient.DqSums`) take
+    # only those, and must stay finite and exact when the maximum's tile joins them.
     query = np.zeros((rows, 1, 1, 16), np.float32)
     query[..., 0] = 4.0
     key = np.zeros((rows, 64, 1, 16), np.float32)
@@ -703,11 +703,14 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
     the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
     family; the written-out one where a family has sinks or a resumed state, which it has no input for,
     or a query of no keys, to which it gives the values' mean where Dew and the truth give zeros (every
-    such family fp32, whose probabilities round to nothing). A family whose products pass fp32's largest
-    before the scale (`Family.query_first`) gives jax's attention the query scaled first and a scale of 1:
-    the scale, 1/4 at its width of 16, a power of two, scales it exactly, so the logits are the scaled
-    products', rounded alike, but finite."""
-    jax_holds = not anchored and np.asarray(family.keep).any(-1).all()
+    such family fp32, whose probabilities round to nothing), or a float16 call on a CPU, whose dot into
+    float32 (F16_F16_F32, the algorithm jax's attention names for it) XLA's CPU compiler has none of, as
+    Dew's xla attention hands it to its reference path (`attention_kernels`' `cpu_float16`). A family whose
+    products pass fp32's largest before the scale (`Family.query_first`) gives jax's attention the query
+    scaled first and a scale of 1: the scale, 1/4 at its width of 16, a power of two, scales it exactly, so
+    the logits are the scaled products', rounded alike, but finite."""
+    cpu_float16 = jnp.dtype(family.dtype) == jnp.float16 and jax.default_backend() == "cpu"
+    jax_holds = not anchored and np.asarray(family.keep).any(-1).all() and not cpu_float16
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
@@ -856,44 +859,49 @@ def _held_empty(family: Family, found, label: str) -> None:
         np.testing.assert_array_equal(np.asarray(array, np.float32)[rows], 0.0, err_msg=f"{label} {leaf}")
 
 
-def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None:
-    """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever
-    the reference's is."""
+def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int) -> None:
+    """The stability rule's finiteness over `seeds` draws: each leaf of `dew_fn`'s outputs finite wherever the
+    float64 truth (`truth_fn` on the inputs widened) rounded to the leaf's dtype is. A reference computing
+    in the call's own dtype is no measure of it: fp16's written-out attention at `logits near 1e4` gives a
+    key gradient of -45376 where the truth's, -68612, rounds past fp16's largest (FS-F16-DK1)."""
+    truth_of = jax.jit(truth_fn)
     for seed in range(seeds):
         inputs = draw(seed)
+        with jax.enable_x64(new_val=True):
+            truth = jax.tree.leaves(truth_of(*widened(inputs)))
         found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        for (path, mine), theirs in zip(found, jax.tree.leaves(reference_fn(*inputs)), strict=True):
-            mine, theirs = (np.asarray(leaf, np.float32) for leaf in (mine, theirs))
-            lost = np.isfinite(theirs) & ~np.isfinite(mine)
+        for (path, mine), wide in zip(found, truth, strict=True):
+            mine = np.asarray(mine)
+            rounded = np.asarray(wide, np.float64).astype(mine.dtype)
+            lost = np.isfinite(rounded.astype(np.float32)) & ~np.isfinite(mine.astype(np.float32))
             assert not lost.any(), (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {int(lost.sum())} "
-                                    "values not finite where the reference's are")
+                                    "values not finite where the truth's rounded to their dtype are")
 
 
-PAST_TARGET = {
-    "accurate": {("a small weight on a large value, bfloat16", "triton"): 325,
-                 ("a small weight on a large value, float32", "triton"): 320,
-                 ("a resumed state of a large denominator", "triton"): 269,
-                 ("a resumed state beside an overflowing column", "triton"): 144,
-                 ("a small column beside an overflowing one", "triton"): 141,
-                 ("a cotangent on a small column beside an overflowing one", "triton"): 139,
-                 ("a column near fp32's least normal beside an overflowing one", "triton"): 135},
-    "frozen default": {("a small column beside an overflowing one",): 181,
-                       ("a cotangent on a small column beside an overflowing one",): 168,
-                       ("a column near fp32's least normal beside an overflowing one",): 137},
-    "frozen rows": {("a small column beside an overflowing one",): 175,
-                    ("a resumed state beside an overflowing column",): 120,
-                    ("a column near fp32's least normal beside an overflowing one",): 119,
-                    ("a cotangent on a small column beside an overflowing one",): 118},
-    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default"): 143}}
-"""The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
-train 281's or 283's CI (f083bb557, cdc28de85; rows 2117, 2193, 2204): the whole suite's run holds them
-(`timed`), every other case of their tests runs each train."""
+GPU_ONLY = {
+    "accurate": {("a small weight on a large value, bfloat16", "triton"),
+                 ("a small weight on a large value, float32", "triton"),
+                 ("a resumed state of a large denominator", "triton"),
+                 ("a resumed state beside an overflowing column", "triton"),
+                 ("a small column beside an overflowing one", "triton"),
+                 ("a cotangent on a small column beside an overflowing one", "triton"),
+                 ("a column near fp32's least normal beside an overflowing one", "triton")},
+    "frozen rows": {"a small column beside an overflowing one",
+                    "a resumed state beside an overflowing column",
+                    "a column near fp32's least normal beside an overflowing one",
+                    "a cotangent on a small column beside an overflowing one"},
+    "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default")}}
+"""The cases whose Pallas-Triton kernel interpreted on a CPU passes the suite's 120 s target (118 to 325 s on
+armada, train 281's and 283's CI, rows 2117, 2193, 2204), by test: each runs compiled on a GPU in its flow
+(tests/test_gpu_attention.py), which proves the kernel the route runs, in seconds, where the interpreter
+proves an interpreter (as `GPU_TRITON_FAMILIES`')."""
 
 
-ACCURATE_ARMS = timed(PAST_TARGET, "accurate", [(family, name) for family in TEMPLATE_FAMILIES
-                                   for name in _mainloops(FAMILIES[family], ACCURATE)])
+ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
+                 for name in _mainloops(FAMILIES[family], ACCURATE)
+                 if (family, name) not in GPU_ONLY["accurate"]]
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
-its own, so none holds a CPU task past the suite's target (row 1849)."""
+its own, so none holds a CPU task past the suite's target (row 1849); those past it on a GPU (`GPU_ONLY`)."""
 
 
 @pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
@@ -912,19 +920,20 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
 
 def default_is_finite(family_name: str, mainloop_name: str) -> None:
     """A template mainloop's output and query, key and value gradients in the default form, finite wherever
-    the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero. Its error
-    here is no claim, and its ties the documented divergence (the module's docstring)."""
+    the float64 truth's rounded to their dtype are (`assert_finite`) over the family's draws; a row that
+    sees nothing, zero. Its error here is no claim, and its ties the documented divergence (the module's
+    docstring)."""
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
-    reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
+    truth = with_gradients(_reference(family, anchored=True))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
-    assert_finite(differentiated, reference, draw, label, seeds=seeds)
+    assert_finite(differentiated, truth, draw, label, seeds=seeds)
     _held_empty(family, differentiated(*draw(0)), label)
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
-def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
+def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     """The plain-JAX mainloop, which walks under the default's guards (`algebra.walked`: its sums' headroom,
     the fold's reach), finite in the default form over every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
@@ -939,16 +948,19 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 (`MosaicBackward.derived`)."""
 
 
-GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
+GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
+                       "a small column beside an overflowing one",
+                       "a cotangent on a small column beside an overflowing one",
+                       "a column near fp32's least normal beside an overflowing one")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): 256 draws interpreted take past the CPU suite's 240 s target (218-257 s,
-row 1849)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
+s, rows 1849, 2193; `GPU_ONLY`)."""
 
 
-@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen default", [
+@pytest.mark.parametrize("family", [
     family for family in TEMPLATE_FAMILIES
-    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES]))
-def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES])
+def test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
     production route runs it on an sm80 or later GPU. It
@@ -957,11 +969,11 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     default_is_finite(family, "triton")
 
 
-@pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen rows", [family for family in TEMPLATE_FAMILIES
-                                                        if FAMILIES[family].overflows]))
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
+                                    if FAMILIES[family].overflows and family not in GPU_ONLY["frozen rows"]])
 def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
-    pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
+    pass fp32's largest, finite wherever the rounded truth is: a guarded forward's live rows carry normalized
     split sums, which only the split pass reads, so it takes that pass wherever the values can overflow
     (`attention_triton.backward`), in either form."""
     seeds, family_of = SEEDS[family], FAMILIES[family]
@@ -974,10 +986,9 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
         with tuning.pinned(PINS):
             return attention_triton.backward(*operands, interpret=INTERPRETED, split=False)
 
-    reference = as_given(jax.jit(with_gradients(_reference(family_of, anchored=False))))
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
-    assert_finite(unsplit, reference, _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}",
-                  seeds=seeds)
+    assert_finite(unsplit, with_gradients(_reference(family_of, anchored=True)),
+                  _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}", seeds=seeds)
 
 
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
@@ -1126,8 +1137,11 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
     return decoded, forward
 
 
-@pytest.mark.parametrize("family, form", timed(PAST_TARGET, "decode", DECODED),
-                         ids=[f"{family}-{form}" for family, form in DECODED])
+DECODED_ON_CPU = [case for case in DECODED if case not in GPU_ONLY["decode"]]
+
+
+@pytest.mark.parametrize("family, form", DECODED_ON_CPU,
+                         ids=[f"{family}-{form}" for family, form in DECODED_ON_CPU])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),
     each row's keys the first `K` of its cache, check 1 over the family's draws."""
@@ -1145,11 +1159,11 @@ largest."""
 @pytest.mark.parametrize("family", DECODED_OVERFLOWS)
 def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     """The decode kernel's default form, interpreted on a CPU and compiled on a GPU, finite wherever the
-    reference is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
+    rounded truth is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
     guards its sums' headroom in either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
-    assert_finite(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
+    assert_finite(jax.jit(decoded), _reference(family, anchored=True), forward,
                   f"decode default {family.dtype}", seeds=seeds)
 
 

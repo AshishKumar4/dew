@@ -27,6 +27,19 @@ from jax.extend.mlir import ir
 from dew import communicators
 from dew.nn.kernels import generation
 
+SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
+"""XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
+which names no kernel (`shared_asked`)."""
+
+
+def shared_asked(error: BaseException) -> int | None:
+    """The shared bytes a Triton kernel of a program XLA refused asked past a block, or None where `error`
+    is not that refusal: the one reading of XLA's text (`kept`, `tuning`'s fitting, the compile-only
+    harness)."""
+    asked = SHARED_REFUSED.search(str(error))
+    return None if asked is None else int(asked.group(1))
+
+
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
@@ -89,6 +102,10 @@ class _Registry:
     kernels that spilled, and each miss."""
     refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
     missed: list["Miss"] = dataclasses.field(default_factory=list)
+    rewritten: list = dataclasses.field(default_factory=list)
+    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
+    passes: list[float] = dataclasses.field(default_factory=list)
+    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
 
 
 _PROCESS = _Registry()
@@ -111,35 +128,40 @@ class Exhausted(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Miss:
-    """A kernel a run's compile found spilling (`compiled`): its name, its launch's op and config (None
-    where no launch of this process traced it), its registers and its stack frame's bytes a thread
-    (`Binary.frame`), and whether its launch's config was refused and its program lowered again
-    (`stepped`)."""
+    """A kernel a run's compile found spilling, or a program whose block XLA refused (`compiled`): its
+    kernel's name, its launch's op and config (None where no launch of this process traced it), its
+    registers and its stack frame's bytes a thread (`Binary.frame`) or the shared bytes it asked
+    (`shared`), and whether its launch's config was refused and its program lowered again (`stepped`)."""
     kernel: str
     op: str | None
     config: Hashable | None
     registers: int | None
     frame: int | None
     stepped: bool
+    shared: int | None = None
 
 
 def _identity(op, arguments: tokamax.BoundArguments) -> str:
     """A launch's identity apart from its config, the same in every process: its op as its picks name it
-    (`tuning.KernelOp.keyed`) and its arguments exactly, its arrays by their own shapes and dtypes (no
-    key's bucket: two launches a key shares compile two kernels) and its hooks by what they compute
-    (`traced`), and the target capacities that size its generated program. Clock rates are not code inputs
+    (`tuning._identity`) and its arguments exactly, its arrays by their own shapes and dtypes (no key's
+    bucket: two launches a key shares compile two kernels), its hooks, the op's and its arguments', by what
+    they compute as their parts tell it (`tuning.KernelOp.identified`: every launch reads it, so it traces
+    nothing), and the target capacities that size its generated program. Clock rates are not code inputs
     once its config is chosen: an attached device and its compile-only target may report different rates
     while emitting exactly that config."""
     def described(name, value):
         if name in op.HOOKS:
-            return op.traced(name, value)
+            return op.identified(name, value)
         return jax.tree.map(lambda leaf: (tuple(leaf.shape), str(leaf.dtype)) if hasattr(leaf, "dtype")
                             and hasattr(leaf, "shape") else leaf, value)
     target = generation.gpu_target()
     hardware = ((generation.device_generation(),) if target is None else
                 (target.generation, target.multiprocessors, target.shared_limit))
+    # The tuner imports this module: read at a call.
+    from dew.nn.kernels import tuning
+
     operands = tuple((name, described(name, value)) for name, value in sorted(arguments.arguments.items()))
-    return repr((hardware, op.keyed(arguments).op, operands))
+    return repr((hardware, tuning._identity(op, traced=False), operands))
 
 
 def _digest(text: str) -> str:
@@ -233,6 +255,33 @@ def misses() -> tuple[Miss, ...]:
         return tuple(_registry().missed)
 
 
+def record_rewrite(made) -> None:
+    """Record one region the algebra pass rewrote (`dew.algebra.program.AlgebraReport`) beside the kernels'
+    misses, as each program traces."""
+    with _GUARD:
+        _registry().rewritten.append(made)
+
+
+def record_pass(seconds: float) -> None:
+    """Record one program's whole algebra pass, its seconds (`dew.algebra.program.program_of`)."""
+    with _GUARD:
+        _registry().passes.append(seconds)
+
+
+def passes() -> tuple[float, ...]:
+    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`): its
+    regions' (`rewrites`) and its walks of the program around them."""
+    with _GUARD:
+        return tuple(_registry().passes)
+
+
+def rewrites() -> tuple:
+    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), for a
+    run's telemetry: a `refusals` scope's own within it."""
+    with _GUARD:
+        return tuple(_registry().rewritten)
+
+
 @contextlib.contextmanager
 def refusals() -> Iterator[None]:
     """Within the block, this context's compiles refuse and record apart from the process's (a test's
@@ -246,19 +295,27 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[None]:
+def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file. A successful replacement commits them after this scope ends."""
+    registry or its file; the scope's registry, whose rewrites the replacement's trace recorded. A successful
+    replacement commits both after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
         proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
-    token = _SCOPE.set(_Registry(refused=proposed))
+    scope = _Registry(refused=proposed)
+    token = _SCOPE.set(scope)
     try:
-        yield
+        yield scope
     finally:
         _SCOPE.reset(token)
+
+
+def _commit(proposal: _Registry) -> None:
+    """A successful replacement's rewrites (`_proposing`'s scope) recorded as the kept program's."""
+    with _GUARD:
+        _registry().rewritten.extend(proposal.rewritten)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -289,21 +346,29 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache carries its kernels' binaries as one compiled here does."""
-    executable, spilling = _compiled_reported(lowered, options)
+    from the persistent compilation cache carries its kernels' binaries as one compiled here does. A
+    program whose block XLA refuses steps its asking Triton launches down (`_unblocked`)."""
+    try:
+        executable, spilling = _compiled_reported(lowered, options)
+    except jax.errors.JaxRuntimeError as error:
+        asked = shared_asked(error)
+        if asked is None:
+            raise
+        return _unblocked(lowered, options, relower, asked, error)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
         _recorded(found, stepped=False)
         return executable
     try:
-        with _proposing(refusals):
+        with _proposing(refusals) as proposal:
             relowered = relower()
             replacement, spilling = _compiled_reported(relowered, options)
     except Exhausted as failed:
         _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
         _recorded(found, stepped=False)
         return executable
+    _commit(proposal)
     for refusal, kernel in refusals:
         _record(refusal, None, frozenset({kernel}))
     _recorded(found, stepped=True)
@@ -311,6 +376,49 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
     # them derive a third program, not the one this compile keeps and runs.
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
+
+
+def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+               relower: Callable[[], jax.stages.Lowered], asked: int,
+               error: Exception) -> jax.stages.Compiled:
+    """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled once
+    more with every one of its Triton launches' configs refused at once (each its next derived config, as a
+    spill refuses one, `kept`): XLA's refusal names no kernel, and a search for the asking launch would
+    compile the whole program a launch at a time (row 3584). Each launch's miss is recorded and logged at
+    the bytes asked; where the relowered program is refused again, or a derivation finds no config left
+    (`Exhausted`), the refusal stands, each a miss not stepped."""
+    from dew.training._lowering import kernel_calls
+
+    tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
+    # Every Triton kernel XLA compiles, a branch no run reaches too (a guarded forward's rewalk).
+    for call in kernel_calls(lowered, unrun=True):
+        kernel, digest = kernel_of(call.name)
+        launch = None if call.kind != "triton" or digest is None else traced(digest)
+        if launch is not None:
+            tried.setdefault((launch.identity, launch.config), (kernel, launch))
+    try:
+        with _proposing([(refusal, kernel) for refusal, (kernel, _) in tried.items()]) as proposal:
+            replacement, spilling = _compiled_reported(relower(), options)
+    except (Exhausted, jax.errors.JaxRuntimeError) as again:
+        if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
+            raise
+        for kernel, launch in tried.values():
+            _missed_block(kernel, launch, asked, stepped=False)
+        raise error from again
+    _commit(proposal)
+    for refusal, (kernel, launch) in tried.items():
+        _record(refusal, None, frozenset({kernel}))
+        _missed_block(kernel, launch, asked, stepped=True)
+    _recorded(_misses_of(spilling), stepped=False)
+    return replacement
+
+
+def _missed_block(kernel: str, launch: Launch, asked: int, *, stepped: bool) -> None:
+    """A Triton launch's shared-memory miss recorded and logged (`_unblocked`), under its first kernel's
+    name: XLA's refusal names none."""
+    _record(None, Miss(kernel, launch.op, launch.config, None, None, stepped, shared=asked))
+    _log.warning("a program asks %d shared bytes past its block; Triton kernel %s (%s at %s): %s", asked,
+                 kernel, launch.op, launch.config, "its launch steps down" if stepped else "no step-down")
 
 
 def _misses_of(spilling: list["Binary"]) -> list[tuple[tuple[str, Hashable] | None, "Binary", Launch | None]]:

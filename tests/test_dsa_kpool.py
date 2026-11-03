@@ -335,7 +335,7 @@ def test_decode_cache_preserves_the_expanded_projection_storage_dtype():
     with jax.enable_x64(new_val=True):
         hidden, _ = inputs()
         block = module()
-        variables = block.init(jax.random.key(91), jnp.asarray(hidden))
+        variables = nn.unbox(block.init(jax.random.key(91), jnp.asarray(hidden)))
         projection = variables["params"]["kv_b_proj"]
         projection["kernel"] = projection["kernel"].astype(jnp.float64)
         _, state = block.apply(variables, jnp.asarray(hidden[:, :1]), MixerCall(decode=True),
@@ -458,7 +458,7 @@ def test_a_gated_layer_gates_its_heads_context_as_latent_attention_does():
     gated, plain = (KPoolSparseAttentionMixer(**SETTINGS).build(MixerContext(
         emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8, max_seq_len=16, norm_eps=1e-5,
         scale_after_cast=True, output_gate=gate))(name="self_attn") for gate in (True, False))
-    params = gated.init(jax.random.key(0), inputs()[0])["params"]
+    params = nn.unbox(gated.init(jax.random.key(0), inputs()[0]))["params"]
     width = H * SETTINGS["v_head_dim"]
     assert width == E, "an identity o_proj reads the heads' context back"
 
@@ -478,7 +478,7 @@ def test_a_gated_layer_gates_its_heads_context_as_latent_attention_does():
 
 def test_a_budget_the_pool_does_not_divide_is_refused():
     with pytest.raises(ValueError):
-        module(index_topk=5).init(jax.random.key(0), jnp.zeros((1, 4, E), jnp.float32))
+        nn.unbox(module(index_topk=5).init(jax.random.key(0), jnp.zeros((1, 4, E), jnp.float32)))
 
 
 def selection_step(block, variables, cache, x, valid, phase):

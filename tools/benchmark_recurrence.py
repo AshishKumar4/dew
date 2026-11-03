@@ -45,8 +45,6 @@ from pathlib import Path
 
 import numpy as np
 
-from dew.nn.kernels.options import program
-
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
@@ -139,6 +137,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
     from dew.nn import linear
     from dew.nn.kernels import generation, mamba_ssd, recurrence
+    from dew.nn.kernels.options import program
     from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
     from dew.nn.mixers.mamba2 import SSD
     from dew.telemetry.benchmark import samples

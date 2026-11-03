@@ -64,7 +64,7 @@ from dew.nn.rope import (
     rotate,
     yarn_query_scale,
 )
-from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
+from dew.nn.sharding import RESIDUAL, constrain, declared, down_projection
 from dew.nn.sparse_selection import (
     index_agreements,
     index_scores,
@@ -190,9 +190,10 @@ class IndexerFront:
         it at the model's dtype."""
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b', kernel_axes=('qlora', 'index'))
         half = self.dtype is not None and jnp.dtype(self.dtype) == jnp.float16
-        self.weights_proj = dense(self.n_heads, name='weights_proj',
+        # Maps the hidden states onto one weight per indexer head.
+        self.weights_proj = dense(self.n_heads, name='weights_proj', kernel_axes=('embed', 'index'),
                                   dtype=jnp.float32 if half and fp32_weights_at_half else self.dtype)
         return dense
 
@@ -212,14 +213,6 @@ class IndexerFront:
         return self.weighed(index_agreements(query, keys, self.precision), hidden)
 
 
-@logical_axes({
-    ("wq_b",): ("qlora", "index"),
-    ("wk",): ("embed", "index"),
-    # The key norm is a LayerNorm, so scale and bias share the indexer width.
-    ("k_norm",): ("index",),
-    # Maps the hidden states onto one weight per indexer head.
-    ("weights_proj",): ("embed", "index"),
-})
 class SparseIndexer(IndexerFront, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
@@ -247,10 +240,13 @@ class SparseIndexer(IndexerFront, nn.Module):
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
         dense = self.declare_front()
-        self.wk = dense(self.head_dim, name='wk')
+        self.wk = dense(self.head_dim, name='wk', kernel_axes=('embed', 'index'))
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
-        # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer).
-        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
+        # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer);
+        # its scale and bias share the indexer width.
+        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm',
+                                scale_init=declared(nn.initializers.ones, ('index',)),
+                                bias_init=declared(nn.initializers.zeros, ('index',)))
 
     def keys(self, hidden):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
@@ -294,18 +290,6 @@ class SparseIndexer(IndexerFront, nn.Module):
         return top_k_selection(scores, keep, self.top_k)
 
 
-@logical_axes({
-    ("q_a_proj",): ("embed", "qlora"),
-    ("q_b_proj",): ("qlora", "attention"),
-    ("q_gate_proj",): ("qlora", "attention"),
-    # The output concatenates the latent and the decoupled rope head, which
-    # ride into the cache together; the name picks the sharded side.
-    ("kv_a_proj_with_mqa",): ("embed", "kvlora"),
-    ("kv_b_proj",): ("kvlora", "attention"),
-    ("o_proj",): ("attention", "embed"),
-    ("q_a_layernorm",): ("qlora",),
-    ("kv_a_layernorm",): ("kvlora",),
-})
 class MultiHeadLatentAttention(LinearProducts):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
@@ -439,30 +423,35 @@ class MultiHeadLatentAttention(LinearProducts):
             # attention_bias says; only the low-rank projections do.
             self.q_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_proj', dot_general=float32_dot_general)
+                precision=self.precision, name='q_proj', dot_general=float32_dot_general,
+                kernel_axes=('embed', 'heads'))
         else:
-            self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
-            self.q_a_layernorm = norm(name='q_a_layernorm')
+            self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj', kernel_axes=('embed', 'qlora'))
+            self.q_a_layernorm = norm(name='q_a_layernorm', scale_axes=('qlora',))
             if self.query_gate:
                 self.q_gate_proj = Dense(
                     self.num_heads * (qk_head_dim + self.v_head_dim), use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='q_gate_proj', dot_general=float32_dot_general)
+                    precision=self.precision, name='q_gate_proj', dot_general=float32_dot_general,
+                    kernel_axes=('qlora', 'attention'))
             else:
                 self.q_b_proj = Dense(
                     self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                    precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
-        self.kv_a_proj_with_mqa = dense(
-            self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
-        self.kv_a_layernorm = norm(name='kv_a_layernorm')
+                    precision=self.precision, name='q_b_proj', dot_general=float32_dot_general,
+                    kernel_axes=('qlora', 'attention'))
+        # The output concatenates the latent and the decoupled rope head, which ride into the cache
+        # together; the name picks the sharded side.
+        self.kv_a_proj_with_mqa = dense(self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa',
+                                        kernel_axes=('embed', 'kvlora'))
+        self.kv_a_layernorm = norm(name='kv_a_layernorm', scale_axes=('kvlora',))
         self.kv_b_proj = Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
-            name='kv_b_proj', dot_general=float32_dot_general)
-        self.o_proj = dense(self.emb_features, name='o_proj')
+            name='kv_b_proj', dot_general=float32_dot_general, kernel_axes=('kvlora', 'attention'))
+        self.o_proj = dense(self.emb_features, name='o_proj', kernel_axes=('attention', 'embed'))
         if self.output_gate:
             self.g_proj = Dense(self.num_heads * self.v_head_dim, use_bias=False,
                                 dtype=self.dtype, precision=self.precision, name='g_proj',
-                                dot_general=float32_dot_general)
+                                dot_general=float32_dot_general, kernel_axes=('embed', 'heads'))
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(

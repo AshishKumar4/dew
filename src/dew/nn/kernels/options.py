@@ -25,6 +25,7 @@ from jax._src.array import ArrayImpl
 from jax.experimental.layout import Format
 from jax.sharding import Sharding
 
+from dew import algebra
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
 from dew.nn.nested import staged
@@ -190,9 +191,34 @@ class OuterProgram:
         self._compiling = threading.Lock()
 
     def _jitted(self) -> jax.stages.Wrapped:
+        """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""
         @functools.wraps(self.function)
         def traced(*args, **kwargs):
             return self.function(*args, **kwargs)
+        return jax.jit(traced, **self.arguments)
+
+    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict) -> jax.stages.Traced:
+        """`jitted`'s trace of a call, its program the algebra pass's (`algebra.program_of`), so its lowering,
+        its trace, its executable and every relowering read one program (docs/design/algebra.md §6.7): the
+        pass reads the trace jit made, which lowers as it is where no rule changes it; a program a rule
+        changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in JAX's
+        trace context, so a held program traces afresh as it changes."""
+        traced = jitted.trace(*args, **kwargs)
+        rewritten = algebra.program_of(traced.jaxpr)
+        if rewritten is traced.jaxpr:
+            return traced
+        replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
+                                           self.names)
+        return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+
+    @functools.cached_property
+    def _eager(self) -> jax.stages.Wrapped:
+        """Its jit called under an eager transformation, which traces it where no trace of it can be read
+        first: the function rewritten as it traces (`algebra.rewritten`), one program as its compiles'."""
+        @functools.wraps(self.function)
+        def traced(*args, **kwargs):
+            return algebra.rewritten(self.function, static_argnums=self.numbers,
+                                     static_argnames=tuple(self.names))(*args, **kwargs)
         return jax.jit(traced, **self.arguments)
 
     @functools.cached_property
@@ -209,7 +235,7 @@ class OuterProgram:
         if staged():
             return self._nested(*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
-            return self.jitted(*args, **kwargs)
+            return self._eager(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
@@ -254,28 +280,30 @@ class OuterProgram:
 
         def relower() -> jax.stages.Lowered:
             fresh = self._jitted()
-            lowered = fresh.lower(*args, **kwargs)
+            lowered = self._traced(fresh, args, kwargs).lower()
             relowered.append(fresh)
             return lowered
-        executable = report.compiled(self.jitted.lower(*args, **kwargs), relower=relower)
+        executable = report.compiled(self.lower(*args, **kwargs), relower=relower)
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted = relowered[-1]
         return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
-        return self.jitted.lower(*args, **kwargs)
+        return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        return self.jitted.trace(*args, **kwargs)
+        return self._traced(self.jitted, args, kwargs)
 
     def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
-        ones dropped."""
+        ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
+        concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
+        compiles its own executable."""
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
             return (len(args), ((), ()), structure, tuple(map(_signature, leaves)),
-                    jax_config.trace_context()), args, kwargs
+                    jax_config.trace_context(), jax.sharding.get_mesh()), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
@@ -285,7 +313,7 @@ class OuterProgram:
                    tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
                                  if name in self.names), key=lambda static: static[0])))
         return (len(args), statics, structure, tuple(map(_signature, leaves)),
-                jax_config.trace_context()), dynamic, named
+                jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
 
 
 def _signature(leaf) -> Hashable:

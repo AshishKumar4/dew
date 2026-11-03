@@ -29,7 +29,7 @@ from jax.typing import DTypeLike
 
 from dew import _records
 from dew._model_types import QWEN35_TYPES
-from dew.batch import Variables
+from dew.batch import Variables, unboxed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
 from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
@@ -76,6 +76,7 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     DtypeName,
@@ -115,7 +116,8 @@ class Placing(Protocol):
     a leaf at a time, by the layout as `model`, where it places its own tree, refines it
     (`RefinesLayout`); as they are where the load places nothing."""
 
-    def __call__(self, variables: Variables, model: RefinesLayout | None = None) -> Variables: ...
+    def __call__(self, variables: Variables, model: RefinesLayout | None = None,
+                 axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
 
 
 
@@ -611,8 +613,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the blocks leave the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the blocks leave the program, so the source's own draws are dead code to XLA; they
+            # join the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: path[0] == "params" and crossing(path))
 
         blocks = owned_program(drawn)(request_key(key))
@@ -646,8 +649,9 @@ class Pretrained:
         length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
 
         def drawn(draw: jax.Array) -> Variables:
-            # Only the extension leaves the program, so the source's own draws are dead code to XLA.
-            return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
+            # Only the extension leaves the program, so the source's own draws are dead code to XLA; it
+            # joins the loaded tree plain, as the tree entered.
+            return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))),
                           lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
                           or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 
@@ -688,9 +692,10 @@ class Pretrained:
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        # A stage-local fit's store is read by its layers' names (`stored_layers`).
-        values = unpacked(self.model, stored_layers(self.model, self.variables if variables is None
-                                                    else variables))
+        # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
+        # fit's store is read by its layers' names (`stored_layers`).
+        values = unpacked(self.model, stored_layers(self.model, unboxed(self.variables if variables is None
+                                                                        else variables)))
         if self.adapter is not None:
             values = self.adapter.merge(values)
         if isinstance(self.model, Differential) and self.model.dex is not None:
@@ -1088,8 +1093,13 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "
                          "fills it places it, so pass no mesh or layout")
 
-    def placed(variables: Variables, model: RefinesLayout | None = None) -> Variables:
-        return place(variables, mesh, _refined(layout, model)) if streaming else variables
+    def placed(variables: Variables, model: RefinesLayout | None = None,
+               axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables:
+        if not streaming:
+            return variables
+        # A loaded tree is plain: the axes it is placed by are its model's draw's (`axes`).
+        with boxed({**current_boxes(), **(axes or {})}):
+            return place(variables, mesh, _refined(layout, model))
 
     return streaming, placed
 
@@ -1191,7 +1201,21 @@ def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: st
     loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
         directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
         variables=variables, lazy=streaming, text=text, stored=stored))
-    return replace(loaded, variables=placed(loaded.variables), revision=commit)
+    # A pipeline placed on a mesh is placed by its denoiser's draw and its encoders' own tables; one
+    # loaded without its text encoder encodes nothing to draw its denoiser over, and is placed by shapes.
+    with boxed({**current_boxes(), **(pipeline_axes(loaded) if streaming and text else {})}):
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+
+
+def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a loaded pipeline's parameters are drawn in: its denoiser's draw over its encoders'
+    parameters' shapes, and each encoder's own table (`DiffusionObjective.denoiser_axes`, `tower_axes`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    objective = DiffusionObjective(loaded)
+    encoders = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype),
+                            loaded.variables["encoders"])
+    return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
 
 
 def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
@@ -2068,10 +2092,23 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             params = materialize(params)
         variables = {"params": params}
     if backbone is None:
+        # A readout released alone reads no backbone to draw it over: placed by its shapes alone.
         return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed(variables), directory,
+    return description.bundle(backbone, head, placed(variables, axes=head_axes(head, backbone)), directory,
                               description.tokenizer_folder, **description.fields)
+
+
+def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
+    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
+    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
+    from dew.decision.head import Head
+    from dew.decision.model import DecisionModel
+
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
+    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
+                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
 
 
 def _native_config(config: Mapping[str, object],
@@ -2337,7 +2374,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        return kind(model, placed(variables), processor, config, directory, built, generation_config,
+        return kind(model, placed(variables, axes=decoder_parts.decoder_axes(model)), processor, config,
+                    directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.

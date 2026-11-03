@@ -178,7 +178,11 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     The sharding is the one the trainer gives a train state's parameters under
     `layout`; `dew.distributed.host.stream` places the leaves, updating the
     dict nodes of `variables` in place and rebuilding a frozen one, which a
-    task holds, as a dict over the same leaves.
+    task holds, as a dict over the same leaves. Each leaf's logical axes are
+    those the tree's own boxes carry (a model's `init` returns them) or the
+    table in context (`dew.nn.sharding.boxed`, as a load holds its model's,
+    `dew.nn.sharding.drawn_axes`); a plain tree with neither is split over
+    fsdp by its shapes alone, and a tensor or expert split needs the table.
     """
     from dew.distributed.host import stream
     from dew.distributed.placement import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh

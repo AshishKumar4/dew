@@ -24,10 +24,9 @@ from dew.nn.moe import ExpertMLP, chosen_experts, renormalized_softmax
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.protocols import Routes
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared
 
 
-@logical_axes({("proj",): ("embed", "exp")})
 class Gemma4TextRouter(nn.Module):
     """Which experts a token takes and with what weight, `[..., k]` of each."""
 
@@ -46,15 +45,17 @@ class Gemma4TextRouter(nn.Module):
         hidden = x.shape[-1]
         normed = RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
                          name='norm')(x)
-        scale = self.param('scale', nn.initializers.ones, (hidden,), jnp.float32)
+        # The router's input scale is as wide as the hidden state, where the registry's suffix named it
+        # an expert axis.
+        scale = self.param('scale', declared(nn.initializers.ones, ('embed',)), (hidden,), jnp.float32)
         scaled = normed * (scale * (hidden ** -0.5)).astype(normed.dtype)
-        logits = Dense(self.num_experts, use_bias=False, dtype=self.dtype,
+        logits = Dense(self.num_experts, use_bias=False, dtype=self.dtype, kernel_axes=("embed", "exp"),
                        precision=self.precision, name='proj', dot_general=float32_dot_general)(scaled)
         logits = logits.astype(at_least_fp32(logits.dtype))
         indices = chosen_experts(lambda: jax.lax.top_k(jax.nn.softmax(logits, axis=-1), self.top_k)[1],
                                  (*logits.shape[:-1], self.top_k), routes)
         weights = renormalized_softmax(logits, indices)
-        per_expert = self.param('per_expert_scale', nn.initializers.ones,
+        per_expert = self.param('per_expert_scale', declared(nn.initializers.ones, ('exp',)),
                                 (self.num_experts,), jnp.float32)
         return weights * per_expert[indices], indices
 

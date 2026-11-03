@@ -41,7 +41,7 @@ from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.sharding import logical_axes, sequence_shards
+from dew.nn.sharding import sequence_shards
 
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
 """The recurrence's form: one log decay a head, no delta rule, no write gate, no scale."""
@@ -68,11 +68,6 @@ def lightning_slopes(heads: int) -> tuple[float, ...]:
     return tuple(slopes(heads))
 
 
-@logical_axes({
-    ("qkv_proj",): ("embed", "linear"),
-    ("output_gate",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class LightningAttention(nn.Module):
     """The token mixer of a MiniMax `linear_attention` layer. Parameter names are the release's:
     `qkv_proj` (each head's query, key and value side by side), `output_gate`, `norm/scale` over
@@ -127,10 +122,10 @@ class LightningAttention(nn.Module):
                              f"{self.activation!r}")
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        self.qkv_proj = dense(3 * self.features, name='qkv_proj')
-        self.output_gate = dense(self.features, name='output_gate')
+        self.qkv_proj = dense(3 * self.features, name='qkv_proj', kernel_axes=('embed', 'linear'))
+        self.output_gate = dense(self.features, name='output_gate', kernel_axes=('embed', 'linear'))
         self.norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj')
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):

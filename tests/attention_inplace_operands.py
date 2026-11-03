@@ -119,7 +119,7 @@ def _spanned(width: int, implementation: str):
 def a_span_calls_one_launch_is_on_par_on_an_h100(name: str) -> None:
     """Row 3171's packed windowed call through the route on an H100, its backward pinned to the one launch,
     on par with the reference path's (check 1): its dK and dV, wrong and unrepeatable there before row 3180's
-    fix, on par with it (ET-SPAN-h100). The derivation still gives span calls two launches, the faster there
+    fix, on par with it (ET-SPAN-h100); span calls derive the one launch as plain ones do
     (`MosaicBackward.derived`)."""
     width, config = SPANNED[name]
     step, keep = _spanned(width, "template")

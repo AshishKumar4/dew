@@ -62,8 +62,8 @@ class GatedShortConv(nn.Module):
     def setup(self):
         dense = functools.partial(Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
-        self.in_proj = dense(3 * self.emb_features, name='in_proj')
-        self.out_proj = dense(self.emb_features, name='out_proj')
+        self.in_proj = dense(3 * self.emb_features, name='in_proj', kernel_axes=('embed', 'linear'))
+        self.out_proj = dense(self.emb_features, name='out_proj', kernel_axes=('attention', 'embed'))
         self.conv = DepthwiseConv1d(features=self.emb_features, kernel=self.kernel, use_bias=self.use_bias,
                                     name='conv')
 

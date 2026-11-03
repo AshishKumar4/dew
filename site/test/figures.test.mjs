@@ -39,6 +39,6 @@ test('every figure a page draws from the repository is inline in its built page,
 			assert.ok(!new RegExp(`<img[^>]+${name}\\.svg`).test(page), `${source}: ${name} is an <img>, which follows only the system theme`);
 		}
 	}
-	// The architecture page's two figures and the tutorials' among them.
-	assert.ok(figures > 2, `only ${figures} figures drawn from the repository were found`);
+	// The architecture page's five figures and the tutorials' among them.
+	assert.ok(figures > 5, `only ${figures} figures drawn from the repository were found`);
 });

@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
     as_given,
@@ -202,7 +203,7 @@ def test_a_packed_batch_selects_inside_its_documents():
     segments = jnp.asarray(np.array([[1] * 3 + [2] * 4 + [0] * (SEQ - 7)]))
     positions = jnp.asarray(np.array([list(range(3)) + list(range(4)) + [0] * (SEQ - 7)]))
     covering, dense = deepseek_stack(SEQ), deepseek_stack(None)
-    init = jax.jit(covering.init)
+    init = jax.jit(lambda *args: nn.unbox(covering.init(*args)))
 
     def draw(seed):
         rng = np.random.default_rng([4, seed])
@@ -276,7 +277,7 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     (check 1)."""
     batch = token_batch()
     plain = LMObjective(deepseek_stack(4), SEQ)
-    params = plain.init(jax.random.key(0))
+    params = nn.unbox(plain.init(jax.random.key(0)))
 
     def gradient(objective):
         (value, aux), grads = jax.value_and_grad(
@@ -364,7 +365,7 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
     for phase, topk in (("warmup", None), ("sparse", 4)):
         objective, wide = (LMObjective(deepseek_stack(topk, dtype=dtype), SEQ, indexer=IndexerTraining(phase))
                            for dtype in (jnp.float32, jnp.float64))
-        params = objective.init(jax.random.key(0))
+        params = nn.unbox(objective.init(jax.random.key(0)))
 
         def kl(objective, at, params=params):
             return jax.jit(lambda *batches: objective.scalar_loss(params, batches[at], step_at())[1]
@@ -404,7 +405,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     columns = packed_batch([packed_row(tokens[:7], tokens[7:13])])
     carried = {"text": ModelInputs(columns["text"], {"coordinates": columns["text_coordinates"]})}
     objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
 
     _, by_columns = objective.scalar_loss(params, columns, step_at())
     _, by_inputs = objective.scalar_loss(params, carried, step_at())
@@ -424,7 +425,7 @@ def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
     by_mask = {"text": ModelInputs(jnp.asarray(ids[None]),
                                    {"attention_mask": jnp.asarray(segments[None] != 0)})}
     objective = LMObjective(deepseek_stack(topk), SEQ, indexer=IndexerTraining(phase))
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
 
     _, masked_by_segments = objective.scalar_loss(params, by_segments, step_at())
     _, masked_by_inputs = objective.scalar_loss(params, by_mask, step_at())
@@ -440,23 +441,23 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
     dense = deepseek_stack(None, mixer={"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                                         "qk_nope_head_dim": 8, "qk_rope_head_dim": 8,
                                         "v_head_dim": 8}})
-    checkpoint = dense.init(jax.random.key(5), jnp.zeros((1, SEQ), jnp.int32))
+    checkpoint = nn.unbox(dense.init(jax.random.key(5), jnp.zeros((1, SEQ), jnp.int32)))
     objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
                             variables=checkpoint)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     frozen = dict(jax.tree_util.tree_leaves_with_path(params[FROZEN]))
     given = dict(jax.tree_util.tree_leaves_with_path(checkpoint["params"]))
     assert frozen.keys() == given.keys()
     for path, leaf in given.items():
         assert bool(jnp.all(frozen[path] == leaf)), jax.tree_util.keystr(path)
     assert jax.tree.structure(params["params"]) == jax.tree.structure(
-        LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
-        .init(jax.random.key(0))["params"])
+        nn.unbox(LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
+        .init(jax.random.key(0)))["params"])
     incomplete = {"params": {name: value for name, value in checkpoint["params"].items()
                              if name != "embed_tokens"}}
     with pytest.raises(ValueError):
-        LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
-                    variables=incomplete).init(jax.random.key(0))
+        nn.unbox(LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"),
+                    variables=incomplete).init(jax.random.key(0)))
 
 
 def test_the_sparse_phase_reads_the_warmup_tree():
@@ -464,9 +465,9 @@ def test_the_sparse_phase_reads_the_warmup_tree():
     the whole tree, as one params collection, leaf for leaf. A plain
     objective keeps the split it is given, so it trains the indexer alone."""
     warmup = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"))
-    split = warmup.init(jax.random.key(0))
-    params = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
-                         variables=split).init(jax.random.key(1))
+    split = nn.unbox(warmup.init(jax.random.key(0)))
+    params = nn.unbox(LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"),
+                         variables=split).init(jax.random.key(1)))
     assert sorted(params) == ["params"]
     leaves = dict(jax.tree_util.tree_leaves_with_path(params["params"]))
     expected = dict(jax.tree_util.tree_leaves_with_path(split["params"]))
@@ -474,7 +475,7 @@ def test_the_sparse_phase_reads_the_warmup_tree():
     assert leaves.keys() == expected.keys()
     assert all(bool(jnp.all(leaves[path] == expected[path])) for path in leaves)
 
-    kept = LMObjective(deepseek_stack(4), SEQ, variables=split).init(jax.random.key(1))
+    kept = nn.unbox(LMObjective(deepseek_stack(4), SEQ, variables=split).init(jax.random.key(1)))
     assert jax.tree.structure(kept) == jax.tree.structure(split)
     assert all(bool(jnp.all(ours == theirs))
                for ours, theirs in zip(jax.tree.leaves(kept), jax.tree.leaves(split), strict=True))
@@ -484,8 +485,8 @@ def test_evaluation_and_scoring_read_the_split_tree():
     """Teacher-forced scores under the warm-up split are on par with the
     dense model's on the merged tree over drawn batches (check 1)."""
     objective = LMObjective(deepseek_stack(None), SEQ, indexer=IndexerTraining("warmup"), ema_decay=0.999)
-    params = objective.init(jax.random.key(0))
-    merged = LMObjective(deepseek_stack(None), SEQ, variables=params).init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
+    merged = nn.unbox(LMObjective(deepseek_stack(None), SEQ, variables=params).init(jax.random.key(0)))
     dense, wide = (LMObjective(deepseek_stack(None, dtype=dtype), SEQ)
                    for dtype in (jnp.float32, jnp.float64))
     scored = jax.jit(lambda text: objective.evaluate(params, {"text": text}, step_at()).losses)

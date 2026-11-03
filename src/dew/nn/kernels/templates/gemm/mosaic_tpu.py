@@ -28,6 +28,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
+from dew.nn.kernels.templates.axes import named
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 from dew.nn.sharding import per_shard
 
@@ -125,14 +126,13 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         group = jnp.minimum(group_ids[slot], groups - 1)
         return (group, column, step) if transpose_rhs else (group, step, column)
 
-    def side_spec(axes):
+    def side_spec(side_axes):
         extent = {'rows': block_m, 'depth': block_k, 'columns': block_n}
 
         def index(column, slot, step, group_offsets, group_ids, m_tile_ids):
-            origin = {'rows': m_tile_ids[slot], 'depth': step, 'columns': column}
-            return tuple(origin[axis] for axis in axes)
+            return named(side_axes, {'rows': m_tile_ids[slot], 'depth': step, 'columns': column})
 
-        return pl.BlockSpec(tuple(extent[axis] for axis in axes), index)
+        return pl.BlockSpec(named(side_axes, extent), index)
 
     def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
@@ -219,14 +219,13 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     def cotangent_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
 
-    def side_spec(axes):
+    def side_spec(side_axes):
         extent = {'rows': block_k, 'depth': block_m}
 
         def index(column, block, slot, group_offsets, group_ids, m_tile_ids):
-            origin = {'rows': m_tile_ids[slot], 'depth': block}
-            return tuple(origin[axis] for axis in axes)
+            return named(side_axes, {'rows': m_tile_ids[slot], 'depth': block})
 
-        return pl.BlockSpec(tuple(extent[axis] for axis in axes), index)
+        return pl.BlockSpec(named(side_axes, extent), index)
 
     def out_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return group_ids[slot], block, column

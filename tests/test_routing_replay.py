@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
@@ -72,7 +73,7 @@ def replayed_log_probs(obj, params, tokens, routes):
 def replay_draw(obj, batch: int):
     """Check 1's draw of a replay: a seed's parameters and tokens, and a record one expert off the
     router's own choice on every layer, so the replay moves each token."""
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
     sown = jax.jit(lambda params, tokens: obj.token_scores(params, tokens, routing=True).routing)
 
     def draw(seed):
@@ -100,7 +101,7 @@ def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(scan
     fp32. Its own top-k disagrees with the rollout's on some tokens, and the
     replayed forward uses the rollout's experts on every token of every layer."""
     trainer, engine = objective(scan), objective(scan, dtype=jnp.bfloat16)
-    params = trainer.init(jax.random.key(0))
+    params = nn.unbox(trainer.init(jax.random.key(0)))
     stale = jax.tree.map(
         lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype), params
     )
@@ -124,7 +125,7 @@ def test_a_routed_mixer_replays_the_record_as_a_routed_feedforward_does():
         kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=32,
                                                mixture=Mixture(experts=EXPERTS, top_k=TOP_K)))})
     obj = LMObjective(model, SEQ_LEN)
-    params = obj.init(jax.random.key(0))
+    params = nn.unbox(obj.init(jax.random.key(0)))
     tokens = tokens_of(2)
 
     def chosen(routes=None):
@@ -207,7 +208,7 @@ def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
         np.testing.assert_array_equal(chosen[:, :, held], shifted[site][:, :-1, held], err_msg=site)
     with pytest.raises(ValueError):
         obj.token_scores(params, tokens, routes=(shifted[FEEDFORWARD_ROUTES], None))
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 
     def draw(seed):
         params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(2, seed=1000 + seed)
@@ -227,7 +228,7 @@ def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
         kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=32, activation="swigluoai",
                                                mixture=Mixture(experts=EXPERTS, top_k=TOP_K)))})
     obj = LMObjective(model, SEQ_LEN)
-    params = obj.init(jax.random.key(0))
+    params = nn.unbox(obj.init(jax.random.key(0)))
     tokens = tokens_of(2)
     first, second = (np.broadcast_to(np.asarray(experts, np.uint8), (2, SEQ_LEN, TOP_K))
                      for experts in ((0, 1), (2, 3)))
@@ -241,7 +242,7 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
     """A record of the router's own choice, replayed, scores the tokens as the router's own run does: on
     par from that run's float64 truth over drawn models and tokens (check 1)."""
     obj = objective(scan=True)
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 
     def draw(seed):
         params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(2, seed=1000 + seed)
@@ -259,7 +260,7 @@ def test_the_gate_keeps_its_gradient_under_replay():
     is scored from the whole logits, whose head forward mode passes; the tiled
     head's custom backward is another test's."""
     obj, wide = objective(layers=(1, 3)), objective(layers=(1, 3), dtype=jnp.float64)
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 
     def draw(seed):
         params = init(jax.random.fold_in(jax.random.key(0), seed))
@@ -308,7 +309,7 @@ def test_a_replayed_pair_weighs_alike_however_far_below_the_routers_own_choice(p
     scores the same losses and gradients, bit for bit, the router's own
     gradient zero and the pair's not."""
     obj = objective(parallel=parallel)
-    params = obj.init(jax.random.key(0))
+    params = nn.unbox(obj.init(jax.random.key(0)))
     tokens = tokens_of(2)
     direction = jax.random.normal(jax.random.key(5), (32, 1))
     pair = np.isin(np.arange(EXPERTS), (1, 2))
@@ -346,7 +347,7 @@ def test_a_replayed_pair_weighs_alike_however_far_below_the_routers_own_choice(p
 
 def test_tokens_without_a_record_keep_the_routers_own_choice():
     obj = objective()
-    params = obj.init(jax.random.key(0))
+    params = nn.unbox(obj.init(jax.random.key(0)))
     tokens = tokens_of(2)
     native = choices(obj, params, tokens)
     routed = (engine_layout(native, 2) + 3) % EXPERTS
@@ -434,7 +435,7 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
 
     obj, wide = objective(scan=True), objective(scan=True, dtype=jnp.float64)
     grpo = GRPOObjective(obj.model, SEQ_LEN)
-    init = jax.jit(obj.init)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
     first_routes = np.broadcast_to(np.arange(TOP_K, dtype=np.uint8), (4, LAYERS, TOP_K)).copy()
     later_routes = np.broadcast_to(first_routes[0], (7, LAYERS, TOP_K)).copy()
     later_routes[conflict] += TOP_K
@@ -519,7 +520,7 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
     tokens = jnp.asarray([[2, 1, 3, 4, 5, 6]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1, -1, -1]], jnp.int32)
     media = {"pixel_values": jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8)}
-    variables = model.init(jax.random.key(0), tokens, image_indices=indices, conditioning=media)
+    variables = nn.unbox(model.init(jax.random.key(0), tokens, image_indices=indices, conditioning=media))
     routed = np.stack([np.stack([(np.arange(6) + layer) % 4, (np.arange(6) + layer + 1) % 4], -1)
                        for layer in range(2)], 1)[None]
 

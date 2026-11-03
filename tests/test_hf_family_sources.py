@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import (
     assert_pads_as,
     clearing_selections,
@@ -290,7 +291,7 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, case, tmp_path
     config, recorded = _padding_case(name, case, directory)
     model = models.build("causal_transformer",
                          {**translate_config(config), "dtype": "float32", "attention_impl": "reference"})
-    variables = model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32))
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
     table = token_table(variables)[1]
     rows = jnp.arange(table.shape[0])[None]
     placeholders = [config[field] for field in PLACEHOLDERS.get(name, ())]

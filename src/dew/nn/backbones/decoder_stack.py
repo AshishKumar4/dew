@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core import meta
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import Variables, merge, part
@@ -31,7 +32,7 @@ from dew.nn.protocols import StagedStacks
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..mla import INDEXER_COLLECTION
-from ..moe import ROUTER_COLLECTION
+from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
 from .layer_names import array_rows, group_layers, group_name, stage_count
@@ -90,6 +91,27 @@ def on_host(tree) -> bool:
     """Whether any leaf of `tree` sits in host memory."""
     return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
                for leaf in jax.tree.leaves(tree))
+
+
+def _apart(held: dict) -> tuple[dict, dict]:
+    """A run's read-only variables as its layers read them from their banks: the variables a layer is
+    fetched as, and the expert kernels it reads in place where they sit in device memory (`BANKED_EXPERTS`,
+    each the run's whole stack, `dew.nn.moe.experts_apart`), which fetching would copy out a layer at a
+    time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on an H100). Kernels in host memory
+    are fetched with the rest."""
+    params = held.get('params')
+    if params is None or not holds_experts(params):
+        return held, {}
+    apart = experts_apart({'params': params})
+    if on_host(apart[BANKED_EXPERTS]):
+        return held, {}
+    return {**held, 'params': apart['params']}, {BANKED_EXPERTS: apart[BANKED_EXPERTS]}
+
+
+def _with(read, in_place: dict, index):
+    """A layer's read-only variables: those fetched for it, and the expert kernels it reads in place at
+    its `index` in the run (`dew.nn.moe.at_iteration`)."""
+    return read if not in_place else {**read, **at_iteration(in_place, index)}
 
 
 def _layer_slice(tree, index):
@@ -319,8 +341,11 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 return step(layer, carry, per_layer_input, store)[0], None
 
             repeats = count // len(run.specs) if periodic else count
+            # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
+            # axis, which the run's view cuts off again per layer (`_rows`).
             x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=repeats)(run, x, inputs)
+                           in_axes=2, length=repeats,
+                           metadata_params={nn.PARTITION_NAME: None})(run, x, inputs)
     return x
 
 
@@ -400,7 +425,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if reader is not None:
             return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(held, 0)
+        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(_apart(held)[0], 0)
 
     probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
@@ -410,7 +435,9 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         state = held(run)
         cached = (run.variables.get('cache') or None) if run.is_mutable_collection('cache') else None
         first_slice = None if inputs is None else inputs.layer(0)
-        opened = _opened(run, specs[first], probed, staged, state if count == 1 else _layer_slice(state, 0),
+        in_place = {} if count == 1 else _apart({name: run.variables[name] for name in read_only(run)})[1]
+        opened = _opened(run, specs[first], probed, _with(staged, in_place, 0),
+                         state if count == 1 else _layer_slice(state, 0),
                          cached if count == 1 or cached is None else _layer_slice(cached, 0), x,
                          first_slice, store=store, train=train, decode=decode,
                          attention_metadata=attention_metadata)
@@ -422,11 +449,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             following = first_of(index + 1, x)
             x, changed = layer(staged, state, cached, x, first_slice)
         else:
-            banks = {name: run.variables[name] for name in read_only(run)}
+            banks = _apart({name: run.variables[name] for name in read_only(run)})[0]
             x, changed, following = _prefetched_run(
                 banks, staged, state, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1),
-                reader=run.variables.get('streaming', {}).get('bank'))
+                reader=run.variables.get('streaming', {}).get('bank'), in_place=in_place)
         staged = following
         for collection, tree in changed.items():
             for name, value in tree.items():
@@ -475,11 +502,13 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         probed.append((spec, written))
     # Capture filters may select one module name but not another with the same layer spec. Keep
     # that collection open wherever the caller does, independently of the spec's write probe.
-    return sorted(name for name in {*written, *state, 'intermediates'} if name not in ('params', 'streaming')
-                  and run.is_mutable_collection(name))
+    # The parameters, a stream's reader and the expert kernels read in place (`_apart`) are only read.
+    return sorted(name for name in {*written, *state, 'intermediates'}
+                  if name not in ('params', 'streaming', BANKED_EXPERTS) and run.is_mutable_collection(name))
 
 
-def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None):
+def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *, following, reader=None,
+                    in_place=None):
     """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already on the device. Iteration
@@ -490,13 +519,16 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     flax's scan hands them out. The carry is the hidden state, the staged
     variables and the cache, written in place one layer's slice per iteration
     so a decode step holds one banked cache; a cache the layers create comes
-    out stacked like `state`.
+    out stacked like `state`. `in_place` holds the expert kernels each layer
+    reads where they lie (`_apart`), handed to every iteration whole with its
+    index rather than staged.
     """
+    in_place = in_place or {}
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
-        hidden, changed = layer(current, _layer_slice(state, index),
+        hidden, changed = layer(_with(current, in_place, index), _layer_slice(state, index),
                                 None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
@@ -506,7 +538,7 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
     last = count - 1
     staged = following(x)
-    x, changed = layer(current, _layer_slice(state, last),
+    x, changed = layer(_with(current, in_place, last), _layer_slice(state, last),
                        None if cache is None else _layer_slice(cache, last), x,
                        None if inputs is None else inputs.layer(last))
     if cache is not None:
@@ -611,8 +643,25 @@ class BlockStage(nn.Module):
 
 
 def stack_layers(*trees):
-    """Layers' trees stacked on a new leading layer axis, a bank."""
-    return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
+    """Layers' trees stacked on a new leading layer axis, a bank (`with_stacked_axes`)."""
+    return with_stacked_axes(jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees), 1)
+
+
+def with_stacked_axes(tree, count: int):
+    """`tree`, its leaves stacked on `count` new leading axes, with a parameter its module boxed with its axes
+    (`nn.with_logical_partitioning`) keeping its box, which names the new axes none (`meta.add_axis`), as a
+    scan stacking it does (`metadata_params`)."""
+    for _ in range(count):
+        tree = meta.add_axis(tree, 0, {nn.PARTITION_NAME: None})
+    return tree
+
+
+def with_unstacked_axes(tree, count: int):
+    """`tree`, its leaves a row of a stacked run's with `count` leading axes taken off, its boxes keeping the
+    names of the axes the row keeps (`meta.remove_axis`), `with_stacked_axes`' inverse."""
+    for _ in range(count):
+        tree = meta.remove_axis(tree, 0, {nn.PARTITION_NAME: None})
+    return tree
 
 
 def stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
@@ -798,6 +847,8 @@ class StackView:
 
     def stack(self, variables: Mapping[str, Mapping]) -> dict:
         inside = {}
+        # A box keeps its parameter's axes, the stacked layer axis named none (`stack_layers`): a draw's
+        # boxes are the draw's, which a run's second trace (`nn.map_variables` at init) does not redraw.
         for collection, tree in variables.items():
             tree = dict(tree)
             if collection in self.banked:
@@ -873,7 +924,8 @@ class StackView:
             leaves, structure = jax.tree_util.tree_flatten_with_path(held.pop(name))
             rows = [rows_of(path, leaf) for path, leaf in leaves]
             for index, layer in enumerate(layers):
-                tree[layer] = structure.unflatten([cuts[index] for cuts in rows])
+                tree[layer] = with_unstacked_axes(structure.unflatten([cuts[index] for cuts in rows]),
+                                                  len(shape))
         if self.stages > 1 and held:
             tree['stages'] = held
         return tree
@@ -893,8 +945,8 @@ class StackView:
                     "the others; a run reads every one of its layers or none")
             _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
             shape = self.stacked_shape(count)
-            runs[name] = jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape),
-                                      *[tree.pop(layer) for layer in layers])
+            runs[name] = with_stacked_axes(jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape),
+                                                        *[tree.pop(layer) for layer in layers]), len(shape))
         return runs
 
     def _stacked_periods(self, collection: str, tree: dict) -> None:
@@ -925,8 +977,47 @@ class StackView:
                 for repeat, layer in enumerate(layers):
                     # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
                     row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
-                    tree[layer] = jax.tree.map(row, view[f'{prefix}{offset}'])
+                    tree[layer] = with_unstacked_axes(jax.tree.map(row, view[f'{prefix}{offset}']), 1)
         return tree
+
+    def stored_layer(self, tree: Mapping, layer: int, part: str, prefix: str = 'layers_'):
+        """Stored layer `layer`'s subtree `part` (its `mlp`) in `tree`, a collection's where the stack is
+        stored on one stage: the layer's own entry, or its row of the bank of the run that holds it, a
+        periodic run's at its position's repeat (`_stacked_periods`), taken with `index_in_dim` as `_leaf`
+        takes a layer's."""
+        keys, row = self._stored_at(tree, layer, prefix)
+        held = functools.reduce(lambda node, key: node[key], keys, tree)[part]
+        return held if row is None else jax.tree.map(
+            functools.partial(jax.lax.index_in_dim, index=row, keepdims=False), held)
+
+    def with_stored_layer(self, tree: Mapping, layer: int, part: str, value, prefix: str = 'layers_') -> dict:
+        """`tree` with stored layer `layer`'s subtree `part` replaced by `value`, written where
+        `stored_layer` reads it: a bank's row in place, cast to the bank's dtypes, its other rows as
+        stored."""
+        keys, row = self._stored_at(tree, layer, prefix)
+
+        def written(node: Mapping, depth: int) -> dict:
+            if depth < len(keys):
+                return {**node, keys[depth]: written(node[keys[depth]], depth + 1)}
+            put = value if row is None else jax.tree.map(
+                lambda stacked, leaf: jax.lax.dynamic_update_index_in_dim(
+                    stacked, leaf.astype(stacked.dtype), row, axis=0), node[part], value)
+            return {**node, part: put}
+        return written(tree, 0)
+
+    def _stored_at(self, tree: Mapping, layer: int, prefix: str) -> tuple[tuple[str, ...], int | None]:
+        """Where `tree` stores layer `layer` on one stage: the keys down to its entry and its row there,
+        None for an entry of its own."""
+        if f'{prefix}{layer}' in tree:
+            return (f'{prefix}{layer}',), None
+        for first, count in self.groups:
+            name = self._inside_name(first, count, prefix)
+            if first <= layer < first + count and name is not None and name in tree:
+                period = self._period(first, count)
+                if period == 1:
+                    return (name,), layer - first
+                return (name, f'{prefix}{(layer - first) % period}'), (layer - first) // period
+        raise ValueError(f"no stored layer holds layer {layer}")
 
     def _leaf(self, stage: int, offset: int | None, broadcast: bool, path, leaf):
         """One layer's leaf, at `path` below its run, out of a run's stacked one, taken with
@@ -1095,8 +1186,10 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
             lambda index, stage: jax.tree.map(lambda value: jax.lax.dynamic_slice_in_dim(
                 jax.lax.dynamic_index_in_dim(value, index, 0, keepdims=False),
                 view.offset + stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
+        # A box its module drew a parameter in carries the stage axis unnamed (`stack_layers`).
         run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
-                      in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
+                      in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS,
+                      metadata_params={nn.PARTITION_NAME: None})
         live = (step - stage_ids >= 0) & (step - stage_ids < count)
         out = _on_stage_axis(run(stage(module), stages_in, stage_inputs,
                                  jax.tree.map(lambda value: gather(value, ids), held), live))
@@ -1105,7 +1198,8 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
         return (state_io, shift_down(out)), None
 
     loop = nn.scan(iteration, variable_broadcast=view.broadcast,
-                   variable_axes={True: 0}, split_rngs={True: True})
+                   variable_axes={True: 0}, split_rngs={True: True},
+                   metadata_params={nn.PARTITION_NAME: None})
     (state_io, _), _ = loop(model, (state_io, shift), jnp.arange(count + stages - 1))
     # Microbatch 0 finished stages - 1 iterations in, so it sits that
     # many slots along; the rest follow it in order.

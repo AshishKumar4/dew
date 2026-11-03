@@ -9,10 +9,8 @@ import re
 import jax
 import jax.numpy as jnp
 import kernel_compile
-from jax.sharding import NamedSharding, PartitionSpec
 
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_triton
+from dew.nn.kernels.templates import attention as template, attention_triton
 
 
 def _overwritten_mma_operands(module: str) -> tuple[list[str], int, int]:
@@ -50,36 +48,27 @@ def _overwritten_mma_operands(module: str) -> tuple[list[str], int, int]:
 def test_hopper_attention_backward_preserves_its_multiuse_query_tile(tmp_path):
     """At the first derived config (two stages) the raw query tile dK's product reads stays its own until
     that product completes, after its prescaled copy fed the scores."""
-    mesh = kernel_compile._device("sm90")
-    sharding = NamedSharding(mesh, PartitionSpec())
     config = attention_triton.BACKWARD_STEPS[0]
     power, scale = template.prescale(jnp.bfloat16, 128, None)
-    how = algebra.recompute(algebra.Forward(
-        "full", 0, ids=False, scale=scale, score_mod=None, natural=False, initial=False,
-        prescale=power))
-
-    def spec(shape, dtype):
-        return jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
-
-    query = spec((1, 1024, 32, 128), jnp.bfloat16)
-    key = spec((1, 1024, 8, 128), jnp.bfloat16)
-    row = spec((1, 32, 1024), jnp.float32)
-    index = spec((1, 32, 1024), jnp.int32)
-    span = spec((1, 1024), jnp.int32)
+    op = attention_triton._backward_op(score_mod=None, score_kinds=(), score_dtypes=(), scale=scale,
+                                       prescale=power, split=True, natural=False, accurate=template.ACCURATE,
+                                       initial=False)
+    query = jax.ShapeDtypeStruct((1, 1024, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 1024, 8, 128), jnp.bfloat16)
+    row = jax.ShapeDtypeStruct((1, 32, 1024), jnp.float32)
+    index = jax.ShapeDtypeStruct((1, 32, 1024), jnp.int32)
+    span = jax.ShapeDtypeStruct((1, 1024), jnp.int32)
 
     def launch(q, k, v, dout, peak, total, anchor, delta, key_index, start, end):
         return attention_triton._dkv_launch(
             q, k, v, dout, peak, total, anchor, delta, key_index, start, end, None, None, (),
-            score_mod=None, score_kinds=(), scale=scale, prescale=power, grad_scale=scale * power,
-            how=how, block_q=config.block_q, block_k=config.block_k, warps=config.dkv_warps,
-            stages=config.dkv_stages, accurate=template.ACCURATE, interpret=False)
+            score_mod=op.score_mod, score_kinds=op.score_kinds, scale=op.scale, prescale=op.prescale,
+            grad_scale=op.scale * op.prescale, how=op.how, block_q=config.block_q, block_k=config.block_k,
+            warps=config.dkv_warps, stages=config.dkv_stages, accurate=op.accurate, interpret=False)
 
-    with (generation.assumed("sm90"),
-          jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm90"))):
-        lowered = jax.jit(launch).trace(
-            query, key, key, query, row, row, row, row, index, span, span).lower()
-        lowered.compile(compiler_options={
-            "xla_dump_to": str(tmp_path), "xla_dump_emitter_re": "triton"})
+    lowered = kernel_compile.lowered_for(
+        launch, (query, key, key, query, row, row, row, row, index, span, span), "sm90")
+    lowered.compile(compiler_options={"xla_dump_to": str(tmp_path), "xla_dump_emitter_re": "triton"})
 
     dumps = list(tmp_path.glob("*attention_dkv.triton-to-llvm.txt"))
     assert len(dumps) == 1, [path.name for path in tmp_path.iterdir()]

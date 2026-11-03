@@ -20,7 +20,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import compile_kernels, failures
+from kernel_compile import Uncounted, compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
@@ -210,20 +210,46 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-class _Uncounted(grouped_matmul.MosaicGmm):
-    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
-    registers do not hold: a launch whose model misses."""
+@lowers("sm90")
+def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
+    """The dense GEMM's mainloop at a cluster pair's 128 x 256 tile, compiled for a compile-only H100 as the
+    GPU compiles it, has its HGMMAs left running while the next step's operands are awaited: ptxas
+    serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
+    between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
+    the gate's registers and spills called clean."""
+    from kernel_compile import _compiled, ptxas_notes
 
-    def registers(self, ba, config):
-        return 0
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    def call():
+        def gmm(lhs, rhs, sizes):
+            return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
+                                                                          cluster=2),
+                                  transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
+                                  multiprocessors=generation.gpu_target("sm90").multiprocessors)
+
+        return gmm, (jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((1,), jnp.int32))
+
+    record = {"name": "dense gmm", "generation": "sm90", "limit": generation.gpu_target("sm90").shared_limit}
+    with tempfile.TemporaryDirectory(prefix="dew-dense-gemm-") as directory:
+        _compiled(support.KernelCase("dense gmm", call), "sm90", record, directory)
+        assert "error" not in record, record["error"]
+        (ptx,) = Path(directory).glob("*.ptx")
+        notes = ptxas_notes(ptx.read_text(), "sm90")
+    assert "bytes spill stores" in notes, notes
+    assert "serialized" not in notes, notes
 
 
-class _OnlyTile(_Uncounted):
-    """A launch with one tile shape, so refusing that shape exhausts its derivation."""
+class _OnlyTile(Uncounted):
+    """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
+    (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
+    same shape: `wgmma.fed`)."""
 
     def candidate(self, ba, config, target):
-        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
-                and super().candidate(ba, config, target))
+        return (config.block_m == 128 and config.block_n == 256 and config.warpgroups == 2
+                and config.family == "wgmma" and super().candidate(ba, config, target))
 
 
 def _spilling_forward(launch, rows: int, devices):
@@ -264,7 +290,7 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
-    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else _Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -322,7 +348,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
                 while not stop.is_set():
                     rows += 64
-                    forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                    forward, shapes = _spilling_forward(Uncounted(), rows, devices)
                     lowered = jax.jit(forward).trace(*shapes).lower()
                     started.set()
                     lowered.compile()
@@ -330,7 +356,7 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
             started.set()
 
     traced = []
-    lowered = _lowering(*_spilling_forward(_Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
 
     with ThreadPoolExecutor(1) as pool:
         other = pool.submit(others)
@@ -486,11 +512,11 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
 
 def _model(launch, ba, config) -> resources.RegisterModel:
     """What a launch's model decides at `config` for the call `ba`, as the gate holds it to the compiled
-    kernel (`resources.register_model`, `kernel_compile.decisions`), and the scratch the planner sized it by
-    (`resources.scratch_bytes` of `launch_of`'s allocations, its barriers apart), against the kernel's
-    own."""
+    kernel (`resources.register_model`, `kernel_compile.decisions`), and the shared memory the planner
+    sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the
+    kernel's own."""
     family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-    shared = resources.scratch_bytes(family, launch.launch_of(ba, config).scope(config.stages))
+    shared = resources.shared_bytes(family, launch.launch_of(ba, config).scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
 
 
@@ -639,7 +665,17 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+@pytest.fixture
+def libtpu_shared(monkeypatch):
+    """libtpu loaded in this process beside another's: its lock file holds one process's libtpu at a time,
+    so two test workers compiling for a TPU at once failed the second's load (ABORTED, /tmp/libtpu_lockfile).
+    A compile-only TPU needs no device a lock guards, so each loads with libtpu's own allowance and takes no
+    lock file."""
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
+
+
 @COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
@@ -764,10 +800,10 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
+        [report.Binary("a", None, 168, 0, shared=1024), report.Binary("b", None, 255, 40, shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
-    assert set(c["unread"]) == {"tensor memory columns", "binary", "registers", "spills"}
+    assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
     assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
@@ -802,6 +838,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
 
 
 @COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized

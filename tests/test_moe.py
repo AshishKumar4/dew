@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
@@ -307,7 +308,7 @@ def routed_experts(num_experts=8, top_k=1, tokens=6, width=8, hidden=12,
     indices = jnp.asarray(
         np.arange(tokens * top_k).reshape(tokens, top_k) % 3, jnp.int32)
     weights = jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32)
-    variables = experts.init(jax.random.key(1), x, weights, indices)
+    variables = nn.unbox(experts.init(jax.random.key(1), x, weights, indices))
     return experts, variables, x, weights, indices
 
 
