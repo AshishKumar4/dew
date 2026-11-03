@@ -217,10 +217,21 @@ class Ticket(Timed):
                 _log.error("exception calling a tokens callback for %r", self, exc_info=error)
 
 
+@dataclass(frozen=True)
+class _KeyData:
+    """The shape and dtype of the data of a key of one implementation, and the key's own dtype."""
+
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    key_type: np.dtype
+
+
 @functools.cache
-def _key_data(impl: str) -> jax.ShapeDtypeStruct:
-    """The shape and dtype of the data of a key of `impl`, read without a device."""
-    return jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0, impl=impl)))
+def _key_data(impl: str) -> _KeyData:
+    """A key of `impl`'s data's shape and dtype and its own dtype, read once, without a device."""
+    key = jax.eval_shape(lambda: jax.random.key(0, impl=impl))
+    bits = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0, impl=impl)))
+    return _KeyData(bits.shape, bits.dtype, key.dtype)
 
 
 def _seed(key: int | jax.Array, impl: str) -> int | jax.Array:
@@ -231,7 +242,7 @@ def _seed(key: int | jax.Array, impl: str) -> int | jax.Array:
     if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
         return int(key)
     typed = request_key(key)
-    if typed.dtype != jax.eval_shape(lambda: jax.random.key(0, impl=impl)).dtype:
+    if typed.dtype != _key_data(impl).key_type:
         raise ValueError(f"a served request's key is {jax.random.key_impl(typed)}, and the server batches "
                          f"keys of the implementation that was the default as it was built, {impl}; pass an "
                          "integer seed or a key of that implementation")
