@@ -56,8 +56,8 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.backbones.decoder_stack import DecoderBank
-    from dew.nn.continuum import HeadTerms
+    from dew.nn.backbones.decoder_stack import DecoderBank, StackView
+    from dew.nn.continuum import HeadTerms, LevelTerms
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
@@ -288,30 +288,50 @@ class ReadsClips(Protocol):
 class SteppedInContext(Protocol):
     """A model whose head reads parameters an objective steps in context, a window at a time
     (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
-    variables, None without a level; the tree with others in their place; and the two halves of the
-    head the steps run between, the level on final states (`continuum_states`) and the head past it
-    (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
+    variables, None without a level (a chain's levels' trees in order, `dew.nn.continuum`); the tree
+    with others in their place; and the two halves of the head the steps run between, the levels on
+    final states (`continuum_states`, each level alone by its index) and the head past them
+    (`head_logits`). Its owner keeps the levels' place in its tree, so an objective never reads it;
+    `in_context_levels` counts them.
     `in_context` says whether the model holds a level, and what a damped step's rate reads
     (`ChunkAdaptation.damped`): `head_bounds`, read from the bound model at the states `head_logits`
     reads, what bounds the curvature and slope of a slot's loss in them (`HeadTerms`); `level_terms`, for
-    the parts that step, the level's |x|^2 and |f|^2 at final states as its maps multiply them, its output
-    map's norm and how much its rounding can grow it, and its activation's derivative bounds."""
+    the parts that step, a level's terms at the states it reads (`LevelTerms`), a level after a stepped
+    one `passed` through."""
 
     @property
     def in_context(self) -> bool: ...
 
+    @property
+    def in_context_levels(self) -> int: ...
+
     def head_bounds(self, states: jax.Array) -> HeadTerms: ...
 
-    def level_terms(self, states: jax.Array, parts: tuple[str, ...]
-                    ) -> tuple[jax.Array, jax.Array, jax.Array, float, float, float]: ...
+    def level_terms(self, states: jax.Array, parts: tuple[str, ...], index: int = 0,
+                    passed: bool = False) -> LevelTerms: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
     def with_in_context_level(self, variables: VariableDict, level: VariableDict) -> VariableDict: ...
 
-    def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
+    def continuum_states(self, hidden: jax.Array, index: int | None = None) -> jax.Array: ...
 
     def head_logits(self, states: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class SteppedFeedForward(Protocol):
+    """A decoder whose own feed-forward blocks an objective steps in context, chunk by chunk through its
+    decode cache (`dew.objectives.lm.stacking`, Nested Learning's ad-hoc level stacking): how a tree of its
+    variables stores its layer stack (`stored_view`), where the blocks of some layers are read and written
+    (`dew.nn.continuum.feedforward_levels`), its cache (`init_cache`) and a cached call's states and
+    logits (`states_and_logits`)."""
+
+    def stored_view(self, store: VariableDict) -> StackView: ...
+
+    def init_cache(self, batch_size: int): ...
+
+    def states_and_logits(self, tokens: jax.Array, **kwargs): ...
 
 
 @runtime_checkable

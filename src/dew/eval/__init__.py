@@ -9,6 +9,10 @@ compute the same numbers over image sets you already have, without a trainer
 or a batch; `CLIPScore().scores(...)` gives each image's, and
 `clip_image_features` the CLIP image embedding a head can read.
 
+Continual learning is measured by `dew.eval.continual`: a run over a sequence of tasks scored on every task
+after each (`continual_run`), its accuracy matrix's average accuracy, forgetting and backward transfer
+(`AccuracyMatrix`), and a language model's choice among labels by their log-likelihood (`label_scores`).
+
 A classifier's forecasts over its options calibrate by `dew.eval.calibration`: a fitted temperature
 (`fit_temperature`), a histogram map, an abstention threshold, and the calibration error and
 risk-coverage area they are scored by.
@@ -31,6 +35,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         risk_coverage_area,
     )
     from dew.eval.common import ImageMetric, Mean
+    from dew.eval.continual import AccuracyMatrix, continual_run, label_accuracy, label_scores
     from dew.eval.fid import FID, frechet_distance
     from dew.eval.images import CLIPDistance, CLIPScore, clip_image_features
     from dew.eval.lpips import LPIPS, LPIPSNetwork
@@ -46,6 +51,10 @@ _EXPORTS = {
     "risk_coverage_area": "dew.eval.calibration",
     "ImageMetric": "dew.eval.common",
     "Mean": "dew.eval.common",
+    "AccuracyMatrix": "dew.eval.continual",
+    "continual_run": "dew.eval.continual",
+    "label_accuracy": "dew.eval.continual",
+    "label_scores": "dew.eval.continual",
     "FID": "dew.eval.fid",
     "frechet_distance": "dew.eval.fid",
     "CLIPDistance": "dew.eval.images",
@@ -66,6 +75,7 @@ __all__ = [
     "LPIPS",
     "PSNR",
     "SSIM",
+    "AccuracyMatrix",
     "CLIPDistance",
     "CLIPScore",
     "ImageMetric",
@@ -73,10 +83,13 @@ __all__ = [
     "Mean",
     "abstention_threshold",
     "clip_image_features",
+    "continual_run",
     "expected_calibration_error",
     "fit_temperature",
     "frechet_distance",
     "histogram_map",
+    "label_accuracy",
+    "label_scores",
     "peak_signal_noise_ratio",
     "reliability_bins",
     "risk_coverage_area",

@@ -1087,7 +1087,7 @@ class Trainer(Generic[Loss, Effects]):
         def lower(split: int, narrow: bool, lowering: bool = True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung), lowering=lowering)
+                                   recorded_launches(recorded, rung), lowering=lowering, capacity=capacity)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1135,13 +1135,14 @@ class Trainer(Generic[Loss, Effects]):
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
-                   mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None
-                   ) -> Candidate:
+                   mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None,
+                   capacity: int | None = None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
         alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
         `launches` are its kernel launches where a record holds them, which settle their configs before it
         lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
-        (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
+        (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`). `capacity` is
+        the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split, narrow)
         shardings = self.shardings(prepared)
@@ -1176,7 +1177,8 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
-            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split, self.optimizer)
+            (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split, self.optimizer,
+            capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)

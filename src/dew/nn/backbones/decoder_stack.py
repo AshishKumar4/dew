@@ -956,6 +956,45 @@ class StackView:
                     tree[layer] = jax.tree.map(row, view[f'{prefix}{offset}'])
         return tree
 
+    def stored_layer(self, tree: Mapping, layer: int, part: str, prefix: str = 'layers_'):
+        """Stored layer `layer`'s subtree `part` (its `mlp`) in `tree`, a collection's where the stack is
+        stored on one stage: the layer's own entry, or its row of the bank of the run that holds it, a
+        periodic run's at its position's repeat (`_stacked_periods`), taken with `index_in_dim` as `_leaf`
+        takes a layer's."""
+        keys, row = self._stored_at(tree, layer, prefix)
+        held = functools.reduce(lambda node, key: node[key], keys, tree)[part]
+        return held if row is None else jax.tree.map(
+            functools.partial(jax.lax.index_in_dim, index=row, keepdims=False), held)
+
+    def with_stored_layer(self, tree: Mapping, layer: int, part: str, value, prefix: str = 'layers_') -> dict:
+        """`tree` with stored layer `layer`'s subtree `part` replaced by `value`, written where
+        `stored_layer` reads it: a bank's row in place, cast to the bank's dtypes, its other rows as
+        stored."""
+        keys, row = self._stored_at(tree, layer, prefix)
+
+        def written(node: Mapping, depth: int) -> dict:
+            if depth < len(keys):
+                return {**node, keys[depth]: written(node[keys[depth]], depth + 1)}
+            put = value if row is None else jax.tree.map(
+                lambda stacked, leaf: jax.lax.dynamic_update_index_in_dim(
+                    stacked, leaf.astype(stacked.dtype), row, axis=0), node[part], value)
+            return {**node, part: put}
+        return written(tree, 0)
+
+    def _stored_at(self, tree: Mapping, layer: int, prefix: str) -> tuple[tuple[str, ...], int | None]:
+        """Where `tree` stores layer `layer` on one stage: the keys down to its entry and its row there,
+        None for an entry of its own."""
+        if f'{prefix}{layer}' in tree:
+            return (f'{prefix}{layer}',), None
+        for first, count in self.groups:
+            name = self._inside_name(first, count, prefix)
+            if first <= layer < first + count and name is not None and name in tree:
+                period = self._period(first, count)
+                if period == 1:
+                    return (name,), layer - first
+                return (name, f'{prefix}{(layer - first) % period}'), (layer - first) // period
+        raise ValueError(f"no stored layer holds layer {layer}")
+
     def _leaf(self, stage: int, offset: int | None, broadcast: bool, path, leaf):
         """One layer's leaf, at `path` below its run, out of a run's stacked one, taken with
         `index_in_dim`: an index array would be a gather, which over a host-resident bank needs

@@ -67,6 +67,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
+from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
@@ -86,6 +87,7 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     PositionCapacity,
+    SteppedFeedForward,
     SteppedInContext,
     TokenModel,
     head_table,
@@ -107,7 +109,13 @@ from dew.objectives.base import (
     merge_totals,
     model_rngs,
 )
-from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
+from dew.objectives.lm.adaptation import (
+    CARRIED,
+    ChunkAdaptation,
+    _carried_start,
+    _carried_update,
+    adapted_scores,
+)
 from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
@@ -118,6 +126,7 @@ from dew.objectives.lm.chunked import (
     support_log_probs,
 )
 from dew.objectives.lm.head import HeadedObjective
+from dew.objectives.lm.stacking import stacked_scores
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.text import Sampling
 
@@ -391,6 +400,11 @@ def _global_qk_max(qk) -> jax.Array | None:
     return jnp.max(jnp.stack(found)) if found else None
 
 
+_ROUTED = "routed"
+"""Where a run that carries its continuum level holds the router counts among its effects, beside what
+the level moved (`CARRIED`)."""
+
+
 class _Scored(NamedTuple):
     """One scoring of a batch (`LMObjective._scored_loss`): the loss's statistics and reports, the
     token scores they came from, and each token's share of the prediction's total, `[B, seq_len]`,
@@ -423,7 +437,9 @@ class Scores(NamedTuple):
     where `token_scores` was asked for the sums alone (`z_loss`): then only
     the totals carry a gradient. Otherwise they are None. `logits` is the
     `[B, seq_len, vocab]` logits the losses were scored from, where
-    `token_scores` was asked for them, else None.
+    `token_scores` was asked for them, else None. `moved` is how far a
+    continuum level that a run carries moved in context (`Adapted.moved`), else
+    None.
     """
 
     losses: jax.Array
@@ -439,6 +455,24 @@ class Scores(NamedTuple):
     total: jax.Array | None = None
     logits: jax.Array | None = None
     inspected: dict | None = None
+    moved: Mapping | None = None
+
+
+def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
+                    conditioned: bool) -> None:
+    """Refuse what a decoder stepping its own feed-forward blocks in context (`ChunkAdaptation.layers`)
+    cannot score: its trunk runs chunk by chunk through its decode cache (`dew.objectives.lm.stacking`),
+    which gathers no collection (`routing`, `qk_stats`, `indexer`, `watched`), keeps no layer's states
+    and no prediction depth's inputs, replays no rollout's experts and reads no conditioning. Its head
+    reads the whole logits, a summed loss's z-loss from their log partition (`_scored_loss`)."""
+    asked = [name for name, given in (("collections", bool(collections)), ("depths", depths),
+                                      ("layers", bool(layers)), ("routes", routes is not None),
+                                      ("conditioning", conditioned)) if given]
+    if asked:
+        raise ValueError(f"a decoder stepping its own feed-forward blocks in context runs chunk by chunk "
+                         f"through its decode cache, which gathers no collection, keeps no layer's or "
+                         f"prediction depth's states, replays no experts and reads no conditioning: "
+                         f"{asked} are asked")
 
 
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
@@ -544,8 +578,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return reduce_routed(self.balance, stats)
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        """`variables` with the router counts `balance` took applied, once per committed update."""
-        return apply_routed(self.balance, variables, effects)
+        """`variables` with the router counts `balance` took applied, once per committed update, and what
+        a run that carries its continuum level carries on (`_carried_update`)."""
+        if CARRIED not in effects:
+            return apply_routed(self.balance, variables, effects)
+        routed = effects.get(_ROUTED)
+        return {CARRIED: _carried_update(variables[CARRIED], effects[CARRIED]),
+                **({} if routed is None else apply_routed(self.balance, variables, routed))}
 
     def _missing_flops(self, model) -> str | None:
         """What the forward and training counts both lack, or None."""
@@ -836,6 +875,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
+        adaptation = self.adaptation
+        if adaptation is not None and adaptation.layers:
+            # The decoder's own blocks step chunk by chunk through its cache, which runs the trunk itself.
+            _refuse_stacked(opened, depths=depths, layers=layers, routes=routes,
+                            conditioned=bool(prepared.conditioning))
+            return self._stacked_scores(params, prepared, inputs, targets, roles, rows, adaptation,
+                                        predict=predict, logits=logits, train=train, rngs=rngs)
         with self._watched(prepared, watched):
             hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
                                                    layers, progress)
@@ -846,12 +892,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self.fused_head(self.model, params) if z_loss is not None else None
-        dtype = at_least_fp32(hidden.dtype)
-        weights = self._row_weights(prepared, roles, dtype)
-        if rows is not None:
-            # A filled row's targets weigh nothing, so a fused head's sum counts each real row once.
-            weights = jnp.where(rows[:, None] > 0, weights, 0)
-        total, (losses, predicted, log_z), whole = self._head_scores(
+        weights = self._target_weights(prepared, roles, at_least_fp32(hidden.dtype), rows)
+        total, (losses, predicted, log_z), whole, moved = self._head_scores(
             params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
@@ -876,7 +918,29 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             depth_scores = self._depth_scores(params, states, targets, prepared, roles, losses.dtype, table,
                                               rows)
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
-                      whole, inspected)
+                      whole, inspected, moved)
+
+    def _target_weights(self, prepared, roles, dtype, rows):
+        """Each target's weight in the loss (`_row_weights`), a filled row's (`rows`) at nothing, so a fused
+        head's sum counts each real row once."""
+        weights = self._row_weights(prepared, roles, dtype)
+        return weights if rows is None else jnp.where(rows[:, None] > 0, weights, 0)
+
+    def _stacked_scores(self, params, prepared, inputs, targets, roles, rows, adaptation: ChunkAdaptation, *,
+                        predict, logits: bool, train: bool, rngs) -> Scores:
+        """`token_scores` of a decoder stepping its own feed-forward blocks in context
+        (`ChunkAdaptation.layers`, `dew.objectives.lm.stacking`), which runs its trunk chunk by chunk
+        through its decode cache: no collection, layer's states or prediction depth (`_refuse_stacked`)."""
+        predict = self.token_accuracy if predict is None else predict
+        dtype = at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32))
+        weights = self._target_weights(prepared, roles, dtype, rows)
+        hidden, adapted = stacked_scores(self.model, params, inputs, targets, weights,
+                                         prepared.slice_tokens(stop=-1).token_fields, adaptation,
+                                         predict=predict, logits=logits, train=train, rngs=rngs)
+        losses = adapted.losses
+        correct = None if adapted.predicted is None else (adapted.predicted == targets).astype(losses.dtype)
+        return Scores(losses, weights.astype(losses.dtype), adapted.log_z, correct, hidden, (), None, [],
+                      None, None, None, adapted.logits, None, adapted.moved)
 
     def _depth_scores(self, params, states, targets, prepared, roles, dtype, table, rows):
         """Each prediction depth's `(losses, weights, total)` from its states, depth d's targets the row's
@@ -901,21 +965,21 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """The head's scores of `targets` from final states `hidden`: the weighted sum where a fused
         head took it (`table`), each target's loss, top-1 column and log partition, and the whole
         logits where asked; through the continuum level stepped in context (`adaptation`), the
-        whole logits, the fused head or the tiled head."""
+        whole logits, the fused head or the tiled head; how far a carried level moved (`Adapted.moved`)."""
         if self.adaptation is not None:
             # The level steps window by window over these targets, weighted as the loss weighs them.
             adapted = adapted_scores(self.model, params, hidden, targets, weights,
                                      prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
                                      predict=predict, logits=logits)
-            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
+            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits, adapted.moved
         if logits:
             whole = model_logits(self.model, params, hidden)
-            return None, logits_cross_entropy(whole, targets, predict=predict), whole
+            return None, logits_cross_entropy(whole, targets, predict=predict), whole, None
         if table is not None:
             total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
                                             tile=self.head_tile, predict=predict)
-            return total, scores, None
-        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None
+            return total, scores, None, None
+        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None, None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -1230,7 +1294,12 @@ class LMObjective(TokenScorer):
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         if adaptation is not None:
-            if not _steps_in_context(self.model):
+            # The model as its protocol names it, apart from `self.model`, which stays a module.
+            stepped: object = self.model
+            if adaptation.layers and not isinstance(stepped, SteppedFeedForward):
+                raise ValueError("adaptation steps the decoder's own feed-forward blocks, which this model "
+                                 "does not name (`SteppedFeedForward`)")
+            if not adaptation.layers and not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
                                  "(CausalTransformer.continuum, `SteppedInContext`)")
             if samples is not None:
@@ -1266,6 +1335,21 @@ class LMObjective(TokenScorer):
         whole. The warm-up may start from a dense checkpoint that has no
         indexer yet, and a fresh init supplies exactly those weights.
         """
+        adaptation = self.adaptation
+        if adaptation is not None and adaptation.carry == "run" and CARRIED not in tree:
+            # A run that carries its level starts with nothing carried.
+            # The level as the model reads it, its frozen leaves among it; the tree keeps its split.
+            if adaptation.layers:
+                # The decoder's own blocks of those layers are the levels (`dew.objectives.lm.stacking`).
+                thawed = thaw(tree)
+                level = (feedforward_levels(self.model.stored_view(thawed), thawed, adaptation.layers)
+                         if isinstance(self.model, SteppedFeedForward) else None)
+            else:
+                level = (self.model.in_context_level(thaw(tree)) if isinstance(self.model, SteppedInContext)
+                         else None)
+            if level is None:
+                raise ValueError("the model has no continuum level or feed-forward block to step in context")
+            tree = {**tree, CARRIED: _carried_start(level)}
         if self.indexer is not None:
             tree = thaw(tree)
             drawn = jax.eval_shape(self.fresh_variables, key, None)
@@ -1444,7 +1528,7 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict, rows=rows)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _ = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
@@ -1501,6 +1585,10 @@ class LMObjective(TokenScorer):
             statistics, effects, metrics = balance.compose(
                 params, prediction, routing or {}, batch, queries, prepared.token_fields)
             reported.update(metrics)
+        if scores.moved is not None:
+            # What a carried level moved (a run that carries it, `Adapted.moved`), beside the router counts,
+            # which an update sums and carries on.
+            effects = {CARRIED: scores.moved, **({} if effects is None else {_ROUTED: effects})}
         if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:

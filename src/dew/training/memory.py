@@ -347,12 +347,12 @@ def stated(memory: Sequence[Mapping[str, int]]) -> bool:
     return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
 
 
-def judged(device) -> bool:
+def judged(device, capacity: int | None = None) -> bool:
     """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
-    a device of this process judges it where it states its memory, which a CPU does not, and a device with
-    none attached (a compile-only GPU, `dew.training.ahead.compile_only_gpus`) against the capacity a plan
-    states for it."""
-    return device not in jax.local_devices() or stated([device_memory(device)])
+    where it states its memory (`device_memory`), which a CPU does not, and a device with none attached (a
+    compile-only GPU, `dew.training.ahead.compile_only_gpus`) only at the `capacity` a plan states for it.
+    The plan's walk and the footprint's trace read this one answer (`FitSearch.walked`)."""
+    return stated([device_memory(device, capacity)])
 
 
 def stranding(device, memory: Mapping[str, int]) -> int:
