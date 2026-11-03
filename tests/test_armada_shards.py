@@ -160,6 +160,23 @@ def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_wai
                                               for start, stop in spans]
 
 
+def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_of_its_judge(ci, tmp_path):
+    """Once a site runs as map tasks, the durations record holds no whole run of it: its test's seconds are what
+    one of its tasks took, its judge's pooling among them. A map task armada has not measured (a later one its
+    judge has not asked for since) weighs its units at the rate of the site's map tasks armada measured, which
+    its first stage, run every time, always is; so a later wave's 8-seed tasks of a site whose first 4 seeds took
+    40 s weigh 80 s each, and armada gives the wave containers for what they take, never the 2 s judge's seconds
+    over the site's seeds (2026-11-03: 267 later tasks of about 85 s each, weighed under 1 s, were given 48
+    containers and ran 10 minutes)."""
+    site_checkout(tmp_path)
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
+    spans = [(0, 4), (4, 12), (12, 20)]
+    names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
+    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": {names[0]: 40.0}})}
+    assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
+
+
 def test_a_weighed_sites_units_are_map_tasks_of_their_own_past_its_unweighted_ones(ci, tmp_path):
     """A check-1 site that declares a weighed check, check1_shards(seeds=4, per_task=8, conditioning=2,
     conditioning_per_task=3), plans its unweighted units as without it (0 to 20, in tasks of at most 8) and
