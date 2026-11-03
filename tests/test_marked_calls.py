@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import checkify
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import equations
 
@@ -27,10 +28,15 @@ def body(x, y):
 def test_a_marked_span_computes_as_its_body_and_stays_one_call_of_its_kind_through_every_transform(kind):
     """A marked span computes what its body does, and its program holds it as one call of its kind; so do
     its derivatives forward and backward (`jax.jvp`, `jax.linearize`, `jax.grad`), its batched form
-    (`jax.vmap`), its checkpointed one (`jax.checkpoint`) and its sharded one (`jax.shard_map`)."""
+    (`jax.vmap`), its checkpointed one (`jax.checkpoint`), its sharded one (`jax.shard_map`) and its
+    checked one (`checkify.checkify`, as a sampler's decode step checks its program), which runs as its body
+    does."""
     spanned = marked(kind, body)
     x, y = jnp.linspace(0.1, 1.0, 8), jnp.linspace(1.0, 2.0, 8)
     np.testing.assert_array_equal(np.asarray(jax.jit(spanned)(x, y)), np.asarray(jax.jit(body)(x, y)))
+    error, checked = jax.jit(checkify.checkify(spanned))(x, y)
+    error.throw()
+    np.testing.assert_array_equal(np.asarray(checked), np.asarray(jax.jit(body)(x, y)))
 
     def loss(x, y):
         return jnp.sum(spanned(x, y))
@@ -44,6 +50,7 @@ def test_a_marked_span_computes_as_its_body_and_stays_one_call_of_its_kind_throu
         "checkpoint": jax.grad(jax.checkpoint(loss)),
         "shard_map": jax.shard_map(spanned, mesh=Mesh(np.array(jax.devices()[:1]), ("rows",)),
                                    in_specs=PartitionSpec("rows"), out_specs=PartitionSpec("rows")),
+        "checkify": checkify.checkify(spanned),
     }
     for name, function in transformed.items():
         found = kinds_of(jax.make_jaxpr(function)(x, y) if name != "vmap"
