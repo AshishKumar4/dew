@@ -9,7 +9,6 @@ import math
 import jax
 import numpy as np
 import reference_error as gate
-from check1_statistics import shown
 
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
@@ -32,9 +31,9 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
         allowed = max(their_row, float(gate.log_over(floor, 1.0)))
         if not row <= math.log(gate.ROW_FACTOR) + allowed:
             over.append(("row", row - allowed,
-                         f"the worst row is {shown(row)} from float64 over its size, the reference's "
-                         f"{shown(their_row)}, allowed "
-                         f"{shown(math.log(gate.ROW_FACTOR) + allowed)}"))
+                         f"the worst row is {gate.shown(row)} from float64 over its size, the reference's "
+                         f"{gate.shown(their_row)}, allowed "
+                         f"{gate.shown(math.log(gate.ROW_FACTOR) + allowed)}"))
     zero = ~sized & ~(mine <= gate.ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])

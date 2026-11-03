@@ -80,6 +80,7 @@ from check1_statistics import (
     FEWEST_SEEDS,
     LOG_ZERO,
     LOWER_TAIL,
+    NARROW_FACTORS,
     PARITY,
     PREVIOUS_TAILS,
     REDRAW,
@@ -91,6 +92,7 @@ from check1_statistics import (
     ZeroRows,
     _interval,
     _over,
+    _paired_rows,
     _pooled,
     _scaled_rms,
     _sized,
@@ -98,12 +100,12 @@ from check1_statistics import (
     _typical_status,
     _unresolved_against_itself,
     _verdict,
-    _worst_rows,
     log_over,
     log_ratio,
     log_sum,
     pooled_zero_rows,
     root_mean,
+    shown,
 )
 from float64_terms import float64_terms
 from map_judge import DRAWS, PoolRefused, ask_later, judging, pooled_units, record_units
@@ -720,7 +722,7 @@ class _Draws:
     reference's; `log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
     `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
-    width (its last axis's length, 0 for a leaf of no rows)."""
+    width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
@@ -732,8 +734,8 @@ class _Draws:
     """A site whose leaves stack independent examples on their first axis (`assert_as_exact`'s
     `examples`): each seed's per-example log RMS ratios of each leaf (`_example_ratios`), else None."""
     example_rows: list[list[np.ndarray | None]] | None = None
-    """At such a site, each seed's per-example logs of Dew's worst row and the reference's on the same
-    example, each over its size, an (examples, 2) array a leaf (`_example_worst_rows`), else None."""
+    """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
+    on the same example, each over its size (`_example_worst_rows`), else None."""
 
     def joined(self, other: "_Draws") -> "_Draws":
         examples, example_rows = ((getattr(self, field) + getattr(other, field)
@@ -761,8 +763,8 @@ class _Draws:
         return None if any(ratios is None for ratios in found) else found
 
     def of_example_rows(self, index: int) -> np.ndarray | None:
-        """Leaf `index`'s per-example worst-row logs over every seed, Dew's and the reference's, or None
-        where the site stacks no examples or the leaf has no rows (`_example_worst_rows`)."""
+        """Leaf `index`'s per-example paired worst-row log ratios over every seed, or None where the site
+        stacks no examples or the leaf has no rows (`_example_worst_rows`)."""
         if self.example_rows is None or any(seed[index] is None for seed in self.example_rows):
             return None
         return np.concatenate([seed[index] for seed in self.example_rows])
@@ -774,9 +776,9 @@ class _Draws:
     def against_larger(self, library: "_Draws", leaves: Sequence[str]) -> "_Draws":
         """These draws judged against the larger of their reference's error and `library`'s, the same
         Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
-        exception's `leaves` alone: seed by seed and leaf by leaf, the reference's error and rows of float64
-        zero are the larger error's arm's, its worst row the larger arm's worst row whichever that is (row
-        3684), and a value must be finite in both. Every other leaf is the reference's alone."""
+        exception's `leaves` alone: seed by seed and leaf by leaf, the reference's evidence (its error,
+        its worst row, its rows of float64 zero) is whichever of the two arms' error is the larger there,
+        and a value must be finite in both. Every other leaf is the reference's alone."""
         if library.names != self.names or len(library.mine) != len(self.mine):
             raise AssertionError("the library arm's draws are not the reference's")
         unknown = sorted(set(leaves) - set(self.names))
@@ -786,8 +788,7 @@ class _Draws:
         covered = np.isin(self.names, leaves)
         pick = (library.theirs > self.theirs) & covered
         worst = self.worst.copy()
-        worst[..., 1] = np.where(covered, np.fmax(library.worst[..., 1], self.worst[..., 1]),
-                                 self.worst[..., 1])
+        worst[..., 1] = np.where(pick, library.worst[..., 1], self.worst[..., 1])
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
@@ -1165,9 +1166,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
         [[] for _ in arms], [[] for _ in arms], None, None
-    # Each arm's per-example ratios and worst rows of the draw read, and of every draw read (`examples`).
-    stacked, stacked_rows = [None for _ in arms], [None for _ in arms]
-    per_example, per_example_rows = [[] for _ in arms], [[] for _ in arms]
+    # Each arm's per-example ratios of the draw being read, and of every draw read (`examples`).
+    stacked: list = [None for _ in arms]
+    stacked_rows: list = [None for _ in arms]
+    per_example: list[list] = [[] for _ in arms]
+    per_example_rows: list[list] = [[] for _ in arms]
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
@@ -1230,12 +1233,13 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
                     if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
                         _of_its_inputs(label, "the reference", arm, here, other)
-                if examples and true_here is truth:
-                    stacked[at_arm], stacked_rows[at_arm] = _examples_at(
-                        stacked[at_arm], stacked_rows[at_arm], prepared, other, _term_leaves(terms, truth),
-                        first=mine_at is ordered[0][0])
-                elif examples and mine_at is ordered[0][0]:
-                    stacked[at_arm] = stacked_rows[at_arm] = [None] * len(prepared.leaves)
+                if examples and mine_at is ordered[0][0]:
+                    # The draw's own order's examples, paired where both arms hold the one truth.
+                    held_here = jax.device_get(other)
+                    stacked[at_arm], stacked_rows[at_arm] = (
+                        (_example_ratios(prepared.leaves, held_here, prepared.truths),
+                         _example_worst_rows(prepared.leaves, held_here, prepared.truths))
+                        if true_here is truth else ([None] * len(prepared.leaves),) * 2)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else _over_orders(rows[at_arm], evidence)
@@ -1250,7 +1254,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             zero_rows[at_arm].append([entry[4] for entry in row])
             finite[at_arm].append([entry[5] for entry in row])
             per_example[at_arm].append(stacked[at_arm])
-            per_example_rows[at_arm].append(_paired_examples(stacked_rows[at_arm]))
+            per_example_rows[at_arm].append(stacked_rows[at_arm])
     drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
                     np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
                     np.asarray(finite[at_arm]), widths, per_example[at_arm] if examples else None,
@@ -1258,22 +1262,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
              for at_arm in range(len(arms))]
     first = drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
     return [first, *drawn[len(arms) - len(also):]] if also else first
-
-
-def _examples_at(ratios, worsts, prepared: "_Prepared", other, terms, *, first: bool):
-    """An arm's examples on one order of a draw against Dew's (`prepared`): their ratios the draw's own
-    order's (`first`), each arm's worst rows its worst over the orders so far (`_example_worst_rows`)."""
-    held = jax.device_get(other)
-    ratios = _example_ratios(prepared.leaves, held, prepared.truths) if first else ratios
-    found = _example_worst_rows(prepared.leaves, held, prepared.truths, terms)
-    return ratios, found if worsts is None else [
-        None if one is None or two is None else (np.fmax(one[0], two[0]), np.fmax(one[1], two[1]))
-        for one, two in zip(worsts, found, strict=True)]
-
-
-def _paired_examples(worsts) -> list[np.ndarray | None] | None:
-    """Each leaf's per-example worst rows of a draw, Dew's and the reference's logs side by side."""
-    return None if worsts is None else [None if pair is None else np.stack(pair, axis=-1) for pair in worsts]
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
@@ -1299,14 +1287,14 @@ def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
     return found
 
 
-def _example_worst_rows(leaves, references, truths, terms=None) -> list[tuple | None]:
-    """Each leaf's per-example worst rows at a site that stacks examples (`examples`): on each example,
-    Dew's (`leaves`) and the reference's worst row's RMS error over its size by their logs, each row of the
-    last axis sized as every row is (`_LaidTruths.of`, by its truth or its `terms`), none under RESOLUTION of
-    its leaf's RMS. None for a leaf under rank two, or with an example of no sized row (row 3684)."""
-    found: list[tuple | None] = []
-    for leaf, reference, truth, term in zip(leaves, jax.tree.leaves(references), truths,
-                                            terms or [None] * len(truths), strict=True):
+def _example_worst_rows(leaves, references, truths) -> list[np.ndarray | None]:
+    """Each leaf's per-example paired worst rows at a site that stacks examples (`assert_as_exact`'s
+    `examples`): on each example, the log of Dew's worst row's RMS error from float64 over its size, less
+    the reference's worst row's on the same example, its rows those of the leaf's last axis, sized by their
+    truth's RMS, rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no
+    rows), or an example with no sized row."""
+    found: list[np.ndarray | None] = []
+    for leaf, reference, truth in zip(leaves, jax.tree.leaves(references), truths, strict=True):
         truth = np.asarray(truth, np.float64)
         if truth.ndim < 2 or isinstance(reference, RecordedLeaf):
             found.append(None)
@@ -1314,10 +1302,7 @@ def _example_worst_rows(leaves, references, truths, terms=None) -> list[tuple | 
         width = truth.shape[-1]
         rows = truth.reshape(truth.shape[0], -1, width)
         sizes = np.stack([_scaled_rms(example) for example in rows])
-        if term is not None:
-            termed = np.abs(np.asarray(term, np.float64)).reshape(rows.shape)
-            sizes = np.maximum(sizes, np.stack([_scaled_rms(example) for example in termed]))
-        sized = sizes > RESOLUTION * float(np.sqrt(np.mean(np.square(truth))))
+        sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(rows), axis=(1, 2)))[:, None]
         if not sized.any(axis=1).all():
             found.append(None)
             continue
@@ -1327,7 +1312,7 @@ def _example_worst_rows(leaves, references, truths, terms=None) -> list[tuple | 
             logs = log_over(np.stack([_scaled_rms(example) for example in errors]),
                             np.where(sized, sizes, 1.0))
             worst.append(np.max(np.where(sized, logs, LOG_ZERO), axis=1))
-        found.append((worst[0], worst[1]))
+        found.append(worst[0] - worst[1])
     return found
 
 
@@ -1338,14 +1323,13 @@ def _leaf_paths(tree) -> list[str]:
 @dataclasses.dataclass(frozen=True)
 class _Prepared:
     """Dew's side of a draw's evidence, read once for every reference (`_evidence`): its leaves and its
-    truth's on the host, their paths, the truth's laid rows, Dew's summaries and whether terms size them."""
+    truth's on the host, their paths, the truth's laid rows and Dew's summaries against them."""
     truth: object
     paths: list
     leaves: list
     truths: list
     held: object
     mine: list
-    termed: bool
 
 
 def _term_leaves(terms, truth):
@@ -1370,7 +1354,7 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
         if np.shape(leaf) != np.shape(true):
             raise AssertionError(f"{path}: dew's shape is {np.shape(leaf)}, the truth's {np.shape(true)}")
     held = _LaidTruths.of(truths, _term_leaves(terms, truth))
-    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held), terms is not None)
+    return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
 
 
 def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, their_terms=None) -> list[tuple]:
@@ -1399,12 +1383,9 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
     theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
                         prepared.held if same else _LaidTruths.of(their_truths,
                                                                    _term_leaves(their_terms, their_truth)))
-    # Against a summarized recording, sized by its truth (`leaf_summaries`), Dew's rows are too (row 3684).
-    plain = _summaries(leaves, _LaidTruths.of(truths)) if prepared.termed and any(recorded) else prepared.mine
-    mine = [alone if was else own for alone, own, was in zip(plain, prepared.mine, recorded, strict=True)]
     row = []
     for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
-            paths, leaves, references, truths, their_truths, recorded, mine, theirs, strict=True):
+            paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
         their = their_leaf if was else their_summary
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
@@ -1422,21 +1403,23 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
-    `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with both
-    arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and whether every
-    value was finite. A row the truth sizes zero (below RESOLUTION of its leaf) is one of float64 zero unless
-    both arms measure it, each one's error there below the row's own float64 RMS, so it is classified the same
-    with the arms swapped, as the sign test's exchangeable pairs need (row 3684). The two are taken by one
-    arithmetic (`_scaled_rms`), so a reference exactly zero on a row is exactly the row's size from it and
-    never measures it (ledger 1831: two arithmetics broke that tie, and Dew's ordinary rounding on a residue
-    row read 1e8 of the row). That is an engineering definition of a measured row, not a proof of float64's
-    accuracy on it; a sum that cancels to float64's residue is never measured so, and a product far below its
-    leaf, which float64 holds to its own precision, is. A measured row is judged at its own size as any row
-    is, its error over its size entering its arm's worst row. A recorded reference keeps no row's own size,
-    and the recording's sketch holds the truth at the leaf's scale, not a tiny row's, so its rows keep the
-    zero rows' rule. A row of zero in Dew's truth the reference's lacks (a recorded truth recomputed
-    otherwise) is refused. Not `paired`, the two held to truths of their own draws (`null_runs`), no row is
-    paired."""
+    `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
+    both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
+    whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
+    is one of float64 zero unless a live reference measures it: its error there below the row's own
+    float64 RMS, so it carries the row better than zero would. The two are taken by one arithmetic
+    (`_scaled_rms`), so a reference exactly zero on a row is exactly the row's size from it and never
+    measures it (ledger 1831: two arithmetics broke that tie, and Dew's ordinary rounding on a residue
+    row read 1e8 of the row). That is an engineering definition of a measured row, not a proof of
+    float64's accuracy on it; a sum that cancels to float64's residue is never measured so, and a
+    product far below its leaf, which float64 holds to its own precision, is.
+    A measured row is judged at its own size as any row is, its error over its size entering both worst
+    rows: against the reference's worst row over the leaf, which holds it with less power than the zero
+    rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
+    one truth they share. A recorded reference keeps no row's own size, and the recording's sketch holds
+    the truth at the leaf's scale, not a tiny row's, so its rows keep the zero rows' rule. A row of zero
+    in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
+    `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
                 mine.finite and theirs.finite)
@@ -1450,7 +1433,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
-        if max(error, at_zero[at]) < size:
+        if at_zero[at] < size:
             worst = max(worst, float(log_over(error, size)))
             their_worst = max(their_worst, float(log_over(at_zero[at], size)))
         elif error or at_zero[at]:
@@ -1512,13 +1495,21 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        # Dew's worst row against the reference's, each arm's RMS over the draws (each example's at a site
-        # that stacks them, else each seed's), judged as the pooled ratio is (`_worst_rows`).
-        stacked = draws.of_example_rows(index) if contained else None
-        found_rows = _worst_rows(leaf, stacked if stacked is not None else draws.worst[:, index, :],
-                                 "examples" if stacked is not None else "seeds", tails, contained=contained,
-                                 typical=typical)
-        over, unresolved = over + found_rows[0], unresolved + found_rows[1]
+        factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
+        paired = draws.of_example_rows(index) if contained else None
+        if paired is not None and (found_rows := _paired_rows(paired, factor)) < tails[0]:
+            # A site that stacks examples: each example's worst row against the reference's on it.
+            over.append(Finding(
+                leaf, "row", float(np.quantile(paired, 1 - tails[0])),
+                f"{leaf}: dew's worst row is past {factor} times the reference's on the same example on "
+                f"{int(np.sum(paired > math.log(factor)))} of {len(paired)} examples, the reference's past "
+                f"it on {int(np.sum(paired < -math.log(factor)))} (p {found_rows:.1e}; `_paired_rows`)"))
+        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        if paired is None and not my_row <= math.log(factor) + their_row:
+            over.append(Finding(leaf, "row", my_row - their_row,
+                                f"{leaf}: the worst row over {count} seeds is {shown(my_row)} from float64 "
+                                f"over its size, the reference's {shown(their_row)}, allowed "
+                                f"{shown(math.log(factor) + their_row)} ({factor} times it)"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1548,17 +1539,18 @@ def _staged(drawn, seeds: int, label: str, *,
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    # The final verdict: a leaf its pooled ratio or worst rows leave inconclusive asked of its typical draw
-    # (`_judgement`'s `typical`).
+    # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
+    # their typical draw (`_judgement`'s `typical`).
     return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage and its verdict to,
-one JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted."""
+"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
+leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
+stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, ynn: str | None = None) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
     import os
 
@@ -1566,7 +1558,8 @@ def _logged(label: str, stage: int, verdict: str, ynn: str | None = None) -> Non
     if path:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
-                                  "label": label, "stage": stage, "verdict": verdict, "ynn": ynn}) + "\n")
+                                  "label": label, "stage": stage, "verdict": verdict,
+                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1694,12 +1687,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False) -> None:
-    """Check 1 of the gate: on par. Each leaf's RMS error from float64, pooled over the site's declared seeds,
-    within PARITY times the reference's, and its worst row's RMS over the seeds within PARITY times the
-    reference's (`_worst_rows`); each row of float64 zero (below RESOLUTION of its leaf where a live reference
-    does not measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
-    over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of squared
-    errors, not seed by seed); every value finite.
+    """Check 1 of the gate: on par. Each leaf's RMS error from float64,
+    pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
+    those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
+    two values); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
+    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
+    over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of
+    squared errors, not seed by seed); every value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
@@ -1717,7 +1711,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     the rows of float64 zero and the sizing stay the draw's own order's. A row that nearly cancels
     rounds worst at some orders and well at others, so one order's worst row is no measure of it, and
     the reference's luckiest order would fail an equally exact Dew; over the orbit Dew's worst is held
-    against the reference's worst at any of the same orders, which is as strict as the
+    within ROW_FACTOR of the reference's worst at any of the same orders, which is as strict as the
     reference is spread over them: a Dew worse than the reference at every order still fails, and one
     the reference is exact against at every order fails at any order it is not.
 
@@ -1777,6 +1771,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     truth_program = _truth_program(truth_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
+    narrow_leaves: list[str] = []
     compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
@@ -1794,6 +1789,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples)
                 ranges[start, stop] = draws if further else [draws]
+                narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn
 
@@ -1804,7 +1800,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:
         drawn_for = pooled
-    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], arms)
+        narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
+    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms)
 
 
 def _site_terms(terms_fn, terms, draw, truth, truth_program):
@@ -1820,14 +1817,19 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
         float64_terms, terms_fn)
 
 
-def _verdicts(drawn_for, seeds: int, labels: list[str], arms) -> None:
+def _narrow(draws: _Draws) -> list[str]:
+    """The leaves of rows of one or two values (NARROW_FACTORS)."""
+    return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
+
+
+def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
     `index`, judged under `labels[index]`), each logged (STAGES_LOG); a GateFailure where any leaf is
     over, else an Inconclusive where any is left unresolved."""
     overs, unresolveds = [], []
     for index, named in enumerate(labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        _logged(named, stage, _verdict(over, unresolved), _mode_of(arms))
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
         overs += over
         unresolveds += unresolved
     if overs:

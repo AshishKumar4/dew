@@ -513,6 +513,23 @@ def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_it
         assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
 
 
+def test_the_paired_worst_row_refuses_a_row_far_off_on_some_examples_and_passes_equally_exact_arms():
+    """At a site that stacks examples, each example's worst row is held to the reference's on the same
+    example (`_paired_rows`, ledger 2469): equally exact arms, their worst rows' log ratios symmetric however
+    wide (a spread of 1.0 and 2.0), pass; Dew ten times the reference's on a fifth of 512 examples of such
+    spread is refused at LOWER_TAIL; and two examples past the factor, both Dew's, are no finding."""
+    from reference_error import LOWER_TAIL, ROW_FACTOR, _paired_rows
+
+    rng = np.random.default_rng([2469, 512])
+    for spread in (1.0, 2.0):
+        null = rng.normal(0.0, spread, 512)
+        assert _paired_rows(null, ROW_FACTOR) >= LOWER_TAIL
+        off = null.copy()
+        off[::5] += math.log(10.0)
+        assert _paired_rows(off, ROW_FACTOR) < LOWER_TAIL
+    assert _paired_rows(np.asarray([3.0, 3.0, 0.0]), ROW_FACTOR) >= LOWER_TAIL
+
+
 def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whole(tmp_path, monkeypatch):
     """armada's map and judge (`DRAWS`, `POOL`): a site whose seeds are sharded across map tasks, each writing
     its draws and judging nothing, is judged over their pooled draws as it is when it draws them itself: a
@@ -1370,7 +1387,7 @@ def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     there is ordinary rounding judged at the row's own size, as at every row, and passes; four thousand
     units off fails the worst-row rule. The row is held against the reference's worst row over the leaf,
     not its own error on the row, which is exact: the zero rows' rule failed Dew at four units, the
-    worst-row rule admits Dew's row up to PARITY times the leaf's worst on the same draw."""
+    worst-row rule admits Dew's row up to ROW_FACTOR times the leaf's worst."""
     dew, reference = _tiny_row(4)
     assert_as_exact(dew, reference, _draw, "tiny row", seeds=8)
     further, reference = _tiny_row(4000)
@@ -2111,6 +2128,7 @@ def test_a_truth_sketch_is_its_signed_sums_bit_for_bit():
             blocks.append(padded.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
         expected = [math.fsum(column) for column in np.concatenate(blocks).T.tolist()]
         assert truth_sketch(values, seed=3).tolist() == expected
+
 
 
 def _bits(value):

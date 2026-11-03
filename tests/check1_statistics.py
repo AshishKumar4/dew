@@ -13,9 +13,18 @@ import numpy as np
 FACTOR = 2.0
 
 ROW_FACTOR = 4.0
-"""How far Dew may sit from a row of float64 zero against the reference's own error on that row
-(`pooled_zero_rows`), and the one-draw rule's worst-row factor (tests/one_draw.py). Check 1's worst row is
-held at PARITY by its pooled worst-row ratio, not by a factor (reference_error.py's `_worst_rows`)."""
+"""How far Dew's worst row may sit from float64 against the reference's worst
+row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS').
+An RMS over every entry averages a few wrong rows into a
+large tensor, so each comparison also holds Dew's worst row to the
+reference's. The worst of many rows is an extreme value, not an average,
+and parts further by chance: over the suite's 3,660 comparisons whose rows
+differ from float64 at all (99 files), Dew's worst row over the
+reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
+exported logits). A row that differs rather than rounds moves further: the
+suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
+with its sinks zeroed, put their worst rows at 7.1 and 3,419 times the
+reference's."""
 
 
 PARITY = 1.5
@@ -45,6 +54,8 @@ the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it t
 decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Finding:
     """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
@@ -476,6 +487,48 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
             if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
+def _paired_rows(paired: np.ndarray, factor: float) -> float:
+    """The paired worst-row test's p-value at a site that stacks examples: of the examples whose worst rows'
+    log ratio (`_example_worst_rows`) lies past `factor` either way, the count with Dew's past `factor`
+    times the reference's against Binomial(n, 1/2). Under equal exactness the two arms are exchangeable on
+    each example, so its ratio is as likely past `factor` as under its inverse whatever their own spread
+    (the known null, distribution-free): Dew whose worst rows sit past `factor` times the reference's on more
+    examples than the reverse is refused, where a maximum over a leaf's every row against the reference's is
+    an extreme of two heavy-tailed samples and no measure of either (ledger 2469)."""
+    from scipy import stats
+
+    above, below = int(np.sum(paired > math.log(factor))), int(np.sum(paired < -math.log(factor)))
+    return float(stats.binom.sf(above - 1, above + below, 0.5)) if above else 1.0
+
+
+NARROW_FACTORS = {1: 90.0, 2: 11.0}
+"""The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR. At either width
+ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
+runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
+near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
+the row whose truth is smallest. Each factor sits above the 1 - 1e-4 quantile of the factor that would
+fail equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
+`row_controls`, through `_staged` itself), at every layout measured, 16 to 4,096 rows a draw and 8 to 512
+declared seeds: that quantile is 40 to 53 at one value and 7 to 8 at two (10,000 to 600,000 runs a
+layout), so 90 and 11 stand about 1.7 and 1.4 times above it, at measured rates near 2e-5 and at most
+3.3e-5; 28,000 fresh runs at the 16-row and 256-row layouts bound them within LOWER_TAIL at 99.9% (at
+most 4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over 16 to 2,048
+rows, a point rate, bounded within LOWER_TAIL at 256 rows and 8 seeds (80,000 runs) and not at 2,048. The
+rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L times as often.
+
+The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
+times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
+judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
+that stage exists to judge on real findings. Check 2 (tests/certified.py `assert_certified`) holds
+each element within its own operation's certified bound where a site runs it, which resolves such an
+error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
+Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
+with n and with the sum's cancellation (for standard normal terms, the smallest error it flagged in a
+review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
+128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
+wherever the pooled ratio does not see it."""
+
+
 PREVIOUS_TAILS = (5e-4, 5e-4)
 """The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
 
@@ -494,40 +547,3 @@ def _verdict(over: list[Finding], unresolved: list[Finding]) -> str:
     """A judgement's verdict: "over" where any leaf failed, else "inconclusive" where any is unresolved,
     else "pass"."""
     return "over" if over else "inconclusive" if unresolved else "pass"
-
-
-def _worst_rows(leaf: str, logs: np.ndarray, drawn_as: str, tails: tuple[float, float], *, contained: bool,
-                typical: bool) -> tuple[list[Finding], list[Finding]]:
-    """Check 1's worst-row rule on a leaf's draws, `logs` each draw's worst row by its log for Dew and the
-    reference ((draws, 2), `log_over`): each arm's worst rows squared and pooled over the draws as the pooled
-    ratio pools errors (`_pooled`), the ratio held to PARITY by the same interval (`_interval`, `_status`),
-    and, at the final verdict, a ratio its draws leave inconclusive read by its typical draw
-    (`_typical_status`). A ratio one draw dominates is inconclusive, never over; a Dew whose worst row sits a
-    little past the reference's on every draw is on par (row 3684). Its findings and its inconclusives."""
-    finite = logs[np.isfinite(logs).all(axis=1)]
-    if not len(finite) or not (finite > LOG_ZERO).any():
-        return [], []
-    # Each arm's squares scaled by the largest of either, so no sum overflows and the ratio is unchanged.
-    mine, theirs = np.exp(2 * (finite - finite.max())).T
-    count = len(finite)
-    if np.sum(theirs) == 0:
-        return [Finding(leaf, "row", float(finite[:, 0].max()),
-                        f"{leaf}: the reference's worst row equals float64 on every {drawn_as[:-1]} "
-                        "and dew's does not")], []
-    ratio, (low, high) = _pooled(mine, theirs), _interval(mine, theirs, tails=tails)
-    status, found = _status(ratio, low, high, contained=contained), None
-    if status == "inconclusive" and contained and typical:
-        found = _typical_status(mine, theirs, tails)
-        status = found[0]
-    measure = math.log(max(ratio, 1e-300))
-    if status == "over":
-        return [Finding(leaf, "row", measure, f"{leaf}: dew's worst row's RMS over {count} {drawn_as} is "
-                        f"{ratio:.3f} times the reference's, interval [{low:.3f}, {high:.3f}] "
-                        f"(allowed {PARITY})")], []
-    if status == "inconclusive":
-        return [], [Finding(
-            leaf, "inconclusive", measure, f"{leaf}: inconclusive: dew's worst row's RMS ratio {ratio:.3f}'s "
-            f"interval over {count} {drawn_as} is [{low:.3f}, {high:.3f}], wider than {PARITY}"
-            + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s [{found[2]:.3f}, "
-               f"{found[3]:.3f}]: {found[4]}") + "; give the site larger inputs or more seeds (`seeds_for`)")]
-    return [], []

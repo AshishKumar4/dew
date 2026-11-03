@@ -218,9 +218,8 @@ fitted to them, and a rule set ships only with measured receipts.
 
 All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of their own:
 - check 1 is `assert_as_exact` as it applies `tests/check1_statistics.py` today: each tensor's pooled RMS distance
-  to the float64 truth against the reference's at `PARITY`, and its worst row against the reference's on the
-  same draw at `PARITY` too (`_paired_rows`). This doc names those and never restates them, so it cannot drift
-  from the gate.
+  to the float64 truth against the reference's at `PARITY`, its worst row at `ROW_FACTOR`, and narrow rows at
+  `NARROW_FACTORS`. This doc names those constants and never restates them, so it cannot drift from the gate.
 - check 2 (bible §7, "never wrong"): where a rewritten operation has a certified bound (`tests/certified.py`),
   every element holds within it, at each rule's site and wherever the gate already runs check 2 for a program
   site.

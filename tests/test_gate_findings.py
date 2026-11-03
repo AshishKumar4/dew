@@ -240,8 +240,8 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     of 1) is a row of float64 zero where the reference is exactly zero on it: its error is the row's
     size by the same arithmetic, so Dew's ordinary rounding there (1e-15) is held by the zero rows' rule
     and not read over the residue's size (ledger 1831); a reference that carries the row still
-    measures it only where Dew carries it too."""
-    from reference_error import _paired, leaf_summary, pooled_zero_rows
+    measures it."""
+    from reference_error import _paired, leaf_summary
 
     # Residue rows whose squares fall below float64's normal range, where a size and an error taken by
     # two arithmetics part by more than a rounding.
@@ -254,14 +254,5 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(reference, truth))
     assert rows.tolist() == list(range(1, len(truth))) and worst < 0
     close = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.5e-40], reference)
-    # A row the reference carries and Dew does not is held by the zero rows' rule, against the reference's
-    # own error there: a row is measured only where both arms carry it, so it is classified alike with the
-    # arms swapped (row 3684).
-    _, _, worst, _, (rows, errors, theirs), _ = _paired("leaf", mine, leaf_summary(close, truth))
-    assert 1 in rows.tolist() and worst < 0
-    assert 1 in [row for row, *_ in pooled_zero_rows([(rows, errors, theirs)])]
-    # Both carrying it, it is measured: each arm's error there over its size enters its worst row.
-    carried = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.55e-40], dew)
-    _, _, worst, their_worst, (rows, _, _), _ = _paired("leaf", leaf_summary(carried, truth),
-                                                        leaf_summary(close, truth))
-    assert 1 not in rows.tolist() and -10 < worst < their_worst < 0
+    _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(close, truth))
+    assert 1 not in rows.tolist() and worst > 50
