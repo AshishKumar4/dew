@@ -1,5 +1,5 @@
 """The sketch a recording keeps of each float64 truth leaf (tests/reference_error.py `truth_sketch`): its
-definition, within the rounding any host may take it at (`sketch_rounding`)."""
+definition, bit for bit where every block sums exactly in any order."""
 
 import math
 
@@ -7,38 +7,39 @@ import numpy as np
 import pytest
 
 DRAWN = {
-    "float64": lambda rng, size: rng.standard_normal(size) * 10.0 ** rng.uniform(-30, 30, size),
-    "float32": lambda rng, size: rng.standard_normal(size).astype(np.float32),
+    "float64": lambda rng, size: rng.integers(-(1 << 40), 1 << 40, size) * 2.0 ** -20,
+    "float32": lambda rng, size: (rng.integers(-(1 << 23), 1 << 23, size) * 2.0 ** -12).astype(np.float32),
     "float16": lambda rng, size: rng.standard_normal(size).astype(np.float16),
     "int32": lambda rng, size: rng.integers(-(1 << 31), (1 << 31) - 1, size, dtype=np.int32),
     "bool": lambda rng, size: rng.integers(0, 2, size).astype(bool),
 }
-"""A truth of each dtype the sketch takes (it reads every one as float64): a float64 truth's magnitudes
-across 60 decades, so a block's rounding is its largest entries' and the others' vanish in it."""
+"""A truth of each dtype the sketch takes (it reads every one as float64), its entries spanning at most 46
+bits of one scale (float16's every value, its subnormals among them), so each block's 64 signed entries
+sum exactly in float64 in any order: the sketch is then its exact sum, whatever order a host takes a block
+in, and any other sign, block or padding is seen bit for bit. Its rounding where a block does not sum
+exactly is `test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or_empty_truth_apart`'s
+(tests/test_reference_error.py)."""
 
 
 @pytest.mark.parametrize("dtype", DRAWN)
 @pytest.mark.parametrize("size", [1, 63, 64, 65, 3000, (1 << 16) + 70])
-def test_a_truths_sketch_is_its_signed_sums_within_any_hosts_rounding(size, dtype):
-    """The sketch a recording keeps is its definition, each entry times each of its SKETCH signs (its sign
-    word's bits, +1 where set), every block of SKETCH_BLOCK summed (a block past the end padded with
-    zeros) and the blocks' sums summed exactly: within `sketch_rounding` of the signed products' exact
-    sum, the most any order of a block's sum may round by, which the gate allows each of two sketches
-    (`indexed_recording`). At a block's and a host chunk's edges, with signed zeros and subnormals among
-    a floating truth's entries, so a recorded sketch stays a recomputed truth's."""
-    from reference_error import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+def test_a_truths_sketch_is_its_signed_sums(size, dtype):
+    """The sketch a recording keeps is its definition, bit for bit where each block sums exactly
+    (`DRAWN`): each entry times each of its SKETCH signs (its sign word's bits, +1 where set), every
+    block of SKETCH_BLOCK summed (a block past the end padded with zeros) and the blocks' sums summed
+    exactly, which is then every product summed exactly. At a block's and a host chunk's edges, with
+    signed zeros among a floating truth's entries, so a recorded sketch stays a recomputed truth's."""
+    from reference_error import SKETCH, _sign_bits, truth_sketch
 
     rng = np.random.default_rng(size)
     truth = DRAWN[dtype](rng, size)
     if np.issubdtype(truth.dtype, np.floating):
         truth[::7] = -0.0
-        truth[1::11] = np.finfo(truth.dtype).smallest_subnormal
-    values = truth.astype(np.float64)
+    if truth.dtype == np.float16:
+        truth[1::11] = np.finfo(np.float16).smallest_subnormal
     signs = ((_sign_bits(size, 5)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
-    exact = np.asarray([math.fsum(column) for column in (values[:, None] * signs).T.tolist()])
-    sketch = truth_sketch(truth, 5)
-    assert sketch.shape == (SKETCH,)
-    assert np.all(np.abs(sketch - exact) <= sketch_rounding(math.fsum(np.abs(values).tolist())))
+    exact = [math.fsum(column) for column in (truth.astype(np.float64)[:, None] * signs).T.tolist()]
+    assert truth_sketch(truth, 5).tolist() == exact
 
 
 def test_a_devices_block_sums_are_the_hosts_where_each_block_sums_exactly():
