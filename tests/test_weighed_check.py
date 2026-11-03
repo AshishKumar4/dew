@@ -65,6 +65,12 @@ def reformulated(a, b, big):
     return jnp.concatenate([cancelled(a, big), b[:, 1:] * a[:, 1:]], axis=-1)
 
 
+def biased(a, b, big):
+    """The reformulated arm (`reformulated`'s cancellation) with every product 8 units of its rounding off."""
+    return jnp.concatenate([cancelled(a, big), (a[:, 1:] * b[:, 1:]) * jnp.float32(1 + 2.0 ** -21)],
+                           axis=-1)
+
+
 def failed(dew, label: str, against=reference) -> GateFailure:
     """The failure check 1 decides `dew` against `against` with conditioning, never an Inconclusive."""
     with pytest.raises(GateFailure) as raised:
@@ -78,10 +84,6 @@ def test_a_fault_on_the_elements_a_program_computes_well_is_decided_weighed():
     """A product eight units of its rounding off beside the amplified element, cancelled the other way,
     leaves the unweighted check undecided over its seeds, and the weighed check decides it a failure of its
     ratio and rows, under the weighed check's own label."""
-    def biased(a, b, big):
-        return jnp.concatenate([cancelled(a, big), (a[:, 1:] * b[:, 1:]) * jnp.float32(1 + 2.0 ** -21)],
-                               axis=-1)
-
     with pytest.raises(Inconclusive):
         assert_as_exact(jax.jit(biased), jax.jit(reference), draw, "a biased product, unweighted",
                         seeds=WEIGHED_SEEDS)
@@ -225,3 +227,40 @@ def test_a_sum_across_devices_is_weighed_as_a_sum_and_a_gather_as_a_move():
               jax.device_put(b.T, jax.NamedSharding(mesh, P("x", None))))
     _, (summed, gathered) = rounding_scale(sharded, *placed)
     assert np.all(summed > 0) and np.all(gathered == 0)
+
+
+def test_a_sharded_weighed_site_judges_its_weighed_check_from_its_own_map_tasks(monkeypatch, tmp_path):
+    """A weighed site run as CI's map and judge: map tasks over the plan's units (tools/armada/ci.py
+    `draws_of`), its unweighted units first, then its weighed check's past them, each task drawing and
+    recording only its own check's units, so each check's tasks cost its own draws; its judge, drawing
+    nothing, defers to the weighed check where the unweighted stays undecided and decides it from the
+    weighed tasks' records, as a run that drew every unit itself does: the biased product fails on its light
+    class, the reformulation passes."""
+    from map_judge import DRAWS, POOL, RECORDS
+
+    plain, weighed = 5 * WEIGHED_SEEDS, 5 * CONDITIONED_SEEDS
+
+    for name, dew in (("biased", biased), ("reformulated", reformulated)):
+        label = f"a sharded weighed site, {name}"
+        for start in [*range(0, plain, 16), *range(plain, plain + weighed, 320)]:
+            stop = min(start + (16 if start < plain else 320), plain if start < plain else plain + weighed)
+            monkeypatch.setenv(DRAWS, f"{start}:{stop}")
+            task = tmp_path / name / f"task {start}"
+            monkeypatch.setenv(RECORDS, str(task))
+            assert_as_exact(jax.jit(dew), jax.jit(reference), draw, label, seeds=WEIGHED_SEEDS,
+                            conditioning=CONDITIONED_SEEDS)
+            # A task draws its own check's units alone: one record, the other check's none.
+            assert len(list(task.glob("*.pkl"))) == 1
+        monkeypatch.delenv(DRAWS)
+        monkeypatch.delenv(RECORDS)
+        monkeypatch.setenv(POOL, str(tmp_path / name))
+        judged = jax.jit(dew), jax.jit(reference), draw, label
+        if name == "biased":
+            with pytest.raises(GateFailure) as raised:
+                assert_as_exact(*judged, seeds=WEIGHED_SEEDS, conditioning=CONDITIONED_SEEDS)
+            assert not isinstance(raised.value, Inconclusive)
+            assert any("['light']" in finding.leaf and finding.leaf.startswith(f"{label}, conditioned")
+                       for finding in raised.value.findings)
+        else:
+            assert_as_exact(*judged, seeds=WEIGHED_SEEDS, conditioning=CONDITIONED_SEEDS)
+        monkeypatch.delenv(POOL)
