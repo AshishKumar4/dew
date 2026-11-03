@@ -624,20 +624,21 @@ def test_a_library_arm_never_holds_dews_worst_row_to_less_than_the_references():
 
 def test_a_row_below_resolution_is_measured_only_where_both_arms_measure_it():
     """A row below RESOLUTION of its leaf is judged at its own size only where both arms' errors there are
-    under it (`_paired`, row 3684): equally exact arms, each off twice the row's own size there on half the
-    seeds apart and exact on the rest, pass, where the reference alone classifying it put Dew's error into
-    Dew's worst row on every seed it was exact and Dew was not, and never the reverse."""
+    under it (`_paired`, row 3684): equally exact arms whose eight such rows each come out twice their own
+    size off on half the seeds, each arm apart, and exact on the rest, pass, where the reference alone
+    classifying them put a row Dew alone missed into Dew's worst row on nearly every seed, and never the
+    reverse."""
     def draw(seed):
         rng = np.random.default_rng([3684, 3, seed])
         values = rng.standard_normal((64, 8))
-        values[0] *= 2.0 ** -60
-        return values, rng.standard_normal((64, 8)), rng.standard_normal((64, 8)), rng.integers(0, 2, 2)
+        values[:8] *= 2.0 ** -60
+        return values, rng.standard_normal((2, 64, 8)), rng.integers(0, 2, (2, 8))
 
     def arm(index):
         @as_given
-        def run(values, mine, theirs, coins):
-            out = values + 2.0 ** -20 * (mine, theirs)[index] * values
-            out[0] = values[0] * (1 + 2.0 * coins[index])
+        def run(values, noises, coins):
+            out = values + 2.0 ** -20 * noises[index] * values
+            out[:8] = values[:8] * (1 + 2.0 * coins[index])[:, None]
             return {"leaf": out}
         return run
 
@@ -646,12 +647,15 @@ def test_a_row_below_resolution_is_measured_only_where_both_arms_measure_it():
 
 def test_stacked_examples_hold_each_arms_worst_row_over_every_order():
     """At a site that stacks examples (`examples`) and sweeps an orbit's orders (`orders`), each example's
-    worst row is each arm's worst over the orders before the two pair (`_example_worst_rows`, row 3684): Dew
-    off twice the reference at the draw's own order and the reference twice Dew at the other, both arms' worst
-    equal over the orbit, passes, where the first order alone paired Dew past PARITY on every example."""
+    worst row is each arm's worst over the orders before the two pair (`_example_worst_rows`, row 3684): a
+    first row of 1/64 of its example, every arm's worst, Dew's noise there twice the reference's at the draw's
+    own order and the reference's twice Dew's at the other, both arms' worst equal over the orbit, passes,
+    where the first order alone paired Dew past PARITY on every example."""
     def draw(seed):
         rng = np.random.default_rng([3684, 4, seed])
-        return rng.standard_normal((32, 4, 8)), rng.standard_normal((32, 4, 8)), np.zeros(())
+        values = rng.standard_normal((32, 16, 8))
+        values[:, 0] *= 2.0 ** -6
+        return values, rng.standard_normal((32, 16, 8)), np.zeros(())
 
     def orders(inputs):
         values, noise, _ = inputs
@@ -660,7 +664,9 @@ def test_stacked_examples_hold_each_arms_worst_row_over_every_order():
     def arm(first, second):
         @as_given
         def run(values, noise, order):
-            return {"leaf": values + 2.0 ** -20 * (second if order else first) * noise * values}
+            scaled = noise.copy()
+            scaled[:, 0] *= second if order else first
+            return {"leaf": values + 2.0 ** -20 * scaled}
         return run
 
     assert_as_exact(arm(2.0, 1.0), arm(1.0, 2.0), draw, "orders", seeds=8, orders=orders, examples=True,
