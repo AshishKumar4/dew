@@ -1128,8 +1128,13 @@ def parameter_type(function: Callable[..., Configured], name: str) -> Annotation
     if name not in annotations:
         return None
     selected = types.SimpleNamespace(__annotations__={name: annotations[name]})
+    # The names the annotation was written among are its module's: a linen module's constructor is written
+    # by Flax's dataclass transform, whose globals are Flax's own. Code made by exec names a module that may
+    # not be loaded, and its globals are where it was written.
+    module = sys.modules.get(underlying.__module__)
+    written = underlying.__globals__ if module is None else vars(module)
     try:
-        return typing.get_type_hints(selected, globalns=dict(underlying.__globals__))[name]
+        return typing.get_type_hints(selected, globalns=dict(written))[name]
     except NameError as error:
         raise ValueError(f"{function.__name__}'s annotation of {name} names what {underlying.__module__} "
                          f"does not import at runtime ({error}); a record is read against it, so "
