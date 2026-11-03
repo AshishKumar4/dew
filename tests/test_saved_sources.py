@@ -120,17 +120,21 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     """Two real processes export a decoder whose kernels span both, every layer's attention extended by
     DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
     projection folded as it is written: each reads one tensor home at a time, together, so neither host's
-    allocations during the export peak at half the model, where the pool read the whole tree home
-    first. The publishing process writes the tensors one process writes of the same weights unplaced,
-    byte for byte, though the restored tree's key order may place one in another shard; the other
-    writes the release's small files alone, no weights. Outside the export's scope the write is
-    refused rather than left waiting on the other process."""
+    resident pages rise during the export by half the model (2.0 to 5.5 MB of 31 MB on armada), where the
+    pool reading the whole tree home first rises past half (23 to 39 MB), and the same measure over that
+    tree held home rises at least half of it on each host, so the measure sees the bytes in that run
+    (`saved_export_worker.resident_growth`, a decoder of 256 KiB tensors): tracemalloc never saw the
+    buffers a tensor is read home into, and held a 1.3 MB decoder's export to its own fixed cost, which
+    CI's process state crossed (ledger 3794). The publishing process writes the tensors one process
+    writes of the same weights unplaced, byte for byte, though the restored tree's key order may place
+    one in another shard; the other writes the release's small files alone, no weights. Outside the
+    export's scope the write is refused rather than left waiting on the other process."""
     publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
                                  fsdp_size=4, run_dir=str(tmp_path))
     for report in (publisher, reader):
         assert report["processes"] == 2 and report["spanning"] > 0
         assert report["refused_outside"]
-        assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
+        assert report["exported"] < report["whole"] / 2 <= report["held"]
     assert publisher["differing"] == {} and len(publisher["release"]) > 10
     assert publisher["alone"] == reader["alone"]
     assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
@@ -141,8 +145,11 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
 def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monkeypatch):
     """Two real processes sharing Dew's cache read a saved language model run as a source (`released_run`,
     ledger 2992): the release is written once, the first process publishing it and the other reading
-    every tensor as it does, writing none, its host's allocations inside the export peaking below half
-    the release. Both read the one release. `dew export` to a destination they share writes it once
+    every tensor as it does, writing none, each host's resident pages rising inside the export by less
+    than half the release, written in shards a fraction of it, where the same measure over the release
+    held home rises at least half of it (`saved_export_worker.resident_growth`): at one shard, the 5 GB
+    default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
+    the one release. `dew export` to a destination they share writes it once
     likewise, the tensors one process's export writes."""
     from dew.cli.main import main
     from dew.registry import ModelConfig
@@ -159,7 +166,8 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     whole = sum(path.stat().st_size for path in Path(publisher["release"]).glob("*.safetensors"))
     assert [scope["writes"] for scope in publisher["read"]] == [True]
     assert [scope["writes"] for scope in reader["read"]] == [False]
-    assert reader["read"][0]["peak"] < whole / 2
+    for report in (publisher, reader):
+        assert report["read"][0]["growth"] < whole / 2 <= report["held"]
 
     assert publisher["export_code"] == reader["export_code"] == 0
     assert [scope["writes"] for scope in reader["exported"]] == [False]
