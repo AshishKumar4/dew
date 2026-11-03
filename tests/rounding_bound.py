@@ -23,6 +23,7 @@ a bound.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import weakref
 
 import jax
@@ -142,21 +143,26 @@ def rounding_scale(fn, *args, seed: int = 0):
             held = SCALES.setdefault(fn, {})
             if signature not in held:
                 jaxpr = closed.jaxpr
-                held[signature] = jax.jit(lambda consts, leaves, key: _scaled(jaxpr, consts, leaves, key))
-            outputs, scales = held[signature](consts, leaves, key)
+                # One tapped evaluation compiled, which every draw runs with its own key: a program of
+                # one copy of `fn`, not one of each draw's.
+                held[signature] = jax.jit(lambda consts, leaves, key, scale: _evaluated(
+                    jaxpr, consts, leaves, rule=TapRule(key, scale))[0])
+            outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), key)
         else:
-            outputs, scales = _scaled(closed.jaxpr, consts, leaves, key)
+            outputs, scales = _scaled(closed.jaxpr, lambda key, scale: _evaluated(
+                closed.jaxpr, consts, leaves, rule=TapRule(key, scale))[0], key)
     return (tree.unflatten([np.asarray(value) for value in outputs]),
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 
 
-def _scaled(jaxpr, consts, leaves, key):
-    """`jaxpr`'s untapped float64 outputs and each floating output's scale (`rounding_scale`): the root mean
-    square of each draw's displacement from the untapped evaluation, each element taken relative to its
-    largest displacement, so no square overflows and a nonfinite displacement stays nonfinite."""
-    plain, _ = _evaluated(jaxpr, consts, leaves, rule=TapRule(key, 0.0))
-    draws = [_evaluated(jaxpr, consts, leaves, rule=TapRule(jax.random.fold_in(key, draw + 1), 1.0))[0]
-             for draw in range(DRAWS)]
+def _scaled(jaxpr, tapped, key):
+    """`jaxpr`'s untapped float64 outputs and each floating output's scale (`rounding_scale`), from
+    `tapped(key, scale)`, its evaluation with every rounding moved by `scale` times a draw keyed by `key`:
+    the root mean square of each draw's displacement from the untapped evaluation, each element taken
+    relative to its largest displacement, so no square overflows and a nonfinite displacement stays
+    nonfinite."""
+    plain = tapped(key, 0.0)
+    draws = [tapped(jax.random.fold_in(key, draw + 1), 1.0) for draw in range(DRAWS)]
     scales = []
     for at, (var, value) in enumerate(zip(jaxpr.outvars, plain, strict=True)):
         if not jnp.issubdtype(var.aval.dtype, jnp.floating):
