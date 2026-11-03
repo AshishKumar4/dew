@@ -143,7 +143,9 @@ def _fixture(name: str) -> dict[str, Any]:
     """The decoder config Dew builds from a fixture model's Hugging Face config (`checkpoint_fields`)."""
     from benchmark_cases import checkpoint_fields
 
-    return checkpoint_fields(json.loads((REPO / "tests/fixtures/hf" / name / "config.json").read_text()))
+    from dew.interop.sources import SourceReference
+
+    return checkpoint_fields(SourceReference(str(REPO / "tests/fixtures/hf" / name)))
 
 
 def _nemotron_h_moe() -> dict[str, Any]:
