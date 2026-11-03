@@ -134,7 +134,10 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
         return logits
 
     model = tiny(**WIDE, **pool)
-    draw = lambda seed: (model.init(jax.random.key(seed), jnp.zeros((1, 4), jnp.int32)),)  # noqa: E731
+
+    def draw(seed):
+        return (model.init(jax.random.key(seed), jnp.zeros((1, 4), jnp.int32)),)
+
     assert_as_exact(jax.jit(mixed(model)), jax.jit(mixed(model.clone(attention_impl="xla"))), draw,
                     f"mixed call through one work list {'paged' if paged else 'dense'}", seeds=8,
                     truth_fn=mixed(float64_twin(model.clone(attention_impl="xla"))))

@@ -196,19 +196,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     def merge(a, b, operands):
         del operands
-        # The later walk, from zero, applies its transfer to the state before it: its decay per key (its
-        # exponent sum in natural units) where no token corrects the state, else the transfer it carried.
-        if not (isinstance(a, Walk) and isinstance(b, Walk)):
-            raise Refused("a merge of walks init did not start from their operands' shapes")
-        if b.transfer is None:
-            h = jnp.exp(b.decay)[:, None] * a.h + b.h
-            transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
-        else:
-            h = float32_matmul(b.transfer, a.h) + b.h
-            transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
-                        else float32_matmul(b.transfer, a.transfer))
-        return Walk(_held(a.decay + b.decay), h.astype(carried),
-                    None if transfer is None else transfer.astype(carried))
+        return _merged(a, b, carried)
 
     def finish(state, operands):
         del operands
@@ -251,6 +239,23 @@ class Walk(NamedTuple):
     decay: jax.Array
     h: jax.Array
     transfer: jax.Array | None
+
+
+def _merged(a, b, carried) -> Walk:
+    """Two consecutive walks' states joined (`derive_scan`'s `merge`), the later's from zero applying its
+    transfer to the state before it: its decay per key (its exponent sum in natural units) where no token
+    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype."""
+    if not (isinstance(a, Walk) and isinstance(b, Walk)):
+        raise Refused("a merge of walks init did not start from their operands' shapes")
+    if b.transfer is None:
+        h = jnp.exp(b.decay)[:, None] * a.h + b.h
+        transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
+    else:
+        h = float32_matmul(b.transfer, a.h) + b.h
+        transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
+                    else float32_matmul(b.transfer, a.transfer))
+    return Walk(_held(a.decay + b.decay), h.astype(carried),
+                None if transfer is None else transfer.astype(carried))
 
 
 def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array) -> jax.Array:
