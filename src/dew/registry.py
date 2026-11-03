@@ -207,11 +207,20 @@ _TRUSTED: set[str] = {"flax"}
 start Flax's, whose layers a model's record names (a `Sequential`'s)."""
 
 
+def trusts(name: str) -> bool:
+    """Whether the process trusts `name` (`import_trusted`): a package outside Dew, or a source,
+    a Hub repository or a directory, whose own code its loads then run (`trust_remote_code`), as
+    `trust=(name,)` and `--trust name` say where a run or a task loads."""
+    return name in _TRUSTED
+
+
 def import_trusted(record: object, trust: Sequence[str]) -> None:
     """Trust the packages in `trust` for the rest of the process, and import
     every module of theirs that `record` names by an import path, so reading
     the record finds them imported (`imported`) and may construct their
-    classes where a field declares no base class (`_owned`)."""
+    classes where a field declares no base class (`_owned`). A source named
+    there, a Hub repository or a directory, has its own code run where a
+    load reads it (`trusts`)."""
     _TRUSTED.update(trust)
     if isinstance(record, str):
         module, colon, name = record.partition(":")
@@ -1761,5 +1770,6 @@ __all__ = [
     "solvers",
     "to_record",
     "towers",
+    "trusts",
     "with_dtype",
 ]
