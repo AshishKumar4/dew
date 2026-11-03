@@ -368,23 +368,24 @@ def test_an_elastic_stream_restored_and_saved_again_resumes_where_it_was(tmp_pat
         last.close()
 
 
-def test_an_elastic_stream_without_workers_counts_chunks_as_an_ordinary_read_does(tmp_path):
+@pytest.mark.parametrize("within", [False, True], ids=["after-the-stream", "within-each-shard"])
+def test_an_elastic_stream_without_workers_counts_chunks_as_an_ordinary_read_does(tmp_path, within):
     """Without loading workers an elastic stream's chunk counters hold each row as it is handed on, as a
-    read that is not elastic counts them, a batch ending inside a document's chunks included, before and
-    after a resume (row 1896)."""
+    read that is not elastic counts them, chunked after the stream or within each shard (before an
+    interleave), a batch ending inside a document's chunks included, before and after a resume: documents
+    of one, three and five chunks, the first's dropped, so the first batch holds three chunks of the
+    second and one of the third (row 1896)."""
     from dew.data.text import Chunks
 
-    lengths = (2, 6, 10, 6, 2, 10)
     (tmp_path / "docs.jsonl").write_text("".join(
-        json.dumps({"text": list(range(length))}) + "\n" for length in lengths))
+        json.dumps({"text": list(range(100 * index, 100 * index + length))}) + "\n"
+        for index, length in enumerate((2, 6, 10, 6))))
 
     def statistics(elastic: bool) -> list[float]:
-        # Every document's first chunk dropped after the chunking, so a batch of four ends inside a group.
-        chain = (Pipeline(Files(str(tmp_path / "docs.jsonl"), format="jsonl"), name="docs")
-                 .flat_map(Chunks(2)).filter(lambda row: int(row["text"][0]) != 0, identity="no-first")
-                 .batch(4))
-        chain = (chain.elastic() if elastic else chain).read("streamed")
-        data = compile(chain, loading=READ, seed=3)
+        chain = Pipeline(Files(str(tmp_path / "docs.jsonl"), format="jsonl"), name="docs").flat_map(Chunks(2))
+        chain = chain.interleave(1) if within else chain
+        chain = chain.filter(lambda row: int(row["text"][0]) >= 100, identity="no-first").batch(4)
+        data = compile((chain.elastic() if elastic else chain).read("streamed"), loading=READ, seed=3)
         opened = data.train(DataPartition())
         found = []
         try:
@@ -396,6 +397,7 @@ def test_an_elastic_stream_without_workers_counts_chunks_as_an_ordinary_read_doe
         resumed = data.train(DataPartition())
         try:
             resumed.set_state(state)
+            found.append(data.statistics()["data/chunks_per_record/docs"])
             next(resumed)
             found.append(data.statistics()["data/chunks_per_record/docs"])
         finally:

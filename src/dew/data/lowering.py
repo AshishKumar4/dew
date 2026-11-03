@@ -1938,8 +1938,11 @@ class _Build:
             # Its rows come as a stream (a streamed read, a cache of each input's outputs), which every
             # worker reads whole, keeping its groups (`_StreamOrder`), and the reading process alone
             # keeps every group: one position, whatever the count of workers it is read in.
-            ordered = _StreamOrder(_as_iter(rows, self.loading), size, read, _Grouped,
-                                   _Ungrouped(size).flat_map)
+            # Without workers each row is a group, so the position, the stream's counters with it (a
+            # shard's chunks), is the stream's after every row handed on, as a read without workers states.
+            alone = size if pool.count else 1
+            ordered = _StreamOrder(_as_iter(rows, self.loading), alone, read, _Grouped,
+                                   _Ungrouped(alone).flat_map)
             return Accepted(ordered, _name(pipeline), _label(pipeline), certain_after=certain_after,
                             rows=_counts_rows(pipeline, at))
         if self.elastic and isinstance(rows, pygrain.MapDataset):

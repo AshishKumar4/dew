@@ -80,8 +80,8 @@ class _StreamOrder(pygrain.IterDataset):
     the position past it, so the stream's counters in it (a shard's chunks), which a read in workers
     states through its workers' positions, count every row handed on at each group's end; within a group
     they hold the rows before it, as a worker's groups' counters do in any read in workers
-    (`_Build.handed`). Without workers the counters are the reading process's own, counting each row as
-    it reads it (row 1896)."""
+    (`_Build.handed`). Without workers each row is a group (`_Build.handed`), so they count each row as
+    it is handed on (row 1896)."""
 
     def __init__(self, rows: pygrain.IterDataset, size: int,
                  read: Callable[[pygrain.IterDataset], pygrain.IterDataset], grouping: Grouping,
