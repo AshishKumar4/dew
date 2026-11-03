@@ -8,8 +8,7 @@ with as many chunks in flight as every launch's shared memory
 allows a block of the device (`staged_bytes`: each launch's streams and staging tiles as its bundle declares
 them, `planned`, the fast backward's with the forward's where a call takes it). Nothing is
 measured, tabled, swept or ranked: a GPU no row names derives its tiles from its own facts, and a measured
-gap is fixed in the derivation or the kernel. The cost model's estimate (`cost`) reports the derived
-launches' seconds.
+gap is fixed in the derivation or the kernel.
 """
 
 import contextlib

@@ -146,7 +146,10 @@ CARRIED = rules.Rules("carried", "reorders", _carried(), receipt="docs/design/al
 @dataclasses.dataclass(frozen=True, order=True)
 class Priced:
     """A carried form's price, compared in order: its work that reads the state (once a chunk, in sequence),
-    then the rest (every chunk's at once), each in seconds under the template's tile walk (`cost.walk`)."""
+    then the rest (every chunk's at once), each in seconds under XLA's schedule (`cost.fused`), where the
+    carry runs (a `lax.scan` step a chunk, recurrence_chunk's derived walk): its span at a loop iteration's
+    latency, as `linear_scan`'s, which the tile walk's schedule leaves unpriced (no fact states an in-kernel
+    step's latency, `templates.cost.step_latency`)."""
 
     sequential: cost.Seconds
     parallel: cost.Seconds
@@ -214,7 +217,7 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     graph.register(sequential, others)
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
     program.saturate(graph, region, (CARRIED,), saturation, facts)
-    schedule = cost.walk(cost.target())
+    schedule = cost.fused(cost.target())
     carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule))
     emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule))
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
