@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from sampling_gate import FALSE_RED
 
 from dew.telemetry.benchmark import benchmark
 
@@ -93,27 +94,88 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     assert "&lt;script&gt;" in slow._repr_html_()
 
 
-def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise():
-    """Two calls compared (`compared`): one sleeping twice the other's time, timed in interleaved,
-    role-swapped pairs, read as their paired ratio, whose bootstrap interval lies well apart from 1 (under
-    2, each call's own dispatch added to both), and the faster call against itself (its A/A) holding 1: an
-    interval apart from 1 and from the A/A's is a difference the placement does not make (row 3616, the
-    kernel challenge's method: one-sided runs moved -0.6% to +0.6% whatever the change)."""
+class Scheduled:
+    """The host's clock as `dew.telemetry.benchmark` reads it (`time.perf_counter`, its seam), advanced by
+    the calls it times alone: each by its sleep and the delay a seeded scheduler adds past it, as a busy
+    host's do (row 3793's measurements). Outside a burst a call is late by 0.1 to 1.5 ms; a burst, which
+    one call in 30 begins, makes 20 calls 1 to 8 ms late and one in ten of them 12 to 40 ms, at most
+    `long` such a run. No delay is negative: a sleep returns no sooner than asked."""
+
+    def __init__(self, seed: int, long: int = 15):
+        self.rng, self.now, self.burst, self.long = np.random.default_rng(seed), 0.0, 0, long
+
+    def read(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        if not self.burst and self.rng.random() < 1 / 30:
+            self.burst = 20
+        if not self.burst:
+            late = self.rng.uniform(1e-4, 1.5e-3)
+        elif self.long and self.rng.random() < 0.1:
+            self.long, late = self.long - 1, self.rng.uniform(0.012, 0.040)
+        else:
+            late = self.rng.uniform(1e-3, 8e-3)
+        self.burst = max(self.burst - 1, 0)
+        self.now += seconds + late
+
+
+def scheduled(monkeypatch, seed: int) -> Scheduled:
+    """A seeded `Scheduled` clock that `compared` reads in place of the host's."""
+    from dew.telemetry import benchmark
+
+    clock = Scheduled(seed)
+    monkeypatch.setattr(benchmark.time, "perf_counter", clock.read)
+    return clock
+
+
+def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise(monkeypatch):
+    """Two calls compared (`compared`): one taking four times the other's 12 ms, timed in role-swapped
+    pairs, read as their paired ratio, and the faster call against itself (its A/A), each interval at a
+    level of 1 - FALSE_RED / 2 over 64 pairs (`_median_rank`: the 16th smallest and largest), on a host
+    whose scheduler bursts (`Scheduled`, seed 3, where 24 pairs at 95% left 1 out of the A/A's interval).
+    The A/A's holds 1 but for 2.4e-5 of the coins that order its pairs, its ratios' sides fair coins
+    whatever the delays. The pair's starts at most at 4 but for 1.2e-5 of them: a ratio passes 4 only
+    where the coin gave the slower call the larger delay, so 49 do with chance P(Bin(64, 1/2) >= 49). And
+    the pair's lies above the A/A's whatever the coins: a ratio reaches 2, the arms' geometric middle,
+    only where a faster call is 12 ms late, and an A/A's only where either is, so the intervals meet only
+    where 16 calls are, one more than the scheduler makes a run: an interval apart from 1 and from the
+    A/A's is a difference the placement does not make (row 3616, the kernel challenge's method: one-sided
+    runs moved -0.6% to +0.6% whatever the change)."""
     from dew.telemetry.benchmark import compared
 
+    clock = scheduled(monkeypatch, 3)
+
     def slow():
-        time.sleep(0.004)
+        clock.sleep(0.048)
         return jnp.zeros(())
 
     def fast():
-        time.sleep(0.002)
+        clock.sleep(0.012)
         return jnp.zeros(())
 
-    result = compared(slow, fast, pairs=24, warmup=1)
-    low, high = result.interval
+    result = compared(slow, fast, pairs=64, warmup=1, level=1 - FALSE_RED / 2)
+    low, _ = result.interval
     alone_low, alone_high = result.alone
-    assert 1.5 < low <= high <= 2.0
-    assert alone_low <= 1.0 <= alone_high < low
+    assert alone_low <= 1.0 <= alone_high < low <= 4.0
+
+
+def test_a_medians_rank_holds_it_at_its_level_and_no_higher_rank_does():
+    """`_median_rank`'s k-th smallest and largest of n values hold their median with chance
+    1 - 2 P(Bin(n, 1/2) < k) (the sign test, any continuous distribution): at least the level, and the next
+    rank's short of it, at every count from the fewest that reach the level to 400; fewer refuse."""
+    from scipy import stats
+
+    from dew.telemetry.benchmark import _median_rank
+
+    for level in (0.95, 0.999, 1 - FALSE_RED / 2):
+        fewest = next(count for count in range(1, 64) if 1 - 2.0 ** (1 - count) >= level)
+        with pytest.raises(ValueError):
+            _median_rank(fewest - 1, level)
+        for count in range(fewest, 401):
+            rank = _median_rank(count, level)
+            assert 1 - 2 * stats.binom.cdf(rank - 1, count, 0.5) >= level
+            assert rank == (count + 1) // 2 or 1 - 2 * stats.binom.cdf(rank, count, 0.5) < level
 
 
 NEIGHBOURED = """
