@@ -197,6 +197,22 @@ def plain_launches(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     return {name(*launched): functools.partial(alone, *launched) for launched in algebra.launch_forms(spec)}
 
 
+def _whole_rows(live: jax.Array, splits: int) -> jax.Array:
+    """A split launch's row live in every slice where it is in any (`[B, H, S·Qp]`): the guarded launch's
+    slices cut its own key tiles, so a row's slices come from one launch, never two."""
+    if splits == 1:
+        return live
+    shaped = live.reshape(*live.shape[:2], splits, -1)
+    return jnp.broadcast_to(jnp.any(shaped, axis=2, keepdims=True), shaped.shape).reshape(live.shape)
+
+
+def _walked_blocks(live: jax.Array, splits: int, block_q: int) -> jax.Array:
+    """A masked launch's query blocks a live row of which any head holds, `[B, Qp // block_q]` int32
+    (`_launch`'s `walks`): its other programs load and write nothing."""
+    live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
+    return jnp.any(live_rows.reshape(live_rows.shape[0], -1, block_q), axis=-1).astype(jnp.int32)
+
+
 def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                     scale: float, natural: bool, tiles: Tiles, interpret: bool, rows: bool = False,
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
@@ -225,33 +241,19 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     # `table`).
     paged = None if call.table is None or call.page is None else (call.table, call.page)
 
-    def whole_rows(live: jax.Array) -> jax.Array:
-        # A split launch's row live in every slice where it is in any (`[B, H, S·Qp]`): the guarded launch's
-        # slices cut its own key tiles, so a row's slices come from one launch, never two.
-        if splits == 1:
-            return live
-        shaped = live.reshape(*live.shape[:2], splits, -1)
-        return jnp.broadcast_to(jnp.any(shaped, axis=2, keepdims=True), shaped.shape).reshape(live.shape)
-
-    def walked_blocks(live: jax.Array, block_q: int) -> jax.Array:
-        # A masked launch's query blocks a live row of which any head holds, `[B, Qp // block_q]` int32
-        # (`_launch`'s `walks`): its other programs load and write nothing.
-        live_rows = jnp.any(live.reshape(*live.shape[:2], splits, -1), axis=(1, 2))
-        return jnp.any(live_rows.reshape(live_rows.shape[0], -1, block_q), axis=-1).astype(jnp.int32)
-
     def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False
                ) -> tuple[tuple, jax.Array, jax.Array]:
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is not None:
-            live = whole_rows(live)
+            live = _whole_rows(live, splits)
         if live is None or not form.headroom:
             # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
             # blocks' outputs side by side, their rows' statistics alike; an output hook of a row's whole
             # output in XLA past them, as the guarded launch's. A masked rewalk of sums that cannot overflow
             # (`algebra.walked_launches`' fold) walks its live rows' blocks so, unguarded.
-            walks = None if live is None else walked_blocks(live, at.block_q)
+            walks = None if live is None else _walked_blocks(live, splits, at.block_q)
             blocks = _column_blocks(v, hooked, at.columns)
             split = len(blocks) > 1 and hooks.output_mod is not None
             launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
@@ -272,7 +274,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
-        walks = walked_blocks(live, guarded.block_q) if masked else None
+        walks = _walked_blocks(live, splits, guarded.block_q) if masked else None
         # A masked launch's rows its own whole, their finished maxima and denominators beside their output
         # (`kept`): a fold's natural rewalk's are its rows' own, in its units.
         finishes = rows and masked
@@ -301,7 +303,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
         # The rewalk's outputs at its rows (its output, and a masked launch's finished rows), the plain
         # launch's elsewhere and past them.
-        live = whole_rows(live)
+        live = _whole_rows(live, splits)
         taken = (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]),
                  *(jnp.where(live, mine, theirs)
                    for mine, theirs in zip(guarded[1:], plain[1:], strict=False)))
