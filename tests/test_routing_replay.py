@@ -198,8 +198,8 @@ def test_a_record_keyed_by_site_replays_each_routed_site_its_own(mixed):
     assert sorted(native) == sorted([FEEDFORWARD_ROUTES, f"{MIXER_ROUTES}/experts",
                                      *([MIXER_ROUTES] if mixed else [])])
     shifted = keyed_record(native, shift=1)
-    replayed = site_choices(obj, params, tokens, routes=(shifted, None))
-    for site, chosen in replayed.items():
+    under_record = site_choices(obj, params, tokens, routes=(shifted, None))
+    for site, chosen in under_record.items():
         # The layers holding the site: the first's mixer, the second's branch, both feed-forwards.
         held = [index for index in range(2) if (site != MIXER_ROUTES or index == 0)
                 and (site != f"{MIXER_ROUTES}/experts" or not mixed or index == 1)]
