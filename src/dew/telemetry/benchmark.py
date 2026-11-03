@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import dataclasses
 import html
+import math
 import statistics
 import time
 from collections.abc import Callable, Hashable, Mapping
+from fractions import Fraction
 
 import jax
 import jax.numpy as jnp
@@ -154,8 +156,8 @@ def carried[S](step: Callable[[S], S], state: S, count: int, *, each: bool = Fal
 @dataclasses.dataclass(frozen=True)
 class Comparison:
     """What `compared` measured: each pair's ratio of the first call's seconds to the second's, the median
-    ratio and its bootstrap interval, and the second call against itself (its A/A), whose interval is the
-    placement's own noise: a difference is one where `interval` lies apart from 1 and outside `alone`."""
+    ratio and its interval (`median_rank`), and the second call against itself (its A/A), whose interval is
+    the placement's own noise: a difference is one where `interval` lies apart from 1 and outside `alone`."""
 
     ratios: tuple[float, ...]
     ratio: float
@@ -163,15 +165,36 @@ class Comparison:
     alone: tuple[float, float]
 
 
+def median_rank(count: int, level: float) -> int:
+    """The rank k whose k-th smallest and k-th largest of `count` values hold their median with chance at
+    least `level`: the largest k with 2 P(Bin(count, 1/2) < k) <= 1 - level, the sign test inverted, which
+    holds for values drawn independently from any one continuous distribution, whatever it is. Raises
+    `ValueError` where no rank does: `count` values hold their median at most at 1 - 2^(1 - count)."""
+    allowed = (1 - Fraction(level)) * 2 ** count
+    below, rank = 0, 0
+    for k in range(1, (count + 1) // 2 + 1):
+        below += math.comb(count, k - 1)
+        if 2 * below > allowed:
+            break
+        rank = k
+    if rank == 0:
+        raise ValueError(f"{count} values hold their median at most at level {1 - 2.0 ** (1 - count):.6g} "
+                         f"(their least and greatest), short of {level}: take more of them")
+    return rank
+
+
 def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int = 400, warmup: int = 3,
-             level: float = 0.95, resamples: int = 2000, seed: int = 0) -> Comparison:
+                level: float = 0.95) -> Comparison:
     """`first` against `second`, each timed as `samples` times one call, in `pairs` interleaved pairs whose
     order swaps each pair (a call that runs second in a pair runs on whatever the first left), and
-    `second` against itself in as many pairs, read as the median of each pair's ratio of seconds and its
-    bootstrap interval at `level` over `resamples` resamples of the pairs: only paired ratios carry from
+    `second` against itself in as many pairs, read as the median of each pair's ratio of seconds and the
+    interval its pairs' order statistics give it at `level` (`median_rank`): only paired ratios carry from
     one machine to another, and one-sided runs of an unchanged call moved -0.6% to +0.6% (the kernel
-    challenge's measurements, row 3616). The caller binds each call to fresh inputs where its time depends
-    on its data (a MoE's routing)."""
+    challenge's measurements, row 3616). The bootstrap's percentile interval it took before held the A/A's
+    median 93.0% of the time at 95% over 24 pairs, and this one 96.8% (3,000 runs on armada, row 3793).
+    The caller binds each call to fresh inputs where its time depends on its data (a MoE's routing).
+    Raises `ValueError` where `pairs` reach no interval at `level`."""
+    rank = median_rank(pairs, level)
     for _ in range(warmup):
         jax.block_until_ready(first())
         jax.block_until_ready(second())
@@ -191,12 +214,9 @@ def compared[T](first: Callable[[], T], second: Callable[[], T], *, pairs: int =
             ratios.append(left_seconds / right_seconds)
         return np.asarray(ratios)
 
-    rng = np.random.default_rng(seed)
-
     def bounds(ratios: np.ndarray) -> tuple[float, float]:
-        medians = np.median(rng.choice(ratios, (resamples, len(ratios))), axis=1)
-        tail = (1.0 - level) / 2.0
-        return float(np.quantile(medians, tail)), float(np.quantile(medians, 1.0 - tail))
+        ordered = np.sort(ratios)
+        return float(ordered[rank - 1]), float(ordered[len(ordered) - rank])
 
     ratios = paired(first, second)
     return Comparison(tuple(float(ratio) for ratio in ratios), float(np.median(ratios)), bounds(ratios),
@@ -229,4 +249,4 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "Comparison", "benchmark", "carried", "compared", "samples"]
+__all__ = ["Benchmark", "Comparison", "benchmark", "carried", "compared", "median_rank", "samples"]
