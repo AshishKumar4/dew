@@ -314,7 +314,7 @@ def test_harnesses_over_one_model_score_through_one_program(run):
 
     import jax
 
-    from dew.telemetry.instrumentation import Compiles
+    from dew.telemetry.compiles import Compiles
 
     first = TextGeneration.from_run(str(run))
     second = dataclasses.replace(first, variables=jax.tree.map(lambda leaf: leaf * 2, first.variables))

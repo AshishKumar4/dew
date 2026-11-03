@@ -664,7 +664,7 @@ def mocks(module: Module) -> Iterator[Finding]:
 
 
 JAX_PRIVATE = {
-    "_cache_size": "count the programs a jitted function needs with dew.telemetry.instrumentation.Compiles",
+    "_cache_size": "count the programs a jitted function needs with dew.telemetry.compiles.Compiles",
 }
 """The private attributes of JAX's objects Dew has read, each with the public way to what it was read
 for."""

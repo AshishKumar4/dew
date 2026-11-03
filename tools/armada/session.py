@@ -162,12 +162,12 @@ def cut(nodes: list[str], seconds: list[float], count: int,
     """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
     every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
     setup's tests in one group. Where `recorded` is given (the nodes the durations record names), a test it
-    lacks weighs nothing in a unit it names another of: the plan, which reads the record alone, cuts where
-    the task does, and the test rides with its setup's."""
+    lacks weighs nothing, alone or in a unit, recorded or new: the plan, which reads the record alone, cuts
+    the recorded tests where the task does, and the new ones ride with their neighbours (the slow-test gate
+    answers for their cost)."""
     held = units(nodes, recorded)
-    runs = groups([sum(seconds[index] for index in unit
-                       if recorded is None or nodes[index] in recorded
-                       or not any(nodes[each] in recorded for each in unit)) for unit in held], count)
+    runs = groups([sum(seconds[index] for index in unit if recorded is None or nodes[index] in recorded)
+                   for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 import pytest
+from lane_environment import without_flags
 
 from dew.builds import CUDA_BUILDS
 
@@ -213,8 +214,7 @@ def test_import_dew_keeps_every_bf16_rounding_a_program_states(imported, named, 
     computation: XLA's default lets the fusion skip the rounding, and Dew keeps it. A run that names
     XLA's policy keeps its own, a bare flag reading as true as XLA reads it, and a process whose
     backend opened before `import dew` keeps XLA's default, which Dew then says once at warning level."""
-    flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-             if not flag.startswith("--xla_allow_excess_precision")]
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_allow_excess_precision").split()
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "XLA_FLAGS": " ".join([*flags, *filter(None, [named])]),
            "PYTHONPATH": ahead(os.path.join(ROOT, "src"))}
     done = subprocess.run([sys.executable, "-c", ROUNDED, imported], capture_output=True, text=True, env=env,

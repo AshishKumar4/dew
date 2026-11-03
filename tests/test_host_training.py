@@ -406,7 +406,7 @@ def test_a_host_master_steps_phases_compile_with_the_options_dew_compiles_with(t
     phases compiled with a bare `jax.jit`, so under the gate's options a host-master run compiled other
     programs than its resident step)."""
     from dew.nn.kernels.options import compiled_with
-    from dew.telemetry.instrumentation import Compiles
+    from dew.telemetry.compiles import Compiles
     from dew.training.transaction import Transaction
 
     objective = LMObjective(decoder(), 8, head_chunks=1)

@@ -11,12 +11,13 @@ import itertools
 import json
 import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from lane_environment import without_flag
+from lane_environment import without_flags
 from model_support import TINY_DECODER
 from token_support import token_rows
 
@@ -25,7 +26,7 @@ from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Layout, MeshSpec, Trainer
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
@@ -74,21 +75,62 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
+NEEDING_MICROBATCHES = 700_000
+"""Bytes a compile-only GPU states for `fine_tune`'s step to need several microbatches."""
+
+
+@pytest.fixture(scope="module")
+def admitted(tmp_path_factory):
+    """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
+    compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
+    trainer and its `AheadOfTime`, admitted once for the module."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    records = tmp_path_factory.mktemp("rungs")
+    with pytest.MonkeyPatch.context() as patch:
+        # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        patch.setenv("DEW_RUNG_RECORDS", str(records))
+        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
+    return records, trainer, ahead
+
+
+@pytest.mark.shared_setup("admitted")
+def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
+    """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
+    plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
+    _, trainer, ahead = admitted
+    plan = record(ahead.plan, "plan")
+    probes = listed(plan["probes"], "probes", read=record, what="probes")
+    assert plan["split"] > 1 and len(probes) > 1 and probes[-1]["fits"] is True
+    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+
+
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_fewer_microbatches(
-        tmp_path, monkeypatch):
+        admitted, monkeypatch):
     """With its frontier asked, a step compiled ahead on GPUs whose memory its plan needs several
     microbatches for reports, past the plan it takes and saves, each rung above it that fits at fewer
     microbatches than every plan before it, at the fewest that fit there (rows 2115, 3108, 3110): the plans
     a run's speed is chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it
-    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan."""
+    takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. Its
+    search starts at the plan admitted before it (`admitted`), kept beside the compilation cache, as a run
+    after another starts at its recorded plan: that plan's compile alone, the frontier read above it."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    records, _, earlier = admitted
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=700_000, frontier=True)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES,
+                          frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
+    admitted_plan = record(earlier.plan, "admitted plan")
+    assert {name: plan[name] for name in rung} == {name: admitted_plan[name] for name in rung}
+    assert len(probes) == 1
     splits = [plan["split"], *(entry["split"] for entry in frontier)]
     assert len(frontier) >= 2 and all(entry["fits"] is True for entry in frontier)
     assert all(isinstance(more, int) and isinstance(fewer, int) and fewer < more
@@ -104,10 +146,13 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
     its autotuner would still compile every candidate it cannot time. A run's own XLA_FLAGS setting, and a
     mesh of devices that run, keep the options as given."""
+    from dew.nn.kernels.options import compiler_options
     from dew.training.ahead import compile_only_gpus
     from dew.training.memory import deviceless_options
+    from dew.training.planning import FitSearch
 
-    monkeypatch.setenv("XLA_FLAGS", without_flag(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_autotune_level"))
+    monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
+                                                  "--xla_gpu_autotune_level"))
     deviceless = MeshSpec().build(compile_only_gpus("sm90", 1))
     assert deviceless_options(deviceless, None) == {"xla_gpu_autotune_level": 0}
     assert deviceless_options(deviceless, {"xla_gpu_enable_triton_gemm": False}) == {
@@ -115,6 +160,15 @@ def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can
     running = MeshSpec().build(jax.devices()[:1])
     assert deviceless_options(running, {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
+    # The fit search alone applies the policy, to the step's options and its towers' alike (row 3506): a
+    # step whose options are its towers' own compiles as the half rung of XLA's defaults does, one program.
+    objective = fine_tune(deviceless, split=None).objective
+    search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
+                       objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
+                       resumed=None, capacity=2**30)
+    assert search.compiled_options(None) == search.required == deviceless_options(
+        deviceless, compiler_options(*objective.towers()) or None)
+    assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
     assert deviceless_options(deviceless, None) is None
 
@@ -240,6 +294,21 @@ def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(gen
 
 
 @pytest.mark.mesh(devices=8)
+def test_programs_saved_before_executables_were_one_type_are_refused_to_compile_again(tmp_path):
+    """A file of programs compiled ahead whose programs are not executables of this Dew's (an `AheadPrograms`
+    saved before row 3670 made `Executable` its programs' one form) is refused as it loads, asking for them
+    compiled again (row 3671), never an AttributeError as it runs."""
+    import pickle
+
+    from dew.training.ahead import AheadPrograms, BuildTarget
+
+    target = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64")
+    path = tmp_path / "old.dew-aot"
+    path.write_bytes(pickle.dumps(AheadPrograms(target, {"step": ("program", b"executable", ())})))
+    with pytest.raises(ValueError):
+        AheadPrograms.load(path)
+
+
 def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
     """A trainer whose mesh is this host's own devices runs its step here; compiling it ahead is
     refused, as XLA's CPU executable, loaded again, finds none of its fused functions."""
@@ -298,6 +367,55 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
     assert saved.capacity == 2**30 and saved.plan is not None
     assert not runs.exists()
+
+
+def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there(
+        tmp_path, monkeypatch):
+    """`--trainer.compile-ahead.multiprocessors` states the GPU a step is compiled ahead for within its
+    generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): XLA compiles the
+    step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
+    the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
+    refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
+    canonical build's beside it in one record directory."""
+    import dataclasses
+
+    from run_kinds import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.nn.kernels.generation import gpu_target
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    records = tmp_path / "rungs"
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
+
+    builds = iter(range(3))
+
+    def compiled(*stated: str) -> AheadOfTime:
+        root = tmp_path / f"run{next(builds)}"
+        root.mkdir()
+        path = root / "step.dew-aot"
+        run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
+                               "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
+                               "--trainer.compile-ahead.devices", "1",
+                               "--trainer.compile-ahead.path", str(path),
+                               "--trainer.compile-ahead.capacity-gib", "0.0007",
+                               "--trainer.inspection.every", "1", *stated],
+                              default=lm(root, drawn=False))
+        with pytest.raises(CompiledAhead):
+            run.run()
+        return AheadOfTime.load(path)
+
+    pcie = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    again = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    canonical = compiled()
+    assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
+    assert pcie.sampled is not None and again.built == pcie.built
+    assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
+    held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
+    assert pcie.derived_for(held) == pcie.target
+    with pytest.raises(ValueError):
+        pcie.derived_for(gpu_target("sm90"))
+    assert len(list(records.rglob("*.json"))) == 2
 
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
@@ -581,7 +699,7 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
     review)."""
     from dew.nn.kernels.generation import chosen, device_generation
-    from dew.telemetry.instrumentation import Compiles
+    from dew.telemetry.compiles import Compiles
     from dew.training import Inspection
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
@@ -777,71 +895,6 @@ def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
         "sm90", "NVIDIA H100 PCIe", 756e12, 114)
     assert (unnamed.generation, unnamed.device_kind, unnamed.bf16_peak, unnamed.multiprocessors) == (
         "sm90", "NVIDIA H20", None, 78)
-
-
-def test_a_process_held_to_loaded_programs_refuses_each_compile_step_and_runs_what_was_compiled():
-    """Within `executable_only`, a function jitted anew, a traced program lowered and a lowered program
-    compiled each stop the run, and an executable compiled before runs; another thread is not held, and past
-    the block jitting compiles again (ledger 2716: a node measuring programs compiled ahead stops where one is
-    missing). One listener hears JAX's events for it and for an open `Compiles` alike, which counts every
-    compile done, the one the block stopped as JAX recorded it done, another thread's and those after it."""
-    import threading
-
-    from dew.telemetry.instrumentation import Compiles, ExecutableOnly, executable_only
-
-    x = jnp.arange(8.0)
-    compiled = jax.jit(lambda value: value * 3).lower(x).compile()
-    traced = jax.jit(lambda value: value * 5).trace(x)
-    lowered = jax.jit(lambda value: value * 7).lower(x)
-    elsewhere = []
-    with Compiles(None) as compiles:
-        with executable_only():
-            assert np.asarray(compiled(x)).tolist() == (np.arange(8.0) * 3).tolist()
-            for step in (lambda: jax.jit(lambda value: value + 1)(x), traced.lower, lowered.compile):
-                with pytest.raises(ExecutableOnly):
-                    step()
-            thread = threading.Thread(
-                target=lambda: elsewhere.append(np.asarray(jax.jit(lambda v: v + 2)(x))))
-            thread.start()
-            thread.join()
-        assert elsewhere[0].tolist() == (np.arange(8.0) + 2).tolist()
-        assert np.asarray(jax.jit(lambda value: value - 1)(x)).tolist() == (np.arange(8.0) - 1).tolist()
-    assert compiles.count == 3
-
-
-def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
-    """A `Compiles` block that closes while another thread's event is being told to it closes once that event
-    is held: what it counts when it closes is what it counts from then on, never a program late."""
-    import threading
-
-    told, release = threading.Event(), threading.Event()
-
-    class Slow(Compiles):
-        """An open block that takes its time over each event of its function it is told."""
-
-        def heard(self, kind, duration_secs, metadata):
-            if metadata.get("fun_name") == self.name:
-                told.set()
-                release.wait(60)
-            super().heard(kind, duration_secs, metadata)
-
-    def elevenfold(value):
-        return value * 11
-
-    x = jnp.arange(8.0)
-    compiles = Slow("elevenfold").__enter__()
-    compiler = threading.Thread(target=lambda: jax.jit(elevenfold).trace(x))
-    compiler.start()
-    assert told.wait(60)
-    closed = []
-    closer = threading.Thread(target=lambda: (compiles.__exit__(None, None, None),
-                                              closed.append(len(compiles.programs))))
-    closer.start()
-    closer.join(0.5)
-    release.set()
-    closer.join()
-    compiler.join()
-    assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
 
 
 def test_a_runs_compilers_dumps_hold_what_it_compiled_and_nothing_where_it_compiled_nothing(tmp_path,

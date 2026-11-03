@@ -26,7 +26,7 @@ from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
 ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
@@ -253,17 +253,17 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     import dataclasses
 
     from dew.nn.kernels.generation import assumed, gpu_target
-    from dew.training.ahead import AheadOfTime, handed
+    from dew.training.ahead import AheadOfTime, Executable, handed
 
     canonical = gpu_target("sm90")
-    step = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {}, canonical)
+    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, canonical)
     h200 = dataclasses.replace(canonical, device_kind="NVIDIA H200")
     with assumed(h200):
         with handed(step):
             assert gpu_target() == canonical
         assert gpu_target() == h200
     # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
-    earlier = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {})
+    earlier = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {})
     vars(earlier).pop("target")
     with assumed(h200), pytest.raises(ValueError), handed(earlier):
         pass
