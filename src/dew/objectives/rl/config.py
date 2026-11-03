@@ -7,7 +7,7 @@ The environment is its class and arguments (`EnvConfig`) and the rollout its cla
 defaults as they were recorded, as a run holds its model and its objective. What the environment states,
 the run derives: the agent's action width, the width a policy reads of each observation and the image a
 world model sees. The rollout replaces every batch whole, so the run reads no data, and the trainer is
-handed a loader of empty rows (`_idle`).
+handed a loader of empty rows (`idle`).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from collections.abc import Callable, Mapping, Sequence
-from typing import Annotated, ClassVar, Self
+from typing import Annotated, ClassVar, Self, TypedDict
 
 import jax
 import numpy as np
@@ -44,7 +44,7 @@ from dew.registry import (
 from dew.rl.aggregation import LABEL, Teacher
 from dew.rl.env import Batched, Driven, Env, Observation, TimeLimit, view
 from dew.rl.evaluation import episodes
-from dew.rl.simulator import Simulator, received
+from dew.rl.simulator import DrivenSimulator, Simulator, received
 from dew.training.evaluation import Episodes
 from dew.training.rollout import Rollout
 
@@ -149,24 +149,34 @@ class TeacherConfig:
 @dataclasses.dataclass(frozen=True)
 class EpisodesConfig:
     """A validation split scored by flying the agent (`dew.training.Episodes` over
-    `dew.rl.evaluation.episodes`): its greedy policy flown `steps` steps from fresh episodes of `env`, the
-    run's own where None, each environment's first episode scored, logged as `episodes/return` and
-    `episodes/steps`. A JAX `Env`'s alone; a `Simulator`'s steps leave the jitted program."""
+    `dew.rl.evaluation.episodes`): its greedy policy, or with `drawn` the policy's draws as it acts in
+    training (`act`), flown `steps` steps from fresh episodes of `env`, the run's own where None, each
+    environment's first episode scored, logged as `<split>/return` and `<split>/steps`, and for each
+    observation view in `reached` its mean at each first episode's last step (a race's gates `passed`),
+    `<split>/<view>`. A JAX `Env` is flown in one program; a `Simulator` from the host, and only one the
+    record names for the split: the run's own simulator holds the rollout's environments mid episode,
+    which a flight would move."""
 
     steps: int
     env: EnvConfig | None = None
+    reached: tuple[str, ...] = ()
+    drawn: bool = False
 
     def split(self, objective: Agent, env: Env | Simulator) -> Episodes:
         """The split of `objective`'s flights, in `env` where the record names no environment of its own."""
         flown = env if self.env is None else self.env.build()
-        if isinstance(flown, Simulator):
-            raise ValueError("a run's episodes are flown in one jitted program, and a Simulator steps from "
-                             "the host; name a JAX Env for them (episodes.env)")
+        if isinstance(flown, Simulator) and self.env is None:
+            raise ValueError("a run's simulator holds its rollout's environments mid episode, which a flight "
+                             "would move; name a simulator of the split's own (env)")
+        policy = objective.act if self.drawn else objective.greedy
         if isinstance(objective, DreamerV3Objective):
-            score = episodes(objective.greedy, Driven(flown), self.steps, memory=objective.memory)
+            driven = DrivenSimulator(flown) if isinstance(flown, Simulator) else Driven(flown)
+            score = episodes(policy, driven, self.steps, memory=objective.memory, reached=self.reached,
+                             models=objective.towers())
         else:
-            score = episodes(objective.greedy, flown, self.steps)
-        return Episodes(score, {"return": Shown(better="higher"), "steps": Shown()})
+            score = episodes(policy, flown, self.steps, reached=self.reached, models=objective.towers())
+        reached = {view: Shown(better="higher") for view in self.reached}
+        return Episodes(score, {"return": Shown(better="higher"), "steps": Shown(), **reached})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,13 +188,15 @@ class EnvRunConfig(RunConfig):
     imitation among its arguments), the rollout's settings (`rollout`), an optional teacher (`teacher`), the
     saved run the agent starts from (`pretrained`) and the episodes each validation flies (`episodes`).
 
-    The environment is what the run reads, as data is a run's, so a run resumed under its name may change
-    it (`RESUMABLE`): a curriculum resumes the run at a new difficulty. The run has no epochs, so its
+    The environment is what the run reads, as data is a run's, and the rollout how it collects and replays
+    it, so a run resumed under its name may change them (`RESUMABLE`): a curriculum resumes the run at a
+    new difficulty, a later phase of training at longer windows (SkyDreamer's), the rollout owing its
+    updates from there at its own pace. The run has no epochs, so its
     trainer validates and checkpoints at the cadences it names, none by default, and at its end."""
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "env": "env",
                                                    "teacher": "teacher"}
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes")
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes", "rollout")
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("dew.objectives.rl.dreamer:WorldModel"))
@@ -210,13 +222,15 @@ class EnvRunConfig(RunConfig):
     """A saved environment run's directory the agent starts from, its model and its weights at the step
     `source.step` selects (the latest unless it names one), which the run pins as it starts; its live
     weights, or its average with `source.ema`. A stage of a chain starts from the stage before it."""
-    episodes: Annotated[EpisodesConfig, record_argument(EpisodesConfig)] | None = None
-    """The episodes each validation flies (`EpisodesConfig`), one JSON value on the command line:
-    `--episodes '{"steps": 1000}'`; at `trainer.eval_every`, or `val_every`'s cadence for `episodes`."""
+    episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = (
+        dataclasses.field(default_factory=dict))
+    """The episodes each validation flies, a split of each (`EpisodesConfig`) by its name, one JSON value
+    on the command line: `--episodes '{"episodes": {"steps": 1000}}'`; at `trainer.eval_every`, or a
+    split's own cadence in `val_every`."""
 
     def build_run(self) -> Prepared:
         """The agent the record names, acting in its environment through its rollout, on the loader the
-        rollout replaces (`_idle`), validated by its episodes where it names them."""
+        rollout replaces (`idle`), validated by its episodes where it names them."""
         if self.data is not None or self.validation is not None or self.lora is not None:
             raise ValueError("an environment run trains its whole agent on the batches its rollout collects; "
                              "leave data, validation and lora unset, and score it by its episodes")
@@ -228,8 +242,8 @@ class EnvRunConfig(RunConfig):
                              "env.count")
         objective = self.agent(env, self.started())
         rollout = self.rollout.build(objective, env, **self.taught(objective, env))
-        validation = None if self.episodes is None else {"episodes": self.episodes.split(objective, env)}
-        return Prepared(self, objective, _idle(), rollout=rollout, validation=validation)
+        validation = {name: split.split(objective, env) for name, split in self.episodes.items()} or None
+        return Prepared(self, objective, idle(), rollout=rollout, validation=validation)
 
     def trained_model(self) -> ModelConfig:
         """The model the run trains: its own, or where it starts from a saved run that run's."""
@@ -241,6 +255,7 @@ class EnvRunConfig(RunConfig):
         Variables that do not fit the agent are refused."""
         model = self.trained_model()
         observation = _observed(env)
+        model = dataclasses.replace(model, fields={**model.fields, **_filled(observation, model.fields)})
         declared = {field.name for field in dataclasses.fields(models[model.name])}
         derived: dict[str, Configured] = {"action_size": env.action_size}
         if declared & {"observation_size", "image"}:
@@ -344,6 +359,40 @@ def _observed(env: Env | Simulator) -> Observation:
     return jax.eval_shape(env.reset, jax.random.key(0))[1].observation
 
 
+class Filled(TypedDict, total=False):
+    """A world model's proprioceptive entries and auxiliary heads with their widths (`_filled`)."""
+
+    proprio: tuple[tuple[str, int], ...]
+    auxiliary: tuple[tuple[str, int, int], ...]
+
+
+def _filled(observation: Observation, fields: Mapping[str, object]) -> Filled:
+    """A world model's proprioceptive entries (`proprio`, by name) and auxiliary heads (`auxiliary`, each its
+    entry's name and its units) as its record names them, each with the width of the environment's view of
+    it, one environment's flattened; a record that states a width is refused, the environment declaring
+    it."""
+    def width(name: str) -> int:
+        return int(np.prod(np.shape(view(observation, name))[1:]))
+
+    filled: Filled = {}
+    proprio = fields.get("proprio")
+    if proprio is not None:
+        if not isinstance(proprio, Sequence) or not all(isinstance(entry, str) for entry in proprio):
+            raise ValueError(f"a record names a world model's proprioceptive entries, whose widths the "
+                             f"environment declares: {proprio}")
+        filled["proprio"] = tuple((name, width(name)) for name in proprio)
+    auxiliary = fields.get("auxiliary")
+    if auxiliary is not None:
+        heads = list(auxiliary) if isinstance(auxiliary, Sequence) else [auxiliary]
+        if not all(isinstance(head, Sequence) and not isinstance(head, str) and len(head) == 2
+                   for head in heads):
+            raise ValueError(f"a record names each auxiliary head's entry and its units, the environment "
+                             f"declaring its width: {auxiliary}")
+        filled["auxiliary"] = tuple((str(head[0]), width(str(head[0])), int(head[1])) for head in heads
+                                    if isinstance(head, Sequence))
+    return filled
+
+
 def _reads(arguments: Mapping[str, object]) -> tuple[str, ...]:
     """The views a reader's recorded `arguments` name it reading (`reads`): a world model's one, a
     policy's several, or none, where it reads the observation whole."""
@@ -364,12 +413,13 @@ def _seen(observation: Observation, names: tuple[str, ...]) -> tuple[int, ...]:
     return shapes[0] if len(shapes) == 1 else (sum(shape[-1] for shape in shapes),)
 
 
-def _idle() -> Loader:
+def idle() -> Loader:
     """The loader of a run whose rollout makes every batch whole (§14): a batch of no records, one value for
     the step, which any mesh places whole, the same each time it opens (`replayed`), so a resume reads on;
-    with no record count, so no cadence is an epoch of it."""
+    with no record count, so no cadence is an epoch of it. A run composed in Python passes it to
+    `Trainer.fit` as the run kind does."""
     return Loader(train=replayed(lambda partition: itertools.repeat({"step": np.zeros((), np.float32)})),
                   val=None, records=None, batch=1)
 
 
-__all__ = ["EnvConfig", "EnvRunConfig", "EpisodesConfig", "RolloutConfig", "TeacherConfig"]
+__all__ = ["EnvConfig", "EnvRunConfig", "EpisodesConfig", "RolloutConfig", "TeacherConfig", "idle"]

@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
+from dew.inputs import unit_range
 from dew.nn.attention import reference_attention
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
@@ -137,6 +138,14 @@ class CausalTokenizer(nn.Module):
         return self._unpatchify(self.pixels(tokens[..., count:, :]))
 
 
+def unit_frames(video: jax.typing.ArrayLike) -> jax.Array:
+    """A batch's `video` as the objectives read it, floats in [-1, 1]: uint8 pixels, as the data workers write
+    clips (`presets.clips`), are scaled to it (`dew.inputs.unit_range`), and floats are taken as the caller
+    made them, already in the range."""
+    video = jnp.asarray(video)
+    return unit_range(video) if video.dtype == jnp.uint8 else video.astype(jnp.float32)
+
+
 class TokenizerObjective(Objective[Ratio]):
     """The tokenizer's MAE reconstruction (Eq. 5 without LPIPS) of a batch's `video` `[B, T, H, W, C]`,
     each frame's mask rate drawn from U(0, 0.9)."""
@@ -155,7 +164,7 @@ class TokenizerObjective(Objective[Ratio]):
         return None
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        video = jnp.asarray(batch["video"], jnp.float32)
+        video = unit_frames(batch["video"])
         rate_key, mask_key = jax.random.split(step.key)
         rate = jax.random.uniform(rate_key, video.shape[:2], maxval=self.max_mask) if step.training else None
 
@@ -297,7 +306,7 @@ class WorldModelObjective(Objective[Ratio]):
         return jax.lax.stop_gradient(self.tokenizer.bind(self.tokenizer_variables).encode(video))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        clean = self.latents(jnp.asarray(batch["video"], jnp.float32))
+        clean = self.latents(unit_frames(batch["video"]))
         actions = batch.get("actions")
         steps_key, noise_key = jax.random.split(step.key)
         d_min = 1.0 / self.model.k_max
@@ -341,4 +350,4 @@ class WorldModelObjective(Objective[Ratio]):
 
 
 __all__ = ["CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
-           "diffusion_forcing_loss", "ramp", "sampled_steps", "shortcut_forcing_loss"]
+           "diffusion_forcing_loss", "ramp", "sampled_steps", "shortcut_forcing_loss", "unit_frames"]
