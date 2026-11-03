@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import _records
+from dew.interop import release_pins
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
@@ -36,6 +37,7 @@ from dew.interop.decoder_parts import (
     Ramp,
     Renames,
     Ropes,
+    SourceCode,
     base_config,
     decoder_kinds,
     grouped_qkv,
@@ -208,24 +210,44 @@ def _mimo_v2_flash_export(model: CausalTransformer) -> Mapping[str, object]:
         'rope_parameters': {kind: {'rope_type': 'default', 'rope_theta': resolved.rope_theta,
                                    'partial_rotary_factor': resolved.partial_rotary_factor or 1.0}
                             for kind, resolved in (('full_attention', full), ('sliding_attention', sliding))},
+        'attention_dropout': model.attention_dropout_rate, 'rope_theta': None, 'rope_local_base_freq': None,
+        **_experts(model)}
+
+
+def _experts(model: CausalTransformer) -> Mapping[str, object]:
+    """Both MiMo-V2 configs' routed experts (`_mixture`), each None without a mixture."""
+    mixture = model.mixture
+    return {
         'moe_intermediate_size': None if mixture is None else mixture.expert_features,
         'n_routed_experts': None if mixture is None else mixture.experts,
         'num_experts_per_tok': None if mixture is None else mixture.top_k,
         'routed_scaling_factor': None if mixture is None else mixture.scaling,
         'n_group': None if mixture is None else mixture.groups,
         'topk_group': None if mixture is None else mixture.groups_per_token,
-        'norm_topk_prob': True, 'attention_dropout': model.attention_dropout_rate,
-        'rope_theta': None, 'rope_local_base_freq': None,
+        'norm_topk_prob': True,
     }
 
 
 def _matches(fields: CausalTransformer) -> bool:
-    """Values narrower than the heads, which no other family's attention has."""
+    """Values narrower than the heads, which no other family's attention has: MiMo-V2's geometry."""
     return fields.value_head_dim is not None and fields.value_head_dim != fields.features_per_head
 
 
+def _flash_matches(fields: CausalTransformer) -> bool:
+    """MiMo-V2's geometry as MiMo-V2-Flash fixes it (MiMoV2FlashAttention): no sinks on the full layers,
+    and the sliding layers' sinks over twice the full layers' key heads. Another holds the authors' own
+    config (`MIMO_V2`)."""
+    if not _matches(fields):
+        return False
+    types = set(fields.per_layer_types)
+    if 'full_attention' in types and fields.kind_of('full_attention').sinks:
+        return False
+    sliding = fields.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    return sliding is None or (sliding.sinks and sliding.num_kv_heads == 2 * fields.kv_heads)
+
+
 MIMO_V2_FLASH = DecoderFamily(
-    ('mimo_v2_flash',), _mimo_v2_flash_config, _matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM',
+    ('mimo_v2_flash',), _mimo_v2_flash_config, _flash_matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM',
     _mimo_v2_flash_export, weight_path=_mimo_v2_flash_path, export_path=partial(renamed_name, _NAMES),
     # Its experts are stored one tensor each, so a save writes them back through the source's own names.
     preserve_source_layout=True,
@@ -347,7 +369,39 @@ def _mimo_v2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     return renamed_path(_NAMES, name, config)
 
 
+def _mimo_v2_export(model: CausalTransformer) -> Mapping[str, object]:
+    """The authors' own config (MiMoV2Config, configuration_mimo_v2.py at 6a7f202) of a MiMo-V2 model: each
+    layer's kind and routing as its flags (`hybrid_layer_pattern`, `moe_layer_freq`), each kind's key heads,
+    base and sinks in the `swa_*` and sink fields, the epsilon under its name, the q, k and v projections
+    stored apart ('split'); the shared fields it does not read (`layer_types`, `rms_norm_eps`,
+    `rope_local_base_freq`) written as nothing."""
+    types = model.per_layer_types
+    sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
+    full = model.kind_of('full_attention') if 'full_attention' in types else None
+    mixture = model.mixture
+    return {
+        'layer_types': None, 'rms_norm_eps': None, 'rope_local_base_freq': None,
+        'layernorm_epsilon': model.norm_eps,
+        'hybrid_layer_pattern': [int(kind == 'sliding_attention') for kind in types],
+        'moe_layer_freq': [int(mixture is not None and index in model.sparse_layers)
+                           for index in range(model.num_layers)],
+        # A sliding kind's geometry, every field stated: its value width defaults to its key width.
+        **({} if sliding is None else {
+            'swa_num_attention_heads': model.num_heads, 'swa_head_dim': model.features_per_head,
+            'swa_v_head_dim': model.value_head_dim, 'swa_num_key_value_heads': sliding.num_kv_heads}),
+        'swa_rope_theta': None if sliding is None else sliding.rope_theta,
+        'sliding_window_size': None if sliding is None else sliding.window,
+        'add_full_attention_sink_bias': full is not None and full.sinks,
+        'add_swa_attention_sink_bias': sliding is not None and sliding.sinks,
+        'v_head_dim': model.value_head_dim, 'attention_value_scale': model.value_scale,
+        'partial_rotary_factor': model.partial_rotary_factor or 1.0,
+        'attention_projection_layout': 'split', 'scoring_func': 'sigmoid', 'topk_method': 'noaux_tc',
+        'attention_dropout': model.attention_dropout_rate, **_experts(model)}
+
+
 MIMO_V2 = DecoderFamily(
-    ('mimo_v2',), _mimo_v2_config, lambda fields: False, 'mimo_v2', 'MiMoV2ForCausalLM',
-    lambda model: {}, weight_path=_mimo_v2_path, packed=_FUSED_QKV, preserve_source_layout=True,
+    ('mimo_v2',), _mimo_v2_config, _matches, 'mimo_v2', 'MiMoV2ForCausalLM',
+    _mimo_v2_export, weight_path=_mimo_v2_path, export_path=partial(renamed_name, _NAMES),
+    packed=_FUSED_QKV, packs=lambda config: config.get('attention_projection_layout') == 'fused_qkv',
+    preserve_source_layout=True, release_code=SourceCode(*release_pins.MIMO_V2),
 )
