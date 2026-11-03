@@ -51,12 +51,12 @@ from .sessions import (
     OLD_LOG_PROBS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROUTED_EXPERTS_KEY,
     ROUTED_KEY,
     SEGMENT_IDS_KEY,
     SESSION_WEIGHTS_KEY,
     SUPPORT_COLUMNS_KEY,
     SUPPORT_KEY,
+    routing_of,
 )
 
 # ppo, gspo and cispo were checked against verl at 12ebe0c; every method against its paper's form
@@ -169,7 +169,8 @@ class GRPOObjective(TokenScorer):
 
     When a packed batch holds engine records, the loss replays them.
     `routed_experts`/`routed` make every router use the experts the engine
-    used (R3). `support_ids`/`support_columns` renormalize each sampled id
+    used (R3), each routed site its own where the records are keyed by site
+    (`sessions.routing_of`). `support_ids`/`support_columns` renormalize each sampled id
     over the ids its top-k/top-p sampler kept, at `sampling_temperature`
     (applied after any final softcap), so the policy likelihood is compared
     with a filtered behavior likelihood (DeepSeek-V3.2 section 3.1). Set
@@ -278,8 +279,8 @@ class GRPOObjective(TokenScorer):
             if jnp.shape(batch[key]) != ids.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
                                  f"the shape of {IDS_KEY}, {ids.shape}")
-        routes = (None if ROUTED_EXPERTS_KEY not in batch
-                  else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
+        routed = routing_of(batch)
+        routes = None if routed is None else (routed, batch.get(ROUTED_KEY))
         # The rollout's packed columns laid out once (`Coordinates`), the layout the model reads.
         laid = coordinates(ids.shape, segments=segments,
                            positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
