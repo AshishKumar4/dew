@@ -1437,40 +1437,6 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
 
 
-def merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
-    """States over disjoint keys stacked on `axis` (a split launch's slices, `imported`) as one, at once:
-    `merge`'s fold over them, each taken to the largest maximum and summed along `axis`, so a combine of
-    many slices traces one sum, not a merge a slice (a decode step's 32 slices traced 44 thousand
-    operations an attention, which at Dory 4B's depth compiled for over eight minutes; row 2491). Each
-    state takes one factor to the largest maximum where the fold takes one a merge, so the sums round in
-    another order, no less accurately. A slice of no key (a maximum of -inf) adds nothing. On the guarded
-    path the sums join at the largest shift, and a row whose join overflows shifts as its natural sums
-    need, as `merge` shifts them."""
-    m = jnp.max(stacked.m, axis=axis)
-    factors = carried(spec, stacked.m, jnp.expand_dims(jnp.where(m == -jnp.inf, 0.0, m), axis))
-    if stacked.guard is None:
-        acc = jnp.sum(expand(factors, stacked.acc) * stacked.acc, axis=axis)
-        return Partial(acc, m, jnp.sum(factors * stacked.total, axis=axis))
-    guard = stacked.guard
-    reach = jnp.max(guard.reach, axis=axis)
-    natural = jnp.sum(power2(factors * stacked.total, guard.shift), axis=axis)
-
-    def joined(shift):
-        # Each state's factor, then its shift's change as a power of two on the product (`carry_factor`).
-        drops = guard.shift - jnp.expand_dims(shift, axis)
-        acc = power2(expand(factors, stacked.acc) * stacked.acc, expand(drops, stacked.acc))
-        return jnp.sum(acc, axis=axis), jnp.sum(power2(factors * stacked.total, drops), axis=axis)
-
-    plain = jnp.sum(expand(factors, guard.plain) * guard.plain, axis=axis)
-    plain_total = jnp.sum(factors * guard.plain_total, axis=axis)
-    held = jnp.max(guard.shift, axis=axis)
-    acc, _ = joined(held)
-    live = overflowed(acc) | jnp.any(guard.live, axis=axis)
-    shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
-    acc, total = joined(shift)
-    return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
-
-
 def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
     """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
     where it may (`guarded`: a guarded walk's or one from a state)."""

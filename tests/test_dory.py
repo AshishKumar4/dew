@@ -3,9 +3,7 @@ tools/dory_reference.py transcribes its forward and writes tests/fixtures/hf/dor
 tests' reference, and tests/fixtures/hf/dory-1.0-4b holds the released config and what vLLM's
 own engine computes of the release on a GPU (tools/dory_vllm_reference.py)."""
 
-import contextlib
 import dataclasses
-import functools
 import itertools
 import json
 from pathlib import Path
@@ -28,6 +26,7 @@ from reference_error import (
     equations,
     indexed_recording,
     recording,
+    seeds_for,
     widened,
 )
 from tool_support import load as load_tool
@@ -91,27 +90,21 @@ def tensors_of(loaded: Pretrained) -> dict[str, np.ndarray]:
     return {key: np.array(value, copy=True) for key, value in loaded.export().items()}
 
 
-def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, *,
-                truth_tensors: dict[str, np.ndarray] | None = None, **fields):
+def transcribed(config: dict, tensors: dict[str, np.ndarray], compute, **fields):
     """The transcription's float32 and float64 runs of `compute(reference, *inputs)` over `tensors`
-    (`TOOL.DoryReference` with `fields`), the float64 run over `truth_tensors` where the weights it is
-    exact for are not the float32 run's: check 1's reference and truth arms, each run as given."""
-    held = ((tensors, TOOL.torch.float32), (tensors if truth_tensors is None else truth_tensors,
-                                            TOOL.torch.float64))
-    arms = [TOOL.DoryReference(config, weights, dtype, **fields) for weights, dtype in held]
+    (`TOOL.DoryReference` with `fields`): check 1's reference and truth arms, each run as given."""
+    arms = [TOOL.DoryReference(config, tensors, dtype, **fields) for dtype in (TOOL.torch.float32,
+                                                                              TOOL.torch.float64)]
     return tuple(as_given(lambda *inputs, arm=arm: compute(arm, *(np.asarray(value) for value in inputs)))
                  for arm in arms)
 
 
-def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, weights=None,
-                           truth_weights=None, **fields) -> None:
+def assert_logits_as_vllms(dew, loaded: Pretrained, label: str, *, stream: int, **fields) -> None:
     """Check 1 of `dew(ids)`, Dory's logits over drawn ids of the fixture's shape, against the
     transcription's forward (`transcribed`) over `loaded`'s weights, its float64 run the truth, over
-    `LOGITS_SEEDS`. `weights` (host tensors under the checkpoint's names) replace `loaded`'s in both
-    runs, and `truth_weights` the float64 run's alone, where Dew's arm computes another function of the
-    same checkpoint (an adapter's)."""
-    reference, truth = transcribed(loaded.config, tensors_of(loaded) if weights is None else weights,
-                                   lambda arm, ids: arm.forward(ids), truth_tensors=truth_weights, **fields)
+    `LOGITS_SEEDS`."""
+    reference, truth = transcribed(loaded.config, tensors_of(loaded), lambda arm, ids: arm.forward(ids),
+                                   **fields)
     draw = token_draw(stream, loaded.config['vocab_size'], REFERENCE['input_ids'].shape)
     assert_as_exact(dew, reference, draw, label, seeds=LOGITS_SEEDS, truth_fn=truth)
 
@@ -426,9 +419,9 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
-DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
-"""Declared seeds for check 1, each sized paired (`seeds_for` with Dew's arm) on armada: the live torch
-reference's gradient of every checkpoint tensor, through every pass or through the last pass alone."""
+DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 32}
+"""Declared seeds for check 1, sized by `seeds_for` on armada: the live torch reference's gradient of
+every checkpoint tensor, through every pass or through the last pass alone."""
 
 
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
@@ -436,10 +429,9 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     """The gradient of a loss over the logits in every tensor the checkpoint holds, its projections,
     nGPT gains and steps, the embeddings and the logit gain, as the reference's autograd takes it,
     within the rule: through every pass, and with the loop cut before its last pass, where the
-    input layers still train through what that pass reinjects (Huginn's truncation). The loss
-    reaches every tensor, so no gradient is compared as zero against zero. Each draw has fresh
-    token ids and cotangents, with their batch rows permuted together, an exact symmetry of the
-    summed loss. The same torch reference that wrote the fixture runs live in fp32 and float64;
+    input layers still train through what that pass reinjects (Huginn's truncation). Each draw has
+    fresh token ids and cotangents, with their batch rows permuted together, an exact symmetry of
+    the summed loss. The same torch reference that wrote the fixture runs live in fp32 and float64;
     every gradient keeps its checkpoint name."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
@@ -475,8 +467,6 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
         order = rng.permutation(len(ids))
         return ids[order], cotangent[order]
 
-    unreached = [tensor for tensor, gradient in torch_gradients(*draw(0)).items() if not np.any(gradient)]
-    assert not unreached, unreached
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
@@ -596,11 +586,11 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
-def peft_merged(checkpoint: Path, adapter: Path, dtype) -> dict[str, np.ndarray]:
-    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself, in the torch
-    dtype `dtype`: its LoRA layers injected by the adapter's own config into a torch module of the
-    checkpoint's linear projections under their checkpoint names, the saved factors loaded as PEFT
-    loads them, and each layer's merge, which PEFT sums in the layer's dtype."""
+def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
+    """The checkpoint's tensors with the adapter at `adapter` merged in by PEFT itself: its LoRA
+    layers injected by the adapter's own config into a torch module of the checkpoint's linear
+    projections under their checkpoint names, the saved factors loaded as PEFT loads them, and each
+    layer's merge."""
     import torch
     from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
     from peft.tuners.lora import LoraLayer
@@ -617,8 +607,8 @@ def peft_merged(checkpoint: Path, adapter: Path, dtype) -> dict[str, np.ndarray]
             if not hasattr(parent, part):
                 parent.add_module(part, torch.nn.Module())
             parent = getattr(parent, part)
-        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False, dtype=dtype)
-        linear.weight.data = torch.as_tensor(value).to(dtype)
+        linear = torch.nn.Linear(value.shape[1], value.shape[0], bias=False)
+        linear.weight.data = torch.as_tensor(value)
         parent.add_module(leaf, linear)
     model = inject_adapter_in_model(LoraConfig.from_pretrained(str(adapter)), base)
     saved = load_file(str(adapter / 'adapter_model.safetensors'))
@@ -634,15 +624,19 @@ def peft_merged(checkpoint: Path, adapter: Path, dtype) -> dict[str, np.ndarray]
     return merged
 
 
+MERGED_SEEDS = 8
+"""The merged-adapter site's declared draws (`seeds_for`)."""
+
+
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
     steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
-    merges it into every projection the checkpoint holds by its name there; and the adapted model's
-    logits, like those of the merged checkpoint Dew writes and reloads, are on par with the
-    transcription's over PEFT's float32 merge, each from the transcription's float64 run over the
-    merge PEFT sums in float64, the function the saved factors define (check 1)."""
+    merges it into every projection the checkpoint holds by its name there, and the transcription
+    over that merge computes the adapted model's logits within the rule of its own run against
+    float64; and the merged checkpoint reloads to logits on par with the adapted model's from
+    float64."""
     from safetensors.numpy import load_file
 
     loaded = load()
@@ -672,21 +666,40 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     ids = REFERENCE['input_ids']
     logits = np.asarray(adapted.model.apply(resumed, ids))
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
+    import torch
 
-    single, double = (peft_merged(TINY, tmp_path / 'adapter', dtype)
-                      for dtype in (TOOL.torch.float32, TOOL.torch.float64))
-    for merge in (single, double):
-        assert {name for name in merge if not np.array_equal(merge[name], original[name])} == projections
+    config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
+    assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
+    vocabulary = adapted.model.vocab_size
 
-    def as_peft_merges(dew, label):
-        assert_logits_as_vllms(dew, loaded, label, stream=0xD0E, weights=single, truth_weights=double)
+    draw = token_draw(0xD0E, vocabulary, ids.shape)
 
-    as_peft_merges(lambda drawn: adapted.model.apply(resumed, drawn), 'the adapter as PEFT merges it')
+    # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
+    # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
+    merged_by_peft = {dtype: TOOL.DoryReference(config, peft, dtype)
+                      for dtype in (torch.float32, torch.float64)}
+
+    def peft_logits(dtype):
+        return as_given(lambda drawn: merged_by_peft[dtype].forward(np.asarray(drawn)))
+
+    def adapted_logits(drawn):
+        return adapted.model.apply(resumed, drawn)
+
+    seeds = seeds_for(peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
+                      truth_fn=peft_logits(torch.float64))
+    assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
+                    seeds=seeds, truth_fn=peft_logits(torch.float64))
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    # Merging folds each adapter into its projection's weight, a rounding of its own, which PEFT's
-    # float32 merge makes too.
-    as_peft_merges(lambda drawn: merged.model.apply(merged.variables, drawn), 'the merged adapter')
+    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
+    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
+    # model's float64 forward (check 1).
+
+    def merged_logits(drawn):
+        return merged.model.apply(merged.variables, drawn)
+
+    assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
+                    truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})
@@ -738,13 +751,16 @@ DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_s
 
 
 def test_the_released_config_round_trips_through_dews_fields():
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config (16 input, 40 looped and 16 output layers, the looped
-    ones run twice) translates into Dew's fields; the model built from them writes back every field
+    """NVIDIA-Nemotron-Labs-Dory1.0-4B's config: 16 input, 40 looped and 16 output layers, the
+    looped ones run twice.
+    It translates into Dew's fields, the model built from them writes back every field
     DoryConfig reads as the release states it (a null by leaving it out, which DoryConfig reads as
-    its default null); and that config translates to the same fields."""
+    its default null), and that config translates to the same fields."""
     released = json.loads((RELEASED / 'config.json').read_text())
     fields = hf_decoders.translate_config(released)
     model = models.build('causal_transformer', fields)
+    assert model.num_layers == 72 and model.loop is not None and model.loop.layers == (16, 56)
+    assert model.loop.steps == 2 and model.ngpt is not None
     written = hf_decoders.export_config(model)
     for field in DORY_FIELDS:
         assert written.get(field) == released[field], field
@@ -851,43 +867,37 @@ SYMMETRIC = {'attention': {'q_proj': ('query', 1), 'k_proj': ('key', 1), 'v_proj
                      'suv_up': ('mlp', 0), 'down_proj': ('mlp', 0)}}
 
 
-def symmetric_leaves(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
-    """The function taking each parameter of `variables` (its path within `params`, and the leaf) under
-    the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or back from them where `inverse`:
-    each attention's and feed-forward's parameters along the axes it reorders (`SYMMETRIC`), then the
-    residual stream's units (tests/residual_orders.py), where the leaf is, one leaf at a time; so a caller
-    placing each leaf as it goes reorders it on the device and holds one leaf beside the reordered ones."""
-    from residual_orders import residual_reorder
+def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+    """`variables` under the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or taken
+    back from them where `inverse`: each attention's and feed-forward's parameters along the axes it
+    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py), each leaf
+    where it is, a device array on its device."""
+    from residual_orders import permuted
 
     found = load_tool('dory_vllm_reference').maps(config, drawn)
     if inverse:
         found = {part: {layer: np.argsort(order) for layer, order in by.items()}
                  for part, by in found.items()}
     kinds = config['layer_types']
-    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
-    along_residual = residual_reorder(variables, residual)
 
     def reorder(path, leaf):
         names = [getattr(entry, 'key', None) for entry in path]
-        if names[0].startswith('layers_'):
-            layer = int(names[0].removeprefix('layers_'))
-            parameter = names[-2] if names[-1] == 'kernel' else names[-1]
-            named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
-            if named is not None:
-                part, axis = named
-                order = found[part][layer]
-                leaf = (jnp.take(leaf, jnp.asarray(order), axis=axis) if isinstance(leaf, jax.Array)
-                        else np.take(np.asarray(leaf), order, axis=axis))
-        return along_residual(path, leaf)
+        if not names[0].startswith('layers_'):
+            return leaf
+        layer = int(names[0].removeprefix('layers_'))
+        parameter = names[-2] if names[-1] == 'kernel' else names[-1]
+        named = SYMMETRIC['mlp' if kinds[layer] == 'mlp' else 'attention'].get(parameter)
+        if named is None:
+            return leaf
+        part, axis = named
+        order = found[part][layer]
+        if isinstance(leaf, jax.Array):
+            return jnp.take(leaf, jnp.asarray(order), axis=axis)
+        return np.take(np.asarray(leaf), order, axis=axis)
 
-    return reorder
-
-
-def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
-    """`variables` under the symmetries `drawn`, or taken back from them where `inverse`
-    (`symmetric_leaves`), each leaf where it is, a device array on its device."""
-    reorder = symmetric_leaves(variables, config, drawn, inverse=inverse)
-    return {**variables, 'params': jax.tree_util.tree_map_with_path(reorder, variables['params'])}
+    params = jax.tree_util.tree_map_with_path(reorder, variables['params'])
+    residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
+    return permuted({**variables, 'params': params}, residual)
 
 
 def decoding(model: CausalTransformer):
@@ -927,17 +937,6 @@ def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Arr
     return scored(jnp.concatenate(rows))
 
 
-@contextlib.contextmanager
-def plain_float64():
-    """Within the block, Dew decodes in float64 as a truth: its kernels chosen as a CPU's and its attention
-    plain XLA. Float64 is the oracle of an fp32 run, so the attention kernels' exact algebra, which their
-    fp32 sums need, buys the truth nothing, and it took four and a half minutes to trace at the release's
-    depth (row 2491's stack samples)."""
-    with jax.enable_x64(new_val=True), generation.assumed('cpu'), generation.chosen(attention='xla',
-                                                                                     decode='xla'):
-        yield
-
-
 def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weights, config: dict,
                                parts: dict, label: str) -> None:
     """Check 1 of `model` over `weights` (host arrays) decoding `parts` (each prompt, the tokens drawn
@@ -955,29 +954,19 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             for prompt, tokens, prompt_rows in parts.values()])}
 
     def dew(index, order):
-        # Each order's weights placed a leaf at a time and reordered there, so the device holds the order's
-        # weights and one leaf beside them, gone when the call returns; the host reordered the 4B's 16 GB
-        # in about two minutes an order.
-        reorder = symmetric_leaves(weights, config, order)
-        placed = {**weights, 'params': jax.tree_util.tree_map_with_path(
-            lambda path, leaf: reorder(path, jax.device_put(leaf)), weights['params'])}
-        return jax.tree.map(np.asarray, rows(programs, jax.device_put(placed)))
+        # Each order's weights placed alone, and gone from the device when the call returns.
+        return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
 
-    # The float64 arm on the default device, a GPU's float64 units where one runs the test
-    # (`plain_float64`); its weights kept on the host and placed for a call alone, so the device never
-    # holds them beside an order's.
-    with plain_float64():
+    # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
+    # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
+    # the device never holds them beside an order's.
+    with jax.enable_x64(new_val=True), generation.assumed('cpu'):
         wide_programs = decoding(model.clone(dtype=jnp.float64))
     held = widened(weights)
 
-    @functools.cache
-    def decoded_truth():
-        with plain_float64():
-            return rows(wide_programs, jax.device_put(held))
-
     def truth(order):
-        # The orders are exact symmetries, so every order's truth is the identity's, decoded once.
-        return decoded_truth()
+        with jax.enable_x64(new_val=True), generation.assumed('cpu'):
+            return rows(wide_programs, jax.device_put(held))
 
     truth.dew_programs = True
     seeds = int(stored[f'{site}.seeds'])

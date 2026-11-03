@@ -104,10 +104,9 @@ def residual_width(variables) -> int:
     return width
 
 
-def residual_reorder(variables, order: np.ndarray):
-    """The function taking each parameter of `variables` (its path within `params`, and the leaf) to the
-    residual stream's units in `order`, where it is: a device array reordered on its device, a host array
-    on the host (`permuted`), one leaf at a time."""
+def permuted(variables, order: np.ndarray):
+    """`variables` with the residual stream's units in `order`, each leaf where it is: a device
+    array reordered on its device, a host array on the host."""
     width = len(order)
     declared = declarations(variables["params"])
 
@@ -120,13 +119,6 @@ def residual_reorder(variables, order: np.ndarray):
                 leaf = np.take(np.asarray(leaf), grouped, axis=axis)
         return leaf
 
-    return reorder
-
-
-def permuted(variables, order: np.ndarray):
-    """`variables` with the residual stream's units in `order`, each leaf where it is: a device
-    array reordered on its device, a host array on the host."""
-    reorder = residual_reorder(variables, order)
     return {**variables, "params": jax.tree_util.tree_map_with_path(reorder, variables["params"])}
 
 
