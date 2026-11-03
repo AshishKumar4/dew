@@ -35,7 +35,7 @@ SECONDS, FPS = 8, 24
 FILM_BYTES, POSTER_BYTES = 600_000, 60_000
 """The most bytes the landing film and its poster may take (Platform's budget for a landing band)."""
 
-CRF = 33
+CRF = 34
 """The film's H.264 constant rate factor: the size it is held under `FILM_BYTES` at."""
 
 _VIDEO = re.compile(r'src="data:video/mp4;base64,([A-Za-z0-9+/=]+)"')
