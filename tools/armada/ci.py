@@ -1488,14 +1488,35 @@ def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
-    durations record does not wholly name (split.py); and pytest's process id once its stacks can be dumped
-    (executed.py)."""
-    log, collection, report, unrecorded, dumped = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "dumped.pid"))
-    for stale in (report, log, collection, unrecorded, dumped):
+    durations record does not wholly name (split.py); and where its stacks are dumped at its deadline, its
+    process id beside them (executed.py)."""
+    log, collection, report, unrecorded, stacks = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "stacks"))
+    for stale in (report, log, collection, unrecorded, stacks, stacks.with_name(f"{stacks.name}.pid")):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
-    return log, collection, report, unrecorded, dumped
+    return log, collection, report, unrecorded, stacks
+
+
+DUMP_SECONDS = 2.0
+"""How long a task past its deadline gives its pytest's dump of its stacks before the interrupt, which would
+unwind the frames the dump walks (a dump the interrupt overtook ended its process in a segmentation fault);
+faulthandler writes one in milliseconds."""
+
+
+def dumped(done: subprocess.Popen, stacks: Path) -> str:
+    """Every thread's stack of a task's pytest past its deadline, as faulthandler wrote them to `stacks`
+    (executed.py): SIGUSR2 sent to pytest itself, the id executed.py wrote beside them once it registered
+    the dump, and `DUMP_SECONDS` for it, which ends early where pytest ends; none where pytest never
+    registered it."""
+    pid = stacks.with_name(f"{stacks.name}.pid")
+    if not pid.is_file():
+        return ""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(pid.read_text()), signal.SIGUSR2)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        done.wait(DUMP_SECONDS)
+    return stacks.read_text(errors="replace")
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1515,7 +1536,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    log, collection, report, unrecorded, dumped = task_files(out)
+    log, collection, report, unrecorded, stacks = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1529,7 +1550,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_DUMPED": str(dumped)})
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1546,17 +1567,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
-    expired = False
+    expired, dump = False, ""
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        expired = True
-        # Every thread's stack as pytest stands at its deadline, written to its output before the interrupt
-        # below: sent to pytest itself, whose id executed.py wrote as it registered SIGUSR2, past any launcher
-        # between (a release check's uv), and to nothing where pytest had not registered it yet.
-        if dumped.is_file():
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(int(dumped.read_text()), signal.SIGUSR2)
+        # Every thread's stack as pytest stands at its deadline, before the interrupt below.
+        expired, dump = True, dumped(done, stacks)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
@@ -1603,8 +1619,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # Long enough to hold a stall's stacks, which come before its interrupt's report.
-                     "output": "\n".join(red + ([output[-12000:]] if red else [])),
+                     # A stall's stacks whole, then the end of what pytest wrote.
+                     "output": "\n".join(red + ([dump[:12000]] if dump else [])
+                                         + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),

@@ -25,20 +25,22 @@ from session import MARKS
 if lifetime.log is None:
     raise pytest.UsageError("executed.py records under lifetime.py's boot alone (session.py's pytest_run)")
 
-# Every thread's stack written to the stderr the task reads into its row when its deadline passes, on the
-# SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call site, one in collection or
-# a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03: a group stalled 28 minutes
-# in a read with no deadline, its row saying only that no tests ran). Registered here, before pytest captures
-# fd 2, on a copy of it that capture leaves alone. No timer: a dump that kills the process, as walking a
-# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped.
-faulthandler.register(signal.SIGUSR2, file=os.dup(sys.stderr.fileno()), all_threads=True)
-# This process's id, where `tested` reads whom to send it: pytest's own, not a launcher's before it (a release
-# check's `uv run`, which passes no SIGUSR2 on), and none before the dump is registered, as the signal would
-# end an unregistered process. Written whole, then named, so no read finds part of it.
-if dumped := os.environ.get("DEW_DUMPED"):
-    with open(f"{dumped}.part", "w") as pid:
+# Every thread's stack written to the file DEW_STACKS names, which the task puts in its row when its
+# deadline passes, on the SIGUSR2 ci.py's `tested` sends then, before its interrupt: a stall names its call
+# site, one in collection or a fixture's setup too, which pytest's report of the interrupt cannot (2026-11-03:
+# a group stalled 28 minutes in a read with no deadline, its row saying only that no tests ran). A file of its
+# own, so no output after it pushes it out of the row. No timer: a dump that kills the process, as walking a
+# running thread may, comes only once the task is past its deadline, and a healthy run is never dumped. This
+# process's id beside it, which `tested` sends the signal to: pytest's own, past a launcher before it (a
+# release check's `uv run`, which passes no SIGUSR2 on), written whole once the dump is registered, as the
+# signal ends a process that has not registered it. Taken out of the environment, so no pytest a test starts
+# writes over either.
+if stacks := os.environ.pop("DEW_STACKS", None):
+    faulthandler.register(signal.SIGUSR2, file=os.open(stacks, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
+                          all_threads=True)
+    with open(f"{stacks}.part", "w") as pid:
         pid.write(str(os.getpid()))
-    os.replace(f"{dumped}.part", dumped)
+    os.replace(f"{stacks}.part", f"{stacks}.pid")
 
 collected: dict[str, int] = {}
 """Each test file's tests as collection found them, before any hook chose among them; a module of none
