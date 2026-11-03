@@ -10,6 +10,7 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import lane_environment
 import jax
 import numpy as np
 import optax
@@ -175,16 +176,23 @@ def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
 def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:
     """Dew's head, the release's fp32 head, its float64 head, and the terms
     Dew's float64 head sums for each logit (`float64_forward`), all on the
-    same fp32 backbone states, over every question of every case."""
+    same fp32 backbone states, over every question of every case. Each case
+    runs alone, padded to the cases' widest layout, so every case is one
+    program, compiled once, and padding reaches none of the head's pooling
+    (`test_a_padded_batch_scores_every_row_as_it_scores_alone`)."""
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="xla")
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
     # Dew's head compiled, as a served task's pass runs it.
     head = jax.jit(loaded.model.apply)
     found, reference, truth, terms = [], [], [], []
+    rows = laid_out(tokenizer)
+    widest = DecisionInputs.collate([row for _, row in rows.values()], 0)
+    length = widest.tokens.shape[1]
     with np.load(TINY / "states.npz") as states, np.load(TINY / "logits.npz") as logits:
-        for case, (_, row) in laid_out(tokenizer).items():
-            inputs = DecisionInputs.collate([row], 0)
-            given = (loaded.variables, states[case][None], inputs, table)
+        for index, (case, (_, row)) in enumerate(rows.items()):
+            inputs = jax.tree.map(lambda leaf, at=index: leaf[at:at + 1], widest)
+            padded = np.pad(states[case], ((0, length - len(states[case])), (0, 0)))[None]
+            given = (loaded.variables, padded, inputs, table)
             scores = head(*given)
             _, summed = float64_forward(loaded.model, *given)
             for slot, laid in enumerate(row.questions):
@@ -425,17 +433,20 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
         assert jax.tree.structure(resumed[collection]) == jax.tree.structure(state.variables[collection])
 
 
-def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
-    """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
-    train together on rows of several questions, and the saved run loads back as a task with identical
-    probabilities. Two such runs average into one task, its temperatures refit on held-out answers
-    (`Decide.averaged`), which saves to a directory of its own and reloads through `from_run` and
-    `dew.pipeline` answering as it did (1505)."""
-    import dataclasses
+@pytest.fixture(scope="module")
+def joint_runs(tmp_path_factory):
+    """A joint-head release's runs (1505): its Qwen 3.5 backbone, joint head and layout trained together
+    on rows of several questions, two steps, and a run of the first step alone, the two-step run's
+    directory holding its first step as the run left it there, its step compiled once for both. Built once
+    for the module's two tests of them."""
+    with pytest.MonkeyPatch.context() as patch:
+        # The module's own rung records, data and Hub caches, as each test's (`own_settings`).
+        lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
+        return _joint_runs(tmp_path_factory.mktemp("joint"))
 
-    from dew.decision import Calibration
-    from dew.inference.loading import pipeline
 
+def _joint_runs(tmp_path):
+    """`joint_runs` built under `tmp_path`."""
     release = tmp_path / "release"
     release.mkdir()
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
@@ -452,43 +463,65 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
                                   layout=JointLayout(max_len=768))
     data = decision_rows(examples, 8, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
-    # Two runs, of two steps and of one: the one-step run is the two-step run's directory holding its
-    # first step alone, as the run left it there, its step compiled once for both.
     runs = [tmp_path / "run0", tmp_path / "run1"]
     checkpoints = Checkpoints(str(runs[0]), keep=2)
-    states = [Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=2, log_every=100, checkpoint_every=1)]
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=2, log_every=100, checkpoint_every=1)
     checkpoints.wait()
     shutil.copytree(runs[0], runs[1])
     shutil.rmtree(Checkpoints(str(runs[1])).path(2))
-    runs = [str(run) for run in runs]
-    assert int(states[0].step) == 2 and Checkpoints(runs[1]).latest == 1
+    return {"objective": objective, "data": data, "start": start, "state": state,
+            "runs": [str(run) for run in runs], "examples": examples,
+            "asked": {"team": team, "urgent": urgent}, "directory": tmp_path}
+
+
+@pytest.mark.shared_setup("joint_runs")
+def test_a_joint_release_fine_tunes_and_reloads_from_its_run(joint_runs):
+    """A joint-head release is a whole task to fine-tune (`joint_runs`): its runs stop where they were
+    asked, every row read whole, its head moved, and the saved run loads back as a task with identical
+    probabilities (1505)."""
+    objective, data, start, state = (joint_runs[name] for name in ("objective", "data", "start", "state"))
+    runs, asked = joint_runs["runs"], joint_runs["asked"]
+    assert int(state.step) == 2 and Checkpoints(runs[1]).latest == 1
     stated = data.statistics()
     assert not [name for name in stated if name.startswith(("data/rejected/", "data/cut"))]
     assert all(value == 0 for name, value in stated.items() if name.startswith("data/truncated/"))
     before = jax.tree.leaves(start["params"]["head"])
-    after = jax.tree.leaves(states[0].variables["params"]["head"])
+    after = jax.tree.leaves(state.variables["params"]["head"])
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
 
-    live, reloaded = objective.pipeline(states[0]), Decide.from_run(runs[0])
+    live, reloaded = objective.pipeline(state), Decide.from_run(runs[0])
     assert live.processor is not None  # the release's, which reads images
-    asked = {"team": team, "urgent": urgent}
     first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
-    task = Decide.averaged(runs, calibrate_on=examples * 4)
+
+@pytest.mark.shared_setup("joint_runs")
+def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
+    """Two runs of a joint-head release (`joint_runs`) average into one task, its temperatures refit on
+    held-out answers (`Decide.averaged`), which saves to a directory of its own and reloads through
+    `from_run` and `dew.pipeline` answering as it did (1505)."""
+    import dataclasses
+
+    from dew.decision import Calibration
+    from dew.inference.loading import pipeline
+
+    runs, asked = joint_runs["runs"], joint_runs["asked"]
+    # Each example twice: a temperature fit's optimum is the examples' own, whatever their copies.
+    task = Decide.averaged(runs, calibrate_on=joint_runs["examples"] * 2)
     assert task.calibration != Calibration()
-    averaged = str(tmp_path / "averaged")
+    averaged = str(joint_runs["directory"] / "averaged")
     task.save(averaged)
+    expected = {state: task(state, asked) for state in ("charged twice!", "is the site down?")}
     for loaded in (Decide.from_run(averaged), pipeline(averaged)):
         assert isinstance(loaded, Decide)
         assert loaded.layout == task.layout and loaded.weights == task.weights
         assert loaded.calibration == task.calibration
-        for state in ("charged twice!", "is the site down?"):
-            found, expected = loaded(state, asked), task(state, asked)
-            for name in expected:
-                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+        for state, answers in expected.items():
+            found = loaded(state, asked)
+            for name in answers:
+                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(answers[name]))
 
 
 def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
