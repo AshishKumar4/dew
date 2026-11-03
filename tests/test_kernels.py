@@ -559,10 +559,7 @@ def _mapped(attend, packed: bool, rowwise: bool = False):
             return attend.flash_mha(q, k, v, is_causal=True)
         return attend.flash_mha_varlen(q, k, v, starts, max(MAPPED_DOCUMENTS), is_causal=True)
 
-    def row(q, k, v, cotangent):
-        out, pull = jax.vjp(truth if attend == "truth" else flash, q, k, v)
-        return (out, *pull(cotangent))
-
+    row = with_gradients(truth if attend == "truth" else flash)
     if rowwise:
         return jax.jit(lambda *rows: jax.tree.map(lambda *each: jnp.stack(each),
                                                   *(row(*(x[at] for x in rows)) for at in range(3))))
@@ -604,12 +601,17 @@ def a_fold_holds_the_kernels_grid_and_its_offsets(without_deterministic_ops):
     """The mapped calls a kernel call folds (`dew_flash_attn._mapped_groups`): as many as keep its rows
     within the 65,535 its grid holds and a packed fold's tokens within its int32 offsets, at least one:
     eight calls of 1,000 rows at once, three of 32,768 one a call, four packed of 2^30 tokens one a call,
-    and two of 70,000 rows one a call."""
+    and two of 70,000 rows one a call. A map over no call, dense or packed, launches none: its output and
+    its query, key and value gradients are empty along the mapped axis, each of one call's shape."""
     flash = flash_here()
     assert flash._mapped_groups(8, 1_000) == [(0, 8)]
     assert flash._mapped_groups(3, 32_768) == [(0, 1), (1, 2), (2, 3)]
     assert flash._mapped_groups(4, 2, 2 ** 30) == [(0, 1), (1, 2), (2, 3), (3, 4)]
     assert flash._mapped_groups(2, 70_000) == [(0, 1), (1, 2)]
+    for packed in (False, True):
+        rows = _mapped_draw(packed)(0)
+        empty = _mapped(flash, packed)(*(x[:0] for x in rows))
+        assert [x.shape for x in empty] == [(0, *x.shape[1:]) for x in (rows[0], *rows[:3])]
 
 
 def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
