@@ -73,10 +73,12 @@ def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], siz
     equation reads; and which each value the equations make reads. Leaves an operation reads together,
     through every operation between, share a chunk: an elementwise update reads one parameter's moments
     alone, a norm over the whole state reads every leaf into each update, and an operation with an effect
-    keeps its place among all of them. A summary of the leaves, a scalar made of them or what an operation
-    makes of summaries alone in no more elements than they hold (a sampled step's norms of its update,
-    summed across leaves and stacked into one vector: `dew.training.inspection`), joins no chunks: each
-    is made in its chunk and held, a few words, until the last chunk it reads is made (`staged`'s phases).
+    keeps its place among all of them. A summary of the leaves joins no chunks: a scalar made of them, or
+    what an operation makes of summaries and other scalars in no more elements than the distinct scalars
+    they are made of (a sampled step's norms of its update, summed across leaves and stacked into one
+    vector: `dew.training.inspection`), so a summary is a few words however it is rearranged, never a
+    scalar spread back over a leaf's shape. Each is made in its chunk and held until the last chunk it
+    reads is made (`staged`'s phases).
     Groups of leaves are packed in the fields' order up to the larger of the largest group and a
     `CHUNKS`th of the fields' bytes. A scalar field is no chunk's: it comes to the device first."""
     grouped = {index for index, field in enumerate(fields)
@@ -84,22 +86,27 @@ def chunks(equations: Sequence[jcore.JaxprEqn], fields: Sequence[jcore.Var], siz
     # Each leaf's group: the leaves some operation read together with it, through every one between.
     together = {index: frozenset({index}) for index in grouped}
     reads: dict[jcore.Var, frozenset[int]] = {fields[index]: frozenset({index}) for index in grouped}
-    summaries: set[jcore.Var] = set()
+    # Each summary's words: the distinct scalars it is made of.
+    summaries: dict[jcore.Var, frozenset] = {}
     taking = []
     for equation in equations:
         read = frozenset(grouped) if equation.effects else frozenset().union(
             *(reads.get(value, frozenset()) for value in equation.invars if computed(value)))
         # Summaries of the leaves combine without holding any leaf: their chunks stay apart.
         derived = [value for value in equation.invars if computed(value) and reads.get(value)]
+        words = frozenset().union(
+            *(summaries.get(value, frozenset()) for value in derived),
+            (value for value in equation.invars if computed(value) and not reads.get(value)
+             and elements(value) == 1))
         summarized = (bool(derived) and not equation.effects and all(value in summaries for value in derived)
-                      and sum(map(elements, equation.outvars)) <= sum(map(elements, derived)))
+                      and sum(map(elements, equation.outvars)) <= len(words))
         if len(read) > 1 and not summarized:
             joined = frozenset().union(*(together[index] for index in read))
             together.update(dict.fromkeys(joined, joined))
         if read:
             reads.update(dict.fromkeys(equation.outvars, read))
-            summaries.update(value for value in equation.outvars
-                             if summarized or (isinstance(value.aval, ShapedArray) and not value.aval.shape))
+            summaries.update({value: words if summarized else frozenset({value}) for value in equation.outvars
+                              if summarized or elements(value) == 1})
         taking.append(read)
     groups = sorted(set(together.values()), key=min)
     budget = max([*(sum(sizes[index] for index in group) for group in groups),
@@ -175,11 +182,13 @@ def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:
     variables = program.invars[:len(fields)]
     cut, taking, reads = chunks(equations, variables, [math.prod(field.shape) * field.dtype.itemsize
                                                        for field in fields])
-    if measuring := _MEASURED.get():
-        shares = sorted((placed_bytes([shapes[index] for index in members]) for members in cut), reverse=True)
-        for found in measuring:
-            found.append(min(placed_bytes(shapes), sum(shares[:2])))
     chunk_of = {index: number for number, members in enumerate(cut) for index in members}
+    if measuring := _MEASURED.get():
+        # The scalar fields, no chunk's, are fetched first and held throughout.
+        shares = sorted((placed_bytes([shapes[index] for index in members]) for members in cut), reverse=True)
+        first = placed_bytes([shape for index, shape in enumerate(shapes) if index not in chunk_of])
+        for found in measuring:
+            found.append(min(placed_bytes(shapes), first + sum(shares[:2])))
     position = {variable: index for index, variable in enumerate(variables)}
 
     def phase(read: frozenset[int]) -> int:

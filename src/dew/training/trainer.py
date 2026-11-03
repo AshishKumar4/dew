@@ -840,7 +840,7 @@ class Trainer(Generic[Loss, Effects]):
         if window == 1 or self.step is not None:
             return state
         stats, aux = shapes
-        shared = isinstance(stats, (Ratio, jax.ShapeDtypeStruct))
+        shared = pooled_by_mean(stats)
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = window - 1
         def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
@@ -1169,7 +1169,7 @@ class Trainer(Generic[Loss, Effects]):
             if staging_measured and not lowering:
                 jitted.trace(*apart(prepared), given, part)
         window = split * self.accumulation
-        footprint = None if self.step is not None or mesh is not None else candidate_footprint(
+        footprint = None if shapes is None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), window, prepared, held,
             (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
             consumed_where_made(self.objective, self.optimizer, prepared, window,
