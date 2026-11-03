@@ -2057,14 +2057,14 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores = None, None, v, k, None
+    decays = laid(g).reshape(rows, -1)
     if per_key:
         # A decay a key dimension's prefix halves `[R, HV * Dk]` the scores' launch's own (`_intra`); its
         # system's launch scans the decay again (`_intra_system`).
-        decays = laid(g).reshape(rows, -1)
         scores, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale)
     else:
         # A decay a head's a head's row of vectors `[HV, R]`.
-        hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(laid(g).reshape(chunks, CHUNK, -1)))
+        hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(decays.reshape(chunks, CHUNK, -1)))
     if per_key and delta and kept is not None:
         # The forward's inverse, weights, memories and corrected values given (`kept`): its scores and gated
         # keys alone formed again, the weighted launch without the delta rule's system.
