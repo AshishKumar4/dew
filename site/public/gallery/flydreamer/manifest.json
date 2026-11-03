@@ -6,7 +6,7 @@
  "seconds": 8,
  "fps": 24,
  "source_fps": 90.0,
- "notebook": "tutorials/13-camera-only-drone-racing.ipynb",
+ "notebook": "tutorials/14-camera-only-drone-racing.ipynb",
  "dew_commit": "19860eb66b76325cf15a06fefcd6f51c1f55b018",
  "scores": [
   {
