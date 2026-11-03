@@ -222,8 +222,12 @@ class GatedMLP(nn.Module):
             return activation(out) if self.activation_after else out
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
-                and self.ngpt is None and self.gate_multiplier == 1.0):
+                and self.ngpt is None):
             gate_up = self._gate_up(x)
+            if gate_up is not None and self.gate_multiplier != 1.0:
+                # The gate half scaled as the halves apart scale it (`scaled`), the up half as it is.
+                gate_up = jnp.stack([scaled(gate_up[..., 0, :], self.gate_multiplier), gate_up[..., 1, :]],
+                                    axis=-2)
             if gate_up is not None:
                 # Both names on the one output: a remat policy that keeps either keeps it whole.
                 if axes is not None:
