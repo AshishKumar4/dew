@@ -136,7 +136,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       cannot stage busy (`holds`, `resources.tile_registers`) gives way to the next narrower or shorter one.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
       rows a tile must divide (not grouped) take no whole role for each, where a group averages fewer rows
-      than their roles (grouped), or where no tile of them holds.
+      than one role (grouped), or where no tile of them holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
       a tile, one at least; a wave is all of them.
@@ -190,12 +190,11 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
-    # whose groups average fewer rows than the consumers' roles (a decode step's experts, a few routed rows
-    # each): its accumulator a role's rows, its registers a share more programs a multiprocessor hold,
-    # where the family's full set held rows no group has (row 3622: deepseek-v3's one-token experts at
-    # 2 x 64 rows ran one program a multiprocessor at 48% of DRAM's peak, FS-3622-NCU1-h100).
-    roles = family.role_rows * family.consumers
-    whole = rows >= roles if grouped else rows % roles == 0
+    # whose groups average fewer rows than one role (a decode step's experts, a few routed rows each), whose
+    # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
+    # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
+    # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
+    whole = rows >= family.role_rows if grouped else rows % (family.role_rows * family.consumers) == 0
     return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
                  for programs in range(family.programs(consumers), 0, -1)
                  if (tile := tiled(consumers, programs)) is not None), None)
