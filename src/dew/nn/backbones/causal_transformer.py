@@ -28,7 +28,6 @@ import math
 from collections.abc import Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
-import flax.core
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -65,9 +64,8 @@ from dew.nn.continuum import (
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.quantization import LinearProducts
-from dew.registry import from_record, read_arguments
 
-from ..activations import _SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
+from ..activations import _SLOPES, UNGATED, GatedActivation, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
@@ -121,13 +119,12 @@ from ..protocols import (
     QuantizesInputs,
     declared_groups,
 )
-from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
+from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
-    NORM_SITES,
     REMAT_POLICIES,
     BlockWiring,
     DecoderBlock,
@@ -137,10 +134,9 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     feedforward_factories,
-    remat_policy,
     remat_record,
 )
-from .decoder_fields import refuse_unbuildable, softmax_attention_layers
+from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
     DecoderBank,
     Loop,
@@ -484,50 +480,7 @@ class CausalTransformer(LinearProducts):
     layout either way."""
 
     def __post_init__(self):
-        if self.layer_types is not None:
-            object.__setattr__(self, "layer_types", tuple(self.layer_types))
-        object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
-        if self.kv_shared_layers is not None:
-            object.__setattr__(self, "kv_shared_layers",
-                               tuple(int(index) for index in self.kv_shared_layers))
-        if isinstance(self.mlp_features, (tuple, list)):
-            object.__setattr__(self, "mlp_features", tuple(int(width) for width in self.mlp_features))
-        if self.activation_sparsity_pattern is not None:
-            object.__setattr__(self, "activation_sparsity_pattern",
-                               tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
-        # A value arrives as a record from a config and as itself from code,
-        # and `models.build` already reads one; reading every field that holds
-        # a record here too, as its annotation declares (`read_arguments`),
-        # means the plain constructor takes the same records, as a test or a
-        # notebook writes them. A bare rotary record and SiTU's betas name no
-        # class, so their own readers take them.
-        records = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
-                   if field.name not in ("rope_scaling", "mlp")
-                   and isinstance(getattr(self, field.name), Mapping)}
-        for name, value in read_arguments(type(self), records).items():
-            object.__setattr__(self, name, value)
-        if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, 'rope_scaling', rope_scaling_from_record(self.rope_scaling))
-        if isinstance(self.mlp, Mapping):
-            # A config states SiTU's betas as a record in the activation's place.
-            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
-        if self.norms is not None:
-            unknown = sorted(set(self.norms) - set(NORM_SITES))
-            if unknown:
-                raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
-                                 f"it builds {list(NORM_SITES)}")
-            # Frozen, because a module's fields are static to jit and a plain
-            # dict cannot be hashed.
-            object.__setattr__(self, "norms", flax.core.freeze(dict(self.norms)))
-        if self.kinds is not None:
-            object.__setattr__(self, "kinds", flax.core.freeze(dict(self.kinds)))
-        if self.mixer is not None and not isinstance(self.mixer, MixerBase):
-            raise ValueError(
-                f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
-        if self.continuum is not None and self.ngpt is not None:
-            raise ValueError("a continuum level reads the final norm's states, which a normalized "
-                             "transformer (ngpt) does not have")
-        object.__setattr__(self, "remat", remat_policy(self.remat))
+        settle_fields(self)
         # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
         _ = self.wiring
         super().__post_init__()
