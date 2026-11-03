@@ -22,8 +22,9 @@ from dew.training.planning import PlanRefused
 
 def deep(remat=None):
     """A decoder whose residuals are most of what its step holds, on one device, reading its batch
-    whole: eight layers over 256 tokens, the derivation's case."""
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+    whole: two layers over 256 tokens, the derivation's case (each layer's residuals there are some forty
+    times its parameters)."""
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=remat)
     return one_device(Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0),
                               split=1))
