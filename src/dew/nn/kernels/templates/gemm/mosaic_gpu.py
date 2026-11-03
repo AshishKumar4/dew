@@ -55,7 +55,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import axes, bundles, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 
@@ -496,8 +496,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     if (dense and paired is None and tiles.cluster == 1 and family_of(tiles, lhs.dtype).fixes_up
             and not exact_sums):
         tail = tail_of.balanced(-(-m // tiles.block_m) * (n // block_n), k // block_k, multiprocessors,
-                                handoff_steps=handoff_steps(tiles, multiprocessors=multiprocessors,
-                                                            target=generation.gpu_target()))
+                                handoff_steps=handoff_steps(tiles, generation.gpu_target()))
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -799,8 +798,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     # An exact sum's order is its contract, which a tile summed across programs reassociates.
     if dense and family_of(tiles, lhs.dtype).fixes_up and not exact_sums:
         tail = tail_of.balanced(m // block_m * (n // block_n), -(-k // block_k), multiprocessors,
-                                handoff_steps=handoff_steps(tiles, multiprocessors=multiprocessors,
-                                                            target=generation.gpu_target()))
+                                handoff_steps=handoff_steps(tiles, generation.gpu_target()))
     return _tgmm_streamed(
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
@@ -1046,21 +1044,20 @@ def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, ste
     return first | last
 
 
-def step_seconds(tiles: Tiles, *, multiprocessors: int, target) -> float | None:
-    """One MMA step of `tiles`, in seconds: its FLOPs at a multiprocessor's share of `target`'s dense bf16
-    peak, the unit the kernel gradient's split (`split_count`) and a balanced tail (`handoff_steps`) price
-    their walks in; None where the target states no peak."""
-    peak = target.bf16_peak
-    flops = 2 * tiles.block_m * tiles.block_n * tiles.block_k
-    return None if peak is None else flops / (peak / multiprocessors)
+def step_seconds(tiles: Tiles, target) -> float | None:
+    """One MMA step of `tiles`, in seconds: its FLOPs at one multiprocessor's 16-bit tensor rate
+    (`templates.cost.rates`, the architecture's a clock at the part's clock, whatever the multiprocessors a
+    target states), the unit the kernel gradient's split (`split_count`) and a balanced tail
+    (`handoff_steps`) price their walks in; None where the target states no rate."""
+    rate = unit_cost.rates(target, device=False)[0]
+    return None if rate is None else 2 * tiles.block_m * tiles.block_n * tiles.block_k / rate
 
 
-def handoff_steps(tiles: Tiles, *, multiprocessors: int, target) -> float:
+def handoff_steps(tiles: Tiles, target) -> float:
     """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
-    of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its peak is
+    of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its rate is
     unmeasured."""
-    step = step_seconds(tiles, multiprocessors=multiprocessors, target=target)
-    handoff = target.handoff_seconds
+    step, handoff = step_seconds(tiles, target), target.handoff_seconds
     return 0.0 if step is None or handoff is None else handoff / step
 
 
