@@ -8,6 +8,8 @@ slice count its work list takes (every count a case, Hypothesis drawing the rows
 pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
 the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
+import dataclasses
+
 import hypothesis
 import jax
 import jax.numpy as jnp
@@ -120,18 +122,26 @@ def _decode_spans(lengths):
     return template.spans(1, DECODE_KEYS, DECODE_ROWS, lengths=jnp.asarray(lengths, jnp.int32))
 
 
+PERSISTENT = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=2)
+"""An H100 of two multiprocessors: a decode step's launches of more programs than two walk their tiles
+persistent (`attention_mosaic_forward._persistent`), a slice's among them."""
+
+
 @INTERPRETS
 @INTERPRETED
+@pytest.mark.parametrize("gpu", ["sm90", "persistent"])
 @pytest.mark.parametrize("slices", [1, 2, 4, 8])
 @hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
-def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
+def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, gpu,
+                                                                                        lengths):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
     decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
-    lengths: on par with the step walked whole."""
+    lengths: on par with the step walked whole, on an H100 and on one of two multiprocessors (`PERSISTENT`),
+    whose programs walk the slices' tiles in turn."""
     spans = _decode_spans(lengths)
 
     def sliced(query, key, value):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm90" if gpu == "sm90" else PERSISTENT):
             rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
             config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                            target=generation.gpu_target()).config
