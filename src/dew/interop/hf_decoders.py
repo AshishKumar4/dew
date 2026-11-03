@@ -73,6 +73,7 @@ from dew.nn.gemma3n import AltUp
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
 from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
 from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
+from dew.nn.vision.lfm3 import translate_lfm3_vl_projector_config, translate_lfm3_vl_vision_config
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
 from dew.nn.vision.muse_glimmer import (
     translate_muse_glimmer_projector_config,
@@ -441,10 +442,12 @@ def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
 
 
 def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
-    """Read an LFM3-VL wrapper (LiquidAI/LFM3-VL-2B): its LFM3 decoder under text_config. Its vision tower
-    (`lfm3_vl_vision`, convolutions between attention over patches) and its projector have no Dew port,
-    so a load reads its language model alone (`text_only`; `WrapperFields.unported`). d1's checkpoints
-    of it (LiquidAI/d1-2B) train their full-attention layers under a visibility of their own
+    """Read an LFM3-VL wrapper (LiquidAI/LFM3-VL-2B@f83d2b0, modeling_lfm3_vl.py's Lfm3VlModel): its
+    trunk of gated grid convolutions between attention over each frame's patches
+    (`dew.nn.vision.lfm3.Lfm3VlVision`), its projector of each merge block (`Lfm3VlProjector`) and its
+    LFM3 decoder under text_config, whose image and video placeholders the projected patches fill. One
+    resolution per call, so the soft-token count varies with the image, as Qwen 3.5's does. d1's
+    checkpoints of it (LiquidAI/d1-2B) train their full-attention layers under a visibility of their own
     (`d1_attention`), which no Dew layout reads: a load refuses it, the language model's function being
     that visibility's."""
     attention = hf_config.get("d1_attention")
@@ -453,17 +456,16 @@ def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
                "d1 trains its full-attention layers to see across a state and its questions as no Dew "
                "decision layout reads yet")
     text = _wrapper_text(hf_config, used)
+    tower = translate_lfm3_vl_vision_config(hf_config)
+    projector = translate_lfm3_vl_projector_config(hf_config, record_int(text, "emb_features"))
     used.update(("downsample_factor", "projector_bias", "projector_hidden_act", "projector_hidden_size",
                  "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
                  "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
     # Lfm3VlConfig's placeholders where a config leaves them out (configuration_lfm3_vl.py).
     image = _defaulted_token_id(hf_config, used, "image_token_id", 125030)
     video = _defaulted_token_id(hf_config, used, "video_token_id", 125029)
-    fields = _wrapper_fields("lfm3_vl", used, text, None, None, image, None, video=video)
+    fields = _wrapper_fields("lfm3_vl", used, text, tower, projector, image, None, video=video)
     fields["text_model_type"] = _records.text(_text_config(hf_config)["model_type"], "text_config.model_type")
-    fields["unported"] = {
-        "vision_tower.": "LFM3-VL's vision tower (lfm3_vl_vision) has no Dew port",
-        "multi_modal_projector.": "LFM3-VL's projector reads its vision tower, which has no Dew port"}
     return fields
 
 
