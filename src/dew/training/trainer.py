@@ -928,7 +928,7 @@ class Trainer(Generic[Loss, Effects]):
             yield schedule
 
     def _step_body(self, shapes, copies, split: int, resting: Mapping[str, object] | None = None,
-                   sampled: bool = False):
+                   sampled: bool = False, placed=None):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
         state's fields `resting` places in host memory to the device only once its gradient is ready, a
         chunk at a time (`Transaction.past`), and, `sampled`, summarizes what the run inspects at its
@@ -936,7 +936,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, resting=resting, examples=self._examples,
-                               inspection=self.inspection if sampled else None).step()
+                               inspection=self.inspection if sampled else None, placed=placed).step()
         # A custom step need not run the objective's loss, which passes a model the run's progress.
         refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(self.objective, self.optimizer)
@@ -1204,7 +1204,7 @@ class Trainer(Generic[Loss, Effects]):
         # from its start.
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
         body = self._step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
-                               sampled)
+                               sampled, shardings.variables["params"])
         body = body if self.diloco is None else self.diloco.step(body, self.device_mesh, split)
         moving, frozen = apart(shardings)
 

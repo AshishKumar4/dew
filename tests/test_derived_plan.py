@@ -203,7 +203,10 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     """Every compile's plan record holds the headroom the derivation judged beside the one the compile
     measured, and each compile whose fit the derivation judged otherwise is told as a model miss, the
     compile deciding: with room between what the derivation and the compile say a step at full
-    recomputation needs, the run hears a miss for its first compile and one for each it judged so."""
+    recomputation needs, the run hears a miss for its first compile and one for each it judged so. Whether
+    a head policy past that compile then fits the room, a plan, or none does, a refusal, is the
+    compiler's schedule's: under XLA:CPU's memory-optimized schedule the head tiled, its gradient taken
+    in the backward, fits it (7263045940), under its default none did; the misses are told either way."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     free(monkeypatch, LIMIT)
     sizing = deep(REMAT_POLICIES["full"])
@@ -214,16 +217,18 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "between"))
     free(monkeypatch, (derived + compiled_need) // 2)
     trainer = deep(REMAT_POLICIES["full"])
+    refused: PlanRefused | None = None
     with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
-        if compiled_need > derived:
-            with pytest.raises(PlanRefused):
-                compiled(trainer)
-        else:
+        try:
             compiled(trainer)
+        except PlanRefused as error:
+            refused = error
     missed = [record for record in caplog.records if "model miss" in record.getMessage()]
-    probes = (trainer.plan or {}).get("probes") or []
-    judged = [probe for probe in probes if (probe["derived_headroom"] >= 0) != probe["fits"]]
-    assert compiles.count >= 1 and missed and (not probes or len(missed) == len(judged))
+    probes = [probe.record() for probe in refused.probes] if refused else trainer.plan["probes"]
+    judged = [probe for probe in probes
+              if probe["derived_headroom"] is not None and (probe["derived_headroom"] >= 0) != probe["fits"]]
+    assert compiles.count >= 1 and probes[0]["fits"] == (compiled_need < derived)
+    assert missed and len(missed) == len(judged)
 
 
 GATE_LAYERS = {

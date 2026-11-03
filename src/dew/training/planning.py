@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from jax.experimental.profiler import get_profiled_instructions_proto
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
@@ -50,6 +51,7 @@ from dew.training.memory import (
     head_tile_of,
     judged,
     local_devices,
+    offloads,
     recompute_more,
     recompute_record,
     remat_half,
@@ -634,13 +636,15 @@ class FitSearch[LossT, EffectsT]:
         offline (`dew.training.ahead.compile_ahead`'s frontier). A rung at as many microbatches as one below
         it recomputes more for none fewer, which no speed favours, so it is not compiled; a remat rung takes
         the run's own head again (`recompute_more`), so a rung may fit at fewer than the one before it, and
-        the search reads the ladder to its end, or until a rung fits at the fewest. Where the plan or the
-        last rung found is the ladder's top, its sibling that offloads the residuals it would recompute
-        (`remat_offloaded`) is compiled at its split too: as many device bytes, another speed (row 1932).
-        The objective is left at the last rung read, the run's to restore."""
+        the search reads the ladder to its end, or until a rung fits at the fewest. Where the ladder's top
+        fits, the plan or a rung found (its head policies after it moving `current` on), its sibling that
+        offloads the residuals it would recompute (`remat_offloaded`) is compiled at the last top that fit,
+        its modules and head policy put back first: as many device bytes, another speed (row 1932). The
+        objective is left at the last rung read, the run's to restore."""
         # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
         self.resumed = None
-        fewer, found, plan = list(candidates[:candidates.index(split)]), [], self.current()
+        fewer, found = list(candidates[:candidates.index(split)]), []
+        top = (split, self.configuration()) if offloads(self.objective) else None
         while fewer and self.onward(lambda: recompute_more(self.objective, self.base)):
             asked = len(self.probes)
             fewest = planned(fewer, 0, self.fits_here, lambda: False,
@@ -649,11 +653,24 @@ class FitSearch[LossT, EffectsT]:
                 found.append(next(probe for probe in self.probes[asked:]
                                   if probe.fits and probe.split == fewest))
                 fewer = fewer[:fewer.index(fewest)]
-        last = found[-1].split if found and found[-1].rung == self.current() else (
-            split if not found and self.current() == plan else None)
-        if last is not None and remat_offloaded(self.objective) and self.fits_here(last):
-            found.append(self.probes[-1])
+                if offloads(self.objective):
+                    top = (fewest, self.configuration())
+        if top is not None:
+            self.restore(top[1])
+            if remat_offloaded(self.objective) and self.fits_here(top[0]):
+                found.append(self.probes[-1])
         return tuple(found)
+
+    def configuration(self) -> tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool]:
+        """The objective's modules and its head's tile and fusion as they stand, which `restore` puts back."""
+        return (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
+                head_fused_of(self.objective))
+
+    def restore(self, configuration: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool]) -> None:
+        """Put the objective's modules and head policy back as `configuration` holds them."""
+        modules, tile, fused = configuration
+        self.objective.substitute(list(modules))
+        self.objective.restore_head(tile, fused=fused)
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
@@ -669,12 +686,10 @@ class FitSearch[LossT, EffectsT]:
         if self.remat_set:
             self.advise(split)
             return
-        base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
-                head_fused_of(self.objective))
+        base = self.configuration()
         label, narrow = self.walked(split)
         if label != "fits":
-            self.objective.substitute(list(base[0]))
-            self.objective.restore_head(base[1], fused=base[2])
+            self.restore(base)
             narrow = self.narrow
         elif self.remat_rung() != self.started:
             _log.info("the derivation says the step fits from remat %s; compiling there first",

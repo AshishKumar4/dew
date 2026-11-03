@@ -42,6 +42,7 @@ from egglog import (
 
 from dew.algebra import cost, forms, program, rules, terms
 from dew.algebra.cost import Work
+from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
 
@@ -156,6 +157,10 @@ class Priced:
 
     def __add__(self, other: Priced) -> Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
+
+    def levels(self) -> tuple[Level, ...]:
+        """The sequential work's levels, then the parallel's (`extract.Linear`)."""
+        return self.sequential.levels() + self.parallel.levels()
 
 
 def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:

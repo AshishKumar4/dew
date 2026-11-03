@@ -127,7 +127,12 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
                           frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
-    frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    # A sibling that offloads what the ladder's top recomputes sits at that top's split (row 1932).
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
+
+    offloaded = remat_record(REMAT_POLICIES["minimal_offloaded"])
+    frontier = [entry for entry in listed(plan["frontier"], "frontier", read=record, what="frontier")
+                if entry["remat"] != offloaded]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
     admitted_plan = record(earlier.plan, "admitted plan")
     assert {name: plan[name] for name in rung} == {name: admitted_plan[name] for name in rung}
@@ -142,23 +147,37 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
 
 
-def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_split(tmp_path, monkeypatch):
+@pytest.mark.parametrize("capacity", [2**30, 520_000], ids=["one microbatch", "several"])
+def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_fit(tmp_path, monkeypatch,
+                                                                                    capacity):
     """A step whose plan is the remat ladder's top ('full') lists, past it, the sibling that keeps what
-    'minimal' saves in pinned host memory in place of recomputing it ('minimal_offloaded') at the plan's
-    split: as many device bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses
-    (row 1932). The run, which times nothing, is left at 'full'."""
+    'minimal' saves in pinned host memory in place of recomputing it ('minimal_offloaded'): as many device
+    bytes as 'full', so no fit rung, but another speed, which the GPUs' timing chooses (row 1932). It is
+    compiled at the last configuration at 'full' that fit, its head policy put back, whatever head policies
+    the frontier then tried at fewer microbatches; and the run, which times nothing, is left at its plan.
+    At 520 kB the plan at 'full' takes four microbatches and the head policies tried past it fit at no fewer
+    (a sweep at 83bc7370bc: from 600 kB to 700 kB the sibling fits at no plan's split on a device with no
+    host memory of its own, and past 850 kB the plan takes one)."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
     from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.memory import head_fused_of, head_tile_of, recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None, remat="full")
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, frontier=True)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=capacity, frontier=True)
     plan = record(ahead.plan, "plan")
-    (sibling,) = listed(plan["frontier"], "frontier", read=record, what="frontier")
-    assert plan["remat"] == remat_record(REMAT_POLICIES["full"])
-    assert sibling["remat"] == remat_record(REMAT_POLICIES["minimal_offloaded"])
-    assert sibling["fits"] is True and sibling["split"] == plan["split"]
-    assert trainer.plan == ahead.plan
+    frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    full, offloaded = (remat_record(REMAT_POLICIES[name]) for name in ("full", "minimal_offloaded"))
+    *rungs, sibling = frontier
+    last = [entry for entry in (plan, *rungs) if entry["remat"] == full][-1]
+    assert plan["remat"] == full
+    assert sibling["remat"] == offloaded and sibling["fits"] is True
+    assert (sibling["split"], sibling["head_tile"], sibling["head_fused"]) == (
+        last["split"], last["head_tile"], last["head_fused"])
+    assert recompute_record(trainer.objective) == plan["remat"]
+    tile = head_tile_of(trainer.objective)
+    assert ([*tile] if tile else None, head_fused_of(trainer.objective)) == (plan["head_tile"],
+                                                                             plan["head_fused"])
 
 
 def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):

@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from map_judge import pooled_units, record_units
 
 from dew.algebra import SATURATION, derive
 from dew.nn.kernels import recurrence_algebra
@@ -146,27 +147,55 @@ def _certify_every_structure(declaration, shapes, tiles) -> None:
 KERNEL_TILES = tuple(itertools.product(ROWS, KEYS, WIDTHS))
 
 
-@pytest.mark.parametrize("factor", FACTORS, ids=str)
-@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
-@pytest.mark.parametrize(("base2", "keys_first"), list(itertools.product((False, True), repeat=2)),
-                         ids=lambda value: str(value))
-def test_every_structure_of_the_forward_is_certified(base2, keys_first, dtype, factor):
+FORWARD_CASES = tuple(itertools.product((False, True), (False, True), DTYPES, FACTORS))
+"""The forward's cases (`test_every_structure_of_the_forward_is_certified`): its base, its order, its
+operands' dtype and its logits' factor."""
+
+BACKWARD_CASES = tuple(itertools.product(("keys", "rows"), (False, True), (False, True), DTYPES, WIDTHS))
+"""The backward's cases (`test_every_structure_of_the_backward_is_certified`): its walked axis, whether it
+is hooked and dropping, its operands' dtype and its head width."""
+
+
+def _certified_in_shards(label: str, cases: tuple, units: int, certify) -> None:
+    """Each of `cases` certified (`certify`), the cases the units of armada's map tasks (the test's `shards`
+    mark, `units` of them): each map task certifies its cases and records how many (`map_judge`), failing on
+    the first that is not lawful, and the judge holds that every case was; run whole, every case in turn. A
+    case certifies its structures at their witnesses whatever task it runs in."""
+    assert len(cases) == units, "the shards mark counts each case"
+
+    def certified(start: int, stop: int) -> int:
+        for case in cases[start:stop]:
+            certify(*case)
+        return stop - start
+
+    if record_units(label, certified):
+        return
+    if pooled_units(label, units) is None:
+        certified(0, units)
+
+
+@pytest.mark.shards(units=60, per_task=1)
+def test_every_structure_of_the_forward_is_certified():
     """The forward's softmax walk (`attention_algebra.declaration`), in either base, queries or keys first,
-    over its formed logits or its raw products and each regime of their factor."""
-    _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES)
+    over its formed logits or its raw products and each regime of their factor, at every dtype: each case
+    40 s to 55 s, one a map task: two took 100 s to 127 s a task on armada (b376a92ee3)."""
+    def certify(base2, keys_first, dtype, factor):
+        _certify_every_structure(*_forward(base2, keys_first, dtype, factor), KERNEL_TILES)
+
+    _certified_in_shards("the forward's structures", FORWARD_CASES, 60, certify)
 
 
-@pytest.mark.parametrize("width", WIDTHS)
-@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
-@pytest.mark.parametrize(("walked", "hooked", "dropped"),
-                         list(itertools.product(("keys", "rows"), (False, True), (False, True))),
-                         ids=lambda value: str(value))
-def test_every_structure_of_the_backward_is_certified(walked, hooked, dropped, dtype, width):
+@pytest.mark.shards(units=120, per_task=4)
+def test_every_structure_of_the_backward_is_certified():
     """The backward (`attention_backward_algebra.backward_declaration`) at the scale of each head width,
-    walked over keys or queries, hooked and dropping or not."""
-    declaration, shapes = _backward(walked, hooked, dropped, dtype, width)
-    tiles = tuple((rows, keys, width) for rows, keys in itertools.product(ROWS, KEYS))
-    _certify_every_structure(declaration, shapes, tiles)
+    walked over keys or queries, hooked and dropping or not, at every dtype: each case 14 s or so, 25 at the
+    most, four a map task (armada, 3bfbdfc842)."""
+    def certify(walked, hooked, dropped, dtype, width):
+        declaration, shapes = _backward(walked, hooked, dropped, dtype, width)
+        tiles = tuple((rows, keys, width) for rows, keys in itertools.product(ROWS, KEYS))
+        _certify_every_structure(declaration, shapes, tiles)
+
+    _certified_in_shards("the backward's structures", BACKWARD_CASES, 120, certify)
 
 
 @pytest.mark.parametrize(("keys_first", "dropped", "masked"),
