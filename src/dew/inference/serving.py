@@ -236,19 +236,21 @@ def _seed(key: int | jax.Array) -> int | jax.Array:
     return jax.random.key_data(typed)
 
 
-@outer_program
+@functools.partial(outer_program, static_argnums=(4,))
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
-              folds: jax.Array) -> jax.Array:
+              folds: jax.Array, impl: str) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
     each row's key, `key(seed)` where it came as an integer seed, folded by
-    the row's index in the batch it came in. A key made here has the bits
-    an eager `jax.random.key(seed)` has, so a request draws as it would
-    alone, and submitting it launched nothing (each submit's own small
-    programs left the RTX 4080 idle between serving steps)."""
+    the row's index in the batch it came in, all of the server's PRNG
+    implementation (`impl`, a static argument, as no trace context holds
+    the default one). A key made here has the bits an eager
+    `jax.random.key(seed)` has, so a request draws as it would alone, and
+    submitting it launched nothing (each submit's own small programs left
+    the RTX 4080 idle between serving steps)."""
     def folded(row: jax.Array, fold: jax.Array) -> jax.Array:
-        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row), fold))
+        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row, impl=impl), fold))
 
-    made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed)))(seeds)
+    made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed, impl=impl)))(seeds)
     return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
@@ -582,8 +584,8 @@ class Server:
         # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
         # like the weights, which `reload` moves to each version it serves without a compile.
         self.progress = progress
-        self.decode_steps = decode_steps
-        self.steps = 0
+        # The PRNG implementation its rows' keys are of: the default one as it was built.
+        self.decode_steps, self.steps, self.prng = decode_steps, 0, str(jax.config.jax_default_prng_impl)
         self._queue: deque[_Row] = deque()
         """The requests waiting for a slot, oldest first. `submit` appends on
         the right while a step seats from the left, so a submitting thread
@@ -609,7 +611,8 @@ class Server:
             self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
-                                                      capacity=capacity, plan=rows.placement.plan), variables)
+                                                      capacity=capacity, plan=rows.placement.plan,
+                                                      impl=self.prng), variables)
             rows.check(shapes.decoder.cache)
             held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
@@ -642,7 +645,8 @@ class Server:
                 # formats would repeat the server's largest compile (`resident_formats`).
                 self._step = chosen
             self._resident, self._carried = split_donated(
-                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan))
+                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan,
+                                   self.prng))
             self._keep_states(formats)
 
     def _keep_states(self, formats) -> None:
@@ -1157,7 +1161,7 @@ class Server:
                 valid,
                 slots,
                 budgets,
-                _row_keys(tuple(keys), seeds, seeded, folds),
+                _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
                 tables,
                 cursors,
                 final,

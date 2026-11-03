@@ -123,16 +123,18 @@ def drafting_depths(model: nn.Module, plan: Speculative | None) -> int | None:
 
 
 def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int,
-           plan: Speculative | None = None) -> Slots:
+           plan: Speculative | None = None, impl: str = "threefry2x32") -> Slots:
     """Every slot free: zeros in the shapes of a prefill over an all-invalid
     prompt, which leave the cursors at zero and the validity false, its
-    drafting state among them where the rows draw speculative blocks."""
+    drafting state among them where the rows draw speculative blocks, and
+    its keys the data of `impl`'s (the server's PRNG implementation, a static
+    argument, as no trace context holds the default one)."""
     ops = decode_ops(model, params, pad_id, drafting_depths(model, plan))
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
     _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
-    keys = jax.random.key_data(jax.random.key(0))
+    keys = jax.random.key_data(jax.random.key(0, impl=impl))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
@@ -670,7 +672,7 @@ def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, O
 def opened_in(formats: Formats) -> OuterProgram:
     """`opened`, allocating its state in `formats`: an outer program (`dew.nn.kernels.options.program`),
     one for every layout."""
-    return outer_program(opened, static_argnums=(0, 2, 3, 4, 5), out_shardings=formats)
+    return outer_program(opened, static_argnums=(0, 2, 3, 4, 5, 6), out_shardings=formats)
 
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
