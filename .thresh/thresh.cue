@@ -9,38 +9,44 @@ import "list"
 _src: ["src/dew/*.py", "src/dew/*/*.py", "src/dew/*/*/*.py", "src/dew/*/*/*/*.py", "src/dew/*/*/*/*/*.py"]
 _tests: ["tests/*.py"]
 
-// The public surface: tools/api_report.py's golden report, one section a contract.
+// The public surface: tools/api_report.py's golden report, one section a contract, each isolated: an edit to
+// another section is no touch of it (the cli and records seams tapped every edit to the report: 0 and 1 of 19
+// verdicts useful, 2026-11-02).
 
 seams: "api-exports": {
 	kind:    "published-language"
 	purpose: "dew's exported names and their signatures are what users' programs call"
 	paths:   ["docs/api/report.txtar"]
-	format:  "golden"
-	section: "exports"
+	format:   "golden"
+	section:  "exports"
+	isolated: true
 }
 
 seams: "api-config": {
 	kind:    "published-language"
 	purpose: "the config dataclasses' fields and defaults are what users' run files set"
 	paths:   ["docs/api/report.txtar"]
-	format:  "golden"
-	section: "config"
+	format:   "golden"
+	section:  "config"
+	isolated: true
 }
 
 seams: "api-cli": {
 	kind:    "published-language"
 	purpose: "the dew command's flags are what users' scripts pass"
 	paths:   ["docs/api/report.txtar"]
-	format:  "golden"
-	section: "cli"
+	format:   "golden"
+	section:  "cli"
+	isolated: true
 }
 
 seams: "api-records": {
 	kind:    "published-language"
 	purpose: "the run records' fields and the schema versions are what saved runs and their readers hold"
 	paths:   ["docs/api/report.txtar"]
-	format:  "golden"
-	section: "records"
+	format:   "golden"
+	section:  "records"
+	isolated: true
 }
 
 // The concept audit's owners (docs/design/architecture.md, one owner per fact): each guarded name used
@@ -59,7 +65,8 @@ seams: programs: {
 	purpose: "every outer program Dew compiles is an options.program, which holds its compile options and its cache key"
 	paths:   _src
 	type:    "jax.jit"
-	onlyIn:  ["OuterProgram.*", "program"]
+	// tools/lint_slop.py's COMPILE_POINT, SLOP025's two: the compile point and the nested program.
+	onlyIn:  ["OuterProgram.*", "program", "nested", "nested.*"]
 }
 
 seams: numerics: {
@@ -80,10 +87,10 @@ seams: tokenizers: {
 
 seams: instructions: {
 	kind:    "choke-point"
-	purpose: "a template's matrix instructions are issued by its bundle (Hopper's and Ampere's Family, Blackwell's Tensor) or a Blackwell template's product warp, which hold their layouts and barriers"
+	purpose: "a template's matrix instructions are issued by its bundle (Hopper's and Ampere's Family, Blackwell's Tensor) or its issuer (Ampere's MmaIssuer, Hopper's WgmmaIssuer, Blackwell's Tcgen05 and Signal), or a Blackwell template's product warp, which hold their layouts and barriers"
 	paths:   _src
 	type:    "jax.experimental.pallas.mosaic_gpu.*mma*"
-	onlyIn:  ["Family.*", "RingFamily.*", "ConsumerFed.*", "Mma.*", "Wgmma.*", "WgmmaFed.*", "Tensor.*", "_products", "_products.*"]
+	onlyIn:  ["Family.*", "RingFamily.*", "ConsumerFed.*", "Mma.*", "Wgmma.*", "WgmmaFed.*", "Tensor.*", "MmaIssuer.*", "WgmmaIssuer.*", "Tcgen05.*", "Signal.*", "_products", "_products.*"]
 }
 
 seams: "tensor-commits": {
@@ -99,6 +106,8 @@ seams: "language-model-config": {
 	purpose: "language_model_config reads a bundle's text config; a direct read skips its fallbacks"
 	paths:   _src
 	watch:   ["text_config"]
+	// A read it adds; one removed moves a caller onto the owner (11 of 17 verdicts, 2026-11-02).
+	added:   true
 	consult: ["interop/hf_decoders.py's language_model_config and its maintainers"]
 }
 
@@ -107,6 +116,8 @@ seams: scalars: {
 	purpose: "LocalTracker.scalars reads a run's scalar journal; a direct read of its file skips its order and types"
 	paths:   list.Concat([_src, _tests])
 	watch:   ["scalars.jsonl"]
+	// A read it adds; the 19 taps of row 3024's migration onto LocalTracker were removed reads.
+	added:   true
 	consult: ["training/tracker.py's LocalTracker and its maintainers"]
 }
 
@@ -158,6 +169,29 @@ seams: "kernel-choices": {
 		ssd:                "the ssd kernel, a choice a dispatch reports"
 		ssd_decode:         "the ssd_decode kernel, a choice a dispatch reports"
 		swiglu:             "the swiglu kernel, a choice a dispatch reports"
+	}
+}
+
+seams: "phase-flags": {
+	kind:    "declared-set"
+	purpose: "each flag is one a program compiled ahead may be loaded under unlike its build's, as it computes nothing the program does; one that does would load a program computing otherwise"
+	paths:   ["src/dew/training/ahead.py"]
+	entries: "PHASE_FLAGS"
+	declared: {
+		"--xla_gpu_load_autotune_results":                 "which autotune results a build loads, not what they compile to"
+		"--xla_gpu_require_complete_aot_autotune_results": "whether a build refuses incomplete autotune results"
+		"--xla_gpu_per_fusion_autotune_cache_dir":         "where a build keeps its fusions' autotune results"
+	}
+}
+
+seams: "dump-flags": {
+	kind:    "declared-set"
+	purpose: "each flag decides only whether and where XLA dumps, which a run sets for itself (dumps)"
+	paths:   ["src/dew/training/ahead.py"]
+	entries: "DUMP_FLAGS"
+	declared: {
+		"--xla_dump":     "XLA's dump directory and kinds"
+		"--xla_gpu_dump": "XLA:GPU's dump of its compiled programs"
 	}
 }
 
@@ -266,6 +300,8 @@ seams: gate: {
 	kind:    "shared-kernel"
 	purpose: "check 1 and its sizing judge every accuracy site in the suite"
 	paths:   ["tests/reference_error.py", "tests/float64_terms.py", "tests/one_draw.py"]
+	// Every change it makes: a watch on what decides a verdict lost the one useful tap of 8 (a change
+	// inside _site_terms, which names none of it on its own lines), 2026-11-02.
 	consult: ["the accuracy gate's maintainers (docs/design/testing.md)"]
 }
 
@@ -273,6 +309,12 @@ seams: suite: {
 	kind:    "shared-kernel"
 	purpose: "the suite's fixtures and its environment (tests/lane_environment.py) shape every test's run"
 	paths:   ["tests/conftest.py", "tests/lane_environment.py"]
+	// What every test computes under, as a change adds it: XLA's flags, JAX's numerics, the mesh, an autouse
+	// fixture. The harness's own plumbing (its cache, Hypothesis's directory, collection) is none of it (0 of 5
+	// verdicts useful, 2026-11-02).
+	watch: ["XLA_FLAGS", "--xla_", "MESH_DEVICES", "jax_enable_x64", "default_matmul_precision", "jax_default_prng",
+		"jax_threefry", "autouse"]
+	added:   true
 	consult: ["the suite's maintainers, as every test runs under them"]
 }
 
@@ -281,6 +323,13 @@ seams: "kernel-targets": {
 	purpose: "the GPU targets and routes decide which kernel every model runs"
 	paths:   ["src/dew/nn/kernels/generation.py"]
 	consult: ["the attention, GEMM and recurrence kernels' maintainers"]
+}
+
+seams: "jax-build": {
+	kind:    "shared-kernel"
+	purpose: "the JAX build every CI and development install runs on is pinned here, beside the declared dependencies"
+	paths:   ["constraints.txt"]
+	consult: ["the CI and the JAX fork's maintainers (Platform), who build its wheels for every Python and CUDA"]
 }
 
 seams: dependencies: {
