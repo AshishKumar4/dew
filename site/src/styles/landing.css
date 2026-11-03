@@ -407,6 +407,11 @@ html[data-has-hero][data-past-hero] header.header {
 	border-radius: 0.4rem;
 }
 
+/* One wide film (several cameras side by side) across the band, not a column of the gallery's grid. */
+.landing-image-grid.landing-film {
+	grid-auto-columns: min(100%, 64rem);
+}
+
 .landing-image-grid figcaption {
 	margin-top: 0.5rem;
 	font-size: 0.75rem;
