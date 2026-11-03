@@ -66,9 +66,10 @@ RED_SITE = """
 
 @pytest.mark.check1_shards(seeds=2, per_task=5)
 def test_red_site():
-    assert os.environ.get("DEW_CHECK1_DRAWS") != "5:10", "this map task's draws failed"
+    assert os.environ.get("DEW_CHECK1_DRAWS") != "2:7", "this map task's draws failed"
 """
-"""A second site of the file, of 10 draws, 5 a map task, whose second map task fails."""
+"""A second site of the file, of 10 draws, its first stage's 2 a map task and its second's 5, whose first
+later map task fails."""
 
 DRAWS = "def drawn(start, stop):\n    return ' '.join(str(seed) for seed in range(start, stop))\n"
 
@@ -124,34 +125,39 @@ def runs(root: Path) -> list[int]:
 def test_a_marked_site_plans_a_map_task_each_per_task_draws_and_a_judge_that_waits_on_them(
         ci, tmp_path, monkeypatch, site, per_unit):
     """A test marked check1_shards(seeds=4, per_task=8) plans map tasks of at most 8 of the 20 seeds check
-    1's two stages draw (seeds 0 to (1 + REDRAW) times 4), and one marked shards(units=20, per_task=8) of at
-    most 8 of its 20 units, each its test's own group, `<test>.draws-<start>-<stop>`, and one judge waiting
-    on them by their names, whose row is the site's, `<file>#<test>`; the file's own row sets the site aside,
-    weighed and cut without its seconds. A map task weighs what armada measured it at, else its units at the
-    site's recorded seconds over the units a whole run takes (a check-1 site's declared seeds, a `shards`
-    test's units); the judge, its row's pooling as armada measured it, else the target; a cold plan adds
-    what a cold task pays to each."""
+    1's two stages draw (seeds 0 to (1 + REDRAW) times 4), its first stage's 4 apart and its second's
+    later, run only where its judge's first judgement asks for them (armada's `later`), and one marked
+    shards(units=20, per_task=8) of at most 8 of its 20 units, none later, each its test's own group,
+    `<test>.draws-<start>-<stop>`, and one judge waiting on them by their names, whose row is the site's,
+    `<file>#<test>`; the file's own row sets the site aside, weighed and cut without its seconds. A map
+    task weighs what armada measured it at, else its units at the site's recorded seconds over the units a
+    whole run takes (a check-1 site's declared seeds, a `shards` test's units); the judge, its row's
+    pooling as armada measured it, else the target; a cold plan adds what a cold task pays to each."""
     site_checkout(tmp_path, site)
     entries = [entry for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"]
-    spans = [(0, 8), (8, 16), (16, 20)]
+    check1 = site is SITE
+    spans = [(0, 4), (4, 12), (12, 20)] if check1 else [(0, 8), (8, 16), (16, 20)]
     names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
     assert [(entry["name"], entry["tests"], entry["split"], entry.get("rows"), entry.get("after"),
-             entry["weight"]) for entry in entries] == [
-        ("3.12-1", "tests/test_site.py", "", ["3.12:tests/test_site.py"], None, 1.0),
+             entry["weight"], entry.get("later", False)) for entry in entries] == [
+        ("3.12-1", "tests/test_site.py", "", ["3.12:tests/test_site.py"], None, 1.0, False),
         *((name, "tests/test_site.py", f"test_site.draws-{start}-{stop}",
-           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, per_unit * (stop - start))
+           [f"3.12:tests/test_site.py#test_site.draws-{start}-{stop}"], None, per_unit * (stop - start),
+           check1 and start >= 4)
           for name, (start, stop) in zip(names, spans, strict=True)),
         (ci.site_task("3.12", "tests/test_site.py", "test_site"), "tests/test_site.py", "test_site", None,
-         names, 30.0)]
+         names, 30.0, False)]
     assert all(re.fullmatch(r"[A-Za-z0-9._-]{1,80}", entry["name"]) for entry in entries)
     # Weighed by what armada measured: a map task under its task's name, the judge under its row's.
     measured = {names[0]: 7.0, "3.12:tests/test_site.py#test_site": 3.0}
     weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": measured})}
-    assert [weighed[name] for name in names] == [7.0, 8 * per_unit, 4 * per_unit]
+    assert [weighed[name] for name in names] == [7.0, *(per_unit * (stop - start)
+                                                          for start, stop in spans[1:])]
     assert weighed[ci.site_task("3.12", "tests/test_site.py", "test_site")] == 3.0
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
     cold = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {}) if entry["python"] == "3.12"}
-    assert [cold[name] for name in names] == [count * per_unit + ci.COLD_SECONDS for count in (8, 8, 4)]
+    assert [cold[name] for name in names] == [(stop - start) * per_unit + ci.COLD_SECONDS
+                                              for start, stop in spans]
 
 
 def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp_path):
@@ -226,14 +232,14 @@ def test_a_map_task_draws_into_the_artifacts_armada_names_it_and_exits_1_where_i
     draws fail writes its red row and exits 1, which armada reads as a map task that did not pass."""
     out = site_checkout(tmp_path, SITE + RED_SITE)
     entries = planned(ci)
-    first = entries[ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 8))]
+    first = entries[ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))]
     assert entry_task(ci, monkeypatch, first, out, artifacts=tmp_path / ".verdict/first") == 0
-    assert sorted(path.name for path in (tmp_path / ".verdict/first").iterdir()) == ["site.0-8.pkl"]
-    red = entries[ci.site_task("3.12", "tests/test_site.py", "test_red_site", (5, 10))]
+    assert sorted(path.name for path in (tmp_path / ".verdict/first").iterdir()) == ["site.0-4.pkl"]
+    red = entries[ci.site_task("3.12", "tests/test_site.py", "test_red_site", (2, 7))]
     assert entry_task(ci, monkeypatch, red, out, artifacts=tmp_path / ".verdict/red") == 1
     [row] = json.loads(out.read_text())["rows"]
     assert (row["name"], row["exitCode"], row["kind"]) == (
-        "3.12:tests/test_site.py#test_red_site.draws-5-10", 1, "nodes")
+        "3.12:tests/test_site.py#test_red_site.draws-2-7", 1, "nodes")
 
 
 def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a_pool_short_of_them(
@@ -291,14 +297,75 @@ def test_site():
     assert row["first_failure"].partition(":")[0].rpartition(".")[2] == "PoolRefused"
 
 
-@KINDS
-def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
-        ci, tmp_path, monkeypatch, cache_worker, site):
-    """A site's judge green on exactly these inputs is kept whole, a check-1 site's and a `shards` test's
-    alike: the plan runs none of its map tasks and not its judge, whose row a kept task reads. Its key is the
-    site's, its map tasks' inputs (each among its artifacts) with its own, so a module only its draws ran
-    (src/draws.py), changed, plans that site's map tasks and judge again and nothing else: the file's own
-    row, which never ran it, stays kept."""
+def test_a_judge_asks_for_its_later_draws_only_where_its_first_stage_finds_something(ci, tmp_path,
+                                                                                     monkeypatch):
+    """Check 1 as armada runs a site with later map tasks: the first stage's map task draws the declared
+    seeds, and the judge over them alone passes where the first stage passes, its row green and asking
+    nothing, and where it finds something writes its ask (LATER, `ask_later`) and its row is red and asks
+    for more (armada's `more`); once the later map tasks have drawn, the judge over them all judges as one
+    that drew every seed (Main, 2026-11-02: the second stage drawn every run, read only where the first
+    found something)."""
+    out = site_checkout(tmp_path, f"""import sys
+
+sys.path.insert(0, {str(ROOT / "tests")!r})
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import assert_as_exact
+
+
+def draw(seed):
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def halved(x, w):
+    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_on_par():
+    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_halved():
+    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
+""")
+    entries = planned(ci)
+
+    def judged(test: str, drawn: list[dict]) -> dict:
+        inputs = tmp_path / f".verdict/inputs-{test}-{len(drawn)}"
+        for index, entry in enumerate(drawn):
+            assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        assert entry_task(ci, monkeypatch, judge, out, artifacts=tmp_path / f".verdict/judge-{test}",
+                          inputs=inputs) == 0
+        [row] = json.loads(out.read_text())["rows"]
+        return row
+
+    for test in ("test_on_par", "test_halved"):
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        maps = [entries[name] for name in judge["after"]]
+        assert [entry.get("later", False) for entry in maps] == [False, True, True]
+        first = judged(test, maps[:1])
+        if test == "test_on_par":
+            assert (first["exitCode"], first.get("more")) == (0, None)
+            continue
+        assert (first["exitCode"], first.get("more")) == (1, True)
+        assert first["first_failure"].partition(":")[0].rpartition(".")[2] == "LaterUnits"
+        asked = json.loads((tmp_path / ".verdict/judge-test_halved/check1-later.json").read_text())
+        assert (asked["from"], asked["to"]) == (16, 80)
+        whole = judged(test, maps)
+        assert (whole["exitCode"], whole.get("more")) == (1, None)
+        assert whole["first_failure"].partition(":")[0].rpartition(".")[2] == "GateFailure"
+
+
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
+    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
+    those, and the file's own row."""
     out = site_checkout(tmp_path, site)
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
@@ -310,29 +377,63 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
     entries = list(planned(ci).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
-    for index, name in enumerate(judge["after"]):
-        [drawn] = [entry for entry in entries if entry["name"] == name]
-        assert entry_task(ci, monkeypatch, drawn, out, artifacts=inputs / "job" / str(index)) == 0
+    drawn = [entry for name in judge["after"] for entry in entries
+             if entry["name"] == name and (later or not entry.get("later", False))]
+    for index, entry in enumerate(drawn):
+        assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
     for entry in entries:
         if not entry["split"] or entry is judge:
             assert entry_task(ci, monkeypatch, entry, out, inputs=inputs) == 0
-    assert runs(tmp_path) == [1, 3, 1]
 
-    def planned_now() -> tuple[set[tuple[str, str]], list[dict]]:
-        """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
-        entries = list(planned(ci).values())
-        kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
-        return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
 
-    kept, ran = planned_now()
+def replanned_once_its_draws_change(ci, tmp_path: Path) -> list[dict]:
+    """The site's file kept whole by the plan after its cached run, its site among it, none of its tasks
+    run; then, a module only its draws ran (src/draws.py) changed, its site planned again and the file's
+    own row kept: the entries the plan then runs."""
+    kept, ran = planned_now(ci)
     assert kept == {("tests/test_site.py", ""), ("tests/test_site.py", "test_site")} and ran == []
     (tmp_path / "src/draws.py").write_text(DRAWS.replace("' '", "','"))
-    kept, ran = planned_now()
+    kept, ran = planned_now(ci)
     assert kept == {("tests/test_site.py", "")}
+    return ran
+
+
+def planned_now(ci) -> tuple[set[tuple[str, str]], list[dict]]:
+    """The rows the plan keeps, and the entries it runs, each holding a row no kept task reads."""
+    entries = list(planned(ci).values())
+    kept = {held for entry in entries for held in ci.kept_of(entry["tests"].split())[1]}
+    return kept, [entry for entry in entries if ci.KEPT_AT not in entry["tests"]]
+
+
+@KINDS
+def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
+        ci, tmp_path, monkeypatch, cache_worker, site):
+    """A site's judge green on exactly these inputs is kept whole, a check-1 site's and a `shards` test's
+    alike: the plan runs none of its map tasks and not its judge, whose row a kept task reads. Its key is the
+    site's, its map tasks' inputs (each among its artifacts) with its own, so a module only its draws ran
+    (src/draws.py), changed, plans that site's map tasks and judge again and nothing else: the file's own
+    row, which never ran it, stays kept."""
+    run_cached(ci, tmp_path, monkeypatch, cache_worker, site, later=True)
+    assert runs(tmp_path) == [1, 3, 1]
+    ran = replanned_once_its_draws_change(ci, tmp_path)
     [again] = [entry for entry in ran if "after" in entry]
     maps = [entry for entry in ran if "after" not in entry]
     assert {ci.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
     assert maps and set(again["after"]) == {entry["name"] for entry in maps}
+
+
+def test_a_judge_green_on_its_first_stage_is_kept_though_its_later_map_tasks_never_ran(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A check-1 site whose judge's first stage finds nothing, as armada runs it: its later map tasks never
+    run, and its judge, green over its first stage's draws alone, keys on those map tasks' inputs with its
+    own, so it is kept whole on them: the plan runs none of its map tasks and not its judge. A module its
+    draws ran (src/draws.py), changed, plans them again."""
+    run_cached(ci, tmp_path, monkeypatch, cache_worker,
+               SITE.replace("held[-1][1] == 20", "held[-1][1] == 4"), later=False)
+    assert runs(tmp_path) == [1, 1, 1]
+    ran = replanned_once_its_draws_change(ci, tmp_path)
+    [again] = [entry for entry in ran if "after" in entry]
+    assert len(again["after"]) == 3 and len(ran) == 4
 
 
 def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_they_were(ci, tmp_path):

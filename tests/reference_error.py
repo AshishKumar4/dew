@@ -108,7 +108,7 @@ from check1_statistics import (
     shown,
 )
 from float64_terms import float64_terms
-from map_judge import DRAWS, PoolRefused, judging, pooled_units, record_units
+from map_judge import DRAWS, PoolRefused, ask_later, judging, pooled_units, record_units
 
 from dew.accuracy import distance, reduction_bound, within
 from dew.nn.precision import FP32_SUMS
@@ -1671,6 +1671,9 @@ def _pooled_draws(label: str, references: int, arms):
 
     def drawn_for(index: int):
         def drawn(start, stop):
+            if stop > held and start == held:
+                # The second stage's seeds, drawn by later map tasks a judge asks for (`ask_later`).
+                ask_later(label, held, stop)
             if stop > held:
                 raise PoolRefused(f"{label}: its stage draws seeds {start} to {stop}; the map tasks drew 0 "
                                   f"to {held} ({DRAWS} covers 0 to (1 + REDRAW) times the declared seeds)",

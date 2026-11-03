@@ -1,6 +1,7 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+import json
 import math
 
 import jax
@@ -555,6 +556,22 @@ def test_a_site_sharded_across_map_tasks_is_judged_by_their_pooled_draws_as_whol
     with pytest.raises(PoolRefused) as gapped:
         judged(halved, "halved, with a gap", [(0, 8), (16, 80)])
     assert (short.value.held, gapped.value.held) == (16, 8)
+    # A judge that asks for its later seeds (LATER): over its first stage's seeds alone it passes where that
+    # stage passes, and where it finds something asks for the second stage's, writing its ask; over every
+    # seed it judges as a site that drew them all.
+    from map_judge import LATER, LaterUnits
+    asked = tmp_path / "later.json"
+    monkeypatch.setenv(LATER, str(asked))
+    judged(jnp.matmul, "on par, its first stage", [(0, 16)])
+    assert not asked.exists()
+    with pytest.raises(LaterUnits):
+        judged(halved, "halved, its first stage", [(0, 16)])
+    assert (json.loads(asked.read_text())["from"], json.loads(asked.read_text())["to"]) == (16, 80)
+    with pytest.raises(GateFailure) as both:
+        sharded_site(monkeypatch, tmp_path / "both stages", [(0, 16), (16, 56), (56, 80)],
+                     lambda: assert_as_exact(halved, jnp.matmul, a_product_draw, "halved", seeds=16))
+    assert str(both.value) == str(whole.value)
+    monkeypatch.delenv(LATER)
     # Two tests' sites of one label, their records under one pool: each judge pools its own test's alone.
     def as_test(test, dew, *, records=None, pool=None):
         monkeypatch.setenv("PYTEST_CURRENT_TEST", f"tests/test_{test}.py::test_{test} (call)")
