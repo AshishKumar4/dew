@@ -35,9 +35,10 @@ checkout's code or hold the GPU."""
 SPAWNS = {"subprocess.Popen", "_posixsubprocess.fork_exec", "os.posix_spawn", "os.spawn", "os.exec",
           "os.fork", "os.forkpty"}
 """Audit events of a process start; a multiprocessing child's is executed.py's `CHILD_START`'s."""
-HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
-"""The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
-the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
+HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes", ".thresh")
+"""The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings,
+thresh's annotations), each the input of the files that read it alone; any other hidden entry (.git, an
+environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
 LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 """The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
