@@ -102,9 +102,9 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     """The work list of a packed call (`packed`) on `target`: the forward's derived config at the key tile
     its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as its programs' residency fills (`resources.resident_programs`, its registers;
-    its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter slice's
-    walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
+    nothing). Else as many as its programs' residency holds at once (`resources.resident_programs`, its
+    registers; its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
+    slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
     whole step took 13)."""
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
@@ -126,7 +126,10 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     if target.shared_limit:
         resident = min(resident, max(1, target.shared_limit // op.staged_bytes(ba, config, target)))
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
-    return Plan(config, max(1, min(math.ceil(processors * resident / programs), longest)))
+    # The most slices whose programs the device holds at once, none past it: one program past them waits a
+    # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
+    # second wave as long as the first).
+    return Plan(config, max(1, min(processors * resident // programs, longest)))
 
 
 def merged(spec: algebra.Forward, out: jax.Array, maximum: jax.Array, total: jax.Array,

@@ -129,6 +129,7 @@ armada."""
 
 
 @pytest.mark.parametrize("frames", [3, 5])
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_chunked_walk_is_the_whole_clip_as_exactly_as_float32_allows(loaded, frames):
     """The decode one latent frame at a time and the encode the first frame then four at a time, each
     convolution's last frames carried in the cache, against the one-pass walk: on par with it over drawn

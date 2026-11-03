@@ -103,11 +103,14 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 
 
 @INTERPRETS
-@pytest.mark.parametrize("hook", ["plain", "sinks"])
+@pytest.mark.parametrize("hook", ["plain", "sinks", "far"])
 def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted(hook):
     """A decode step of 17 rows over 8 key heads (136 programs, past an H100's 132 multiprocessors), so its
-    work list takes one slice a row (`plan`) and the walk finishes each row itself from the initial state (a
-    sink's), in the query's dtype: on par with the reference path (check 1)."""
+    work list takes one slice a row (`plan`), its launches walk their tiles persistent (`_persistent`, a
+    program a multiprocessor) and the walk finishes each row itself from the initial state (a sink's), in
+    the query's dtype; `far` its first row's query 2^16 times a drawn one, past the fold's reach, so the
+    masked rewalk walks that row's tile alone among inactive ones: on par with the reference path
+    (check 1)."""
     batch, heads, keys = 17, 8, 128
     lengths = jnp.asarray([keys - 7 * row for row in range(batch)], jnp.int32)
     spans = template.spans(1, keys, batch, lengths=lengths)
@@ -126,6 +129,8 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 4)
         query = jax.random.normal(streams[0], (batch, 1, heads, 64), jnp.bfloat16)
+        if hook == "far":
+            query = query.at[0].multiply(2.0 ** 16)
         key, value = (jax.random.normal(stream, (batch, keys, heads, 64), jnp.bfloat16)
                       for stream in streams[1:3])
         return query, key, value, jax.random.normal(streams[3], (heads,), jnp.float32)
@@ -160,6 +165,25 @@ def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode over a work list's rows",
                     seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("drafts", [4, 8, 16])
+def test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted(drafts):
+    """A speculative verify block (`drafts` tokens a row written after the row's cache, `slots` theirs), each
+    draft over its row's prefix and the drafts before it (causal over the block's slots) through the template
+    decode, packed over 32 query heads on 8 key heads: on par with the reference path (check 1)."""
+    held = jnp.asarray([200 - drafts, 37 - drafts], jnp.int32)
+    slots = held[:, None] + jnp.arange(drafts, dtype=jnp.int32)[None]
+    spans = template.spans(drafts, KEYS, 2, causal=True, lengths=held + drafts, slots=slots)
+    drawn = _drawn(drafts, 32, 8, jnp.bfloat16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
+                    lambda seed: drawn(seed)[:3], f"template verify block of {drafts}", seeds=SEEDS)
 
 
 PAGE = 128

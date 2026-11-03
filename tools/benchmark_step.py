@@ -44,7 +44,7 @@ Usage:
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
         "num_heads": 8}, "batch_size": 32, "image_size": 32, "mesh": {"fsdp": 2}}]'
     python tools/benchmark_step.py --cases '[{"architecture": "causal_transformer",
-        "hf_config": "Qwen3.5-4B/config.json", "dtype": "bfloat16", "batch_size": 2,
+        "hf_config": "Qwen/Qwen3.5-4B", "dtype": "bfloat16", "batch_size": 2,
         "seq_len": 2048}]'
     python tools/benchmark_step.py --preset small --architectures causal_transformer \\
         --mesh '{"fsdp": 2, "tensor": 2}' --profile-dir /tmp/dew-trace
