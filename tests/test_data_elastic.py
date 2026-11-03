@@ -422,6 +422,40 @@ def test_an_elastic_stream_with_no_written_workers_of_a_volatile_source_reads(tm
         compile(chain(1), loading=READ, seed=3).train(DataPartition())
 
 
+@pytest.mark.parametrize(("saved", "resumed"), [(2, 0), (0, 2), (2, 3)])
+def test_an_elastic_stream_saved_inside_a_group_resumes_on_another_count_of_workers(tmp_path, saved, resumed):
+    """A position saved inside a group whose rejected records came before its rows, as a worker's group
+    hands them on, resumes on another count of workers, none of them included, in the batches an unbroken
+    read reads: ids 0 to 31 with 0, 5 and 7 rejected, batches of four, saved after the first, its group
+    [4, 5, 6, 7] handed on as 5's and 7's markers, then 4 and 6 (row 1896)."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(32)))
+    chain = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl"))
+             .filter(lambda row: int(row["id"]) not in (0, 5, 7), identity="no-0-5-7").batch(4).elastic()
+             .read("streamed"))
+
+    def opened(workers: int):
+        loading = Loading(workers=workers, threads=2, read_buffer=2, worker_buffer=2)
+        return compile(chain, loading=loading, seed=3).train(DataPartition())
+
+    whole = opened(saved)
+    try:
+        batches = [np.asarray(next(whole)["id"]).tolist() for _ in range(4)]
+    finally:
+        whole.close()
+    first = opened(saved)
+    try:
+        assert np.asarray(next(first)["id"]).tolist() == batches[0]
+        state = first.get_state()
+    finally:
+        first.close()
+    again = opened(resumed)
+    try:
+        again.set_state(state)
+        assert [np.asarray(next(again)["id"]).tolist() for _ in range(3)] == batches[1:]
+    finally:
+        again.close()
+
+
 def test_elastic_and_per_share_positions_refuse_each_others_read():
     """Elastic and per-share positions each refuse the other's read."""
     shared = reader(stream(elastic=False), 0, 2)

@@ -80,14 +80,16 @@ class _StreamOrder(pygrain.IterDataset):
     the position past it, so the stream's counters in it (a shard's chunks), which a read in workers
     states through its workers' positions, count every row handed on at each group's end; within a group
     they hold the rows before it, as a worker's groups' counters do in any read in workers
-    (`_Build.handed`). Without workers each row is a group (`_Build.handed`), so they count each row as
-    it is handed on (row 1896)."""
+    (`_Build.handed`). Without workers (`alone`) each row is a group, so they count each row as it is
+    handed on, but for the group a resume stopped inside, read whole as workers group it, so the rows it
+    had taken mean the same on every count (row 1896)."""
 
     def __init__(self, rows: pygrain.IterDataset, size: int,
                  read: Callable[[pygrain.IterDataset], pygrain.IterDataset], grouping: Grouping,
-                 ungrouped: Callable[[Batch], Sequence]):
+                 ungrouped: Callable[[Batch], Sequence], *, alone: bool = False):
         super().__init__([])
         self.rows, self.size, self.read, self.grouping, self.ungrouped = rows, size, read, grouping, ungrouped
+        self.alone = alone
 
     def __iter__(self) -> pygrain.DatasetIterator:
         return _StreamOrderIterator(self)
@@ -107,8 +109,13 @@ class _StreamOrderIterator(pygrain.DatasetIterator):
     def _opened(self) -> pygrain.DatasetIterator:
         if self._reads is None:
             ordered = self._ordered
-            self._reads = iter(ordered.read(_Kept(ordered.rows, ordered.size, self._position,
-                                                  ordered.grouping)))
+            # Read alone, each row is a group, but for the group a resume stopped inside, read whole as a
+            # batch's count of rows, as every count of workers groups it: its rows taken are counted in
+            # its order of markers and records (`ungrouped`).
+            opening = ordered.size if self._skip else 1
+            self._reads = iter(ordered.read(_Kept(ordered.rows, 1 if ordered.alone else ordered.size,
+                                                  self._position, ordered.grouping,
+                                                  opening if ordered.alone else None)))
             self._reads.start_prefetch()
         return self._reads
 
@@ -156,13 +163,14 @@ class _StreamOrderIterator(pygrain.DatasetIterator):
 class _Kept(pygrain.IterDataset):
     """The groups of `size` consecutive rows of the stream `rows` that one loading worker keeps
     (`_StreamOrder`): every group whose number is its slice's (`set_slice`, which stops here, so Grain never
-    deals the stream's shards between the workers), from the stream's `position` where given, each grouped
-    (`lowering._Grouped`) with the stream's position after it."""
+    deals the stream's shards between the workers), from the stream's `position` where given, the first
+    `opening` rows long, each grouped (`lowering._Grouped`) with the stream's position after it."""
 
     def __init__(self, rows: pygrain.IterDataset, size: int, position: Mapping[str, object] | None,
-                 grouping: Grouping):
+                 grouping: Grouping, opening: int | None = None):
         super().__init__([])
         self.rows, self.size, self.position, self.grouping = rows, size, position, grouping
+        self.opening = size if opening is None else opening
         self.first, self.step = 0, 1
 
     def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
@@ -184,7 +192,7 @@ class _KeptIterator(pygrain.DatasetIterator):
     def __next__(self) -> Batch:
         kept = self._kept
         while True:
-            group = list(itertools.islice(self._rows, kept.size))
+            group = list(itertools.islice(self._rows, kept.opening if self._number == 0 else kept.size))
             if not group:
                 raise StopIteration
             number, self._number = self._number, self._number + 1
