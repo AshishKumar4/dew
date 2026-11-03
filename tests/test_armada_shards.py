@@ -193,28 +193,28 @@ def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp
         "pytest", "-p", "executed", "tests/test_site.py::TestSite::test_work"]
 
 
-def test_the_plan_refuses_marks_whose_map_tasks_pass_what_one_judges_job_takes(ci, tmp_path, monkeypatch):
-    """armada runs the judges of one environment and size in one job, which takes at most MAX_INPUTS map
-    tasks' artifacts (armada's MAX_INPUT_RUNS): sites each within it but past it together, check-1 sites and
-    `shards` tests alike, counted on every Python as a cold run plans them, are refused by the plan before any
-    task runs, never left to a judges' job armada refuses after every map task ran. Within it, a cold plan's
-    judges wait on every map task."""
+def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_alone_is_refused(
+        ci, tmp_path, monkeypatch):
+    """armada cuts the judges of one environment and size into as many judges' jobs as keep each within
+    the map tasks' artifacts one job takes (MAX_INPUTS, armada's MAX_INPUT_RUNS; its `judgeChunks`), so
+    marks whose map tasks pass it together are planned, every judge waiting on all of its own (Dew's
+    base/kernels, 2026-11-02: 1,050 map tasks were refused). A site whose map tasks alone pass it would be
+    a judge no job takes, and is refused by the plan before any task runs, naming its line."""
     def marked(mark: str) -> str:
         return f"import pytest\n\n@pytest.mark.{mark}\ndef test_site():\n    pass\n"
 
-    # The most map tasks a Python's sites may plan, a unit a map task: a check-1 site's 1 + REDRAW draws each
-    # of its seeds, and a `shards` test's units the rest.
-    each = ci.MAX_INPUTS // len(ci.PYTHONS)
-    seeds = (each - 200) // (1 + ci.REDRAW)
-    units = each - seeds * (1 + ci.REDRAW)
+    # Two sites a Python, each within one job's inputs and past them together on every Python.
+    seeds = ci.MAX_INPUTS // (2 * (1 + ci.REDRAW))
+    units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
     # Cold, as a policy-off run plans every site on every Python.
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
     judges = [entry for entry in ci.plan(120.0, {}) if "after" in entry]
     assert len(judges) == 2 * len(ci.PYTHONS)
-    assert sum(len(entry["after"]) for entry in judges) == each * len(ci.PYTHONS) <= ci.MAX_INPUTS
-    written(tmp_path, {"test_b.py": marked(f"shards(units={units + 1}, per_task=1)")})
+    assert sum(len(entry["after"]) for entry in judges) > ci.MAX_INPUTS
+    assert max(len(entry["after"]) for entry in judges) <= ci.MAX_INPUTS
+    written(tmp_path, {"test_b.py": marked(f"shards(units={ci.MAX_INPUTS + 1}, per_task=1)")})
     with pytest.raises(SystemExit):
         ci.plan(120.0, {})
     assert ci.sites("tests/test_b.py")["test_site"].line == 3
