@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from sampling_gate import FALSE_RED
 
 from dew.telemetry.benchmark import benchmark
 
@@ -95,25 +96,48 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
 
 def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise():
     """Two calls compared (`compared`): one sleeping twice the other's time, timed in interleaved,
-    role-swapped pairs, read as their paired ratio, whose bootstrap interval lies well apart from 1 (under
-    2, each call's own dispatch added to both), and the faster call against itself (its A/A) holding 1: an
-    interval apart from 1 and from the A/A's is a difference the placement does not make (row 3616, the
-    kernel challenge's method: one-sided runs moved -0.6% to +0.6% whatever the change)."""
+    role-swapped pairs, read as their paired ratio, and the faster call against itself (its A/A), each
+    interval at a level of 1 - FALSE_RED / 2 (`median_rank`). The A/A's holds 1, failing at most
+    FALSE_RED / 2 of runs; the pair's starts at most at their ratio, the sleeps' with each call's own
+    dispatch added to both, so under 2, failing at most FALSE_RED / 4. Over 96 pairs of 24 and 12 ms it
+    lies above the A/A's: an interval apart from 1 and from the A/A's is a difference the placement does
+    not make (row 3616, the kernel challenge's method: one-sided runs moved -0.6% to +0.6% whatever the
+    change). Sleeps a sixth as long over 64 pairs fell within the A/A's 34 times in 30,000 runs on armada,
+    a host's scheduling delays of milliseconds swamping them. These held every claim in 6,000 runs, the
+    pair's interval at least 0.8 above the A/A's, and in 1,200 beside three or four busy processes on a
+    container's four CPUs missed only the A/A's 1, twice, by under 3e-5 (row 3793)."""
     from dew.telemetry.benchmark import compared
 
     def slow():
-        time.sleep(0.004)
+        time.sleep(0.024)
         return jnp.zeros(())
 
     def fast():
-        time.sleep(0.002)
+        time.sleep(0.012)
         return jnp.zeros(())
 
-    result = compared(slow, fast, pairs=24, warmup=1)
-    low, high = result.interval
+    result = compared(slow, fast, pairs=96, warmup=1, level=1 - FALSE_RED / 2)
+    low, _ = result.interval
     alone_low, alone_high = result.alone
-    assert 1.5 < low <= high <= 2.0
-    assert alone_low <= 1.0 <= alone_high < low
+    assert alone_low <= 1.0 <= alone_high < low <= 2.0
+
+
+def test_a_medians_rank_holds_it_at_its_level_and_no_higher_rank_does():
+    """`median_rank`'s k-th smallest and largest of n values hold their median with chance
+    1 - 2 P(Bin(n, 1/2) < k) (the sign test, any continuous distribution): at least the level, and the next
+    rank's short of it, at every count from the fewest that reach the level to 400; fewer refuse."""
+    from scipy import stats
+
+    from dew.telemetry.benchmark import median_rank
+
+    for level in (0.95, 0.999, 1 - FALSE_RED / 2):
+        fewest = next(count for count in range(1, 64) if 1 - 2.0 ** (1 - count) >= level)
+        with pytest.raises(ValueError):
+            median_rank(fewest - 1, level)
+        for count in range(fewest, 401):
+            rank = median_rank(count, level)
+            assert 1 - 2 * stats.binom.cdf(rank - 1, count, 0.5) >= level
+            assert rank == (count + 1) // 2 or 1 - 2 * stats.binom.cdf(rank, count, 0.5) < level
 
 
 NEIGHBOURED = """
