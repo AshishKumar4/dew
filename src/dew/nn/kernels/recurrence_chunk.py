@@ -670,10 +670,6 @@ PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
                "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
                "(window-h100-c70aaa8-b8109ee)"),
-    ('wgmma', 'training, a decay a key dimension'): (
-        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward and gradient 4.84 ms a call against the "
-               "template's 5.42 (its per-key fast backward, `key_backward`) on Kimi Linear's delta "
-               "attention, wall time over 50 calls (wall-window2-h100-e1f928585)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
@@ -681,7 +677,10 @@ selector runs the port on them where it takes the call (`Op.declared`, owner, bi
 shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
 cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
 the port's 8.81 (JS-kdacells-a100-a928ea2b4), and its training, 11.12 ms against 15.92
-(batch-window-a100-b2ad84c61). A gated delta net's training is the template's, its
+(batch-window-a100-b2ad84c61). Warpgroup MMA's training of Kimi delta attention is the template's, its
+forward and gradient 3.926 ms a call against the port's 4.726 on an H100 80GB HBM3 and 3.916 against 4.694 on
+a GH200 480GB (FS-RECROUTES-h100 and -gh200 at 26d3fdf5df: cold, exclusive, two rounds alternating the arms'
+order). A gated delta net's training is the template's, its
 keys launch a key block a program and its query/key launch's memory sum a product: its forward and gradient
 on an H100 2.46 ms against the port's 3.12
 on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
@@ -1445,12 +1444,6 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
 
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward'): (
-        'pallas', "on an H100 80GB HBM3, the port's forward 0.228 ms against the template's 0.248 on "
-                  "Nemotron-H 30B's SSD (chunk 128), the template's launches 0.167 against the port's 0.194 "
-                  "and its fp32 output's skip and cast 0.045 past them; on Nemotron-H 4B's (chunk 256) the "
-                  "template's 0.575 against 0.606, each the same `chunk(SSD, ...)` call under the fast forms "
-                  "(ssd-rounded-h100-fdab2424c)"),
     ('wgmma', 'training'): (
         'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
                   "1.877 on Nemotron-H 4B's SSD and 0.660 against 0.820 on 30B's, its query/key launch "
@@ -1464,7 +1457,10 @@ product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 
 mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
 template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on Nemotron-H
-4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). The template trains the rated scan under
+4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c), and warpgroup MMA's: on an H100 80GB HBM3
+0.211 ms against 0.241 on 30B's and 0.522 against 0.617 on 4B's, on a GH200 480GB 0.207 against 0.225 and
+0.509 against 0.595 (FS-RECROUTES-h100 and -gh200 at 26d3fdf5df: cold, exclusive, two rounds alternating the
+arms' order). The template trains the rated scan under
 the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones its training is the port's by
 the template's refusal, not a cell."""
 
