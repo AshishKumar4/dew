@@ -646,6 +646,7 @@ def test_windows_apart_in_a_literal_or_a_shape_are_derived_apart():
                         lambda seed, shapes=shapes: rows(seed, *shapes), f"scale {scale} at {width}", seeds=8)
 
 
+@pytest.mark.mesh(devices=4)
 def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_devices():
     """A window's values' placement is part of what derives it: after one program over one device's values,
     the same program over values an explicit mesh shards derives its own, whose forms take its mesh, and
@@ -665,3 +666,25 @@ def test_a_window_over_values_an_explicit_mesh_places_is_derived_apart_from_one_
         assert not any(made.reused for made in _rewrites(two_sums, placed(9)))
         assert_as_exact(jax.jit(algebra.rewritten(two_sums)), jax.jit(two_sums), placed,
                         "an explicit mesh's window", seeds=8)
+
+
+def test_a_reused_window_holds_the_literal_it_was_derived_with_after_a_captured_scalar_changes():
+    """A literal may view a NumPy scalar its function captured: a window derived over a captured scale of 0.5
+    that is then set to 4 keeps its own 0.5, so a later program of its structure over its own 0.5 reuses it
+    and computes with 0.5 (check 1)."""
+    shapes = ((3, 60),) * 3
+
+    def scaled(scale):
+        def sums(x, y, a):
+            x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+            return jnp.sum(scale * a * x, axis=-1) + jnp.sum(scale * a * y, axis=-1)
+        return sums
+
+    captured = np.array(0.5, np.float32)
+    _rewrites(scaled(captured), rows(10, *shapes))
+    captured[...] = 4.0
+    own = np.array(0.5, np.float32)
+    [made] = _rewrites(scaled(own), rows(10, *shapes))
+    assert (made.reused, made.spliced) == (True, 1)
+    assert_as_exact(jax.jit(algebra.rewritten(scaled(own))), jax.jit(scaled(own)),
+                    lambda seed: rows(seed, *shapes), "a reused window's literal", seeds=8)

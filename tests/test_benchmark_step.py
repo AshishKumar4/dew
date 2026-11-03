@@ -46,24 +46,39 @@ def test_a_case_of_a_translated_config_is_read_back_as_the_case_it_builds(name):
             == to_record(models.build(case.architecture, **case.config), object))
 
 
-def test_a_case_names_a_checkpoints_config_on_the_command_line():
-    """`--cases` names a checkpoint's config (`hf_config`, its directory or its config.json), which the case's
-    model is built from as the family translates it, its own `config` fields over the translated ones (row
-    3755)."""
-    from dew.interop.hf_decoders import translate_config
+@pytest.mark.parametrize("name", ["qwen35-tiny", "qwen35-native-tiny"])
+def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
+    """`--cases` names a checkpoint's config (`hf_config`, its directory or its config.json): a decoder's own,
+    or a multimodal wrapper's whose language model a text-only load reads (`decoder_config`), which the case's
+    model is built from as the family translates it, the case's own `config` fields over the translated ones
+    (row 3755)."""
+    from dew.interop.hf_decoders import decoder_config, translate_config
     from dew.registry import models, to_record
 
     step = load("benchmark_step")
     models_module = load("benchmark_models")
-    directory = FIXTURES / "qwen35-tiny"
+    directory = FIXTURES / name
     [case] = step.cases_from_json(json.dumps([{"architecture": "causal_transformer",
-                                              "hf_config": str(directory), "config": {"scan_layers": True},
+                                              "hf_config": str(directory), "config": {"max_seq_len": 128},
                                               "dtype": "float32", "batch_size": 2, "seq_len": 8}]))
-    translated = translate_config(json.loads((directory / "config.json").read_text()))
-    expected = models.build("causal_transformer", **translated, scan_layers=True, dtype="float32",
+    translated = translate_config(decoder_config(json.loads((directory / "config.json").read_text())))
+    assert translated["max_seq_len"] != 128
+    expected = models.build("causal_transformer", **{**translated, "max_seq_len": 128}, dtype="float32",
                             attention_impl="xla")
     built = models_module.build_objective(case, "xla").program_key()[0].module
     assert to_record(built, object) == to_record(expected, object)
+
+
+def test_a_case_naming_a_checkpoint_is_identified_by_the_fields_it_holds_now(tmp_path):
+    """What keys a cache of a case's results (`Case.resolved`, layout_parity's references) is the checkpoint's
+    translated fields, not the path naming it: the same file with a changed norm epsilon is another case."""
+    step = load("benchmark_step")
+    config = json.loads((FIXTURES / "qwen35-tiny" / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    case = step.Case("causal_transformer", hf_config=str(tmp_path), dtype="float32", batch_size=2, seq_len=8)
+    before = case.resolved().record()
+    (tmp_path / "config.json").write_text(json.dumps({**config, "rms_norm_eps": config["rms_norm_eps"] * 10}))
+    assert case.resolved().record() != before
 
 
 @pytest.mark.parametrize("architecture, fixed_batch", [
