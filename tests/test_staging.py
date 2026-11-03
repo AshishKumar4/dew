@@ -75,9 +75,29 @@ def test_a_sampled_commits_summaries_stage_each_parameters_moments_alone():
     assert len(cut_of(optax.adamw(1e-3), sampled=True)) == len(SHAPES)
 
 
+def spread_total() -> optax.GradientTransformation:
+    """A trace whose every leaf is its update plus the whole last trace's sum, that scalar spread over the
+    leaf's shape by stacking it once an entry: each new leaf reads every old one, though only a scalar of
+    them meets each update."""
+    def init(params):
+        return optax.TraceState(trace=jax.tree.map(jnp.zeros_like, params))
+
+    def update(updates, state, params=None):
+        del params
+        total = sum(jnp.sum(leaf) for leaf in jax.tree.leaves(state.trace))
+        trace = jax.tree.map(lambda held, new: new + jnp.stack([total] * held.size).reshape(held.shape),
+                             state.trace, updates)
+        return trace, optax.TraceState(trace=trace)
+    return optax.GradientTransformation(init, update)
+
+
 def test_an_update_that_reads_its_whole_state_stages_it_in_one_chunk():
-    """A trace scaled by its own global norm reads every leaf of the state into each update: one chunk."""
+    """A trace scaled by its own global norm reads every leaf of the state into each update: one chunk. So
+    does one that spreads a scalar of every leaf back over each leaf's shape (`spread_total`): a summary
+    is no larger than the distinct scalars it is made of, and a leaf-sized value of one scalar is a leaf
+    each update holds till the last chunk is read."""
     assert [len(chunk) for chunk in cut_of(normalized_trace())] == [len(SHAPES)]
+    assert [len(chunk) for chunk in cut_of(spread_total())] == [len(SHAPES)]
 
 
 def test_a_staged_commit_is_the_whole_commit_and_rests_where_it_rested():

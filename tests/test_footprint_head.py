@@ -238,30 +238,35 @@ class Layers(Features):
 
 def staged_of(trainer: Trainer) -> int:
     """The bytes of its host-resident commit fields `trainer`'s step holds at once, as its own staged cut
-    measures them where its fit traces it (`staging.measured`)."""
-    rows = {"x": np.ones((2, 32), np.float32), "y": np.zeros((2, 2), np.float32)}
-    data = Loader(replayed(lambda partition: itertools.repeat(rows)), None, batch=2, records=None)
+    measures them wherever its fit traces it (`staging.measured`), the sampled step among them; the plan's
+    footprint (`Footprint.staged`) holds the step's own."""
+    rows = {"x": np.ones((16, 32), np.float32), "y": np.zeros((16, 2), np.float32)}
+    data = Loader(replayed(lambda partition: itertools.repeat(rows)), None, batch=16, records=None)
     with staging.measured() as cuts:
         trainer.fit(data, steps=1, log_every=1)
-    return max(cuts, default=0)
+    measured = max(cuts, default=0)
+    assert [probe["derived"]["staged"] for probe in trainer.plan["probes"]] == [measured], trainer.plan
+    return measured
 
 
 def test_a_commit_over_host_resident_state_holds_two_of_its_chunks():
     """A step whose Adam moments and EMA rest in pinned host memory stages them a parameter at a time,
     each parameter's moments and average one chunk (`dew.training.staging`): its commit holds the two
-    largest, two 32 x 32 kernels' three copies, beside its gradient, as its own traced cut measures it
-    (`staging.measured`), as does one that samples its update's norms (`Trainer(inspection=...)`, row
-    3659); a window of two, committing under a conditional, stages it whole; one whose state the device
-    holds stages none."""
+    largest, two 32 x 32 kernels' three copies, beside its gradient and the moments' count, which it
+    fetches first, as its own traced cut measures it (`staging.measured`) and its plan's footprint reads
+    it, as does one that samples its update's norms (`Trainer(inspection=...)`, row 3659); a window of
+    two, committing under a conditional, stages it whole; one whose state the device holds stages none."""
     device = Layout(min_shard=1, tolerance=1.0)
     host = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
     trainer = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host)
     state, _, _ = trainer.place()
-    whole = sum(leaf.nbytes for leaf in jax.tree.leaves((state.opt_state, state.ema)))
-    assert staged_of(trainer) == 2 * 3 * 32 * 32 * 4
+    leaves = jax.tree.leaves((state.opt_state, state.ema))
+    whole, count = sum(leaf.nbytes for leaf in leaves), sum(leaf.nbytes for leaf in leaves if leaf.ndim == 0)
+    assert count == 4
+    assert staged_of(trainer) == count + 2 * 3 * 32 * 32 * 4
     sampled = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host,
                       inspection=Inspection(every=1))
-    assert staged_of(sampled) == 2 * 3 * 32 * 32 * 4
+    assert staged_of(sampled) == count + 2 * 3 * 32 * 32 * 4
     windowed = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=host, accumulation=2)
     assert staged_of(windowed) == whole
     resident = Trainer(Layers(), optax.adam(0.1), key=jax.random.key(0), layout=device)
