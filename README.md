@@ -226,10 +226,8 @@ Measured against the kernels the templates replace:
 | Kimi delta attention, training step | A100 | — | 11.12 ms | fla 15.92 ms |
 | Gated DeltaNet, forward | H100 | Qwen3.5-27B | 0.364 ms | fla 0.514 ms |
 | Gated DeltaNet, forward and gradient | H100 | Qwen3.5-27B | 2.46 ms | fla 3.12 ms |
-| Grouped MoE projection, forward / forward and backward | H100 SXM | 8192 rows, 2048 to 768, 128 experts | 0.72 / 1.60 ms | XLA 5.40 / 33.5 ms |
-| Grouped MoE projection, forward / forward and backward | A100 40 GB | 8192 rows, 2048 to 768, 128 experts | 1.62 / 4.04 ms | XLA 15.1 / 82.7 ms |
 
-Attention is still slower than FlashAttention 3 and 2 at the shapes where those stay in use, and dense GEMM is about 1.9 times slower than cuBLAS on the A100. [Performance](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md) has every measurement and how to reproduce it.
+Attention is still slower than FlashAttention 3 and 2 at the shapes where those stay in use, and dense GEMM is 1.9 to 2.9 times slower than cuBLAS on the A100 across its forward and gradients. [Performance](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md) has every measurement and how to reproduce it.
 
 The algebra engine rewrites each program Dew compiles before XLA sees it, using an [egglog](https://github.com/egraphs-good/egglog) e-graph. It merges matching reductions into one pass, moves scales through contractions, and merges products that share an operand. A rewrite that reorders floating-point arithmetic is applied only where the operands' bounds are known, and the accurate numerics admit exact rewrites only. Every rewrite and every kernel is held to the same accuracy gate as the rest of Dew: its RMS error from a float64 reference within 1.5 times the reference implementation's, and, where an operation has a certified rounding bound, every element of every step within that bound ([testing](https://github.com/AshishKumar4/dew/blob/main/docs/design/testing.md#numerical-accuracy)).
 
