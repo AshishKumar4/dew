@@ -248,8 +248,11 @@ class Decide(SavedRunTask, InItsForm):
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-                        attention_impl: AttentionImpl = "auto") -> Self:
+                        attention_impl: AttentionImpl = "auto", trust: Sequence[str] = ()) -> Self:
         """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
+
+        `trust` names the sources whose own code the load may run (a backbone's media processor's), as
+        `dew.inference.load`'s does (`dew.registry.import_trusted`).
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
@@ -258,7 +261,9 @@ class Decide(SavedRunTask, InItsForm):
         """
         from dew.decision.sources import PretrainedDecision
         from dew.interop.pretrained import Pretrained
+        from dew.registry import import_trusted
 
+        import_trusted(None, trust)
         bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                   param_dtype=param_dtype, attention_impl=attention_impl)
         if not isinstance(bundle, PretrainedDecision):

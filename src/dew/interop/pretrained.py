@@ -82,12 +82,12 @@ from dew.registry import (
     ModelConfig,
     dtype_name,
     from_record,
-    import_trusted,
     projectors,
     record_fields,
     resolve_dtype,
     towers,
-    trusts,
+    trust_sources,
+    trusts_source,
 )
 from dew.sampling.text import Sampling, with_ids_of
 
@@ -483,7 +483,7 @@ class Pretrained:
         `trust_remote_code=True` lets tier 2 run the repository's own modeling code (its
         `auto_map`) for a model_type transformers has no class for (`dew.interop.verify`), and a media
         processor its own processor code (LFM3-VL's), and `save` writes it beside the weights (`code`);
-        the process then trusts the source (`dew.registry.trusts`), so a processor reloaded from its
+        the process then trusts the source (`dew.registry.trusts_source`), so a processor reloaded from its
         record runs that code too (`load_processor`). None, the default, runs it where the process
         already trusts the source: a task or run loaded with `trust=(name,)` or `--trust name`
         (`dew.inference.load`, `dew train`). False never runs it.
@@ -518,8 +518,8 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        trust_remote_code = _runs_code(str(name_or_dir), trust_remote_code)
-        name_or_dir = released_run(name_or_dir, step=step, ema=ema, mesh=mesh, layout=layout)
+        name_or_dir, trust_remote_code = _released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
+                                                          mesh=mesh, layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -1307,14 +1307,25 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     return None
 
 
+def _released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:
+    """The source a load reads, itself or a saved run's release (`released_run`), and whether the load
+    runs its own code (`_runs_code`): a trusted run's release is trusted with it, as the processor's
+    record names the release."""
+    runs = _runs_code(str(name_or_dir), asked)
+    released = released_run(name_or_dir, **release)
+    if runs and released != name_or_dir:
+        trust_sources((str(released),))
+    return released, runs
+
+
 def _runs_code(name: str, asked: bool | None) -> bool:
     """Whether a load of `name` runs the source's own code: as `asked`, or, where None, as the process
-    trusts the source (`dew.registry.trusts`). A load asked to run it trusts the source for the process,
-    so a processor reloaded from its record runs that code too (`load_processor`)."""
+    trusts the source (`dew.registry.trusts_source`). A load asked to run it trusts the source for the
+    process, so a processor reloaded from its record runs that code too (`load_processor`)."""
     if asked is None:
-        return trusts(name)
+        return trusts_source(name)
     if asked:
-        import_trusted(None, (name,))
+        trust_sources((name,))
     return asked
 
 
@@ -1327,10 +1338,10 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     without loading the model's weights. A composite's metadata codec selects
     the native component's config, as it does for the initial load. A record whose
     load ran the source's own code (`SourceReference.remote_code`) runs it again
-    only where the process trusts the source (`dew.registry.trusts`): a record
+    only where the process trusts the source (`dew.registry.trusts_source`): a record
     arrives from the Hub, and its flag alone never runs code.
     """
-    if source.remote_code and not trusts(source.name):
+    if source.remote_code and not trusts_source(source.name):
         raise ValueError(f"{source.name}'s processor runs the source's own code, which this process does not "
                          f"trust: load with trust=({source.name!r},) or --trust {source.name}")
     directory = source.metadata()

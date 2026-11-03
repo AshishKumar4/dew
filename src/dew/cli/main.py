@@ -175,7 +175,11 @@ def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
     back as, so its run.json trains the same run; a chain the record cannot describe trains as Python
     built it, and its run.json says why it can't be rebuilt (`RunConfig.unrecorded`)."""
     from dew.config import RunConfig
+    from dew.registry import import_trusted
 
+    # What the caller trusts holds before the run is read or its file runs, a source a run loads there
+    # included (`dew.registry.trusts_source`), whether or not the run's record holds every part of it.
+    import_trusted(None, trust)
     path = Path(named)
     if path.suffix == ".json":
         return RunConfig.load(str(path), trust=trust)

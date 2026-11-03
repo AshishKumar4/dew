@@ -207,11 +207,28 @@ _TRUSTED: set[str] = {"flax"}
 start Flax's, whose layers a model's record names (a `Sequential`'s)."""
 
 
-def trusts(name: str) -> bool:
-    """Whether the process trusts `name` (`import_trusted`): a package outside Dew, or a source,
-    a Hub repository or a directory, whose own code its loads then run (`trust_remote_code`), as
-    `trust=(name,)` and `--trust name` say where a run or a task loads."""
-    return name in _TRUSTED
+_TRUSTED_SOURCES: set[tuple[str, str]] = set()
+"""The sources whose own code the process runs where a load reads them (`trusts_source`), by identity
+(`_source_identity`): none from the start, unlike the packages, which hold Flax's."""
+
+
+def _source_identity(name: str) -> tuple[str, str]:
+    """A source's identity: an existing directory by its resolved path, which no other working directory
+    and no Hub repository of the same name shares; any other name the Hub repository it names."""
+    path = Path(name).expanduser()
+    return ("directory", str(path.resolve())) if path.is_dir() else ("hub", name)
+
+
+def trusts_source(name: str) -> bool:
+    """Whether the process trusts the source `name`, a Hub repository or a directory, to run its own
+    code where a load reads it (`trust_remote_code`): as `trust=(name,)` and `--trust name` say where a
+    run or a task loads (`import_trusted`), or a load asked to run it (`trust_sources`)."""
+    return _source_identity(name) in _TRUSTED_SOURCES
+
+
+def trust_sources(names: Sequence[str]) -> None:
+    """Trust the sources `names` for the rest of the process (`trusts_source`)."""
+    _TRUSTED_SOURCES.update(_source_identity(str(name)) for name in names)
 
 
 def import_trusted(record: object, trust: Sequence[str]) -> None:
@@ -220,8 +237,9 @@ def import_trusted(record: object, trust: Sequence[str]) -> None:
     the record finds them imported (`imported`) and may construct their
     classes where a field declares no base class (`_owned`). A source named
     there, a Hub repository or a directory, has its own code run where a
-    load reads it (`trusts`)."""
+    load reads it (`trusts_source`)."""
     _TRUSTED.update(trust)
+    trust_sources(trust)
     if isinstance(record, str):
         module, colon, name = record.partition(":")
         if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
@@ -1770,6 +1788,7 @@ __all__ = [
     "solvers",
     "to_record",
     "towers",
-    "trusts",
+    "trust_sources",
+    "trusts_source",
     "with_dtype",
 ]

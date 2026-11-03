@@ -372,20 +372,35 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
         dew.pipeline(str(untrusted), dtype='float32').processor('w5 <|image|>', images=[image])
 
 
-def test_a_sources_record_keeps_whether_its_load_runs_its_code(tmp_path):
+def test_a_sources_record_runs_its_code_only_under_its_callers_trust(tmp_path):
     """A source's record (`SourceReference`), which a run keeps for its processor, keeps whether its load
     ran the source's own code (`remote_code`), and a record written before the field reads as not
-    trusted; a processor reloaded from a record that ran the code refuses to run it again unless the
-    process trusts the source (`load_processor`): a record arrives from the Hub, and its flag alone runs
-    nothing."""
+    trusted. A processor reloaded from a record that ran the code (LFM3-VL's, its release's code beside
+    it) refuses unless the process trusts the source (`load_processor`, `dew.registry.trusts_source`): a
+    record arrives from the Hub, and its flag alone runs nothing; trusted, it reloads. A directory named
+    as a package the process trusts (Flax's) is no source it trusts."""
+    import shutil
+
+    from tool_support import run_from
+
     from dew.interop.pretrained import load_processor
     from dew.interop.sources import SourceReference
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import from_record, to_record
+    from dew.registry import from_record, to_record, trust_sources, trusts_source
 
-    model = CausalTransformer(vocab_size=8, num_layers=1, num_heads=1, emb_features=8, mlp_features=8)
+    source = tmp_path / 'source'
+    shutil.copytree(VL, source)
+    with run_from('remote_code_reference', 'tools') as reference:
+        for file in reference.RELEASES['lfm3-vl-tiny'][2]:
+            shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
+    model = Pretrained.load(source, dtype='float32', attention_impl='reference',
+                            trust_remote_code=False).model
+    recorded = SourceReference(str(source), remote_code=True)
     with pytest.raises(ValueError):
-        load_processor(SourceReference(str(tmp_path / 'unknown'), remote_code=True), model)
+        load_processor(recorded, model)
+    trust_sources((str(source),))
+    assert load_processor(recorded, model) is not None
+    (tmp_path / 'flax').mkdir()
+    assert not trusts_source(str(tmp_path / 'flax'))
 
     trusted = SourceReference('LiquidAI/LFM3-VL-2B', 'f83d2b0a2296aaa277f394990a9b8b949ddf9691',
                               remote_code=True)

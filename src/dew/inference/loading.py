@@ -84,7 +84,7 @@ def pipeline(
     """
     persist_compilations()
     # What the caller trusts, a package a run's record names or a source whose own code its load runs
-    # (`dew.registry.trusts`), the process trusts from here on.
+    # (`dew.registry.trusts_source`), the process trusts from here on.
     import_trusted(None, trust)
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
