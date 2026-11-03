@@ -1,13 +1,13 @@
 """Speculative decoding: the emitted law, and the cache the block leaves behind.
 
-The acceptance and the token after it are transformers' `_speculative_sampling`
-on fixed logits and the same uniforms (tools/speculative_reference.py). The
-law is checked against fixed distributions rather than a model, so nothing
-but the acceptance rule, the residual and the bonus decide the answer. The
-cache is checked against greedy sampling on real models: with a zero
-temperature the target's point mass wins every rejection, so a block has to
-emit exactly the greedy walk, which it can only do if the state it replays
-after a rejection is the state the accepted prefix would have left.
+The law is checked on a real model's own draws: a block's tokens, whatever its
+draft proposed, are drawn as the target alone draws them, the acceptance, the
+residual after a rejection and the bonus together, held to the target's own
+chances by the sampling gate (tests/sampling_gate.py). The cache is checked
+against greedy sampling on real models: with a zero temperature the target's
+point mass wins every rejection, so a block has to emit exactly the greedy
+walk, which it can only do if the state it replays after a rejection is the
+state the accepted prefix would have left.
 """
 
 
@@ -291,3 +291,39 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     scores = jax.nn.log_softmax(model.apply(
         params, jnp.asarray(np.asarray(drawn.tokens)[:, :4]))[:, -1])
     np.testing.assert_allclose(drawn.raw_log_probs[0, 1], scores[0, eos], atol=3e-6, rtol=0)
+
+
+LAW_ROWS, LAW_SEEDS = 512, 8
+"""The law's draws: each seed a call of `LAW_ROWS` copies of one prompt, every row drawn apart."""
+
+
+def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
+    """Speculation changes how a token is drawn, never its law: a block's first two tokens, the target's
+    own draw and the one its draft proposed after it (accepted at the ratio of the two distributions or
+    replaced from their difference), are drawn as the target alone draws them, the pair at the chance the
+    target's float64 run gives the first token times the second's given it, over every pair of a
+    13-token vocabulary (the sampling gate). The draft is the model's own prediction depth, untrained,
+    so it proposes off the target's law and the acceptance has to undo it."""
+    from reference_error import widened
+    from sampling_gate import assert_draws_as_declared
+
+    model = predictor()
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    vocab = model.vocab_size
+    with jax.enable_x64(new_val=True):
+        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
+        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1])
+        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
+        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1], axis=-1)
+        chances = np.asarray(first[:, None] * second).reshape(-1)
+
+    rows = jnp.broadcast_to(prompt, (LAW_ROWS, 3))
+
+    def counts(seed):
+        drawn = generate(model, params, rows, 2, key=jax.random.key(seed), sampling=Sampling(temperature=1.0),
+                         strategy=Speculative(block=3))
+        tokens = np.asarray(drawn.tokens)[:, 3:5]
+        return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
+
+    assert_draws_as_declared(counts, chances, "a speculative block's first two tokens", seeds=LAW_SEEDS)
