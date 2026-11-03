@@ -101,9 +101,8 @@ def landing(source: bytes) -> tuple[bytes, bytes, int, int, float]:
         frames = [frame for index, frame in enumerate(reader) if index % every == 0][:SECONDS * FPS]
         reader.close()
         height, width = frames[0].shape[:2]
-        imageio.mimwrite(cut, frames, fps=FPS, codec="libx264", macro_block_size=1,
-                         output_params=["-crf", str(CRF), "-preset", "slow", "-pix_fmt", "yuv420p",
-                                        "-movflags", "+faststart"])
+        imageio.mimwrite(cut, frames, fps=FPS, codec="libx264", macro_block_size=1, pixelformat="yuv420p",
+                         output_params=["-crf", str(CRF), "-preset", "slow", "-movflags", "+faststart"])
         encoded = cut.read_bytes()
     poster = io.BytesIO()
     Image.fromarray(np.asarray(frames[0])).save(poster, "WEBP", quality=70, method=6)
