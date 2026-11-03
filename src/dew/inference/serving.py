@@ -795,7 +795,7 @@ class Server:
             sampling=dataclasses.replace(policy, stop=task.sampling.stop),
             transforms=transforms,
             stopping=stopping,
-            grammar=None if plan is not None else strategy.grammar,
+            grammar=strategy.grammar if isinstance(strategy, Sample) else None,
             rows=rows,
             slots=slots,
             capacity=rounded,
