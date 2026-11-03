@@ -382,7 +382,7 @@ def test_unified_backward_follows_the_recorded_reference(source):
     truth's sketch. Its 256 recorded seeds (`backward.seeds`), both arms over four windows of 32 rows a
     seed, are one site that CI draws in map tasks of 32 seeds, 61 to 87 s each on armada, and judges
     pooled: seven groups of its leaves, each a test of its own, ran the draws and the forward seven times
-    over, 90 to 220 s each, 404 s whole (rows 1848, 2787)."""
+    over, 90 to 220 s each, where the one site takes 404 s in one task (rows 1848, 2787)."""
     ours, _, _, draw = gradient_functions(source)
     stored = recording(FIXTURE / "backward.npz")
     with jax.enable_x64(new_val=True):
