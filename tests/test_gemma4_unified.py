@@ -410,10 +410,13 @@ def test_the_backward_groups_hold_every_recorded_leaf_once():
 
 
 @pytest.mark.parametrize("group", BACKWARD_GROUPS)
+@pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_unified_backward_follows_the_recorded_reference(source, group):
     """The recorded backward's `group` of leaves: Dew's gradients against transformers' recorded float32
     evidence from its recorded float64 truth over the recorded seeds (check 1), Dew's own float64 path
-    held to the recorded truth's sketch."""
+    held to the recorded truth's sketch. Each group's 256 recorded seeds (`backward.seeds`) take a
+    second a seed or so, both arms over four windows of 32 rows: CI draws them in map tasks of 64 seeds
+    each, about 50 s apiece on armada, and judges them pooled."""
     ours, _, _, draw = gradient_functions(source, group)
     stored = recording(FIXTURE / "backward.npz")
     with jax.enable_x64(new_val=True):
