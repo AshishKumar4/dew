@@ -217,21 +217,23 @@ class Ticket(Timed):
                 _log.error("exception calling a tokens callback for %r", self, exc_info=error)
 
 
-_KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
-"""The shape and dtype of a default key's data, read without a device."""
+@functools.cache
+def _key_data(impl: str) -> jax.ShapeDtypeStruct:
+    """The shape and dtype of the data of a key of `impl`, read without a device."""
+    return jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0, impl=impl)))
 
 
-def _seed(key: int | jax.Array) -> int | jax.Array:
+def _seed(key: int | jax.Array, impl: str) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
-    reads every row's key with the default PRNG implementation, so a key of
-    another is refused here, before the request queues."""
+    reads every row's key with the server's PRNG implementation (`impl`), so
+    a key of another is refused here, before the request queues."""
     if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
         return int(key)
     typed = request_key(key)
-    if typed.dtype != jax.random.key_dtype():
+    if typed.dtype != jax.eval_shape(lambda: jax.random.key(0, impl=impl)).dtype:
         raise ValueError(f"a served request's key is {jax.random.key_impl(typed)}, and the server batches "
-                         f"keys of the default implementation, {jax.config.jax_default_prng_impl}; pass an "
+                         f"keys of the implementation that was the default as it was built, {impl}; pass an "
                          "integer seed or a key of that implementation")
     return jax.random.key_data(typed)
 
@@ -867,7 +869,7 @@ class Server:
         here and queued at once; a step seats it when a slot is free.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int) -> Ticket:
@@ -1053,7 +1055,7 @@ class Server:
         through `TextGeneration` would. Each row is validated as `submit`
         validates one.
         """
-        base = _seed(key)
+        base = _seed(key, self.prng)
         inputs = prepared_inputs(self.processor, prompts, images=None)
         tickets = [self._enqueued(inputs.take_rows(jnp.arange(index, index + 1)), max_new_tokens, base, index)
                    for index in range(inputs.tokens.shape[0])]
@@ -1111,7 +1113,7 @@ class Server:
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        empty_key = np.zeros(_KEY_DATA.shape, _KEY_DATA.dtype)
+        empty_key = np.zeros(_key_data(self.prng).shape, _key_data(self.prng).dtype)
         keys: list[jax.Array | np.ndarray] = [empty_key] * count
         seeds = np.zeros((count,), np.int64)
         seeded = np.zeros((count,), bool)
