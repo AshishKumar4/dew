@@ -29,13 +29,13 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 GALLERY = ROOT / "site" / "public" / "gallery"
 
-SECONDS, FPS = 8, 30
+SECONDS, FPS = 8, 24
 """The landing film: the film's first `SECONDS`, at `FPS` frames a second."""
 
 FILM_BYTES, POSTER_BYTES = 600_000, 60_000
 """The most bytes the landing film and its poster may take (Platform's budget for a landing band)."""
 
-CRF = 30
+CRF = 33
 """The film's H.264 constant rate factor: the size it is held under `FILM_BYTES` at."""
 
 _VIDEO = re.compile(r'src="data:video/mp4;base64,([A-Za-z0-9+/=]+)"')
