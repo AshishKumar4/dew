@@ -123,7 +123,7 @@ def greedy_walk(model, params, prompts, steps: int) -> np.ndarray:
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
-    walk (`greedy_walk`), each row's crossing inside a block."""
+    walk (`greedy_walk`), each row crossing it in the replay of what a block emits."""
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
@@ -132,6 +132,36 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     walked = greedy_walk(model, params, prompts, 6)
     np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
+
+
+@pytest.mark.parametrize("kind", ["attention", "dspark"])
+def test_a_speculative_block_across_a_longrope_change_compiles_one_rebuild(kind, monkeypatch):
+    """A block's candidates cross no LongRoPE change: a row they would cross keeps none and draws its one
+    token as the walk does (`strategies.block_step`), so a speculative decode traces the rebuild, a whole
+    prefill of the history, once, in the replay of what its block emits, where the candidates' verify
+    traced it again (ledger 3703: 27 s of the DSpark program's compile on CPU), and still draws the walk."""
+    from dew.nn.kernels import options
+    from dew.sampling import text
+
+    model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
+    walked = greedy_walk(model, params, prompts, 6)
+    rebuilds = []
+    rebuilt = text._rebuilt
+
+    def counted(*arguments, **keywords):
+        rebuilds.append(len(rebuilds))
+        return rebuilt(*arguments, **keywords)
+
+    monkeypatch.setattr(text, "_rebuilt", counted)
+    # The decode traced afresh, whatever this process compiled before.
+    options.release()
+    jax.clear_caches()
+    speculated = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
+                          strategy=Speculative(block=3))
+    assert len(rebuilds) == 1
+    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, 3:], walked)
 
 
 def stretch_verified(model, params, depths):
