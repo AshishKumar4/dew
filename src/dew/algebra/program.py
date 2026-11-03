@@ -223,7 +223,8 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
 
 WINDOWS_HELD = 4096
 """The windows' derivations a process keeps (`_derived`), its least recently read dropped past them: the
-distinct windows of the steps it compiles, each a saturation's tens of milliseconds to derive again."""
+distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner traced over its compiles, each
+33 ms on average to derive again; row 3764)."""
 
 
 @dataclasses.dataclass(frozen=True)
