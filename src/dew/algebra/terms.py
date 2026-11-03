@@ -35,6 +35,7 @@ from egglog import (
 from egglog.declarations import Declarations, HasDeclarations
 from egglog.runtime import RuntimeExpr
 from jax._src import core as jax_core
+from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -354,7 +355,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
 
     def read(atom) -> Node:
         if isinstance(atom, jcore.Literal):
-            literals.append(atom.val)
+            literals.append(_held(atom.val))
             term = forms.literal(len(literals) - 1)
             shapes.append((term, _shape(atom)))
             _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
@@ -659,6 +660,15 @@ def form_value(region_: Region, form: Term, values: list) -> jax.Array:
         return known[named]
 
     return value(form)
+
+
+def _held(value: np.ndarray | complex) -> np.ndarray | complex:
+    """A literal's value as a region holds it, its own copy and its type (a `TypedNdArray`'s aval, its weak
+    type and placement): JAX's literal may view a NumPy scalar a function captured, which its caller may
+    change after a region is derived and kept (`program._derived`)."""
+    if isinstance(value, TypedNdArray):
+        return TypedNdArray(np.array(value), value.aval)
+    return np.array(value) if isinstance(value, np.ndarray) else value
 
 
 def _shape(atom) -> tuple[int, ...]:

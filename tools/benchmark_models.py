@@ -204,11 +204,11 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
 
     sample_key = "video" if case.frames else "image"
     fields = case.trunk_fields()
+    trunk = built(case.trunk, fields)
 
     if case.canvas is not None:
         prompt, width, count = canvas_split(case)
-        model = DiffusionGemma(text=built("causal_transformer", fields),
-                               canvas_length=width)
+        model = DiffusionGemma(text=trunk, canvas_length=width)
         if case.decoder_objective != "lm":
             raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
                              f"it names decoder_objective={case.decoder_objective!r}")
@@ -218,14 +218,13 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.
-        model = MultimodalTransformer(
-            built("causal_transformer", fields), tower, projector, family, token,
-            dtype=jnp.float64 if widened else resolve_dtype(dtype))
+        model = MultimodalTransformer(trunk, tower, projector, family, token,
+                                      dtype=jnp.float64 if widened else resolve_dtype(dtype))
         objective = decoder_objective(case, model)
     elif case.is_lm:
-        objective = decoder_objective(case, built(case.architecture, fields))
+        objective = decoder_objective(case, trunk)
     elif case.predictor is not None:
-        model = built(case.architecture, fields)
+        model = trunk
         patch = fields.get("patch_size", 16)
         if not isinstance(patch, int):
             raise ValueError(f"{case.architecture}'s patch_size is {patch!r}, not an int")
@@ -235,7 +234,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
             MultiBlockMask.for_grid(grid, num_targets=2, scale=(0.2, 0.3)),
             sample=Field(sample_key, case.sample_shape))
     else:
-        model = built(case.architecture, fields)
+        model = trunk
         preset = presets.EDM(regime="pixel")
         if isinstance(model, QwenImageTransformer):
             keyword = "conditioning"
