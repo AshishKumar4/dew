@@ -793,31 +793,36 @@ HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pa
 
 @dataclasses.dataclass(frozen=True)
 class HybridSite:
-    """A shared prefix site's model and draws: its vocabulary and width, the tokens each request draws,
-    and its declared seeds, sized paired by `seeds_for` on armada (None sizes them each run)."""
+    """A shared prefix site's model and draws: its declared seeds, sized paired by `seeds_for` on armada,
+    its vocabulary and width, and the tokens each request draws. A site sized each run drew twice its
+    count again as pilots, two thirds of its draws (evicted's 141 s, armada)."""
 
+    seeds: int
     vocab: int = 256
     width: int = 16
     budget: int = 8
-    seeds: int | None = None
 
 
 WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
 """The site of the requests whose repeats share the most: at 256 words, 16 wide and 8 draws, fp32 sums as
 users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
+NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
+"""The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
+0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
+one-entry-booked-twice's at 512."""
 
 
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
-    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, HybridSite()),
+    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
     ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None,
-     HybridSite()),
+     NARROW_HYBRID_TAILED),
     ((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))), {"prefix_states": 1},
-     (0, 8), (2, 2), HybridSite()),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), HybridSite())],
+     (0, 8), (2, 2), NARROW_HYBRID_TAILED),
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "evicted", "one-entry-booked-twice",
          "restores-past-admission"])
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
@@ -842,7 +847,7 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
                           sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
-                           seeds=None if site.seeds is None else (site.seeds, site.seeds))
+                           seeds=(site.seeds, site.seeds))
 
 
 def served_alongside(bound, slots=4, admission=2, **options):

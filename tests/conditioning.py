@@ -5,7 +5,7 @@ a decided failure fails the site and a decided pass passes it. Only where it is 
 budget spent is the site judged again, weighed: each arm's element e at its truth t read as the residual
 (e - t) / c against a truth of zeros, every row of unit size, c the reference program's rounding scale
 there, the same for every arm (the element's RMS displacement where every rounding of the program, traced
-in the arithmetic the arms run in, moves its value by a standard normal multiple of its bound; tests/
+in the arithmetic the arms run in, moves its value by a random sign times its bound; tests/
 rounding_bound.py's `rounding_scale`). A leaf's heavy elements (`heavy_masks`) are judged as a leaf of
 their own beside the light rest, each class's worst rows by the gate's factor for its values a row
 (`check1_statistics.row_factor`); that check must decide a pass. An element no rounding reaches (c = 0)

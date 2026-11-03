@@ -7,8 +7,9 @@ magnitude, a sum of m terms in any order by (m - 1) times the sum of the terms' 
 product of m terms by m times it (Higham, Accuracy and Stability of Numerical Algorithms, 2nd ed., 2002,
 sections 2.2, 3.1 and 4.2), an integer converted to a float too narrow to hold it by its magnitude, and an
 elementary function by its implementation's ulps times its result (`ULPS`). The program is evaluated in
-float64 with each rounding moved by w(v) u times a standard normal draw (a tap), every operation its own
-draw (`TapRule`), and each output element's scale c is the root mean square, over `DRAWS` draws, of how
+float64 with each rounding moved by w(v) u times a random sign, + or - alike (a tap, a draw of unit variance),
+every operation its own draw (`TapRule`), and each output element's scale c is the root mean square, over
+`DRAWS` draws, of how
 far the taps move it from the untapped evaluation: its rounding error's size where every rounding moves its
 value by a random multiple of its bound, the program's own conditioning included, first order or not. An
 element no rounding reaches has c = 0.
@@ -77,11 +78,12 @@ SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 shapes, dtypes and weak types and the matmul precision it traced under, held while the function lives."""
 
 
+@jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class TapRule:
     """The walk's rule of a tapped evaluation (`float64_terms.Rule`): each primitive evaluated in float64,
     its parameters' dtypes widened, and each floating result it rounds moved by `scale` times its rounding's
-    bound (module docstring) times a standard normal draw of its own, keyed by `key`, a uint64 counter mixed
+    bound (module docstring) times a random sign of its own, keyed by `key`, a uint64 counter mixed
     with the walk's path to it (`at`); `scale` 0 the untapped evaluation."""
 
     key: jax.Array
@@ -116,7 +118,7 @@ class TapRule:
                 continue
             unit = _unit(name, params, dtype)
             tap = _mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64)))
-            draw = _normal(tap, jnp.shape(value))
+            draw = _signs(tap, jnp.shape(value))
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
 
@@ -133,23 +135,21 @@ def _mixed(x: jax.Array) -> jax.Array:
     return x ^ (x >> 31)
 
 
-def _normal(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """Standard normal float64 draws of `shape` keyed by `key`, a uint64 word: two uniform draws an element,
-    each counter's mixed word (`_mixed`), by Box and Muller's transform. A program holding a draw at every
-    rounding compiles in seconds, where `jax.random`'s threefry keys and inverse error function at each
-    took minutes."""
-    count = int(np.prod(shape))
-    counters = jnp.arange(2 * count, dtype=jnp.uint64).reshape((2, *shape))
+def _signs(key: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """Random signs of `shape`, each + or - alike, as float64, keyed by `key`, a uint64 word: each element's
+    counter's mixed word's top bit (`_mixed`). A draw of unit variance, as a standard normal's, whose
+    displacements' mean square is the same sum of squared weights (Hutchinson's estimator, "A stochastic
+    estimator of the trace of the influence matrix", 1990, draws signs so too); a program holding a draw at
+    every rounding compiles in seconds, where normals' logarithm and cosine at each took minutes."""
+    counters = jnp.arange(int(np.prod(shape)), dtype=jnp.uint64).reshape(shape)
     bits = _mixed(key + _GOLDEN * (counters + 1))
-    # Each uniform in (0, 1] from the top 53 bits, so the logarithm is finite.
-    uniform = ((bits >> 11).astype(jnp.float64) + 1) * 2.0 ** -53
-    return jnp.sqrt(-2 * jnp.log(uniform[0])) * jnp.cos(2 * jnp.pi * uniform[1])
+    return 1.0 - 2.0 * (bits >> 63).astype(jnp.float64)
 
 
 def rounding_scale(fn, *args, seed: int = 0):
     """`fn(*args)` in float64, and each floating output element's rounding scale c (module docstring), its
-    rounding error's root mean square where each of the program's roundings moves its value by a standard
-    normal multiple of its bound, over `DRAWS` draws keyed by `seed`, so the same draw of the same program
+    rounding error's root mean square where each of the program's roundings moves its value by a random
+    sign times its bound, over `DRAWS` draws keyed by `seed`, so the same draw of the same program
     weighs alike for every arm. The program is traced at `args` as given, its roundings those formats', and
     evaluated in float64; a non-floating output's scale is None. A static program (no branch or loop its
     values pick) evaluates compiled, once a signature and matmul precision; any other walks eagerly."""
@@ -176,8 +176,9 @@ def rounding_scale(fn, *args, seed: int = 0):
                     jaxpr, consts, leaves, rule=TapRule(key, scale))[0])
             outputs, scales = _scaled(closed.jaxpr, functools.partial(held[signature], consts, leaves), key)
         else:
+            # Its runs of static steps between a branch and a loop compiled, the rule passed in (`_span`).
             outputs, scales = _scaled(closed.jaxpr, lambda key, scale: _evaluated(
-                closed.jaxpr, consts, leaves, rule=TapRule(key, scale))[0], key)
+                closed.jaxpr, consts, leaves, rule=TapRule(key, jnp.float64(scale)), compiling=True)[0], key)
     return (tree.unflatten([np.asarray(value) for value in outputs]),
             tree.unflatten([None if scale is None else np.asarray(scale) for scale in scales]))
 

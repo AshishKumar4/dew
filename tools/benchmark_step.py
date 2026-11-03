@@ -58,6 +58,7 @@ import io
 import json
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
@@ -95,6 +96,15 @@ from trace_window import kernel_category, kernel_totals
 Row = dict[str, object]
 
 
+def cases_to_json(cases: Sequence[Case]) -> str:
+    """`cases` as the JSON list `cases_from_json` reads back: each case's fields as they are, a translated
+    config's records (`dew.interop.config_records.NativeFields`) written as the fields they state, which the
+    model's declared field types rebuild them from. `dataclasses.asdict` would rebuild each record by its
+    type, whose constructor takes the native owner beside its fields."""
+    return json.dumps([{field.name: getattr(case, field.name) for field in dataclasses.fields(case)}
+                       for case in cases])
+
+
 def cases_from_json(text: str) -> list[Case]:
     """`--cases`: a JSON list of objects whose keys are Case fields."""
     parsed = json.loads(text)
@@ -120,7 +130,7 @@ JsonCases = Annotated[
         metavar="JSON",
         instance_from_str=lambda args: cases_from_json(args[0]),
         is_instance=lambda value: isinstance(value, list),
-        str_from_instance=lambda cases: [json.dumps([dataclasses.asdict(c) for c in cases])],
+        str_from_instance=lambda cases: [cases_to_json(cases)],
     ),
 ]
 """A list of cases, written as one JSON string on the command line."""
@@ -357,7 +367,7 @@ def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
     the case's own that loads its programs from a cache and compiles nothing. Run before this process
     opens a backend, which would hold the device it needs."""
     return peak_memory.measured(
-        [os.path.abspath(__file__), "--cases", json.dumps([dataclasses.asdict(case)]),
+        [os.path.abspath(__file__), "--cases", cases_to_json([case]),
          "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
          "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
          *(["--xla-flags", config.xla_flags] if config.xla_flags else []),

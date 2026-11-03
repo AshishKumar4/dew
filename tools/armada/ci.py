@@ -41,7 +41,11 @@ draws from its inputs and reports the site's row, `<file>#<test>`, as a run
 that drew every seed itself would; a map task that does not pass exits 1, and
 armada reads its judge red, naming it. Other work too long for one task, marked
 shards(units, per_task), runs so too, its map tasks taking per_task of its
-units each. Each row
+units each. A check-1 site that also declares a weighed check (reference_error's
+`conditioning`), check1_shards(seeds, per_task, conditioning,
+conditioning_per_task), draws its weighed units in map tasks of their own,
+conditioning_per_task each, past its unweighted ones, every one a later task
+its judge asks for. Each row
 also carries its tests' own times, which `durations` folds into tests/test_durations.json from main's CI
 (`armada verdict <sha> --json`): a file whose record no longer cuts it as it
 runs takes what its tests took (`folded`). The land queue folds main's CI so
@@ -1006,12 +1010,16 @@ class Mark:
     """A site's mark (`SHARDS`): the units its map tasks together take, 0 to `units`, the most of them a map
     task takes, the line of its test's source that holds the mark, and the units a whole run of its test
     takes at least, over which its recorded seconds weigh one (`site_entries`): a check-1 site's declared
-    seeds, of (1 + REDRAW) times as many its map tasks draw; a `shards` test's units, every one."""
+    seeds, of (1 + REDRAW) times as many its map tasks draw; a `shards` test's units, every one. A check-1
+    site's weighed check (`conditioning`) draws `weighed` units more, `units` to `units + weighed`, at most
+    `weighed_per_task` a map task: its draws cost their own, apart from the unweighted check's."""
 
     units: int
     per_task: int
     line: int
     timed: int
+    weighed: int = 0
+    weighed_per_task: int = 0
 
 
 def armada_dir(variable: str, default: str) -> Path:
@@ -1056,20 +1064,26 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
             continue
         counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
                   if isinstance(keyword.value, ast.Constant)}
-        if (not mark.args and len(mark.keywords) == 2 and counts.keys() == {SHARDS[kind], "per_task"}
+        allowed = [{SHARDS[kind], "per_task"}]
+        if kind == "check1_shards":
+            allowed.append({SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
+        if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[SHARDS[kind]]
             units = (1 + REDRAW) * declared if kind == "check1_shards" else declared
-            found[test] = Mark(units, counts["per_task"], mark.lineno, declared)
+            weighed = (1 + REDRAW) * counts.get("conditioning", 0)
+            found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
+                               counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
     unread = sorted(node.lineno for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute) and node.attr in SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
     if unread:
         raise SystemExit(f"{name}, line {', '.join(map(str, unread))}: check1_shards and shards mark a test "
-                         f"once, on its own decorator, as @pytest.mark.check1_shards(seeds=S, per_task=P) or "
-                         f"@pytest.mark.shards(units=N, per_task=P) of literal counts above zero, which the "
-                         f"plan reads from the source (tools/armada/ci.py `sites`)")
+                         f"once, on its own decorator, as @pytest.mark.check1_shards(seeds=S, per_task=P), "
+                         f"with conditioning=C, conditioning_per_task=Q where it declares a weighed check, "
+                         f"or @pytest.mark.shards(units=N, per_task=P), of literal counts above zero, "
+                         f"which the plan reads from the source (tools/armada/ci.py `sites`)")
     return found
 
 
@@ -1077,10 +1091,16 @@ def draws_of(mark: Mark) -> list[tuple[int, int]]:
     """The units each map task of a site marked `mark` takes, at most its per_task each: together 0 to its
     units, every seed both of check 1's stages draw, or every unit of a `shards` test's work; a check-1 site's
     first stage (0 to its declared seeds, `timed`) and its second each in tasks of their own, the second's
-    `later` (`site_entries`)."""
+    `later` (`site_entries`); and its weighed check's units past them (`Mark.weighed`), at most
+    `weighed_per_task` a task, every one later."""
     stages = [(0, mark.timed), (mark.timed, mark.units)] if mark.units > mark.timed else [(0, mark.units)]
-    return [(start, min(start + mark.per_task, stop)) for first, stop in stages
-            for start in range(first, stop, mark.per_task)]
+    spans = [(start, min(start + mark.per_task, stop)) for first, stop in stages
+             for start in range(first, stop, mark.per_task)]
+    if not mark.weighed:
+        return spans
+    end = mark.units + mark.weighed
+    return spans + [(start, min(start + mark.weighed_per_task, end))
+                    for start in range(mark.units, end, mark.weighed_per_task)]
 
 
 def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
@@ -1134,7 +1154,9 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             for start, stop in draws_of(mark):
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
-                weight = measured.get(task_name) or (whole * (stop - start) / mark.timed or target)
+                # A weighed check's units cost their own: unmeasured, a task of them weighs the target.
+                weight = measured.get(task_name) or (target if start >= mark.units
+                                                     else whole * (stop - start) / mark.timed or target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
@@ -1484,17 +1506,39 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
     return []
 
 
-def task_files(out: Path) -> tuple[Path, Path, Path, Path]:
+def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
-    has exited (`record`); how collection found each file (executed.py); pytest's report; and the files the
-    durations record does not wholly name (split.py)."""
-    log, collection, report, unrecorded = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json"))
-    for stale in (report, log, collection, unrecorded):
+    has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
+    durations record does not wholly name (split.py); and where its stacks are dumped at its deadline, its
+    process id beside them (executed.py)."""
+    log, collection, report, unrecorded, stacks = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "stacks"))
+    for stale in (report, log, collection, unrecorded, stacks, stacks.with_name(f"{stacks.name}.pid")):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
-    return log, collection, report, unrecorded
+    return log, collection, report, unrecorded, stacks
+
+
+DUMP_SECONDS = 2.0
+"""How long a task past its deadline gives its pytest's dump of its stacks before the interrupt, which would
+unwind the frames the dump walks (a dump the interrupt overtook ended its process in a segmentation fault);
+faulthandler writes one in milliseconds."""
+
+
+def dumped(done: subprocess.Popen, stacks: Path) -> str:
+    """Every thread's stack of a task's pytest past its deadline, as faulthandler wrote them to `stacks`
+    (executed.py): SIGUSR2 sent to pytest itself, the id executed.py wrote beside them once it registered
+    the dump, and `DUMP_SECONDS` for it, which ends early where pytest ends; none where pytest never
+    registered it."""
+    pid = stacks.with_name(f"{stacks.name}.pid")
+    if not pid.is_file():
+        return ""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(int(pid.read_text()), signal.SIGUSR2)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        done.wait(DUMP_SECONDS)
+    return stacks.read_text(errors="replace")
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1514,7 +1558,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    log, collection, report, unrecorded = task_files(out)
+    log, collection, report, unrecorded, stacks = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1528,7 +1572,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded)})
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
     # Every data file the task's processes open, held from before pytest starts until its group stopped
@@ -1545,15 +1589,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
-    expired = False
+    expired, dump = False, ""
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        expired = True
-        # Every thread's stack as pytest stands at its deadline, written to its output before the interrupt
-        # below (executed.py registers SIGUSR2).
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(done.pid, signal.SIGUSR2)
+        # Every thread's stack as pytest stands at its deadline, before the interrupt below.
+        expired, dump = True, dumped(done, stacks)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
@@ -1600,8 +1641,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # Long enough to hold a stall's stacks, which come before its interrupt's report.
-                     "output": "\n".join(red + ([output[-12000:]] if red else [])),
+                     # A stall's stacks whole, then the end of what pytest wrote.
+                     "output": "\n".join(red + ([dump[:12000]] if dump else [])
+                                         + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
@@ -2173,15 +2215,21 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
     reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
     executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
     (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
-    marked whole_suite too."""
+    marked whole_suite too. A check-1 site's map task past the target is reported whatever the record holds
+    (its test is recorded whole): its mark gives a task too many units, which fewer a task (per_task,
+    conditioning_per_task) bring within it (row 3729: one ran 1,366 s unreported)."""
     found = []
     for row_ in verdict["rows"]:
         cells = set(row_.get("whole_suite", []))
+        drawn = SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
+        mapped = drawn is not None and drawn["start"] is not None
         for test, seconds in (row_.get("tests") or {}).items():
-            if seconds <= target or (base is not None and test in base):
+            if seconds <= target or (base is not None and test in base and not mapped):
                 continue
             found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
-                          "target": target, **({"whole_suite": True} if test in cells else {})})
+                          "target": target, **({"whole_suite": True} if test in cells else {}),
+                          **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
+                              "conditioning_per_task)"} if mapped else {})})
     return sorted(found, key=lambda item: (-item["seconds"], item["test"]))
 
 

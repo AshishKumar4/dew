@@ -1,8 +1,12 @@
 """A CI task's deadline (tools/armada/ci.py's `tested`): a task past it interrupts its pytest, names every row
 it holds red, and says where every thread of its pytest stood."""
 
+import base64
+import hashlib
 import json
 import time
+import zipfile
+from pathlib import Path
 
 import pytest
 from armada_support import interpreter, loaded, written
@@ -49,6 +53,39 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert interrupted["kind"] == "deadline"
     # faulthandler's dump: each thread's frames, most recent call first, the stalled one's among them.
+    assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
+
+
+def wheel(root: Path) -> Path:
+    """A wheel of one empty package, a release check's requirement that uv installs from its file alone."""
+    path = root / "unused-1.0-py3-none-any.whl"
+    files = {"unused/__init__.py": b"",
+             "unused-1.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: unused\nVersion: 1.0\n",
+             "unused-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\n"
+                                           b"Tag: py3-none-any\n"}
+    hashed = {name: base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+              for name, data in files.items()}
+    digests = [f"{name},sha256={hashed[name]},{len(data)}" for name, data in files.items()]
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+        archive.writestr("unused-1.0.dist-info/RECORD",
+                         "\n".join([*digests, "unused-1.0.dist-info/RECORD,,"]) + "\n")
+    return path
+
+
+def test_a_release_checks_task_past_its_deadline_says_where_its_pytest_was(ci, tmp_path):
+    """A release check's pytest runs under `uv run`, which stands between the task and pytest: the stacks are
+    still pytest's own as it stood at the deadline, the stalled call among them, taken from pytest itself
+    before the interrupt reaches it, never through the launcher, which would pass the signal on after the
+    interrupt had begun unwinding the stall, or not at all."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_stalls.py": "import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
+                                         "stalled_reading()\n\n\ndef test_never():\n    pass\n"})
+    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0, cache="off", grace=5.0,
+            release=str(wheel(tmp_path)))
+    [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
+    assert interrupted["kind"] == "deadline"
     assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
 
 
