@@ -18,8 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import bits
 from episode_support import environment as sandbox
+from recording import bits
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed, tapped

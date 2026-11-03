@@ -137,7 +137,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels import generation
-from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
+from dew.nn.kernels.options import compiler_options, program as outer_program
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
@@ -644,8 +644,7 @@ class Server:
 
     def _keep_states(self, formats) -> None:
         """Open the store of row states a shared prefix is read with, where the rows keep state beside
-        their pages (`PagedRows.stateful`), and the programs that move them (`state_programs`), each run by
-        its executable as the steps are (`Fetched`): its slots and entries are padded to fixed sizes."""
+        their pages (`PagedRows.stateful`), and the programs that move them (`state_programs`)."""
         self._states: Variables | None = None
         """Each row state leaf (`row_state`) with its slot axis holding the groups' `States` entries,
         placed as the slots are; None where rows keep none."""
@@ -662,7 +661,7 @@ class Server:
                                                   leaf.sharding) if row_state(path) else None,
                 self.cache)
             self._states = states
-            self._restored, self._captured = map(Fetched, state_programs(formats, states))
+            self._restored, self._captured = state_programs(formats, states)
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
