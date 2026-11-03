@@ -1172,8 +1172,9 @@ class Trainer(Generic[Loss, Effects]):
         footprint = None if shapes is None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), window, prepared, held,
             (local_devices(self.device_mesh) or [*self.device_mesh.devices.flat])[0], split,
-            consumed_where_made(self.objective, self.optimizer, prepared, window,
-                                shared=pooled_by_mean(shapes[0]), progressed=self._examples is not None),
+            lambda: consumed_where_made(self.objective, self.optimizer, prepared, window,
+                                        shared=pooled_by_mean(shapes[0]),
+                                        progressed=self._examples is not None),
             max(cuts, default=0), capacity)
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,

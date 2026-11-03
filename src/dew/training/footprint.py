@@ -601,13 +601,14 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
-                                          held: int, target, split: int, consumed: bool, staged: int,
-                                          capacity: int | None = None) -> Footprint:
+                                          held: int, target, split: int, consumed: Callable[[], bool],
+                                          staged: int, capacity: int | None = None) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
     (`gemm_workspace`), each gradient held while it is made where the step reads it there (`consumed`,
-    `transaction.consumed_where_made`), its trained parameters' gradient, laid out as they are, and
+    `transaction.consumed_where_made`, asked only where the peak is derived), its trained parameters'
+    gradient, laid out as they are, and
     `held`, and `staged`, the bytes of its host-resident commit fields its own staged cut holds at
     once (`dew.training.staging.measured`, as the step is traced). Over
     several devices that split the microbatch's rows alone (data and fully sharded data parallelism,
@@ -645,7 +646,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             lowering = lowering_platform(target)
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering, consumed=consumed)
+                                            lowering=lowering, consumed=consumed())
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
