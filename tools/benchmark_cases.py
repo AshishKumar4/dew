@@ -4,6 +4,7 @@ import dataclasses
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
@@ -63,7 +64,7 @@ class Case:
     """The fields of the model the case builds (`trunk`'s), over the checkpoint config's where it names
     one."""
     hf_config: str | None = None
-    """A checkpoint, a local directory or a Hub repo (`repo@revision` pins one,
+    """A checkpoint, a local directory (or its config.json) or a Hub repo (`repo@revision` pins one,
     `dew.interop.sources.SourceReference.parse`), whose config's translation is the decoder's fields,
     `config`'s over them (`trunk_fields`, `checkpoint_fields`)."""
     dtype: str | None = None
@@ -141,7 +142,10 @@ class Case:
             return dict(self.config)
         from dew.interop.sources import SourceReference
 
-        return {**checkpoint_fields(SourceReference.parse(self.hf_config)), **self.config}
+        # A checkpoint's config.json names the directory holding it.
+        named = Path(self.hf_config)
+        source = SourceReference.parse(str(named.parent) if named.is_file() else self.hf_config)
+        return {**checkpoint_fields(source), **self.config}
 
     def resolved(self) -> "Case":
         """The case with its checkpoint's fields in `config` (`trunk_fields`), naming no checkpoint: what a
