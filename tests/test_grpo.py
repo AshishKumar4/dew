@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
 from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
@@ -135,7 +136,7 @@ def test_the_loss_reads_the_rolled_out_batch():
     stored old ones, surrogate and KL masked alike."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
                               PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     frozen = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), params)
     batch = rollout_batch()
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
@@ -163,7 +164,7 @@ def test_evaluation_scores_prompt_perplexity(policy):
     once for the objective's modules; a policy that gives its logits only
     from its tokens is scored as the training loss scores it."""
     objective = GRPOObjective(policy(vocab_size=VOCAB), 4, beta=0.0)
-    params = objective.init(jax.random.key(0))
+    params = nn.unbox(objective.init(jax.random.key(0)))
     prompts = np.array([[0, 0, 1, 2, 3], [4, 5, 6, 7, 1]], np.int32)
     batch = {PROMPT_KEY: jnp.asarray(prompts),
              LENGTH_KEY: jnp.asarray([5, 3], np.int32)}
@@ -190,7 +191,7 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     advantages by name and nothing else (`steady_state`). The prompts reach
     the device as each batch arrives, so only reads are held."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), step=0, updates=0)
+    state = SimpleNamespace(variables=nn.unbox(objective.init(jax.random.key(0))), step=0, updates=0)
     rollout = RolloutScheduler.sampled(objective, lambda *args: float(len(args[0]) % 3), groups=2,
                                        max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")

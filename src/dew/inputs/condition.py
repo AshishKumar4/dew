@@ -83,6 +83,13 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     architectures' `textcontext`, and a `DenoisingCondition` to the
     published families' `conditioning`."""
 
+    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        """The axes each parameter of `params` is drawn in, by its path in `params`, read off its towers'
+        draws (`dew.nn.sharding.drawn_axes`): the table that places a run holding this encoder frozen
+        (`dew.objectives.diffusion.DiffusionObjective.parameter_axes`) and a pipeline loaded on a mesh. An
+        encoder whose towers name no axes holds none."""
+        return {}
+
     @classmethod
     @abstractmethod
     def from_pretrained(cls, checkpoint: str, *, params: Variables | None = None) -> Self:

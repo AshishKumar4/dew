@@ -21,7 +21,7 @@ from .kernels.generation import linear_tangent
 from .norms import GroupNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
-from .sharding import constrain, explicit_spec, rows_taken, whole_spec
+from .sharding import LogicalAxes, constrain, explicit_spec, rows_taken, whole_spec
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -97,14 +97,14 @@ def _whole(x: jax.Array) -> jax.Array:
 
 def modulation(conditioning, features: int, pieces: int, *, name: str, silu: bool = True,
                bias: bool = True, zero_init: bool = False, dtype: Dtype | None = None,
-               precision: PrecisionLike = None) -> jax.Array:
+               precision: PrecisionLike = None, kernel_axes: LogicalAxes | None = None) -> jax.Array:
     """The adaLN projection of `conditioning`, `[..., pieces * features]`: SiLU, then one linear map,
-    named `name` in the calling module so each family keeps its checkpoint's path. `silu` False
-    projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
-    adaLN-Zero's identity block at the start of training."""
+    named `name` in the calling module so each family keeps its checkpoint's path, its kernel's logical
+    axes `kernel_axes` (none by default). `silu` False projects the conditioning as it is (FlaxDiff
+    0.2's DiT); `zero_init` starts it at zero, adaLN-Zero's identity block at the start of training."""
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
                  kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal(),
-                 dot_general=float32_dot_general)(
+                 dot_general=float32_dot_general, kernel_axes=kernel_axes)(
         activations.silu(conditioning) if silu else conditioning)
 
 
@@ -135,8 +135,10 @@ class Modulation(nn.Module):
 
     @nn.compact
     def __call__(self, conditioning):
+        # Its output, the pieces of the width, splits as an MLP's hidden width does.
         projected = modulation(conditioning, self.features, self.pieces, name="linear", bias=self.bias,
-                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision)
+                               zero_init=self.zero_init, dtype=self.dtype, precision=self.precision,
+                               kernel_axes=("embed", "mlp"))
         return jnp.split(projected, self.pieces, axis=-1)
 
 

@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import flat_tree
 from reference_error import assert_as_exact
 from test_cross_attention import (
@@ -81,8 +82,8 @@ def tied(variables):
     (`SHARED_LEAVES`), its feed-forward's gate zero, which leaves the feed-forward's maps out, and
     every other leaf the shared model's own."""
     own = flat_tree(variables["params"])
-    shapes = flat_tree(jax.eval_shape(TIED_MODEL.init, jax.random.key(0),
-                                      jnp.zeros((1, 1), jnp.int32))["params"])
+    shapes = flat_tree(nn.unbox(jax.eval_shape(TIED_MODEL.init, jax.random.key(0),
+                                      jnp.zeros((1, 1), jnp.int32)))["params"])
 
     def leaf(path, shape):
         if path in own:
@@ -176,9 +177,9 @@ def test_a_layer_with_no_attention_of_its_own_is_refused():
         kinds={"ssm": LayerKind(mixer=Mamba2Mixer(num_heads=2, head_dim=4, state_size=3, n_groups=1,
                                                    norm_groups=1, chunk_size=1)),
                "attention": LayerKind()})
-    hybrid.clone(cross_attention=SharedCrossAttention((1,), 4)).init(jax.random.key(0), ids)
+    nn.unbox(hybrid.clone(cross_attention=SharedCrossAttention((1,), 4)).init(jax.random.key(0), ids))
     with pytest.raises(ValueError):
-        hybrid.clone(cross_attention=SharedCrossAttention((0,), 4)).init(jax.random.key(0), ids)
+        nn.unbox(hybrid.clone(cross_attention=SharedCrossAttention((0,), 4)).init(jax.random.key(0), ids))
     for fields in ({"layer_ids": ()}, {"layer_ids": (1, 1)}, {"context_length": 0}):
         with pytest.raises(ValueError):
             SharedCrossAttention(**{"layer_ids": (0,), "context_length": 4, **fields})
@@ -467,7 +468,7 @@ def context_draw(layer):
     """Check 1's draw for `layer`'s read: its variables, its sinks drawn away from zero where it has
     them, an input, a context, each row's real context tokens (a row of none among them) and a
     cotangent."""
-    init = jax.jit(layer.init)
+    init = jax.jit(lambda *args: nn.unbox(layer.init(*args)))
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -501,7 +502,7 @@ def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kin
                               mixer=LATENT_KINDS[kind], cross_attention=SharedCrossAttention((0, 1), 6))
     ids = jnp.ones((B, SEQ), jnp.int32)
     conditioning = {CONTEXT: jnp.ones((B, 6, CONTEXT_WIDTH)), CONTEXT_LENGTHS: jnp.full((B,), 6, jnp.int32)}
-    variables = model.init(jax.random.key(0), ids, conditioning=conditioning)
+    variables = nn.unbox(model.init(jax.random.key(0), ids, conditioning=conditioning))
     gradients = jax.grad(lambda params: jnp.sum(model.apply(
         {**variables, "params": params}, ids, conditioning=conditioning)))(variables["params"])
     gates = [np.asarray(leaf) for path, leaf in flat_tree(gradients).items() if "alpha_" in path]

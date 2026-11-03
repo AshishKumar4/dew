@@ -17,7 +17,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import MeshSpec
 
 

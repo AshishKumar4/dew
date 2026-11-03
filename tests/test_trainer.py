@@ -41,6 +41,7 @@ from affine_run import (
     raw_leaf,
     val_batches,
 )
+from flax import linen as nn
 from flax.core import FrozenDict, freeze as frozen_dict
 from recording import RecordingTracker, preempting
 from reference_error import as_given, assert_as_exact
@@ -2258,14 +2259,16 @@ def test_a_fresh_state_is_built_in_the_buffers_its_held_checkpoint_arrives_in(mo
     state, shardings, _ = trainer.place()
     params = dict(jax.tree_util.tree_leaves_with_path(shardings.variables))
     sharded = 0
-    for path, leaf in jax.tree_util.tree_leaves_with_path(weights):
+    # The held tree enters plain (`dew.batch.unboxed`), the arrays the init drew in their boxes.
+    plain = nn.unbox(weights)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(plain):
         copy = held[path]
         assert copy.is_deleted(), jax.tree_util.keystr(path)
         assert copy.sharding == params[path], jax.tree_util.keystr(path)
         sharded += not copy.sharding.is_fully_replicated
         assert not leaf.is_deleted()
     assert sharded
-    jax.tree.map(np.testing.assert_array_equal, state.variables, weights)
+    jax.tree.map(np.testing.assert_array_equal, state.variables, plain)
 
 
 

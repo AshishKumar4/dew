@@ -52,7 +52,7 @@ from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .linear import DepthwiseConv1d, held_conv1d
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
-from .sharding import logical_axes
+from .sharding import declared
 
 __all__ = ["Engram", "PLELayer", "compressed_token_map"]
 
@@ -319,13 +319,6 @@ class EngramHashes(nn.Module):
         return spec.hash_ids(ids, blocked, table[spec.pad_token_id])
 
 
-@logical_axes({
-    # The table's rows, 384M a layer at release size, shard as a
-    # vocabulary's do; the key weights are model-width rows per stream.
-    ("engram", "embed"): ("vocab", None),
-    ("engram",): (None, "embed"),
-    ("wkv",): (None, "embed"),
-})
 class EngramLayer(nn.Module):
     """One layer's lookup gated into the residual streams (model.py:328-365).
 
@@ -349,16 +342,20 @@ class EngramLayer(nn.Module):
         token_mask = None if media is None else ~media
         # The rows are gathered from the table in its storage dtype and cast
         # after, so the table itself is never cast whole.
-        table = nn.Embed(self.rows, self.head_dim, embedding_init=nn.initializers.normal(1.0), name='embed')
+        table = nn.Embed(self.rows, self.head_dim, name='embed',
+                         embedding_init=declared(nn.initializers.normal(1.0), ('vocab', None)))
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
-                   precision=self.precision, name='wkv', dot_general=float32_dot_general)(looked)
+                   precision=self.precision, name='wkv', kernel_axes=(None, 'embed'),
+                   dot_general=float32_dot_general)(looked)
         q_weight = self.param(
-            "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+            "q_weight", declared(nn.initializers.ones, (None, "embed")), (self.hc_mult, self.emb_features),
+            jnp.float32
         )
         k_weight = self.param(
-            "k_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
+            "k_weight", declared(nn.initializers.ones, (None, "embed")), (self.hc_mult, self.emb_features),
+            jnp.float32
         )
         wide = at_least_fp32(kv.dtype)
         key = kv[..., :self.hc_mult * self.emb_features].astype(wide).reshape(

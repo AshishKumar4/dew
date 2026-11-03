@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 from architecture_cases import CASES as ARCHITECTURE_CASES
+from flax import linen as nn
 from tiny_configs import COMPOSITES, FRAMES, LM, PER_ARCH, RES, TINY
 
 from dew.diffusion.process import DenoisingCondition
@@ -140,7 +141,7 @@ def forward(architecture, dtype, rng):
     model = build_model(architecture, dtype)
     inputs = tiny_inputs(architecture, rng)
     args, kwargs = inputs if isinstance(inputs[0], tuple) else (inputs, {})
-    variables = model.init(rng, *args, **kwargs)
+    variables = nn.unbox(model.init(rng, *args, **kwargs))
     if dtype == "float64":
         variables, args, kwargs = jax.tree.map(
             lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,

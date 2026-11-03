@@ -29,6 +29,7 @@ from reference_error import (
     seeds_for,
     widened,
 )
+from residual_orders import model_axes
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
@@ -138,11 +139,12 @@ def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
     with jax.enable_x64(new_val=True):
         wide = loaded.model.clone(dtype=jnp.float64)
         roundings = chain_roundings(jax.make_jaxpr(wide.apply)(widened(loaded.variables), ids))
+    axes = model_axes(loaded.model)
     for index in range(3):
         drawn = recorder.symmetry(config, 1, index)
-        ordered = symmetric(loaded.variables, config, drawn)
+        ordered = symmetric(loaded.variables, config, drawn, axes)
         jax.tree.map(np.testing.assert_array_equal,
-                     symmetric(ordered, config, drawn, inverse=True), loaded.variables)
+                     symmetric(ordered, config, drawn, axes, inverse=True), loaded.variables)
         found, _ = float64_forward(loaded.model, ordered, ids)
         assert_computes_the_oracle(np.asarray(found), np.asarray(exact), f'order {index} in float64',
                                    roundings=roundings)
@@ -867,11 +869,11 @@ SYMMETRIC = {'attention': {'q_proj': ('query', 1), 'k_proj': ('key', 1), 'v_proj
                      'suv_up': ('mlp', 0), 'down_proj': ('mlp', 0)}}
 
 
-def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse: bool = False):
+def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], axes, *, inverse: bool = False):
     """`variables` under the symmetries `drawn` (tools/dory_vllm_reference.py's `symmetry`), or taken
     back from them where `inverse`: each attention's and feed-forward's parameters along the axes it
-    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py), each leaf
-    where it is, a device array on its device."""
+    reorders (`SYMMETRIC`), then the residual stream's units (tests/residual_orders.py) by the model's
+    `axes` (`model_axes`), each leaf where it is, a device array on its device."""
     from residual_orders import permuted
 
     found = load_tool('dory_vllm_reference').maps(config, drawn)
@@ -897,7 +899,7 @@ def symmetric(variables, config: dict, drawn: dict[str, np.ndarray], *, inverse:
 
     params = jax.tree_util.tree_map_with_path(reorder, variables['params'])
     residual = np.argsort(drawn['residual']) if inverse else drawn['residual']
-    return permuted({**variables, 'params': params}, residual)
+    return permuted({**variables, 'params': params}, residual, axes)
 
 
 def decoding(model: CausalTransformer):
@@ -953,9 +955,12 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
             forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
             for prompt, tokens, prompt_rows in parts.values()])}
 
+    axes = model_axes(model)
+
     def dew(index, order):
         # Each order's weights placed alone, and gone from the device when the call returns.
-        return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
+        placed = jax.device_put(symmetric(weights, config, order, axes))
+        return jax.tree.map(np.asarray, rows(programs, placed))
 
     # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
     # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
@@ -1002,13 +1007,13 @@ def test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distance
             return torch.as_tensor(logits).log_softmax(-1).numpy()
 
         truth = transcribed(tensors, torch.float64)
-        host = jax.device_get(loaded.variables)
+        host, axes = jax.device_get(loaded.variables), model_axes(loaded.model)
 
         def order(seed):
             return recorder.symmetry(config, *divmod(seed, recorder.ORDERS))
 
-        def distances(seed, transcribed=transcribed, truth=truth, host=host):
-            tensors = loaded.export(symmetric(host, config, order(seed)))
+        def distances(seed, transcribed=transcribed, truth=truth, host=host, axes=axes):
+            tensors = loaded.export(symmetric(host, config, order(seed), axes))
             found = transcribed({key: np.array(value, copy=True) for key, value in tensors.items()},
                                 torch.float32)
             return np.sqrt(np.mean(np.square(found - truth), axis=1))

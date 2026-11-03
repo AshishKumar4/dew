@@ -16,6 +16,7 @@ import ml_dtypes
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import assert_as_exact, with_gradients
@@ -479,7 +480,7 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation
     weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
     choices = (np.tile([0, 1], (24, 1)) if skewed
                else np.argsort(rng.normal(size=(24, 8)), axis=-1)[:, :2]).astype(np.int32)
-    parameters = model.init(jax.random.key(19), x, weights, choices)
+    parameters = nn.unbox(model.init(jax.random.key(19), x, weights, choices))
     columns = NamedSharding(mesh, P('expert', None, 'fsdp'))
     specs = {'params': {'gate_proj': {'kernel': columns}, 'up_proj': {'kernel': columns},
                         'down_proj': {'kernel': NamedSharding(mesh, P('expert', 'fsdp'))}}}
@@ -501,7 +502,7 @@ def test_a_bf16_combine_weighs_its_experts_in_fp32_and_rounds_once():
     indices = jnp.asarray([[0, 1]], jnp.int32)
     params = {"up_proj": {"kernel": jnp.ones((2, 1, 1), jnp.float32)},
               "down_proj": {"kernel": jnp.asarray([[[1.0]], [[-1.0]]], jnp.float32)}}
-    initialized = layer.init(jax.random.key(0), x, weights, indices)["params"]
+    initialized = nn.unbox(layer.init(jax.random.key(0), x, weights, indices))["params"]
     assert jax.tree.map(jnp.shape, initialized) == jax.tree.map(jnp.shape, params)
     expected = np.asarray(np.dot([1.0, -1.0], np.asarray(weights[0], np.float64)), ml_dtypes.bfloat16)
     for apply in (layer.apply, jax.jit(layer.apply)):

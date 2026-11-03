@@ -55,7 +55,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesBySite, RoutesExperts, declared_groups
-from ..sharding import RESIDUAL, constrain, logical_axes
+from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -111,16 +111,17 @@ def gate_flops(specs: Mapping[str, NormSpec] | None, sites, width: int, lengths,
 
 def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
-                 dtype: Dtype | None,
+                 dtype: Dtype | None, precision: PrecisionLike = None,
                  specs: Mapping[str, NormSpec] | None = None,
                  routed: bool | None = None) -> Callable[..., nn.Module]:
     """The decoder's norm factory, building each norm by its `name` as
     `specs` changes it there, a gated one (`NormSpec.gate_rank`) gated where
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
-    it runs. 'layer' keeps torch's exact variance, the reference decoders'
-    formula; 'fast_layer' is flax's E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`),
-    whose mean and square reduce in one pass, which the vision towers run."""
+    it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
+    exact variance, the reference decoders' formula; 'fast_layer' is flax's
+    E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
+    in one pass, which the vision towers run."""
 
     def build(*, name: str) -> nn.Module:
         spec = (specs or {}).get(name, NormSpec())
@@ -131,7 +132,7 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                 RMSNorm, epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
                 scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups, dtype=dtype)
             if gated and spec.gate_rank is not None:
-                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, name=name)
+                return GatedRMSNorm(spec.gate_rank, norm, dtype=dtype, precision=precision, name=name)
             return norm(name=name)
         offset = scale_offset if spec.offset is None else spec.offset
         if spec.gate_rank is not None:
@@ -584,13 +585,6 @@ def remat_record(remat: RematPolicy | None) -> JSON:
             else {'save': list(remat.save), 'offload': list(remat.offload)})
 
 
-@logical_axes({
-    ("per_layer_input_gate",): ("embed", "mlp"),
-    ("per_layer_projection",): ("mlp", "embed"),
-    # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
-    ("attn_alpha",): ("embed",),
-    ("mlp_alpha",): ("embed",),
-})
 class _Plain(NamedTuple):
     """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
     predictions of every copy when the block runs AltUp."""
@@ -800,7 +794,7 @@ class DecoderBlock(nn.Module):
         norm = decoder_norm(
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-            dtype=self.dtype, specs=self.norms, routed=self.routed)
+            dtype=self.dtype, precision=self.precision, specs=self.norms, routed=self.routed)
         if self.wiring.parallel_residual and (
                 not self.wiring.pre_norms or self.wiring.output_norms
                 or self.feedforward is None or self.hyper_connections is not None
@@ -845,9 +839,9 @@ class DecoderBlock(nn.Module):
                 Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                 dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
-                                              name='per_layer_input_gate')
+                                              name='per_layer_input_gate', kernel_axes=('embed', 'mlp'))
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
-                                              name='per_layer_projection')
+                                              name='per_layer_projection', kernel_axes=('mlp', 'embed'))
             self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')  # in `_built_norms`
         if self.altup is not None:
             if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
@@ -1157,7 +1151,8 @@ class DecoderBlock(nn.Module):
             raise ValueError("an nGPT block steps its one residual along the sphere: it takes no "
                              "hyper-connections, depth mixture, altup, laurel, per-layer inputs or "
                              "parallel branch")
-        start = nn.initializers.constant(ngpt.start)
+        # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
+        start = declared(nn.initializers.constant(ngpt.start), ("embed",))
         self.attn_alpha = self.param('attn_alpha', start, (self.emb_features,), jnp.float32)
         if self.feedforward is not None:
             self.mlp_alpha = self.param('mlp_alpha', start, (self.emb_features,), jnp.float32)
@@ -1317,13 +1312,6 @@ class DecoderBlock(nn.Module):
         return self.post_per_layer_input_norm(projected)
 
 
-@logical_axes({
-    # The input is two embed-width vectors concatenated, which no single name
-    # describes and the rules must not split twice; the output side shards.
-    ("eh_proj",): (None, "embed"),
-    ("e_proj",): (None, "embed"),
-    ("h_proj",): (None, "embed"),
-})
 class MTPBlock(nn.Module):
     """Computes one multi-token-prediction depth: the hidden states of the next depth.
 
@@ -1389,7 +1377,7 @@ class MTPBlock(nn.Module):
         self.hnorm = norm(name='hnorm')
         maps = self.projections()
         def dense(name):
-            return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
+            return Dense(maps[name][1], use_bias=False, dtype=self.dtype, kernel_axes=(None, "embed"),
                          precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')

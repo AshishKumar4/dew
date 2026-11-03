@@ -68,15 +68,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import core, linen as nn
+from flax.core import meta
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.batch import Coordinates
+from dew.batch import Coordinates, unboxed
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
+from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -346,8 +348,9 @@ class LinearProducts(nn.Module):
     def applied_kernel(self, name: str) -> jax.Array:
         """The kernel the submodule `name` multiplies its input by on this call: its own. A method
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
-        frozen FP8 site's is its codes decoded."""
-        return getattr(self, name).get_variable("params", "kernel")
+        frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
+        (`nn.with_logical_partitioning`)."""
+        return meta.unbox(getattr(self, name).get_variable("params", "kernel"))
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
         """Whether this call computes the submodule `name`, or a module under it, other than as a linear
@@ -626,7 +629,7 @@ def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
-        product = product + module.get_variable("params", "bias").astype(jnp.float32)
+        product = product + meta.unbox(module.get_variable("params", "bias")).astype(jnp.float32)
     dtype = module.dtype or jnp.result_type(inputs.dtype, module.param_dtype)
     return product.astype(dtype).reshape(*inputs.shape[:-1], product.shape[-1])
 
@@ -883,6 +886,7 @@ class InputQuantization:
     def packed(self, frozen: Variables) -> Variables:
         """The `QUANTIZATION` leaves of `frozen_fp8`, packed from the kernels
         the `frozen` tree holds at their scopes (`frozen_fp8_leaves`)."""
+        frozen = unboxed(frozen)
         return unflatten_dict({(*site.split("/"), leaf): value for site in self.frozen_fp8
                                for leaf, value in frozen_fp8_leaves(_site_kernel(frozen, site)).items()})
 
@@ -1009,6 +1013,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     """
     from dew import _coordination, cache
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
+
+    variables = unboxed(variables)
 
     def planned() -> dict:
         return {"tokens": tokens,
@@ -1714,10 +1720,10 @@ def _rules(spec: Quantization, training: bool) -> list:
             for pattern in spec.patterns]
 
 
-def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables:
+def _serving_parameters(parameters: Variables, shaped: Variables) -> Variables:
     """Quantize one kernel at a time, retaining its host or device placement."""
     qwix = _qwix()
-    shapes = flatten_dict(abstract)
+    shapes = flatten_dict(shaped)
     quantized = {}
     for path, parameter in flatten_dict(parameters).items():
         host = isinstance(parameter, np.ndarray)
@@ -1756,6 +1762,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     place the weights with a mesh and layout before quantizing. Resident
     JAX parameters keep their placement through Qwix's operations.
     """
+    # A draw boxes the parameters its modules declare the axes of; Qwix quantizes their values.
+    variables = unboxed(variables)
     rules = _rules(spec, training=False)
     served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):
@@ -1767,8 +1775,8 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
                 scope.put_variable(collection, name, value)
         return served.clone(parent=scope)(*args, **kwargs)
 
-    _, abstract = jax.eval_shape(core.init(initialized), jax.random.key(0), variables)
-    parameters = _serving_parameters(variables["params"], abstract["params"])
+    _, abstracted = unboxed(abstract(core.init(initialized), jax.random.key(0), variables))
+    parameters = _serving_parameters(variables["params"], abstracted["params"])
     return served, {**variables, "params": parameters}
 
 

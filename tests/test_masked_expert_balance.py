@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
 from dew.batch import coordinates
@@ -35,7 +36,7 @@ def routed(max_seq_len=SEQ):
 
 
 def initial(length=SEQ):
-    return routed().init(jax.random.key(0), jnp.zeros((1, length), jnp.int32))
+    return nn.unbox(routed().init(jax.random.key(0), jnp.zeros((1, length), jnp.int32)))
 
 
 def objective(variables, length=SEQ):

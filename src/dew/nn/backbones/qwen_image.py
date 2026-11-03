@@ -44,10 +44,10 @@ from dew.nn.flops import (
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import LogicalAxes
 
 from ..mlp import GatedMLP
-from .joint import TIME_FEATURES, JointAttention, embedding, embedding_axes, embedding_flops, layer_norm
+from .joint import TIME_FEATURES, JointAttention, embedding, embedding_flops, layer_norm
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -80,9 +80,9 @@ def _rotary_positions(lengths: jax.Array, text: int, rows: int, columns: int) ->
     return jnp.concatenate([frame[..., None], jnp.broadcast_to(grid, (batch, *grid.shape))], axis=-1)
 
 
-def _dense(features: int, name: str, dtype, precision) -> Dense:
+def _dense(features: int, name: str, dtype, precision, axes: LogicalAxes) -> Dense:
     return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name,
-                 dot_general=float32_dot_general)
+                 dot_general=float32_dot_general, kernel_axes=axes)
 
 
 def _per_rows(x, values, image: int, apply):
@@ -173,10 +173,6 @@ class _Block(nn.Module):
         return x
 
 
-@logical_axes({("img_in",): (None, "embed"), ("proj_out",): ("embed", None),
-               ("modulation",): (None, "embed"), ("norm_out_linear",): (None, "embed"),
-               ("txt_in", "in_layer"): (None, "embed"), ("txt_in", "out_layer"): (None, "embed"),
-               **embedding_axes("timestep_embedder")})
 class QwenImageTransformer(nn.Module):
     """Runs `QwenImage21Transformer2DModel` behind Dew's model interface.
 
@@ -281,7 +277,7 @@ class QwenImageTransformer(nn.Module):
                  else jnp.broadcast_to(jnp.asarray(conditioning.mask, bool), (batch, text)))
         lengths = jnp.sum(valid, axis=1, dtype=jnp.int32)
         maps = self.projections(x.shape[-1])
-        image = _dense(maps['img_in'][1], "img_in", self.dtype, self.precision)(
+        image = _dense(maps['img_in'][1], "img_in", self.dtype, self.precision, (None, "embed"))(
             x.reshape(batch, image_tokens, x.shape[-1]))
         context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.precision,
                           name="txt_in")(conditioning.context)
@@ -293,7 +289,7 @@ class QwenImageTransformer(nn.Module):
         times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
         timed = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
         projected = modulation(timed, self.features, 4, name="modulation", bias=False, dtype=self.dtype,
-                               precision=self.precision)
+                               precision=self.precision, kernel_axes=(None, "embed"))
         embedded = timed[:batch]
         sampled = jnp.split(projected[:batch], 4, axis=-1)
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
@@ -309,9 +305,9 @@ class QwenImageTransformer(nn.Module):
         # are rows the source computes and its pipeline drops.
         image = joint[:, :image_tokens]
         scale = modulation(embedded, self.features, 1, name="norm_out_linear", bias=False, dtype=self.dtype,
-                           precision=self.precision)
+                           precision=self.precision, kernel_axes=(None, "embed"))
         image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
-        output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision)(image)
+        output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision, ("embed", None))(image)
         return output.reshape(batch, rows, columns, self.out_channels)
 
 
@@ -332,7 +328,8 @@ class _TextIn(nn.Module):
     def __call__(self, x):
         x = RMSNorm(epsilon=self.eps, scale_offset=True, dtype=self.dtype, name="text_norm")(x)
         mlp = GatedMLP(self.features, self.features, in_features=x.shape[-1], activation=gelu_tanh,
-                        names=("in_layer", "out_layer"), dtype=self.dtype, precision=self.precision)
+                        names=("in_layer", "out_layer"), dtype=self.dtype, precision=self.precision,
+                        named_axes=(("in_layer", (None, "embed")), ("out_layer", (None, "embed"))))
         nn.share_scope(self, mlp)
         return mlp(x)
 

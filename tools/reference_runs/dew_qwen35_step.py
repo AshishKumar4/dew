@@ -61,6 +61,10 @@ class BackboneLoss(Objective):
         rows, sequence = np.shape(batch["tokens"])
         return np.full((rows,), sequence, np.int64)
 
+    def fresh_variables(self, key, held):
+        """The backbone drawn over a row of its tokens: the boxes a run's table reads its axes from."""
+        return self.model.init(key, jnp.zeros((1, self.inputs.sample.shape[0]), jnp.int32))
+
     def loss(self, variables, batch, step):
         hidden = self.model.apply(variables, batch["tokens"], train=step.training,
                                   method="hidden_states")

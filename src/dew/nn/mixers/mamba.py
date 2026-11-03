@@ -49,7 +49,7 @@ from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import logical_axes, rows_like, sequence_shards
+from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
@@ -98,10 +98,6 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     return out.astype(dtype), final.astype(dtype)
 
 
-@logical_axes({
-    ("in_proj",): ("embed", "linear"),
-    ("out_proj",): ("attention", "embed"),
-})
 class Mamba(nn.Module):
     """The token mixer of a Mamba layer, `MambaMixer` (modeling_mamba.py:285-482).
 
@@ -167,7 +163,7 @@ class Mamba(nn.Module):
         dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
-                             **normal_kernel(self.init_std))
+                             kernel_axes=('embed', 'linear'), **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,
                                       use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         self.x_proj = dense(self.time_step_rank + 2 * self.state_size, use_bias=False, name='x_proj',
@@ -183,8 +179,10 @@ class Mamba(nn.Module):
         # A_log = log(1..N) on every channel, D ones.
         self.A_log = self.param('A_log', _log_state_index, (self.intermediate_size, self.state_size))
         self.D = self.param('D', nn.initializers.ones, (self.intermediate_size,), jnp.float32)
-        self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj', **normal_kernel(
-            self.init_std if self.output_init_std is None else self.output_init_std))
+        self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj',
+                              kernel_axes=('attention', 'embed'),
+                              **normal_kernel(self.init_std if self.output_init_std is None
+                                              else self.output_init_std))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import (
     assert_exported_decoder_follows_transformers,
     fixture_ids,
@@ -96,7 +97,7 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
                                   pre_norms=False, final_norm=False, dtype=jnp.float64,
                                   attention_impl="reference")
         ids = jnp.arange(6, dtype=jnp.int32).reshape(1, 6) % 16
-        variables = model.init(jax.random.key(0), ids)
+        variables = nn.unbox(model.init(jax.random.key(0), ids))
         # Integer-valued weights and final states: both products are exact in float64, whatever their
         # order.
         whole = jax.tree.map(lambda leaf: jnp.round(leaf * 4), variables)
@@ -109,7 +110,7 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
                              attention_impl="reference")
     normed = base.clone(**looped)
     plain = base.clone(**{**looped, "loop": Loop(2, layers=(0, 2), step_norm=False)})
-    params = normed.init(jax.random.key(1), ids)
+    params = nn.unbox(normed.init(jax.random.key(1), ids))
     assert not np.array_equal(np.asarray(normed.apply(params, ids)), np.asarray(plain.apply(params, ids)))
 
 
@@ -153,7 +154,7 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
     def draw(seed):
         rng = np.random.default_rng([2409, seed])
         ids = rng.integers(0, 61, (2, 6)).astype(np.int32)
-        params = projected.init(jax.random.key(seed), ids)["params"]
+        params = nn.unbox(projected.init(jax.random.key(seed), ids))["params"]
         # The gates drawn away from zero, so the context reaches the states.
         params = jax.tree_util.tree_map_with_path(
             lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)

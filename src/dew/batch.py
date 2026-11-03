@@ -17,8 +17,8 @@ from typing import Any, ClassVar
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import struct
-from flax.core import FrozenDict
+from flax import struct, traverse_util
+from flax.core import FrozenDict, meta
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -630,19 +630,20 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     attached over another keeps both training. Raises `ValueError` when the
     split keeps every leaf or none, since then there is nothing to split.
     """
+    # A leaf is what a dict holds, a parameter's box as its array (as `select` walks it), so a draw
+    # splits in the boxes its modules made it in.
     training = (frozenset() if FROZEN not in variables else frozenset(
-        ("params", *(entry.key for entry in path))
-        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+        ("params", *path) for path in traverse_util.flatten_dict(variables["params"])))
     variables = thaw(variables)
 
     def trains(path: Path) -> bool:
         return path in training or trainable(path)
 
-    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
-    if kept in (0, len(leaves)):
+    paths = [("params", *path) for path in traverse_util.flatten_dict(variables["params"])]
+    kept = sum(map(trains, paths))
+    if kept in (0, len(paths)):
         raise ValueError(
-            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
+            f"trainable keeps {kept} of {len(paths)} parameter leaves, which "
             f"{'freezes' if kept else 'trains'} nothing")
     moving = select(variables, lambda path: path[0] == "params" and trains(path))
     frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
@@ -660,6 +661,22 @@ def thaw(variables: Variables) -> Variables:
         return variables
     rest = {name: value for name, value in variables.items() if name not in (FROZEN, PACKED_FROZEN)}
     return {**rest, "params": merge(variables.get(FROZEN, {}), variables.get("params", {}))}
+
+
+def unboxed[Tree](tree: Tree) -> Tree:
+    """`tree` with each box of axis metadata (`nn.with_logical_partitioning`'s) replaced by the value it
+    holds, as stored: how a tree enters Dew. No constraint its names would apply is applied, which
+    `LogicallyPartitioned.unbox` (and `nn.unbox`) applies under an active mesh and bound Flax rules: Dew
+    places the arrays from its run's own table (`Objective.parameter_axes`), in one place. A tree that
+    holds no box is the caller's own, as `dicts` keeps it, so a placement writing each placed leaf into
+    the dict that held it writes into the caller's."""
+    def boxed(leaf) -> bool:
+        return isinstance(leaf, meta.Partitioned)
+
+    if not any(boxed(leaf) for leaf in jax.tree.leaves(tree, is_leaf=boxed)):
+        return tree
+    return jax.tree.map(lambda leaf: leaf.unbox(apply_constraint=False) if boxed(leaf) else leaf, tree,
+                        is_leaf=boxed)
 
 
 def dicts[Tree](tree: Tree) -> Tree:
@@ -722,7 +739,7 @@ def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
     (a quantized kernel with its scales, Qwix's struct dataclasses a served model's params hold)."""
     return {tuple(entry.key for entry in path): leaf
             for path, leaf in jax.tree_util.tree_leaves_with_path(
-                tree, is_leaf=lambda node: node is not None and not isinstance(node, Mapping))}
+                unboxed(tree), is_leaf=lambda node: node is not None and not isinstance(node, Mapping))}
 
 
 def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:

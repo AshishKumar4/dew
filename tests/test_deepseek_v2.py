@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
@@ -72,7 +73,7 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
     tokens = jax.random.randint(jax.random.PRNGKey(1), (2, 9), 0, 32)
     plain = LMObjective(model, 8)
     balanced = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.05, seq_aux=False))
-    params = plain.init(jax.random.PRNGKey(0))
+    params = nn.unbox(plain.init(jax.random.PRNGKey(0)))
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
     base, _ = plain.scalar_loss(params, {TEXT_KEY: tokens}, step)
     loss, aux = balanced.scalar_loss(params, {TEXT_KEY: tokens}, step)

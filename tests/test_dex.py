@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, widened
@@ -147,6 +148,8 @@ def loads(trains: str = "all", dtype: str = "float32"):
 def moved_draw(variables, value_dim: int):
     """A draw of the extended decoder's variables with lambda and the projections moved off their start,
     beside a row of tokens and a cotangent on its logits."""
+    variables = nn.unbox(variables)
+
     def draw(seed):
         rng = np.random.default_rng([0xDEC, seed])
         flat = flatten_dict(variables["params"])
@@ -221,7 +224,7 @@ def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path, dtype
                     truth_fn=truth)
     gated = every_layer(output_gate=True)
     with pytest.raises(ValueError):
-        gated.dex_exported(gated.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+        gated.dex_exported(nn.unbox(gated.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))))
 
 
 def test_an_export_folds_the_operands_a_layer_multiplies_in():
@@ -329,7 +332,7 @@ def scanned_site():
     draw of their variables with each layer's lambda and projections moved off their start, and the
     plain decoder's float64 as truth."""
     plain = every_layer()
-    start = plain.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+    start = nn.unbox(plain.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
 
     def draw(seed):
         rng = np.random.default_rng([0xD5, seed])

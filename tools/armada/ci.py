@@ -982,12 +982,13 @@ REDRAW = 4
 """Check 1's REDRAW (tests/check1_statistics.py, which the plan cannot import: it has no JAX): a site its
 first stage leaves undecided draws REDRAW times its declared seeds further, so its map tasks together draw
 seeds 0 to (1 + REDRAW) times the declared count."""
-DRAWS, RECORDS, POOL = "DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL"
+DRAWS, RECORDS, POOL, LATER = "DEW_CHECK1_DRAWS", "DEW_CHECK1_RECORDS", "DEW_CHECK1_POOL", "DEW_CHECK1_LATER"
 """What runs a site's test as a map task, which takes the units DRAWS names (`start:stop`) and writes what
 they give into the directory RECORDS names, judging nothing, or as their judge, which pools the records
 under POOL and judges them as a test that took every unit itself would (tests/map_judge.py's
 `record_units` and `pooled_units`): a check-1 site its seeds' draws (tests/reference_error.py), and a test
-marked `shards` the units of its own work, given alike."""
+marked `shards` the units of its own work, given alike. A judge whose judgement needs units its later map
+tasks draw writes the file LATER names (`ask_later`), and its row asks for them (armada's `more`)."""
 INPUTS = "/armada/inputs"
 """Where a judge's task finds its map tasks' artifacts (armada's `{inputs}`), each task's under
 `<job>/<index>`, where armada names none (`armada_dir`)."""
@@ -1072,8 +1073,12 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
 
 def draws_of(mark: Mark) -> list[tuple[int, int]]:
     """The units each map task of a site marked `mark` takes, at most its per_task each: together 0 to its
-    units, every seed both of check 1's stages draw, or every unit of a `shards` test's work."""
-    return [(start, min(start + mark.per_task, mark.units)) for start in range(0, mark.units, mark.per_task)]
+    units, every seed both of check 1's stages draw, or every unit of a `shards` test's work; a check-1 site's
+    first stage (0 to its declared seeds, `timed`) and its second each in tasks of their own, the second's
+    `later` (`site_entries`)."""
+    stages = [(0, mark.timed), (mark.timed, mark.units)] if mark.units > mark.timed else [(0, mark.units)]
+    return [(start, min(start + mark.per_task, stop)) for first, stop in stages
+            for start in range(first, stop, mark.per_task)]
 
 
 def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
@@ -1128,8 +1133,11 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
                 weight = measured.get(task_name) or (whole * (stop - start) / mark.timed or target)
+                # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
+                # them (armada's `later`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
-                             "rows": [row(python, name, group)], "weight": weight})
+                             "rows": [row(python, name, group)], "weight": weight,
+                             **({"later": True} if start >= mark.timed else {})})
             entries += [*maps, {"name": site_task(python, name, test), "python": python, "tests": name,
                                 "split": test, "after": [each["name"] for each in maps],
                                 "weight": measured.get(row(python, name, test)) or target}]
@@ -1421,13 +1429,26 @@ def pytest_command(run: list[str], tests: list[str], split: str, release: str) -
 
 def site_environment(site: re.Match | None) -> dict[str, str]:
     """What a check-1 site's own task runs its test under (`site`, its group's match of `SITE`): a map task
-    draws its seeds into its artifacts, and its judge pools every map task's from its inputs; nothing for any
-    other group."""
+    draws its seeds into its artifacts, and its judge pools every map task's from its inputs, its ask for its
+    later map tasks (LATER) none before it runs; nothing for any other group."""
     if site is None:
         return {}
     if site["start"] is None:
-        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS))}
+        # A judge's ask for its later map tasks (`ask_later`) is its own run's alone.
+        later_file().unlink(missing_ok=True)
+        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file())}
     return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
+
+
+def asked(site: re.Match | None) -> dict[str, bool]:
+    """A row's ask for more, where its task is a check-1 site's judge that asked for its later map tasks
+    (`ask_later`): armada runs them and it judges again (its `more`); nothing else."""
+    return {"more": True} if site and site["start"] is None and later_file().is_file() else {}
+
+
+def later_file() -> Path:
+    """Where a judge writes that its judgement needs its later map tasks (LATER, `ask_later`)."""
+    return armada_dir("ARMADA_ARTIFACTS", ARTIFACTS) / "check1-later.json"
 
 
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
@@ -1574,7 +1595,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause})
+                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
@@ -1600,7 +1621,8 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     read (`depends`, None where that is not known): a map task's own, kept among its artifacts for its judge,
     which reads every one of its map tasks' among its inputs and keys on them with its own (`cache_key`), so
     the site's key covers what its draws ran, which the judge runs none of (an arm run as given, a branch of a
-    later seed); None where a map task's is not known or not found. Any other row's, as it is."""
+    later seed): its first stage's map tasks', and its later ones' where they ran; None where one of those is
+    not known or not found. Any other row's, as it is."""
     _, name, group = parsed_row(row_name)
     site = SITE.fullmatch(group)
     if site is None:
@@ -1616,8 +1638,13 @@ def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[s
     found = {path.name: json.loads(path.read_text())
              for path in armada_dir("ARMADA_INPUTS", INPUTS).rglob("*.inputs.json")}
     mark = sites(name).get(test)
-    drawn = [found.get(f"{site_task(python, name, test, span)}.inputs.json")
-             for span in (draws_of(mark) if mark else [])]
+    named = {span: f"{site_task(python, name, test, span)}.inputs.json"
+             for span in (draws_of(mark) if mark else [])}
+    # A judge's later map tasks ran only where its first stage asked for them (`site_entries`), all of them:
+    # one that judged without them judged over its first stage's alone.
+    later = [span for span in named if mark and span[0] >= mark.timed]
+    supplied = [span for span in named if span not in later or any(named[each] in found for each in later)]
+    drawn = [found.get(named[span]) for span in supplied]
     if depends is None or not drawn or any(each is None for each in drawn):
         return None
     return sorted({*depends, *(path for each in drawn for path in each)})

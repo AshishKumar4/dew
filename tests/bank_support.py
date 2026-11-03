@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 from dew.batch import merge
 from dew.inference.banks import LayerBanks, at_namespace, entry_tree, in_namespace, narrowed
@@ -27,11 +28,11 @@ def fixture(kind):
     projection = GemmaProjector(text_width=16,
                                patches_per_side=2, tokens_per_side=1)
     if kind == "root":
-        return text, text.init(jax.random.key(0), tokens), tokens, indices, media
+        return text, nn.unbox(text.init(jax.random.key(0), tokens)), tokens, indices, media
     if kind == "multimodal":
         model = MultimodalTransformer(text, vision, projection, family="gemma3",
                                       image_token_id=1, dtype=jnp.float32)
-        variables = model.init(jax.random.key(0), tokens, image_indices=indices, conditioning=media)
+        variables = nn.unbox(model.init(jax.random.key(0), tokens, image_indices=indices, conditioning=media))
         return model, variables, tokens, indices, media
     model = DiffusionGemma(text, canvas_length=2, conditioner=VisionConditioner(
         vision, projection, dtype=jnp.float32))
@@ -41,7 +42,7 @@ def fixture(kind):
         assert bound.conditioner is not None
         bound.conditioner(media)
 
-    variables = model.init(jax.random.key(0), method=initialize)
+    variables = nn.unbox(model.init(jax.random.key(0), method=initialize))
     return model, {name: tree for name, tree in variables.items() if name != "cache"}, tokens, indices, media
 
 

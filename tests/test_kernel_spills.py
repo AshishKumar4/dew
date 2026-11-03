@@ -28,7 +28,7 @@ from dew.nn.kernels.options import compiled_with, owned_program, program
 from dew.nn.kernels.templates import report
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
 ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
@@ -247,17 +247,17 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     import dataclasses
 
     from dew.nn.kernels.generation import assumed, gpu_target
-    from dew.training.ahead import AheadOfTime, handed
+    from dew.training.ahead import AheadOfTime, Executable, handed
 
     canonical = gpu_target("sm90")
-    step = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {}, canonical)
+    step = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {}, canonical)
     h200 = dataclasses.replace(canonical, device_kind="NVIDIA H200")
     with assumed(h200):
         with handed(step):
             assert gpu_target() == canonical
         assert gpu_target() == h200
     # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
-    earlier = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {})
+    earlier = AheadOfTime("sm90", 1, {}, "", Executable(b"", ()), None, 0, 0, 0, 0, 0, {})
     vars(earlier).pop("target")
     with assumed(h200), pytest.raises(ValueError), handed(earlier):
         pass
@@ -434,6 +434,29 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
         report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("statics", [False, True], ids=["dynamic", "static"])
+def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_devices(statics):
+    """A program called under two meshes of one shape over other devices runs on each mesh's own devices,
+    as jit does: its executable is keyed by the mesh in place, its dynamic and its static calls alike
+    (ledger 3452), where under the second mesh it ran the first's executable on the first's devices."""
+    from jax.sharding import AxisType, Mesh, PartitionSpec
+
+    def function(x, scale=1):
+        return jax.lax.with_sharding_constraint(x, PartitionSpec("x")) * scale + 1
+
+    devices = jax.devices()
+    meshes = [Mesh(np.asarray(devices[start:start + 2]), ("x",), axis_types=(AxisType.Auto,))
+              for start in (0, 2)]
+    compiled = program(function, **({"static_argnames": "scale"} if statics else {}))
+    given, scale = np.arange(8, dtype=np.float32), 2 if statics else 1
+    for mesh in meshes:
+        with jax.set_mesh(mesh):
+            ran = compiled(given, **({"scale": scale} if statics else {}))
+        assert ran.sharding.device_set == set(mesh.devices.flat)
+        np.testing.assert_array_equal(np.asarray(ran), given * scale + 1)
 
 
 @lowers("sm90")

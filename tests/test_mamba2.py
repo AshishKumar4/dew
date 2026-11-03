@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from model_support import decode_through
 from reference_error import (
     assert_as_exact,
@@ -150,7 +151,7 @@ def test_the_layer_matches_mamba2_mixer(seeded_reference):
     weights loaded under Dew's names (check 1 against the recorded mixer)."""
     variables = mamba2_layer_params(mamba2_layer_draw(0))
     width = LAYER_SHAPES["hidden"][-1]
-    template = jax.eval_shape(mamba2_layer().init, jax.random.key(0), jnp.zeros((1, 4, width)))
+    template = nn.unbox(jax.eval_shape(mamba2_layer().init, jax.random.key(0), jnp.zeros((1, 4, width))))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
     assert_recorded_as_exact(seeded_reference, "layer")
 
@@ -396,7 +397,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
         assert_rows_as_exact_over_orders,
         chain_roundings,
     )
-    from residual_orders import orders, permuted, residual_width
+    from residual_orders import model_axes, orders, permuted, residual_width
 
     from dew.nn.kernels import generation
     from dew.nn.kernels.ssd import ssd_kernel_runs
@@ -404,21 +405,22 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     assert ssd_kernel_runs(64, 64, 64, "tpu", dtype=jnp.float32)
     model, devices = ssd_lm(), jax.devices()
     ids = np.asarray(jax.random.randint(jax.random.key(0), (2 * len(devices), 129), 0, 64))
-    variables = jax.device_get(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1])))
-    units = residual_width(variables)
+    variables = jax.device_get(nn.unbox(model.init(jax.random.key(1), jnp.asarray(ids[:, :-1]))))
+    axes = model_axes(model, jnp.asarray(ids[:, :-1]))
+    units = residual_width(variables, axes)
 
     def ordered(result, order):
         """The step's gradients with the residual's units in `order`, and its logits, which no order
         moves."""
         gradients, logits = result
-        return permuted({"params": gradients}, order)["params"], logits
+        return permuted({"params": gradients}, order, axes)["params"], logits
 
     # The float64 oracle runs on the host: a TPU emulates float64.
     with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
         wide = stepped(model.clone(dtype=jnp.float64))
         exact = jax.device_get(wide(widened(variables["params"]), ids))
         last = orders(units, 2, seed=0)[-1]
-        found = jax.device_get(wide(permuted(widened(variables), last)["params"], ids))
+        found = jax.device_get(wide(permuted(widened(variables), last, axes)["params"], ids))
         roundings = chain_roundings(jax.make_jaxpr(wide)(widened(variables["params"]), ids))
         for (path, leaf), true in zip(jax.tree_util.tree_leaves_with_path(found),
                                       jax.tree.leaves(ordered(exact, last)), strict=True):
@@ -433,7 +435,7 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
     distances: dict = {}
     with jax.set_mesh(mesh):
         for order in orders(units, ORDERS, seed=1):
-            params = jax.device_put(permuted(variables, order)["params"], whole)
+            params = jax.device_put(permuted(variables, order, axes)["params"], whole)
             truth = jax.tree_util.tree_leaves_with_path(ordered(exact, order))
             found = {"dew": jax.device_get(kernel(params, placed))}
             with generation.assumed("cpu"):
@@ -450,3 +452,40 @@ def test_a_training_step_on_a_tpu_mesh_is_as_exact_with_the_ssd_kernel_as_with_t
                                     np.sqrt(np.mean(np.square(theirs), axis=1)), f"the step's {name}")
         assert_rows_as_exact_over_orders(mine, theirs, f"the step's {name} row by row",
                                          sizes=distances[name, "size"])
+
+
+@pytest.mark.parametrize("scale_wide", [False, True], ids=["weighted-narrow", "weighted-wide"])
+def test_a_gated_norm_broadcasts_its_gate_in_either_order(scale_wide):
+    """Falcon-H1's gated norm (`MambaRMSNormGated`, modeling_falcon_h1.py:256-282) over two groups computes
+    as the RMS norm's arithmetic orders it (`rms_statistics`, `rms_weighted`), where the module computes
+    in float64 over fp32 inputs (ledger 3627), bit for bit: norm first, each group normalized in fp32 and
+    weighted, the weighted norm rounded to fp32 before a gate broadcast over it multiplies it; gate first,
+    over a gate broadcasting the input's leading axis, the norm of the gated values' shape."""
+    from dew.nn.mixers.mamba2 import MambaRMSNormGated
+    from dew.nn.precision import rms_statistics
+
+    rng = np.random.default_rng(0x3627)
+    with jax.enable_x64(new_val=True):
+        x = jnp.asarray(rng.normal(size=(2, 4, 8)), jnp.float32)
+        gate = jnp.asarray(rng.normal(size=(2, 4, 1)), jnp.float32)
+        weight = jnp.asarray(rng.normal(size=(8,)), jnp.float32)
+        norm = MambaRMSNormGated(groups=2, gate_after=True, scale_wide=scale_wide, dtype=jnp.float64)
+        out = norm.apply({"params": {"weight": weight}}, x, gate)
+        grouped = x.reshape(2, 4, 2, 4)
+        normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(x.shape)
+        weighted = (normalized * weight if scale_wide
+                    else normalized.astype(jnp.float64) * weight.astype(jnp.float64))
+        expected = (weighted.astype(jnp.float32) * jax.nn.silu(gate)).astype(jnp.float64)
+        assert out.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+        # The gate-first order over a gate that broadcasts the input's leading axis: the norm takes the
+        # gated values' shape.
+        wide = jnp.asarray(rng.normal(size=(2, 4, 8)), jnp.float32)
+        first = MambaRMSNormGated(groups=2, scale_wide=scale_wide, dtype=jnp.float64)
+        gated = x[:1] * jax.nn.silu(wide)
+        grouped = gated.reshape(2, 4, 2, 4)
+        normalized = (grouped * rms_statistics(grouped, 1e-5)[1]).reshape(gated.shape)
+        expected = (normalized * weight if scale_wide
+                    else normalized.astype(jnp.float64) * weight.astype(jnp.float64)).astype(jnp.float64)
+        np.testing.assert_array_equal(np.asarray(first.apply({"params": {"weight": weight}}, x[:1], wide)),
+                                      np.asarray(expected))

@@ -8,6 +8,7 @@ from collections.abc import Callable
 import jax
 import numpy as np
 import optax
+from flax import linen as nn
 from process_support import serve_mode, worker_parser
 from test_env_rollout import Walk
 
@@ -66,7 +67,7 @@ def flown(args):
     from dew.training import Episodes, Evaluation
 
     objective = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 1, discount=0.9)
-    variables = objective.init(jax.random.key(0))
+    variables = nn.unbox(objective.init(jax.random.key(0)))
     walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 8)
     scored = episodes(objective.greedy, walks, 8)
     split = Episodes(scored, {"return": Shown(better="higher"), "steps": Shown()})

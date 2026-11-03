@@ -28,7 +28,7 @@ from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, sqrt_or_zero
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared
 
 # The reference floors the magnitude a projected copy is rescaled by
 # (modeling_gemma3n.py, Gemma3nTextModel.forward, `epsilon_tensor`).
@@ -75,10 +75,6 @@ def rescale_to(x, target):
     return x * target_magnitude / magnitude
 
 
-@logical_axes({
-    ("linear_left",): ("embed", "mlp"),
-    ("linear_right",): ("mlp", "embed"),
-})
 class LaurelBlock(nn.Module):
     """Computes Gemma 3n's learned augmented residual (LAuReL).
 
@@ -103,8 +99,8 @@ class LaurelBlock(nn.Module):
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype,
                                   precision=self.precision, dot_general=float32_dot_general)
         maps = self.projections()
-        low = dense(maps['linear_left'][1], name='linear_left')(x)
-        projected = dense(maps['linear_right'][1], name='linear_right')(low)
+        low = dense(maps['linear_left'][1], name='linear_left', kernel_axes=('embed', 'mlp'))(x)
+        projected = dense(maps['linear_right'][1], name='linear_right', kernel_axes=('mlp', 'embed'))(low)
         return x + RMSNorm(epsilon=self.norm_eps, dtype=self.dtype,
                            name='post_laurel_norm')(projected)
 
@@ -130,7 +126,8 @@ class _Coefficients(nn.Module):
 
     @nn.compact
     def __call__(self, x, train: bool = False):
-        kernel = self.param('kernel', nn.initializers.lecun_normal(),
+        # Both sides are the streams' small mixing counts, kept whole on every device.
+        kernel = self.param('kernel', declared(nn.initializers.lecun_normal(), (None, None)),
                             (x.shape[-1], self.features), jnp.float32)
         if train and self.clip is not None:
             clipped = jnp.clip(kernel, -self.clip, self.clip)
@@ -158,13 +155,6 @@ def clamped_predictions(params, clip: float):
     return clamped(params, None)
 
 
-@logical_axes({
-    ("modality_router",): ("embed", None),
-    # A handful of coefficients per token: num_inputs squared at most, which
-    # no mesh axis should split.
-    ("correction_coefs",): (None, None),
-    ("prediction_coefs",): (None, None),
-})
 class AltUpLayer(nn.Module):
     """Runs one layer's AltUp: `predict` before the block and `correct` after it.
 
@@ -222,7 +212,7 @@ class AltUpLayer(nn.Module):
                                              name='prediction_coefs')
         self.modality_router = Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
                                      precision=self.precision, name='modality_router',
-                                     dot_general=float32_dot_general)
+                                     kernel_axes=('embed', None), dot_general=float32_dot_general)
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 
     def modalities(self, x):

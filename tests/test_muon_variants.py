@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
@@ -76,7 +77,7 @@ def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
     mla = MultiHeadLatentAttention(emb_features=32, num_heads=2, max_seq_len=8, q_lora_rank=24,
                                    kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=4, v_head_dim=8,
                                    attention_impl="reference")
-    params = mla.init(jax.random.key(0), jnp.ones((1, 8, 32), jnp.float32))
+    params = nn.unbox(mla.init(jax.random.key(0), jnp.ones((1, 8, 32), jnp.float32)))
     query, value = ('params', 'q_b_proj', 'kernel'), ('params', 'kv_b_proj', 'kernel')
     widths = {query: 12, value: 16}
 
@@ -215,3 +216,30 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
     assert np.all(np.isfinite(np.asarray(node(updated, ("w",)), np.float32)))
     assert np.linalg.norm(np.asarray(node(updated, ("w",)), np.float64)) == np.linalg.norm(
         np.asarray(large["w"], np.float64))
+
+
+def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
+    """A flat attention stores each projection as one `[C, heads * head_dim]` matrix and declares it so
+    where it makes it, so Muon takes each projection as one matrix, orthogonalizes it and steps (ledger
+    3453), as it does the headed attention's three-axis kernels: the flat kernels took the headed
+    attention's suffix declarations, three axes cut to their two, which no matrix's sides read."""
+    from dew.nn.attention_blocks import NormalAttention
+    from dew.nn.sharding import boxed, boxed_axes
+    from dew.optim import OptimConfig, muon_partition
+
+    for flat in (True, False):
+        model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat, attention_impl="xla")
+        drawn = model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32))
+        params = nn.unbox(drawn)["params"]
+        # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
+        with boxed(boxed_axes(drawn)):
+            split = muon_partition(params)
+            solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
+            state = solver.init(params)
+            gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
+            updates, _ = solver.update(gradients, state, params)
+        assert {path: reason for path, reason in split.items() if path.endswith("['kernel']")} == {
+            f"['{name}']['kernel']": "muon" for name in ("to_q", "to_k", "to_v", "to_out_0")}
+        stepped = optax.apply_updates(params, updates)
+        for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(stepped), strict=True):
+            assert np.all(np.isfinite(np.asarray(after))) and not np.array_equal(after, before)

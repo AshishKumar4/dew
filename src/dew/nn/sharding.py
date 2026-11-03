@@ -1,18 +1,19 @@
-"""Where a parameter is split across devices, declared on the module that creates it.
+"""Where a parameter is split across devices, declared where the module creates it.
 
-A module names the logical axes of the parameters its submodules create,
-keyed by the trailing module path, outermost dimension first:
+A module draws each parameter it names the logical axes of in Flax's box,
+outermost dimension first (`nn.with_logical_partitioning`, `declared`):
 
-    @logical_axes({("q_proj",): ("embed", "heads"), ("o_proj",): ("attention", "embed")})
-    class CausalSelfAttention(nn.Module): ...
+    self.param("kernel", declared(init, ("embed", "heads")), shape)
+    Dense(features, kernel_axes=("attention", "embed"))
 
-A parameter takes as many of the trailing names as its rank holds, so a
-kernel takes all of them and its bias takes the output ones. The
-declarations of every decorated module merge into one table. The `Layout`
-reads that table when it places a train state, and Muon reads it when it
-picks a parameter's matrix axes. The models stay plain Flax modules whose
-init returns arrays. The optimizer's moments and the EMA copy have paths
-that end in their parameter's path, so one declaration covers them as well.
+so an init returns its parameters boxed, as Flax's partitioning reads them.
+A run reads its objective's draw once, traced for its shapes alone, into one
+table by each parameter's path (`boxed_axes`, `Objective.parameter_axes`),
+and holds its trees as plain arrays past where they enter (`unboxed`). The
+`Layout` reads that table when it places a train state, and Muon reads it
+when it picks a parameter's matrix axes. The optimizer's moments and the EMA
+copy have paths that end in their parameter's path, so one declaration covers
+them as well.
 
 A parameter that no declaration names (a convolution, a state matrix, a
 projection with no side worth naming) gets the shape heuristic, which
@@ -45,9 +46,10 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
+from flax.typing import Initializer
 
+from dew.batch import FROZEN
 from dew.mesh import (
     SEQUENCE_AXIS,
     STAGE_AXIS,
@@ -92,10 +94,6 @@ MLP_HIDDEN: LogicalAxes = ("activation_batch", "activation_length", "activation_
 LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_vocab")
 """`[batch, length, vocab]` scores."""
 
-
-_OWNERS: dict[Suffix, tuple[LogicalAxes, type]] = {}
-"""Every declaration by its suffix, with the class that made it: the table
-`declarations` matches, one set of axes per suffix across all classes."""
 
 @dataclasses.dataclass
 class Schedule:
@@ -560,50 +558,6 @@ def per_shard(kernel: str) -> None:
                          f"manual (`manual_map`), each device on its own rows")
 
 
-def _qualified(cls: type) -> str:
-    return f"{cls.__module__}.{cls.__qualname__}"
-
-
-def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
-    """Declare the parameter axes of the modules `cls` creates.
-
-    A suffix names a parameter's trailing module names, matched in every
-    model in the process, so two classes that declare one suffix differently
-    are refused here, both named. A class outside Dew qualifies a one-name
-    suffix with the name its own module goes by, (`head`, `readout`) rather
-    than (`readout`,), which would place any model's `readout`.
-    """
-    declared = {tuple(suffix): tuple(axes) for suffix, axes in declared.items()}
-    for suffix, axes in declared.items():
-        names = [name for name in axes if name is not None]
-        repeated = sorted({name for name in names if names.count(name) > 1})
-        if repeated:
-            # The rules hand a mesh axis to a logical name once per array.
-            raise ValueError(
-                f"{'/'.join(suffix)} is declared {axes}, which names "
-                f"{', '.join(repeated)} twice; a kernel whose two sides share a "
-                f"width names one of them or leaves the other None")
-
-    def decorate(cls):
-        single = sorted('/'.join(suffix) for suffix in declared if len(suffix) == 1)
-        if single and cls.__module__.partition('.')[0] != 'dew':
-            raise ValueError(
-                f"{_qualified(cls)} declares the one-name suffixes {single}, which place a "
-                f"module of that name in any model; qualify each with the name of the "
-                f"module that holds it, e.g. ('head', '{single[0]}')")
-        for suffix, axes in declared.items():
-            held = _OWNERS.get(suffix)
-            if held is not None and held[0] != axes:
-                raise ValueError(
-                    f"{'/'.join(suffix)} is declared {axes} by {_qualified(cls)} and "
-                    f"{held[0]} by {_qualified(held[1])}; a suffix has one set of axes")
-        for suffix, axes in declared.items():
-            _OWNERS.setdefault(suffix, (axes, cls))
-        return cls
-
-    return decorate
-
-
 def parameter_path(path) -> Suffix:
     """The parameter's own path: the trailing run of dict keys under a leaf.
 
@@ -618,41 +572,56 @@ def parameter_path(path) -> Suffix:
     return tuple(reversed(names))
 
 
-def _matching(table, names: Suffix):
-    for length in range(len(names), 0, -1):
-        if names[-length:] in table:
-            return names[-length:]
-    return None
-
-
 _BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.ContextVar(
     "boxed", default=types.MappingProxyType({}))
-"""The axes modules boxed on their own parameters (`boxed_axes`), which
-`declared_axes` reads ahead of the suffix table while `boxed` holds them."""
+"""The axes a run's modules box their parameters in where they make them (`boxed_axes` of the objective's
+draw, `Objective.parameter_axes`), which `declared_axes` reads while `boxed` holds them."""
+
+
+def declared(init: Initializer, axes: LogicalAxes | None) -> Initializer:
+    """`init` drawing a parameter whose module declares its logical `axes` where it makes it
+    (`nn.with_logical_partitioning`: the axes travel with the parameter, as Flax's partitioning reads
+    them), or `init` itself for `axes` None, a parameter its module names no axes of. A module's `param`
+    hands back the array a box holds, so its draw reads as any initializer's."""
+    return init if axes is None else nn.with_logical_partitioning(init, axes)
 
 
 def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
-    """The axes each parameter a module boxed itself carries
-    (`nn.with_logical_partitioning`), by the parameter's full path,
-    collection first; `nn.unbox` drops them."""
-    table: dict[Suffix, LogicalAxes] = {}
+    """The axes each parameter carries in the box its module drew it in (`nn.with_logical_partitioning`),
+    by its full path, collection first: where a run's table is read off its objective's draw
+    (`Objective.parameter_axes`) and a tree given to `Layout` names its own; `nn.unbox` drops them."""
+    boxes = jax.tree_util.tree_leaves_with_path(tree, is_leaf=lambda leaf: isinstance(leaf, nn.Partitioned))
+    return {parameter_path(path): tuple(box.names) for path, box in boxes if isinstance(box, nn.Partitioned)}
 
-    def visit(path, leaf):
-        if isinstance(leaf, nn.LogicallyPartitioned):
-            table[parameter_path(path)] = tuple(leaf.names)
 
-    jax.tree_util.tree_map_with_path(visit, tree,
-                                     is_leaf=lambda leaf: isinstance(leaf, nn.LogicallyPartitioned))
-    return table
+def abstract[TreeT](fn: Callable[..., TreeT], *args) -> TreeT:
+    """`fn(*args)` traced for shapes alone (`jax.eval_shape`), Flax's logical axis rules unbound: a draw
+    read for its shapes and its boxes' names places nothing, so it asks no mesh for the axes its names
+    map to (Flax's `param` constrains a box it draws under rules a trainer binds, and a mesh without
+    those axes refuses it)."""
+    with nn.logical_axis_rules(()):
+        return jax.eval_shape(fn, *args)
+
+
+def drawn_axes(init: Callable[..., Mapping], *inputs) -> dict[Suffix, LogicalAxes]:
+    """The axes `init` (a module's, an objective's, a head's over its backbone) draws each parameter in,
+    read off its draw traced for shapes alone (`jax.eval_shape`, no array made) from a key and `inputs`:
+    the one table a plain tree of it is placed and stepped by, whether a run's objective holds it
+    (`Objective.parameter_axes`), a load places by it (`dew.interop.Pretrained`) or a tower carries its
+    own (`dew.interop.components.bind_component`)."""
+    return boxed_axes(abstract(init, jax.random.key(0), *inputs))
 
 
 def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) -> dict[Suffix, LogicalAxes]:
-    """`table`'s boxes that name an axis `rules` places. A box whose names
-    the rules never mention keeps the shape heuristic, as an undeclared
-    parameter does, where its names alone would leave it whole: a Flax model
-    boxing with its own names (MaxText's 'activation_*', 'kv')."""
+    """`table`'s boxes placement reads under `rules`: those that name an axis the rules place, and those
+    that name none at all, a parameter its module keeps whole on every device. A box whose names the
+    rules never mention keeps the shape heuristic, as an undeclared parameter does, where its names alone
+    would leave it whole: a Flax model boxing with its own names (MaxText's 'activation_*', 'kv'). Only
+    placement filters: what a parameter's axes are (an optimizer's matrix, a diagnostic) reads the whole
+    table."""
     named = {name for name, _ in rules}
-    return {path: names for path, names in table.items() if named.intersection(names)}
+    return {path: names for path, names in table.items()
+            if named.intersection(names) or all(name is None for name in names)}
 
 
 def current_boxes() -> Mapping[Suffix, LogicalAxes]:
@@ -675,42 +644,20 @@ ADAPTER_RANK = "adapter_rank"
 
 LOW_RANK_FACTORS = ("lora_A", "lora_B")
 """The low-rank factors an adapted module holds beside its kernel (`dew.lora`): `lora_A` of shape
-`[in..., r]` and `lora_B` of `[r, out...]`, which `declarations` gives the kernel's axes on each
-one's side of the rank."""
+`[in..., r]` and `lora_B` of `[r, out...]`, which it declares with the kernel's axes on each one's side
+of the rank (`factor_axes`)."""
 
 
-def declarations(tree) -> dict[Suffix, LogicalAxes]:
-    """The axes `logical_axes` declares for each leaf of `tree`, by the
-    leaf's parameter path, the one place the declarations are read: a
-    declaration names a module, whose parameters share its axes, or one
-    parameter under its module, for a module whose leaves have different
-    axes (GPT OSS's fused experts). The parameter's own path is tried first.
-    A low-rank factor under a declared module takes its kernel's axes on its
-    side of the rank and `ADAPTER_RANK` for the rank (`factor_axes`).
-    """
-    table: dict[Suffix, LogicalAxes] = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
-        names = parameter_path(path)
-        if (owned := _matching(_OWNERS, names)) is not None:
-            table[names] = _OWNERS[owned][0]
-        elif (module := _matching(_OWNERS, names[:-1])) is not None:
-            axes = _OWNERS[module][0]
-            factor = names[-1] in LOW_RANK_FACTORS
-            # A stage-local run's factor stacks its layers' over leading dimensions its kernel's
-            # declaration names none of (`stacked_layers`).
-            layers = stacked_layers(path)
-            ndim = np.ndim(leaf) - (0 if layers is None else layers[1])
-            table[names] = factor_axes(axes, names[-1], ndim) if factor else axes
-    return table
-
-
-def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
+def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes | None:
     """The axes of a layer's low-rank `factor` (`LOW_RANK_FACTORS`) of `ndim` dimensions, under a
     kernel declared `kernel`: `lora_A`'s are the kernel's leading `ndim - 1` axes, its inputs, then
-    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs.
-    Read off the factor alone, so a tree holding one factor without the other (an optimizer's
-    masked partition, a parameter group) declares it as the whole adapter does."""
+    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs; none
+    under a kernel its module names no axes of (`kernel` empty). Read off the factor alone, so a tree
+    holding one factor without the other (an optimizer's masked partition, a parameter group) declares
+    it as the whole adapter does."""
     sides = ndim - 1
+    if not kernel:
+        return None
     if not 0 < sides < len(kernel):
         raise ValueError(f"a {factor} of {ndim} dimensions does not split a kernel declared {kernel}")
     if factor == "lora_A":
@@ -718,34 +665,32 @@ def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
     return (ADAPTER_RANK, *kernel[len(kernel) - sides:])
 
 
-def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
-    """The axes of the parameter at `path`, or None for an unnamed one: the
-    axes its module boxed on it (`boxed`), matched by its whole path, a
-    variables leaf by its own and a leaf of a tree that mirrors the params
-    collection (an optimizer moment, a gradient) under `params`; else those
-    `declared`, the `declarations` of the tree it is a leaf of, give it. A
-    stage-local run's leaf (`stacked_layers`) has its first layer's axes,
-    after a dimension it names none of for each it stacks the layers over.
+def declared_axes(path, ndim: int) -> LogicalAxes | None:
+    """The axes of the parameter at `path`, or None for one its module names no axes of: those it was
+    boxed in where it was made, from the run's table (`boxed`), matched by its whole path, a variables leaf
+    by its own and a leaf of a tree that mirrors the params collection (an optimizer moment, a gradient)
+    under `params`. A stage-local run's leaf (`stacked_layers`) has its first layer's axes, after a
+    dimension it names none of for each it stacks the layers over. A leaf of fewer dimensions than its
+    parameter (a factored moment) takes the trailing names.
     """
     names = parameter_path(path)
     layers = stacked_layers(path)
     stacked, keys = (0, (names,)) if layers is None else (layers[1], (parameter_path(layers[0][0]), names))
     held = _BOXED.get()
-    axes = next((found for key in keys
-                 if (found := held.get(key) or held.get(("params", *key)) or declared.get(key)) is not None),
-                None)
-    if axes is None:
+
+    def candidates(key: Suffix) -> tuple[Suffix, ...]:
+        # A frozen parameter (`dew.batch.freeze`) is the parameter its module made.
+        unfrozen = ("params", *key[1:]) if key[:1] == (FROZEN,) else key
+        return key, ("params", *key), unfrozen
+
+    # A declaration of no axes, a scalar's `()`, is a declaration all the same.
+    found = [held[candidate] for key in keys for candidate in candidates(key) if candidate in held]
+    if not found:
         return None
+    axes = found[0]
     if ndim - stacked > len(axes):
         raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
     return (*(None,) * stacked, *axes[len(axes) - (ndim - stacked):])
 
 
-__all__ = [
-    "ADAPTER_RANK",
-    "RESIDUAL",
-    "Link",
-    "Schedule",
-    "layers_of",
-    "logical_axes",
-]
+__all__ = ["ADAPTER_RANK", "RESIDUAL", "Link", "Schedule", "layers_of"]

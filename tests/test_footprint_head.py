@@ -244,7 +244,21 @@ def test_a_step_consumes_a_gradient_where_it_is_made_only_into_device_resident_s
         trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                           dynamic_scale=scaled)
         state, _, _ = trainer.place()
-        assert consumed_where_made(trainer.optimizer, state, 1) is consumed
+        assert consumed_where_made(trainer.objective, trainer.optimizer, state, 1) is consumed
+
+
+def test_a_step_whose_head_takes_its_gradient_in_the_backward_holds_every_gradient():
+    """A decoder's head that takes its gradient in the backward a tile at a time holds every gradient to the
+    step's end, as XLA schedules its weight gradients and updates after the whole backward (row 3653); its
+    whole logits, and its tile taking its gradient in the forward, consume each where it is made."""
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER)
+    objective = LMObjective(model, 16, head_tile=(16, 128))
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    state, _, _ = trainer.place()
+    for tile, fused, consumed in (((16, 128), False, False), ((16, 128), True, True), (None, True, True)):
+        objective.restore_head(tile, fused=fused)
+        assert consumed_where_made(objective, trainer.optimizer, state, 1) is consumed
 
 
 class Layers(Features):

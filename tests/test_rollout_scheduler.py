@@ -19,6 +19,7 @@ import numpy as np
 import optax
 import pytest
 from episode_support import environment as sandbox
+from flax import linen as nn
 from recording import bits
 
 from dew.checkpoints import Checkpoints
@@ -126,7 +127,7 @@ def rig(environment, verifier, *, tasks, log, workers=16, scheduler=RolloutSched
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
     target = GRPOObjective(model, seq_len=WIDTH - 1, behavior_importance=2.0)
-    params = target.init(jax.random.key(0))
+    params = nn.unbox(target.init(jax.random.key(0)))
     sampling = Sampling(temperature=1.0, eos_token_ids=STOP)
     server = NativeRolloutServer(Server.from_task(TextGeneration(model, params, None, sampling=sampling),
                                                   slots=16, capacity=64))

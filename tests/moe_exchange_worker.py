@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.moe import ExpertMLP
@@ -32,7 +33,7 @@ def main() -> None:
         with jax.default_device(jax.local_devices()[0]):
             x = jnp.asarray(inputs, dtype)
             weights, ids = jnp.asarray(routing_weights), jnp.asarray(choices)
-            parameters = model.init(jax.random.key(19), x, weights, ids)
+            parameters = nn.unbox(model.init(jax.random.key(19), x, weights, ids))
             expected = jax.jit(jax.value_and_grad(functools.partial(objective, model, ids),
                                                 (0, 1, 2), has_aux=True))(parameters, x, weights)
         parameter_specs = jax.tree.map(lambda _: split, parameters)

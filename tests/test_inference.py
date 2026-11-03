@@ -38,7 +38,7 @@ from dew.inference.projections import inference_projections
 from dew.inputs import Field, TextCondition, unit_range
 from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
 
 RES = 8

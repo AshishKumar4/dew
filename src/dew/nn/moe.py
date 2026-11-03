@@ -41,9 +41,16 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import generation
 from .kernels.templates.gemm import template
-from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
+from .precision import (
+    at_least_fp32,
+    capped_logits,
+    exact_float32,
+    float32_dot_general,
+    float32_einsum,
+    rounded_operand,
+)
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import logical_axes
+from .sharding import declared
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -259,6 +266,8 @@ class Router(nn.Module):
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
+    kernel_axes: LogicalAxes | None = None
+    """Its kernel's logical axes, as its owner declares them where it makes it."""
     def setup(self):
         if self.group_score not in ('top2', 'max'):
             raise ValueError(
@@ -315,22 +324,25 @@ class Router(nn.Module):
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
         self.kernel = self.param(
-            'kernel', normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
-            (self.in_features, self.num_experts), jnp.float32)
+            'kernel', declared(normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
+                               self.kernel_axes), (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
-                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
+                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, declared(jnp.zeros, ('exp',)),
                 (self.num_experts,), jnp.float32)
         if self.media_bias:
             self.bias_vl = self.variable(
-                EXPERT_BIAS_COLLECTION, 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
+                EXPERT_BIAS_COLLECTION, 'media_bias', declared(jnp.zeros, ('exp',)), (self.num_experts,),
+                jnp.float32)
         if self.hash_vocab is not None:
             if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
                     "balancing bias, no expert groups and no routing blocks")
+            # A token's experts, read by token: whole on every device.
             self.tid2eid = self.variable(
-                EXPERT_BIAS_COLLECTION, 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
+                EXPERT_BIAS_COLLECTION, 'tid2eid', declared(jnp.zeros, (None, None)),
+                (self.hash_vocab, self.top_k), jnp.int32)
 
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
@@ -394,12 +406,10 @@ class Router(nn.Module):
         `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
         (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
         past each other, where the references' float32 routers multiply in IEEE float32. A
-        `logit_softcap` caps them."""
+        `logit_softcap` caps them (`capped_logits`)."""
         logits = float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                                 precision=exact_float32(self.precision))
-        if self.logit_softcap is None:
-            return logits
-        return jnp.tanh(logits / self.logit_softcap) * self.logit_softcap
+        return capped_logits(logits, self.logit_softcap)
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -572,11 +582,13 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
 class ExpertLinear(nn.Module):
     """One matrix per expert, `[exp, in_features, features]`; `ExpertMLP`
     reads the kernel and projects tokens sorted by expert through
-    `expert_projection`."""
+    `expert_projection`. `kernel_axes` are its logical axes, as its owner
+    declares them where it makes it."""
     num_experts: int
     in_features: int
     features: int
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
+    kernel_axes: LogicalAxes | None = None
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -593,9 +605,9 @@ class ExpertLinear(nn.Module):
         # every expert initialises like the matching Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
-            normal_kernel(self.init_std, nn.initializers.variance_scaling(
+            declared(normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
-                batch_axis=(0,)))['kernel_init'],
+                batch_axis=(0,)))['kernel_init'], self.kernel_axes),
             (self.num_experts, self.in_features, self.features), jnp.float32)
 
 
@@ -1025,12 +1037,13 @@ class ExpertMLP(nn.Module):
         else:
             self.gate_proj = expert(in_features=self.out_features,
                                     features=self.hidden_features, init_std=self.init_std,
-                                    name='gate_proj')
+                                    name='gate_proj', kernel_axes=EXPERT_AXES['gate_proj'])
         self.up_proj = expert(in_features=self.out_features,
                               features=self.hidden_features, init_std=self.init_std,
-                              name='up_proj')
+                              name='up_proj', kernel_axes=EXPERT_AXES['up_proj'])
         self.down_proj = expert(in_features=self.hidden_features,
                                 features=self.out_features, name='down_proj',
+                                kernel_axes=EXPERT_AXES['down_proj'],
                                 init_std=(self.init_std if self.output_init_std is None
                                           else self.output_init_std))
 
@@ -1076,23 +1089,6 @@ class ExpertMLP(nn.Module):
         return self._combine(slots, weights)
 
 
-@logical_axes({
-    ("gate",): ("embed", "exp"),
-    # A sparse layer's experts are stacked on one leaf, so the expert
-    # dimension is named here and the longer path wins over the dense
-    # projection of the same name.
-    **{("experts", name): axes for name, axes in EXPERT_AXES.items()},
-    # The shared branch is one dense gated MLP beside the experts, sharded
-    # like the dense layers' own.
-    ("shared_experts", "gate_proj"): ("embed", "mlp"),
-    ("shared_experts", "up_proj"): ("embed", "mlp"),
-    ("shared_experts", "down_proj"): ("mlp", "embed"),
-    ("shared_expert_gate",): ("embed", None),
-    # Kimi K3's latent projections around the routed experts: the experts
-    # themselves run at the latent width under the expert names above.
-    ("routed_expert_down_proj",): ("embed", None),
-    ("routed_expert_up_proj",): (None, "embed"),
-})
 class SparseMLP(nn.Module):
     """A router over `num_experts` MLPs, `top_k` of them per token.
 
@@ -1183,9 +1179,9 @@ class SparseMLP(nn.Module):
                            block_experts=self.block_experts,
                            weight_sum_epsilon=self.weight_sum_epsilon, weight_sum_min=self.weight_sum_min,
                            logit_softcap=self.router_softcap, excluded_group_score=self.excluded_group_score,
-                           hash_vocab=self.hash_vocab,
-                           init_std=self.init_std,
-                           precision=self.precision, name='gate')
+                           hash_vocab=self.hash_vocab, init_std=self.init_std,
+                           # Its experts split as the experts it chooses do.
+                           kernel_axes=("embed", "exp"), precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -1199,8 +1195,10 @@ class SparseMLP(nn.Module):
         if self.latent_features is not None:
             dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
                                       dot_general=float32_dot_general)
-            self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
-            self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
+            self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj',
+                                                 kernel_axes=("embed", None))
+            self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj',
+                                               kernel_axes=(None, "embed"))
             if self.latent_norm is not None:
                 self.routed_expert_norm = self.latent_norm(name='routed_expert_norm')
         if self.shared_gate and self.shared is None:
@@ -1210,7 +1208,7 @@ class SparseMLP(nn.Module):
             if self.shared_gate:
                 self.shared_expert_gate = Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
-                    name='shared_expert_gate', **normal_kernel(self.init_std),
+                    name='shared_expert_gate', **normal_kernel(self.init_std), kernel_axes=("embed", None),
                     dot_general=float32_dot_general)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:

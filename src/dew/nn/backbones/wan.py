@@ -39,7 +39,7 @@ from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, pro
 from dew.nn.norms import LayerNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import declared
 
 from ..mlp import GatedMLP
 from .joint import embedding, embedding_flops, layer_norm, modulate
@@ -61,9 +61,6 @@ def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,
 
 # The source stores one flat [inner, inner] tensor per projection; the
 # suffixes carry the attention's own name, as JointAttention's do.
-@logical_axes({(module, name): axes for module in ("attn1", "attn2")
-               for name, axes in (*(((name), ("embed", None)) for name in ("to_q", "to_k", "to_v")),
-                                  ("to_out_0", (None, "embed")))})
 class WanBlock(nn.Module):
     """Runs `WanTransformerBlock`: modulated self-attention, cross-attention to the text, and a feed-forward.
 
@@ -135,9 +132,6 @@ class WanBlock(nn.Module):
         return (x.astype(wide) + fed.astype(wide) * gate_mlp[:, None]).astype(x.dtype)
 
 
-@logical_axes({("text_embedder_linear_1",): (None, "embed"), ("text_embedder_linear_2",): (None, "embed"),
-               ("time_embedder_linear_1",): (None, "embed"), ("time_embedder_linear_2",): (None, "embed"),
-               ("patch_embedding_3d",): (None, None, None, None, "embed"), ("proj_out",): ("embed", None)})
 class WanTransformer(nn.Module):
     """Runs Diffusers 0.34.0's `WanTransformer3DModel` for text-to-video, behind Dew's model interface.
 
@@ -245,7 +239,8 @@ class WanTransformer(nn.Module):
         # The source's `patch_embedding`; CLIP's vision tower holds a 2-D
         # kernel at that path, and one path holds one set of axes.
         tokens = Conv(self.features, patch, strides=patch, padding="VALID", name="patch_embedding_3d",
-                      **dense)(x)
+                      kernel_init=declared(nn.initializers.lecun_normal(), (None, None, None, None, "embed")),
+                      bias_init=declared(nn.initializers.zeros_init(), ("embed",)), **dense)(x)
         tokens = tokens.reshape(x.shape[0], -1, self.features)
         # `WanTimeTextImageEmbedding`: the time embedder in fp32, its output
         # in the model's dtype, and one projection of it into six pieces.
@@ -265,7 +260,7 @@ class WanTransformer(nn.Module):
         shift, scale = (table.astype(wide)[:, index] + embedded.astype(wide) for index in range(2))
         tokens = modulate(layer_norm(wide, self.eps)(tokens), shift, scale).astype(tokens.dtype)
         out = Dense(int(np.prod(patch)) * self.out_channels, name="proj_out", **dense,
-                    dot_general=float32_dot_general)(tokens)
+                    kernel_axes=("embed", None), dot_general=float32_dot_general)(tokens)
         return einops.rearrange(out.reshape(x.shape[0], *grid, *patch, self.out_channels),
                                 "b f h w pf ph pw c -> b (f pf) (h ph) (w pw) c")
 

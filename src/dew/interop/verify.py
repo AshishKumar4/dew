@@ -53,6 +53,7 @@ from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
 from dew.nn.blocks import padded_row
+from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.registry import models
 
@@ -723,7 +724,7 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
     try:
-        template = jax.eval_shape(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
+        template = abstract(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
     except ValueError as error:
         raise _Mismatch(f"{convention}'s model does not build at the probe's sizes ({error})") from error
     return model, record, inert, sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(template['params']))

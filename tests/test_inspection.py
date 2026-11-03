@@ -20,7 +20,7 @@ from run_kinds import KINDS, lm, scalars
 from dew.cli.main import main
 from dew.data.dataset import Loader
 from dew.nn.inspection import HISTOGRAM_EDGES, statistics
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Inspection, MeshSpec, Trainer, inspected
 
 BATCH, RATE = 8, 0.25
