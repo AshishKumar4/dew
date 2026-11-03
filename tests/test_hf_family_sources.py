@@ -55,6 +55,10 @@ the reference (`seeds_for(dew_fn=...)`, the count check 1's paired verdict needs
 draw's weights and inputs: Qwen3-Next's at 64, Qwen 3.5 MoE's text decoder's at 32 and Qwen 3.5's at 8
 (2026-11-01), the rest at the fewest; Gemma 3n's at 512, whose pooled ratio sized at 64 stays
 inconclusive at the verdict's redraw (its draws' log ratios spread 0.42, armada IGLANE9)."""
+SHARDED_YARN = "gemma3n-tiny"
+"""The fixture whose YaRN site CI draws in map tasks (`check1_shards`), a test of its own: its 512 seeds and
+the redraw its verdict takes on them, the source's float32 and float64 forwards over each, took 190 to 350 s
+in one task, and take about 25 s a map task of 256 seeds (armada, 11-03)."""
 
 PADDED = {"llama-tiny", "mistral-tiny", "mixtral-tiny", "ministral-tiny",
                 "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny", "qwen3-moe-tiny",
@@ -179,11 +183,22 @@ def _reference(directory: Path):
     return model.eval(), float64_twin(model, lambda: built(torch.float64)).eval()
 
 
-@pytest.mark.parametrize("name", sorted(YARN_SEEDS))
+@pytest.mark.parametrize("name", sorted(set(YARN_SEEDS) - {SHARDED_YARN}))
 def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_path):
     """The family's reader takes a YaRN record onto its rotated layers, and its logits over drawn ids
     past the original context hold check 1 against the source's."""
+    assert_yarn_extends(name, tmp_path)
 
+
+@pytest.mark.check1_shards(seeds=512, per_task=256)
+def test_a_yarn_record_extends_gemma3n_as_its_source_does(tmp_path):
+    """`test_a_yarn_record_extends_every_family_whose_source_builds_it` over Gemma 3n (`SHARDED_YARN`)."""
+    assert_yarn_extends(SHARDED_YARN, tmp_path)
+
+
+def assert_yarn_extends(name, tmp_path):
+    """A case of `test_a_yarn_record_extends_every_family_whose_source_builds_it`: fixture `name`'s YaRN
+    logits against its source's (check 1)."""
     from dew.nn.rope import YarnScaling
 
     config = _fixture_config(name)
