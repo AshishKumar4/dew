@@ -174,7 +174,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
                      approx_math, score_places(hooks), drop is not None)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
-    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
+    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k, readers=True)
     # The queries taken by the call's power: the logits' operand of the two launches (`_dkv_step`).
     scaled = by_power(query, prescale)
     if drop is not None:

@@ -59,26 +59,34 @@ def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge)
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_paged_decode_kernel_holds_every_order(edge):
-    """`kv_cache.gpu_paged` (the Pallas paged decode kernel's value, the gathered attention's derivatives
-    through `generation.linear_tangent`), interpreted off a GPU: every order runs in the query, the key
-    and value pages and the sinks, finite wherever float64 is a normal float32 and the plain formula, one
-    query a row over its row's first `lengths` keys gathered from its pages with the sinks in the
-    softmax, is."""
+def test_the_paged_decode_kernel_holds_every_order(edge, kernel="gpu_paged"):
+    """`kv_cache.gpu_paged` (the Pallas paged decode kernel's value), interpreted off a GPU, and
+    `kv_cache.template_paged` (the attention template's decode's, at its pages of 64 keys, on an H100 in
+    the GPU flow, tests/test_gpu_attention.py: Mosaic GPU's interpreter runs its kernel through ordered
+    callbacks, which no rematerialization differentiates), the gathered attention's derivatives through
+    `generation.linear_tangent`: every order runs in the query, the key and value pages and the sinks,
+    finite wherever float64 is a normal float32 and the plain formula, one query a row over its row's first
+    `lengths` keys gathered from its pages with the sinks in the softmax, is."""
+    page = 16 if kernel == "gpu_paged" else 64
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
-    lengths = jnp.asarray([21, 32], jnp.int32)
-    shapes = ((2, 4, 64), (2, 4, 16, 64), (2, 4, 16, 64), (4,))
+    lengths = jnp.asarray([page + 5, 2 * page], jnp.int32)
+    shapes = ((2, 4, 64), (2, 4, page, 64), (2, 4, page, 64), (4,))
     primals = normal_draw(2660, *shapes, scale=EDGES[edge])
     direction = normal_draw(2661, *shapes, scale=EDGES[edge])
     (cotangent,) = normal_draw(2662, shapes[0])
+    if kernel == "template_paged":
+        # The template's decode takes 16-bit operands: a bf16 cache's step.
+        primals, direction = ((*(x.astype(jnp.bfloat16) for x in drawn[:3]), drawn[3])
+                              for drawn in (primals, direction))
+        cotangent = cotangent.astype(jnp.bfloat16)
 
     def paged(query, key, value, sinks):
-        return kv_cache.gpu_paged(None)(query, key, value, table, lengths, None, sinks)
+        return getattr(kv_cache, kernel)(None)(query, key, value, table, lengths, None, sinks)
 
     def plain(query, key, value, sinks):
         # Each row's pages in its table's order, `[rows, keys, key heads, D]`, each key head read by two
         # query heads.
-        keys, values = (jnp.repeat(jnp.moveaxis(pool[:, table], 0, 3).reshape(2, 32, 2, 64), 2, axis=2)
+        keys, values = (jnp.repeat(jnp.moveaxis(pool[:, table], 0, 3).reshape(2, 2 * page, 2, 64), 2, axis=2)
                         for pool in (key, value))
         logits = jnp.einsum("rhd,rkhd->rhk", query, keys) * 64 ** -0.5
         logits = jnp.where(jnp.arange(keys.shape[1]) < lengths[:, None, None], logits, -jnp.inf)
@@ -86,5 +94,5 @@ def test_the_paged_decode_kernel_holds_every_order(edge):
         weights = jax.nn.softmax(jnp.concatenate([logits, sunk], axis=-1), axis=-1)[..., :-1]
         return jnp.einsum("rhk,rkhd->rhd", weights, values)
 
-    assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge}",
+    assert_contract(paged, primals, direction, cotangent, f"the paged decode kernel {edge} {kernel}",
                     truth_fn=plain, plain_fn=plain)

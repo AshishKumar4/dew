@@ -96,6 +96,50 @@ def test_a_mixed_call_decodes_and_prefills_as_the_separate_calls_do(continuing, 
             np.testing.assert_array_equal(attention[name][2], cache[layer]["self_attn"][name][2])
 
 
+WIDE = {"head_dim": 64, "max_seq_len": 128, "dtype": jnp.bfloat16}
+"""The template's decode at head width 64 over 128 slots a row, bf16: what its Mosaic mainloop takes."""
+
+
+@pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+@pytest.mark.parametrize("continuing", [True, False])
+def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(continuing, paged):
+    """On an H100 (assumed, interpreted), a mixed call's attention runs as one work list through the
+    attention template (`AttentionMixer._worked`): rows 0 and 1 decoding, row 3 admitted with a
+    four-token prompt and a padding piece, over a dense cache or pages of 16 slots, its logits on par
+    with the same call on xla's two calls (check 1), the truth the model in float64."""
+    from model_support import float64_twin
+    from reference_error import assert_as_exact
+
+    from dew.nn.kernels import generation
+
+    pool = {"kv_cache": KVCache(page_size=16, pages=ROWS * 8)} if paged else {}
+    fed = jnp.asarray([7, 9, 0, 0], jnp.int32)
+    prompt = jnp.asarray([0, 0, 11, 12, 13, 14], jnp.int32)
+    tokens = jnp.concatenate([fed, prompt, jnp.zeros(WIDTH, jnp.int32)])[None]
+    valid = jnp.concatenate([fed > 0, prompt > 0, jnp.zeros(WIDTH, bool)])[None]
+    picked = jnp.asarray([[0, 1, ROWS + WIDTH - 1]])
+
+    def mixed(model):
+        def logits(params):
+            cache = prefilled(model, params)
+            admitted = Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]),
+                                continuing=continuing, tables=tables_of(cache, [3, 0]) if paged else None)
+            # An H100's choices, its norms', feed-forwards' and decode rows' Pallas kernels aside (this host
+            # interprets the attention template's alone).
+            with generation.assumed("sm90"), generation.chosen(rms_norm="xla", swiglu="xla", decode="xla",
+                                                              paged_decode="gathered"):
+                return model.apply({**params, "cache": cache}, tokens, picked, decode=True, mutable=["cache"],
+                                   coordinates=coordinates(valid.shape, valid=valid), admitted=admitted,
+                                   method=CausalTransformer.states_and_logits_at)[0][1]
+        return logits
+
+    model = tiny(**WIDE, **pool)
+    draw = lambda seed: (model.init(jax.random.key(seed), jnp.zeros((1, 4), jnp.int32)),)  # noqa: E731
+    assert_as_exact(jax.jit(mixed(model)), jax.jit(mixed(model.clone(attention_impl="xla"))), draw,
+                    f"mixed call through one work list {'paged' if paged else 'dense'}", seeds=8,
+                    truth_fn=mixed(float64_twin(model.clone(attention_impl="xla"))))
+
+
 REFUSALS = {"plain": {}, "alibi": {"position_embedding": "alibi"}, "sinks": {"attention_sinks": True},
             "shared keys": {"kv_shared_layers": (1,)}, "int8 cache": {"kv_cache": KVCache(quantized="int8")},
             "window": {"layer_types": ("local", "global"),

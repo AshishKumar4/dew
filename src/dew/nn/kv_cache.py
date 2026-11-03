@@ -522,6 +522,58 @@ class KVStore:
             scale = None if scale is None else self._gathered(scale)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
+    def attends_rows(self, query: jax.Array, softcap: float | None) -> bool:
+        """Whether `attend_rows` reads this cache for `query`: its rows' keys of the query's 16-bit dtype,
+        unquantized (the template's decode reads no codes yet, ledger 3624), a paged pool's pages each
+        whole tiles or tiles of whole pages (`TEMPLATE_PAGED_SUPPORTS`), on a GPU its Mosaic mainloop is
+        qualified on."""
+        from dew.nn.kernels.templates import attention_mosaic_program
+
+        if self.layout.quantized or backend() != "gpu" or query.dtype not in (jnp.bfloat16, jnp.float16):
+            return False
+        pool = self._get(self.payloads[0][0])
+        if pool.dtype != query.dtype:
+            return False
+        if self.layout.page_size is None:
+            family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype)
+            return family is not None
+        case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
+                         value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
+                         pool=pool.dtype, page_size=self.layout.page_size, quantized=False,
+                         groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
+                         named='auto')
+        return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
+
+    def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None) -> jax.Array:
+        """`query` `[B, T, H, D]` through the attention template's decode over this cache's rows
+        (`attends_rows`):
+        batch row `b` over row `sources[b]`'s keys under `spans` (`attention.KeySpans`), read where they
+        lie: a dense cache's rows by `sources`, a paged pool's by those rows' tables. One call over a serving
+        step's work list (ledger 3623)."""
+        from dew.nn.kernels.templates import attention as template, attention_decode
+
+        hooks = template.Hooks(None if softcap is None else template.Capped(softcap))
+        interpret = generation.placed_platform() != "gpu"
+        if self.layout.page_size is None:
+            keys, values = self.read()
+            return attention_decode.attend(query, keys, values, spans, hooks, interpret=interpret,
+                                           sources=sources)
+        pools = [self._get(name) for name, _ in self.payloads]
+        table = self._absolute(self._get(TABLE))[sources]
+        return attention_decode.attend(query, pools[0], pools[-1], spans, hooks, interpret=interpret,
+                                       table=table)
+
+    def _absolute(self, table: jax.Array) -> jax.Array:
+        """A grouped pool's table `[rows, pages a row]` indexing the whole pool: each group's rows' pages
+        past the start of the group's part (`grouped`), as a kernel over one pool reads them; an ungrouped
+        pool's as it is."""
+        groups = self.layout.groups
+        if groups == 1:
+            return table
+        part = self._get(self.payloads[0][0]).shape[1] // groups
+        starts = jnp.arange(table.shape[0], dtype=table.dtype) // (table.shape[0] // groups) * part
+        return table + starts[:, None]
+
     def _gathered(self, pool: jax.Array) -> jax.Array:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
@@ -544,8 +596,9 @@ class KVStore:
         from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads), with
         `sinks` `[heads]` where the layer has them (the GPU's kernel applies them).
 
-        Decode runs the device's paged kernel, which raises `KernelRefused` where its requirements
-        (`PAGED`) turn the step down. The TPU kernel does not scale
+        Decode runs the paged kernel the selector takes (`PAGED`: the device's, or the attention template's
+        decode where the GPU's refuses the pool), which raises `KernelRefused` where every paged kernel's
+        requirements turn the step down. The TPU kernel does not scale
         the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
         same scale every other attention path applies. A Mosaic kernel cannot
         be partitioned automatically, and neither can the GPU's Pallas kernel,
@@ -555,13 +608,19 @@ class KVStore:
         """
         case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
                          windowed=starts is not None, sinks=sinks is not None)
-        # The device's paged kernel, named: one its requirements turn down raises.
-        selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
+        # The selector's paged kernel: the layer reads this step through the pages where one takes it
+        # (`CausalSelfAttention._decode_attention`), the gathered rows elsewhere.
+        kernel = selected(PAGED, case).name
+        if kernel == 'gathered':
+            # No paged kernel takes the step: the device's own raises its refusals.
+            selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
 
         def local(query, key, value, lengths, table, *extras):
             # The optional operands as `decode` gave them: the window's starts, then the sinks.
             starts, sinks = (extras[0] if given else None), (extras[-1] if sunk else None)
-            if backend() == "gpu":
+            if kernel == 'template':
+                return template_paged(softcap)(query, key, value, table, lengths, starts, sinks)
+            if kernel == 'triton':
                 return gpu_paged(softcap)(query, key, value, table, lengths, starts, sinks)
             from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 
@@ -572,7 +631,7 @@ class KVStore:
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
         pools = [self._get(name) for name, _ in self.payloads]
-        arrays = (query, pools[0], pools[-1], lengths, self._get(TABLE),
+        arrays = (query, pools[0], pools[-1], lengths, self._absolute(self._get(TABLE)),
                   *given, *sunk)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
@@ -651,6 +710,46 @@ TRITON_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
 are the gathered attention's, through the attention dispatch (`gpu_paged`), so neither a backward's
 kernel nor forward mode limits it."""
 
+def _template_tiles(case: PagedCase) -> bool:
+    """Whether the attention template's decode reads `case`'s pages: its Mosaic mainloop qualified on the
+    GPU's family for the query's dtype (`attention_mosaic_program.bundle`), and its key tiles whole in a
+    page or a page's keys whole in its tiles, one copy a page (`attention_mosaic._pages_hold` over the
+    family's key extents, `attention_mosaic_program.extents`)."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program
+
+    if backend() != "gpu" or case.page_size is None:
+        return False
+    family = attention_mosaic_program.bundle(generation.gpu_target().generation, case.dtype)
+    if family is None:
+        return False
+    # Every key tile the family's copies move (a page's keys whole in it), else one of the page's.
+    tiles = attention_mosaic_program.extents(family, case.dtype, family.copy_extent or case.page_size)
+    return any(attention_mosaic._pages_hold(case.page_size, tile, family) for tile in tiles)
+
+
+TEMPLATE_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
+    Requirement('pages', lambda case: case.page_size is not None, "the cache keeps no pages", row=INHERENT),
+    Requirement('quantized', lambda case: not case.quantized,
+                "the template's decode reads 16-bit pages; a quantized pool is read through the gather",
+                row='ledger 3624'),
+    Requirement('dtype', lambda case: case.dtype == case.pool and case.pool in (jnp.bfloat16, jnp.float16),
+                lambda case: f"the template's decode reads a 16-bit query over pages of its dtype, not "
+                             f"{case.dtype} over {case.pool}", row='ledger 3624'),
+    Requirement('tiles', _template_tiles,
+                lambda case: f"the attention template's decode reads no key tile of pages of "
+                             f"{case.page_size} keys on this GPU", row='ledger 3648'),
+    Requirement('head_shards', lambda case: case.kv_heads % case.head_shards == 0,
+                "a mesh splits the query heads past the pool's key heads, whose pages the kernel reads "
+                "per shard", row=INHERENT),
+    Requirement('arithmetic', lambda case: not case.arithmetic,
+                "the step asks for arithmetic only the reference path computes (`reference_only`)",
+                row=INHERENT),
+)
+"""The attention template's decode over the pages (`attention_decode.attend`'s `table`): a GPU's paged
+step where Dew's Pallas kernel turns the pool down (its values narrower than its keys, a 16-bit query of
+fp16, a pool split into groups, read through its table's pages past each group's part's start,
+`KVStore._absolute`), its derivatives at every order the gathered attention's (`template_paged`)."""
+
 TPU_PAGED_SUPPORTS: tuple[Requirement[PagedCase], ...] = (
     Requirement('capability', lambda case: generation.backend() == 'tpu',
                 "the paged attention kernel runs on a TPU", row=INHERENT),
@@ -679,11 +778,13 @@ def _paged_preferred(case: PagedCase) -> str:
 
 PAGED: Op[PagedCase] = Op('paged_decode', (
     Kernel('triton', TRITON_PAGED_SUPPORTS),
+    Kernel('template', TEMPLATE_PAGED_SUPPORTS),
     Kernel('tpu', TPU_PAGED_SUPPORTS),
     Kernel('gathered', (), generic=True),
 ), _paged_preferred)
 """The paged selector: a decode step over a paged pool reads it through its device's paged kernel where
-that kernel's requirements hold (`TRITON_PAGED_SUPPORTS`, `TPU_PAGED_SUPPORTS`), else the gathered rows
+that kernel's requirements hold (`TRITON_PAGED_SUPPORTS`, `TPU_PAGED_SUPPORTS`), else on a GPU through the
+attention template's decode where its requirements hold (`TEMPLATE_PAGED_SUPPORTS`), else the gathered rows
 through the layer's attention (`CausalSelfAttention._decode_attention`)."""
 
 
@@ -747,6 +848,34 @@ def gpu_paged(softcap: float | None):
     with no context of the caller's. An inactive row reads one slot, so its unused output stays
     finite."""
     return generation.linear_tangent(functools.partial(_paged_forward, softcap=softcap),
+                                     functools.partial(_paged_backward, softcap=softcap),
+                                     functools.partial(_gathered_tangent, softcap=softcap))
+
+
+def _template_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
+    """The attention template's decode over the pages (`attention_decode.attend`): one query a row over its
+    keys from `starts` (a window's first, where given) to `lengths`, under the `softcap` and the `sinks`
+    `[heads]` the layer has. An inactive row reads one slot."""
+    from dew.nn.kernels.templates import attention as template, attention_decode
+
+    rows = query.shape[0]
+    spans = template.spans(1, table.shape[1] * key.shape[2], rows, lengths=jnp.maximum(lengths, 1),
+                           starts=starts)
+    hooks = template.Hooks(None if softcap is None else template.Capped(softcap),
+                           initial=None if sinks is None else template.sinks(sinks, rows, 1, value.shape[-1]))
+    # Interpreted where the arrays lie off a GPU (Mosaic GPU compiles on one alone), whatever GPU the step
+    # is chosen for (`generation.assumed`).
+    out = attention_decode.attend(query[:, None], key, value, spans, hooks, table=table,
+                                  interpret=generation.placed_platform() != "gpu")
+    return out[:, 0], ()
+
+
+@functools.cache
+def template_paged(softcap: float | None):
+    """The attention template's decode over the pages (`_template_forward`) under the layer's `softcap`,
+    over `(query, key, value, table, lengths, starts, sinks)` as `gpu_paged` takes them, its derivatives at
+    every order the gathered attention's (`generation.linear_tangent`), as `gpu_paged`'s."""
+    return generation.linear_tangent(functools.partial(_template_forward, softcap=softcap),
                                      functools.partial(_paged_backward, softcap=softcap),
                                      functools.partial(_gathered_tangent, softcap=softcap))
 

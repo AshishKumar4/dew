@@ -41,6 +41,7 @@ import test_attention_mosaic as mosaic
 import test_attention_route as route
 import test_attention_stability as stability
 import test_attention_triton as triton
+import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
@@ -117,6 +118,10 @@ def test_the_attention_kernels_run_on_this_gpu():
                functools.partial(stability.test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
                                  family, form))
           for family, form in sorted(stability.GPU_ONLY["decode"])),
+        *(Cell(f"the template's paged decode holds every order: {edge}",
+               functools.partial(contracts.test_the_paged_decode_kernel_holds_every_order, edge,
+                                 "template_paged"), "sm90")
+          for edge in contracts.EDGES),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic"), "sm90")
           for family in stability.MOSAIC_FAMILIES),

@@ -274,7 +274,8 @@ CUDNN_SUPPORTS = (
                 "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
-                "mask but for a window's band or a forward-only cache call (`attention.mask_kernel`)",
+                "mask; a window's band and a forward-only cache call over several queries, which it is "
+                "measured faster at, reach it as that bias (`attention.mask_kernel`'s `as_bias`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
                 "cuDNN takes block groups, key validity or counted places only as the mask the call's spans "

@@ -486,7 +486,7 @@ def _fragments(call: _Call, *tiles) -> list:
 
 @dataclasses.dataclass(frozen=True)
 class Launch:
-    """A launch as planned (`mainloop_backward.planned`): its name (`recurrence_states`, ...), its programs
+    """A launch as planned (`template.planned`): its name (`recurrence_states`, ...), its programs
     and each one's threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program
     allocates (its streams' slots and barriers and its staging tiles, as its bundle declares them), the
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
@@ -513,7 +513,7 @@ class Launch:
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
-"""Where `mainloop_backward.planned` collects its launches; None where they run."""
+"""Where `template.planned` collects its launches; None where they run."""
 
 
 STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype")
@@ -524,7 +524,7 @@ and its constants; its every other argument an array or None."""
 _lowered_once = tuning.lowered_once(STATIC, unless=lambda: _PLANNED.get() is not None)
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
 so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
-Planning (`mainloop_backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
+Planning (`template.planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
 def _allocated(call: _Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
@@ -667,7 +667,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     stores' (`landing`, `_landed`) scoped, named for its launch (`recurrence_solved`, ...; `name` where
     given). The program returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None
     where it runs its own roles (`_sequence_walk`'s). `held` is what a consumer thread holds in registers
-    (`_Held`). Where `mainloop_backward.planned` collects launches, the launch's record (`Launch`, its
+    (`_Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
     `work`) and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
@@ -1922,7 +1922,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     memory fp32. Without the `delta` rule nothing is corrected and each token writes its values gated by
     `beta` (the identity inverse: Mamba2's SSD through its rated decay's log gates, the gated linear
     attentions, GLA's with a decay a key dimension). Keys and values padded to whole blocks (`block_of`), at
-    any width whose launches the device holds (the template's legality, `mainloop_backward.planned`'s shared
+    any width whose launches the device holds (the template's legality, `template.planned`'s shared
     memory and registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
