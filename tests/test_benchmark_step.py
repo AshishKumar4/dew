@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -46,8 +47,9 @@ def test_a_case_of_a_translated_config_is_read_back_as_the_case_it_builds(name):
             == to_record(models.build(case.architecture, **case.config), object))
 
 
+@pytest.mark.parametrize("named", ["directory", "config.json"])
 @pytest.mark.parametrize("name", ["qwen35-tiny", "qwen35-native-tiny"])
-def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
+def test_a_case_names_a_checkpoints_config_on_the_command_line(name, named):
     """`--cases` names a checkpoint's config (`hf_config`, its directory or its config.json): a decoder's own,
     or a multimodal wrapper's whose language model a text-only load reads (`decoder_config`), which the case's
     model is built from as the family translates it, the case's own `config` fields over the translated ones
@@ -58,8 +60,9 @@ def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
     step = load("benchmark_step")
     models_module = load("benchmark_models")
     directory = FIXTURES / name
+    checkpoint = directory if named == "directory" else directory / "config.json"
     [case] = step.cases_from_json(json.dumps([{"architecture": "causal_transformer",
-                                              "hf_config": str(directory), "config": {"max_seq_len": 128},
+                                              "hf_config": str(checkpoint), "config": {"max_seq_len": 128},
                                               "dtype": "float32", "batch_size": 2, "seq_len": 8}]))
     translated = translate_config(decoder_config(json.loads((directory / "config.json").read_text())))
     assert translated["max_seq_len"] != 128
@@ -67,6 +70,35 @@ def test_a_case_names_a_checkpoints_config_on_the_command_line(name):
                             attention_impl="xla")
     built = models_module.build_objective(case, "xla").program_key()[0].module
     assert to_record(built, object) == to_record(expected, object)
+
+
+def test_a_case_names_a_quantized_wrapper_whose_selection_reads_its_tensors_names(tmp_path):
+    """A wrapper checkpoint whose quantized selection is a pattern over its modules (compressed-tensors'
+    `re:`) is read with its tensors' names, from their headers, as a text-only load reads it
+    (`decoder_config`'s inventory): the case builds the decoder that selection, renamed to the text
+    checkpoint's modules, gives (row 3777)."""
+    import shutil
+
+    from dew.interop.hf_decoders import decoder_config, translate_config
+    from dew.interop.safetensors_io import read_file
+    from dew.registry import models, to_record
+
+    source = FIXTURES / "qwen35-native-tiny"
+    wrapper = Path(shutil.copytree(source, tmp_path / "wrapper"))
+    config = json.loads((source / "config.json").read_text())
+    quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
+                    "config_groups": {"fp8": {
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"],
+                        "weights": {"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": False}}},
+                    "ignore": ["lm_head", "model.language_model.layers.1"]}
+    quantized = {**config, "quantization_config": quantization}
+    (wrapper / "config.json").write_text(json.dumps(quantized))
+    names, _ = read_file(source / "model.safetensors")
+    case = load("benchmark_step").Case("causal_transformer", hf_config=str(wrapper), dtype="float32",
+                                       batch_size=2, seq_len=8)
+    expected = translate_config(decoder_config(quantized, lambda: names.keys()))
+    assert (to_record(models.build("causal_transformer", **case.trunk_fields()), object)
+            == to_record(models.build("causal_transformer", **expected), object))
 
 
 def test_a_case_naming_a_checkpoint_is_identified_by_the_fields_it_holds_now(tmp_path):

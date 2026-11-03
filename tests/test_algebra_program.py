@@ -493,7 +493,8 @@ def test_device_memory_is_priced_at_the_parts_measured_stream():
 
     (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
     assert measured is not None and measured < 4.0e12
-    assert memory_rate("NVIDIA H100 PCIe", 2.0e12) == 2.0e12
+    # A part no device reports (its kind the test's own), which no row's streams can name: its clocks'.
+    assert memory_rate("a Hopper part no one measured", 2.0e12) == 2.0e12
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])

@@ -244,7 +244,7 @@ def test_the_recurrences_run_on_this_gpu():
                    hooks, packed)))
           for hooks in forward.TAKEN for packed in (False, True)),
         *(Cell(f"the Mosaic gradient is as exact as its reference: {name}",
-               functools.partial(gradient.test_the_mosaic_gradient_is_as_exact_as_its_reference, *values))
+               functools.partial(gradient.the_mosaic_gradient_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(gradient.GRADIENT_GRID, gradient.INTERPRETED_GRADIENT)),
         *(Cell(f"a walk of two roles is as exact as its reference: {name}",
                functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),

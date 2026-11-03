@@ -451,7 +451,9 @@ TARGETS = {target.generation: target for target in (
               # tools/device_facts.py on an H100 SXM and a GH200 (FS-DEVICEFACTS2-h100 and -gh200); the H200's
               # the same line through the kernel challenge's best read at each size, 16.8 MB to 805 MB,
               # cold L2 under graph replay (judge-facts.md:3-18).
+              # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
               streams={'NVIDIA H100 80GB HBM3': Streamed(1.87e-6, 3.190e12),
+                       'NVIDIA H100 PCIe': Streamed(2.11e-6, 1.980e12),
                        'NVIDIA GH200 480GB': Streamed(2.51e-6, 3.812e12),
                        'NVIDIA H200': Streamed(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
