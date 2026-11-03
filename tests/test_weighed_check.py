@@ -26,9 +26,10 @@ NULL_RUNS = 64
 """The null control's runs: the reference against its reformulation on the same draws, judged as a weighed
 site is."""
 
-WEIGHED_DECIDED = 40
-"""The null runs the weighed check decides at least: 40 of 64 on armada at 256 conditioned seeds (20 the
-unweighted check passed, 4 its worst-row rule failed, row 3684; job for 7316a2074a)."""
+WEIGHED_DECIDED = 35
+"""The null runs the weighed check decides at least: 35 of 64 on armada at 256 conditioned seeds, each run's
+draws past both budgets of the run before it (`null_runs`); the unweighted check decides the rest, its
+worst-row rule failing some (row 3684; run gate-r12 at fa6c49b25a)."""
 
 CONDITIONED_SEEDS = 256
 """The weighed check's declared seeds here: its heavy class holds one value a draw, some draws exact in both

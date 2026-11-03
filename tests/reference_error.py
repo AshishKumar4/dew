@@ -1029,9 +1029,10 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
              one[5] and other[5]) for one, other in zip(first, later, strict=True)]
 
 
-def _conditioning(reference_fn, truth_fn, draw, seeds) -> Conditioning:
+def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None) -> Conditioning:
     """Check 1's conditioning of `reference_fn` (tests/conditioning.py): its rounding scale at a draw as its
-    arm runs (`summed_as_run`, a window loop's by window), its heavy elements over `seeds`."""
+    arm runs (`summed_as_run`, a window loop's by window), its heavy elements over `seeds` as `ran`, its
+    compiled arm where given, runs it."""
     from rounding_bound import rounding_scale
 
     def scale_of(inputs, seed):
@@ -1043,7 +1044,7 @@ def _conditioning(reference_fn, truth_fn, draw, seeds) -> Conditioning:
             return jax.tree.map(lambda *scale: None if scale[0] is None else np.stack(scale), *each,
                                 is_leaf=lambda leaf: leaf is None)
 
-    return conditioned(reference_fn, truth_fn, draw, seeds, scale_of)
+    return conditioned(ran or reference_fn, truth_fn, draw, seeds, scale_of)
 
 
 def _truth_and_terms(truth_fn, terms_fn, inputs):
@@ -1745,6 +1746,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (tests/
     conditioning.py: built of the site's compiled reference and truth where it draws, never in its judge),
     a map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
+    given = reference_fn
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     truth_program = _truth_program(truth_fn)
@@ -1765,7 +1767,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     def conditioning_now():
         if weighing is not None and "of" not in weighed:
             began = time.perf_counter()
-            weighed["of"] = weighing(reference_fn, truth_fn)
+            weighed["of"] = weighing(given, truth_fn, ran=reference_fn)
             weighed["seconds"] = time.perf_counter() - began
         return weighed.get("of")
 
