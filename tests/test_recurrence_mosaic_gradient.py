@@ -103,10 +103,10 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     _holds_check_1(case, dtype, remat)
 
 
-@pytest.mark.check1_shards(seeds=256, per_task=32)
+@pytest.mark.check1_shards(seeds=256, per_task=20)
 def test_a_packed_bf16_gradient_is_as_exact_as_its_reference():
     """`test_the_mosaic_gradient_is_as_exact_as_its_reference` at packed documents in bf16, from the forward's
-    memories kept (`DRAWN_APART`)."""
+    memories kept (`DRAWN_APART`): a task of 32 seeds took 122 s (grad-shards at 61f6e8d39)."""
     _holds_check_1('packed documents', jnp.bfloat16, 'kept')
 
 
