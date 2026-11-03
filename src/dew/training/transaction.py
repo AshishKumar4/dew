@@ -447,15 +447,16 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
-_GROUPS: contextvars.ContextVar[tuple[int, jax.Array] | None] = contextvars.ContextVar("example_groups",
-                                                                                      default=None)
+_GROUPS: contextvars.ContextVar[tuple[int, int | jax.Array] | None] = contextvars.ContextVar(
+    "example_groups", default=None)
 
 
 @contextlib.contextmanager
-def example_groups(groups: int, group: jax.Array) -> Iterator[None]:
+def example_groups(groups: int, group: int | jax.Array) -> Iterator[None]:
     """Within the block, a step's microbatch is group `group`'s share of `groups` equal ones (DiLoCo's,
     `dew.training.diloco`): its examples are placed and counted among the whole step's (`example_fields`),
-    each group's rows the `group`th share of them, as one run of every row places them."""
+    each group's rows the `group`th share of them, as one run of every row places them. `group` is the
+    traced axis index within a step, and a host integer where a plan reads one group's shapes."""
     token = _GROUPS.set((groups, group))
     try:
         yield
