@@ -10,15 +10,17 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _coords,
     _rows,
     _Spans,
+    issued_into,
     reducing,
     stated,
+    transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -42,7 +44,9 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    # The logits' and dP's products read the keys and values transposed.
+    return scoped, family.streams(blocks, stages, consumers,
+                                  swizzles=transposed_swizzles(config, "keys", "values"))
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):
@@ -50,7 +54,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     (`slots`) and its queries and output cotangents (`operands`) under its rows' statistics (`stats`), the
     tile's coordinates (`coords_of(k_first)`), its hook parameters (`params_of(like, k_first=k_first)`) and
     whether its block sees it whole (`whole(index)`). The row sums are carried (`rows`); dQ's and the keyed
-    sums' products are issued into `accumulators` in place (`algebra.dq_issued`)."""
+    sums' products are issued into `accumulators` in place (`gradient.dq_issued`)."""
     q, do = operands
     peak, prior, anchor, delta, chosen = stats
     family, tiles, empty = walk.program.family, walk.program.tiles, jnp.zeros((), jnp.float32)
@@ -63,19 +67,19 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     params = params_of(s, k_first=k_first)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
     # dQ's and the keyed sums' places stay empty: their products go to the accumulators.
-    sums = algebra.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
+    sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
 
     def issued(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask; the row sums and the parts are taken
-        # where the mask is read (`algebra.pulled`).
+        # where the mask is read (`gradient.pulled`).
         # Its places tiles: vector broadcasts took dQ 1.77 to 2.06 ms under sinks at width 64 (ET-HELD-h100,
         # the config unchanged), its registers no fewer.
         coords = coords_of(k_first)
         scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked)
         exponentials, _, cotangents, slopes, seen = scored
-        terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
+        terms, parts, keyed = gradient.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
-                                                summed=walk.summed, accurate=walk.accurate)
+                                                summed=walk.summed, accurate=walk.accurate, rows=True)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
         return row_sums, parts, keyed
@@ -87,15 +91,21 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     dq_acc, *keyed_accs = accumulators
     # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
     # branches yield the scaled cotangents alone, not every part.
-    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
+    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate, rows=True)
     # dQ's (and the keyed sums') products against the program's share of the keys' columns (`share`).
     k_columns = k_slot.at[:, pl.ds(*share)]
-    dq_acc = family.register_products(dq_acc, parts, k_columns, walk.interpret)
+    dq_acc = issued_into(family, dq_acc, parts, k_columns, walk.interpret)
     if keyed is None:
         return rows, (dq_acc,)
     factor, keyed_parts = keyed
     if factor is None:
-        keyed_acc = family.register_products(keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_accs[0], keyed_parts, k_columns, walk.interpret)
+    elif k_slot.dtype == jnp.float16:
+        # fp16's parts scaled (`product.Scaled`): the keyed sums rescaled by their row factor first, the
+        # tile's products then restored into them (`issued_into`).
+        keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
+                                             (), k_columns, walk.interpret)
+        keyed_acc = issued_into(family, keyed_acc, keyed_parts, k_columns, walk.interpret)
     else:
         # The keyed sums rescaled by their row factor, then the tile's products added in place.
         keyed_acc = family.rescaled_products(keyed_accs[0], functools.partial(algebra.rescale, alpha=factor),
@@ -123,7 +133,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
 def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
                 score_params: tuple, drop: Dropout | None, *, walk: _Backward, share: tuple[int, int],
                 name: str):
-    """The dQ program's sums over its key tiles (`algebra.dq_issued`), unfinished: dQ's and, in the accurate
+    """The dQ program's sums over its key tiles (`gradient.dq_issued`), unfinished: dQ's and, in the accurate
     form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and the rows
     `[4 + 2n, B, H, Qp]` fp32 (n the dQ parameters, `walk.summed`): the cotangents' and weights' row sums, the
     keyed sums' mass and exponent, then each dQ parameter's gradient and its weights' pullback, which
@@ -167,7 +177,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
             step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole, share)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,
-                     nothing + algebra.NO_SHIFT)
+                     nothing + gradient.NO_SHIFT)
             # The tiles its partner reads around its own (`Family.walk_own`).
             (residual, mass, grads, weighed, keyed_mass, keyed_shift), accumulated = family.walk_own(
                 streams, views, (lo, hi), streamed, index,

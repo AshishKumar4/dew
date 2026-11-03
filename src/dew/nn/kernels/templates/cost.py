@@ -1,54 +1,18 @@
-"""The seconds a template's launch takes at a config, estimated from the GPU's facts and the launch's
-geometry: the cost every template's `cost` returns (`dew.nn.kernels.templates.base`).
+"""The kernel cost vocabulary (`Work`) and the template's tile walk over it (`walked`), from a GPU's facts
+(`generation.GpuTarget`): docs/design/algebra.md §6.5, kernel-templates.md's toolkit. A program of a tile
+walk does tensor-core FLOPs, stages bytes through shared memory (its operand tiles written there and read
+back by its matrix instructions), evaluates special-function exponentials and does fp32 operations on the
+CUDA cores (the algebra between its products); its units overlap, so its time is the longest unit's at its
+rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor cores' rate is the
+generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates the CUDA
+architecture's own (`SHARED_BYTES_PER_CLOCK`, `EXPONENTIALS_PER_CLOCK`), the CUDA cores' the generation's
+fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the derivation prices a
+form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`). The register and
+shared-memory constants the resource model reads live here beside it (`resources`)."""
 
-A launch runs `programs` programs. Each does `program_flops` tensor-core FLOPs, moves `program_staged`
-bytes through shared memory (its operand tiles written there and read back by its matrix
-instructions) and evaluates `program_exponentials` exponentials; the launch as a whole reads and writes
-`device_bytes` of device memory, rereads counted where the launch's order evicts them from the L2
-before they come again (each template's `cost` says which). Programs a multiprocessor holds at once
-share its tensor cores, shared memory and special-function units, so it does their work one after
-another; and while one waits for its next step's operands, the others' work hides the wait. A program
-of `steps` pipeline steps, `stages` of them in flight, issues each step's loads `stages - 1` steps
-before it needs them, so each step waits at least the global load latency over `stages - 1`; a
-multiprocessor's `resident` programs (`resident`) wait together (Little's law). A mainloop that keeps
-`in_flight` steps' products running past their step holds their stages too, so it loads `stages - 1 -
-in_flight` ahead, and with none ahead each step's wait and its transfer (its staged bytes at the
-program's share of the bandwidth) are serial with its work. Per multiprocessor,
-
-    program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
-                   program_exponentials / special-function rate)
-             + serial_staged / shared-memory rate
-             + serial_exponentials / special-function rate
-    waiting  = steps · load latency / min(stages - 1 - in_flight, steps)
-    tile     = program + serial_stored / (memory bandwidth / multiprocessors)
-    compute  = ceil(programs / (multiprocessors · resident))
-               · max(min(resident, ceil(programs / multiprocessors)) · tile, waiting)
-    memory   = device_bytes / memory bandwidth
-    l2       = l2_bytes / L2 bandwidth
-    seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
-
-`l2_bytes` are the bytes all programs stage from the L2 together: a tile every program re-reads (the
-keys and values each query block of attention walks, the operand bands each output tile of a GEMM
-reads) is served there, not from device memory, at the L2's rate, so a config of more, smaller programs
-stages more. A template states them; one that states none is ranked without the term.
-
-Work a program does between its matrix instructions, which they wait for, is serial: `serial_staged` bytes
-and `serial_exponentials` exponentials it adds to its service time rather than overlapping (a Mosaic
-mainloop's prologue, rewriting each stage in shared memory before the warpgroup MMA reads it). So are the
-`serial_stored` bytes a persistent program stores before its next tile's loads go out, at its
-multiprocessor's share of the device's bandwidth: a tile that builds its own pipeline has none of the next
-tile's stages in flight while its store drains, which at a kernel gradient's few steps a tile is most of
-the tile's time (GMMCOOP-h100's sweep), where a streamed tile loads the next one's stages during its own.
-A persistent launch's work items are its programs. Every rate is a fact of the target
-(`dew.nn.kernels.generation.GpuTarget`): its multiprocessors and clock, its memory bandwidth, and its
-generation's dense tensor FLOPs per clock per multiprocessor in the launch's arithmetic mode; the
-shared-memory and special-function rates are the CUDA architecture's own (`SHARED_BYTES_PER_CLOCK`,
-`EXPONENTIALS_PER_CLOCK`); the load latency is the generation's, measured (`GpuTarget.load_latency`).
-A fact the target lacks raises, naming it: no rate is made up. A generation whose load latency no
-measurement states is costed without the waiting term, its launches ranked by their work alone.
-"""
 
 import dataclasses
+import functools
 import math
 
 from dew.nn.kernels import generation
@@ -79,71 +43,98 @@ size plus one reservation."""
 
 
 @dataclasses.dataclass(frozen=True)
-class Cost:
-    """One launch's work at one config, as the model reads it (the module's docstring). `mode` names
-    the tensor cores' arithmetic ('16bit' or 'tf32', `GpuTarget.tensor_rates`) and is read only where
-    `program_flops` is nonzero. `in_flight`: the steps whose products a program keeps running past their
-    step (a mainloop's MMAs in flight), each holding its stage, so `stages - 1 - in_flight` steps load
-    ahead."""
-    programs: float
-    device_bytes: float
-    program_flops: float = 0.0
-    program_staged: float = 0.0
-    program_exponentials: float = 0.0
-    mode: str = '16bit'
-    steps: float = 0.0
-    stages: int = 2
-    resident: int = 1
-    serial_staged: float = 0.0
-    serial_exponentials: float = 0.0
-    l2_bytes: float = 0.0
-    serial_stored: float = 0.0
-    in_flight: int = 0
+class Work:
+    """The cost vocabulary every price is told in (docs/design/algebra.md §6.5): an operation's work by unit
+    (tensor-core FLOPs by mode: the 16-bit mode's, 16-bit operands summed in fp32, and TF32's, fp32 operands
+    at the default precision, `GpuTarget.tensor_rate`; CUDA-core fp32 operations, a product at
+    `Precision.HIGHEST`'s FLOPs among them; special-function exponentials; conversions, which run on the
+    CUDA cores at their rate until a target states one of their own) and its bytes by level (device memory,
+    shared memory), and its span, the dependent steps on its critical path (a loop's iterations, each reading
+    the last). The algebra's terms and a template's instructions both price through it; a schedule turns it
+    into seconds by the work-span model (Brent's): the larger of its work at its units' rates and its span
+    at a dependent step's latency, XLA's fusion's (`dew.algebra.cost.fused`) or a template's tile walk
+    (`walked`)."""
+
+    flops: float = 0.0
+    operations: float = 0.0
+    exponentials: float = 0.0
+    conversions: float = 0.0
+    device_bytes: float = 0.0
+    shared_bytes: float = 0.0
+    tf32_flops: float = 0.0
+    span: float = 0.0
+
+    def __add__(self, other: "Work") -> "Work":
+        # Works summed side by side: their span the longer one's; a chain of works' span is its path's sum,
+        # which the term that chains them states (`dew.algebra.linear_scan`).
+        return Work(self.flops + other.flops, self.operations + other.operations,
+                    self.exponentials + other.exponentials, self.conversions + other.conversions,
+                    self.device_bytes + other.device_bytes, self.shared_bytes + other.shared_bytes,
+                    self.tf32_flops + other.tf32_flops, max(self.span, other.span))
 
 
-def seconds(cost: Cost, target: generation.GpuTarget) -> float:
-    """The seconds `cost`'s launch is estimated to take on `target` (the module's docstring)."""
-    facts = target
-    multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
-    rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1.0
-    if multiprocessors is None or clock is None or bandwidth is None or rate is None:
-        named = (('multiprocessors', multiprocessors), ('clock_hz', clock),
-                 (f'tensor_rates[{cost.mode!r}]', rate), ('memory_bandwidth', bandwidth))
-        raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
-                         f"{', '.join(name for name, value in named if value is None)}, "
-                         "which the kernel cost model needs")
-    latency = facts.load_latency
-    program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
-    waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
-    if cost.stages - 1 - cost.in_flight < 1:
-        # No step loads ahead: each waits for its own load, its transfer at the program's share of the
-        # memory's bandwidth, serial with the products (H100 PCIe sweeps: a two-stage warpgroup-MMA tile,
-        # which loads nothing ahead, ran 1.16 to 1.94 times its three-stage twin, R1/R3-sweep-h100).
-        program += waiting + cost.program_staged * multiprocessors / bandwidth
-        waiting = 0.0
-    waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
-    # A multiprocessor holds no more programs at once than a wave gives it.
-    resident = min(cost.resident, max(math.ceil(cost.programs / multiprocessors), 1))
-    l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
-    step = facts.grid_step_seconds
-    stepping = 0.0 if step is None else cost.programs * cost.steps * step
-    return max(waves * max(resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
+@functools.cache
+def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, ...]:
+    """`target`'s rate of each unit `units` prices, per second: the tensor cores' 16-bit and TF32 modes, the
+    CUDA cores, the special-function units, shared memory and device memory. Each is a multiprocessor's at
+    the target's clock, or with `device` the whole device's (its multiprocessors at its clock, the tensor
+    cores at its datasheet's dense peak where it states no clock), where a tile walk's device bytes and XLA's
+    fusion's staged bytes cost nothing (infinite); None for a unit the target states no rate of (a TPU's
+    vector and transcendental units, a datasheet's missing clock)."""
+    clock = target.clock_hz
+    if not device:
+        each = clock
+    else:
+        each = clock * target.multiprocessors if clock and target.multiprocessors else None
+    # The special-function and shared-memory rates are a CUDA multiprocessor's (a TPU has neither).
+    cuda = generation.capability(target.generation) is not None
+
+    def rate(per_clock: float | None) -> float | None:
+        return None if per_clock is None or each is None else per_clock * each
+
+    tensor = rate(target.tensor_rate("16bit"))
+    if tensor is None and device:
+        tensor = target.bf16_peak
+    return (tensor, rate(target.tensor_rate("tf32")), rate(target.tensor_rate("fp32")),
+            rate(EXPONENTIALS_PER_CLOCK if cuda else None),
+            math.inf if device else rate(SHARED_BYTES_PER_CLOCK if cuda else None),
+            target.memory_bandwidth if device else math.inf)
 
 
-def program_seconds(cost: Cost, rate: float, clock: float) -> float:
-    """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
-    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work (the
-    module's docstring)."""
-    return (max(cost.program_flops / (rate * clock),
-                cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
-                cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
-            + cost.serial_staged / (SHARED_BYTES_PER_CLOCK * clock)
-            + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+def units(work: Work, at: tuple[float | None, ...]) -> tuple[list[float], tuple[float, ...]]:
+    """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit and TF32
+    modes in turn), the CUDA cores (operations and conversions), the special-function units, shared memory and
+    device memory; and, mode by mode, the work at a rate the target states none of, which no time prices (0
+    where one does)."""
+    tensor, tf32, cuda, special, shared, device = at
+    grouped = (((work.flops, tensor), (work.tf32_flops, tf32)), ((work.operations + work.conversions, cuda),),
+               ((work.exponentials, special),), ((work.shared_bytes, shared),),
+               ((work.device_bytes, device),))
+    priced = [sum(amount / per_second for amount, per_second in unit if amount and per_second is not None)
+              for unit in grouped]
+    unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
+    return priced, unpriced
 
 
-def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
-    """The seconds a program's steps wait on loads `latency` clocks long, the steps loading ahead
-    (`stages - 1 - in_flight`) hiding as many steps of it, and never more steps than it takes (Little's
-    law, the module's docstring)."""
-    ahead = cost.stages - 1 - cost.in_flight
-    return cost.steps * latency / max(min(ahead, math.ceil(cost.steps)), 1) / clock
+def spanned(work: Work, latency: float | None) -> tuple[float, float]:
+    """`work`'s span at a dependent step's `latency` (`Work.span`), and its span at no latency stated
+    (`GpuTarget.step_seconds` None), which no time prices (0 where one does)."""
+    if not work.span:
+        return 0.0, 0.0
+    return (0.0, work.span) if latency is None else (work.span * latency, 0.0)
+
+
+def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
+    """A dependent step's latency on a schedule's path: XLA's loop iteration (`GpuTarget.step_seconds`) for
+    the whole device's; a template's in-kernel step from its instructions' latencies, which no fact states
+    yet, so none."""
+    return target.step_seconds if device else None
+
+
+def walked(work: Work, target: generation.GpuTarget) -> float:
+    """The seconds a program of a template's tile walk spends on `work` by the work-span model: its units'
+    work overlapped, each at its rate on one multiprocessor, the longest unit's time (`units`), or its span
+    at an in-kernel step's latency where longer (`spanned`); its device bytes the launch's, which a form of
+    its algebra does not change."""
+    return max(*units(work, rates(target, device=False))[0],
+               spanned(work, step_latency(target, device=False))[0])

@@ -26,6 +26,7 @@ What lands:
   reference release.
 """
 
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -164,19 +165,179 @@ def write_mamba2_tiny(name: str = "mamba2-tiny") -> None:
     print(f"{directory}: source.json written")
 
 
+def _stepped(forward, length: int, prefill: int) -> np.ndarray:
+    """`model_support.stepped_outputs` in NumPy, a float64 run's outputs kept wide: `forward(n)` over the
+    first `n` positions, a prefill of `prefill` positions, then one position a step."""
+    calls = [(0, prefill), *((position, position + 1) for position in range(prefill, length))]
+    return np.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
+
+
+def _layer_config() -> Mamba2Config:
+    """One `Mamba2Mixer` at the layer fixture's geometry (`ssd_support.LAYER_GEOMETRY`)."""
+    from ssd_support import LAYER_GEOMETRY as g
+
+    return Mamba2Config(hidden_size=g["hidden_size"], expand=2, num_heads=g["num_heads"],
+                        head_dim=g["head_dim"], state_size=g["state_size"], n_groups=g["n_groups"],
+                        conv_kernel=g["conv_kernel"], chunk_size=g["chunk_size"], num_hidden_layers=1,
+                        vocab_size=32, layer_norm_epsilon=g["layer_norm_epsilon"])
+
+
+def _mixer(arrays, dtype) -> Mamba2Mixer:
+    """Transformers' mixer on a drawn layer's weights (`ssd_support.mamba2_layer_draw`), in `dtype`."""
+    from ssd_support import LAYER_SHAPES
+
+    layer = Mamba2Mixer(_layer_config(), layer_idx=0).eval()
+    layer.load_state_dict({name: torch.from_numpy(value) for name, value in arrays.items()
+                           if name in LAYER_SHAPES and name != "hidden"})
+    return layer.to(dtype)
+
+
+def scan_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
+    """Transformers' scan on a draw's native inputs (`ssd_support.mamba2_draw`): 'scan' and 'carried' its
+    chunk scan from zero or from the drawn state, 'step' its selective step's first token, 'starts' its chunk
+    scan on each document alone (`ssd_support.SCAN_STARTS`), each row's first from the drawn state."""
+    from ssd_support import SCAN_STARTS, documents_of
+
+    t = {name: torch.from_numpy(value).to(dtype) for name, value in inputs.items()}
+    if site == "step":
+        state = t["h0"].clone()
+        output = mamba2_selective_state_update(
+            state, t["x"][:, 0], t["dt"][:, 0][..., None].expand(-1, -1, P),
+            t["A"][:, None, None].expand(-1, P, N), t["B"][:, 0], t["C"][:, 0], t["D"][:, None].expand(-1, P),
+            dt_bias=t["dt_bias"][:, None].expand(-1, P), dt_softplus=True)
+        return {"output": output.numpy(), "final": state.numpy()}
+
+    def scanned(rows, span, initial):
+        pieces = [t[name][rows, span] for name in ("x", "dt", "B", "C")]
+        return mamba2_chunk_scan(pieces[0], pieces[1], t["A"], pieces[2], pieces[3], chunk_size=CHUNK,
+                                 D=t["D"], dt_bias=t["dt_bias"], dt_softplus=True, initial_states=initial,
+                                 return_final_states=True)
+
+    if site != "starts":
+        output, state = scanned(slice(None), slice(None), t["h0"] if site == "carried" else None)
+        return {"output": output.numpy(), "final": state.numpy()}
+    outputs, finals = [], []
+    for row, spans in enumerate(documents_of(SCAN_STARTS)):
+        pieces = []
+        for index, (start, end) in enumerate(spans):
+            piece, final = scanned(slice(row, row + 1), slice(start, end),
+                                   t["h0"][row:row + 1] if index == 0 else None)
+            pieces.append(piece)
+        outputs.append(torch.cat(pieces, dim=1))
+        finals.append(final)
+    return {"output": torch.cat(outputs).numpy(), "final": torch.cat(finals).numpy()}
+
+
+def layer_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
+    """Transformers' mixer on a drawn layer as each site compares it (`ssd_support.mamba2_layer_site_run`'s
+    shapes): 'layer' the mixer over the hidden states, 'layer_bf16' with its weights cast too, 'decoded' its
+    forwards at a cached decode's widths, 'padded' each row closed, 'packed' each document alone, 'tangent'
+    its JVP along the drawn direction (`torch.func.jvp`)."""
+    import ssd_support as support
+
+    # The bf16 site's narrow run in bfloat16 end to end; its truth, as every site's, in `dtype` (float64).
+    dtype = torch.bfloat16 if site == "layer_bf16" and dtype == torch.float32 else dtype
+    layer = _mixer(inputs, dtype)
+    hidden = torch.from_numpy(inputs["hidden"]).to(dtype)
+
+    def on(x):
+        return layer(x).double().numpy()
+
+    if site in ("layer", "layer_bf16"):
+        return {"output": layer(hidden).double().numpy()}
+    if site == "decoded":
+        return {"output": _stepped(lambda length: on(hidden[:, :length]), hidden.shape[1], support.PREFILL)}
+    if site == "padded":
+        second = hidden[1, :12][torch.from_numpy(support.PAUSED[1])][None]
+        return {"first": on(hidden[:1, :12])[0], "second": on(second)[0]}
+    if site == "packed":
+        return {"output": np.concatenate([on(hidden[:1, start:end])
+                                          for start, end in itertools.pairwise(support.CUTS)], axis=1)}
+    direction = torch.from_numpy(inputs["direction"]).to(dtype)
+    tangent = torch.func.jvp(layer, (hidden[:1, :support.TANGENT_TOKENS],), (direction,))[1]
+    return {"output": tangent.double().numpy()}
+
+
+def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
+    """Transformers' `Mamba2ForCausalLM` of `ssd_support.HF_TINY`'s architecture on a model draw, its weights
+    Dew's tree exported (`Pretrained.export`): 'model_padded' and 'model_scored' the final states of each
+    document of the padded row alone over its real tokens, the scored row's first 12; 'model_decoded' the
+    logits at a cached decode's widths, from the fourth."""
+    import ssd_support as support
+
+    tensors = support.mamba2_model().export(support.mamba2_model_variables(inputs))
+    model = Mamba2ForCausalLM(Mamba2Config.from_pretrained(support.HF_TINY)).eval()
+    model.load_state_dict({name: torch.from_numpy(np.asarray(value)) for name, value in tensors.items()})
+    model = model.to(dtype)
+    ids = torch.from_numpy(inputs["ids"].astype(np.int64))
+    if site == "model_decoded":
+        def logits(length):
+            return model(ids[:, :length]).logits.double().numpy()
+
+        return {"logits": _stepped(logits, 12, 4)[:, 3:]}
+    length = {"model_padded": 16, "model_scored": 17}[site]
+    valid, segments = support.padded_layout(length)
+    real, closed = ids[:1, :length][:, torch.from_numpy(valid[0])], segments[:, valid[0]]
+    if site == "model_scored":
+        real, closed = real[:, :12], closed[:, :12]
+    starts = np.concatenate([[True], closed[0, 1:] != closed[0, :-1]])[None]
+    return {"hidden": np.concatenate([model.backbone(real[:, start:end]).last_hidden_state[0].double().numpy()
+                                      for start, end in support.documents_of(starts)[0]])}
+
+
+PAIRED = frozenset({"starts", "padded", "tangent", "model_padded", "model_scored", "model_decoded"})
+"""The sites sized paired with Dew's arm (`record_case`'s `dew`, Dew's twin in the inputs' dtype), whose
+reference compared with itself resolved within no 512 draws: the resets' final state, only the last
+document's tokens writing it, the padded rows' outputs, twelve tokens and seven (m2-seeded-rec4 at
+c868cbbc6), the tangent's 24 tokens of one row and the tiny model's (eight wide) hidden states and logits
+(m2-sizing at 4412b99f9: each unresolved in the recorder's own planning)."""
+
+
+def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
+    """A site's recording (`record_case`): `reference(site, inputs, dtype)` in fp32 and in torch float64 on
+    each draw, Dew's float64 `twin(site, inputs)` held to the latter at every seed (the test's truth, Dew's
+    float64 path, `indexed_recording`'s `truth_fn`); sized paired with Dew's arm at `PAIRED`'s sites."""
+    import jax
+    from recorded_references import record_case
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+
+    exact_run = jax.jit(lambda inputs: twin(site, inputs))
+    with jax.enable_x64(new_val=True):
+        roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
+
+    def evaluate(inputs):
+        with torch.no_grad():
+            narrow = reference(site, inputs, torch.float32)
+            with float64():
+                exact = reference(site, inputs, torch.float64)
+        with jax.enable_x64(new_val=True):
+            found = jax.tree.map(np.asarray, exact_run(widened(inputs)))
+        for name, value in exact.items():
+            assert_computes_the_oracle(found[name], value, f"transformers float64 {site} {name}",
+                                       roundings=roundings)
+        return narrow, exact
+
+    if site in PAIRED:
+        return record_case(site, draw, evaluate, store_inputs=False, summary=True,
+                           dew=jax.jit(lambda inputs: twin(site, inputs)))
+    return record_case(site, draw, evaluate, lambda inputs: twin(site, inputs), store_inputs=False,
+                       summary=True)
+
+
 def write_seeded() -> None:
-    """Fresh native-input/orbit draws with transformers' fp32 and torch-float64 outputs.
+    """Fresh draws with transformers' fp32 and torch-float64 outputs at each site: the scan's native inputs
+    under an orbit ('scan', 'carried', 'step', 'starts'), a mixer's weights and hidden states ('layer',
+    'layer_bf16', 'decoded', 'padded', 'packed', 'tangent') and a model's ('model_padded', 'model_scored',
+    'model_decoded').
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
     """
-    import jax
-    from recorded_references import provenance, record_case, save
-    from reference_error import assert_computes_the_oracle, chain_roundings, widened
-    from ssd_support import mamba2_draw, mamba2_run
+    import ssd_support as support
+    from recorded_references import provenance, save
 
     def draw(seed):
-        inputs = mamba2_draw(seed, (B, S, H, P, G, N))
-        redrawn = mamba2_draw(seed)
+        inputs = support.mamba2_draw(seed, (B, S, H, P, G, N))
+        redrawn = support.mamba2_draw(seed)
         assert inputs.keys() == redrawn.keys(), f"transformers seed {seed}: regenerated inputs differ"
         for name, value in inputs.items():
             other = redrawn[name]
@@ -184,45 +345,14 @@ def write_seeded() -> None:
                     and value.tobytes() == other.tobytes()), f"transformers seed {seed}: {name} differs"
         return inputs
 
-    def reference(site, arrays):
-        x, dt, A, Bm, Cm, D, bias, initial = (arrays[name] for name in
-                                             ("x", "dt", "A", "B", "C", "D", "dt_bias", "h0"))
-        if site == "step":
-            state = initial.clone()
-            output = mamba2_selective_state_update(
-                state, x[:, 0], dt[:, 0][..., None].expand(-1, -1, P),
-                A[:, None, None].expand(-1, P, N), Bm[:, 0], Cm[:, 0],
-                D[:, None].expand(-1, P), dt_bias=bias[:, None].expand(-1, P), dt_softplus=True)
-        else:
-            output, state = mamba2_chunk_scan(
-                x, dt, A, Bm, Cm, chunk_size=CHUNK, D=D, dt_bias=bias, dt_softplus=True,
-                initial_states=initial if site == "carried" else None, return_final_states=True)
-        return {"output": output.detach().numpy(), "final": state.detach().numpy()}
-
     stored = {}
-    for site in ("scan", "carried", "step"):
-        exact_run = jax.jit(lambda inputs, site=site: mamba2_run(site, inputs))
-        with jax.enable_x64(new_val=True):
-            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
-
-        def evaluate(inputs, site=site, exact_run=exact_run, roundings=roundings):
-            """The reference's fp32 outputs and its torch float64 truth, Dew's float64 path held to that
-            truth at this seed: the recording keeps the reference's evidence alone, and the test's truth
-            is Dew's float64 path (`indexed_recording`'s `truth_fn`)."""
-            tensors = {name: torch.from_numpy(value) for name, value in inputs.items()}
-            with torch.no_grad():
-                narrow = reference(site, tensors)
-                with float64():
-                    exact = reference(site, {name: value.double() for name, value in tensors.items()})
-            with jax.enable_x64(new_val=True):
-                twin = jax.tree.map(np.asarray, exact_run(widened(inputs)))
-            for name, value in exact.items():
-                assert_computes_the_oracle(twin[name], value, f"transformers float64 {site} {name}",
-                                           roundings=roundings)
-            return narrow, exact
-
-        stored.update(record_case(site, draw, evaluate, lambda inputs, site=site: mamba2_run(site, inputs),
-                                  store_inputs=False, summary=True))
+    references = {**dict.fromkeys(support.SCAN_SITES, scan_reference),
+                  **dict.fromkeys(support.LAYER_SITES, layer_reference),
+                  **dict.fromkeys(support.MODEL_SITES, model_reference)}
+    for site, reference in references.items():
+        inputs_of, twin = support.mamba2_site(site)
+        # The scan's draws checked against their regeneration at the fixture's geometry.
+        stored.update(_recorded(site, draw if site in support.SCAN_SITES else inputs_of, twin, reference))
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
@@ -233,9 +363,66 @@ def write_seeded() -> None:
     print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
 
 
+def write_interop() -> None:
+    """state-spaces/mamba2-130m's site ('interop'): transformers' port of it (AntonV/mamba2-130m-hf) on seeded
+    rows of tokens (`ssd_support.mamba2_interop_draw`), its logits in bfloat16 and in its float64 twin, on the
+    GPU where there is one; Dew's float64 load held to the latter at every seed (the test's truth), the
+    count sized paired with Dew's bfloat16 load, whose logits' errors are heavy-tailed across draws alike.
+
+    PYTHONPATH=src:tests:tools python tools/mamba2_reference.py interop   (the Hub's two checkpoints)
+    """
+    import copy
+
+    import jax
+    import jax.numpy as jnp
+    import ssd_support as support
+    from recorded_references import provenance, record_case, save
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from torch_precision import float64_twin
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf",
+                                                           revision=support.MAMBA2_130M_HF)
+    assert tokenizer.vocab_size >= support.INTEROP_VOCAB, tokenizer.vocab_size
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    port = Mamba2ForCausalLM.from_pretrained("AntonV/mamba2-130m-hf", revision=support.MAMBA2_130M_HF,
+                                             dtype=torch.float32).eval()
+    narrow, twin = copy.deepcopy(port).to(device, torch.bfloat16), float64_twin(port).to(device)
+
+    @torch.no_grad()
+    def logits(model, inputs):
+        ids = torch.from_numpy(inputs["ids"].astype(np.int64)).to(device)
+        return {"logits": model(ids).logits.double().cpu().numpy()}
+
+    exact_run = jax.jit(support.mamba2_130m_logits(support.mamba2_130m(jnp.float64)))
+    with jax.enable_x64(new_val=True):
+        roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(support.mamba2_interop_draw(0))))
+
+    def evaluate(inputs):
+        with float64():
+            exact = logits(twin, inputs)
+        with jax.enable_x64(new_val=True):
+            found = np.asarray(exact_run(widened(inputs))["logits"])
+        assert_computes_the_oracle(found, exact["logits"], "transformers float64 interop logits",
+                                   roundings=roundings)
+        return logits(narrow, inputs), exact
+
+    stored = record_case("interop", support.mamba2_interop_draw, evaluate, store_inputs=False, summary=True,
+                         dew=jax.jit(support.mamba2_130m_logits(support.mamba2_130m(jnp.bfloat16))))
+    stored["provenance"] = provenance(
+        f"transformers {transformers.__version__}", transformers_record()["revision"], device,
+        "PYTHONPATH=src:tests:tools python tools/mamba2_reference.py interop",
+        truth="transformers reference in torch float64 through tools/torch_precision.py")
+    destination = SSD / "interop_seeded.npz"
+    written = save(destination, stored, reference=f"transformers {transformers.__version__}",
+                   license="Apache-2.0")
+    print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["seeded"]:
         write_seeded()
+    elif sys.argv[1:] == ["interop"]:
+        write_interop()
     elif sys.argv[1:] == ["float64"]:
         write_float64()
     else:

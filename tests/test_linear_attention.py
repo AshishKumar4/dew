@@ -42,7 +42,7 @@ from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence as kernel, tuning
 from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
@@ -845,6 +845,74 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     # The kernel aliases its state into its output, and serving donates it (`donate`).
     assert_runs_per_shard(decode_gated_delta_rule, draw, specs, mesh, f"delta decode split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
+
+
+KEYED = kernel.Hooks(decay='vector')
+RATED = kernel.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+"""The decode step's hooks beside the gated delta net's: Kimi delta attention's decay a key dimension
+(`linear.KEY_STEP`) and Mamba-2's rated scan with its skip (`mamba2.SSD`)."""
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
+@pytest.mark.parametrize("form", ["a decay a key dimension", "a rated decay"])
+def test_the_decode_step_keeps_the_kernel_contract_on_a_mesh_for_each_decay(form, axis, split):
+    """One decode token of Kimi delta attention's decay a key dimension, or of Mamba-2's rated scan with
+    its skip (its queries and keys a group's, its rate and skip a head's), through the step kernel per
+    shard (`linear.stepped_per_shard`, which `kda.py` and `mamba2.py` decode through) over rows split two
+    ways or heads split two ways, idle rows among the drawing ones: its output and state within the float64
+    gate of one device's, from the portable step's in float64 (`recurrence.step_reference`), no operand or
+    state moved between devices (`sharded.assert_runs_per_shard`). Off a GPU the kernel interprets."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    from dew.nn.linear import stepped_per_shard
+
+    rows, heads, groups, width = 4, 4, 2, 32
+    keyed = form == "a decay a key dimension"
+    hooks = KEYED if keyed else RATED
+    active = jnp.asarray([True, False, True, False])
+
+    def draw(seed):
+        rng = np.random.default_rng(3 + seed)
+        reads = heads if keyed else groups
+        unit = [rng.normal(size=(rows, reads, width)) for _ in range(2)]
+        query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+        value = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.float32)
+        beta = jnp.asarray(rng.random((rows, heads)), jnp.float32)
+        state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, jnp.float32)
+        if keyed:
+            decay = jnp.asarray(-rng.random((rows, heads, width)) * 3, jnp.float32)
+            return query, key, value, decay, beta, state, active
+        rate = jnp.asarray(-rng.random(heads) * 3, jnp.float32)
+        skip = jnp.asarray(rng.normal(size=heads), jnp.float32)
+        return query, key, value, rate, beta, state, active, skip
+
+    def stepped(query, key, value, decay_or_rate, beta, state, active, skip=None):
+        if keyed:
+            return stepped_per_shard(hooks, state, query, key, value, decay_or_rate, beta, active)
+        return stepped_per_shard(hooks, state, query, key, value, None, beta, active, rate=decay_or_rate,
+                                 skip=skip)
+
+    def exact(query, key, value, decay_or_rate, beta, state, active, skip=None):
+        with jax.enable_x64(new_val=True):
+            given = {"log_decay": decay_or_rate} if keyed else {"rate": decay_or_rate, "skip": skip}
+            out, _, final = kernel.step_reference(hooks, kernel.Step(
+                jnp.asarray(state, jnp.float64), query=query, key=key, value=value, beta=beta, active=active,
+                **given), dtype=jnp.float64)
+            return np.asarray(out), np.asarray(final)
+
+    def spec(rank: int, at: int):
+        return PartitionSpec(*(axis if dim == at else None for dim in range(rank)))
+
+    # A row-shaped operand split on its rows or its heads; a head's rate and skip on the heads alone.
+    at = {0: 0, 2: 1}[split]
+    per_head = spec(1, 0 if split == 2 else None)
+    specs = [spec(3, at)] * 3 + [spec(3, at) if keyed else per_head, spec(2, at), spec(4, at),
+                                 spec(1, 0 if split == 0 else None), *([] if keyed else [per_head])]
+    mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    assert_runs_per_shard(stepped, draw, specs, mesh, f"{form} decode split over {axis}",
                           seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 

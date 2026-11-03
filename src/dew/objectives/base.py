@@ -48,6 +48,7 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.distributed.placement import Layout, RefinesLayout
+from dew.nn.derivatives import surrogate
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import (
@@ -659,18 +660,17 @@ class ProgramModule(NamedTuple):
     more than a tile (`Objective.unfuse_head`)."""
 
 
-@jax.custom_jvp
-def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
-    """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`)."""
-    return value
-
-
-@_ruled.defjvp
-def _ruled_jvp(primals, tangents):
-    value, rule, _ = primals
+def _ruled_tangent(primals, tangents, _value) -> jax.Array:
+    """`_ruled`'s tangent: the value's own, and in `params` the rule's inner product with their tangent."""
+    _, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
-                                    zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+    return moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
+                             zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+
+
+_ruled = surrogate(lambda value, rule, params: value, _ruled_tangent)
+"""`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`): a surrogate
+(`dew.nn.derivatives.surrogate`), the loss's own derivative replaced by a learning rule's."""
 
 
 class Objective(ABC, Generic[Loss, Effects]):

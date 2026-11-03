@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.kernels.generation import linear_tangent
+from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, divided
 
 from .guidance import Guidance, Walk
@@ -132,8 +132,9 @@ FLOOR = -4096
 
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each `x` as its significand, in [1, 2) or zero, and its exponent (`_exponent`), `x = significand *
-    2**exponent` for a normal `x`."""
-    exponent = _exponent(x)
+    2**exponent` for a normal `x`. A zero's exponent is none, so a derivative of a zero (a residual of
+    zero's, at a higher order) is not taken up past float32's range before its restoration."""
+    exponent = jnp.where(x == 0, 0, _exponent(x))
     return _scaled(x, -exponent), exponent
 
 
@@ -156,7 +157,8 @@ def _differences(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Arra
     plain subtraction, a coordinate's two operands shifted first as `_shift` asks (`2**127 - -2**127`,
     two neighbouring tiny values), so every coordinate a plain subtraction holds is that subtraction
     and no other coordinate moves."""
-    shift = _shift(jnp.maximum(_exponent(left), _exponent(right)))
+    # Two zeros take no shift, as `_split` takes a zero up by none.
+    shift = jnp.where((left == 0) & (right == 0), 0, _shift(jnp.maximum(_exponent(left), _exponent(right))))
     return _scaled(left, -shift) - _scaled(right, -shift), shift
 
 
@@ -173,11 +175,19 @@ def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
     float32's, does not ask."""
     (left_part, left_power), (right_part, right_power) = _split(left), _split(right)
     products = left_part * right_part
-    powers = jnp.where(products != 0, left_power + right_power + left_shift + right_shift, FLOOR)
+    powers = left_power + right_power + left_shift + right_shift
     count = math.prod(left.shape[1:])
-    top = jnp.max(powers, axis=tuple(range(1, left.ndim)))
-    excess = _shift(top, 2 + math.ceil(math.log2(max(count, 1))))
+    top = jnp.max(jnp.where(products != 0, powers, FLOOR), axis=tuple(range(1, left.ndim)))
+    excess = _unshifted_at_zero(top, _shift(top, 2 + math.ceil(math.log2(max(count, 1)))))
+    # Each product restored by its own powers, a zero's included, so a derivative of a zero product (a
+    # residual of zero, `_half_mahalanobis`'s second order) is restored as its value would be.
     return _scaled(products, powers - expand(excess, powers)).sum(axis=tuple(range(1, left.ndim))), excess
+
+
+def _unshifted_at_zero(top: jax.Array, shift: jax.Array) -> jax.Array:
+    """`shift`, or none where every value is zero (`top` is `FLOOR`): a zero's derivatives are then
+    restored by their own powers, not taken past float32's range by the floor's."""
+    return jnp.where(top == FLOOR, 0, shift)
 
 
 def _quotient(numerator: jax.Array, power: jax.Array, divisor: jax.Array) -> Split:
@@ -195,7 +205,7 @@ def _sum(left: Split, right: Split) -> jax.Array:
     (left_value, left_power), (right_value, right_power) = left, right
     top = jnp.maximum(jnp.where(left_value != 0, left_power + _exponent(left_value), FLOOR),
                       jnp.where(right_value != 0, right_power + _exponent(right_value), FLOOR))
-    shift = _shift(top, 1)
+    shift = _unshifted_at_zero(top, _shift(top, 1))
     return _scaled(_scaled(left_value, left_power - shift) + _scaled(right_value, right_power - shift), shift)
 
 
@@ -214,55 +224,9 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     end (`_scaled`): a squared difference past float32's largest over a variance as wide, or a
     variance whose double overflows; and taken up where every value lies below 2**-63, so it keeps
     what the plain formula would flush (`_shift`). It keeps every term the plain formula keeps. Its
-    derivatives are `_gaussian_kl`'s."""
+    derivatives are `_gaussian_kl`'s and `_half_mahalanobis`'s."""
     *_, (quotient, power) = _divergence_parts(mean, reference, variance)
     return _scaled(quotient, power)
-
-
-@jax.custom_jvp
-def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`_divergence`, whose forward mode is the plain `sum(d * (t_mean - t_reference)) / v - KL * t_v /
-    v` formed as the KL is: the tangents' difference (`_differences`), its sum of products against the
-    difference (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms
-    joined (`_sum`), each taken down only by what keeps it in range. Its tangent reads the tangents'
-    exponents, so it is forward mode alone: reverse mode is `_kl_pullback`'s (`linear_tangent`), and a
-    derivative of the reverse mode in forward mode is not defined."""
-    return _divergence(mean, reference, variance)
-
-
-@_directional.defjvp
-def _directional_jvp(primals, tangents):
-    """`_directional`'s tangent, the plain formula's, each step taken down only where it would overflow."""
-    mean_tangent, reference_tangent, variance_tangent = tangents
-    difference, shift, (quotient, power) = _divergence_parts(*primals)
-    along, excess = _summed_products(difference, shift, *_differences(mean_tangent, reference_tangent))
-    stretch, stretch_power = _split(variance_tangent)
-    variance_term = _quotient(-(quotient * stretch), power + stretch_power, primals[2])
-    moved = _sum(_quotient(along, excess, primals[2]), variance_term)
-    return _scaled(quotient, power), moved
-
-
-def _kl_pullback(saved, operands, cotangent):
-    """The KL's reverse mode, the plain formula's: each element's `cotangent * (mean - reference) /
-    variance`, the reference's its negation, and the variance's `-cotangent * KL / variance`, each product
-    of significands (`_split`) with its exponents added, each quotient as its significands' (`_quotient`),
-    and each power restored once (`_scaled`)."""
-    del saved
-    difference, shift, (quotient, power) = _divergence_parts(*operands)
-    variance = operands[2]
-    (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
-    level, spread = _split(variance)
-    # The plain order, the product then the division, and the division IEEE's (`divided`), where
-    # XLA:CPU takes a division by a broadcast as a product with its reciprocal.
-    pulled = _scaled(divided(expand(scale, part) * part, expand(level, part)),
-                     expand(scale_power - spread, part) + part_power + shift)
-    to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
-    return pulled, -pulled, _scaled(*to_variance)
-
-
-def _measured(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> tuple[jax.Array, tuple]:
-    """`_divergence`, with nothing its reverse mode keeps (`linear_tangent`'s `forward`)."""
-    return _divergence(mean, reference, variance), ()
 
 
 @jax.custom_jvp
@@ -306,10 +270,54 @@ def _half(power: jax.Array) -> jax.Array:
     return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
-_gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)
-"""`_divergence` differentiated through Dew's seam (`dew.nn.kernels.generation.linear_tangent`): its
-forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each forming every difference,
-product and quotient from operands scaled to range."""
+@jax.custom_jvp
+def _gaussian_kl(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`_divergence`, the KL of two transitions of one variance, differentiated as one linear map: its
+    forward mode `_kl_tangent`'s, its reverse mode `_kl_pullback`'s, each forming every difference,
+    product and quotient from operands scaled to range, so each is finite wherever its derivative is,
+    whatever the tangents' or the cotangent's scale; a higher order differentiates either's arithmetic
+    in the operands, so a forward derivative of the gradient runs (ledger 2383)."""
+    return _divergence(mean, reference, variance)
+
+
+@_gaussian_kl.defjvp
+def _gaussian_kl_jvp(primals, tangents):
+    return _gaussian_kl(*primals), linear_map(_kl_tangent, _kl_pullback, primals, tangents)
+
+
+def _kl_tangent(primals: tuple[jax.Array, jax.Array, jax.Array],
+                tangents: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+    """The KL's forward mode, the plain `sum(d * (t_mean - t_reference)) / v - KL * t_v / v` formed as
+    the KL is: the tangents' difference (`_differences`), its sum of products against the difference
+    (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms joined
+    (`_sum`), each taken down only by what keeps it in range. It reads the tangents' exponents, so its
+    transpose is `_kl_pullback`'s, not JAX's. The density's quadratic term keeps a tangent linear in the
+    tangents (`_half_mahalanobis_jvp`), which JAX transposes and batches (`jax.hessian` of a density), and
+    which cannot join two terms past float32's range whose sum is in it, as this one does."""
+    mean_tangent, reference_tangent, variance_tangent = tangents
+    difference, shift, (quotient, power) = _divergence_parts(*primals)
+    along, excess = _summed_products(difference, shift, *_differences(mean_tangent, reference_tangent))
+    stretch, stretch_power = _split(variance_tangent)
+    variance_term = _quotient(-(quotient * stretch), power + stretch_power, primals[2])
+    return _sum(_quotient(along, excess, primals[2]), variance_term)
+
+
+def _kl_pullback(primals: tuple[jax.Array, jax.Array, jax.Array],
+                 cotangent: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The KL's reverse mode, the plain formula's: each element's `cotangent * (mean - reference) /
+    variance`, the reference's its negation, and the variance's `-cotangent * KL / variance`, each product
+    of significands (`_split`) with its exponents added, each quotient as its significands' (`_quotient`),
+    and each power restored once (`_scaled`)."""
+    difference, shift, (quotient, power) = _divergence_parts(*primals)
+    variance = primals[2]
+    (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
+    level, spread = _split(variance)
+    # The plain order, the product then the division, and the division IEEE's (`divided`), where
+    # XLA:CPU takes a division by a broadcast as a product with its reciprocal.
+    pulled = _scaled(divided(expand(scale, part) * part, expand(level, part)),
+                     expand(scale_power - spread, part) + part_power + shift)
+    to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
+    return pulled, -pulled, _scaled(*to_variance)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

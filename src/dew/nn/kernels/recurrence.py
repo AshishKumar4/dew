@@ -19,6 +19,7 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+import math
 from typing import Any, ClassVar
 
 import jax
@@ -569,8 +570,18 @@ class Launch:
 
 WARPS = Launch(0, 8)
 """The launch over a whole head."""
-COLUMNS = Launch(32, 8)
-"""The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
+COLUMNS = Launch(32, 4)
+"""The launch over value columns: 32 a program, four warps (as fast as eight or faster on an H100 and an A100,
+step-configs at b98bf618f). Mamba-2 2.7B's decode token took 1.3 to 1.5% longer on an A100 at 64, its
+program's 164 registers holding three blocks a multiprocessor against 82's five, and an H100 within 2% either
+way (step-ncu2 at 6a4dc937b, 32 and 128 rows)."""
+
+KEYED_COLUMNS = 64
+"""The value columns a program takes under a decay a key dimension: its key dimension's decays and
+exponentials amortized over twice the block, 21% fewer instructions a token. Kimi Linear's decode token at
+128 rows took 0.2003 ms on an H100 at 64 against 0.2082 at 32, and on an A100 0.4333 against 0.4268, its 157
+registers three blocks a multiprocessor against 89's five (grid-ab and step-ncu2 at 6a4dc937b): the H100's
+gain the larger."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -665,7 +676,8 @@ class StepLaunch(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> Launch:
         if _whole(ba.kwargs['hooks']):
             return WARPS
-        return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
+        widest = KEYED_COLUMNS if ba.kwargs['hooks'].decay == 'vector' else COLUMNS.block
+        return dataclasses.replace(COLUMNS, block=column_block(ba.arguments['state'].shape[-1], widest))
 
     def pinnable(self, ba, config) -> bool:
         # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
@@ -680,6 +692,14 @@ class StepLaunch(tuning.KernelOp):
             return super().unpinnable(ba, config)
         return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
                 "dividing the state's width")
+
+
+def column_block(width: int, widest: int = COLUMNS.block) -> int:
+    """A program's block of a head's `width` value columns: the widest power of two dividing it up to
+    `widest` (itself one), so the programs a head takes cover its every column and a Triton block's
+    size is a power of two. `min(COLUMNS.block, width)` launched `width // block` programs, which left an
+    80-wide head's last 16 columns unwritten and their state stale (quality audit, 2026-11-03)."""
+    return math.gcd(width, widest)
 
 
 def _whole(hooks: Hooks) -> bool:

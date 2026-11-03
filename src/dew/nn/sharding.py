@@ -519,6 +519,16 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def varying_like(x: jax.Array, *operands) -> jax.Array:
+    """`x` varying over every manual axis (a checked `shard_map`'s) any of `operands` varies over (None for
+    none): a scan's carry seeded so keeps its type through steps that read them, as a step's output varies
+    wherever an input does."""
+    axes = frozenset().union(*(jax.typeof(operand).mat.varying for operand in operands
+                               if operand is not None))
+    missing = tuple(sorted(axes - jax.typeof(x).mat.varying))
+    return jax.lax.pcast(x, missing, to="varying") if missing else x
+
+
 def automatic_axes() -> tuple[str, ...]:
     """The axes of the context's mesh larger than one device that no
     `shard_map` holds manual: those over which XLA's partitioner, not a

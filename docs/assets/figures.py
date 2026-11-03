@@ -1220,14 +1220,21 @@ def cfg_sweep_figure():
 
 
 Part = tuple[str, Sequence[str], str, tuple[float, float, float, float], int]
-"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; or
-"plain"), where it sits in the wide layout (x, y, width, height), and its row: parts of one row are
-alternatives, drawn side by side wide and boxed together on a phone, never with an arrow between them."""
+"""A part of an architecture figure: its title, its lines, its kind ("dew", Dew's own engine, teal; "plain";
+"elsewhere", built on another branch, amber), where it sits in the wide layout (x, y, width, height), and its
+row: parts of one row are alternatives, drawn side by side wide and boxed together on a phone, never with an
+arrow between them."""
 
 
 def part(svg: Figure, x, y, w, h, title, lines, kind: str):
     """One part, drawn as its kind is (`Part`)."""
-    box(svg, x, y, w, h, title, lines, accent=kind == "dew")
+    if kind == "elsewhere":
+        svg.rect(x, y, w, h, fill="warm_fill", stroke="warm")
+        svg.text(x + 12, y + 23, title, size=14, mono=True, weight=600)
+        for i, line in enumerate(lines):
+            svg.text(x + 12, y + 45 + 19 * i, line, size=13, color="muted")
+    else:
+        box(svg, x, y, w, h, title, lines, accent=kind == "dew")
 
 
 def drawn(name: str, label: str, size: tuple[int, int], parts: Sequence[Part],
@@ -1283,46 +1290,51 @@ def architecture_flow_figure():
     """One training run through Dew, from the user's code to the GPU (docs/design/architecture.md)."""
     label = ("One training run through Dew. A script calls Trainer(objective, optax, key).fit(data), or "
              "dew train builds the same Trainer from a RunConfig. Trainer.fit compiles the step: jax.jit "
-             "traces it, it is lowered to StableHLO with kernels as custom calls, and XLA compiles it. "
-             "Kernels come from Dew's templates, vendor libraries or XLA, and run in one executable per "
-             "step.")
+             "traces it, the algebra pass rewrites the jaxpr, it is lowered to StableHLO with kernels as "
+             "custom calls, and XLA compiles it. Kernels come from Dew's templates, vendor libraries or XLA, "
+             "and run in one executable per step, where on sm90 and later a Mosaic launch may start the next "
+             "early.")
     parts = [
         ("Trainer(…).fit(data)", ["a script or notebook"], "plain", (110, 16, 340, 62), 0),
         ("or: dew train run.json", ["RunConfig builds the same Trainer"], "plain", (462, 16, 282, 62), 0),
         ("Trainer.fit", ["compiles a step per batch shape,", "runs it every micro-batch"], "plain",
          (110, 100, 634, 81), 1),
-        ("jax.jit", ["traces the step"], "plain", (110, 203, 206, 62), 2),
-        ("lower", ["StableHLO"], "plain", (324, 203, 206, 62), 3),
-        ("XLA compile", ["fuses, runs ptxas"], "plain", (538, 203, 206, 62), 4),
-        ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62), 5),
-        ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62), 5),
-        ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62), 5),
-        ("one executable per step", ["its kernels run in order"], "plain", (110, 371, 634, 62), 6),
+        ("jax.jit", ["traces the step"], "plain", (110, 203, 140, 62), 2),
+        ("algebra pass", ["rewrites the jaxpr"], "dew", (258, 203, 160, 62), 3),
+        ("lower", ["StableHLO"], "plain", (426, 203, 150, 62), 4),
+        ("XLA compile", ["fuses, runs ptxas"], "plain", (584, 203, 160, 62), 5),
+        ("Dew's templates", ["Mosaic GPU, Triton, TPU"], "dew", (110, 287, 220, 62), 6),
+        ("vendor kernels", ["FlashAttention, cuDNN"], "plain", (338, 287, 200, 62), 6),
+        ("XLA", ["fusions, cuBLAS"], "plain", (546, 287, 198, 62), 6),
+        ("one executable per step", ["its kernels run in order; from sm90 a",
+                                     "Mosaic launch may start the next early"], "plain", (110, 371, 634, 81), 7),
     ]
 
     def wide(svg: Figure) -> None:
         for y, lane in ((49, "YOUR CODE"), (142, "TRAINER"), (236, "COMPILE"), (320, "KERNELS"),
                         (404, "GPU")):
             svg.text(16, y, lane, size=11, weight=600, color="muted")
-        for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 181, 427, 201), (316, 234, 322, 234),
-                               (530, 234, 536, 234), (427, 265, 427, 285), (427, 349, 427, 369)):
+        for x1, y1, x2, y2 in ((427, 78, 427, 98), (427, 181, 427, 201), (250, 234, 256, 234),
+                               (418, 234, 424, 234), (576, 234, 582, 234), (427, 265, 427, 285),
+                               (427, 349, 427, 369)):
             svg.arrow(x1, y1, x2, y2)
 
-    drawn("architecture-flow", label, (760, 449), parts, wide, flows=range(6))
+    drawn("architecture-flow", label, (760, 468), parts, wide, flows=range(7))
 
 
 def architecture_template_figure():
     """A kernel template's layers, and an attention forward call through them."""
     label = ("A template's layers, top deciding: choice derives one config from device facts; the mainloop "
-             "orders the bundle's steps; the toolkit holds one Family per instruction family, and the bundles "
-             "WGMMA, FED and Mma; then structure, hooks and the algebra. An "
+             "orders the bundle's steps; the toolkit's Family is an issuer and a transport, its bundles "
+             "WGMMA, FED, Mma and MmaFed routed and TCGEN05 not; then structure, hooks and the algebra. An "
              "attention forward call goes from attention_route through MosaicForward.derived, bundles.of, "
              "the launch and each consumer's walk.")
     parts = [
         ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62), 0),
         ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62), 1),
-        ("toolkit: one Family each", ["instructions, rings, roles, registers;",
-                                      "bundles: WGMMA, FED, Mma"], "dew", (16, 174, 400, 81), 2),
+        ("toolkit: Family = Issuer + Transport", ["products, waits, walks, rings, roles;",
+                                                  "WGMMA, FED, Mma, MmaFed; TCGEN05 unrouted"], "dew",
+         (16, 174, 400, 81), 2),
         ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62), 3),
         ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62), 4),
         ("algebra", ["init, step, merge, finish on tiles"], "dew", (16, 403, 400, 62), 5),
@@ -1347,6 +1359,93 @@ def architecture_template_figure():
           headings={0: layers, 6: call})
 
 
+def architecture_pass_figure():
+    """The compile-time algebra pass, from a traced jaxpr to the program XLA compiles."""
+    label = ("The compile-time algebra pass. The traced jaxpr's arithmetic becomes terms, the rest opaque "
+             "leaves; windows form around each head a rule can cheapen, and each cluster of them saturates "
+             "under facts and the identities, linear and joined rule sets within a budget; egglog's greedy "
+             "DAG extraction picks each form by its price in seconds; a region's forms go in only where "
+             "it costs less, and the outer jit lowers the result for XLA.")
+    parts = [
+        ("traced jaxpr", ["the whole step,", "backward included"], "plain", (16, 16, 170, 81), 0),
+        ("terms", ["language equations become terms;", "the rest stay opaque"], "dew", (204, 16, 260, 81), 1),
+        ("windows", ["each cheapenable head, two producer", "levels; clusters of 64 equations"], "dew",
+         (482, 16, 262, 81), 2),
+        ("saturate", ["each cluster its own e-graph:", "identities, linear, joined"], "dew",
+         (16, 137, 240, 81), 3),
+        ("extract", ["greedy DAG, priced by cost.fused", "a shared value counted once"], "dew",
+         (274, 137, 220, 81), 4),
+        ("splice", ["a region's forms, where the", "region costs less"], "dew", (512, 137, 232, 81), 5),
+        ("outer jit lowers → XLA", [], "plain", (512, 259, 232, 54), 6),
+    ]
+
+    def wide(svg: Figure) -> None:
+        svg.rect(16, 259, 478, 54, fill="none", stroke="rule")
+        svg.text(28, 281, "switch: dew.algebra.passes(on, target), on by default", size=12, color="muted")
+        svg.text(28, 301, "loop bodies are rewritten in place, never unrolled", size=12, color="muted")
+        svg.arrow(186, 56, 202, 56)
+        svg.arrow(464, 56, 480, 56)
+        svg.polyline([(613, 97), (613, 117), (136, 117), (136, 135)], color="muted", width=1.25)
+        svg.arrow(256, 177, 272, 177)
+        svg.arrow(494, 177, 510, 177)
+        svg.arrow(628, 218, 628, 257)
+
+    drawn("architecture-pass", label, (760, 329), parts, wide, flows=range(6),
+          note=["dew.algebra.passes(on, target), on by default;", "loop bodies rewritten in place"])
+
+
+def architecture_derived_figure():
+    """How a template's algebra is derived from a declaration, behind one switch."""
+    label = ("The derivation of a Reduction: the declaration is traced at one tile into terms, facts mark "
+             "the walked sums and maxima, the step, merge and finish readings saturate under the decoupled "
+             "rules, and extraction priced by the tile walk yields init, step, merge and finish, or "
+             "refuses. The switch dew.cache.DERIVED, off by default, chooses the derived forms or the "
+             "hand-written ones for the template's plain_step, merge and finish.")
+    parts = [
+        ("declaration", ["a Reduction:", "softmax(s)·v by keys"], "plain", (16, 16, 172, 81), 0),
+        ("traced at a tile", ["terms; facts mark", "walked sums, maxima"], "dew", (200, 16, 172, 81), 1),
+        ("saturate", ["step, merge, finish;", "decoupled rules"], "dew", (384, 16, 172, 81), 2),
+        ("extract", ["priced by the tile", "walk, or refused"], "dew", (568, 16, 176, 81), 3),
+        ("Derived", ["init, step, merge,", "finish"], "dew", (568, 143, 176, 81), 4),
+        ("dew.cache.DERIVED", ["one switch,", "off by default"], "elsewhere", (272, 143, 240, 81), 5),
+        ("hand-written forms", ["attention_algebra,", "recurrence_algebra"], "plain", (16, 143, 220, 81), 4),
+        ("plain_step, merge, finish", [], "plain", (196, 252, 392, 40), 6),
+    ]
+
+    def wide(svg: Figure) -> None:
+        for x1, y1, x2, y2 in ((188, 56, 198, 56), (372, 56, 382, 56), (556, 56, 566, 56),
+                               (656, 97, 656, 141), (568, 183, 514, 183), (236, 183, 270, 183),
+                               (392, 224, 392, 250)):
+            svg.arrow(x1, y1, x2, y2)
+
+    drawn("architecture-derived", label, (760, 300), parts, wide, flows=range(6),
+          headings={4: "DERIVED, OR HAND-WRITTEN"})
+
+
+def architecture_cost_figure():
+    """One cost vocabulary, two schedules."""
+    label = ("One cost vocabulary, two schedules. templates.cost.Work counts tensor-core FLOPs, fp32 "
+             "operations, SFU exponentials, conversions and device and shared bytes, over the device facts "
+             "of GpuTarget. cost.fused, XLA's fusion, prices the compile-time pass; cost.walk, the "
+             "template's tile walk, prices derived forms.")
+    parts = [
+        ("GpuTarget + Architecture", ["rates, bandwidth, clock, SMs"], "plain", (230, 16, 300, 62), 0),
+        ("templates.cost.Work", ["tensor FLOPs, fp32 ops, SFU exp,", "conversions, device, shared bytes"],
+         "dew", (170, 104, 420, 81), 1),
+        ("cost.fused: XLA's fusion", ["whole-device rates, in series", "with memory: prices the pass"], "dew",
+         (16, 229, 350, 81), 2),
+        ("cost.walk: the tile walk", ["one tile on one SM, units", "overlapped: prices derived forms"], "dew",
+         (394, 229, 350, 81), 2),
+    ]
+
+    def wide(svg: Figure) -> None:
+        svg.arrow(380, 78, 380, 102)
+        svg.arrow(300, 185, 200, 227, color="accent")
+        svg.arrow(460, 185, 560, 227, color="accent")
+
+    drawn("architecture-cost", label, (760, 326), parts, wide, flows=range(2))
+
+
 FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pipeline": data_figure,
            "diffusion-forward": diffusion_figure, "moe-routing": moe_routing_figure,
            "post-training": post_training_figure, "rlvr-loop": rlvr_loop_figure,
@@ -1357,7 +1456,9 @@ FIGURES = {"mesh": mesh_figure, "training-loop": training_step_figure, "data-pip
            "pretrained-round-trip": pretrained_round_trip_figure, "jepa-step": jepa_step_figure,
            "lm-next-token": lm_next_token_figure, "agent-episode": agent_episode_figure,
            "agent-lanes": agent_lanes_figure, "architecture-flow": architecture_flow_figure,
-           "architecture-template": architecture_template_figure}
+           "architecture-pass": architecture_pass_figure,
+           "architecture-template": architecture_template_figure,
+           "architecture-derived": architecture_derived_figure, "architecture-cost": architecture_cost_figure}
 
 
 if __name__ == "__main__":

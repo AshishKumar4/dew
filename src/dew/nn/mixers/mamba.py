@@ -44,7 +44,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import recurrence_chunk
+from dew.nn.kernels import recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
@@ -83,8 +83,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
 
     def one_chunk(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
-        decay = jnp.exp(dt_c[..., None] * A)                # [B, C, D, N]
-        decay = jnp.where(reset_c[..., None, None], 0.0, decay)
+        # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
+        decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
+                                                   1.0 - reset_c[..., None, None].astype(work))
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
         # The reference's `combine_fn` (modeling_mamba.py:231-234).
         decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)

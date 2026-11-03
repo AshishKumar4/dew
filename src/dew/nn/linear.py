@@ -528,24 +528,29 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
 
 
 def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
-                      value: jax.Array, log_decay: jax.Array, beta: jax.Array, active: jax.Array | None
-                      ) -> tuple[jax.Array, jax.Array]:
+                      value: jax.Array, log_decay: jax.Array | None, beta: jax.Array,
+                      active: jax.Array | None, *, rate: jax.Array | None = None,
+                      skip: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
     """`recurrence.step`'s `(output [B, Hv, Dv], state')` of a decode token of `query`, `key`,
-    `value` `[B, H, D]`, `log_decay` and `beta` `[B, Hv]` over its `state` `[B, Hv, Dk, Dv]`, run per
-    shard (`manual_map`), each shard's rows and heads with their state: the launch has no partitioning
-    rule, and the state is most of a decode step's bytes. A row `active` `[B]` marks False keeps its
-    state."""
+    `value` `[B, H, D]`, `log_decay` (`[B, Hv]` a head's, `[B, Hv, Dk]` a key dimension's, None under a
+    rated decay) and `beta` `[B, Hv]` over its `state` `[B, Hv, Dk, Dv]`, a rated decay's `rate` and the
+    skip's `skip` `[Hv]` where its hooks take them, run per shard (`manual_map`), each shard's rows and
+    heads with their state: the launch has no partitioning rule, and the state is most of a decode step's
+    bytes. A row `active` `[B]` marks False keeps its state."""
     active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
     rows, heads = grouped_heads((state.shape[0], 1, *value.shape[1:]), key.shape[1])
     three, two, memory = P(rows, heads, None), P(rows, heads), P(rows, heads, None, None)
+    given = {name: operand for name, operand in (('query', query), ('key', key), ('value', value),
+                                                  ('log_decay', log_decay), ('beta', beta), ('rate', rate),
+                                                  ('skip', skip)) if operand is not None}
+    specs = {name: (P(heads) if name in ('rate', 'skip') else three if operand.ndim == 3 else two)
+             for name, operand in given.items()}
 
-    def local(query, key, value, log_decay, beta, held, active):
-        out, _, final = recurrence.step(hooks, recurrence.Step(
-            held, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active))
+    def local(held, active, given):
+        out, _, final = recurrence.step(hooks, recurrence.Step(held, active=active, **given))
         return out, final
 
-    return manual_map(local, (three, three, three, two, two, memory, P(rows)), (three, memory))(
-        query, key, value, log_decay, beta, state, active)
+    return manual_map(local, (memory, P(rows), specs), (three, memory))(state, active, given)
 
 
 def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool) -> str:
@@ -556,21 +561,46 @@ def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool) -> st
 
 
 def decode_step(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
-                value: jax.Array, log_decay: jax.Array, beta: jax.Array,
-                active: jax.Array | None) -> tuple[jax.Array, jax.Array]:
+                value: jax.Array, log_decay: jax.Array | None, beta: jax.Array,
+                active: jax.Array | None, *, rate: jax.Array | None = None,
+                skip: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
     """A decode token's `(output, state')` through the shared recurrence, its operands as
     `stepped_per_shard` takes them: the step kernel per shard where `decode_kernel` picks it, else the
     portable step (`recurrence.step_reference`) in the operands' own precision, which the compiler
     partitions."""
     if decode_kernel(state, fuses=False) == 'step':
-        return stepped_per_shard(hooks, state, query, key, value, log_decay, beta, active)
+        return stepped_per_shard(hooks, state, query, key, value, log_decay, beta, active, rate=rate,
+                                 skip=skip)
     out, _, final = recurrence.step_reference(hooks, recurrence.Step(
-        state, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active))
+        state, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active, rate=rate,
+        skip=skip))
     return out, final
 
 
 STEP = recurrence.Hooks(decay='scalar')
 """The decode step between the layer's own conv and norm: the delta rule with one decay a head."""
+
+KEY_STEP = recurrence.Hooks(decay='vector')
+"""The decode step between Kimi delta attention's own conv and norm: the delta rule with a decay a key
+dimension."""
+
+
+def decode_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
+    """`recurrent_delta_rule` for one decode token `[B, 1, H, D]` of a decay a key dimension `g`
+    `[B, 1, H, Dk]` (Kimi delta attention's), through the recurrence's decode step (`decode_step`): the step
+    kernel where the decode selector gives it (`DELTA_DECODE`), the state read and written once, else the
+    portable step; a row `starts` marks enters a zero memory. Returns the output `[B, 1, H, Dv]` and the
+    state in fp32."""
+    work = jnp.float32
+    query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
+    if state is None:
+        state = jnp.zeros((*value.shape[:2], key.shape[-1], value.shape[-1]), work)
+    state = jnp.asarray(state, work)
+    if starts is not None:
+        state = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], jnp.zeros((), work), state)
+    out, final = decode_step(KEY_STEP, state, query * key.shape[-1] ** -0.5, key, value,
+                             g[:, 0].astype(work), beta[:, 0].astype(work), None)
+    return out[:, None], final
 
 
 @dataclasses.dataclass(frozen=True)

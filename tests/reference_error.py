@@ -135,10 +135,18 @@ def ieee_fixture(path) -> dict[str, np.ndarray]:
 
 
 def widened(tree):
-    """`tree` as float64 host arrays, its integer leaves as they are: the
-    inputs of a float64 truth."""
-    return jax.tree.map(lambda leaf: np.asarray(
-        leaf, np.float64 if _floating(leaf.dtype) else leaf.dtype), tree)
+    """`tree` in float64, its integer leaves as they are: the inputs of a float64 truth. A leaf an
+    accelerator holds is widened where it lies, so its truth runs on that device's FP64 units with no host
+    round trip (a decode step's keys and values, a hundred megabytes a draw to the host and back); any other
+    is a host array."""
+    def wide(leaf):
+        if isinstance(leaf, jax.Array) and _floating(leaf.dtype) and all(
+                device.platform != "cpu" for device in leaf.devices()):
+            with jax.enable_x64(new_val=True):
+                return leaf.astype(jnp.float64)
+        return np.asarray(leaf, np.float64 if _floating(leaf.dtype) else leaf.dtype)
+
+    return jax.tree.map(wide, tree)
 
 
 def _stack_draws(trees):
@@ -1149,7 +1157,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once. With
     `also`, further references run beside it on Dew's own inputs, each held to Dew's truth, Dew and the
     truth evaluated once for them all: the reference's draws, then each further reference's, a list. With
-    `terms_fn`, the truth is that program's evaluated op by op with each output's terms (`float64_terms`),
+    `terms_fn`, the truth is that program's with each output's terms (`float64_terms`),
     every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
     terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
     widened inputs."""
@@ -1177,7 +1185,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             with jax.enable_x64(new_val=True):
                 return truth, terms_fn.of(truth, *widened(inputs))
         with jax.enable_x64(new_val=True):
-            return float64_terms(terms_fn, *widened(inputs))
+            return terms_fn(*widened(inputs))
 
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
@@ -1797,10 +1805,13 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
     """The site's terms program: `terms_fn`, the site's own, or by default (`terms` None) one sized from
     `truth` where its first draw holds a row of float64 zero (`_cancelling_terms`); none where `terms` is
     False, or in a judge, whose draws are its map tasks' records, each row sized by the terms its task
-    found (`map_judge.judging`): no truth runs there."""
-    if terms_fn is not None or terms is False or judging():
-        return terms_fn
-    return _cancelling_terms(draw, truth, truth_program if isinstance(truth_program, _Truth) else None)
+    found (`map_judge.judging`): no truth runs there. A program traced for its terms is traced once a
+    signature, its static runs compiled once for the site's every draw (`float64_terms`)."""
+    if terms is not False and not judging() and terms_fn is None:
+        program = truth_program if isinstance(truth_program, _Truth) else None
+        terms_fn = _cancelling_terms(draw, truth, program)
+    return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
+        float64_terms, terms_fn)
 
 
 def _narrow(draws: _Draws) -> list[str]:

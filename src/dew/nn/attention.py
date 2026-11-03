@@ -979,20 +979,24 @@ def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dty
                                             force_fp32_for_softmax=force_fp32_for_softmax)
     return _masked_kernel(implementation, None if implementation == 'auto' else implementation, query, key,
                           ('cudnn', 'xla', 'reference'), dtype=dtype, precision=precision,
-                          force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks)
+                          force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+                          as_bias=True)
 
 
 def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
                    preference: tuple[str, ...], *, dtype, precision, force_fp32_for_softmax, softcap=None,
-                   sinks: bool = False) -> AttentionImpl:
+                   sinks: bool = False, as_bias: bool = False) -> AttentionImpl:
     """The attention selector's kernel for a call of `implementation` with a mask (`selection.selected`,
     reporting nothing: the dispatch that runs it reports its route): `named` where it takes the call, else
     one a run's context forces, else `preference`'s first that takes it, the reference path where xla hands
-    it on (`attention_kernels.XLA_SUPPORTS`)."""
+    it on (`attention_kernels.XLA_SUPPORTS`). A mask the call hands cuDNN as its dense bias (`as_bias`, as
+    jax's cuDNN path takes a mask, `combine_bias_and_mask`) is that bias to the selector, its rows' own;
+    any other an arbitrary mask (`AttentionCase.mask`), which cuDNN is measured slower at."""
+    form = {"bias": True, "dense_bias": True, "row_bias": True} if as_bias else {"mask": True}
     case = dataclasses.replace(
         attention_case(query, key, dtype=dtype, precision=precision,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
                        sinks=True if sinks else None, named=implementation),
-        mask=True, folds=False)
+        folds=False, **form)
     return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
                                                               preference=preference).name))

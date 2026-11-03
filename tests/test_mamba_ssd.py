@@ -27,7 +27,6 @@ from reference_error import (
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
-from whole_suite import timed
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -109,19 +108,36 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
                         and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
 
 
-PAST_TARGET = {"port": {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}}
-"""The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
-66a222273, ledger 2119), which the whole suite runs (`timed`)."""
+SEEDS = {128: ["bf16", "whole-chunks"], 256: ["ragged-documents", "wide-state-documents"]}
+"""The port's cases by their recorded seeds, each past or at two minutes in one process: bf16 256 seconds,
+ragged documents 130, wide-state documents 297 (train 270's CI on 66a222273, ledger 2119) and whole chunks
+136 (ssd-shards on 052cc16d8), each seed 0.5 to 2 seconds of the interpreter's. Each runs as armada's map
+tasks of seeds and their judge (`check1_shards`), every seed drawn and judged as one process would."""
 
 
-@pytest.mark.parametrize("case", timed(PAST_TARGET, "port", list(CASES)))
+@pytest.mark.parametrize("case", SEEDS[128])
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 def test_the_port_is_as_exact_as_mamba_ssm(case):
     """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
 
     The truth is mamba_ssm's minimal torch reference in float64. Each of the case's head counts (`CASES`:
     kernels summing a group's heads take that many a program) runs every declared draw, each draw's truth
-    taken once for all of them.
+    taken once for all of them. A map task draws 16 seeds of both cases: 79 s, where 24 took 100
+    (ssd-shards2 on 2bd537430, 2.5 s a seed past 39 s of compiles).
     """
+    _port_holds_check_1(case)
+
+
+@pytest.mark.parametrize("case", SEEDS[256])
+@pytest.mark.check1_shards(seeds=256, per_task=24)
+def test_the_documents_port_cases_are_as_exact_as_mamba_ssm(case):
+    """`test_the_port_is_as_exact_as_mamba_ssm` over the cases of 256 recorded seeds (`SEEDS`), a map task
+    drawing 24 of both (32 took 69 to 91 s, ssd-shards on 052cc16d8)."""
+    _port_holds_check_1(case)
+
+
+def _port_holds_check_1(case):
+    """The port case's check 1 (`test_the_port_is_as_exact_as_mamba_ssm`)."""
     stored = recording(SEEDED)
     precision = str(stored.pop(PRECISION, "no precision"))
     if precision != "ieee":

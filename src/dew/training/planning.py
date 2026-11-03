@@ -518,11 +518,24 @@ def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> di
     return {"launch": identity, "config": repr(config), "kernels": kernels}
 
 
+def rewrite_record(made) -> dict[str, JSON]:
+    """A region the algebra pass rewrote as a compile traced its program (`dew.algebra.program.AlgebraReport`,
+    `report.rewrites`): its equations, the sets admitted and the matches each fired, its iterations, nodes and
+    limits, its price before and after, its seconds, and the roots its splice took."""
+    fired: dict[str, JSON] = dict(made.fired)
+    limits: list[JSON] = list(made.limits)
+    admitted: list[JSON] = list(made.admitted)
+    return {"equations": made.equations, "admitted": admitted, "fired": fired, "iterations": made.iterations,
+            "nodes": made.nodes, "limits": limits, "limited": made.limited, "before": made.before,
+            "after": made.after, "seconds": made.seconds, "spliced": made.spliced}
+
+
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
-    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    """A kernel a compile found spilling, or a launch whose program's block XLA refused (`report.Miss`), its
+    launch's config by its text."""
     return {"kernel": miss.kernel, "op": miss.op,
             "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
-            "frame": miss.frame, "stepped": miss.stepped}
+            "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass
@@ -603,13 +616,14 @@ class FitSearch[LossT, EffectsT]:
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the search then finds its split there.
         self.derived_start(candidates[-1])
-        seen, held = len(report.misses()), set(report.refused_launches())
+        seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
-        self.kernels = {"spills": spills, "refused": refused}
+        rewrites: list[JSON] = [rewrite_record(made) for made in report.rewrites()[traced:]]
+        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)

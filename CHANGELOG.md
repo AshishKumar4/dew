@@ -80,7 +80,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   read of the training stream after its first is agreed over the coordination service only where its
   shares may run out apart, so a global order, arrays handed whole and a handed map dataset step without a
   round a step.
-- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md).
+- Dew depends on egglog 14.0.0, the e-graph engine of its algebraic rewrite pass (docs/design/algebra.md),
+  on Linux Dew's build of it, 14.0.0.post1 from Dew's package index, which registers the facts of a deep term
+  with shared subterms in linear time rather than cubic (a recurrence chunk's rewrite 243 s on 14.0.0, 9.2 s).
   egglog requires black, graphviz and anywidget unconditionally, so a core install of Dew gains 27 packages
   (127 to 154): those three with IPython and its stack (jedi, parso, prompt-toolkit, pexpect, stack-data,
   traitlets) and ipywidgets, jupyterlab-widgets, widgetsnbextension and comm.
