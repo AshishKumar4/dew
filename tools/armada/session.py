@@ -47,8 +47,8 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
     No timed dump of every thread's stack runs beside the tests, as walking threads that run killed the
     process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test,
     2026-10-25): a caller's deadline ends a hang (ci.py's `tested`: SIGINT, whose report pytest prints where
-    it can handle it, then the group killed past the grace), and a fatal signal still prints the stacks
-    (pytest's faulthandler)."""
+    it can handle it, then the group killed past the grace), its stacks written once as it passes
+    (executed.py), and a fatal signal still prints the stacks (pytest's faulthandler)."""
     runner = [*measured, "-m", "pytest"] if measured else ["pytest"]
     return [f".venv-{python}/bin/python", "-S", "-u", "-c", BOOT, *runner, "-q", *SELECTION, "-rfE",
             "--tb=short", "--continue-on-collection-errors", "-p", "no:cacheprovider", f"--junitxml={report}"]
@@ -161,13 +161,14 @@ def cut(nodes: list[str], seconds: list[float], count: int,
         recorded: Container[str] | None = None) -> list[list[str]]:
     """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
     every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
-    setup's tests in one group. Where `recorded` is given (the nodes the durations record names), a test it
-    lacks weighs nothing, alone or in a unit, recorded or new: the plan, which reads the record alone, cuts
-    the recorded tests where the task does, and the new ones ride with their neighbours (the slow-test gate
-    answers for their cost)."""
+    setup's tests in one group, at its first test `recorded` names (the nodes the durations record names,
+    where given). A test the record lacks weighs what its caller gives it (split.py: its file's mean), so a
+    new parametrization spreads across the groups from its first run, never into one group past its
+    deadline (2026-11-03: test_attention_mosaic's ~190 new ids, weighed nothing, packed into one). The plan,
+    which reads the record alone, cuts as the task does where the record names every test the task collects;
+    a group of a file it does not is run, never reused (ci.py's `record`)."""
     held = units(nodes, recorded)
-    runs = groups([sum(seconds[index] for index in unit if recorded is None or nodes[index] in recorded)
-                   for unit in held], count)
+    runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 

@@ -315,6 +315,31 @@ class MosaicForward(_Mainloop[Tiles]):
                           lambda config: self._launch_legal(ba, config, target), overlapped=True)
         return None if config is None else self._relaunched(ba, config, target)
 
+    def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
+        """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
+        ring still streams at: a program pays its ring's first `stages` tiles before its first product, and
+        a launch of more programs than the device runs at once pays it a program, so the least tile pays
+        least, where its `stages` slots hold the bytes a program's share of the device's stream keeps in
+        flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's measured `Streamed.fixed`):
+        a decode step of 128 rows over 4096 keys took 0.70 ms at 64-key tiles against 0.73 at 128 on an
+        H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
+        the 45 KB a program keeps in flight (ET-STAGES2-h100).
+        Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
+        holds, or the part's stream is unmeasured."""
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        rate, streamed = target.memory_rate, target.streamed
+        if not (streams(query, value, target) and rate and streamed and target.multiprocessors):
+            return config
+        family = bundle_of(config, query.dtype)
+        itemsize = jnp.dtype(query.dtype).itemsize
+        per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
+        in_flight = rate / target.multiprocessors * streamed.fixed
+        for extent in reversed(extents(family, query.dtype, config.block_k)):
+            candidate = dataclasses.replace(config, block_k=extent)
+            if config.stages * extent * per_key >= in_flight and self._launch_legal(ba, candidate, target):
+                return self._relaunched(ba, candidate, target) or config
+        return config
+
     def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                     ) -> Tiles | None:
         """`config` with its natural rewalk's tiles, a fold's (`Tiles.relaunch`): the largest key tile and the
@@ -499,6 +524,18 @@ def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     if page % tile == 0:
         return True
     return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
+
+
+def streams(query, value, target: generation.GpuTarget) -> bool:
+    """Whether a call's walk the device's memory bounds: the products its keys and values feed, a query row
+    of `query`'s `[B, Q, H, D]` each (4 flops a key entry, its logit's and its weighted value's), fewer a byte
+    of them than the device's dense products a byte its memory streams (`GpuTarget.peaks` over
+    `memory_rate`): a decode step's few rows a key head, never a prefill's. False where either fact is
+    unknown."""
+    peak, rate = target.peaks.get("bf16"), target.memory_rate
+    if not (peak and rate):
+        return False
+    return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < peak / rate
 
 
 def _keys(ba: tokamax.BoundArguments) -> int:

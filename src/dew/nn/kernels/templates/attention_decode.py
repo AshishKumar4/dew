@@ -99,7 +99,8 @@ class Plan:
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
          sources: jax.Array | None = None) -> Plan:
-    """The work list of a packed call (`packed`) on `target`: the forward's derived config and its slices.
+    """The work list of a packed call (`packed`) on `target`: the forward's derived config at the key tile
+    its memory-bound walk streams at least (`MosaicForward.streaming`) and its slices.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
     nothing). Else as many as its programs' residency fills (`resources.resident_programs`, its registers;
     its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter slice's
@@ -113,6 +114,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     config = op.derived(ba, target)
     if config is None:
         raise NotImplementedError(f"the template's forward derives no decode step's config on {target}")
+    # A decode step's few rows a key head stream its keys (`MosaicForward.streaming`).
+    config = op.streaming(ba, config, target)
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
     programs = query.shape[0] * query.shape[2] * tiles

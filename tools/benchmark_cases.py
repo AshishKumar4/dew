@@ -1,12 +1,16 @@
 """Benchmark cases and presets shared without importing either framework."""
 
 import dataclasses
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from flax import linen as nn
+
+    from dew._records import JSON
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -56,6 +60,12 @@ class Case:
 
     architecture: str
     config: dict[str, object] = field(default_factory=dict)
+    """The fields of the model the case builds (`trunk`'s), over the checkpoint config's where it names
+    one."""
+    hf_config: str | None = None
+    """A checkpoint's config.json, or the directory holding it, whose family's translation
+    (`dew.interop.hf_decoders.translate_config`) is the decoder's fields, `config`'s over them
+    (`trunk_fields`)."""
     dtype: str | None = None
     """Compute dtype, written into the model's `dtype` field; None takes the run's --dtype."""
     matmul_precision: str | None = None
@@ -118,6 +128,37 @@ class Case:
     fsdp_min_param_size: int = 2 ** 16
 
     @property
+    def trunk(self) -> str:
+        """The architecture whose fields `config` holds: the decoder a canvas or a media case wraps, else the
+        case's own."""
+        wrapped = self.canvas is not None or self.media is not None
+        return "causal_transformer" if wrapped else self.architecture
+
+    def trunk_fields(self) -> dict[str, object]:
+        """The fields `trunk` is built from: the checkpoint config's (`checkpoint_fields`) where the case
+        names one (`hf_config`), `config`'s fields over them."""
+        if self.hf_config is None:
+            return dict(self.config)
+        path = Path(self.hf_config)
+        read = json.loads((path / "config.json" if path.is_dir() else path).read_text())
+        return {**checkpoint_fields(read), **self.config}
+
+    def resolved(self) -> "Case":
+        """The case with its checkpoint's fields in `config` (`trunk_fields`), naming no checkpoint: what a
+        cache of its results is keyed by, whatever the checkpoint's file holds later."""
+        return dataclasses.replace(self, config=self.trunk_fields(), hf_config=None)
+
+    def record(self) -> "dict[str, JSON]":
+        """The case as the JSON object `benchmark_step.cases_from_json` reads back: each field as it is but
+        `config`, whose values are written as the records of the fields `trunk` declares
+        (`dew.registry.argument_records`): a translated config's records and its values already built
+        (a family's mixer) alike, which `dataclasses.asdict` cannot write."""
+        from dew.registry import argument_records, models
+
+        fields = {name.name: getattr(self, name.name) for name in dataclasses.fields(self)}
+        return {**fields, "config": argument_records(models[self.trunk], self.config)}
+
+    @property
     def is_jepa(self) -> bool:
         return self.predictor is not None
 
@@ -149,6 +190,18 @@ class Case:
         pooled = "" if self.accumulation == 1 else f" x{self.accumulation}acc"
         return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size}{pooled} "
                 f"{mesh_label(self.mesh)}{order}")
+
+
+def checkpoint_fields(config: Mapping[str, object]) -> dict[str, object]:
+    """The decoder fields Dew builds from a checkpoint's Hugging Face config: a decoder's own, a wrapper's
+    language model as a text-only load reads it (`decoder_config`), or DiffusionGemma's trunk, the causal
+    text tower its assembly builds (`diffusion_gemma.text_config`), which a text-only load does not take."""
+    from dew.interop import diffusion_gemma
+    from dew.interop.hf_decoders import decoder_config, translate_config
+
+    trunk = (diffusion_gemma.text_config(config) if config.get("model_type") == "diffusion_gemma"
+             else decoder_config(config))
+    return dict(translate_config(trunk))
 
 
 def mesh_label(mesh: Mapping[str, int | tuple[str, ...]]) -> str:

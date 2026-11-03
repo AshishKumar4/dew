@@ -60,8 +60,9 @@ jobs:
       with:
         workflow: ci.yml
 
-  # Lint and the site's checks, and the type check beside them: each installs
-  # dewml as tools/armada/install.sh does, with uv, from uv's cache.
+  # Lint and the type check beside it: each installs dewml as tools/armada/install.sh
+  # does, with uv, from uv's cache. The site's content is the site build's to check
+  # (site.yml), after a train publishes: a red site holds a deploy, never a train.
   lint:
     needs: proven
     if: needs.proven.outputs.run == ''
@@ -93,13 +94,6 @@ jobs:
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
-    - name: The site's toolchain and dependencies
-      uses: ./.github/actions/site
-    - name: Check site content
-      run: |
-        node site/scripts/sync-docs.mjs --check
-        node site/scripts/render-notebooks.mjs --check
-        node site/scripts/render-posts.mjs --check
 
   # What a release attaches and Dew's index serves, installed the way a user
   # installs it: the sdist and wheel build, pass twine, and name no requirement
@@ -222,10 +216,13 @@ jobs:
     # Its gangs run side by side, one a model's layout parity and one the
     # rest (each about 5 min), as `ci.py gangs` reads them from the test's
     # MODELS, so every case runs in one. A commit proven on another push is not run
-    # again. One run's armada jobs at a time (`armada`, queued in order): two
-    # runs' suites fill the deployment's fleet, and the gangs, which need
-    # four containers at once, then wait out their deadline (armada#49). The
-    # land queue's one train at a time takes `armada`. A base/<producer>
+    # again. A land-queue train's run (ci/batch-*, ci/fix-*) takes a group of
+    # its own: a train whose base moved under it runs its suite on to its end,
+    # which seeds the test cache for the train composed again, beside that
+    # train's run, never ahead of it, as a staged train's runs beside the
+    # testing one's. armada's priorities share the fleet among them, and its one line
+    # of waiting holders gives a gang's ranks their containers in turn
+    # (armada#49). Any other run takes `armada`, one at a time. A base/<producer>
     # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
     # change reaches or the whole suite, and so does the whole suite on main,
     # every fifth publish, in the background (ci/full-whole-*): both run no
@@ -240,6 +237,8 @@ jobs:
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
         || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
+        || ((startsWith(github.ref_name, 'ci/batch-') || startsWith(github.ref_name, 'ci/fix-'))
+        && format('armada-{0}', github.ref_name))
         || (github.ref_name == 'main' && 'armada-main')
         || 'armada' }}
       cancel-in-progress: false
