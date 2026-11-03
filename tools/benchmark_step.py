@@ -99,8 +99,8 @@ Row = dict[str, object]
 def cases_to_json(cases: Sequence[Case]) -> str:
     """`cases` as the JSON list `cases_from_json` reads back: each case's fields as they are, a translated
     config's records (`dew.interop.config_records.NativeFields`) written as the fields they state, which the
-    model's declared field types rebuild them from. `dataclasses.asdict` would rebuild each record by its type,
-    whose constructor takes the native owner beside its fields."""
+    model's declared field types rebuild them from. `dataclasses.asdict` would rebuild each record by its
+    type, whose constructor takes the native owner beside its fields."""
     return json.dumps([{field.name: getattr(case, field.name) for field in dataclasses.fields(case)}
                        for case in cases])
 
