@@ -495,12 +495,15 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows; one consumer runs alone,
-                    # a cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    # Each consumer keeps its share of the derived tile's rows, at as many of its stages as
+                    # the block holds (a one-consumer tile's deeper ring past two consumers' rows); one
+                    # consumer runs alone, a cluster being two consumers' (`mosaic_gpu.Tiles`).
                     rows_ = config.block_m // config.warpgroups * consumers
-                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_,
-                                               cluster=config.cluster if consumers > 1 else 1)
-                    if launch.legal(ba, tile, target):
+                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
+                                                  cluster=config.cluster if consumers > 1 else 1)
+                              for stages in range(config.stages, 1, -1))
+                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
