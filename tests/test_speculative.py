@@ -11,7 +11,6 @@ after a rejection is the state the accepted prefix would have left.
 """
 
 
-import concurrent.futures
 import dataclasses
 from pathlib import Path
 
@@ -115,14 +114,9 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = model.init(jax.random.key(0), prompts)
-
-    def generated(strategy):
-        return generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                        strategy=strategy)
-
-    # The walk's program and the speculation's are two compilations apart, each on a thread of its own.
-    with concurrent.futures.ThreadPoolExecutor(2) as pool:
-        walked, speculated = pool.map(generated, (None, Speculative(block=3)))
+    walked, speculated = (generate(model, params, prompts, 6, key=jax.random.key(1),
+                                   sampling=Sampling(temperature=0), strategy=strategy)
+                          for strategy in (None, Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
