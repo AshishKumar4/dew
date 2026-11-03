@@ -535,7 +535,7 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
 
     def direct(obj):
         run = jax.jit(lambda params, tokens, record: replayed_log_probs(obj, params, tokens, (record, None)))
-        return lambda params, tokens, record: np.asarray(run(params, tokens, record))[0, 4:]
+        return lambda params, tokens, record: run(params, tokens, record)[0, 4:]
 
     def draw(seed):
         params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(1, seed=1000 + seed)
