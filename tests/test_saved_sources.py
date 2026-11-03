@@ -145,8 +145,11 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
 def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monkeypatch):
     """Two real processes sharing Dew's cache read a saved language model run as a source (`released_run`,
     ledger 2992): the release is written once, the first process publishing it and the other reading
-    every tensor as it does, writing none, its host's allocations inside the export peaking below half
-    the release. Both read the one release. `dew export` to a destination they share writes it once
+    every tensor as it does, writing none, each host's resident pages rising inside the export by less
+    than half the release, written in shards a fraction of it, where the same measure over the release
+    held home rises at least half of it (`saved_export_worker.resident_growth`): at one shard, the 5 GB
+    default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
+    the one release. `dew export` to a destination they share writes it once
     likewise, the tensors one process's export writes."""
     from dew.cli.main import main
     from dew.registry import ModelConfig
@@ -163,7 +166,8 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     whole = sum(path.stat().st_size for path in Path(publisher["release"]).glob("*.safetensors"))
     assert [scope["writes"] for scope in publisher["read"]] == [True]
     assert [scope["writes"] for scope in reader["read"]] == [False]
-    assert reader["read"][0]["peak"] < whole / 2
+    for report in (publisher, reader):
+        assert report["read"][0]["growth"] < whole / 2 <= report["held"]
 
     assert publisher["export_code"] == reader["export_code"] == 0
     assert [scope["writes"] for scope in reader["exported"]] == [False]

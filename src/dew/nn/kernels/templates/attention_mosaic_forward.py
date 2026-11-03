@@ -96,80 +96,6 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
     return out_type
 
 
-def _persistent(program: _Program, spec: algebra.Forward, layout: "_Layout", *refs, streams, shape: tuple,
-                page: int | None, finishes: bool, hooks: Hooks, interpret: bool) -> None:
-    """A persistent inference launch's programs (`_launch`'s `persistent`, one consumer): each walks query
-    tiles in turn (`Family.persist`), a tile's batch row, head and query tile (its slice's) from its place
-    in the grid's order, its key tiles streamed at a ring counter running across the tiles, so a tile's
-    first loads go out while its program's consumer finishes the last (`_consumer`, its walk the tile's):
-    a launch of a program a query tile paid each program's ring's first tiles and its setup before its
-    first product (row 2079's decode at 128 rows of 4096 keys, a program a row and key head: 1024 programs
-    over an H100's 132). A masked launch's tile its walks do not name (`_launch`'s `walks`) is inactive,
-    loading and writing nothing: its empty walks' launches of a program a tile took 18 us each at 128 rows
-    of 4096 keys on an H100 PCIe, nine waves of empty programs (ET-DECPROF4-h100). A guarded launch's tiles
-    read its live rows (`_Guard`). `refs` the kernel's as `layout` lays them out; `shape` its call's batch
-    rows, padded queries, heads and key heads; `finishes` whether it stores its rows."""
-    batch, queries, heads, kv_heads = shape
-    family, block_q = program.family, program.tiles.block_q
-    refs = layout.unpacked(*refs)
-    read = refs.read
-    named = {"keys": refs.k, "values": refs.v}
-    turn = functools.partial(family.turn, refs.schedule, 1)
-    group, tiles_q = heads // kv_heads, -(-queries // block_q)
-    count = tiles_q * program.splits
-
-    def place(index):
-        # The grid's order: heads, query tiles (slices within), batch rows (`_launched`).
-        (flat,) = index
-        rest = lax.rem(flat, count * batch)
-        return lax.rem(rest, batch), lax.div(flat, count * batch), lax.div(rest, batch)
-
-    def scheduled(index):
-        row, head, tile = place(index)
-        at = program.persistent_tile(tile)
-        first = at.query_tile(tiles_q) * block_q
-        lo, hi, _ = at.reach(first, read.spans, row)
-        views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page,
-                           block_k=program.tiles.block_k,
-                           column_block=None if read.block is None else read.block[0])
-
-        def from_first(tile_of, j):
-            # A tile's steps counted from its first key tile.
-            return tile_of(lo + j)
-
-        shifted = {name: (ref, functools.partial(from_first, tile_of))
-                   for name, (ref, tile_of) in views.items()}
-        walked = hi > lo
-        if read.walks is not None:
-            walked = walked & (read.walks[row, lax.div(first, block_q)] != 0)
-        return walked, hi - lo, shifted, (row, head, tile)
-
-    def consumer(index, at_tile, walk, store, *, active):
-        del store
-        row, head, tile = at_tile
-        at = program.persistent_tile(tile)
-        block = _Block.of(at, row, head, at.query_tile(tiles_q) * block_q, queries)
-
-        def walked():
-            status, out_view, finished = block.inference(refs.written, finishes)
-            _consumer(at, spec, index, refs.q.at[row, pl.ds(block.first, block_q), head], out_view, status,
-                      refs.q_smem.at[index], refs.q_loaded.at[index], refs.out_smem.at[index],
-                      refs.row_smem.at[index], None, {"values": (refs.v, None)}, turn, (), block.first,
-                      read.spans, read.hooked, read.guard, (row, head, lax.div(head, group)), hooks=hooks,
-                      residuals=None, interpret=interpret, finished=finished, walker=walk)
-
-        if read.walks is None or active:
-            walked()
-        else:
-            # A masked launch's tile it names whose slice holds no key stores its empty walk's start, as the
-            # grid's program does (`kept` and the slices' merge read it); a tile it names not, nothing (its
-            # outputs unread, `algebra.walked_launches`).
-            pl.when(read.walks[row, lax.div(block.first, block_q)] != 0)(walked)
-
-    family.persist(streams, (heads * count * batch,), scheduled, consumer, consumers=1, axis="programs",
-                   outputs=(), interpret=interpret)
-
-
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          pieces: int = 1) -> tuple[list, dict]:
@@ -729,7 +655,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
-              finished: tuple | None = None, walker: Callable | None = None):
+              finished: tuple | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -740,8 +666,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     (`algebra.stepped`). With `residuals` the walk is the training step's at the `anchors` a peak walk found
     (`algebra.anchored_step`): the accumulator holds the split sums, every key's weighted values but the
     anchor's, which it stores with the rows' sums and status, no output (the output's anchor term joins in
-    XLA, `_trained_forward`). A persistent launch's tile walks its key tiles through `walker` (`walk`'s, of
-    `Family.persist`: its step counted from the tile's first, `_persistent`)."""
+    XLA, `_trained_forward`)."""
     row, head, _ = place
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, row)
@@ -814,12 +739,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return _trained(spec, family, start, known, scored, values, (lo, hi), streams, counted,
                         interpret=interpret)
 
-    if walker is not None:
-        state, trained = inference(_walk_of(family, None, lo, None, None, walker=walker, interpret=interpret))
-    else:
-        # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
-        state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
-                                         between=lambda: (turn(), turn()))
+    # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
+    state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
+                                     between=lambda: (turn(), turn()))
     if merged:
         state = algebra.merge(spec, _initial(family, spec, hooked, state_rows, live), state)
     if residuals is not None:
@@ -860,21 +782,14 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
     family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
 
 
-def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool,
-             walker: Callable | None = None) -> Callable:
-    """A consumer's walk of its key tiles `lo` to `hi`, as `walk(step, start, shapes, initial=)` takes it:
-    its family's over its program's `streams` from the program's `counted`-th step (`Family.walk`), or a
-    persistent tile's `walker` (`Family.persist`'s), a step's index the tile's own from its first key tile
-    `lo`."""
-    def tile_walk(step, start, shapes, initial=None):
-        assert walker is not None
-        return walker(lambda at, *carried: step(lo + at, *carried), start, shapes, initial=initial)
-
-    def grid_walk(step, start, shapes, initial=None):
+def _walk_of(family: mosaic.Family, streams, lo, hi, counted, *, interpret: bool) -> Callable:
+    """A consumer's walk of its key tiles `lo` to `hi` over its program's `streams` from the program's
+    `counted`-th step (`Family.walk`), as `walk(step, start, shapes, initial=)` takes it."""
+    def walk(step, start, shapes, initial=None):
         return family.walk(streams, ((step, lo, hi),), start, shapes, interpret, first=counted,
                            initial=initial)
 
-    return grid_walk if walker is None else tile_walk
+    return walk
 
 
 def _started(program: _Program, spec: algebra.Forward, guard: _Guard | None, hooked: _Hooked, rows: tuple,
@@ -1061,13 +976,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
     # resource gate's cases 50 to 150 s on a CPU).
     block = None if column_width is None else jnp.full((1,), (columns or 0) // column_width, jnp.int32)
-    # A plain inference launch of more query tiles than the device runs at once walks them persistent, a
-    # program a multiprocessor (`_persistent`).
     target = generation.gpu_target()
-    programs = (query.shape[2] * -(-query.shape[1] // (tiles.consumers * tiles.block_q)) * splits
-                * query.shape[0])
-    persistent = (target.multiprocessors if not training and not peaks and tiles.consumers == 1
-                  and target.multiprocessors and programs > target.multiprocessors else None)
     return _launched(query, key, value,
                      _Read(spans, hooked, guard, anchors, None if table is None else table[0], walks, sources,
                            block),
@@ -1077,23 +986,21 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      counted=counted, finishes=finishes, target=target,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_width=column_width, persistent=persistent)
+                     column_width=column_width)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_width",
-                      "persistent"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_width"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, persistent: int | None = None):
+              column_width: int | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
-    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it); `persistent` a
-    persistent launch's programs (`_persistent`), else a program a query tile."""
+    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
     del target
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width = query.shape
@@ -1167,12 +1074,6 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         family.roles(consumers, consumer, producer)
 
     def entry(*refs):
-        if persistent is not None:
-            walked = functools.partial(_persistent, program, spec, layout,
-                                       shape=(batch, queries, heads, kv_heads), page=page, finishes=finishes,
-                                       hooks=hooks, interpret=interpret)
-            family.scoped(functools.partial(walked, *refs), *scoped, streams=rings)
-            return
 
         def scoped_body():
             family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -1189,9 +1090,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     widths = width if peaks else value_width if training else width + value_width
     cost = (stated(spec, batch, heads, spec.queries or queries, widths, query, key, value) if counted
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
-    grid, grid_names = (((persistent,), ("programs",)) if persistent is not None
-                        else ((heads, queries // pair * splits, batch), ("heads", "q_tiles", "batch")))
-    return family.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, consumers=consumers,
+    return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair * splits, batch),
+                         grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=approx_math, name=name, cost=cost,
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,

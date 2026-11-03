@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.kernels import generation, selection
-from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
+from dew.nn.kernels.templates import attention_decode, attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
@@ -200,6 +200,10 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=residuals, **form))
     if mainloop == 'mosaic':
+        if not residuals and attention_decode.serves(query, key, hooks, natural=config.natural,
+                                                     target=generation.gpu_target()):
+            # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
+            return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale)
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
