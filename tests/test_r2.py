@@ -2,6 +2,7 @@
 object round-trips, a miss is None, a listing pages to its end, a key or a body the Worker's contract refuses
 never reaches it, and an answer cut short, or arriving too slowly, is no object."""
 
+import contextlib
 import http.server
 import threading
 import time
@@ -120,10 +121,12 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
             self.send_response(200)
             self.send_header("Content-Length", str(64 * 64))
             self.end_headers()
-            for _ in range(64):
-                self.wfile.write(b"x" * 64)
-                self.wfile.flush()
-                time.sleep(0.2)
+            # Written until the client gives up on it, which closes the connection.
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                for _ in range(64):
+                    self.wfile.write(b"x" * 64)
+                    self.wfile.flush()
+                    time.sleep(0.2)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
     server.daemon_threads = True
