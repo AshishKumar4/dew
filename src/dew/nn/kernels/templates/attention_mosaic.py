@@ -328,7 +328,7 @@ class MosaicForward(_Mainloop[Tiles]):
         holds, or the part's stream is unmeasured."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         rate, streamed = target.memory_rate, target.streamed
-        if not (streams(query, value, target) and rate and streamed and target.multiprocessors):
+        if not (streams(query, target) and rate and streamed and target.multiprocessors):
             return config
         family = bundle_of(config, query.dtype)
         itemsize = jnp.dtype(query.dtype).itemsize
@@ -526,13 +526,13 @@ def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
 
 
-def streams(query, value, target: generation.GpuTarget) -> bool:
+def streams(query, target: generation.GpuTarget) -> bool:
     """Whether a call's walk the device's memory bounds: the products its keys and values feed, a query row
     of `query`'s `[B, Q, H, D]` each (4 flops a key entry, its logit's and its weighted value's), fewer a byte
     of them than the device's dense products a byte its memory streams (`GpuTarget.peaks` over
     `memory_rate`): a decode step's few rows a key head, never a prefill's. False where either fact is
     unknown."""
-    peak, rate = target.peaks.get("bf16"), target.memory_rate
+    peak, rate = target.bf16_peak, target.memory_rate
     if not (peak and rate):
         return False
     return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < peak / rate

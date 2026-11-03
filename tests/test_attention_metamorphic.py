@@ -3,36 +3,40 @@ output unchanged, or move it predictably, judged by check 1 (tests/reference_err
 against the reference path over the untransformed one, its float64 truth the reference's: never bitwise, so a
 property holds of whatever form the route runs. Hypothesis draws each transformation (the suite's derandomized
 profile, docs/design/testing.md): a full call's keys and values permuted together, a causal call against its
-own first queries, query heads permuted with the key heads they read, a decode step's keys cut into every
-slice count its work list takes, and a paged cache's pages permuted with its table. The plain-JAX mainloop
-runs the dense properties on this CPU; the decode and paged ones run the Mosaic mainloop interpreted, as an
-H100 runs it."""
+own first queries, query heads permuted with the key heads they read, and a decode step's keys cut into each
+slice count its work list takes (every count a case, Hypothesis drawing the rows' lengths; a paged cache's
+pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
+the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
 import hypothesis
 import jax
 import jax.numpy as jnp
-import numpy as np
+import pytest
 from generation_support import INTERPRETS
 from hypothesis import strategies as st
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_decode,
+    attention_mosaic,
     attention_portable,
     attention_triton,
 )
+from dew.nn.kernels.templates.attention import Kept
 
 SEEDS = 8
 ROWS, QUERIES, KEYS, HEADS, KV_HEADS, WIDTH = 2, 48, 48, 4, 2, 32
 """A dense call's geometry: a grouped call whose queries and keys are no whole tile, so every walk pads."""
 
-DENSE = hypothesis.settings(max_examples=6, deadline=None)
-"""Each dense property's draws: the plain-JAX mainloop's check 1 a draw, about 3 s on armada's CPU."""
+DENSE = hypothesis.settings(max_examples=30, deadline=None)
+"""Each dense property's draws: the plain-JAX mainloop's check 1 a draw, about 0.5 s on armada's CPU (six
+draws' tests took 3.1 s in CI), about 15 s a property."""
 
-INTERPRETED = hypothesis.settings(max_examples=3, deadline=None)
-"""Each interpreted property's draws: the Mosaic mainloop interpreted, about 15 s a draw."""
+INTERPRETED = hypothesis.settings(max_examples=8, deadline=None)
+"""Each interpreted case's draws: the Mosaic mainloop interpreted, about 2.7 s a draw (three draws' test took
+7.95 s in CI), about 22 s a slice count."""
 
 
 def _dense_draw(seed: int, queries: int = QUERIES):
@@ -101,8 +105,7 @@ def test_a_calls_heads_permuted_with_the_key_heads_they_read_permute_its_output(
 
 
 DECODE_ROWS, DECODE_KEYS, DECODE_HEADS, DECODE_KV = 2, 512, 8, 2
-PAGE = 64
-"""A decode step's geometry on the interpreter: rows of their own lengths over 512 keys, pages of 64."""
+"""A decode step's geometry on the interpreter: rows of their own lengths over 512 keys."""
 
 
 def _decode_draw(seed: int):
@@ -119,49 +122,31 @@ def _decode_spans(lengths):
 
 @INTERPRETS
 @INTERPRETED
-@hypothesis.given(slices=st.sampled_from((1, 2, 4, 8)),
-                  lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
+@pytest.mark.parametrize("slices", [1, 2, 4, 8])
+@hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
 def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
-    """A decode step's keys cut into `slices` slices a row, each walked by a program of its own and merged
-    (`attention_decode`'s work list at a pinned slice count, rows of their own lengths): on par with the
-    step walked whole."""
+    """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
+    decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
+    lengths: on par with the step walked whole."""
     spans = _decode_spans(lengths)
-    derived = attention_decode.plan
-
-    def pinned(*args, **kwargs):
-        work = derived(*args, **kwargs)
-        return attention_decode.Plan(work.config, slices)
 
     def sliced(query, key, value):
-        attention_decode.plan = pinned
-        try:
-            with generation.assumed("sm90"):
-                return attention_decode.attend(query, key, value, spans, interpret=True)
-        finally:
-            attention_decode.plan = derived
+        with generation.assumed("sm90"):
+            rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
+            config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
+                                           target=generation.gpu_target()).config
+            with tuning.pinned({attention_mosaic.MosaicForward: config}):
+                out, maximum, total = attention_mosaic.forward(
+                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
+                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True,
+                    splits=slices)[:3]
+            if slices == 1:
+                # One slice's launch gives its rows without a slices axis.
+                out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
+            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
+            merged = attention_decode.merged(spec, out, maximum, total)
+            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
 
     assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
                     _decode_draw, f"decode step cut into {slices} slices", seeds=SEEDS)
 
-
-@INTERPRETS
-@INTERPRETED
-@hypothesis.given(order=st.permutations(range(2 * DECODE_KEYS // PAGE)))
-def test_a_paged_caches_pages_permuted_with_its_table_attend_as_before_interpreted(order):
-    """A paged cache's pages permuted in its pool, its table mapping each row's slots to where they moved:
-    each row reads the same keys, and its step is on par with the dense cache's."""
-    spans = _decode_spans((DECODE_KEYS, DECODE_KEYS - 37))
-    per_row = DECODE_KEYS // PAGE
-    moved = np.asarray(order)
-    # Page p of the row-major pool lands at moved[p]; the table names each row's pages where they now are.
-    table = jnp.asarray(moved.reshape(DECODE_ROWS, per_row), jnp.int32)
-    inverse = jnp.asarray(np.argsort(moved), jnp.int32)
-
-    def paged(query, key, value):
-        pools = [x.reshape(DECODE_ROWS * per_row, PAGE, DECODE_KV, 64).transpose(2, 0, 1, 3)[:, inverse]
-                 for x in (key, value)]
-        with generation.assumed("sm90"):
-            return attention_decode.attend(query, *pools, spans, interpret=True, table=table)
-
-    assert_as_exact(jax.jit(paged), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
-                    _decode_draw, "paged cache, pages permuted", seeds=SEEDS)
