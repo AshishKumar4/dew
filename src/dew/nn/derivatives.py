@@ -8,12 +8,11 @@ registry reads as a surrogate (tests/test_derivative_seams.py) and no rewrite of
 replaces with the value's own derivative.
 
 A marked span (`marked`) is a computation carried as one call of its kind (`Kind`), which every transform
-keeps a call of that kind, its tangent and cotangent too (docs/design/algebra.md §6.10). The marker and its
-transforms are what exists: the algebra pass does not read its kinds yet, and no declaration site marks its
-spans (Dew's error-free transforms still carry `dew.nn.precision.PROTECTED`'s name scope, which the pass
-reads). The kinds state what a span may become once it does: a protected span (`Protected`) kept as it is, a
-surrogate's bodies (`Surrogate`) and a kernel derivative's glue (`KernelGlue`) rewritten within, and a
-derivative written to restructure algebra (`Algebra`) rewritten freely.
+keeps a call of that kind, its tangent and cotangent too (docs/design/algebra.md §6.10). The algebra pass
+reads each span's kind as an object (`dew.algebra.program`), never a name: a protected span (`Protected`)
+kept as it is, Dew's error-free transforms each one (`dew.nn.precision`); a surrogate's bodies
+(`Surrogate`) and a kernel derivative's glue (`KernelGlue`) rewritten within; and a derivative written to
+restructure algebra (`Algebra`) rewritten freely.
 """
 
 from __future__ import annotations
@@ -87,9 +86,9 @@ type Kind = Protected | Surrogate | KernelGlue | Algebra
 marked_call_p = create_call_primitive("marked_call")
 """A marked span: a call of its body's jaxpr (`call_jaxpr`) under its `kind`, whose JVP, linearization,
 transpose, batching, partial evaluation and checkpointing are JAX's call primitive's, each a marked call of
-the same kind; lowered by inlining its body, so it costs nothing compiled. No Pallas backend lowers it: a
-span is marked where the algebra pass reads it, outside kernel bodies, and an error-free transform is still
-marked by its name scope (`dew.nn.precision.PROTECTED`), which kernel bodies carry as metadata alone."""
+the same kind; lowered by inlining its body, so it costs nothing compiled, within a Pallas kernel's body
+too, which Dew's Pallas fork lowers as it does any call (post49): an error-free transform a launch runs
+(`recurrence_algebra`'s prefix within one) is the same span there as outside it."""
 
 
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
