@@ -338,11 +338,17 @@ def _span(jaxpr, start: int, stop: int):
     if key not in RUNS:
         wanted, last, _ = _layout(jaxpr)
         run = jaxpr.eqns[start:stop]
+        # A platform's index the run reads is read again inside it (`_platform`), never passed in: the
+        # branch it picks is then one static step of the compiled run.
+        platforms = {var: equation for equation in jaxpr.eqns if equation.primitive.name == "platform_index"
+                     for var in equation.outvars}
         written, reads = set(), []
         for equation in run:
             reads += [var for var in equation.invars
-                      if not isinstance(var, Literal) and var not in written and var not in reads]
+                      if not isinstance(var, Literal) and var not in written and var not in reads
+                      and var not in platforms]
             written.update(equation.outvars)
+        picked = {var for equation in run for var in equation.invars if var in platforms}
         kept = [var for equation in run for var in equation.outvars
                 if last.get(var, len(jaxpr.eqns)) >= stop]
         freed = [var for var in reads if start <= last.get(var, -1) < stop]
@@ -351,6 +357,8 @@ def _span(jaxpr, start: int, stop: int):
         def evaluate(read_values, read_energies):
             values = dict(zip(reads, read_values, strict=True))
             energies = dict(zip(reads, read_energies, strict=True))
+            for var in picked:
+                values[var], energies[var] = _platform(platforms[var]), None
             for equation, mark in zip(run, marks, strict=True):
                 inputs = [var.val if isinstance(var, Literal) else values[var] for var in equation.invars]
                 given = [None if isinstance(var, Literal) else energies.get(var) for var in equation.invars]
