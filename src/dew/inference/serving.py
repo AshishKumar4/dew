@@ -4,8 +4,10 @@
 width and a budget and nothing joins until it returns. `Server` keeps the
 cache instead: `slots` rows of `capacity` cache slots, refilled from a queue.
 One jitted step per iteration prefills the prompts admitted this iteration
-into their rows and draws one token for every occupied row; a row leaves on
-EOS or at its budget, and its slot takes the next request. Each row carries
+into their rows and draws one token for every occupied row, or, where the
+task speculates (`Speculative`), drafts, verifies and emits a block in every
+occupied row, its prompts prefilled apart; a row leaves on EOS or at its
+budget, and its slot takes the next request. Each row carries
 its own cursor, length and budget, and the attention mask hides free rows
 and bucket filler.
 
@@ -513,7 +515,8 @@ class Server:
     join until it returns. A server keeps `slots` rows of `capacity` cache
     slots each and refills them from a queue. Each step prefills the prompts
     admitted that step into free rows and draws one token for every occupied
-    row. A row leaves where the task's criteria end it (EOS, a stop string) or
+    row, or a speculative block where the task speculates (`from_task`). A
+    row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
     task alone with the same key, except where the model's products round at
@@ -735,6 +738,10 @@ class Server:
             raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
                              "batch-wide")
         plan = strategy if isinstance(strategy, Speculative) else None
+        if plan is not None and mesh is not None:
+            raise ValueError("speculative rows check each block's draws between its model calls, and jax's "
+                             "checkify carries no check into the shard_map a model on a mesh may run "
+                             "(jax-ml/jax#40907); serve speculation on one device")
         if plan is not None and (chunk is not None or prefix_cache):
             raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
                              "own prefill; serve without chunk and prefix_cache")
@@ -827,7 +834,14 @@ class Server:
         their cache and draw their next token from the new weights, and
         prefix pages the old weights wrote are no longer shared. `reload` is
         not thread-safe against `step`, so the caller must serialize the two.
+        A server drawing speculative blocks reloads between requests alone: a
+        running row's next block opens on the boundary logits its last block
+        verified under the old weights, which no next-step draw recomputes.
         """
+        if self.rows.placement.plan is not None and self._rows:
+            raise ValueError("a server drawing speculative blocks reloads with no row running, as a running "
+                             "row's next block opens on logits the old weights scored; settle its requests "
+                             "(run) first")
         if progress is not None and (progress.updates is None) != (self.progress.updates is None):
             raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
                              "from a task at a run's progress (LMObjective.policy) to serve a run's versions")

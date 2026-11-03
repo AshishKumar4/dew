@@ -463,8 +463,9 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     own without a compile of its own.
 
     The first iteration takes the admission, the draws come back stacked
-    `[steps, slots]`, and the host throws the error when it reads them, one
-    call later. The state comes back split as it went in.
+    `[steps, slots, emitted]` (a token, or a speculative block's slots, an
+    iteration), and the host throws the error when it reads them, one call
+    later. The state comes back split as it went in.
 
     Each iteration checks its own draws. jax's checkify cannot carry a check
     into a shard_map (jax-ml/jax#40907), and every iteration after the first

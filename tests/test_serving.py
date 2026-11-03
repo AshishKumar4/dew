@@ -928,20 +928,33 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     """A task whose strategy is speculative blocks (`Speculative`) serves them: each iteration every row
     drafts with the model's prediction depth, verifies and emits a block, rows of different widths and
     budgets beside one another, seated mid-flight, ending inside a call, and every request draws what its
-    lone task call draws, greedy or sampled (3617). Speculation over paged or chunked rows is refused by
-    name."""
+    lone task call draws, greedy or sampled, the sampled ones under counter-based row keys too, as the
+    RBG implementation keys them (3617). Speculation over paged or chunked rows is refused by name, and so
+    is a reload with a row running, whose next block would open on the old weights' logits."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=temperature),
                            strategy=Speculative(block=3))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    _, tickets = served_alongside(bound, decode_steps=decode_steps)
+    server, tickets = served_alongside(bound, decode_steps=decode_steps)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
+    if temperature:
+        # Every row's own stream, whatever slot it sits in, where vmap would draw them all from the first.
+        with jax.default_prng_impl("rbg"):
+            alone = [bound(prompt, budget, key=index)
+                     for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+            _, tickets = served_alongside(bound, decode_steps=decode_steps)
+        for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+            assert_same_generation(ticket.result(), lone)
     for options in ({"kv_cache": KVCache(page_size=16, pages=12)}, {"chunk": 3}):
         with pytest.raises(ValueError):
             Server.from_task(bound, slots=2, capacity=128, **options)
+    server.submit(PROMPTS[0], 50, key=0)
+    server.step()
+    with pytest.raises(ValueError):
+        server.reload(params)
 
 
 @pytest.mark.mesh(devices=4)

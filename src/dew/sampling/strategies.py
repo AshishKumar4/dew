@@ -22,7 +22,7 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
-from dew._distributions import row_draw, wellformed
+from dew._distributions import counted, row_draw, wellformed
 from dew.batch import Variables, prefix_sum
 from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
@@ -620,13 +620,19 @@ class Speculative:
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], Finish],
                  budget: int, n: int) -> Draws:
-        depths = ops.propose is not None and ops.embed is not None and ops.depths
-        if ops.verify is None or not (depths or ops.draft is not None):
-            raise ValueError("speculative decoding drafts with the model's prediction depths or "
-                             "its block drafter, and this model has neither; load a checkpoint "
-                             "with MTP or DSpark weights or choose another strategy")
+        refuse_undrafted(ops)
         return continuations(start, n, lambda drawn: _speculate(
             state, drawn, ops, transform, stopping, budget, self))
+
+
+def refuse_undrafted(ops: DecodeOps) -> None:
+    """Refuse a decode that has nothing to draft with: speculative blocks (`block_step`) draft with the
+    model's prediction depths or its block drafter, and verify with the model."""
+    depths = ops.propose is not None and ops.embed is not None and ops.depths
+    if ops.verify is None or not (depths or ops.draft is not None):
+        raise ValueError("speculative decoding drafts with the model's prediction depths or "
+                         "its block drafter, and this model has neither; load a checkpoint "
+                         "with MTP or DSpark weights or choose another strategy")
 
 
 def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.Array:
@@ -737,7 +743,8 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     for at in range(1, block_size):
         ratio = (categorical.token_log_probs(targets[at], candidates[at])
                  - categorical.token_log_probs(drafts[at], candidates[at]))
-        uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
+        # Each row its own key's uniform, whatever rows it is drawn beside (`counted`).
+        uniform = jax.vmap(jax.random.uniform)(counted(keys[:, block_size + at]))
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
     matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)).astype(jnp.int32)
@@ -846,7 +853,9 @@ def block_step(state: DecoderState, step: StepState, terminated: jax.Array, plan
     replaying the accepted prefix into the cache saved before the block: the
     step both speculative loops take, `Speculative`'s scan and the server's
     (`dew.inference.serving_kernel`). `budget` caps each row's draws, one
-    for every row or a row's own (`[rows]`)."""
+    for every row or a row's own (`[rows]`). A decode with nothing to draft
+    with is refused (`refuse_undrafted`)."""
+    refuse_undrafted(ops)
     verify, block_size = ops.verify, plan.block
     assert verify is not None
     slots = jnp.arange(block_size + 1)[None, :]
