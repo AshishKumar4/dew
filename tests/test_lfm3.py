@@ -17,6 +17,7 @@ from dew.interop.families.lfm3 import LFM3
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = FIXTURES / 'lfm3-tiny'
+VL = FIXTURES / 'lfm3-vl-tiny'
 
 
 def fixture(name: str) -> np.ndarray:
@@ -46,15 +47,19 @@ def release_cache(tmp_path, monkeypatch) -> Path:
     return snapshot
 
 
-def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
-    """A load and a save write every tensor the release stores under its own name, bit for bit."""
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+@pytest.mark.parametrize('fixture', [TINY, VL], ids=['decoder', 'wrapper'])
+def test_a_saved_source_writes_the_releases_tensors_back(tmp_path, fixture):
+    """A load and a save write every tensor the release stores under its own name, bit for bit, and its
+    config's model type: LFM3's decoder, and LFM3-VL's wrapper, its trunk's, projector's and decoder's."""
+    loaded = Pretrained.load(fixture, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'saved')
-    stored = load_file(TINY / 'model.safetensors')
+    stored = load_file(fixture / 'model.safetensors')
     written = load_file(tmp_path / 'saved' / 'model.safetensors')
     assert sorted(written) == sorted(stored)
     for name, tensor in stored.items():
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+    model_type = json.loads((fixture / 'config.json').read_text())['model_type']
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == model_type
 
 
 @pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
@@ -156,64 +161,63 @@ def test_a_config_that_omits_its_pattern_and_rotary_reads_lfm3s_own():
 
 
 def wrapped(directory: Path, **wrapper: object) -> Path:
-    """The tiny LFM3 as an LFM3-VL wrapper holds it: its decoder's tensors under
-    `model.language_model.`, a vision tower's and a projector's beside them, and `wrapper`'s fields."""
+    """The tiny LFM3 as an LFM3-VL wrapper holds it: its decoder's tensors under `model.language_model.`,
+    lfm3-vl-tiny's vision tower and projector beside them, under lfm3-vl-tiny's config with `wrapper`'s
+    fields."""
     from safetensors.numpy import save_file
 
     config = json.loads((TINY / 'config.json').read_text())
     tensors = {f"model.language_model.{name.removeprefix('model.')}": tensor
                for name, tensor in load_file(TINY / 'model.safetensors').items()}
-    tensors['model.vision_tower.embedding_norm.weight'] = np.ones(8, np.float32)
-    tensors['model.multi_modal_projector.linear_1.weight'] = np.ones((8, 8), np.float32)
+    tensors.update({name: tensor for name, tensor in load_file(VL / 'model.safetensors').items()
+                    if name.startswith(('model.vision_tower.', 'model.multi_modal_projector.'))})
     directory.mkdir()
     (directory / 'config.json').write_text(json.dumps({
-        'architectures': ['Lfm3VlForConditionalGeneration'], 'model_type': 'lfm3_vl', 'text_config': config,
-        'vision_config': {'model_type': 'lfm3_vl_vision', 'hidden_size': 8}, 'image_token_id': 5,
-        'downsample_factor': 2, 'projector_hidden_size': 8, 'tie_word_embeddings': True, **wrapper}))
+        **json.loads((VL / 'config.json').read_text()), 'text_config': config, **wrapper}))
     save_file(tensors, directory / 'model.safetensors')
     return directory
 
 
-def test_an_lfm3_vl_wrappers_language_model_loads_alone_and_its_unported_tower_refuses(tmp_path):
-    """LFM3-VL's wrapper (LiquidAI/LFM3-VL-2B) holds an LFM3 decoder beside a vision tower Dew has no port
-    of: `text_only` loads the decoder, computing the decoder's own logits bit for bit, and a multimodal
-    load refuses the tower by name. d1's checkpoint of it (LiquidAI/d1-2B), whose full-attention layers
-    train under a visibility of their own (`d1_attention`), refuses that by name."""
-    from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
+def test_an_lfm3_vl_wrapper_loads_whole_and_its_language_model_alone(tmp_path):
+    """LFM3-VL's wrapper (LiquidAI/LFM3-VL-2B) holds an LFM3 decoder beside its vision trunk and projector:
+    a load reads all three, and on ids without placeholders computes its decoder's own logits bit for
+    bit, as `text_only`, which loads the decoder alone, does. d1's checkpoint of it (LiquidAI/d1-2B),
+    whose full-attention layers train under a visibility of their own (`d1_attention`), refuses that by
+    name."""
+    from dew.interop.hf_decoders import translate_wrapper_config
 
     ids = jnp.asarray(fixture('input_ids'), jnp.int32)
     alone = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    expected = np.asarray(alone.model.apply(alone.variables, ids))
     source = wrapped(tmp_path / 'wrapper')
     text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
-    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
-                                  np.asarray(alone.model.apply(alone.variables, ids)))
-    with pytest.raises(ValueError):
-        Pretrained.load(source, dtype='float32', attention_impl='reference')
-    config = json.loads((source / 'config.json').read_text())
-    with pytest.raises(ValueError):
-        translate_wrapper_weights(load_file(source / 'model.safetensors'), translate_wrapper_config(config))
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)), expected)
+    whole = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    np.testing.assert_array_equal(np.asarray(whole.model.apply(whole.variables, ids)), expected)
     with pytest.raises(ValueError):
         Pretrained.load(wrapped(tmp_path / 'd1', d1_attention='set', d1_set_size=16), text_only=True)
-    # Lfm3VlConfig types its text_config as lfm3 and places its images at 125030 where a config is silent.
+    # Lfm3VlConfig types its text_config as lfm3 and places its images at 125030 and its videos at 125029
+    # where a config is silent.
     bare = wrapped(tmp_path / 'bare')
     stated = json.loads((bare / 'config.json').read_text())
     stated['text_config'].pop('model_type')
     stated.pop('image_token_id')
+    stated.pop('video_token_id')
     (bare / 'config.json').write_text(json.dumps(stated))
     record = translate_wrapper_config(stated)
     assert (record['text_model_type'], record['image_token_id'], record['video_token_id']) == ('lfm3', 125030,
                                                                                                125029)
     reread = Pretrained.load(bare, dtype='float32', attention_impl='reference', text_only=True)
-    np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)),
-                                  np.asarray(alone.model.apply(alone.variables, ids)))
+    np.testing.assert_array_equal(np.asarray(reread.model.apply(reread.variables, ids)), expected)
 
 
 @pytest.mark.network
-def test_the_released_lfm3_vl_and_d1_headers_load_their_language_model_or_refuse_d1s_attention():
-    """LiquidAI/LFM3-VL-2B's language model loads from its safetensors headers alone (`weights=False`,
-    `text_only`); LiquidAI/d1-2B's refuses its d1_attention by name."""
+def test_the_released_lfm3_vl_and_d1_headers_load_whole_or_refuse_d1s_attention():
+    """LiquidAI/LFM3-VL-2B loads whole, its trunk, projector and language model, from its safetensors
+    headers alone (`weights=False`), every released tensor read; LiquidAI/d1-2B's refuses its d1_attention
+    by name."""
     loaded = Pretrained.load('LiquidAI/LFM3-VL-2B', revision='f83d2b0a2296aaa277f394990a9b8b949ddf9691',
-                             weights=False, text_only=True)
+                             weights=False)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(loaded.variables))
     with pytest.raises(ValueError):
         Pretrained.load('LiquidAI/d1-2B', revision='cfe5760ff5d5998f91d9ac56bd4b2dbd96996d41', weights=False,
@@ -290,3 +294,83 @@ def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
     released = {file: Path(hf_hub_download(str(code.source), file, revision=code.revision))
                 for file in ('configuration_lfm3.py', 'modeling_lfm3.py', 'lfm3_conv.py')}
     assert written == {file: path.read_bytes() for file, path in released.items()}
+
+
+@pytest.mark.release_env("transformers==5.18.0")
+def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_path):
+    """LFM3-VL's processor is its release's own code (Lfm3VlProcessor and its image and video processors
+    at f83d2b0), which a load that trusts the source's code runs (`trust_remote_code`, `Processor`): over a
+    prompt with an image, and one with a video sampled at its own rate, Dew's processor gives the release
+    processor's tokens, and each image's or video frame's patch vectors and grid where its placeholders
+    read them, the placeholders in text order reading their media's merge blocks in order. So does the
+    processor a run reloads from its recorded source (`load_processor`), which keeps the load's trust,
+    and the processor of the bundle's save, which writes the processor's own modules beside it."""
+    import shutil
+
+    from tool_support import run_from
+    from transformers import AutoProcessor
+
+    from dew.inference.tasks import recorded_processor
+    from dew.interop.pretrained import load_processor
+
+    source = tmp_path / 'source'
+    shutil.copytree(VL, source)
+    with run_from('remote_code_reference', 'tools') as reference:
+        for file in reference.RELEASES['lfm3-vl-tiny'][2]:
+            shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference', trust_remote_code=True)
+    release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
+    loaded.save(tmp_path / 'saved')
+    saved = AutoProcessor.from_pretrained(str(tmp_path / 'saved'), trust_remote_code=True,
+                                          local_files_only=True)
+    reloaded = load_processor(recorded_processor(loaded.processor), loaded.model)
+    config = json.loads((VL / 'config.json').read_text())
+    rng = np.random.default_rng(0x2067)
+    image = rng.integers(0, 256, (24, 40, 3), dtype=np.uint8)
+    video = rng.integers(0, 256, (4, 24, 24, 3), dtype=np.uint8)
+    metadata = [{'fps': 2.0, 'total_num_frames': 4, 'frames_indices': [0, 1, 2, 3]}]
+    for text, media, token in (('w5 w6 <|image|> w7', {'images': [image]}, config['image_token_id']),
+                               ('w5 <|video|> w9', {'videos': [video], 'video_metadata': metadata},
+                                config['video_token_id'])):
+        theirs = release(text=[text], return_tensors='np', **media)
+        written = saved(text=[text], return_tensors='np', **media)
+        assert sorted(written) == sorted(theirs)
+        for name, value in theirs.items():
+            np.testing.assert_array_equal(written[name], value, err_msg=name)
+        ours = loaded.processor(text, **media)
+        np.testing.assert_array_equal(np.asarray(ours.tokens), theirs['input_ids'])
+        again = reloaded(text, **media)
+        np.testing.assert_array_equal(np.asarray(again.tokens), theirs['input_ids'])
+        np.testing.assert_array_equal(np.asarray(again.conditioning['pixel_values']),
+                                      np.asarray(ours.conditioning['pixel_values']))
+        kind = 'image' if 'images' in media else 'video'
+        pixels = theirs['pixel_values' if kind == 'image' else 'pixel_values_videos']
+        frames, height, width = (int(side) for side in theirs[f'{kind}_grid_thw'][0])
+        # An image is one frame of its own; a video's frames each one, as its placeholders' runs are.
+        chunks = 1 if kind == 'image' else frames
+        patches = frames * height * width // chunks
+        placed = np.asarray(ours.conditioning['pixel_values'])[0]
+        grids = np.asarray(ours.conditioning['image_grid_thw'])[0]
+        for chunk in range(chunks):
+            np.testing.assert_array_equal(placed[chunk, :patches],
+                                          pixels[chunk * patches:(chunk + 1) * patches])
+            assert tuple(grids[chunk]) == (frames // chunks, height, width)
+        indices = np.asarray(ours.token_fields['image_indices'])[0]
+        held = theirs['input_ids'][0] == token
+        assert held.sum() == frames * height * width // 4 and np.all(indices[~held] == -1)
+        assert np.all(np.diff(indices[held]) > 0)
+
+
+def test_a_sources_record_keeps_whether_its_load_runs_its_code():
+    """A source's record (`SourceReference`), which a run keeps for its processor, keeps whether its load
+    ran the source's own code (`remote_code`), as a processor reloaded from it runs it again
+    (`load_processor`); a record written before the field reads as not trusted."""
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record, to_record
+
+    trusted = SourceReference('LiquidAI/LFM3-VL-2B', 'f83d2b0a2296aaa277f394990a9b8b949ddf9691',
+                              remote_code=True)
+    assert from_record(SourceReference, to_record(trusted, SourceReference)) == trusted
+    record = to_record(trusted, SourceReference)
+    earlier = {key: value for key, value in record.items() if key != 'remote_code'}
+    assert from_record(SourceReference, earlier) == SourceReference(trusted.name, trusted.revision)

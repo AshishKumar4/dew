@@ -6,7 +6,8 @@ weight read from the checkpoint's safetensors under its reference tensor name.
 The operation order follows transformers 5.16.1
 `models/siglip/modeling_siglip.py`, `models/llama4/modeling_llama4.py`,
 `models/gemma4/modeling_gemma4.py`, `models/qwen3_5/modeling_qwen3_5.py` and
-`models/muse_glimmer/modeling_muse_glimmer.py`, and MiMo-V2.6's `modeling_mimo_v2.py`.
+`models/muse_glimmer/modeling_muse_glimmer.py`, MiMo-V2.6's `modeling_mimo_v2.py` and LFM3-VL's
+`modeling_lfm3_vl.py`.
 
 The SigLIP trunk is patch convolution with bias, learned position embeddings
 with no class token, pre-norm encoder blocks and a post layer norm. Its block
@@ -19,11 +20,12 @@ token dropped, and the pixel-shuffle MLP inside the tower where the reference
 keeps it. The Gemma 4 trunk is patch pixels scaled to [-1, 1] through a
 bias-free map, summed 2D position tables, RMS-normed blocks with a 2D rotary
 and gated feed-forwards, and a position pooler with standardization. The
-Qwen 3.5, MiMo-V2.6 and Muse Glimmer trunks are configs of one windowed and
+Qwen 3.5, MiMo-V2.6, Muse Glimmer and LFM3-VL trunks are configs of one windowed and
 full vision transformer (`vit`): a NaViT-style patchify with the still frame
 repeated along time, an optional resampled position table, decoder blocks
 with a 2D rotary that attend over a frame, a band of keys or a window of
-patches, each layer in its own token order, and the merge-block projector. Each tower's projector is a
+patches, or convolve the frame's patch grid (LFM3-VL's), each layer in its own token order, and
+the merge-block projector. Each tower's projector is a
 value beside it: Gemma 3's averages each patch block, norms and maps to the
 decoder width, Llama 4's maps the shuffled output to the decoder width,
 Gemma 4's norms without a scale and maps, and Qwen 3.5's is the merger.
@@ -35,7 +37,7 @@ projector is the aligner, which groups squares of the patch grid through an
 exact-GELU MLP and lays the image out as its decoder reads it.
 
 Each family lives in its own module of this package (`siglip`, `llama4`,
-`gemma4`, `qwen35`, `mimo`, `muse_glimmer`, `deepseek_v41`, `gemma3n`) over the
+`gemma4`, `qwen35`, `mimo`, `muse_glimmer`, `lfm3`, `deepseek_v41`, `gemma3n`) over the
 bases in `common` and the shared trunk in `vit`,
 with its path map and its config and weight translators, and each family's
 classes say where their tensors sit (`TowerLayout`, `ProjectorLayout`), so the
@@ -64,6 +66,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.nn.vision.deepseek_v41 import DeepseekV41Projector, DeepseekV41Vision
     from dew.nn.vision.gemma3n import Gemma3nProjector, Gemma3nVision
     from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision, Gemma4VisionTransformer
+    from dew.nn.vision.lfm3 import Lfm3VlProjector, Lfm3VlVision
     from dew.nn.vision.llama4 import Llama4Projector, Llama4Vision, Llama4VisionTransformer
     from dew.nn.vision.mimo import MiMoProjector, MiMoVision
     from dew.nn.vision.muse_glimmer import MuseGlimmerProjector, MuseGlimmerVision
@@ -88,6 +91,8 @@ _EXPORTS = {
     "Gemma4Projector": "dew.nn.vision.gemma4",
     "Gemma4Vision": "dew.nn.vision.gemma4",
     "Gemma4VisionTransformer": "dew.nn.vision.gemma4",
+    "Lfm3VlProjector": "dew.nn.vision.lfm3",
+    "Lfm3VlVision": "dew.nn.vision.lfm3",
     "Llama4Projector": "dew.nn.vision.llama4",
     "Llama4Vision": "dew.nn.vision.llama4",
     "Llama4VisionTransformer": "dew.nn.vision.llama4",
@@ -115,6 +120,8 @@ __all__ = [
     "Gemma4Vision",
     "Gemma4VisionTransformer",
     "GemmaProjector",
+    "Lfm3VlProjector",
+    "Lfm3VlVision",
     "Llama4Projector",
     "Llama4Vision",
     "Llama4VisionTransformer",
