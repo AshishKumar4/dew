@@ -735,9 +735,8 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
 
 def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
     """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host, the last block
-    padded with zeros: a block's entries summed by each sign byte's value (`np.bincount`) times the value's
-    eight signs (`_BYTE_SIGNS`), exact products and empty values adding zero, so one order of its signed
-    products, within gamma(SKETCH_BLOCK) as any is (ledger 2807: 3 to 4 times as fast), over 2^12 a chunk."""
+    padded with zeros: a block's entries summed by each sign byte's value (`np.bincount`) times its eight
+    signs (`_BYTE_SIGNS`), one order of its exact products, within gamma(SKETCH_BLOCK) (ledger 2807)."""
     partials = []
     for start in range(0, flat.size, 1 << 12):
         chunk = flat[start:start + (1 << 12)]
@@ -745,9 +744,8 @@ def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
         # order, so the first byte holds bits 0 to 7. An entry's bins: its block's, its byte's, the value's.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
         bins = (np.arange(chunk.size)[:, None] // SKETCH_BLOCK * 4 + np.arange(4)) * 256 + words
-        histogram = np.bincount(bins.reshape(-1), weights=np.repeat(chunk, 4),
-                                minlength=-(-chunk.size // SKETCH_BLOCK) * 1024)
-        partials.append((histogram.reshape(-1, 256) @ _BYTE_SIGNS).reshape(-1, SKETCH))
+        summed = np.bincount(bins.reshape(-1), np.repeat(chunk, 4), -(-chunk.size // SKETCH_BLOCK) * 1024)
+        partials.append((summed.reshape(-1, 256) @ _BYTE_SIGNS).reshape(-1, SKETCH))
     return np.concatenate(partials)
 
 
