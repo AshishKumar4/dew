@@ -73,7 +73,6 @@ from dew.data.dataset import (
     stacked,
     take_batch,
 )
-from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.mixing import (
     Accepted,
     Carried,
@@ -1222,6 +1221,56 @@ def _elastic_cut(stages: Sequence[Stage]) -> int:
     return max((at + 1 for at, stage in enumerate(stages) if not one_for_one(stage)), default=0)
 
 
+class _InputOrder(pygrain.IterDataset):
+    """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
+    order whatever their count: groups of `size` consecutive inputs (`_Grouped`), group k read by
+    worker k mod W, which Grain's interleave of the workers hands on in turn, so group after group
+    in order. Its position is the input its next group begins at, so a resume opens its workers
+    there (`rows[next:]`) on any count; `size` is the chain's batch, the same on every topology, so
+    a flat map over it (`_Ungrouped`) finds the group it was inside where it left it."""
+
+    def __init__(self, rows: pygrain.MapDataset, size: int,
+                 read: Callable[[pygrain.MapDataset], pygrain.IterDataset]):
+        super().__init__([])
+        self.rows, self.size, self.read = rows, size, read
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _InputOrderIterator(self)
+
+
+class _InputOrderIterator(pygrain.DatasetIterator):
+    def __init__(self, ordered: _InputOrder):
+        super().__init__()
+        self._ordered, self._next, self._reads = ordered, 0, None
+
+    def _opened(self) -> pygrain.DatasetIterator:
+        if self._reads is None:
+            ordered = self._ordered
+            # Each group a dataset element of its own, so the workers' slices of them, every W-th,
+            # interleave back into the inputs' order.
+            groups = ordered.rows[self._next:].batch(ordered.size, drop_remainder=False, batch_fn=_Grouped())
+            self._reads = iter(ordered.read(groups))
+            self._reads.start_prefetch()
+        return self._reads
+
+    def __next__(self) -> Batch:
+        group = next(self._opened())
+        self._next += self._ordered.size
+        return group
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"next_input": self._next}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.close()
+        self._next = integer(state["next_input"], "elastic read's next input")
+
+    def close(self) -> None:
+        if self._reads is not None:
+            self._reads.close()
+            self._reads = None
+
+
 class _ElasticBatches(pygrain.IterDataset):
     """An elastic read's batches (`_Build.elastic_batches`): `rows`, the order one reader reads,
     taken a whole batch's `size` at a time, of which this reader keeps its share (`partition.held`),
@@ -1388,12 +1437,12 @@ class _Build:
         in those."""
         count = _workers(pipeline, self.loading)
         written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
-        # An elastic read reads its inputs as workers do, by index (`_InputOrder`) or as a stream
-        # (`_StreamOrder`), none of them too, so its position is the same whatever their count; after its
-        # batch they would read every count-th of its rows.
+        # An elastic read by index reads its inputs as workers do (`_InputOrder`), none of them too,
+        # so its position is the same whatever their count; after its batch they would read every
+        # count-th of its rows. A streamed one reads without them (`compile._refuse_inelastic`).
         pooled = (count or written) and (_dropping(pipeline, self.lowering)
                                          or _streamed_take(pipeline, self.read))
-        ordered = self.elastic
+        ordered = self.elastic and self.read != "streamed"
         if self.global_order or not self.training or not (ordered or pooled):
             return self
         pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
@@ -1922,17 +1971,22 @@ class _Build:
         `certain_after` rejections of inputs read in order (`_barren_bound`) as certain to go on
         forever."""
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
-        # stack stacked as a batch's are, as many groups in flight as it had batches; an elastic read's
-        # a whole batch's count, the same on every topology.
-        size = self.batch if self.elastic else partition.rows(self.batch)
-        read = functools.partial(self.read_in, pipeline=pipeline, partition=partition, pool=pool)
+        # stack stacked as a batch's are, as many groups in flight as it had batches.
+        size = partition.rows(self.batch)
         if self.elastic and not isinstance(rows, pygrain.MapDataset):
-            # Its rows come as a stream (a streamed read, a cache of each input's outputs), which every
-            # worker reads whole, keeping its groups (`_StreamOrder`), and the reading process alone
-            # keeps every group: one position, whatever the count of workers it is read in.
-            handed = _StreamOrder(_as_iter(rows, self.loading), size, read, _Grouped)
-        elif self.elastic and isinstance(rows, pygrain.MapDataset):
-            handed = _InputOrder(rows, size, read, _Grouped)
+            # Its inputs come as a stream before any step (a cache of each input's outputs), which
+            # no worker reads by index; without workers they are read in their order as they come.
+            if pool.count:
+                raise ValueError(
+                    f"{_name(pipeline)} is read elastically, and its cache hands on each input's "
+                    "outputs as a stream, which loading workers cannot read in order by index: read "
+                    "it with Loading(workers=0), or publish the cache and read the generation by index")
+            return Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            certain_after=certain_after, rows=_counts_rows(pipeline, at))
+        if self.elastic and isinstance(rows, pygrain.MapDataset):
+            size = self.batch
+            handed = _InputOrder(rows, size, functools.partial(self.read_in, pipeline=pipeline,
+                                                               partition=partition, pool=pool))
         else:
             grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())
             handed = self.read_in(grouped, pipeline=pipeline, partition=partition, pool=pool)
@@ -1987,9 +2041,9 @@ class _Build:
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
         if loading.workers == "auto":
-            # A global order is read by the batch, as an elastic read is, a batch's count of its inputs a
-            # group (`_InputOrder`, `_StreamOrder`); any other order by the record (`batch_order`).
-            grouped = self.global_order or self.elastic
+            # A global order is read by the batch, as an elastic read by index is, a batch's count of
+            # its inputs a group (`_InputOrder`); any other order by the record (`batch_order`).
+            grouped = self.global_order or (self.elastic and self.read != "streamed")
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
                 loading = loading.resolved(sampled, reads=1 if grouped else size)
         if loading.worker_count and (not self.training or not self.lowering.endless):
