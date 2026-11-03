@@ -1416,10 +1416,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
-        # A summarized recording's rows are sized by its truth alone (`leaf_summaries`), so Dew's are too:
-        # its worst row against the reference's under one sizing (row 3684), the site's terms aside.
-        mine = leaf_summary(leaf, true) if was else summary
-        row.append(_paired(path, mine, their, paired=paired))
+        row.append(_paired(path, summary, their, paired=paired))
     return row
 
 

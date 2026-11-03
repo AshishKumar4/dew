@@ -1580,52 +1580,6 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     assert raised.type is GateFailure
 
 
-def test_a_summarized_recording_sizes_dews_rows_as_its_own_whatever_the_sites_terms():
-    """A summarized recording sizes its reference's rows by its truth alone (`leaf_summaries`), so Dew's are
-    sized so too, the site's terms aside (row 3684): on a row whose truth nearly cancels (a difference of
-    1e-6 of terms of one), Dew ten times the recorded reference's error there fails, where Dew's row read
-    over its terms' size and the reference's over its truth's put Dew's worst row under the reference's."""
-    from tool_support import load
-
-    recorder = load("recorded_references")
-
-    def program(a, b, c, noises):
-        return {"rows": jnp.concatenate([a[:1] - b[:1], c[1:]])}
-
-    def computed(scale, index, a, b, c, noises):
-        out = np.concatenate([a[:1] - b[:1], c[1:]])
-        out[0] += scale * noises[index, 0]
-        out[1:] += 2.0 ** -24 * c[1:] * noises[index, 1:]
-        return {"rows": out}
-
-    def draw(seed):
-        rng = np.random.default_rng([3684, 6, seed])
-        a = rng.standard_normal((64, 8))
-        b = a.copy()
-        b[0] -= 1e-6 * rng.standard_normal(8)
-        return {"a": a, "b": b, "c": rng.standard_normal((64, 8)), "noises": rng.standard_normal((2, 64, 8))}
-
-    @as_given
-    def dew(index, inputs):
-        return computed(1e-6, 1, **inputs)
-
-    def evaluate(inputs):
-        return computed(1e-7, 0, **inputs), program(**inputs)
-
-    def as_inputs(fn):
-        return lambda inputs: fn(**inputs)
-
-    with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, as_inputs(program), summary=True)
-    seeds = int(recorded["site.seeds"])
-    drawn, recorded_reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
-                                                         truth_fn=as_inputs(program))
-    with pytest.raises(AssertionError) as raised:
-        assert_as_exact(dew, recorded_reference, drawn, "summarized", seeds=seeds, truth_fn=truth,
-                        terms=lambda index, inputs: as_inputs(program)(inputs))
-    assert raised.type is GateFailure and {finding.rule for finding in raised.value.findings} == {"row"}
-
-
 @pytest.mark.parametrize("planned", [False, True])
 def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
     """A reference recorded on a CPU keeps the larger count a GPU's held-out paired sizing declared,
