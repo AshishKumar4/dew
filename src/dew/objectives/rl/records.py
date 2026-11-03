@@ -8,7 +8,7 @@ from dataclasses import asdict
 import numpy as np
 
 from dew._records import finite, integer, integers, listed, record as section, text
-from dew.inference.rollouts import Draw
+from dew.inference.rollouts import Draw, routing_record
 from dew.sampling.text import Sampling
 
 from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition
@@ -39,15 +39,15 @@ messages = functools.partial(listed, read=section, what="a list of chat messages
 
 def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
     """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one,
-    with the engine records it carries (routing as nested lists of expert ids, kept ids per
-    sampled id)."""
+    with the engine records it carries (routing as nested lists of expert ids, an object of them by
+    site where it is keyed, `routing_record`; kept ids per sampled id)."""
     record = section(value, "draw")
     raw, routed, support = record["raw_log_probs"], record["routed_experts"], record["support"]
     return Draw(integers(record["prompt"], "prompt"), integers(record["tokens"], "tokens"),
                 reals(record["behavior_log_probs"], "behavior_log_probs"),
                 text(record["finish_reason"], "finish_reason"), integer(record["version"], "version"),
                 None if raw is None else reals(raw, "raw_log_probs"),
-                None if routed is None else np.asarray(routed),
+                None if routed is None else routing_record(routed),
                 None if support is None else listed(support, "support", read=integers,
                                                     what="a list of token-id lists")).checked(sampling)
 

@@ -37,6 +37,7 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field, fields
@@ -52,7 +53,7 @@ from jax.typing import ArrayLike
 from dew._records import finite, json_value, record as section
 from dew.batch import Variables
 from dew.data.tokens import first_fit
-from dew.inference.rollouts import Draw
+from dew.inference.rollouts import Draw, Routing, routing_rows
 from dew.nn.inputs import local_rows
 from dew.rl import group_advantage, rloo_advantage
 
@@ -87,7 +88,9 @@ SESSION_WEIGHTS_KEY = "session_weights"
 Summed over a batch it counts sessions, so `sum(weights * terms)` over
 `sum(weights)` is the mean over sessions of each session's token mean."""
 ROUTED_EXPERTS_KEY = "routed_experts"
-"""`[rows, width, layers, top_k]` expert ids the engine routed each id to, for replay."""
+"""`[rows, width, layers, top_k]` expert ids the engine routed each id to, for replay. Where the calls'
+records are keyed by site (`Routing`), one such array a routed site under `routed_experts/<its path>`
+(`routing_of`)."""
 ROUTED_KEY = "routed"
 """Where `routed_experts` holds a record; elsewhere the trainer's router chooses."""
 SUPPORT_KEY = "support_ids"
@@ -354,7 +357,7 @@ class _Chain:
     members: list[tuple[int, int, int]] = field(default_factory=list)
     """Each call this chain holds: its index, where its sampled ids start in
     the chain and how many it sampled, which may be none."""
-    routing: np.ndarray | None = None
+    routing: Routing | None = None
     """The latest recorded call's `routed_experts`. Once a call is appended
     the chain is exactly that call's ids, so its record row p is chain
     token p, and it covers every row an earlier call's record did."""
@@ -365,7 +368,7 @@ class _Chain:
         """Whether the token prefix and its recorded routing agree with `call`."""
         return (merges(self.tokens, call)
                 and (self.routing is None or call.routed_experts is None
-                     or np.array_equal(self.routing, call.routed_experts[:len(self.routing)])))
+                     or _extends(self.routing, call.routed_experts)))
 
     def extend(self, call: Call, index: int, start: int) -> None:
         """Append `call`'s prompt from `start`, then its sampled ids."""
@@ -383,6 +386,15 @@ class _Chain:
         self.supports.extend(call.support if call.support is not None else [None] * len(call.tokens))
         if call.routed_experts is not None:
             self.routing = call.routed_experts
+
+
+def _extends(held: np.ndarray | Mapping[str, np.ndarray],
+             record: np.ndarray | Mapping[str, np.ndarray]) -> bool:
+    """Whether `record` routes every id `held` covers as `held` does, site by site where they are keyed."""
+    if isinstance(held, Mapping) or isinstance(record, Mapping):
+        return (isinstance(held, Mapping) and isinstance(record, Mapping) and held.keys() == record.keys()
+                and all(_extends(held[site], record[site]) for site in held))
+    return np.array_equal(held, record[:len(held)])
 
 
 def merges(chain: Sequence[int], call: Call) -> bool:
@@ -693,7 +705,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     train, and `INFRA_ERROR` and `CANCELLED` sessions never do.
 
     Calls that recorded `routed_experts` add that array,
-    `[rows, width, layers, top_k]`, and `routed`, which is true where a
+    `[rows, width, layers, top_k]`, one a routed site where their records are
+    keyed by site (`ROUTED_EXPERTS_KEY`), and `routed`, which is true where a
     call's record covers the id. Calls that recorded a `support` add
     `support_ids` and `support_columns`: each row's kept ids back to back,
     and for each one the column of the sampled id it belongs to, both
@@ -768,10 +781,51 @@ def _spans(built: Sequence[_Chain], placed: Sequence[Sequence[int]]):
             start += len(chain.tokens)
 
 
-def _empty_routing(shape: tuple[int, int], layout: tuple[int, ...], dtype) -> dict[str, np.ndarray]:
-    """The routing record's empty form over packed rows of `shape`: expert ids of zero `[*shape,
-    layers, top_k]` in the engines' dtype, and `routed` false, which the trainer reads as no record."""
-    return {ROUTED_EXPERTS_KEY: np.zeros((*shape, *layout), dtype), ROUTED_KEY: np.zeros(shape, bool)}
+def routing_of[Leaf](batch: Mapping[str, Leaf]) -> Leaf | dict[str, Leaf] | None:
+    """A packed batch's routing record as the trainer replays it (`dew.nn.inputs.LayerInputs.experts`):
+    its one array, or one a routed site by its path where the calls' records are keyed by site
+    (`ROUTED_EXPERTS_KEY`); None without one."""
+    if ROUTED_EXPERTS_KEY in batch:
+        return batch[ROUTED_EXPERTS_KEY]
+    prefix = f"{ROUTED_EXPERTS_KEY}/"
+    sites = {name.removeprefix(prefix): value for name, value in batch.items() if name.startswith(prefix)}
+    return sites or None
+
+
+def _routing_keys(record: np.ndarray | Mapping[str, np.ndarray]) -> list[tuple[str, np.ndarray]]:
+    """A routing record's arrays under the batch keys `pack` lays them out at (`ROUTED_EXPERTS_KEY`)."""
+    if isinstance(record, Mapping):
+        return [(f"{ROUTED_EXPERTS_KEY}/{site}", held) for site, held in record.items()]
+    return [(ROUTED_EXPERTS_KEY, record)]
+
+
+def _empty_routing(shape: tuple[int, int], layout: Mapping[str, tuple[tuple[int, ...], np.dtype]]
+                   ) -> dict[str, np.ndarray]:
+    """The routing record's empty form over packed rows of `shape`: under each of `layout`'s keys (one
+    a routed site where the records are keyed by site, `ROUTED_EXPERTS_KEY`), expert ids of zero
+    `[*shape, layers, top_k]` in the engines' dtype, and `routed` false, which the trainer reads as
+    no record."""
+    return {**{name: np.zeros((*shape, *dims), dtype) for name, (dims, dtype) in layout.items()},
+            ROUTED_KEY: np.zeros(shape, bool)}
+
+
+def _layout(records: Sequence[Routing]) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
+    """The `[layers, top_k]` and dtype of the calls' routing records by their batch keys
+    (`_routing_keys`), which every call's must agree on: their sites, and each site's."""
+    keyed = [dict(_routing_keys(record)) for record in records]
+    names = {tuple(sorted(arrays)) for arrays in keyed}
+    if len(names) != 1:
+        raise ValueError(f"routed_experts disagree on their routed sites across calls: {sorted(names)}")
+
+    def held(name: str) -> tuple[tuple[int, ...], np.dtype]:
+        arrays = [arrays[name] for arrays in keyed]
+        dims = {array.shape[1:] for array in arrays}
+        if len(dims) != 1:
+            raise ValueError(f"routed_experts disagree on [layers, top_k] across calls at {name}: "
+                             f"{sorted(dims)}")
+        return dims.pop(), np.result_type(*arrays)
+
+    return {name: held(name) for name in names.pop()}
 
 
 def _empty_support(rows: int, capacity: int) -> dict[str, np.ndarray]:
@@ -785,6 +839,7 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     """The packed routing and support arrays, present only when a call recorded them.
 
     `routed_experts` is `[rows, width, layers, top_k]` in the engines' dtype,
+    one a routed site where the records are keyed by site (`_routing_keys`),
     with `routed` true where a call's record covers the id. The supports are
     ragged within each row, as vLLM's `sampling_mask` and slime's
     `top_p_token_ids` with offsets keep them: row r of `support_ids` holds the
@@ -793,19 +848,15 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     `support_capacity`, so the arrays shard with the rows they describe.
     """
     records = [chain.routing for chain in built if chain.routing is not None]
-    out: dict[str, np.ndarray] = {}
-    if records:
-        layout = {record.shape[1:] for record in records}
-        if len(layout) != 1:
-            raise ValueError(f"routed_experts disagree on [layers, top_k] across calls: {sorted(layout)}")
-        out = _empty_routing(shape, layout.pop(), np.result_type(*records))
+    out = {} if not records else _empty_routing(shape, _layout(records))
     kept: list[list[tuple[int, ...]]] = [[] for _ in range(shape[0])]
     owners: list[list[int]] = [[] for _ in range(shape[0])]
     for row, _, start, chain in _spans(built, placed):
         if out and chain.routing is not None:
-            rows_covered = len(chain.routing)
-            out[ROUTED_EXPERTS_KEY][row, start:start + rows_covered] = chain.routing
-            out[ROUTED_KEY][row, start:start + rows_covered] = True
+            covered = slice(start, start + routing_rows(chain.routing))
+            for name, held in _routing_keys(chain.routing):
+                out[name][row, covered] = held
+            out[ROUTED_KEY][row, covered] = True
         for position, ids in enumerate(chain.supports):
             if ids is not None:
                 kept[row].append(ids)
@@ -840,26 +891,28 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     (`shard_batch` takes one tree from every process). A record another
     process packed and this one did not holds its empty form here: `routed`
     false over expert ids of zero, and supports of -1, which the trainer
-    reads as no record. The routing's `[layers, top_k]` and dtype come from
-    the processes that packed it, which must agree. A process that packed
+    reads as no record. The routing's `[layers, top_k]` and dtype, a routed
+    site's each where the records are keyed by site, come from the processes
+    that packed it, which must agree. A process that packed
     nothing, a share's later reader, keeps nothing. Every process calls
     this, in the order of its other coordination rounds.
     """
     from dew._coordination import from_every_process
 
-    routed = packed.get(ROUTED_EXPERTS_KEY)
-    pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],
-                               "support": SUPPORT_KEY in packed})
-    layouts = {tuple(share["routing"]) for share in pool if share["routing"] is not None}
+    routed = {name: [*map(int, value.shape[2:]), value.dtype.name] for name, value in packed.items()
+              if name == ROUTED_EXPERTS_KEY or name.startswith(f"{ROUTED_EXPERTS_KEY}/")}
+    pool = from_every_process({"routing": routed or None, "support": SUPPORT_KEY in packed})
+    layouts = {json.dumps(share["routing"], sort_keys=True) for share in pool if share["routing"] is not None}
     if len(layouts) > 1:
-        raise ValueError(f"the pool's routed_experts disagree on [layers, top_k] or dtype: {sorted(layouts)}")
+        raise ValueError(f"the pool's routed_experts disagree on their sites, [layers, top_k] or dtype: "
+                         f"{sorted(layouts)}")
     if not packed:
         return packed
     shape = np.shape(packed[IDS_KEY])
     filled = dict(packed)
-    if layouts and routed is None:
-        (layers, top_k, dtype), = layouts
-        filled.update(_empty_routing(shape, (layers, top_k), np.dtype(dtype)))
+    if layouts and not routed:
+        filled.update(_empty_routing(shape, {name: (tuple(held[:-1]), np.dtype(held[-1]))
+                                             for name, held in json.loads(layouts.pop()).items()}))
     if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
         filled.update(_empty_support(shape[0], support_capacity))

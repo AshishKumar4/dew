@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew._coordination import agreed, collective_host
-from dew._records import JSON, finite
+from dew._records import JSON, finite, record as section
 from dew.batch import Variables, thaw, token_id
 from dew.nn.inputs import key_seed, request_key
 from dew.nn.progress import Progress, progressed
@@ -98,6 +98,65 @@ def _likelihoods(name: str, values: object, count: int) -> tuple[float, ...]:
     return tuple(finite(value, f"a {name} log-probability") for value in values)
 
 
+type Routing = np.ndarray | Mapping[str, np.ndarray]
+"""An engine's routing record (`Draw.routed_experts`): `[forwarded ids, layers, top_k]` expert ids, one
+array for a model whose layers route at one site, or one a routed site keyed by its path, as the trainer
+replays it (`dew.nn.inputs.LayerInputs.experts`: `feedforward`, `mixer`, a composed mixer's
+`mixer/<branch>`)."""
+
+
+def _routing(record: Routing, forwarded: int) -> Routing:
+    """`record` checked against a draw that forwarded `forwarded` ids (`Routing`), each array read only."""
+    if not isinstance(record, Mapping):
+        return _routed("routed_experts", record, forwarded)
+    if not record or not all(isinstance(site, str) and site for site in record):
+        raise ValueError("a routing record keyed by site names one routed site's path a record, at least one")
+    return {site: _routed(f"routed_experts[{site!r}]", value, forwarded) for site, value in record.items()}
+
+
+def routing_rows(record: Routing) -> int:
+    """The forwarded ids a routing record covers, every site's alike (`Draw`)."""
+    return len(next(iter(record.values())) if isinstance(record, Mapping) else record)
+
+
+def routing_head(record: Routing, rows: int) -> Routing:
+    """A routing record's first `rows` forwarded ids, every site's."""
+    if isinstance(record, Mapping):
+        return {site: held[:rows] for site, held in record.items()}
+    return record[:rows]
+
+
+def routing_json(record: Routing) -> list | dict[str, list]:
+    """A routing record as JSON: nested lists of expert ids, an object of them by site where it is keyed
+    (`routing_record` reads it back)."""
+    if isinstance(record, Mapping):
+        return {site: held.tolist() for site, held in record.items()}
+    return record.tolist()
+
+
+def routing_record(value: object) -> Routing:
+    """A routing record `routing_json` wrote, as `Draw` checks it: nested lists of expert ids, or an
+    object of them by site."""
+    if isinstance(value, Mapping):
+        return {site: np.asarray(held) for site, held in section(value, "routed_experts").items()}
+    if not isinstance(value, list):
+        raise ValueError(f"routed_experts={value!r}: a routing record is nested lists of expert ids, or an "
+                         f"object of them by routed site")
+    return np.asarray(value)
+
+
+def _routed(name: str, value: np.ndarray, forwarded: int) -> np.ndarray:
+    """One site's routing record (`Routing`), `[forwarded, layers, top_k]` nonnegative expert ids."""
+    routed = np.array(value)
+    if routed.ndim != 3 or routed.shape[0] != forwarded or not np.issubdtype(routed.dtype, np.integer):
+        raise ValueError(f"{name} is [forwarded ids, layers, top_k] expert ids, {forwarded} rows for this "
+                         f"draw; got {routed.dtype} {routed.shape}")
+    if routed.size and routed.min() < 0:
+        raise ValueError(f"{name} holds expert ids, which are nonnegative")
+    routed.setflags(write=False)
+    return routed
+
+
 @dataclass(frozen=True)
 class Draw:
     """One model call as the engine served it: the one record a server, an environment, a session
@@ -119,7 +178,9 @@ class Draw:
     `[len(prompt) + len(tokens) - 1, layers, top_k]` expert ids in the dtype
     the engine sent; the last sampled id is never forwarded. vLLM calls this
     record `routed_experts` and SGLang `meta_info.routed_experts`, and the
-    trainer replays it (`dew.nn.protocols.Routes`). `support` holds, for
+    trainer replays it (`dew.nn.protocols.Routes`). A model whose layers
+    route at several sites, a routed mixer beside a routed feed-forward,
+    records one such array a site, keyed by its path (`Routing`). `support` holds, for
     each sampled id, the token ids the sampler's top-k/top-p filters kept
     (vLLM's `sampling_mask`). With a support, the behavior log-probability
     is the filtered one, and the trainer renormalizes over the same support.
@@ -133,7 +194,7 @@ class Draw:
     finish_reason: str
     version: int
     raw_log_probs: tuple[float, ...] | None = None
-    routed_experts: np.ndarray | None = field(default=None, compare=False)
+    routed_experts: Routing | None = field(default=None, compare=False)
     support: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
@@ -152,17 +213,8 @@ class Draw:
         if type(self.version) is not int or self.version < 0:
             raise ValueError("a draw's policy version is a nonnegative integer")
         if self.routed_experts is not None:
-            routed = np.array(self.routed_experts)
-            forwarded = len(self.prompt) + count - 1
-            if (routed.ndim != 3 or routed.shape[0] != forwarded
-                    or not np.issubdtype(routed.dtype, np.integer)):
-                raise ValueError(
-                    f"routed_experts is [forwarded ids, layers, top_k] expert ids, "
-                    f"{forwarded} rows for this draw; got {routed.dtype} {routed.shape}")
-            if routed.size and routed.min() < 0:
-                raise ValueError("routed_experts holds expert ids, which are nonnegative")
-            routed.setflags(write=False)
-            object.__setattr__(self, "routed_experts", routed)
+            object.__setattr__(self, "routed_experts",
+                               _routing(self.routed_experts, len(self.prompt) + count - 1))
         if self.support is not None:
             if not isinstance(self.support, tuple) or len(self.support) != count:
                 raise ValueError("support holds one tuple of kept ids per sampled id")
