@@ -193,15 +193,18 @@ def a_dense_layers_terms_are_its_placements_own_on_a_gpu_host(tmp_path):
     its platform picks (`dew.nn.precision.spread`), and of a product whose form its platform picks
     (`placed_terms`), evaluated from inputs committed to the CPU and then the GPU, and again the other way,
     holds each placement's own values and terms: those a fresh process evaluating that placement alone
-    holds, bit for bit. A branch its platform picks is read where the inputs are placed, and no compiled
-    evaluation of one placement is reused by the other (`evaluated_on`)."""
+    holds, bit for bit, the CPU's one that sees no GPU (`JAX_PLATFORMS=cpu`), so none of its branches can
+    be the GPU's. A branch its platform picks is read where the inputs are placed, not on the host's
+    default device, and no compiled evaluation of one placement is reused by the other (`evaluated_on`)."""
+    import os
     import subprocess
     import sys
 
     fresh = {}
     for platform in ("cpu", "gpu"):
         saved = tmp_path / f"{platform}.npz"
-        subprocess.run([sys.executable, "-c", PLACED_DENSE, platform, str(saved)], check=True)
+        alone = {**os.environ, "JAX_PLATFORMS": "cpu"} if platform == "cpu" else None
+        subprocess.run([sys.executable, "-c", PLACED_DENSE, platform, str(saved)], check=True, env=alone)
         with np.load(saved) as held:
             fresh[platform] = [held[f"arr_{index}"] for index in range(len(held.files))]
     for order in (("cpu", "gpu"), ("gpu", "cpu")):
