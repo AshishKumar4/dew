@@ -237,29 +237,27 @@ class Window:
 
 
 def structure(window: jcore.Jaxpr) -> Hashable:
-    """What a window's derivation (`_region`) reads of it: each input's shape, dtype and weak type; each
-    equation's primitive, its parameters as a region holds them (`terms.parameters_key`), whether it is
-    protected (`terms.protected`), its operands (an input's or an earlier output's position, or a literal's
-    value and type) and its outputs' types; and which values it yields. Two windows of one structure,
-    their values named apart, derive one rewrite: every layer of a stack's, every compile's of one step."""
+    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
+    type and placement, the sharding and memory its forms' values take); each equation's primitive, its
+    parameters as a region holds them (`terms.parameters_key`), whether it is protected
+    (`terms.protected`), its operands (an input's or an earlier output's position, or a literal's value and
+    type) and its outputs' types; and which values it yields. Two windows of one structure, their values
+    named apart, derive one rewrite: every layer of a stack's, every compile's of one step."""
     position = {var: index for index, var in enumerate(window.invars)}
-
-    def typed(var) -> tuple:
-        return var.aval.shape, var.aval.dtype, var.aval.weak_type
 
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
             value = np.asarray(atom.val)
-            return value.dtype, value.shape, value.tobytes(), typed(atom)
+            return value.dtype, value.shape, value.tobytes(), atom.aval
         return position[atom]
 
     equations = []
     for equation in window.eqns:
         equations.append((terms.parameters_key(equation.primitive, equation.params),
                           terms.protected(equation), tuple(map(operand, equation.invars)),
-                          tuple(map(typed, equation.outvars))))
+                          tuple(var.aval for var in equation.outvars)))
         position.update({var: len(position) for var in equation.outvars})
-    return tuple(map(typed, window.invars)), tuple(equations), tuple(map(operand, window.outvars))
+    return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
 
 
 @functools.lru_cache(maxsize=WINDOWS_HELD)
