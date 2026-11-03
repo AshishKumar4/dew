@@ -265,7 +265,8 @@ significand among them, and one given its operands by name."""
 @pytest.mark.parametrize("name", ERROR_FREE)
 def test_an_error_free_transform_is_one_protected_span_its_derivative_keeps(name):
     """An error-free transform traces as one marked span of kind `Protected` (`dew.nn.derivatives.marked`)
-    holding the whole of it, every array it is given by position or by name an operand of the span, and
+    holding the whole of it, every array it is given by position or by name an operand of the span (a
+    compensated sum's pairs repeat them) and none other, and
     its derivative's program keeps the mark, so the algebra pass reads what it may never reassociate as an
     object, not a name scope (ledger 3640). A composite (a compensated sum, the significand's rounding)
     is its own span, not only the spans of the transforms it calls."""
@@ -278,7 +279,7 @@ def test_an_error_free_transform_is_one_protected_span_its_derivative_keeps(name
     program = jax.make_jaxpr(transform)(a, b).jaxpr
     (span,) = program.eqns
     assert (span.primitive, span.params["kind"]) == (marked_call_p, Protected())
-    assert span.invars == program.invars
+    assert set(span.invars) == set(program.invars)
 
     def summed(a, b):
         return sum(jnp.sum(leaf) for leaf in jax.tree.leaves(transform(a, b)))
