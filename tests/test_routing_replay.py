@@ -12,6 +12,8 @@ they are on par from the stack's float64 run over drawn models, tokens and
 records (check 1, tests/reference_error.py).
 """
 
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -32,7 +34,7 @@ from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
 SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64, 'own routing': 8,
-         'own keyed routing': 8}
+         'own keyed routing': 8, 'keyed pack': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -498,6 +500,75 @@ def test_packed_grpo_replays_the_routing_its_batch_carries():
     params, tokens, routed = draw(0)
     native = np.asarray(obj.per_token_log_probs(params, tokens))[0, 4:]
     assert not np.array_equal(through_pack(params, tokens, routed), native)
+
+
+def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_grpo_replays_it():
+    """An engine's routing record keyed by routed site (`dew.inference.rollouts.Routing`), as a model
+    routing in a parallel mixer's branch and in its feed-forward records it, rides its call into the
+    packed batch, one array a site (`sessions.routing_of`), a call that continues it extending each
+    site's record; it reads back from the journal and from verl's rows as written; and GRPO's packed
+    scoring replays each site its own entry, scoring the tokens as a direct replay of the keyed record
+    does, on par from its float64 truth over drawn models and tokens (check 1, ledger 3630). A site
+    covering other ids than its draw forwarded, and a record naming no site, are refused."""
+    from dew.inference.rollouts import Draw
+    from dew.objectives.rl.grpo import GRPOObjective
+    from dew.objectives.rl.records import draw_record, record_json
+    from dew.objectives.rl.verl import from_verl, to_verl
+    from dew.sampling import Sampling
+
+    obj = parallel_routed(mixed=False)
+    packed = jax.jit(GRPOObjective(obj.model, SEQ_LEN).packed_log_probs)
+    init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
+
+    def call_of(ids: list[int], record: dict[str, np.ndarray], prompt: int, end: int) -> Call:
+        """The call that read `ids[:prompt]` and sampled up to `end`, with each site's record of the ids
+        it forwarded."""
+        return Call(tuple(ids[:prompt]), tuple(ids[prompt:end]), (-1.0,) * (end - prompt), "length", 0,
+                    routed_experts={site: held[0, :end - 1] for site, held in record.items()})
+
+    @as_given
+    def through_pack(params, tokens, record):
+        ids = [int(token) for token in np.asarray(tokens[0])]
+        session = Session("t", "g", 0, 0, (call_of(ids, record, 5, SEQ_LEN + 1),), Status.COMPLETED, 1.0)
+        return np.asarray(packed(params, pack([session], SEQ_LEN + 1)))[0, 5:]
+
+    def direct(obj):
+        run = jax.jit(lambda params, tokens, record: replayed_log_probs(obj, params, tokens, (record, None)))
+        return lambda params, tokens, record: run(params, tokens, record)[0, 4:]
+
+    def draw(seed):
+        params, tokens = init(jax.random.fold_in(jax.random.key(0), seed)), tokens_of(1, seed=1000 + seed)
+        return params, tokens, keyed_record(site_choices(obj, params, tokens), shift=1)
+
+    assert_as_exact(through_pack, direct(obj), draw, "keyed routing through pack", seeds=SEEDS['keyed pack'],
+                    truth_fn=direct(parallel_routed(mixed=False, dtype=jnp.float64)))
+
+    from dew.objectives.rl.sessions import routing_of
+
+    _, tokens, record = draw(0)
+    ids = [int(token) for token in np.asarray(tokens[0])]
+    first, second = call_of(ids, record, 5, 7), call_of(ids, record, 8, SEQ_LEN + 1)
+    batch = pack([Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.0)], SEQ_LEN + 1)
+    assert ROUTED_EXPERTS_KEY not in batch
+    replayed_record = routing_of(batch)
+    assert isinstance(replayed_record, dict) and isinstance(second.routed_experts, dict)
+    assert sorted(replayed_record) == sorted(record)
+    for site, held in second.routed_experts.items():
+        np.testing.assert_array_equal(replayed_record[site][0, :SEQ_LEN], held, err_msg=site)
+    assert batch[ROUTED_KEY][0].tolist() == [True] * SEQ_LEN + [False]
+    written = Draw(second.prompt, second.tokens, second.behavior_log_probs, "length", 0,
+                   routed_experts=second.routed_experts)
+    journaled = draw_record(json.loads(record_json(written)), Sampling(temperature=1.0)).routed_experts
+    (verl,) = from_verl(json.loads(json.dumps(to_verl([Session("t", "g", 0, 0, (second,), Status.COMPLETED,
+                                                               1.0)]))))
+    for read in (journaled, verl.session.calls[0].routed_experts):
+        assert isinstance(read, dict) and sorted(read) == sorted(record)
+        for site, held in second.routed_experts.items():
+            np.testing.assert_array_equal(read[site], held, err_msg=site)
+    short = {**second.routed_experts, FEEDFORWARD_ROUTES: second.routed_experts[FEEDFORWARD_ROUTES][:-1]}
+    for refused in (short, {}):
+        with pytest.raises(ValueError):
+            Call(second.prompt, second.tokens, second.behavior_log_probs, "length", 0, routed_experts=refused)
 
 
 def test_a_multimodal_mixture_replays_through_its_language_model():
