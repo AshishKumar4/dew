@@ -1652,12 +1652,12 @@ def test_the_forward_pairs_a_groups_row_tiles_where_its_rows_span_two(trans_rhs)
     """On an H100 the forward and the input gradient derive a pair of multiprocessors a cluster
     (`mosaic.Family.cluster`) where a group averages a row tile's rows, each multiprocessor's tile and
     stages as alone, and one multiprocessor where it averages fewer; an A100's mma.sync bundle takes no
-    cluster at any rows. Each derived tile is legal."""
+    cluster at any rows. Each derived tile is legal, a decode step's few rows a group too."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     groups, depth, width = 8, 2048, 1536
     launch = grouped_matmul.MosaicGmm()
     derived = {}
-    for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm80", 8 * 512)):
+    for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm90", 8 * 32), ("sm80", 8 * 512)):
         with generation.assumed(name):
             target = generation.gpu_target()
             ba = launch.bind(bf16((rows, width if trans_rhs else depth)), bf16((groups, depth, width)),
