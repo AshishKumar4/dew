@@ -41,7 +41,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import Protected, marked, surrogate
 from dew.nn.nested import nested
 from dew.nn.sharding import explicit_spec
 
@@ -825,18 +825,26 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
-PROTECTED = "dew_protected"
-"""The name scope an error-free transform's equations carry, which survives autodiff in each traced equation's
-name stack: `dew.algebra` never rewrites them, as reassociation would cancel the residual they keep."""
-
-
 def _protected(transform: Callable) -> Callable:
-    """`transform` traced under `PROTECTED`'s name scope."""
+    """`transform` as one span the algebra pass keeps as it is (`dew.nn.derivatives.Protected`), a call
+    every transform of it keeps (`marked`), as reassociation would cancel the residual an error-free
+    transform keeps. Its arrays are the span's operands; its constants (a kernel's static factor, a Python
+    number) and its options are bound in, so a constant still splits where it is known (`two_product`)."""
     @functools.wraps(transform)
-    def traced(*args, **kwargs):
-        with jax.named_scope(PROTECTED):
-            return transform(*args, **kwargs)
-    return traced
+    def kept(*args, **options):
+        leaves, structure = jax.tree.flatten(args)
+        traced = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)]
+        if not traced:
+            return transform(*args, **options)
+
+        def span(*operands):
+            filled = list(leaves)
+            for index, operand in zip(traced, operands, strict=True):
+                filled[index] = operand
+            return transform(*jax.tree.unflatten(structure, filled), **options)
+
+        return marked(Protected(), span)(*(leaves[index] for index in traced))
+    return kept
 
 
 @_protected
@@ -946,6 +954,7 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     return jnp.where(special, plain, signed)
 
 
+@_protected
 def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The correctly rounded fp32 quotient of two significands in [0.5, 1), and the sign of the exact
     quotient's distance from it (+1 above, -1 below, 0 exact).
@@ -955,16 +964,14 @@ def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[
     quotient within one ulp; comparing its exact residual with each
     neighbour's half-spacing times the divisor chooses nearest-even.
     That threshold product is exact because the half-spacing is a power
-    of two, and every intermediate is normal at these magnitudes."""
+    of two, and every intermediate is normal at these magnitudes. Each
+    residual is an error-free step, so the whole is one protected span."""
     quotient = numerator / denominator
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
     residual = (numerator - product) - error
     quotient = quotient + residual / denominator
     product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
-    difference = numerator - product
-    high = difference - error
-    recovered = high - difference
-    low = (difference - (high - recovered)) - (error + recovered)
+    high, low = two_sum(numerator - product, -error)
     above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
     upper = (above - quotient) * 0.5 * denominator
     lower = (quotient - below) * 0.5 * denominator

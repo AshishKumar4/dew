@@ -21,7 +21,16 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import ACCURATE, Numerics, fp32_result_dot_general
+from dew.nn.precision import (
+    ACCURATE,
+    Numerics,
+    compensated_add,
+    compensated_difference,
+    correctly_rounded_divide,
+    fp32_result_dot_general,
+    two_product,
+    two_sum,
+)
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
@@ -236,6 +245,70 @@ def test_a_bit_split_keeps_large_factors_finite(barrier, subtract):
         rounding=jax.lax.optimization_barrier if barrier else None))(left, right)
     truth = left.astype(np.float64) * right.astype(np.float64)
     np.testing.assert_array_equal(high, truth.astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
+
+
+def marked_kinds(jaxpr) -> list:
+    """The kind of every marked span (`dew.nn.derivatives.marked`) in `jaxpr` and the programs its equations
+    hold, at any depth."""
+    from jax.extend.core import ClosedJaxpr, Jaxpr
+
+    from dew.nn.derivatives import marked_call_p
+
+    found = []
+    for equation in jaxpr.eqns:
+        if equation.primitive is marked_call_p:
+            found.append(equation.params["kind"])
+        for value in equation.params.values():
+            for held in value if isinstance(value, tuple | list) else (value,):
+                if isinstance(held, ClosedJaxpr | Jaxpr):
+                    found += marked_kinds(held.jaxpr if isinstance(held, ClosedJaxpr) else held)
+    return found
+
+
+ERROR_FREE = {
+    "two_sum": two_sum,
+    "two_product": two_product,
+    "two_product bit-split": functools.partial(two_product, bit_split=True, subtract=True),
+    "compensated_add": lambda a, b: compensated_add((a, b), (b, a)),
+    "compensated_difference": lambda a, b: compensated_difference((a, b), (b, a)),
+    "correctly_rounded_divide": correctly_rounded_divide,
+}
+"""Each error-free transform of `dew.nn.precision` over two arrays, and the division whose significand one
+rounds."""
+
+
+@pytest.mark.parametrize("name", ERROR_FREE)
+def test_an_error_free_transform_is_a_protected_span_its_derivative_keeps(name):
+    """An error-free transform traces as one marked span of kind `Protected` (`dew.nn.derivatives.marked`),
+    and its derivative's program keeps the mark, so the algebra pass reads what it may never reassociate
+    as an object, not a name scope (ledger 3640)."""
+    from dew.nn.derivatives import Protected
+
+    transform = ERROR_FREE[name]
+    a, b = (jnp.asarray(np.random.default_rng(seed).uniform(0.5, 2.0, 8), jnp.float32) for seed in (1, 2))
+    assert Protected() in marked_kinds(jax.make_jaxpr(transform)(a, b).jaxpr)
+
+    def summed(a, b):
+        return sum(jnp.sum(leaf) for leaf in jax.tree.leaves(transform(a, b)))
+
+    assert Protected() in marked_kinds(jax.make_jaxpr(jax.grad(summed, argnums=(0, 1)))(a, b).jaxpr)
+
+
+def test_a_constant_factor_splits_on_the_host_outside_its_protected_span():
+    """A factor known when the product traces (a kernel's static one) splits where it is known: the
+    protected span takes the traced operand alone, the constant's halves bound into it, and the product
+    and residual are the float64 product's, as an unmarked split's are."""
+    from dew.nn.derivatives import marked_call_p
+
+    left = jnp.asarray(np.random.default_rng(3).uniform(-4.0, 4.0, 8), jnp.float32)
+    factor = np.float32(1.4426950408889634)
+    program = jax.make_jaxpr(lambda a: two_product(a, factor, bit_split=True))(left)
+    (span,) = [equation for equation in program.jaxpr.eqns if equation.primitive is marked_call_p]
+    assert len(span.invars) == 1
+    high, low = jax.jit(lambda a: two_product(a, factor, bit_split=True))(left)
+    truth = np.asarray(left, np.float64) * np.float64(factor)
+    np.testing.assert_array_equal(np.asarray(high), truth.astype(np.float32))
     np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
 
 
