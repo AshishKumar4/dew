@@ -122,7 +122,7 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
     opened = []
     request = http.client.HTTPConnection.request
     monkeypatch.setattr(http.client.HTTPConnection, "request",
-                        lambda self, *args, **kwargs: (opened.append(args), request(self, *args, **kwargs))[1])
+                        lambda self, *args, **kwargs: opened.append(args) or request(self, *args, **kwargs))
     cache = remote_cache.RemoteCache(tmp_path, f"http://127.0.0.1:{port}", "token", "jax/cpu")
     began = time.monotonic()
     for index in range(10):
