@@ -106,10 +106,9 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 @pytest.mark.parametrize("hook", ["plain", "sinks", "far"])
 def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted(hook):
     """A decode step of 17 rows over 8 key heads (136 programs, past an H100's 132 multiprocessors), so its
-    work list takes one slice a row (`plan`), its launches walk their tiles persistent (`_persistent`, a
-    program a multiprocessor) and the walk finishes each row itself from the initial state (a sink's), in
-    the query's dtype; `far` its first row's query 2^16 times a drawn one, past the fold's reach, so the
-    masked rewalk walks that row's tile alone among inactive ones: on par with the reference path
+    work list takes one slice a row (`plan`) and the walk finishes each row itself from the initial state (a
+    sink's), in the query's dtype; `far` its first row's query 2^16 times a drawn one, past the fold's reach,
+    so the masked rewalk walks that row's query block alone: on par with the reference path
     (check 1)."""
     batch, heads, keys = 17, 8, 128
     lengths = jnp.asarray([keys - 7 * row for row in range(batch)], jnp.int32)
