@@ -23,7 +23,7 @@ from dew.nn.flops import counted_flops, projection_flops
 from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
-from dew.nn.sharding import drawn_axes
+from dew.nn.sharding import abstract, drawn_axes
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.registry import dtype_name
 
@@ -145,10 +145,36 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     t5: T5Segment | None = None
     guidance: float | None = None
     param_dtype: str = "float32"
+    projections: Mapping[str, int] = field(default_factory=dict, kw_only=True)
+    """Each CLIP tower's projection width, read from its config: the width its `text_projection` kernel
+    maps a pooled state to, where the composition reads it (`projected`, `drawn`)."""
     tokenizer_files: tuple[PinnedTokenizer, ...] = field(default=(), kw_only=True)
     """The files of the CLIP tokenizers, each pinned as it was loaded (`dew.data.text.pin_tokenizer`),
     which `dependencies` records with the T5 segment's: the ids a caption tokenizes to are theirs."""
     keyword: ClassVar[str] = "conditioning"
+
+    @property
+    def projected(self) -> tuple[str, ...]:
+        """The CLIP towers whose pooled state the composition projects (`text_projection`): the last of
+        an XL pair, each of SD3's, none of another's."""
+        return (self.names[-1:] if self.composition == "clip_pooled" else
+                self.names if self.composition == "sd3" else ())
+
+    def drawn(self) -> Mapping:
+        """Each CLIP tower drawn under its name's `text_model` beside the projection the composition reads,
+        and the T5 segment under its own name, over a row of token ids, as `encode` reads them
+        (`ConditionEncoder.drawn`)."""
+        ids, key = jnp.zeros((1, 2), jnp.int32), jax.random.key(0)
+        towers: dict[str, Mapping] = {name: {"text_model": abstract(tower.init, key, ids)["params"]}
+                                      for name, tower in zip(self.names, self.towers, strict=True)}
+        for name, tower in zip(self.names, self.towers, strict=True):
+            if name in self.projected:
+                # In float32, as the towers' own draws are: a draw's dtypes place nothing, its shapes do.
+                kernel = jax.ShapeDtypeStruct((tower.hidden_size, self.projections[name]), jnp.float32)
+                towers[name] = {**towers[name], "text_projection": {"kernel": kernel}}
+        if self.t5 is not None:
+            towers[self.t5.name] = abstract(self.t5.tower.init, key, ids)["params"]
+        return towers
 
     def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
         """Each CLIP tower's draw under its name's `text_model`, and the T5 segment's under its own name,
@@ -183,9 +209,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         t5_lengths = rows * (np.shape(tokens["t5_input_ids"])[-1] if self.t5 is not None else ids.shape[-1])
         if self.t5 is not None:
             count += counted_flops(self.t5.tower, t5_lengths)
-        projected = (self.names[-1:] if self.composition == "clip_pooled" else
-                     self.names if self.composition == "sd3" else ())
-        for name in projected:
+        for name in self.projected:
             kernel = self.params[name]["text_projection"]["kernel"]
             count += projection_flops(rows, kernel.shape[0], kernel.shape[1])
         lengths = (t5_lengths if self.composition == "flux" else
@@ -414,6 +438,11 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
         """The language tower's draw over a row of token ids (`ConditionEncoder.parameter_axes`)."""
         return drawn_axes(self.tower.init, jnp.zeros((1, 2), jnp.int32))
 
+    def drawn(self) -> Mapping:
+        """The language tower drawn over a row of token ids, its variables under `text_encoder`, as
+        `encode` reads them (`ConditionEncoder.drawn`)."""
+        return {"text_encoder": abstract(self.tower.init, jax.random.key(0), jnp.zeros((1, 2), jnp.int32))}
+
     def dependencies(self) -> Mapping[str, object]:
         """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume
         refuses a prompt's ids from other files."""
@@ -639,6 +668,12 @@ class WanConditioner(_LanguageText):
         # The encoder masks padding, but Wan reads its zero-filled fixed
         # output budget without a mask; those keys remain in its softmax.
         return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features)
+
+    def drawn(self) -> Mapping:
+        """The language tower drawn over a row of token ids, its parameters under `text_encoder`, as
+        `encode` reads them (`ConditionEncoder.drawn`)."""
+        return {"text_encoder": abstract(self.tower.init, jax.random.key(0),
+                                         jnp.zeros((1, 2), jnp.int32))["params"]}
 
     def encode(self, params, tokens) -> DenoisingCondition:
         mask = jnp.asarray(tokens["attention_mask"])

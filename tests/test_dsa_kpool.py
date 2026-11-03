@@ -120,7 +120,8 @@ MARGIN = 1e-3
 rounding, so float64 and fp32 select the same pools."""
 
 SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 64, 'parallel': 8, 'decode': 8,
-         'padded decode': 8, 'hole': 8, 'gated layer': 8, 'ordinary step': 32, 'reordered draft': 32}
+         'padded decode': 8, 'hole': 8, 'gated layer': 8, 'ordinary step': 32, 'reordered draft': 32,
+         'parallel chain': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -592,8 +593,9 @@ def test_a_parallel_prediction_mixer_hands_its_kpool_branch_the_chains_phases():
     """A parallel prediction mixer (`dew.nn.mixers.parallel`, a k-pool beside Mamba-2, each scaled in and
     out) through a prediction chain, allocated and extended over five tokens, then drafted at the sixth and
     the seventh: its k-pool branch takes each call's phase, sharing its seeded selection through the drafts,
-    and its Mamba-2 branch its ordinary decode steps; each draft's output is the two branches' run apart
-    through the same calls, scaled and summed, bit for bit (ledger 3575)."""
+    and its Mamba-2 branch its ordinary decode steps; each call's output is the two branches' run apart
+    through the same calls, scaled and summed, on par from that sum's float64 truth over drawn hidden
+    states (check 1; ledger 3575)."""
     from dew.nn.mixers.mamba2 import Mamba2Mixer
     from dew.nn.mixers.parallel import ParallelMixers
     from dew.nn.precision import scaled
@@ -604,38 +606,49 @@ def test_a_parallel_prediction_mixer_hands_its_kpool_branch_the_chains_phases():
         MixerContext(E, H, H, 8, 16))
     parallel = ParallelMixers(branches=(("kpool", kpool, 1.0, 0.5, True),
                                         ("mamba", mamba, 0.75, 1.25, False)))
-    hidden, valid = inputs()
-    x, active = jnp.asarray(hidden), jnp.asarray(valid)
-    mamba_params = parallel.init(jax.random.key(3), x[:, :4])["params"]["mamba"]
+    hidden, _ = inputs()
+    mamba_params = parallel.init(jax.random.key(3), jnp.asarray(hidden)[:, :4])["params"]["mamba"]
     variables = {"params": {"kpool": translated(reference_block())["params"], "mamba": mamba_params}}
     calls = [(slice(0, 5), "extend"), (slice(5, 6), "draft"), (slice(6, 7), "draft")]
 
-    def chain(module, variables, phased: bool, into: float = 1.0):
-        """The module's outputs at each call of the chain over `x` times `into`, its cache allocated
+    def chain(module, variables, hidden, valid, phased: bool, into: float = 1.0):
+        """The module's outputs at each call of the chain over `hidden` times `into`, its cache allocated
         first as `drafts` does."""
-        read = scaled(x, into)
+        read = scaled(hidden, into)
 
         def step(cache, span, phase):
             options = {"prediction_phase": phase} if phased else {}
-            call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=active[:, span])), decode=True)
+            call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid[:, span])), decode=True)
             return module.apply({**variables, "cache": cache}, read[:, span], call, mutable=["cache"],
                                 **options)
 
         _, allocated = module.apply(variables, read[:, :1], MixerCall(decode=True), mutable=["cache"],
                                     **({"prediction_phase": "extend"} if phased else {}))
-        cache, outputs = allocated["cache"], []
+        cache, outputs = allocated["cache"], {}
         for span, phase in calls:
             out, held = step(cache, span, phase)
             cache = held["cache"]
-            outputs.append(np.asarray(out))
+            outputs[f"call {span.start}"] = out
         return outputs
 
-    together = chain(parallel, variables, phased=True)
-    selected = chain(kpool(), {"params": variables["params"]["kpool"]}, phased=True)
-    recurred = chain(mamba(), {"params": variables["params"]["mamba"]}, phased=False, into=0.75)
-    for joined, attended, scanned in zip(together, selected, recurred, strict=True):
-        apart = scaled(jnp.asarray(attended), 0.5) + scaled(jnp.asarray(scanned), 1.25)
-        np.testing.assert_array_equal(joined, np.asarray(apart))
+    def apart(dtype):
+        """The branches run apart at `dtype`, each scaled in and out as the mixer scales it, and summed."""
+        def run(variables, hidden, valid):
+            attended = chain(kpool(dtype=dtype), {"params": variables["params"]["kpool"]}, hidden, valid,
+                             phased=True)
+            scanned = chain(mamba(dtype=dtype), {"params": variables["params"]["mamba"]}, hidden, valid,
+                            phased=False, into=0.75)
+            return {name: scaled(attended[name], 0.5) + scaled(scanned[name], 1.25) for name in attended}
+        return jax.jit(run)
+
+    def draw(seed):
+        hidden, valid = inputs(1 + seed)
+        return variables, hidden, valid
+
+    together = jax.jit(lambda variables, hidden, valid: chain(parallel, variables, hidden, valid,
+                                                             phased=True))
+    assert_as_exact(together, apart(jnp.float32), draw, 'parallel prediction chain',
+                    seeds=SEEDS['parallel chain'], truth_fn=apart(jnp.float64))
 
 
 def test_prediction_selection_rewind_recomputes_only_invalidated_row():

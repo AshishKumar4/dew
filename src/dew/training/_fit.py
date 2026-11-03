@@ -1033,4 +1033,5 @@ def _rollout_resumed(rollout: Rollout | None, checkpoints: Checkpoints, step: in
             leaf.dtype, jax.dtypes.prng_key)
         return jax.random.wrap_key_data(leaf) if keyed else leaf
 
-    restored(jax.tree.map(typed, tree, dict(template)))
+    # Read as the keys the step holds: one saved before the rollout held a key lacks it (`rollout_state`).
+    restored(jax.tree.map(typed, tree, {name: template[name] for name in tree}))

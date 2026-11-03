@@ -2,8 +2,8 @@
 (`templates.cost.Work`, `work`), from its operands' shapes (`rules.shape`) and its parameters, turned into
 seconds by a schedule over a GPU target's facts (`generation.GpuTarget`, their one owner): XLA's fusion for
 the compile-time pass over a program (`fused`), or a template's tile walk for a form a template's algebra
-takes (`walk`). Each shared value is priced once over the extracted DAG (egglog's `DagCostModel` under its
-`greedy-dag` extractor)."""
+takes (`walk`). Each shared value is priced once over the extracted DAG (egglog's `DagCostModel`, extracted
+exactly: `dew.algebra.extract`)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, get_callable_args
 
-from dew.algebra.rules import shape
+from dew.algebra.extract import Level
+from dew.algebra.rules import CONTRACTED, shape
 from dew.algebra.terms import Region, Term, integer, key, text
 from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
@@ -104,6 +105,9 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
         elements = made(graph, args[:1], held)
         special = text(args[1]) in EXPONENTIALS
         return Work(exponentials=elements) if special else Work(operations=elements)
+    if (args := get_callable_args(node, Term.binary)) is not None and text(args[1]) == CONTRACTED["mul"]:
+        # Its reader's fused multiply-add computes it (`rules._contracted`).
+        return Work()
     for constructor, operands in ((Term.binary, (0, 2)), (Term.compare, (0, 2)), (Term.select, (0, 1, 2))):
         if (args := get_callable_args(node, constructor)) is not None:
             return Work(operations=made(graph, [args[index] for index in operands], held))
@@ -157,8 +161,8 @@ def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=j
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class Seconds:
-    """A form's work and the seconds its schedule gives it, as extraction adds and compares it (egglog's
-    `ComparableAdd`): the work summed, compared by the seconds the schedule gives the sum and the `extra`
+    """A form's work and the seconds its schedule gives it, as extraction adds and compares it
+    (`extract.Linear`): the work summed, compared by the seconds the schedule gives the sum and the `extra`
     seconds beside it, which no rate prices (a reading the derivation left, infinite, `derive`; a stable
     proposal's risk, `RISK`), ties broken by the schedule's `tiebreak` (`Walk`'s: its units' seconds in
     series; `Fused`'s none), its `key`, taken where it is compared (extraction adds far more than it
@@ -178,6 +182,12 @@ class Seconds:
 
     def __add__(self, other: Seconds) -> Seconds:
         return Seconds(self.work + other.work, self.schedule, self.extra + other.extra)
+
+    def levels(self) -> tuple[Level, ...]:
+        """Its seconds and its tie, as extraction composes them node by node (`extract.Linear`): the
+        schedule's pieces and span (`Schedule.pieces`, `spanned`) beside its `extra`, then its tiebreak."""
+        return (Level(self.schedule.pieces(self.work), self.schedule.spanned(self.work), self.extra),
+                Level((self.schedule.tiebreak(self.work),)))
 
     def __eq__(self, other) -> bool:
         return isinstance(other, Seconds) and self.key == other.key
@@ -199,8 +209,14 @@ class Seconds:
 
 
 class Schedule(Protocol):
-    """A schedule (the module's account): the seconds it gives a work, what tells two works of one time
-    apart, and the work it gives no time, at a rate its target states none of (`templates.cost.units`)."""
+    """A schedule (the module's account): the seconds it gives a work, the larger of its `pieces` and its
+    span's (`spanned`), each piece linear in the work, which extraction sums node by node (`extract.Level`);
+    what tells two works of one time apart, linear too; and the work it gives no time, at a rate its target
+    states none of (`templates.cost.units`)."""
+
+    def pieces(self, done: Work) -> tuple[float, ...]: ...
+
+    def spanned(self, done: Work) -> float: ...
 
     def __call__(self, done: Work) -> float: ...
 
@@ -226,9 +242,14 @@ class Fused:
 
     facts: generation.GpuTarget
 
+    def pieces(self, done: Work) -> tuple[float, ...]:
+        return (sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0]),)
+
+    def spanned(self, done: Work) -> float:
+        return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=True))[0]
+
     def __call__(self, done: Work) -> float:
-        work = sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0])
-        return max(work, kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=True))[0])
+        return max(*self.pieces(done), self.spanned(done))
 
     def tiebreak(self, done: Work) -> float:
         del done
@@ -253,6 +274,12 @@ class Walk:
     lighter leaves its units more of the step another form's work would take."""
 
     facts: generation.GpuTarget
+
+    def pieces(self, done: Work) -> tuple[float, ...]:
+        return tuple(kernel_cost.units(done, kernel_cost.rates(self.facts, device=False))[0])
+
+    def spanned(self, done: Work) -> float:
+        return kernel_cost.spanned(done, kernel_cost.step_latency(self.facts, device=False))[0]
 
     def __call__(self, done: Work) -> float:
         return kernel_cost.walked(done, self.facts)
@@ -283,6 +310,9 @@ def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> Dag
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
 
+PRIMITIVES = {contracted: name for name, contracted in CONTRACTED.items()}
+"""The primitive each of a fused multiply-add's names binds (`rules.CONTRACTED`)."""
+
 RISK = {"log": 1.0, "sub": 1e-3}
 """What a node of the stable proposal (`stable`) costs beside its time, in seconds: a logarithm whose value
 is rounded into what follows it, a difference that may cancel its operands' digits. A proposal, not a choice:
@@ -298,8 +328,8 @@ def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> Da
         done = work(graph, node, region, bytes_per_element, held)
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
-                # Each operation's name follows its first operand.
-                risk = RISK.get(text(args[1]), 0.0)
+                # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
+                risk = RISK.get(PRIMITIVES.get(text(args[1]), text(args[1])), 0.0)
                 return Seconds(done, schedule, risk)
         return Seconds(done, schedule)
 

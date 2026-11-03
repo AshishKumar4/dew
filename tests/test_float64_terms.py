@@ -102,6 +102,34 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
     assert abs(float(value[0, 0])) < 1e-8 < float(terms[0, 0])
 
 
+def test_a_sum_its_platform_picks_carries_the_terms_of_the_branch_it_runs_where_placed():
+    """A value whose form its platform picks (`jax.lax.platform_dependent`, as Dew's bias spread is) carries
+    the terms of the branch the platform its inputs are placed on runs, at the top and inside a remat, its
+    compiled evaluation kept apart by platform: a CPU's product sums its terms, another platform's
+    elementwise form sums none, each within float64's own reduction bound of the terms written apart."""
+    rng = np.random.default_rng(5)
+    x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
+
+    def picked(x, weight):
+        return jax.lax.platform_dependent(x, weight, cpu=lambda x, weight: x @ weight,
+                                          default=lambda x, weight: x[:, :3] * weight[0])
+
+    with jax.enable_x64(new_val=True):
+        device = jax.devices()[0]
+        placed = [jax.device_put(jnp.asarray(value), device) for value in (x, weight)]
+        for program in (picked, jax.checkpoint(picked)):
+            value, terms = float64_terms(program, *placed)
+            if device.platform == "cpu":
+                written, size = x @ weight, np.sqrt(np.square(x) @ np.square(weight))
+                assert within(np.abs(np.asarray(value) - written),
+                              reduction_bound(np.abs(x) @ np.abs(weight), x.shape[1], np.float64))
+                assert within(np.abs(np.asarray(terms) - size), reduction_bound(size, x.shape[1], np.float64))
+            else:
+                written = x[:, :3] * weight[0]
+                assert np.array_equal(np.asarray(value), written) and np.array_equal(np.asarray(terms),
+                                                                                     np.abs(written))
+
+
 def test_a_grouped_matmul_sums_each_groups_terms_as_a_dot_does():
     """An expert layer's grouped matmul (`jax.lax.ragged_dot`) and its kernel's gradient sum their
     rows' products within each group: their terms are each group's dense dot's, not their own

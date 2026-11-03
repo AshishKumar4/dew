@@ -27,7 +27,7 @@ checked-in output yet. The text stays as the design to resume.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
-| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `reuse`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
+| Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `linear`, `identities`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
 - **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
@@ -192,7 +192,9 @@ fitted to them, and a rule set ships only with measured receipts.
     default `dew train` runs and the planner compiles through `compiled_if_it_fits`, jits the rewritten step the
     same way, and so does every objective's step it builds, an RL update's included.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
-    `dreamer`) jit theirs the same way.
+    `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
+    an environment through `Objective.program`, the rest through `options.program` and `owned_program`, so none
+    is built as an `OuterProgram` of its own (SLOP025).
   - A training step's traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
   - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices
@@ -297,7 +299,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets: `linear`, `identities`, `reuse`, `decoupled`, `stable`, `error_free` |
+| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets registered: `identities`, `stable`, `linear`, `joined` (`reuse`, `decoupled` and `error_free`, §1, are not registered yet) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
@@ -459,9 +461,9 @@ class Mode(Enum):
 
 @dataclass(frozen=True)
 class Rules:
-    name: str                                # "linear", "identities", "reuse", "decoupled", "stable", ...
+    name: str                                # "identities", "stable", "linear", "joined"
     rounding: Literal["exact", "reorders", "bounded"]   # the rounding class each of its rewrites gives
-    modes: frozenset[Mode]                   # linear, identities, reuse: both; the rest: DEV
+    modes: frozenset[Mode]                   # identities, linear, joined: both; stable: DEV
     ruleset: egglog.Ruleset
     receipt: str                             # the measurement it ships with: a ledger row and its receipts
 
@@ -520,9 +522,21 @@ class Extraction:
   time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
   candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
   is always a candidate, so one is always admitted.
-- Extraction reads the e-graph through egglog's serialization. A DAG extractor prices each shared e-class once.
-  egglog's `greedy-dag` is the baseline it has to beat.
-- Ties break by node order in the serialization, which is deterministic with one thread.
+- Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
+  exact counterpart (`extract.extracted`) is the oracle. The exact extraction finds the roots' forms whose nodes
+  together cost least as a mixed integer program, solved by HiGHS through SciPy: one binary choice per node; a
+  used class takes one node, a used node's child classes are used, and an order over each cyclic class keeps the
+  choice a DAG. The nodes and their prices are the model's own, read through one `greedy-dag` pass that records
+  every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
+  algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
+  time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
+  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  exactly (`derive.Reduction.exact`).
+- A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
+  pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
+  beside it. A schedule's seconds are exactly such a level (`Schedule.pieces`, `spanned`), and its tiebreak
+  the next. Each level is solved in turn with the ones before it held at their optimum; a level whose
+  additions are infinite on every DAG (a reading the derivation left) ties, as its prices compare.
 - `fired` comes from the nodes each set's run added, recorded between runs of the sets.
 - The facts are the owners' (§1.6): `gpu_target()` for bandwidth, peaks by precision and latencies, and the
   pool-agreed `link_figure` for links, so every process prices with the same numbers. A fact no owner holds is

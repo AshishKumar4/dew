@@ -2,7 +2,8 @@
 
 `Slots` is the state a server keeps on its devices, `Admission` and `Draws`
 what one step takes in and gives back, and `Dense` and `Paged` how a cache
-lays out its rows. `decode_programs` compiles the step (`_stepped`) and the
+lays out its rows, and whether its rows draw a token a step or a speculative
+block (`plan`). `decode_programs` compiles the step (`_stepped`) and the
 admitting step (`_mixed_step`) once per resident format, so the host-side
 scheduler in `serving` only feeds and reads them.
 """
@@ -45,8 +46,8 @@ from dew.nn.scatter import DROPPED
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import DecoderState, row_step
-from dew.sampling.text import decode_ops, prefill_state, rounding_keys
+from dew.sampling.strategies import DecoderState, Speculative, block_step, row_step
+from dew.sampling.text import decode_ops, prediction_depths, prefill_state, rounding_keys
 
 
 @struct.dataclass
@@ -61,7 +62,10 @@ class Slots:
     `StepState` buffer the transforms and criteria read, `[slots, 2 *
     capacity]`: a row's prompt sits right-aligned in the first half and its
     draws start at `capacity`, so `prompt_width` is the capacity for every
-    row whatever its prompt length. `step` counts a row's draws, `budget`
+    row whatever its prompt length. A server drawing speculative blocks
+    (`Dense.plan`) keeps every emitted token in a row's cache, its logits
+    scoring the next, as `Speculative` does, and its drafting state beside
+    them (`DecoderState.hidden`, `drafts`). `step` counts a row's draws, `budget`
     caps them, `active` marks the rows still drawing, and `keys` holds each
     row's PRNG key data. `automaton` is each row's grammar state under a
     guided policy, zero (the start) on admission, and unread otherwise.
@@ -99,9 +103,10 @@ class Admission:
 
 @struct.dataclass
 class Draws:
-    """What one step drew, per slot: the token, whether the row drew at
-    all, whether a criterion finished it and whether one that ends a row
-    did (`decoding.Finish`), and both likelihoods."""
+    """What one step drew, per slot: its tokens, `[slots, emitted]`, one a
+    step or a speculative block's slots, which of them the row kept, whether
+    a criterion finished the row and whether one that ends a row did
+    (`decoding.Finish`), and both likelihoods of each token."""
 
     token: jax.Array
     drawn: jax.Array
@@ -111,15 +116,25 @@ class Draws:
     raw: jax.Array
 
 
-def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int) -> Slots:
+def drafting_depths(model: nn.Module, plan: Speculative | None) -> int | None:
+    """The prediction depths a server's decode keeps state for: the model's (`prediction_depths`) where
+    its rows draw speculative blocks (`plan`), else none."""
+    return None if plan is None else prediction_depths(model)
+
+
+def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int,
+           plan: Speculative | None = None, impl: str = "threefry2x32") -> Slots:
     """Every slot free: zeros in the shapes of a prefill over an all-invalid
-    prompt, which leave the cursors at zero and the validity false."""
-    ops = decode_ops(model, params, pad_id, None)
+    prompt, which leave the cursors at zero and the validity false, its
+    drafting state among them where the rows draw speculative blocks, and
+    its keys the data of `impl`'s (the server's PRNG implementation, a static
+    argument, as no trace context holds the default one)."""
+    ops = decode_ops(model, params, pad_id, drafting_depths(model, plan))
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {VALIDITY_FIELD: jnp.zeros((slots, 1), bool)})
     _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
-    keys = jax.random.key_data(jax.random.key(0))
+    keys = jax.random.key_data(jax.random.key(0, impl=impl))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
                  jnp.zeros((slots, 2 * capacity), jnp.int32),
                  jnp.zeros((slots, 2 * capacity), bool),
@@ -187,12 +202,15 @@ class Dense:
     tokens and the prompts (`_mixed_step`) where the model allows it
     (`mixed_refusal`); otherwise the prompts prefill in a forward of their own.
     With `continuing` a prompt can prefill in pieces, which the mixed step
-    alone serves, each reading its row's earlier keys.
+    alone serves, each reading its row's earlier keys. `plan` draws each row's
+    tokens a speculative block a step (`Speculative`), its prefill seeding the
+    row's drafting state; None, a token a step.
     """
 
     groups: int = 1
     mixed: bool = False
     continuing: bool = False
+    plan: Speculative | None = None
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
@@ -206,7 +224,8 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                                    decode_ops(narrow, params, pad_id, None, progress),
+                                    decode_ops(narrow, params, pad_id, drafting_depths(model, self.plan),
+                                               progress),
                                     rounding=rounding_keys(jax.random.wrap_key_data(admission.keys)),
                                     progress=progress)
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
@@ -221,12 +240,13 @@ class Paged:
 
     `mixed` runs the admitting step as one forward, as `Dense.mixed` does;
     `continuing` pieces (chunks, or a shared prefix's pages) read their
-    row's earlier keys.
+    row's earlier keys; `plan` is `Dense.plan`.
     """
 
     groups: int = 1
     mixed: bool = False
     continuing: bool = False
+    plan: Speculative | None = None
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission, progress: Progress = END) -> tuple[DecoderState, jax.Array]:
@@ -261,8 +281,8 @@ class Paged:
 
         cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts,
-                                    decode_ops(model, params, pad_id, None, progress), cache=cache,
-                                    progress=progress)
+                                    decode_ops(model, params, pad_id, drafting_depths(model, self.plan),
+                                               progress), cache=cache, progress=progress)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
@@ -292,8 +312,11 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     checkify cannot carry a check into a shard_map (jax-ml/jax#40907), and a
     model on a mesh runs its expert dispatch in one. A token is therefore fed
     in the step after the one that drew it, and a row that feeds nothing,
-    one seated this step, keeps the logits its prompt left.
+    one seated this step, keeps the logits its prompt left. A server drawing
+    speculative blocks runs `_speculated` instead.
     """
+    if placement.plan is not None:
+        return _speculated(model, params, pad_id, placement, state, admission, transforms, stopping, progress)
     mixed = admission is not None and placement.mixed
     if mixed:
         assert admission is not None
@@ -328,7 +351,35 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if drew.automaton is None else drew.automaton),
-            Draws(drew.token, drawn, stopped, drawn & drew.finished.ended, drew.behavior, drew.raw))
+            Draws(drew.token[:, None], drawn[:, None], stopped, drawn & drew.finished.ended,
+                  drew.behavior[:, None], drew.raw[:, None]))
+
+
+def _speculated(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
+                admission: Admission | None, transforms: tuple[LogitsTransform, ...],
+                stopping: decoding.Finishing, progress: Progress = END) -> tuple[Slots, Draws]:
+    """One iteration of a server whose rows draw speculative blocks (`Dense.plan`): admit, then every
+    active row drafts, verifies and emits a block (`block_step`) within its own budget, every forward at
+    the run's `progress`. A row's cache holds every token it emitted and its logits score its next, so a
+    row seated this step drafts from the logits its prompt left, as one that drew last step does from its
+    block's."""
+    if admission is not None:
+        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission, progress),
+                        admission, placement.groups)
+    plan = placement.plan
+    assert plan is not None
+    capacity = state.tokens.shape[1] // 2
+    ops = decode_ops(model, params, pad_id, drafting_depths(model, plan), progress)
+    view = StepState(state.tokens, state.valid, state.step, state.active,
+                     jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
+    block = block_step(state.decoder, view, jnp.zeros_like(view.active), plan, ops,
+                       decoding.chain(transforms), decoding.finish(stopping), state.budget)
+    drawn, kept = state.active, block.kept
+    committed = block.step
+    return (Slots(block.state, committed.tokens, committed.valid, committed.step, state.budget,
+                  committed.active, state.keys, state.automaton),
+            Draws(block.tokens, kept & drawn[:, None], drawn & block.stopped, drawn & block.terminated,
+                  jnp.where(kept, block.behavior, 0.0), jnp.where(kept, block.raw, 0.0)))
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
@@ -367,6 +418,8 @@ def mixed_refusal(model: nn.Module, shapes: Slots, placement: Placement) -> str 
     of its own, or None when one mixed forward (`_mixed_step`) runs the model
     as the two would. The model answers for its layers (`Serving`), and one
     that does not keeps the two forwards; the placement answers for the rest."""
+    if placement.plan is not None:
+        return "its rows draw speculative blocks, whose drafting state a prompt's own prefill seeds"
     if not isinstance(model, Serving):
         return f"{type(model).__name__} does not say its layers run a mixed step (Serving)"
     refusal = model.mixed_admission_refusal()
@@ -412,8 +465,9 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     own without a compile of its own.
 
     The first iteration takes the admission, the draws come back stacked
-    `[steps, slots]`, and the host throws the error when it reads them, one
-    call later. The state comes back split as it went in.
+    `[steps, slots, emitted]` (a token, or a speculative block's slots, an
+    iteration), and the host throws the error when it reads them, one call
+    later. The state comes back split as it went in.
 
     Each iteration checks its own draws. jax's checkify cannot carry a check
     into a shard_map (jax-ml/jax#40907), and every iteration after the first
@@ -618,7 +672,7 @@ def state_programs(formats: Formats, states: Variables) -> tuple[OuterProgram, O
 def opened_in(formats: Formats) -> OuterProgram:
     """`opened`, allocating its state in `formats`: an outer program (`dew.nn.kernels.options.program`),
     one for every layout."""
-    return outer_program(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+    return outer_program(opened, static_argnums=(0, 2, 3, 4, 5, 6), out_shardings=formats)
 
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}

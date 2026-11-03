@@ -85,9 +85,16 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
 
     def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
         """The axes each parameter of `params` is drawn in, by its path in `params`, read off its towers'
-        draws (`dew.nn.sharding.drawn_axes`): the table that places a run holding this encoder frozen
-        (`dew.objectives.diffusion.DiffusionObjective.parameter_axes`) and a pipeline loaded on a mesh. An
-        encoder whose towers name no axes holds none."""
+        draws (`drawn`, `dew.nn.sharding.boxed_axes`): the table that places a run holding this encoder
+        frozen (`dew.objectives.diffusion.DiffusionObjective.parameter_axes`) and a pipeline loaded on a
+        mesh. An encoder whose towers name no axes holds none."""
+        return {}
+
+    def drawn(self) -> Mapping:
+        """Its towers' parameters as their draws make them, traced for shapes alone (`jax.eval_shape`, no
+        array made), laid out as `params` holds them: the shapes a pipeline loaded without them draws its
+        denoiser over (`dew.interop.pretrained.pipeline_axes`). None drawn for an encoder that draws
+        none."""
         return {}
 
     @classmethod

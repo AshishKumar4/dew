@@ -24,7 +24,7 @@ stacks at module scope, so they are compiled with those names stubbed, as
 tools/parity_rl.py does; every number written comes from the reference's
 own arithmetic. Run with an interpreter that has torch:
 
-  ~/Desktop/dew/.venv/bin/python tools/parity_agentic.py
+  .venv/bin/python tools/parity_agentic.py
 """
 
 import sys
@@ -167,7 +167,8 @@ def main() -> None:
     offpolicy = helper.compute_offpolicy_metrics(old, behavior, mask)
     out.update(offpolicy_kl=np.float32(offpolicy["kl"]), offpolicy_k3_kl=np.float32(offpolicy["k3_kl"]))
 
-    scaled = lightning.normalize_advantages_by_rollout(advantages, mask, ROLLOUTS, num_trained_rows=len(ROLLOUTS))
+    scaled = lightning.normalize_advantages_by_rollout(advantages, mask, ROLLOUTS,
+                                                        num_trained_rows=len(ROLLOUTS))
     current = torch.tensor(CURRENT).requires_grad_()
     per_rollout, _ = core.compute_policy_loss_vanilla(old, current, scaled, mask, "token-sum", config, None)
     per_rollout.backward()

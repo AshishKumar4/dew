@@ -1782,10 +1782,10 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
     tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
     derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
-    hand step's 62 fewer multiplies a step at Qwen3's tile. Its derived forms stand beside this module's
-    (`plain_step`, `merge`, `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`),
-    which they replace only on par with them against float64 and no slower in the kernel
-    (docs/design/algebra.md)."""
+    hand step's 62 fewer multiplies a step at Qwen3's tile, its exponent's argument one fused multiply-add a
+    logit (`rules._contracted`). Its derived forms stand beside this module's (`plain_step`, `merge`,
+    `finish`), behind the one switch (`dew.algebra.forms.derived`, `derived_forms`), which they replace
+    only on par with them against float64 and no slower in the kernel (docs/design/algebra.md)."""
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
 
     def walked(logits, values):

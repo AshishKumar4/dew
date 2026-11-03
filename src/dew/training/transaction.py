@@ -45,7 +45,7 @@ from dew.nn.inspection import (
 )
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import rows_spec
+from dew.nn.sharding import auto_part, rows_spec
 from dew.objectives.base import (
     EXAMPLE_STREAM,
     Aux,
@@ -275,6 +275,17 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
     return gradient.astype(dtype) / jnp.asarray(factor, dtype)
 
 
+def placed_as(tree, placement):
+    """`tree` constrained to where `placement` places each of its leaves, over the Auto axes of the mesh in
+    context (`auto_part`): an Explicit axis stays where a leaf's type places it, a Manual one is a
+    `shard_map`'s own, and no mesh, or one of no Auto axis, leaves `tree` as it is."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty or not mesh.auto_axes:
+        return tree
+    return jax.tree.map(lambda leaf, sharding: jax.lax.with_sharding_constraint(
+        leaf, auto_part(sharding.spec, mesh)), tree, placement)
+
+
 def _descending(gradient: jax.Array, parameter: jax.Array) -> jax.Array:
     """`gradient` in its parameter's dtype, as optax descends along it. JAX's gradient of a real
     loss in a complex parameter is the conjugate of its steepest ascent."""
@@ -462,7 +473,7 @@ class Transaction:
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, resting: Mapping[str, object] | None = None,
-                 inspection: Inspection | None = None, examples: int | None = None):
+                 inspection: Inspection | None = None, examples: int | None = None, placed=None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -481,12 +492,14 @@ class Transaction:
         memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
         hostmem.json). Fetched whole there, XLA:GPU held the whole state for the update, so keeping it on
         the host freed nothing at a step's peak (a Dew decoder's peaked at 8.427 GB either way): the
-        commit takes them a chunk at a time (`past`, `dew.training.staging`). `examples`
+        commit takes them a chunk at a time (`past`, `dew.training.staging`). `placed` is the parameters'
+        placement, which the commit's gradient is constrained to (`placed_as`). `examples`
         is a run's bound in source examples, where it counts no updates ahead: each update hands its
         optimizer the run's progress, the share of them its state has consumed (`TrainState.consumed`),
         which a schedule over the run reads (`dew.optim.ScheduleBase.progressed`).
         """
         self.resting = dict(resting or {})
+        self.placed = placed
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
@@ -727,6 +740,10 @@ class Transaction:
             raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
                              "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
                              "through the trainer, which gives one written before them none waiting")
+        # The gradient where the parameters are placed (`placed`): left where the backward made it, a
+        # stage-local leaf's update came out split over the tensor axis its pipeline's read took, and the
+        # commit gathered every parameter and moment back each step (row 3697).
+        gradient = gradient if self.placed is None else placed_as(gradient, self.placed)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)

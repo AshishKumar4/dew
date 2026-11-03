@@ -25,15 +25,15 @@ network reads exactly as its W_0 does.
 
 Two computations give the one function. A row of one document runs chunk by chunk: its real tokens
 compacted to the front (`valid_order`), each chunk's gradients one `vmap` at the chunk's start, the
-momentum and retention across the chunk one associative scan of their affine steps, and the chunk's
-readouts one `vmap` over its states. A packed row, and a cached call, run token by token (`_stepped`),
-which is the definition. The state is the network's parameters, a traced carry. Each head's network
-is this layer's child (`head_0`, ...), whose parameters are its W_0, and every application runs that
-child at its own scope over the weights the step holds, read-only (`_substituted`), so the layer
-composes with a scanned layer stack and remat, and a method interceptor the model computes under finds
-each head's sites at their paths, as at any child; the chunk's carry is named (`CARRY`) for a remat
-policy. The heads run one after another, each vectorized over its rows and tokens, and may hold
-different trees (an adapter on one head alone).
+momentum and retention across the chunk one associative scan of their affine steps over every leaf at
+once (the leaves laid side by side, `_flattened`), and the chunk's readouts one `vmap` over its states.
+A packed row, and a cached call, run token by token (`_stepped`), which is the definition. The state is
+the network's parameters, a traced carry. Each head's network is this layer's child (`head_0`, ...),
+whose parameters are its W_0, and every application runs that child at its own scope over the weights
+the step holds, read-only (`_substituted`), so the layer composes with a scanned layer stack and remat,
+and a method interceptor the model computes under finds each head's sites at their paths, as at any
+child; the chunk's carry is named (`CARRY`) for a remat policy. The heads run one after another, each
+vectorized over its rows and tokens, and may hold different trees (an adapter on one head alone).
 
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
 does at any Dense, its dropout drawing from each token's key in a forward that carries the dropout
@@ -69,11 +69,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, traverse_util
 from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
@@ -722,17 +724,17 @@ class InContextMemory(LinearProducts):
         keys = _at(step.keys, index, 2)
         gradient = jax.vmap(jax.vmap(functools.partial(self._step, head), in_axes=(None, 0, 0, 0)))(
             state, step.key[:, :, index], step.value[:, :, index], keys)
-        update = jax.tree.map(lambda g: -_lead(theta, g) * g, gradient)
+        update = _flattened(jax.tree.map(lambda g: -_lead(theta, g) * g, gradient), 2)
+        # One scan, each step's arithmetic per entry as it would be per leaf, whatever the network's tree.
         composed, offsets = jax.lax.associative_scan(_composed, (matrices, (update, update)), axis=1)
-        moment = jax.tree.map(lambda s0, bs: _scaled(composed[..., 0, 0], s0) + bs, momentum, offsets[0])
-        states = jax.tree.map(lambda s0, w0, bw: _scaled(composed[..., 1, 0], s0)
-                              + _scaled(composed[..., 1, 1], w0) + bw, momentum, state, offsets[1])
+        s0, w0 = _flattened(momentum, 1), _flattened(state, 1)
+        moment = _scaled(composed[..., 0, 0], s0) + offsets[0]
+        states = _scaled(composed[..., 1, 0], s0) + _scaled(composed[..., 1, 1], w0) + offsets[1]
         # Each token reads its own state, or with commit per chunk the state the chunk entered.
-        read, mapped = (states, 0) if self.commit == "token" else (state, None)
+        read, mapped = (_unflattened(states, state), 0) if self.commit == "token" else (state, None)
         reads = jax.vmap(jax.vmap(functools.partial(self._read, head), in_axes=(mapped, 0, 0)))(
             read, step.query[:, :, index], keys)
-        last = jax.tree.map(lambda leaf: leaf[:, -1], (states, moment))
-        return *last, reads
+        return _unflattened(states[:, -1], state), _unflattened(moment[:, -1], momentum), reads
 
     def _decoded(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
         """A cached call: the cache's state continued token by token, its first call allocating it. The
@@ -910,6 +912,22 @@ def _momentum_step(mu: jax.Array, theta: jax.Array, momentum: jax.Array, gradien
 def _state_step(a: jax.Array, state: jax.Array, momentum: jax.Array) -> jax.Array:
     """`a W + S` for a head's leaf `[B, ...]` and its rows' kept shares `[B]`."""
     return _lead(a, state) * state + momentum
+
+
+def _flattened(tree: dict, lead: int) -> jax.Array:
+    """A network's leaves `[..., *shape]` laid side by side, each flattened past its `lead` axes, along
+    one last axis: `[*lead axes, entries]`."""
+    return jnp.concatenate([leaf.reshape(*leaf.shape[:lead], -1) for leaf in jax.tree.leaves(tree)], axis=-1)
+
+
+def _unflattened(flat: jax.Array, like: dict) -> dict:
+    """`flat` `[..., entries]` (`_flattened`) as `like`'s tree, whose leaves `[B, *shape]` lead with their
+    rows: each leaf `[..., *shape]` in its own dtype."""
+    leaves, structure = jax.tree.flatten(like)
+    ends = np.cumsum([math.prod(leaf.shape[1:]) for leaf in leaves])[:-1]
+    pieces = jnp.split(flat, ends, axis=-1)
+    return jax.tree.unflatten(structure, [piece.reshape(*flat.shape[:-1], *leaf.shape[1:]).astype(leaf.dtype)
+                                          for piece, leaf in zip(pieces, leaves, strict=True)])
 
 
 def _scaled(scalars: jax.Array, leaf: jax.Array) -> jax.Array:

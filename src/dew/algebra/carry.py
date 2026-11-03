@@ -42,8 +42,10 @@ from egglog import (
 
 from dew.algebra import cost, forms, program, rules, terms
 from dew.algebra.cost import Work
+from dew.algebra.extract import Level
 from dew.algebra.forms import Refused
 from dew.algebra.terms import Term
+from dew.cache import ALGEBRA
 
 
 @function(merge=lambda old, new: old)
@@ -157,6 +159,10 @@ class Priced:
     def __add__(self, other: Priced) -> Priced:
         return Priced(self.sequential + other.sequential, self.parallel + other.parallel)
 
+    def levels(self) -> tuple[Level, ...]:
+        """The sequential work's levels, then the parallel's (`extract.Linear`)."""
+        return self.sequential.levels() + self.parallel.levels()
+
 
 def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
     """`Priced` per node: its work (`cost.work`) sequential where an operand reads the state (the e-classes
@@ -218,8 +224,10 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     facts = seq(rules.FACTS.saturate(), CARRYING.saturate())
     program.saturate(graph, region, (CARRIED,), saturation, facts)
     schedule = cost.fused(cost.target())
-    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule))
-    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule))
+    # The extractor oracle where it is on (`Passes.checked`), as every derivation's (`derive._derived`).
+    checked = ALGEBRA.value.checked
+    carry_forms, _ = program.extracted(graph, sequential, _carry_priced(region, schedule), checked=checked)
+    emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
     consts = list(closed.consts)

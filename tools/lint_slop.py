@@ -60,10 +60,13 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP025 is about `src/<package>`: no program compiles by a bare `jax.jit` or
   `jax.pmap`, by any name it is imported as, but the compile point's own
   (`OuterProgram`) and the nested program's (`dew.nn.nested.nested`), which
-  compiles nothing at the top level (`COMPILE_POINT`); every program is compiled
-  through `dew.nn.kernels.options.program` or `owned_program`, whose every
-  compile admits its communicators and takes the algebra pass, and a trace that
-  compiles nothing traces (`jax.make_jaxpr`, `jax.eval_shape`).
+  compiles nothing at the top level (`COMPILE_POINT`), and none builds an
+  `OuterProgram` itself, by a call, a `functools.partial` or a decorator,
+  outside the compile point's module; every program is compiled through
+  `dew.nn.kernels.options.program` or `owned_program`, whose every compile
+  takes the options its models and the run's seam hold, admits its
+  communicators and takes the algebra pass, and a trace that compiles nothing
+  traces (`jax.make_jaxpr`, `jax.eval_shape`).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1910,6 +1913,13 @@ compiles and that compiles nothing at the top level (`dew.nn.nested.nested`)."""
 BARE_COMPILERS = frozenset({"jax.jit", "jax.pmap"})
 """JAX's own compiles of a program, which SLOP025 reports outside `COMPILE_POINT`."""
 
+OUTER_PROGRAM = "nn.kernels.options.OuterProgram"
+"""The compile point's program class, below the package (SLOP025): no module builds one but the compile
+point's own (`OUTER_PROGRAM_OWNER`)."""
+
+OUTER_PROGRAM_OWNER = "nn/kernels/options.py"
+"""The module of `src/<package>` that builds `OuterProgram`s, which `program` and `owned_program` do."""
+
 
 def _within(tree: ast.Module, name: str) -> set[int]:
     """The identity of every node of `tree` inside its top-level class or function `name`."""
@@ -1918,21 +1928,44 @@ def _within(tree: ast.Module, name: str) -> set[int]:
             for node in ast.walk(statement)}
 
 
+def _builds(node: ast.AST, table: Mapping[str, str], outer: str) -> Iterator[ast.expr | ast.stmt]:
+    """What of `node` builds an `OuterProgram` (`outer`, its dotted path): a call of it, a
+    `functools.partial` over it, or its use as a decorator, each name read through the imports of its
+    scope."""
+    if isinstance(node, ast.Call):
+        called = scopes.resolved(node.func, table)
+        if called == outer or (called == "functools.partial" and node.args
+                               and scopes.resolved(node.args[0], table) == outer):
+            yield node
+    elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        yield from (decorator for decorator in node.decorator_list
+                    if scopes.resolved(decorator, table) == outer)
+
+
 def compile_points(module: Module) -> Iterator[Finding]:
     """SLOP025: a bare `jax.jit` or `jax.pmap` (`BARE_COMPILERS`), its name read through the imports of its
-    scope, anywhere in `src/<package>` but the two definitions `COMPILE_POINT` names."""
+    scope, anywhere in `src/<package>` but the two definitions `COMPILE_POINT` names; and an
+    `OuterProgram` built anywhere in it but the compile point's module (`OUTER_PROGRAM_OWNER`), where
+    `program` and `owned_program` build it with the options a program compiles under."""
     prefix = f"src/{module.package}/"
     if not module.relative.startswith(prefix):
         return
     relative = module.relative.removeprefix(prefix)
     inside = {node for path, owner in COMPILE_POINT if relative == path
               for node in _within(module.tree, owner)}
+    outer = f"{module.package}.{OUTER_PROGRAM}"
     for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
         compiler = isinstance(node, (ast.Name, ast.Attribute)) and scopes.resolved(node, table)
         if compiler in BARE_COMPILERS and id(node) not in inside:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP025",
                           f"compiles by a bare {compiler}; compile through `dew.nn.kernels.options.program` "
                           "or `owned_program`, Dew's one compile point, or nest it (`dew.nn.nested.nested`)")
+        if relative != OUTER_PROGRAM_OWNER:
+            for built in _builds(node, table, outer):
+                yield Finding(module.relative, built.lineno, built.col_offset + 1, "SLOP025",
+                              "builds an OuterProgram of its own, which takes no compiler option; compile "
+                              "through `dew.nn.kernels.options.program` or `owned_program`, over the models "
+                              "it runs, or an objective's `Objective.program`")
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
@@ -1945,7 +1978,8 @@ GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tes
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
                   "tests/sampling_gate.py", "tests/test_sampling_gate.py",
                   "tests/learning_gate.py", "tests/test_learning_gate.py", "tests/one_draw.py",
-                  "tests/float64_terms.py"})
+                  "tests/float64_terms.py", "tests/conditioning.py", "tests/site_draws.py",
+                  "tests/rounding_bound.py", "tests/test_weighed_check.py", "tests/arm_arithmetic.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
 compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t

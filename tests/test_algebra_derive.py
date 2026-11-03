@@ -107,6 +107,7 @@ def draw(seed):
 
 
 def declared(function, exponent: Literal[2, "e"] = "e") -> derive.Reduction:
+    """`function`'s walk over the keys."""
     return derive.Reduction(function, AXES, walked="keys", exponent=exponent)
 
 
@@ -164,9 +165,10 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
     """The declaration's derived step over every key tile in order, finished, or over the keys in two disjoint
     halves, each from the empty state, their states merged (a split walk's combine, the work scheduler's
     fix-up), finished: on par with the whole-operand function against the float64 truth (check 1)."""
-    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
+    function, exponent = DECLARED[name]
+    forms = derive.derive(declared(function, exponent), accurate=False, saturation=SATURATION)
     run = walked_whole(forms) if walk == "walked" else merged_whole(forms)
-    assert_as_exact(jax.jit(run), jax.jit(whole(DECLARED[name][0])), draw, f"{name} {walk}", seeds=16)
+    assert_as_exact(jax.jit(run), jax.jit(whole(function)), draw, f"{name} {walk}", seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):
@@ -184,7 +186,8 @@ def test_a_declaration_derives_once_whatever_routes_block_its_traces_record_into
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import report
 
-    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False, saturation=SATURATION)
+    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False,
+                          saturation=SATURATION)
     tiles = shaped(tile_of(operands(*draw(0)), 0))
     with generation.routes():
         forms.init(tiles)

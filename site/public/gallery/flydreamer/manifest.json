@@ -1,0 +1,45 @@
+{
+ "video": "flydreamer.mp4",
+ "poster": "flydreamer.webp",
+ "width": 1024,
+ "height": 256,
+ "seconds": 8,
+ "fps": 24,
+ "source_fps": 90.0,
+ "notebook": "tutorials/14-camera-only-drone-racing.ipynb",
+ "dew_commit": "19860eb66b76325cf15a06fefcd6f51c1f55b018",
+ "scores": [
+  {
+   "policy": "untrained",
+   "race": "evaluation",
+   "gates": 0.0,
+   "return": -193.7,
+   "steps": 515,
+   "episode": 2000
+  },
+  {
+   "policy": "untrained",
+   "race": "held_out",
+   "gates": 0.0,
+   "return": -168.2,
+   "steps": 511,
+   "episode": 2000
+  },
+  {
+   "policy": "trained",
+   "race": "evaluation",
+   "gates": 44.4,
+   "return": 2723.7,
+   "steps": 2000,
+   "episode": 2000
+  },
+  {
+   "policy": "trained",
+   "race": "held_out",
+   "gates": 36.2,
+   "return": 1859.8,
+   "steps": 1646,
+   "episode": 2000
+  }
+ ]
+}

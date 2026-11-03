@@ -632,6 +632,13 @@ def remat_offloaded[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> b
                  if isinstance(module, OffloadsResiduals) else None)
 
 
+def offloads[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
+    """Whether a module the objective trains is at the top of its ladder with a sibling that offloads the
+    residuals it recomputes (`OffloadsResiduals.recompute_offloaded`), which `remat_offloaded` moves to."""
+    return any(isinstance(entry.module, OffloadsResiduals) and entry.module.recompute_offloaded() is not None
+               for entry in objective.program_key() if entry.trained)
+
+
 def moved[LossT, EffectsT](objective: Objective[LossT, EffectsT],
           step: Callable[[nn.Module], nn.Module | None]) -> bool:
     """Put each module the objective trains where `step` takes it (None leaves it), and return whether

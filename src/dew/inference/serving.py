@@ -4,8 +4,10 @@
 width and a budget and nothing joins until it returns. `Server` keeps the
 cache instead: `slots` rows of `capacity` cache slots, refilled from a queue.
 One jitted step per iteration prefills the prompts admitted this iteration
-into their rows and draws one token for every occupied row; a row leaves on
-EOS or at its budget, and its slot takes the next request. Each row carries
+into their rows and draws one token for every occupied row, or, where the
+task speculates (`Speculative`), drafts, verifies and emits a block in every
+occupied row, its prompts prefilled apart; a row leaves on EOS or at its
+budget, and its slot takes the next request. Each row carries
 its own cursor, length and budget, and the attention mask hides free rows
 and bucket filler.
 
@@ -137,7 +139,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels import generation
-from dew.nn.kernels.options import compiler_options, program as outer_program
+from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
@@ -146,7 +148,7 @@ from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
-from dew.sampling.strategies import Sample
+from dew.sampling.strategies import Sample, Speculative, Strategy
 from dew.sampling.text import Generation, Sampling, check_inputs, decoded_rows, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
@@ -215,38 +217,53 @@ class Ticket(Timed):
                 _log.error("exception calling a tokens callback for %r", self, exc_info=error)
 
 
-_KEY_DATA = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
-"""The shape and dtype of a default key's data, read without a device."""
+@dataclass(frozen=True)
+class _KeyData:
+    """The shape and dtype of the data of a key of one implementation, and the key's own dtype."""
+
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    key_type: np.dtype
 
 
-def _seed(key: int | jax.Array) -> int | jax.Array:
+@functools.cache
+def _key_data(impl: str) -> _KeyData:
+    """A key of `impl`'s data's shape and dtype and its own dtype, read once, without a device."""
+    key = jax.eval_shape(lambda: jax.random.key(0, impl=impl))
+    bits = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0, impl=impl)))
+    return _KeyData(bits.shape, bits.dtype, key.dtype)
+
+
+def _seed(key: int | jax.Array, impl: str) -> int | jax.Array:
     """A request's key as a row holds it: an integer seed as given, for
     `_row_keys` to make into a key, or a key's data. `_row_keys` makes and
-    reads every row's key with the default PRNG implementation, so a key of
-    another is refused here, before the request queues."""
+    reads every row's key with the server's PRNG implementation (`impl`), so
+    a key of another is refused here, before the request queues."""
     if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
         return int(key)
     typed = request_key(key)
-    if typed.dtype != jax.random.key_dtype():
+    if typed.dtype != _key_data(impl).key_type:
         raise ValueError(f"a served request's key is {jax.random.key_impl(typed)}, and the server batches "
-                         f"keys of the default implementation, {jax.config.jax_default_prng_impl}; pass an "
+                         f"keys of the implementation that was the default as it was built, {impl}; pass an "
                          "integer seed or a key of that implementation")
     return jax.random.key_data(typed)
 
 
-@outer_program
+@functools.partial(outer_program, static_argnums=(4,))
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
-              folds: jax.Array) -> jax.Array:
+              folds: jax.Array, impl: str) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
     each row's key, `key(seed)` where it came as an integer seed, folded by
-    the row's index in the batch it came in. A key made here has the bits
-    an eager `jax.random.key(seed)` has, so a request draws as it would
-    alone, and submitting it launched nothing (each submit's own small
-    programs left the RTX 4080 idle between serving steps)."""
+    the row's index in the batch it came in, all of the server's PRNG
+    implementation (`impl`, a static argument, as no trace context holds
+    the default one). A key made here has the bits an eager
+    `jax.random.key(seed)` has, so a request draws as it would alone, and
+    submitting it launched nothing (each submit's own small programs left
+    the RTX 4080 idle between serving steps)."""
     def folded(row: jax.Array, fold: jax.Array) -> jax.Array:
-        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row), fold))
+        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row, impl=impl), fold))
 
-    made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed)))(seeds)
+    made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed, impl=impl)))(seeds)
     return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
 
 
@@ -513,7 +530,8 @@ class Server:
     join until it returns. A server keeps `slots` rows of `capacity` cache
     slots each and refills them from a queue. Each step prefills the prompts
     admitted that step into free rows and draws one token for every occupied
-    row. A row leaves where the task's criteria end it (EOS, a stop string) or
+    row, or a speculative block where the task speculates (`from_task`). A
+    row leaves where the task's criteria end it (EOS, a stop string) or
     at its budget, and the next request takes its slot. Every request runs
     the task's policy and draws the same tokens it would draw through the
     task alone with the same key, except where the model's products round at
@@ -579,8 +597,8 @@ class Server:
         # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
         # like the weights, which `reload` moves to each version it serves without a compile.
         self.progress = progress
-        self.decode_steps = decode_steps
-        self.steps = 0
+        # The PRNG implementation its rows' keys are of: the default one as it was built.
+        self.decode_steps, self.steps, self.prng = decode_steps, 0, str(jax.config.jax_default_prng_impl)
         self._queue: deque[_Row] = deque()
         """The requests waiting for a slot, oldest first. `submit` appends on
         the right while a step seats from the left, so a submitting thread
@@ -606,7 +624,8 @@ class Server:
             self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
-                                                      capacity=capacity), variables)
+                                                      capacity=capacity, plan=rows.placement.plan,
+                                                      impl=self.prng), variables)
             rows.check(shapes.decoder.cache)
             held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
             self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
@@ -639,12 +658,14 @@ class Server:
                 # formats would repeat the server's largest compile (`resident_formats`).
                 self._step = chosen
             self._resident, self._carried = split_donated(
-                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
+                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity, rows.placement.plan,
+                                   self.prng))
             self._keep_states(formats)
 
     def _keep_states(self, formats) -> None:
         """Open the store of row states a shared prefix is read with, where the rows keep state beside
-        their pages (`PagedRows.stateful`), and the programs that move them (`state_programs`)."""
+        their pages (`PagedRows.stateful`), and the programs that move them (`state_programs`), each run by
+        its executable as the steps are (`Fetched`): its slots and entries are padded to fixed sizes."""
         self._states: Variables | None = None
         """Each row state leaf (`row_state`) with its slot axis holding the groups' `States` entries,
         placed as the slots are; None where rows keep none."""
@@ -661,7 +682,7 @@ class Server:
                                                   leaf.sharding) if row_state(path) else None,
                 self.cache)
             self._states = states
-            self._restored, self._captured = state_programs(formats, states)
+            self._restored, self._captured = map(Fetched, state_programs(formats, states))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -681,7 +702,10 @@ class Server:
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
         must stay within the model's context. The task's `n` must be one, and
-        its strategy must be the row-wise sampler, with or without a grammar.
+        its strategy the row-wise sampler, with or without a grammar, or
+        speculative blocks (`Speculative`): each iteration then drafts,
+        verifies and emits a block in every row, which draws as the row-wise
+        sampler draws, over a dense cache whose prompts prefill whole.
 
         `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`). A
         paged layout pools the pages of every row, so short requests fit more
@@ -728,8 +752,7 @@ class Server:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
-        if not isinstance(strategy, Sample):
-            raise ValueError("a server runs the row-wise sampler; beam and speculative loops are batch-wide")
+        plan = _served_plan(strategy, mesh, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
@@ -758,6 +781,11 @@ class Server:
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every)
+        if plan is not None:
+            if isinstance(rows, PagedRows):
+                raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
+                                 "before it, which a dense cache holds per row; serve without page_size")
+            rows.placement = dataclasses.replace(rows.placement, plan=plan)
         return cls(
             model,
             task.placed,
@@ -767,7 +795,7 @@ class Server:
             sampling=dataclasses.replace(policy, stop=task.sampling.stop),
             transforms=transforms,
             stopping=stopping,
-            grammar=strategy.grammar,
+            grammar=strategy.grammar if isinstance(strategy, Sample) else None,
             rows=rows,
             slots=slots,
             capacity=rounded,
@@ -814,7 +842,14 @@ class Server:
         their cache and draw their next token from the new weights, and
         prefix pages the old weights wrote are no longer shared. `reload` is
         not thread-safe against `step`, so the caller must serialize the two.
+        A server drawing speculative blocks reloads between requests alone: a
+        running row's next block opens on the boundary logits its last block
+        verified under the old weights, which no next-step draw recomputes.
         """
+        if self.rows.placement.plan is not None and self._rows:
+            raise ValueError("a server drawing speculative blocks reloads with no row running, as a running "
+                             "row's next block opens on logits the old weights scored; settle its requests "
+                             "(run) first")
         if progress is not None and (progress.updates is None) != (self.progress.updates is None):
             raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
                              "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
@@ -846,7 +881,7 @@ class Server:
         here and queued at once; a step seats it when a slot is free.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key), 0)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int) -> Ticket:
@@ -1032,7 +1067,7 @@ class Server:
         through `TextGeneration` would. Each row is validated as `submit`
         validates one.
         """
-        base = _seed(key)
+        base = _seed(key, self.prng)
         inputs = prepared_inputs(self.processor, prompts, images=None)
         tickets = [self._enqueued(inputs.take_rows(jnp.arange(index, index + 1)), max_new_tokens, base, index)
                    for index in range(inputs.tokens.shape[0])]
@@ -1090,7 +1125,7 @@ class Server:
         valid = np.zeros((count, width), bool)
         slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        empty_key = np.zeros(_KEY_DATA.shape, _KEY_DATA.dtype)
+        empty_key = np.zeros(_key_data(self.prng).shape, _key_data(self.prng).dtype)
         keys: list[jax.Array | np.ndarray] = [empty_key] * count
         seeds = np.zeros((count,), np.int64)
         seeded = np.zeros((count,), bool)
@@ -1140,7 +1175,7 @@ class Server:
                 valid,
                 slots,
                 budgets,
-                _row_keys(tuple(keys), seeds, seeded, folds),
+                _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
                 tables,
                 cursors,
                 final,
@@ -1158,7 +1193,9 @@ class Server:
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
-        iteration; resolve the rows that ended."""
+        iteration and each iteration's tokens in order (one a token a step, a
+        speculative block's kept slots); resolve the rows that ended at the
+        iteration's last."""
         if self._pending is None:
             return
         error, draws = jax.device_get(self._pending)
@@ -1172,15 +1209,16 @@ class Server:
         drew: dict[int, _Row] = {}
         for step in range(draws.drawn.shape[0]):
             for slot, row in list(self._rows.items()):
-                if not draws.drawn[step, slot]:
+                kept = np.flatnonzero(draws.drawn[step, slot])
+                if not len(kept):
                     continue
                 if not row.tokens:
                     row.ticket.first = now
-                row.tokens.append(int(draws.token[step, slot]))
-                row.behavior.append(float(draws.behavior[step, slot]))
-                row.raw.append(float(draws.raw[step, slot]))
+                row.tokens.extend(int(token) for token in draws.token[step, slot, kept])
+                row.behavior.extend(float(value) for value in draws.behavior[step, slot, kept])
+                row.raw.extend(float(value) for value in draws.raw[step, slot, kept])
                 drew[slot] = row
-                if draws.stopped[step, slot] or len(row.tokens) == row.budget:
+                if draws.stopped[step, slot] or len(row.tokens) >= row.budget:
                     del self._rows[slot]
                     self.rows.release(row)
                     del drew[slot]
@@ -1214,6 +1252,25 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
+                 prefix_cache: bool) -> Speculative | None:
+    """The speculative blocks a server's rows draw (`Dense.plan`), or None where they sample a token a step
+    (`Sample`); a beam search, and speculation where its rows cannot run it, refused by name."""
+    if not isinstance(strategy, Sample | Speculative):
+        raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
+                         "batch-wide")
+    if isinstance(strategy, Sample):
+        return None
+    if mesh is not None:
+        raise ValueError("speculative rows check each block's draws between its model calls, and jax's "
+                         "checkify carries no check into the shard_map a model on a mesh may run "
+                         "(jax-ml/jax#40907); serve speculation on one device")
+    if chunk is not None or prefix_cache:
+        raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
+                         "own prefill; serve without chunk and prefix_cache")
+    return strategy
 
 
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,

@@ -154,6 +154,11 @@ class SourceTask:
     grid: SourceGrid
 
 
+CLIP_PROJECTION_WIDTH = 512
+"""The width a CLIP tower's `text_projection` maps to where its config states none: transformers'
+`CLIPTextConfig.projection_dim` default."""
+
+
 @dataclass(frozen=True)
 class _TextTowers:
     """The CLIP towers a UNet, SD3 or Flux denoiser reads, the T5 tower where
@@ -200,7 +205,9 @@ class _TextTowers:
             denoiser.context_width, composition=self.composition, t5=t5,
             guidance=policy.guidance if self.embeds_guidance and not policy.guided else None,
             aesthetics=bool(index.get("requires_aesthetics_score", False)), param_dtype=param_dtype,
-            tokenizer_files=pins)
+            tokenizer_files=pins, projections={
+                name: _records.integer(components[name].get("projection_dim", CLIP_PROJECTION_WIDTH),
+                                       "projection_dim") for name in names})
         return encoder, layouts, {}, components
 
     def unconditional(self, index: Mapping[str, object]) -> dict:

@@ -9,7 +9,6 @@ import json
 import math
 import threading
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, overload
@@ -248,8 +247,11 @@ class Decide(SavedRunTask, InItsForm):
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-                        attention_impl: AttentionImpl = "auto") -> Self:
+                        attention_impl: AttentionImpl = "auto", trust: Sequence[str] = ()) -> Self:
         """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
+
+        `trust` names the sources whose own code the load may run (a backbone's media processor's), as
+        `dew.inference.load`'s does (`dew.registry.import_trusted`).
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
@@ -258,7 +260,9 @@ class Decide(SavedRunTask, InItsForm):
         """
         from dew.decision.sources import PretrainedDecision
         from dew.interop.pretrained import Pretrained
+        from dew.registry import import_trusted
 
+        import_trusted(None, trust)
         bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
                                   param_dtype=param_dtype, attention_impl=attention_impl)
         if not isinstance(bundle, PretrainedDecision):
@@ -650,18 +654,15 @@ class Decide(SavedRunTask, InItsForm):
 
     def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
-        default), in parallel, by one pass of the layout's shortest row at each shape that holds it, so
-        a scorer compiles none while it serves; returns the shapes compiled. Where the budget declares no
-        options (`Budget`), a pass's own decide its program, which it compiles as it comes, and none is
-        compiled here."""
+        default), by one pass of the layout's shortest row at each shape that holds it, so a scorer
+        compiles none while it serves; returns the shapes compiled. Each pass runs on the calling thread,
+        under every context its caller holds (a mesh, JAX's and Dew's own thread-local settings), which
+        the program its serving calls read is keyed by: a worker thread holds none of them. Where the
+        budget declares no options (`Budget`), a pass's own decide its program, which it compiles as it
+        comes, and none is compiled here."""
         if self.budget.options is None:
             return ()
         mesh = mesh_of(self.variables if variables is None else variables)
-
-        def compiled(shape: PassShape) -> None:
-            # Each worker traces under the mesh a pass serves under: a thread's mesh is its own.
-            with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
-                self._pass(self._probe, variables, shape)
 
         # A layout that keeps a schema whole lays the probe out past a window, or its schema past the
         # context, too small for it, and those shapes compile on their first pass.
@@ -669,8 +670,9 @@ class Decide(SavedRunTask, InItsForm):
             len(row.context or ()) <= self.context_length for row in self._probe)
         held = tuple(shape for shape in self.pass_shapes
                      if fits_context and shape.length >= max(len(row.tokens) for row in self._probe))
-        with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
-            list(pool.map(compiled, held))
+        with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
+            for shape in held:
+                self._pass(self._probe, variables, shape)
         return held
 
     @functools.cached_property

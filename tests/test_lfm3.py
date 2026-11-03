@@ -304,13 +304,16 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
     prompt with an image, and one with a video sampled at its own rate, Dew's processor gives the release
     processor's tokens, and each image's or video frame's patch vectors and grid where its placeholders
     read them, the placeholders in text order reading their media's merge blocks in order. So does the
-    processor a run reloads from its recorded source (`load_processor`), which keeps the load's trust,
-    and the processor of the bundle's save, which writes the processor's own modules beside it."""
+    processor a run reloads from its recorded source (`load_processor`) in the process that trusts the
+    source, the processor of the bundle's save, which writes the processor's own modules beside it, and
+    the processor of a task the public pipeline loads where its caller trusts the source
+    (`dew.pipeline(trust=...)`); one loaded without that trust refuses to run the source's code."""
     import shutil
 
     from tool_support import run_from
     from transformers import AutoProcessor
 
+    import dew
     from dew.inference.tasks import recorded_processor
     from dew.interop.pretrained import load_processor
 
@@ -325,6 +328,11 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
     saved = AutoProcessor.from_pretrained(str(tmp_path / 'saved'), trust_remote_code=True,
                                           local_files_only=True)
     reloaded = load_processor(recorded_processor(loaded.processor), loaded.model)
+    # Copies under names of their own, which no load above trusted.
+    public, untrusted = tmp_path / 'public', tmp_path / 'untrusted'
+    for directory in (public, untrusted):
+        shutil.copytree(source, directory)
+    task = dew.pipeline(str(public), dtype='float32', trust=(str(public),))
     config = json.loads((VL / 'config.json').read_text())
     rng = np.random.default_rng(0x2067)
     image = rng.integers(0, 256, (24, 40, 3), dtype=np.uint8)
@@ -342,6 +350,7 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
         np.testing.assert_array_equal(np.asarray(ours.tokens), theirs['input_ids'])
         again = reloaded(text, **media)
         np.testing.assert_array_equal(np.asarray(again.tokens), theirs['input_ids'])
+        np.testing.assert_array_equal(np.asarray(task.processor(text, **media).tokens), theirs['input_ids'])
         np.testing.assert_array_equal(np.asarray(again.conditioning['pixel_values']),
                                       np.asarray(ours.conditioning['pixel_values']))
         kind = 'image' if 'images' in media else 'video'
@@ -360,14 +369,39 @@ def test_an_lfm3_vl_processor_lays_out_its_releases_own_processor_output(tmp_pat
         held = theirs['input_ids'][0] == token
         assert held.sum() == frames * height * width // 4 and np.all(indices[~held] == -1)
         assert np.all(np.diff(indices[held]) > 0)
+    with pytest.raises(ValueError):
+        dew.pipeline(str(untrusted), dtype='float32').processor('w5 <|image|>', images=[image])
 
 
-def test_a_sources_record_keeps_whether_its_load_runs_its_code():
+def test_a_sources_record_runs_its_code_only_under_its_callers_trust(tmp_path):
     """A source's record (`SourceReference`), which a run keeps for its processor, keeps whether its load
-    ran the source's own code (`remote_code`), as a processor reloaded from it runs it again
-    (`load_processor`); a record written before the field reads as not trusted."""
+    ran the source's own code (`remote_code`), and a record written before the field reads as not
+    trusted. A processor reloaded from a record that ran the code (LFM3-VL's, its release's code beside
+    it) refuses unless the process trusts the source (`load_processor`, `dew.registry.trusts_source`): a
+    record arrives from the Hub, and its flag alone runs nothing; trusted, it reloads. A directory named
+    as a package the process trusts (Flax's) is no source it trusts."""
+    import shutil
+
+    from tool_support import run_from
+
+    from dew.interop.pretrained import load_processor
     from dew.interop.sources import SourceReference
-    from dew.registry import from_record, to_record
+    from dew.registry import from_record, to_record, trust_sources, trusts_source
+
+    source = tmp_path / 'source'
+    shutil.copytree(VL, source)
+    with run_from('remote_code_reference', 'tools') as reference:
+        for file in reference.RELEASES['lfm3-vl-tiny'][2]:
+            shutil.copy(reference.release_file('lfm3-vl-tiny', file), source / file)
+    model = Pretrained.load(source, dtype='float32', attention_impl='reference',
+                            trust_remote_code=False).model
+    recorded = SourceReference(str(source), remote_code=True)
+    with pytest.raises(ValueError):
+        load_processor(recorded, model)
+    trust_sources((str(source),))
+    assert load_processor(recorded, model) is not None
+    (tmp_path / 'flax').mkdir()
+    assert not trusts_source(str(tmp_path / 'flax'))
 
     trusted = SourceReference('LiquidAI/LFM3-VL-2B', 'f83d2b0a2296aaa277f394990a9b8b949ddf9691',
                               remote_code=True)

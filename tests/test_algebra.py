@@ -198,21 +198,23 @@ def test_sums_of_operands_of_other_shapes_stay_apart():
         np.testing.assert_array_equal(np.asarray(algebra.rewritten(apart)(x, y)), np.asarray(apart(x, y)))
 
 
-def test_distributivity_factors_a_shared_scale_where_its_sum_is_bounded():
-    """A scale multiplied into two bounded terms (tanh's) that are then added is multiplied once into their
+def test_distributivity_factors_a_shared_matrix_where_its_sum_is_bounded():
+    """A matrix multiplied into two bounded terms (tanh's) that are then added is multiplied once into their
     sum, which the range facts bound (§6.3); over two unbounded terms, whose sum may pass float32's largest
-    where the program's terms do not, it stays as the program wrote it."""
+    where the program's terms do not, it stays as the program wrote it. A shared elementwise scale is not the
+    case: the sum of its two products is a multiply and a fused multiply-add (`rules._contracted`), as many
+    operations as the factored sum's add and multiply, so no price falls."""
     def bounded(x, y, a):
         x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
-        return a * x + a * y
+        return a @ x + a @ y
 
     def free(x, y, a):
-        return a * x + a * y
+        return a @ x + a @ y
 
-    x, y, a = rows(2, (8, 64), (8, 64), (8, 64))
-    assert (count(jax.make_jaxpr(bounded)(x, y, a), "mul"),
-            count(jax.make_jaxpr(algebra.rewritten(bounded))(x, y, a), "mul")) == (2, 1)
-    assert count(jax.make_jaxpr(algebra.rewritten(free))(x, y, a), "mul") == 2
+    x, y, a = rows(2, (64, 32), (64, 32), (8, 64))
+    assert (count(jax.make_jaxpr(bounded)(x, y, a), "dot_general"),
+            count(jax.make_jaxpr(algebra.rewritten(bounded))(x, y, a), "dot_general")) == (2, 1)
+    assert count(jax.make_jaxpr(algebra.rewritten(free))(x, y, a), "dot_general") == 2
 
 
 def test_a_row_scalar_leaves_a_sum_along_its_rows():

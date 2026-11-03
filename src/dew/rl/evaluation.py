@@ -3,17 +3,23 @@ steps)`, the scorer `dew.training.evaluation.Episodes` runs on a run's validatio
 data splits. Each score is a mean over the environments' first episodes from fresh starts: the
 undiscounted `return`, the `steps` the episode lasted, and the mean over those steps of each named
 observation view's last step (a race's gates passed, `passed`), so a score is one a drone's episode
-earns once, whatever the steps the rollout runs past it."""
+earns once, whatever the steps the rollout runs past it.
+
+Every such flight is `flights`': a JAX `Env` flown in one program, a host-stepped batch (a `Simulator`, or a
+`DrivenSimulator` a world-model learner acts in) from the host, each answering the environment's own steps.
+A judge that reads each environment's episode whole reads them with `first_episode_rows`."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.options import OuterProgram
-from dew.rl.env import Env, Memory, Policy, TimeStep, env_rollout, start, view
+from dew.nn.kernels.options import Held, owned_program
+from dew.rl.env import Driven, Env, Memory, Policy, TimeStep, env_rollout, start, view, views
+from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
 Params = Mapping[str, object]
 
@@ -43,33 +49,73 @@ def first_episode_rows(following: TimeStep,
     return {**rows, **{name: at_last(value) for name, value in (reached or {}).items()}}
 
 
-def episodes(policy: Policy, env: Env, steps: int, *, memory: Callable[[int], Memory] | None = None,
-             reached: Sequence[str] = ()) -> Callable[[Params, jax.Array], dict[str, float]]:
-    """A scorer of `policy` in fresh environments of `env`, flown `steps` steps without restarting
-    (`dew.rl.env.env_rollout`, one program, `OuterProgram`): called with the policy's variables and a key, it
-    returns the first episodes' mean `return` and `steps`, and for each observation view in `reached` the
-    mean of its value at each first episode's last step. `env` is batched, or one environment, scored as a
-    batch of one. `memory(count)` is a recurrent policy's starting state over a batched env's `count`
-    environments (`DreamerV3Objective.memory`)."""
-    reward = jax.eval_shape(env.reset, jax.random.key(0))[1].reward
-    count = reward.shape[0] if reward.ndim else 1
-    starting = None if memory is None else memory(count)
+def flights(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
+            memory: Callable[[int], Memory] | None = None,
+            models: tuple[Held, ...] = ()) -> Callable[[Params, jax.Array], TimeStep]:
+    """A flier of `policy` in fresh environments of `env`, flown `steps` steps without restarting: called
+    with the policy's variables and a key, it answers the steps that followed each action `[steps, envs]`,
+    their observations the environment's own (a driver's, `Driven` or `DrivenSimulator`, taken off). A JAX
+    `Env` is flown in one program (`dew.rl.env.env_rollout`), one environment as a batch of one; a
+    host-stepped batch, a `Simulator` or a `DrivenSimulator`, from the host (`simulator_rollout`), its
+    ended episodes left ended or, driven, restarted, which a first episode's reading leaves out.
+    `memory(count)` is a recurrent policy's starting state over the `count` environments
+    (`DreamerV3Objective.memory`), and `models` the networks the policy runs, whose compiler options its
+    programs take (`dew.nn.kernels.options.owned_program`; an objective's `towers()`)."""
+    driven = isinstance(env, Driven | DrivenSimulator)
 
-    @OuterProgram
-    def scored(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
-        taken = env_rollout(env, policy, variables, start(env, key, starting), steps, reset=False)[1]
+    def own(following: TimeStep) -> TimeStep:
+        # A driver's step holds the environment's observation under its `observation` entry.
+        if not driven:
+            return following
+        return dataclasses.replace(following, observation=views(following.observation)["observation"])
+
+    if isinstance(env, Simulator | DrivenSimulator):
+        stepped = env
+        starting = None if memory is None else memory(stepped.count)
+
+        def flown_host(variables: Params, key: jax.Array) -> TimeStep:
+            carry = simulator_start(stepped, key, starting)
+            taken = simulator_rollout(stepped, policy, variables, carry, steps, reset=False, models=models)[1]
+            return own(taken.following)
+
+        return flown_host
+    jax_env = env
+    reward = jax.eval_shape(jax_env.reset, jax.random.key(0))[1].reward
+    starting = None if memory is None else memory(reward.shape[0] if reward.ndim else 1)
+
+    def flown(variables: Params, key: jax.Array) -> TimeStep:
+        taken = env_rollout(jax_env, policy, variables, start(jax_env, key, starting), steps, reset=False)[1]
         # One environment's steps `[T]` taken as a batch of one's `[T, 1]`.
-        following = (taken.following if reward.ndim
-                     else jax.tree.map(lambda leaf: leaf[:, None], taken.following))
+        following = taken.following
+        return own(following if reward.ndim else jax.tree.map(lambda leaf: leaf[:, None], following))
+
+    return owned_program(flown, *models)
+
+
+def episodes(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
+             memory: Callable[[int], Memory] | None = None, reached: Sequence[str] = (),
+             models: tuple[Held, ...] = ()) -> Callable[[Params, jax.Array], dict[str, float]]:
+    """A scorer of `policy` in fresh environments of `env`, flown `steps` steps without restarting
+    (`flights`): called with the policy's variables and a key, it returns the first episodes' mean `return`
+    and `steps`, and for each observation view in `reached` the mean of its value at each first episode's
+    last step. `memory(count)` is a recurrent policy's starting state (`DreamerV3Objective.memory`), and
+    `models` the networks whose compiler options its programs take."""
+    flown = flights(policy, env, steps, memory=memory, models=models)
+
+    def means(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
+        following = flown(variables, key)
         rows = first_episode_rows(following, {name: view(following.observation, name) for name in reached})
         # The return at the reward's own width; counts and views as floats.
         return {"return": jnp.mean(rows["return"]),
                 **{name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("steps", *reached)}}
 
+    # A JAX Env's flight and its reading are one program; a host-stepped flight is read as it lands.
+    read = means if isinstance(env, Simulator | DrivenSimulator) else owned_program(means, *models)
+
     def score(variables: Params, key: jax.Array) -> dict[str, float]:
-        return {name: float(value) for name, value in jax.device_get(scored(variables, key)).items()}
+        return {name: float(value) for name, value in jax.device_get(read(variables, key)).items()}
 
     return score
 
 
-__all__ = ["episodes", "first_episode_rows", "first_episodes"]
+__all__ = ["episodes", "first_episode_rows", "first_episodes", "flights"]

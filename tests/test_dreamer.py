@@ -2,6 +2,7 @@
 (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) transcribed here in NumPy float64,
 an episode driver's records against the steps it took, and an agent that learns its world."""
 
+import dataclasses
 import itertools
 import math
 
@@ -17,7 +18,7 @@ from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
 from dew.objectives.rl.tssm import TSSM
-from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean
+from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean, unimix_log_probs
 from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
 
 
@@ -49,6 +50,23 @@ def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
         expected.append(-(share * row[below] + (1 - share) * row[above]))
     assert_computes_the_oracle(found, np.asarray(expected), "the two-hot loss", roundings=roundings)
     assert_computes_the_oracle(inverted, targets, "symexp of symlog", roundings=8)
+
+
+@pytest.mark.parametrize("unimix", [0.0, 0.01])
+def test_a_categoricals_log_probabilities_stay_finite_where_a_class_is_far_below(unimix):
+    """A latent's log-probabilities (`unimix_log_probs`) of logits a thousand below their row's largest,
+    with and without the uniform mixture, are finite in float32, so the world model's KL over them stays
+    finite, and in float64 the mixture's written from the log-softmax, where a probability's log is -inf
+    once its softmax underflows (below about -745 in float64)."""
+    logits = np.asarray([[0.0, -1000.0, -3.0, 2.5], [-40.0, 0.0, -1000.0, 1.0]], np.float32)
+    assert np.isfinite(np.asarray(unimix_log_probs(jnp.asarray(logits), unimix))).all()
+    wide = logits.astype(np.float64)
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(unimix_log_probs(jnp.asarray(wide), unimix))
+    log_softmax = wide - wide.max(-1, keepdims=True)
+    log_softmax = log_softmax - np.log(np.exp(log_softmax).sum(-1, keepdims=True))
+    expected = log_softmax if not unimix else np.log((1 - unimix) * np.exp(log_softmax) + unimix / 4)
+    assert_computes_the_oracle(found, expected, "the latent's log-probabilities", roundings=16)
 
 
 def test_lambda_returns_are_the_codes_recursion():
@@ -108,15 +126,14 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     """A Dreamer rollout donates its live state to the steps that advance it, each buffer once, so it runs
     over an environment whose state holds one array in two fields: three updates at a train ratio of 32 over
     windows of 16 in batches of 8 take the prefill and exactly the steps they owe."""
-    from dew.data.dataset import Loader
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
     objective = DreamerV3Objective(tiny())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     trainer.fit(data, steps=3, log_every=3)
     owed = -(-3 * 8 * 16 // 32)
     assert rollout.environment_steps == 8 * 24 + 8 * -(-owed // 8)
@@ -214,6 +231,26 @@ position, the GRU's again over the walks simulated on the host, and TransDreamer
 pixels alone, its position predicted from the latent by an auxiliary head."""
 
 
+@pytest.mark.parametrize("agent", ["gru", "gru-simulator"])
+def test_a_rollout_writes_its_replay_in_place(agent):
+    """A Dreamer rollout's steps are written to its replay in place: the replay it held when a collection
+    began, over an environment on the device or a simulator on the host, is donated to the program that
+    writes them and deleted once it ran, so the replay is never held twice."""
+    from dew.training import Trainer
+
+    environments, model = AGENTS[agent]
+    objective = DreamerV3Objective(model())
+    rollout = DreamerRollout(objective, environments(), capacity=400, batch=8, length=16, train_ratio=8.0,
+                             prefill=24)
+    state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout).place()[0]
+    rollout(state, {}, jax.random.key(1))
+    begun = rollout.held_replay
+    assert begun is not None
+    # The next update owes steps the prefill did not take.
+    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2))
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(begun.held))
+
+
 def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
     """Imagining through `env_rollout` over the `LatentEnv` takes the GRU and the prior's draw each
     step, as stepping the model's own functions one at a time from the same keys does, bit for bit."""
@@ -251,8 +288,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
     pixels, the pixels' agent predicting the privileged position it never reads better too. Its policy's
     return is the acceptance run's to judge, on a task at the steps the paper reports."""
-    from dew.data.dataset import Loader
     from dew.objectives.base import Step
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
     environments, model = AGENTS[agent]
@@ -261,8 +298,7 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
     initial = jax.device_get(trainer.place()[0])
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     final = trainer.fit(data, steps=150, log_every=150)
     windows = rollout.sample(jax.random.key(8))
 
@@ -372,7 +408,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     """A Dreamer rollout started from a replay of recorded steps takes no random prefill: after 12 updates
     at a train ratio of 32 over windows of 16 in batches of 8, its environments have taken exactly the
     steps those updates owe, written after the recorded ones."""
-    from dew.data.dataset import Loader
+    from dew.objectives.rl.config import idle
     from dew.rl.replay import ReplayBuffer
     from dew.training import Trainer
 
@@ -387,8 +423,7 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     seeded = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), 400).add(stream)
     rollout = DreamerRollout(objective, env, batch=8, length=16, train_ratio=32.0, prefill=0, replay=seeded)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
-                  records=8, batch=8)
+    data = idle()
     trainer.fit(data, steps=12, log_every=12)
     owed = -(-12 * 8 * 16 // 32)
     assert rollout.environment_steps == 4 * -(-owed // 4)
@@ -478,11 +513,10 @@ def dreamer_targets(objective, *, checkpointed, replay=None):
 def dreamer_fit(directory, objective, rollout, steps, **options):
     """A Dreamer run of `steps` updates over `rollout`, checkpointed every update to `directory`."""
     from dew.checkpoints import Checkpoints, Keep
-    from dew.data.dataset import Loader, replayed
+    from dew.objectives.rl.config import idle
     from dew.training import Trainer
 
-    unread = replayed(lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}))
-    data = Loader(train=unread, val=None, records=8, batch=8)
+    data = idle()
     checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
     trainer = Trainer(objective, options.pop("optimizer", optax.adam(1e-3)), key=jax.random.key(7),
                       rollout=rollout, checkpoints=checkpoints)
@@ -543,6 +577,25 @@ def test_a_dreamer_rollouts_step_counts_past_32_bits_come_back_from_its_checkpoi
     assert (back.environment_steps, back._prefilled) == (2**33 + 2**31 + 7, 2**31 + 5)
 
 
+def test_a_dreamer_rollouts_steps_saved_without_its_pacing_come_back_from_its_checkpoint(tmp_path):
+    """A Dreamer rollout's step counts saved in a run's checkpoint without where it owes its updates from (as
+    an earlier Dew saved them) come back into a fresh rollout through the run's restore
+    (`_rollout_resumed`), which then owes from them."""
+    from dew.checkpoints import Checkpoints
+    from dew.training._fit import _rollout_resumed, _rollout_saved
+
+    objective = DreamerV3Objective(tiny())
+    rollout = dreamer_targets(objective, checkpointed=False)
+    state = dreamer_fit(None, objective, rollout, 2)
+    saved = {name: leaf for name, leaf in _rollout_saved(rollout).items() if name in ("taken", "prefilled")}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(2, state, rollout=saved)
+    checkpoints.wait()
+    back = dreamer_targets(objective, checkpointed=False)
+    _rollout_resumed(back, checkpoints, 2, state.key.sharding)
+    assert (back.environment_steps, back._prefilled) == (rollout.environment_steps, rollout._prefilled)
+
+
 def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps_after_it(tmp_path):
     """A DreamerV3 run resumed at its third update from checkpoints written without its rollout's state
     (as an earlier Dew wrote them) begins its targets and replay again and owes the steps of its fourth
@@ -567,6 +620,88 @@ def test_a_dreamer_run_resumed_from_a_step_without_its_state_owes_only_the_steps
     owed = [math.ceil(updates * 8 * 16 / 32.0) for updates in (3, 5)]
     taken = resumed.environment_steps - 24 * 8 - owed[0]
     assert owed[1] - owed[0] <= taken < owed[1] - owed[0] + 8
+
+
+def test_a_dreamer_run_resumed_with_longer_windows_owes_the_updates_after_it_at_their_pace(tmp_path):
+    """A DreamerV3 run of 16-step windows, resumed at its third update by a rollout drawing 64-step windows
+    (as a later phase of training lengthens them), owes its fourth and fifth updates the steps their
+    windows train on alone: after its prefill it takes at least those steps, and less than one step of
+    every target more, where owing the whole run's updates at the longer windows' pace would take twice
+    as many."""
+    objective = DreamerV3Objective(tiny())
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def drawing(length):
+        return DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
+                              prefill=64)
+
+    first = drawing(16)
+    dreamer_fit(tmp_path / "run", objective, first, 3)
+    resumed = drawing(64)
+    dreamer_fit(tmp_path / "run", objective, resumed, 5)
+    owed = 2 * 8 * 64 // 32
+    taken = resumed.environment_steps - first.environment_steps - 64 * 8
+    assert owed <= taken < owed + 8
+
+
+def test_a_dreamer_rollout_restored_after_collecting_for_an_uncommitted_update_owes_it_none_again():
+    """A Dreamer rollout called twice for its third update (an accumulation window's microsteps, or an
+    update the trainer rejected and draws again), its state saved after the first call and restored with
+    its replay into a fresh rollout, takes on the second call and the updates after it the steps the
+    uninterrupted rollout takes: the steps it took for the update not yet committed stand paid."""
+    from types import SimpleNamespace
+
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    batch = {}
+
+    def called(rollout, updates):
+        for at, update in enumerate(updates):
+            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at))
+
+    uninterrupted = dreamer_targets(objective, checkpointed=True)
+    called(uninterrupted, (0, 1, 2, 2, 3, 4))
+    stopped = dreamer_targets(objective, checkpointed=True)
+    called(stopped, (0, 1, 2))
+    resumed = dreamer_targets(objective, checkpointed=True)
+    resumed.restored(stopped.saved())
+    called(resumed, (2, 3, 4))
+    assert resumed.environment_steps == uninterrupted.environment_steps
+
+
+def test_a_dreamer_rollout_restored_in_a_later_phase_owes_each_update_at_its_own_pace_once():
+    """A Dreamer rollout of 16-step windows restored at 64 (a later phase), called twice for its fourth
+    update, takes the steps that update trains on once: restored between the two calls, it takes on the
+    second and the update after it the steps the rollout restored once takes. One of 32-step windows
+    restored at 16 takes for its next update the steps that update trains on at 16 (4, a step of each of
+    its eight targets)."""
+    from types import SimpleNamespace
+
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    targets = Batched(TimeLimit(Target(), episode_length=20), 8)
+
+    def drawing(length, restored=None):
+        rollout = DreamerRollout(objective, targets, capacity=400, batch=8, length=length, train_ratio=32.0,
+                                 prefill=64, checkpointed_replay=True)
+        if restored is not None:
+            # A copy, as a checkpoint holds it: the restored rollout's calls donate what it carries.
+            rollout.restored(jax.tree.map(jnp.copy, restored.saved()))
+        return rollout
+
+    def called(rollout, updates):
+        for update in updates:
+            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update))
+        return rollout
+
+    earlier = called(drawing(16), (0, 1, 2))
+    once = called(drawing(64, earlier), (3, 3, 4))
+    stopped = called(drawing(64, earlier), (3,))
+    resumed = called(drawing(64, stopped), (3, 4))
+    assert resumed.environment_steps == once.environment_steps
+    longer = called(drawing(32), (0, 1))
+    shorter = called(drawing(16, longer), (2,))
+    assert shorter.environment_steps - longer.environment_steps == 8
 
 
 def test_a_dreamer_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it():

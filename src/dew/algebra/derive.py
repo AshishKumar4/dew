@@ -56,10 +56,11 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
-from dew.algebra import cost, program, rules, terms
+from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Derived, Refused, evaluated, evaluator, inlined
 from dew.algebra.terms import Term
+from dew.cache import ALGEBRA
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -80,6 +81,9 @@ class Reduction:
     walked: str
     exponent: Literal[2, "e"]
     ranges: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    exact: bool = False
+    """Whether its forms are extracted exactly (`extract.cheapest`): a declaration whose greedy extraction the
+    test suite's oracle finds dearer than the optimum (`dew.cache.Passes.checked`)."""
 
 
 # The facts the derivation reads (§6.3), each registered from a parameter's own values or saturated by
@@ -527,7 +531,7 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         # whose identity-keyed collections (`dew.cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are new in each
         # lowering: every lowering derived again and the cache grew without end.
         contexts = (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
-                    jax.config.jax_default_matmul_precision)
+                    jax.config.jax_default_matmul_precision, ALGEBRA.value.checked)
         return derived_at(contexts, tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1]))
                                           for name in names))
 
@@ -660,8 +664,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     bundle = Term.bundle(Vec[Term](*roots) if roots else Vec[Term].empty())
     graph.register(declared, bundle)
     schedule = cost.walk(cost.target())
-    _, before = graph.extract(declared, include_cost=True, cost_model=cost.model(region, schedule),
-                              extractor="greedy-dag")
+    _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), WALKING.saturate())
     _decoupled_through(graph, region, facts)
     saturated = program.saturate(graph, region, (*rules.admitted(accurate), DECOUPLED),
@@ -674,7 +677,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     if parts:
         bundle = Term.bundle(Vec[Term](*roots, *parts))
         graph.register(bundle)
-    chosen, after = program.extracted(graph, bundle, _priced(region, schedule))
+    chosen, after = program.extracted(graph, bundle, _priced(region, schedule), exact=declaration.exact,
+                                      checked=ALGEBRA.value.checked)
     held = iter(chosen[len(roots):])
     accumulated = tuple((next(held), next(held), next(held)) if index in accumulating else None
                         for index in range(len(reductions)))

@@ -12,4 +12,7 @@ for python in $(python3 tools/armada/ci.py pythons); do
   ".venv-$python/bin/python" -m compileall -q "$(".venv-$python/bin/python" -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')"
   sh tools/armada/compiled.sh ".venv-$python/bin/python"
 done
+# The repository's own Python's environment as .venv too, the one pyproject.toml's [tool.pyright] names, so pyright
+# resolves it here as in a developer's checkout.
+ln -sfn ".venv-$(tr -d '\n' < .python-version)" .venv
 ".venv-$(tr -d '\n' < .python-version)/bin/python" tools/fetched_fixtures.py fetch

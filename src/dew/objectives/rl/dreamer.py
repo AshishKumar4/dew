@@ -26,7 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -39,7 +39,7 @@ from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.nn.categorical import kl_divergence
-from dew.nn.kernels.options import OuterProgram
+from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.objectives.rl.tssm import TSSM, Cache
@@ -68,7 +68,7 @@ from dew.rl.env import (
     view,
     views,
 )
-from dew.rl.evaluation import episodes, first_episode_rows
+from dew.rl.evaluation import episodes
 from dew.rl.replay import ReplayBuffer, Steps
 from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
@@ -527,6 +527,9 @@ class DreamerV3Objective(Objective[Ratio]):
     is untouched)."""
 
     shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
+    resumable = ("entropy",)
+    """The entropy bonus weighs how the policy explores, which SkyDreamer lowers for its last phase; the
+    horizon, lambda and the rest say what the critic and world model estimate."""
     scales: Mapping[str, float] = {"decoder": 1.0, "reward": 1.0, "continue": 1.0, "dynamics": 1.0,
                                    "representation": 0.1, "policy": 1.0, "value": 1.0, "replay_value": 0.3}
 
@@ -702,7 +705,7 @@ class DreamerV3Objective(Objective[Ratio]):
         }
         alive = (1 - terminal) * (1 - 1 / self.horizon)
         logit = model.continue_(feature)
-        losses["continue"] = -(alive * jax.nn.log_sigmoid(logit) + (1 - alive) * jax.nn.log_sigmoid(-logit))
+        losses["continue"] = optax.losses.sigmoid_binary_cross_entropy(logit, alive)
         for name, _, _ in self.model.auxiliary:
             target = jnp.asarray(batch["observation"][name], jnp.float32)
             losses[name] = jnp.sum(jnp.square(model.predicted(name, feature) - target), -1)
@@ -800,13 +803,34 @@ class DreamerV3Objective(Objective[Ratio]):
 class Saved(TypedDict):
     """What a `DreamerRollout` carries between calls, as a checkpoint holds it (`DreamerRollout.saved`):
     the environment steps it took and those of them its prefills took (each two 32-bit words, `_words`),
-    and with a checkpointed replay its environments, replay and returns."""
+    where it owes its updates from (`paced`: the updates and the steps owed for them, an update's replayed
+    steps and the train ratio's float64 bits, each two words) and with a checkpointed replay its
+    environments, replay and returns."""
 
     taken: np.ndarray
     prefilled: np.ndarray
+    paced: NotRequired[np.ndarray]
     carry: NotRequired[Carry]
     replay: NotRequired[ReplayBuffer]
     returns: NotRequired[jax.Array]
+
+
+def _kept(replay: ReplayBuffer, returns: jax.Array,
+          recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+    """The replay with a rollout's steps written, each environment's running return, and the sum and
+    count of the returns of the episodes that ended in it. A step is written with its teacher's label
+    where its policy gave one (`dew.rl.aggregation.labelled`)."""
+    observed = views(recorded.observation)
+    extras = recorded.extras
+    label = {LABEL: extras[LABEL]} if isinstance(extras, Mapping) and LABEL in extras else {}
+    replay = replay.add({**observed, "action": recorded.action, **label})
+
+    def tally(held, observed):
+        total = jnp.where(observed["first"], 0, held) + observed["reward"]
+        return total, (total, observed["last"])
+
+    returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
+    return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
 
 
 @dataclass
@@ -832,12 +856,15 @@ class DreamerRollout:
 
     The run's checkpoints hold the environment steps it has taken (`saved`), so a resumed run takes the
     steps it still owes; its environments begin again and its replay is made again, from `replay` or the
-    prefill. Resumed from a step that holds none of its state (one an earlier Dew saved), it owes the
-    steps of the updates after that step alone. A cooldown branch runs on copies of its environments and
-    replay (`branch`), a `Simulator` keeping its own (`dew.rl.simulator.branched`). With
-    `checkpointed_replay`, its checkpoints also hold its replay, its environments mid episode and their
-    running returns, and a resumed run samples what the uninterrupted run did, at the replay's size a
-    checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live outside JAX)."""
+    prefill. A rollout owes each update from the step it goes on from at its own pace, so a run resumed
+    with another batch, length or train ratio (a later phase's longer windows) takes the steps of its
+    updates from there at that pace alone. Resumed from a step that holds none of its state (one an
+    earlier Dew saved), it owes the steps of the updates after that step alone. A cooldown branch runs on
+    copies of its environments and replay (`branch`), a `Simulator` keeping its own
+    (`dew.rl.simulator.branched`). With `checkpointed_replay`, its checkpoints also hold its replay, its
+    environments mid episode and their running returns, and a resumed run samples what the uninterrupted
+    run did, at the replay's size a checkpoint (a JAX `Env`'s alone: a `Simulator`'s environments live
+    outside JAX)."""
 
     objective: DreamerV3Objective
     env: Env | Simulator
@@ -854,6 +881,8 @@ class DreamerRollout:
     _taken: int = field(default=0, init=False, repr=False)
     _prefilled: int = field(default=0, init=False, repr=False)
     _restored: bool = field(default=False, init=False, repr=False)
+    _paced: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _recorded: tuple[int, int, int, float] | None = field(default=None, init=False, repr=False)
     _ended: tuple[jax.Array | float, jax.Array | int] = field(default=(0.0, 0), init=False, repr=False)
     _driven: DrivenSimulator | None = field(default=None, init=False, repr=False)
 
@@ -874,15 +903,11 @@ class DreamerRollout:
         if isinstance(env, Simulator):
             driven = self._driven = DrivenSimulator(env)
             self._begin = functools.partial(simulator_start, driven)
-            # The replay is written in place, its buffer donated to the step that writes it.
-            recorded = OuterProgram(self._kept, donate_argnames=("replay",))
-            self._roll = functools.partial(self._simulated, driven, recorded)
+            self._roll = functools.partial(self._simulated, driven)
         else:
             stepped = Driven(env)
             self._begin = functools.partial(start, stepped)
-            self._roll = OuterProgram(functools.partial(self._stepped, stepped),
-                                 static_argnames=("steps", "random"), donate_argnames=("live",))
-        self._sample = OuterProgram(lambda replay, key: replay.sample(key, self.batch, self.length))
+            self._roll = functools.partial(self._flown, stepped)
 
     @property
     def metrics(self) -> Mapping[str, float]:
@@ -901,16 +926,21 @@ class DreamerRollout:
         live = self._live
         if live is None:
             return None
-        taken, prefilled = _words(self._taken), _words(self._prefilled)
-        if not self.checkpointed_replay:
-            return Saved(taken=taken, prefilled=prefilled)
-        return Saved(taken=taken, prefilled=prefilled, carry=live.carry, replay=live.replay,
-                     returns=live.returns)
+        counts = Saved(taken=_words(self._taken), prefilled=_words(self._prefilled))
+        # Where it owes from, or where the checkpoint it was restored from did, before its first call.
+        paced = self._recorded if self._paced is None else (*self._paced, self.batch * self.length,
+                                                             self.train_ratio)
+        if paced is not None:
+            since, owed, windows, ratio = paced
+            counts["paced"] = np.stack([_words(since), _words(owed), _words(windows), _words(_bits(ratio))])
+        if self.checkpointed_replay:
+            counts.update(carry=live.carry, replay=live.replay, returns=live.returns)
+        return counts
 
     def saved_shapes(self) -> Mapping[str, object]:
         """`saved`'s leaves' shapes and dtypes, before any call."""
         counted = jax.ShapeDtypeStruct((2,), np.uint32)
-        taken = {"taken": counted, "prefilled": counted}
+        taken = {"taken": counted, "prefilled": counted, "paced": jax.ShapeDtypeStruct((4, 2), np.uint32)}
         env = self.env
         if not self.checkpointed_replay or isinstance(env, Simulator):
             return taken
@@ -928,6 +958,10 @@ class DreamerRollout:
         """The rollout carrying on from a `saved` tree: owing the steps after those it had taken, and with
         `checkpointed_replay` from its replay and its environments as they stood."""
         self._taken, self._prefilled, self._restored = _count(tree["taken"]), _count(tree["prefilled"]), True
+        self._paced, self._recorded = None, None
+        if "paced" in tree:
+            since, owed, windows, bits = (_count(words) for words in np.asarray(tree["paced"]))
+            self._recorded = (since, owed, windows, _ratio(bits))
         if "replay" in tree and "carry" in tree and "returns" in tree:
             self._live = _Live(tree["carry"], tree["replay"], tree["returns"])
 
@@ -978,38 +1012,33 @@ class DreamerRollout:
         acting = self.demonstrator.variables if random and self.demonstrator is not None else variables
         return acting if self.teacher is None else paired(acting, self.teacher.variables)
 
-    def _kept(self, replay: ReplayBuffer, returns: jax.Array,
-              recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
-        """The replay with a rollout's steps written, each environment's running return, and the sum
-        and count of the returns of the episodes that ended in it."""
-        observed = views(recorded.observation)
-        extras = recorded.extras
-        label = {LABEL: extras[LABEL]} if self.teacher is not None and isinstance(extras, Mapping) else {}
-        replay = replay.add({**observed, "action": recorded.action, **label})
-
-        def tally(held, observed):
-            total = jnp.where(observed["first"], 0, held) + observed["reward"]
-            return total, (total, observed["last"])
-
-        returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
-        return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
-
     def _stepped(self, env: Env, variables: Variables, live: _Live, *, steps: int,
                  random: bool) -> tuple[_Live, jax.Array, jax.Array]:
         """`live` after `steps` steps of every environment of `env`, one scan, and the ended episodes'
         returns' sum and count."""
         carry, recorded = env_rollout(env, self._policy(random), variables, live.carry, steps, reset=False)
-        replay, returns, total, count = self._kept(live.replay, live.returns, recorded)
+        replay, returns, total, count = _kept(live.replay, live.returns, recorded)
         return _Live(carry, replay, returns), total, count
 
-    def _simulated(self, simulator: DrivenSimulator, recorded: Callable, variables: Variables, live: _Live, *,
-                   steps: int, random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+    def _simulated(self, simulator: DrivenSimulator, variables: Variables, live: _Live, *, steps: int,
+                   random: bool) -> tuple[_Live, jax.Array, jax.Array]:
         """`live` after `steps` steps of every environment of `simulator`, stepped from the host, and the
-        ended episodes' returns' sum and count."""
+        ended episodes' returns' sum and count. The replay is written in place: its buffer is donated to
+        the program that writes it."""
         carry, steps_taken = simulator_rollout(simulator, self._policy(random), variables, live.carry, steps,
-                                               reset=False)
-        replay, returns, total, count = recorded(live.replay, live.returns, steps_taken)
+                                               reset=False, models=self.objective.towers())
+        replay, returns, total, count = program(_kept, donate_argnames=("replay",))(
+            live.replay, live.returns, steps_taken)
         return _Live(carry, replay, returns), total, count
+
+    def _flown(self, stepped: Driven, variables: Variables, live: _Live, *, steps: int,
+               random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+        """`_stepped` over `stepped` as a program of the objective's (`Objective.program`), as it runs the
+        policy's modules, the live state donated to it so the replay is written in place."""
+        rolled = self.objective.program(
+            "rollout", functools.partial(self._stepped, stepped), holds=(stepped,),
+            static_argnames=("steps", "random"), donate_argnames=("live",))
+        return rolled(variables, live, steps=steps, random=random)
 
     def _started(self, variables: Variables, key: jax.Array) -> _Live:
         """Every environment's first episode begun, and the replay: the one given, or a fresh one the
@@ -1032,14 +1061,16 @@ class DreamerRollout:
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
-        if self._live is None and not self._restored:
+        updates = int(state.updates)
+        if self._paced is None and not self._restored:
             # A run this rollout begins mid way (resumed from a step that holds no state of it) owes the
             # steps of the updates after that step alone: those before it were taken by the run it resumes.
-            self._taken = self._owed(int(state.updates))
+            self._taken = self._paced_steps(updates)
         live = self._started(variables, act_key) if self._live is None else self._live
-        owed = self._owed(int(state.updates) + 1)
         envs = live.returns.shape[0]
-        due = max(owed - (self._taken - self._prefilled), 0)
+        if self._paced is None:
+            self._paced = self._anchored(updates, envs)
+        due = max(self._owed(updates + 1, envs) - (self._taken - self._prefilled), 0)
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
         self._live = live
@@ -1047,9 +1078,43 @@ class DreamerRollout:
         # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
         return self._drawn(sample_key)
 
-    def _owed(self, updates: int) -> int:
-        """The environment steps `updates` updates train on at the rollout's train ratio, rounded up."""
-        return math.ceil(updates * self.batch * self.length / self.train_ratio)
+    def _anchored(self, updates: int, envs: int) -> tuple[int, int]:
+        """Where the rollout owes its updates from (`_owed`), at its first call with `updates` committed: the
+        updates and the steps owed for them. Restored, its checkpoint's anchor where it goes on at the pace
+        that saved it, so the steps it took for an update not yet committed (in an accumulation window, or
+        one the trainer rejected) stand paid; at another pace (a later phase's longer windows), the steps
+        that pace owed for `updates`, from which this one owes the updates after them. A checkpoint that
+        holds no anchor (an earlier Dew's, its run at one pace) has its pace's steps for `updates` within
+        one update of those taken, else the nearest. Begun afresh, or mid way without its state, it owes
+        from the steps it has."""
+        taken = self._taken - self._prefilled
+        windows = self.batch * self.length
+        if self._recorded is not None:
+            since, owed, saved_windows, ratio = self._recorded
+            if (saved_windows, ratio) == (windows, self.train_ratio):
+                return since, owed
+            return updates, owed + _whole(updates, saved_windows, ratio, envs) - _whole(
+                since, saved_windows, ratio, envs)
+        if not self._restored:
+            return updates, taken
+        owed = _whole(updates, windows, self.train_ratio, envs)
+        step = _whole(updates + 1, windows, self.train_ratio, envs) - owed
+        return updates, min(max(owed, taken - step), taken)
+
+    def _owed(self, updates: int, envs: int) -> int:
+        """The environment steps owed for `updates` updates over `envs` environments stepped together: those
+        owed where the rollout owes from (`_anchored`), and from there the steps of its updates at its
+        pace (`_whole`)."""
+        assert self._paced is not None
+        since, owed = self._paced
+        windows = self.batch * self.length
+        return owed + _whole(updates, windows, self.train_ratio, envs) - _whole(
+            since, windows, self.train_ratio, envs)
+
+    def _paced_steps(self, updates: int) -> int:
+        """The environment steps `updates` updates train on at the rollout's batch, length and train ratio,
+        rounded up."""
+        return _whole(updates, self.batch * self.length, self.train_ratio, 1)
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -1058,13 +1123,14 @@ class DreamerRollout:
         that advance it, so the run's is copied aside first, at the replay's size again for the branch; a
         begun `Simulator` keeps its own environments (`DrivenSimulator.branch`)."""
         kept = (None if self._live is None else jax.tree.map(jnp.copy, self._live), self._taken,
-                self._prefilled, self._restored, self._ended)
+                self._prefilled, self._restored, self._paced, self._recorded, self._ended)
         driven = self._driven if self._live is not None else None
         try:
             with contextlib.nullcontext() if driven is None else driven.branch():
                 yield
         finally:
-            self._live, self._taken, self._prefilled, self._restored, self._ended = kept
+            (self._live, self._taken, self._prefilled, self._restored, self._paced, self._recorded,
+             self._ended) = kept
 
     def sample(self, key: jax.Array) -> Batch:
         """`batch` windows of `length` steps drawn from the replay as an update draws them, fetched to the
@@ -1077,7 +1143,8 @@ class DreamerRollout:
         if replay is None:
             raise ValueError("a rollout samples its replay once it has begun (its first call)")
         key = jax.device_put(key, jax.tree.leaves(replay.held)[0].sharding)
-        return self._sample(replay, key)
+        return program(ReplayBuffer.sample, static_argnames=("batch", "length"))(
+            replay, key, batch=self.batch, length=self.length)
 
     def _advanced(self, variables: Variables, live: _Live, steps: int, *, random: bool) -> _Live:
         live, total, count = self._roll(self._acting(variables, random), live, steps=steps, random=random)
@@ -1097,6 +1164,22 @@ def _count(words) -> int:
     """The count `_words` wrote."""
     high, low = (int(word) for word in np.asarray(words, np.uint64))
     return high << 32 | low
+
+
+def _bits(ratio: float) -> int:
+    """A train ratio's float64 bits, which `_words` keeps exactly (`_ratio`)."""
+    return int(np.asarray(ratio, np.float64).view(np.uint64))
+
+
+def _ratio(bits: int) -> float:
+    """The train ratio `_bits` wrote."""
+    return float(np.asarray(bits, np.uint64).view(np.float64))
+
+
+def _whole(updates: int, windows: int, ratio: float, envs: int) -> int:
+    """The environment steps `updates` updates of `windows` replayed steps each train on at the train
+    `ratio`, rounded up, then to whole steps of every one of `envs` environments stepped together."""
+    return envs * -(-math.ceil(updates * windows / ratio) // envs)
 
 
 @struct.dataclass
@@ -1138,14 +1221,9 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
                     steps: int) -> float:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the agent's draws from fresh episodes: the whole episode where
-    `steps` is its length. Read as every first episode is (`dew.rl.evaluation.first_episode_rows`; an
-    `Env`'s by `dew.rl.evaluation.episodes`)."""
-    if isinstance(env, Simulator):
-        driven = DrivenSimulator(env)
-        carry = simulator_start(driven, key, objective.memory(env.count))
-        _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return float(jnp.mean(first_episode_rows(recorded.following)["return"]))
-    return episodes(objective.act, Driven(env), steps, memory=objective.memory)(variables, key)["return"]
+    `steps` is its length (`dew.rl.evaluation.episodes`, the environment driven for the agent)."""
+    driven = DrivenSimulator(env) if isinstance(env, Simulator) else Driven(env)
+    return episodes(objective.act, driven, steps, memory=objective.memory)(variables, key)["return"]
 
 
 __all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",

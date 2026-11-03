@@ -19,7 +19,7 @@ Writes advantage.npz and surrogate.npz. tests/test_rl_advantage.py and
 tests/test_rl_surrogate.py hold the tolerances and the largest differences
 observed. Run it with an interpreter that has torch and jax:
 
-  ~/Desktop/dew/.venv/bin/python tools/parity_rl.py
+  .venv/bin/python tools/parity_rl.py
 
 `recording` records the advantage estimators over check 1's seeds instead
 (tools/recorded_references.py), each reference's float32 run's evidence from

@@ -337,8 +337,7 @@ The two harnesses differ in one respect. Dew's bf16-head ablation still writes f
 The retained harness is `/tmp/benchmark-parity`, a link to disk-backed storage. No repository source file is modified by the JAX audit harness.
 
 ```bash
-# Environment and idle check
-cd ~/Desktop/dew
+# Environment and idle check, from the checkout
 nvidia-smi --query-compute-apps=pid --format=csv,noheader
 .venv/bin/python -c 'import jax,jaxlib,flax,optax; print(jax.__version__,jaxlib.__version__,flax.__version__,optax.__version__,jax.devices())'
 /tmp/torchbench/bin/python -c 'import torch; print(torch.__version__,torch.version.cuda,torch.backends.cudnn.version(),torch.cuda.get_device_name())'
