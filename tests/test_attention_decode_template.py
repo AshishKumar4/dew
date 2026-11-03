@@ -167,6 +167,25 @@ def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
                     seeds=SEEDS)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("drafts", [4, 8, 16])
+def test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted(drafts):
+    """A speculative verify block (`drafts` tokens a row written after the row's cache, `slots` theirs), each
+    draft over its row's prefix and the drafts before it (causal over the block's slots) through the template
+    decode, packed over 32 query heads on 8 key heads: on par with the reference path (check 1)."""
+    held = jnp.asarray([200 - drafts, 37 - drafts], jnp.int32)
+    slots = held[:, None] + jnp.arange(drafts, dtype=jnp.int32)[None]
+    spans = template.spans(drafts, KEYS, 2, causal=True, lengths=held + drafts, slots=slots)
+    drawn = _drawn(drafts, 32, 8, jnp.bfloat16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
+                    lambda seed: drawn(seed)[:3], f"template verify block of {drafts}", seeds=SEEDS)
+
+
 PAGE = 128
 """A paged cache's keys a page: whole key tiles of the derived decode launch's."""
 
