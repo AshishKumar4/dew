@@ -285,6 +285,14 @@ def _mapped_groups(size: int, rows: int, tokens: int = 0) -> list[tuple[int, int
     return [(begin, min(begin + per, size)) for begin in range(0, size, per)]
 
 
+def _unmapped(function, *arguments):
+    """`function`'s results over no mapped call, each empty along the mapped axis, its shapes those of one
+    call over `arguments`' (the mapped calls' operands, mapped axis first) and no kernel launched."""
+    one = jax.eval_shape(function, *jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape[1:], x.dtype),
+                                                 arguments))
+    return jax.tree.map(lambda result: jnp.zeros((0, *result.shape), result.dtype), one)
+
+
 def _broadcast(x, mapped: bool, size: int):
     """`x` with `jax.vmap`'s mapped axis first, broadcast to `size` where it is unmapped."""
     return x if mapped else jnp.broadcast_to(x, (size, *x.shape))
@@ -304,6 +312,8 @@ def _mapped_forward(packed: bool, longest, scale: float, causal: bool, window: t
         q, k, v = (_broadcast(x, held, size)
                    for x, held in zip((query, key, value), batched[:3], strict=True))
         offsets = tuple(_broadcast(x, held, size) for x, held in zip(starts, batched[3], strict=True))
+        if size == 0:
+            return _unmapped(forward, q, k, v, offsets), (True, True)
         tokens = (query.shape[-3], key.shape[-3])
         outs, lses = [], []
         for begin, end in (_mapped_groups(size, starts[0].shape[-1] - 1, max(tokens)) if packed
@@ -331,6 +341,8 @@ def _mapped_backward(packed: bool, longest, scale: float, causal: bool, window: 
         g, q, k, v, o, held = (_broadcast(x, mapped_, size) for x, mapped_ in
                                zip((grad, query, key, value, out, lse), batched[:6], strict=True))
         offsets = tuple(_broadcast(x, mapped_, size) for x, mapped_ in zip(starts, batched[6], strict=True))
+        if size == 0:
+            return _unmapped(backward, g, q, k, v, o, held, offsets), (True, True, True)
         tokens = (query.shape[-3], key.shape[-3])
         grads = []
         for begin, end in (_mapped_groups(size, starts[0].shape[-1] - 1, max(tokens)) if packed
