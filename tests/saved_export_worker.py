@@ -63,14 +63,6 @@ def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
 
 
-def _status(field: str) -> int:
-    """One of this process's memory figures in /proc/self/status (`VmRSS`, `VmHWM`), in bytes."""
-    for line in Path("/proc/self/status").read_text().splitlines():
-        if line.startswith(f"{field}:"):
-            return int(line.split()[1]) * 1024
-    raise ValueError(f"/proc/self/status lists no {field}")
-
-
 @contextlib.contextmanager
 def resident_growth(into: list[int]) -> Iterator[None]:
     """How far this process's resident pages rise above where they start within the block, appended to
@@ -79,13 +71,17 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     resident do not hide one that reuses them. The pages XLA's buffers newly take are among them, the
     buffers a tensor is read home into, which tracemalloc, counting Python's and NumPy's allocations
     alone, never sees (ledger 3794); storage another allocator keeps from before the block and reuses is
-    not, which the export's test checks against by the same measure over the whole tree held home."""
+    not, which each test checks against by the same measure over the whole tree held home. The kernel's
+    counters lag the pages just written by a batch for each CPU (`resident_memory`), within the margins
+    the tests' bounds hold on armada, twice and more either side."""
+    from dew.telemetry.benchmark import resident_memory
+
     gc.collect()
     ctypes.CDLL(None).malloc_trim(0)
     Path("/proc/self/clear_refs").write_text("5")
-    before = _status("VmRSS")
+    before = resident_memory()["VmRSS"]
     yield
-    into.append(_status("VmHWM") - before)
+    into.append(resident_memory()["VmHWM"] - before)
 
 
 def exported(args) -> dict:
