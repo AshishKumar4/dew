@@ -44,6 +44,11 @@ TINY_SHARD = 4
 SHARD = "64KB"
 """The release's shard size, so it is written in a score of shards."""
 
+RELEASE_SHARD = "1MB"
+"""A saved run's release's shard size (`released`), so its 17 MB are written in shards each a fraction of
+it: the writer holds one shard at a time, and at the 5 GB default the release is one shard, which held
+the whole release on each host (19 to 22 MB of resident growth on armada) while tracemalloc read 0.25 MB."""
+
 
 def digests(directory: Path) -> dict[str, str]:
     return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -58,14 +63,6 @@ def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
 
 
-def _status(field: str) -> int:
-    """One of this process's memory figures in /proc/self/status (`VmRSS`, `VmHWM`), in bytes."""
-    for line in Path("/proc/self/status").read_text().splitlines():
-        if line.startswith(f"{field}:"):
-            return int(line.split()[1]) * 1024
-    raise ValueError(f"/proc/self/status lists no {field}")
-
-
 @contextlib.contextmanager
 def resident_growth(into: list[int]) -> Iterator[None]:
     """How far this process's resident pages rise above where they start within the block, appended to
@@ -74,13 +71,17 @@ def resident_growth(into: list[int]) -> Iterator[None]:
     resident do not hide one that reuses them. The pages XLA's buffers newly take are among them, the
     buffers a tensor is read home into, which tracemalloc, counting Python's and NumPy's allocations
     alone, never sees (ledger 3794); storage another allocator keeps from before the block and reuses is
-    not, which the export's test checks against by the same measure over the whole tree held home."""
+    not, which each test checks against by the same measure over the whole tree held home. The kernel's
+    counters lag the pages just written by a batch for each CPU (`resident_memory`), within the margins
+    the tests' bounds hold on armada, twice and more either side."""
+    from dew.telemetry.benchmark import resident_memory
+
     gc.collect()
     ctypes.CDLL(None).malloc_trim(0)
     Path("/proc/self/clear_refs").write_text("5")
-    before = _status("VmRSS")
+    before = resident_memory()["VmRSS"]
     yield
-    into.append(_status("VmHWM") - before)
+    into.append(resident_memory()["VmHWM"] - before)
 
 
 def exported(args) -> dict:
@@ -164,12 +165,9 @@ def exported(args) -> dict:
             "whole": sum(leaf.nbytes for leaf in jax.tree.leaves(deep))}
 
 
-def scoped_peaks(modules) -> list[dict]:
-    """Each `reading_home` scope the export opens (`dew.interop.saved_sources`), as it closes: the peak
-    of the host's allocations inside it (`tracemalloc`) and whether its writer wrote weights."""
-    import contextlib
-    import tracemalloc
-
+def scoped_growth(modules) -> list[dict]:
+    """Each `reading_home` scope the export opens (`dew.interop.saved_sources`), as it closes: how far the
+    host's resident pages rose inside it (`resident_growth`) and whether its writer wrote weights."""
     from dew import _coordination
 
     scopes: list[dict] = []
@@ -177,14 +175,13 @@ def scoped_peaks(modules) -> list[dict]:
 
     @contextlib.contextmanager
     def measured(phase, **options):
-        tracemalloc.start()
+        growth: list[int] = []
         try:
-            with opened(phase, **options):
+            with resident_growth(growth), opened(phase, **options):
                 writes = _coordination.writes_weights()
                 yield
         finally:
-            scopes.append({"peak": tracemalloc.get_traced_memory()[1], "writes": writes})
-            tracemalloc.stop()
+            scopes.append({"growth": growth[0] if growth else None, "writes": writes})
 
     modules.reading_home = measured
     return scopes
@@ -192,21 +189,34 @@ def scoped_peaks(modules) -> list[dict]:
 
 def released(args) -> dict:
     """A saved run's release read through `released_run` over a cache the pool shares, which writes it
-    once, and its export through `dew export` to a destination the pool shares."""
+    once, and its export through `dew export` to a destination the pool shares; the release written in
+    shards (`RELEASE_SHARD`), after an export of the run outside the cache, so the measured one finds its
+    programs compiled and its modules imported, and the same measure over the release held home."""
     import jax
+    from safetensors.numpy import load_file
 
     from dew.cli.main import main
     from dew.interop import saved_sources
+    from dew.interop.pretrained import PretrainedDecoder
 
-    scopes = scoped_peaks(saved_sources)
+    PretrainedDecoder.save = functools.partialmethod(PretrainedDecoder.save, max_shard_size=RELEASE_SHARD)
+    rank = jax.process_index()
+    scopes = scoped_growth(saved_sources)
+    warm = Path(args.run_dir).parent / f"warm{rank}"
+    saved_sources.export_run(saved_sources.pinned_run(args.run_dir), warm, publishes=rank == 0)
+    scopes.clear()
     release = saved_sources.released_run(args.run_dir)
     read = list(scopes)
     scopes.clear()
+    held: list[int] = []
+    with resident_growth(held):
+        tensors = [load_file(path) for path in sorted(Path(release).glob("*.safetensors"))]
+    del tensors
     destination = Path(args.run_dir).parent / "exported"
     code = main(["export", args.run_dir, str(destination)])
-    return {"processes": jax.process_count(), "rank": jax.process_index(), "release": str(release),
+    return {"processes": jax.process_count(), "rank": rank, "release": str(release),
             "export_code": code,
-            "release_files": digests(Path(release)), "read": read, "exported": list(scopes),
+            "release_files": digests(Path(release)), "read": read, "held": held[0], "exported": list(scopes),
             "export_files": digests(destination)}
 
 

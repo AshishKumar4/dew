@@ -181,8 +181,9 @@ NEWEST_FILES = (
     # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
-    # Host allocations a test bounds by tracemalloc's peak, which moves on 3.14: a pool's export peaked past
-    # half its model on 3.14 in CI's process, green there standalone.
+    # Host memory a test bounds or records: a pool's export, once bounded by tracemalloc's peak, which moved
+    # on 3.14 past half its model in CI's process alone and never saw XLA's buffers, now by resident pages
+    # (ledger 3794); and a mixture's compile, its tracemalloc peak recorded.
     "tests/test_saved_sources.py", "tests/test_mixture_scale.py",
 )
 """The files the newest Python runs whole on a pushed run: those its changes broke before, and
