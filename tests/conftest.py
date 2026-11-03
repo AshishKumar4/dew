@@ -1,3 +1,4 @@
+import dataclasses
 import gc
 import http.server
 import json
@@ -174,6 +175,17 @@ def pytest_runtest_setup(item):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:
             pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
+
+
+@pytest.fixture(autouse=True)
+def exact_oracle():
+    """Each template derivation's greedy extraction held to the exact optimum (`dew.cache.Passes.checked`):
+    a declaration greedy prices dearer is refused (`dew.algebra.extract.Dearer`) until it is extracted
+    exactly (`dew.algebra.derive.Reduction.exact`)."""
+    from dew.cache import ALGEBRA
+
+    with ALGEBRA(dataclasses.replace(ALGEBRA.value, checked=True)):
+        yield
 
 
 @pytest.fixture(autouse=True)

@@ -1,17 +1,24 @@
-"""Exact DAG extraction (docs/design/algebra.md §6.5): the roots' forms whose nodes together cost least, each
-shared node priced once, found as an integer program rather than class by class.
+"""Extraction (docs/design/algebra.md §6.5): egglog's greedy DAG extraction by default (`cheapest`), and the
+exact one (`extracted`), the roots' forms whose nodes together cost least, each shared node priced once, found
+as an integer program rather than class by class.
 
-egglog's `greedy-dag` extractor keeps for each e-class the node whose own node set costs least, which misses a
-choice that costs more in one class but shares more with the others. Here the same nodes and the same model's
-prices (its `DagCostModel`, read through a `greedy-dag` pass that records each node it prices) become a mixed
-integer program, solved by HiGHS through SciPy (`scipy.optimize.milp`): one binary variable a node, a used
-class choosing one node, a used node's child classes used, and an order variable a class in a cycle of the
-graph that a used node's child must precede, so the chosen nodes are a DAG. A price states itself as levels,
-compared in order (`Linear`): each the larger of its pieces, every piece a sum over the chosen nodes, and of
-the largest of its nodes' peaks (a span, the longest chain's), plus what the nodes add beside it (a reading's
-infinite price, a proposal's risk), each solved in turn with the levels before it held at their optimum.
-The chosen DAG is then extracted by egglog itself, every chosen node free and every other priced, so its term
-is the one the program chose.
+egglog's `greedy-dag` extractor keeps for each e-class the node whose own node set costs least, which can miss
+a choice that costs more in one class but shares more with the others. The exact extraction reads the same
+nodes and the same model's prices (its `DagCostModel`, through a `greedy-dag` pass that records each node it
+prices) as a mixed integer program, solved by HiGHS through SciPy (`scipy.optimize.milp`): one binary variable
+a node, a used class choosing one node, a used node's child classes used, and an order variable a class in a
+cycle of the graph that a used node's child must precede, so the chosen nodes are a DAG. A price states itself
+as levels, compared in order (`Linear`): each the larger of its pieces, every piece a sum over the chosen
+nodes, and of the largest of its nodes' peaks (a span, the longest chain's), plus what the nodes add beside it
+(a reading's infinite price, a proposal's risk), each solved in turn with the levels before it held at their
+optimum. The chosen DAG is then extracted by egglog itself, every chosen node free and every other priced, so
+its term is the one the program chose.
+
+Greedy stays the default: over the algebra's and the templates' test derivations (324 extractions) the exact
+extraction priced no template's form below greedy's, cheaper only on test declarations (a row's scaling,
+0.02%), and took twice greedy's time (15.8 s against 8.0). It is the oracle instead: under `Passes.checked`,
+which the test suite sets, each template derivation's greedy choice is held to the exact optimum, and a
+declaration greedy prices dearer is extracted exactly (`derive.Reduction.exact`).
 """
 
 from __future__ import annotations
@@ -59,6 +66,40 @@ class Node[Price: Linear]:
     owner: Hashable
     children: tuple[Hashable, ...]
     price: Price
+
+
+class Dearer(ValueError):
+    """A greedy extraction priced above the exact optimum where the oracle holds it to it (`cheapest`)."""
+
+
+def cheapest[Price: Linear](graph: EGraph, root: BaseExpr, model: DagCostModel[Price], *, exact: bool = False,
+                            checked: bool = False) -> tuple[BaseExpr, Price]:
+    """`root`'s form under `model` and its price: egglog's greedy DAG extraction, or the exact one
+    (`extracted`) where the caller asks (`exact`). `checked`, the oracle, holds a greedy choice to the
+    exact optimum and refuses one dearer at any level (`Dearer`), which then asks for the exact extraction:
+    an infinite level, no form, compares no further."""
+    if exact:
+        return extracted(graph, root, model)
+    form, price = graph.extract(root, include_cost=True, cost_model=model, extractor="greedy-dag")
+    if checked:
+        _, optimum = extracted(graph, root, model)
+        if _dearer(price, optimum):
+            raise Dearer(f"greedy extraction prices {root} at {price}, above the exact optimum {optimum}: "
+                         "extract it exactly (derive.Reduction.exact)")
+    return form, price
+
+
+def _dearer(price: Linear, optimum: Linear) -> bool:
+    """Whether `price` is above `optimum`, level by level, beyond rounding (a millionth, HiGHS's gap)."""
+    for mine, best in zip(price.levels(), optimum.levels(), strict=True):
+        ours, theirs = (max([*level.summed, level.peak]) + level.added for level in (mine, best))
+        if math.isinf(ours) and math.isinf(theirs):
+            return False
+        if ours > theirs + 1e-6 * abs(theirs):
+            return True
+        if theirs > ours + 1e-6 * abs(ours):
+            return False
+    return False
 
 
 def extracted[Price: Linear](graph: EGraph, root: BaseExpr,

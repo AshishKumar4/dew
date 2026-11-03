@@ -520,13 +520,16 @@ class Extraction:
   time, whether its sampled error meets the declared accuracy (§1.5), which `dew.algebra.error` measures on the
   candidate itself. The candidates come cheapest first, so the first admitted is the answer; the form as written
   is always a candidate, so one is always admitted.
-- Extraction is exact (`dew.algebra.extract`): the roots' forms whose nodes together cost least, each shared
-  node priced once, solved as a mixed integer program by HiGHS through SciPy. One binary choice per node; a used
-  class takes one node, a used node's child classes are used, and an order over each cyclic class keeps the
-  choice a DAG. egglog's `greedy-dag` keeps each class's cheapest node set alone, so it pays twice for a value
-  a costlier choice would have shared. The nodes and their prices are the model's own, read through one
-  `greedy-dag` pass that records every node it prices, and the chosen DAG is extracted by egglog with every
-  chosen node free.
+- Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
+  exact counterpart (`extract.extracted`) is the oracle. The exact extraction finds the roots' forms whose nodes
+  together cost least as a mixed integer program, solved by HiGHS through SciPy: one binary choice per node; a
+  used class takes one node, a used node's child classes are used, and an order over each cyclic class keeps the
+  choice a DAG. The nodes and their prices are the model's own, read through one `greedy-dag` pass that records
+  every node it prices, and the chosen DAG is extracted by egglog with every chosen node free. Over the
+  algebra's and the templates' test derivations it priced no template's form below greedy's and took twice its
+  time, so greedy stays the default. The test suite holds each derivation's greedy choice to the exact optimum
+  (`dew.cache.Passes.checked`); a declaration greedy prices dearer is refused there until it is extracted
+  exactly (`derive.Reduction.exact`).
 - A price states itself as levels compared in order (`extract.Linear`). Each level is the larger of its
   pieces, each a sum over the chosen nodes, and its nodes' largest peak (a span), plus what the nodes add
   beside it. A schedule's seconds are exactly such a level (`Schedule.pieces`, `spanned`), and its tiebreak

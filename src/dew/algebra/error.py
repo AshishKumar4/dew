@@ -53,7 +53,7 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     graph, bundle, roots = program.graphed(region)
     facts = cost.target()
     timed = cost.model(region, cost.fused(facts))
-    _, written_seconds = extract.extracted(graph, bundle, timed)
+    _, written_seconds = extract.cheapest(graph, bundle, timed)
     program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation)
     tree = jax.tree.structure(shaped)
     cheapest, _ = program.extracted(graph, bundle, timed)
@@ -87,7 +87,7 @@ def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[
     alone = terms.Term.bundle(Vec[terms.Term](*chosen))
     graph.register(alone)
     graph.run(rules.FACTS.saturate())
-    _, price = extract.extracted(graph, alone, model)
+    _, price = extract.cheapest(graph, alone, model)
     return price.value
 
 

@@ -82,9 +82,11 @@ def softmax_beside_a_half_maximum(q, k, v, rows, keys):
         jnp.float32)[:, None]
 
 
-DECLARED: dict[str, tuple[Callable, Literal[2, "e"]]] = {
-    "attention": (attention, "e"), "causal": (causal, "e"), "base2": (base2, 2), "shifted": (shifted, "e"),
-    "products": (products, "e"), "a softmax beside an fp16 maximum": (softmax_beside_a_half_maximum, "e")}
+DECLARED: dict[str, tuple[Callable, Literal[2, "e"], bool]] = {
+    "attention": (attention, "e", True), "causal": (causal, "e", False), "base2": (base2, 2, True),
+    "shifted": (shifted, "e", False), "products": (products, "e", False),
+    "a softmax beside an fp16 maximum": (softmax_beside_a_half_maximum, "e", True)}
+"""Each declaration's function, its exponent's base and whether it is extracted exactly (`declared`)."""
 AXES = {"q": ("rows", "width"), "k": ("keys", "width"), "v": ("keys", "values"), "rows": ("rows",),
         "keys": ("keys",)}
 ROWS, PLACES = jnp.arange(QUERIES) * (KEYS // QUERIES), jnp.arange(KEYS)
@@ -106,8 +108,12 @@ def draw(seed):
             jnp.asarray(rng.standard_normal((KEYS, WIDTH)), jnp.float32))
 
 
-def declared(function, exponent: Literal[2, "e"] = "e") -> derive.Reduction:
-    return derive.Reduction(function, AXES, walked="keys", exponent=exponent)
+def declared(function, exponent: Literal[2, "e"] = "e", *, exact: bool = False) -> derive.Reduction:
+    """`function`'s walk over the keys; `exact` where the oracle finds its greedy extraction dearer than the
+    optimum (`Passes.checked`): a scaled softmax's row maximum taken over the scaled logits its exponent
+    reads, greedy's over the unscaled product scaled again (0.02% of the walk's seconds), and a floored
+    shift's merge alike."""
+    return derive.Reduction(function, AXES, walked="keys", exponent=exponent, exact=exact)
 
 
 def operands(q, k, v) -> dict:
@@ -164,9 +170,10 @@ def test_the_derived_walk_computes_the_declared_function(name, walk):
     """The declaration's derived step over every key tile in order, finished, or over the keys in two disjoint
     halves, each from the empty state, their states merged (a split walk's combine, the work scheduler's
     fix-up), finished: on par with the whole-operand function against the float64 truth (check 1)."""
-    forms = derive.derive(declared(*DECLARED[name]), accurate=False, saturation=SATURATION)
+    function, exponent, exact = DECLARED[name]
+    forms = derive.derive(declared(function, exponent, exact=exact), accurate=False, saturation=SATURATION)
     run = walked_whole(forms) if walk == "walked" else merged_whole(forms)
-    assert_as_exact(jax.jit(run), jax.jit(whole(DECLARED[name][0])), draw, f"{name} {walk}", seeds=16)
+    assert_as_exact(jax.jit(run), jax.jit(whole(function)), draw, f"{name} {walk}", seeds=16)
 
 
 def unshifted(q, k, v, rows, keys):
@@ -184,7 +191,8 @@ def test_a_declaration_derives_once_whatever_routes_block_its_traces_record_into
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import report
 
-    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False, saturation=SATURATION)
+    forms = derive.derive(declared(softmax_beside_a_half_maximum, exact=True), accurate=False,
+                          saturation=SATURATION)
     tiles = shaped(tile_of(operands(*draw(0)), 0))
     with generation.routes():
         forms.init(tiles)
@@ -254,7 +262,7 @@ def floored(q, k, v, rows, keys):
 def test_a_merge_of_a_shift_that_reads_an_operand_computes_the_declared_function():
     """A walk whose shift reads an operand of the queries beside the walked maximum, walked in two halves
     and merged: on par with the whole-operand function (check 1)."""
-    forms = derive.derive(declared(floored), accurate=False, saturation=SATURATION)
+    forms = derive.derive(declared(floored, exact=True), accurate=False, saturation=SATURATION)
     assert_as_exact(jax.jit(merged_whole(forms)), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
 
 

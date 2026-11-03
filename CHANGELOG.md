@@ -7,10 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- The algebra pass (`dew.algebra`) extracts each program's and each template derivation's cheapest forms
-  exactly, as an integer program over the e-graph's nodes, each shared node priced once (`dew.algebra.extract`).
-  It used egglog's greedy DAG extractor, which keeps each class's cheapest node set alone and pays twice for a
-  value a costlier choice would have shared.
+- `dew.algebra.extract` adds exact DAG extraction, an integer program over the e-graph's nodes with each shared
+  node priced once. egglog's greedy DAG extraction stays the default: the exact one priced no template's forms
+  lower and took twice as long. A template declaration can ask for exact extraction
+  (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
+  optimum.
 - Dew requires its JAX build 0.12.0.1.post46: Mosaic GPU's layout inference computes each
   shared-memory-to-registers transfer check once, and a Pallas Mosaic GPU scratch ref can state that it is
   plain (`plgpu.PlainTransform()`), so Kimi delta attention's kernels lower and compile for sm90 in seconds

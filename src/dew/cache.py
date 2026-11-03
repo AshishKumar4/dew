@@ -255,11 +255,14 @@ context only beside no other JAX call."""
 
 @dataclasses.dataclass(frozen=True)
 class Passes:
-    """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), and the GPU whose
-    facts it prices them for (a `GpuTarget` name; None for the process's own)."""
+    """Whether the algebra pass rewrites the programs Dew compiles (`dew.algebra.passes`), the GPU whose
+    facts it prices them for (a `GpuTarget` name; None for the process's own), and whether each template
+    derivation's greedy extraction is held to the exact optimum (`checked`, the test suite's oracle,
+    `dew.algebra.extract.cheapest`)."""
 
     on: bool = True
     target: str | None = None
+    checked: bool = False
 
 
 ALGEBRA = jax.make_user_context(default_value=Passes())

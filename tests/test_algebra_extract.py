@@ -1,12 +1,14 @@
-"""Exact DAG extraction (`dew.algebra.extract`, docs/design/algebra.md §6.5): the roots' forms whose nodes
-together cost least, each shared node once, where egglog's greedy-dag extractor keeps each class's cheapest
-node set alone and pays twice for what a costlier choice would have shared."""
+"""Extraction (`dew.algebra.extract`, docs/design/algebra.md §6.5): egglog's greedy DAG extraction by default,
+and the exact one, the roots' forms whose nodes together cost least, each shared node once, where greedy keeps
+each class's cheapest node set alone and pays twice for what a costlier choice would have shared; the oracle
+holds greedy's choice to the exact optimum."""
 
 from __future__ import annotations
 
 import dataclasses
 import math
 
+import pytest
 from egglog import (
     DagCostModel,
     EGraph,
@@ -79,12 +81,27 @@ def sharing() -> tuple[EGraph, Toy]:
 
 
 def test_a_choice_that_shares_a_node_beats_each_class_cheapest_alone():
+    """Greedy pays 13.5 where the exact extraction shares the leaf for 8; the oracle refuses greedy's choice
+    as dearer, and a caller that asks for the exact extraction gets the shared form."""
     graph, root = sharing()
-    _, greedy = graph.extract(root, include_cost=True, cost_model=MODEL, extractor="greedy-dag")
-    form, price = extract.extracted(graph, root, MODEL)
-    assert greedy == Cost(13.5)
-    assert price == Cost(8.0)
-    assert str(form) == str(Toy.two(Toy.one("f", Toy.leaf("shared")), Toy.one("g", Toy.leaf("shared"))))
+    shared = Toy.two(Toy.one("f", Toy.leaf("shared")), Toy.one("g", Toy.leaf("shared")))
+    assert extract.cheapest(graph, root, MODEL)[1] == Cost(13.5)
+    with pytest.raises(extract.Dearer):
+        extract.cheapest(graph, root, MODEL, checked=True)
+    for form, price in (extract.extracted(graph, root, MODEL),
+                        extract.cheapest(graph, root, MODEL, exact=True)):
+        assert price == Cost(8.0)
+        assert str(form) == str(shared)
+
+
+def test_the_oracle_admits_a_greedy_choice_at_the_optimum():
+    """Where greedy's choice is the cheapest DAG, the oracle passes it as it is."""
+    graph = EGraph()
+    root = Toy.two(Toy.leaf("small"), Toy.one("f", Toy.leaf("big")))
+    graph.register(root)
+    form, price = extract.cheapest(graph, root, MODEL, checked=True)
+    assert price == Cost(17.5)
+    assert str(form) == str(root)
 
 
 def test_a_class_its_own_cheapest_node_reads_through_a_cycle_takes_a_node_that_closes_none():
