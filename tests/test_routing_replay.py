@@ -513,7 +513,6 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
     from dew.inference.rollouts import Draw
     from dew.objectives.rl.grpo import GRPOObjective
     from dew.objectives.rl.records import draw_record, record_json
-    from dew.objectives.rl.sessions import routing_of
     from dew.objectives.rl.verl import from_verl, to_verl
     from dew.sampling import Sampling
 
@@ -543,6 +542,8 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
 
     assert_as_exact(through_pack, direct(obj), draw, "keyed routing through pack", seeds=SEEDS['keyed pack'],
                     truth_fn=direct(parallel_routed(mixed=False, dtype=jnp.float64)))
+
+    from dew.objectives.rl.sessions import routing_of
 
     _, tokens, record = draw(0)
     ids = [int(token) for token in np.asarray(tokens[0])]
