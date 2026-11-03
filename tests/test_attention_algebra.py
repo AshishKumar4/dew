@@ -95,10 +95,10 @@ def test_the_plain_jax_backward_is_on_par_under_every_score_hook(hooks, dtype, a
 
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
 def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
-    """The backward from the forward's split sums (`algebra.split_delta`) and from the dQ launch's own
-    first pass over the keys (`algebra.off_anchor_delta`) on par (check 1, the reference's float64 gradients
-    the truth), over a windowed causal call of packed documents: the training forward's sums are the first
-    pass."""
+    """The backward from the forward's split sums (`attention_gradient.split_delta`) and from the dQ launch's
+    own first pass over the keys (`attention_gradient.off_anchor_delta`) on par (check 1, the reference's
+    float64 gradients the truth), over a windowed causal call of packed documents: the training forward's sums
+    are the first pass."""
     queries, keys = geometry(CASES["causal-documents-window"])
     spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-documents-window"]))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 32)
@@ -674,7 +674,7 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
 
 def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     """The accurate form's dQ (`natural=True, accurate=True`: the keyed sums, each factor's mantissa and
-    exponent apart, `algebra.dq_finish`) on the Triton mainloop interpreted and the plain-JAX one: finite,
+    exponent apart, `gradient.dq_finish`) on the Triton mainloop interpreted and the plain-JAX one: finite,
     the two equal to the bit, and on par with the reference's own fp32 dQ against float64's (check 1); where
     the reference's is float64's exactly, which check 1 cannot weigh, float64's exactly too."""
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
@@ -709,13 +709,13 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
 def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
     """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
     hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
-    so the accurate form's dQ is exactly 0 in both mainloops, as float64's (`algebra.DqSums.keyed`): keys near
-    fp32's largest at a scale or a slope of 2, whose sum under coefficients summing to 2 would overflow, and
-    small keys under a score whose derivative, the slope times the scale, is fp32's largest, whose
-    coefficients' magnitudes would (held as mantissas and exponents, `keyed_shift`). A derivative past fp32's
-    largest is no fp32 number: XLA's compiled arithmetic forms it whole in the logits themselves
-    (`template.scores` is NaN there), so no form of the backward is asked of it. The slope is a head's
-    parameter, traced as a learned slope is."""
+    so the accurate form's dQ is exactly 0 in both mainloops, as float64's
+    (`attention_gradient.DqSums.keyed`): keys near fp32's largest at a scale or a slope of 2, whose sum under
+    coefficients summing to 2 would overflow, and small keys under a score whose derivative, the slope times
+    the scale, is fp32's largest, whose coefficients' magnitudes would (held as mantissas and exponents,
+    `keyed_shift`). A derivative past fp32's largest is no fp32 number: XLA's compiled arithmetic forms it
+    whole in the logits themselves (`template.scores` is NaN there), so no form of the backward is asked of
+    it. The slope is a head's parameter, traced as a learned slope is."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
     # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
@@ -734,9 +734,9 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
 def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
     """Three equal keys of 2^100 at a scale of 2^-80, one value of 2^54: equal logits, so the cotangents'
     rounding leaves D's refinement at -2^29 against keys of 2^100, while the correction it makes,
-    -2^29 · 2^-80 · 2^100 times the weights' mass, is 2^49 (`algebra.dq_finish`: each factor's mantissa and
-    exponent apart). The accurate form's dQ is finite in both mainloops, the two agree to the bit, and it
-    is on par with the reference's against float64's."""
+    -2^29 · 2^-80 · 2^100 times the weights' mass, is 2^49 (`attention_gradient.dq_finish`: each factor's
+    mantissa and exponent apart). The accurate form's dQ is finite in both mainloops, the two agree to the
+    bit, and it is on par with the reference's against float64's."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, :, :, 0].set(2.0 ** 100)
     value = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, 2, :, 0].set(2.0 ** 54)
@@ -763,9 +763,9 @@ def test_a_padded_call_at_a_scale_fp32_takes_to_zero_weighs_its_keys_alike(scale
 def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
     """The accurate form at a scale of 2^-128, below fp32's least normal: a query of zeros over two equal keys
     and values of 1 under a cotangent of 1, whose score cotangents, dQ and the reference's are all 0. The
-    keyed sums carry the scale as a mantissa and an exponent (`algebra.dq_terms`), taken apart in Python's
-    double, where 2^128 is no overflow; an infinite mantissa would make dQ's correction 0 · inf, NaN. dQ is
-    finite and 0 in both mainloops."""
+    keyed sums carry the scale as a mantissa and an exponent (`attention_gradient.dq_terms`), taken apart in
+    Python's double, where 2^128 is no overflow; an infinite mantissa would make dQ's correction 0 · inf, NaN.
+    dQ is finite and 0 in both mainloops."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.ones((1, 2, 1, 16), jnp.float32)
     value = jnp.ones((1, 2, 1, 16), jnp.float32)
@@ -783,8 +783,8 @@ def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
 def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
     """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
     probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,
-    is not (`algebra.dq_step`: each factor's mantissa and exponent apart). The accurate form's dQ agrees
-    to the bit in both mainloops and is on par with the reference's against float64's."""
+    is not (`attention_gradient.dq_step`: each factor's mantissa and exponent apart). The accurate form's dQ
+    agrees to the bit in both mainloops and is on par with the reference's against float64's."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
@@ -843,8 +843,9 @@ def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at
     """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0, at
     a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is near
     2^-287, past fp32's range, and its share of dQ is below fp32's least value, so the accurate form's dQ is
-    finite in both mainloops, on par with the reference's against float64's (`algebra.NO_SHIFT` below every
-    composed exponent, so a tile's running mass is never subnormal) and the two agree to the bit."""
+    finite in both mainloops, on par with the reference's against float64's (`attention_gradient.NO_SHIFT`
+    below every composed exponent, so a tile's running mass is never subnormal) and the two agree to the
+    bit."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(-83.0 * 2.0 ** 40)
     value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)

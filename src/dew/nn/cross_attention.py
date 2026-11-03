@@ -338,7 +338,8 @@ class CrossAttention:
             norm=None if decoder.ngpt is not None else decoder_norm(
                 decoder.norm_type, epsilon=decoder.norm_eps, bias=decoder.norm_bias,
                 scale_offset=decoder.scale_offset, scale_after_cast=decoder.scale_after_cast,
-                dtype=decoder.dtype, specs=decoder.norms),
+                dtype=decoder.dtype, precision=decoder.precision, specs=decoder.norms,
+                routed=index in decoder.sparse_layers),
             ngpt=decoder.ngpt is not None,
             feedforward=functools.partial(
                 GatedMLP, hidden_features=width, out_features=decoder.emb_features,

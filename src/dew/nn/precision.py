@@ -132,8 +132,11 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     rotary and time-embedding angles, the vocabulary head's product and loss
     reductions read it, so a bfloat16 model reduces in float32 and a float64
     model computes in float64 throughout, not with its float32 twin's
-    roundings."""
-    return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
+    roundings. An 8-bit float, which promotes implicitly to nothing, reads
+    float32 as every narrower float does."""
+    if dtype is None or jnp.dtype(dtype).itemsize < 4:
+        return jnp.dtype(jnp.float32)
+    return jnp.promote_types(dtype, jnp.float32)
 
 
 def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = True,

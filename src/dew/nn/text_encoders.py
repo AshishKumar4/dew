@@ -94,7 +94,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                packed: bool = False, kv_heads: int | None = None, head_dim: int | None = None,
                norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
-               branch_scale: float | None = None,
+               branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
+               scale_after_cast: bool = False, mixer: Callable[..., nn.Module] | None = None,
                dtype: Dtype | None = None, precision: PrecisionLike = None,
                name: str | None = None) -> DecoderBlock:
     """One encoder layer of a text or vision tower as the decoder block runs it: CLIP's, SigLIP's,
@@ -109,14 +110,18 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     over `window` places either side where given; the vision towers rotate it by their patch grid
     (`rotary_axes`, Llama 4's in adjacent pairs). A layout sets the rest: grouped `kv_heads`, a
     `head_dim` beside `width // heads`, RMS norms or no norm bias, an unbiased or gated
-    feed-forward whose gate and up maps are one (`mlp_packed`), and queries, keys and values in
-    one map (`packed`).
+    feed-forward whose gate and up maps are one (`mlp_packed`), queries, keys and values in
+    one map (`packed`), unbiased attention maps (`attention_bias`), an RMS norm on each head's
+    queries and keys at the layer's epsilon (`qk_norm`), RMS norms that weigh their normalized input
+    after its cast back (`scale_after_cast`, Llama's); a `mixer` takes the attention's place
+    (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`).
     """
     head_dim = width // heads if head_dim is None else head_dim
     attention = functools.partial(
         CausalSelfAttention, ctx=MixerContext(
             emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
-            head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=False, attention_bias=True,
+            head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm,
+            attention_bias=attention_bias, norm_eps=eps, scale_after_cast=scale_after_cast,
             rope_theta=rope_theta,
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
             sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
@@ -124,8 +129,9 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
         nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, packed=packed)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
                             use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
-    return DecoderBlock(attention, mlp, width, BlockWiring(branch_scale=branch_scale),
-                        norm_eps=eps, norm_type=norm_type,
+    return DecoderBlock(attention if mixer is None else mixer, mlp, width,
+                        BlockWiring(branch_scale=branch_scale),
+                        norm_eps=eps, norm_type=norm_type, scale_after_cast=scale_after_cast,
                         norm_bias=norm_bias, dtype=dtype, precision=precision, name=name)
 
 
@@ -245,7 +251,7 @@ class CLIPVisionTransformer(nn.Module):
             positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),
             special_tokens=SpecialTokens("first", initializer=nn.initializers.normal(
                 self.hidden_size ** -0.5)),
-            patch_projection="conv", image_size=self.image_size, rotary=None, pre_norm=True,
+            patch_projection="conv", image_size=self.image_size, rotary=None, pre_norm="layer",
             post_norm="layer", post_norm_scope="class", outer_norm_eps=self.layer_norm_eps,
             merge_blocks=False)
 

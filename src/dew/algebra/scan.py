@@ -108,22 +108,25 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
     prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's outputs from the state
     entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's from zero),
     `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for each operand
-    but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form."""
+    but the reset's. Refused (`Refused`) where the update or the readout is not of the module's form.
+    `init(shapes)` given a chunk's operands (or their shapes and dtypes) starts a walk that merges (`Walk`),
+    its transfer carried where its tokens correct the state; given none, one that steps alone."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
         raise Refused("a state of rank other than two (keys by values) has no chunk form here")
 
-    corrects: list = []  # whether a token corrects the state, once a chunk was read
     decomposed: dict = {}  # the token's affine map by its operands' types, its e-graph saturated once
 
-    def parts(chunk: Mapping):
-        types = tuple((chunk[name].shape, str(chunk[name].dtype)) for name in names)
+    def affine_of(chunk: Mapping):
+        types = tuple((tuple(chunk[name].shape), str(chunk[name].dtype)) for name in names)
         if types not in decomposed:
             decomposed[types] = linear_scan.parts(_traced(declaration, declaration.update, names, chunk),
                                                    _traced(declaration, declaration.readout, names, chunk))
-        affine = decomposed[types]
-        corrects[:] = [affine.correction is not None]
+        return decomposed[types]
+
+    def parts(chunk: Mapping):
+        affine = affine_of(chunk)
         # An operand with no walked axis (a rate, a skip) is every token's.
         axes = [declaration.operands[name].index(declaration.walked)
                 if declaration.walked in declaration.operands[name] else None for name in names]
@@ -142,8 +145,11 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
     carried = at_least_fp32(jnp.dtype(dtype))
 
     def init(shapes):
-        del shapes
-        return jnp.zeros((shape[0],), carried), jnp.zeros(shape, carried)
+        empty = jnp.zeros((shape[0],), carried), jnp.zeros(shape, carried)
+        if not shapes:
+            return empty
+        corrected = affine_of(shapes).correction is not None
+        return Walk(*empty, jnp.eye(shape[0], dtype=carried) if corrected else None)
 
     splits: dict = {}
 
@@ -170,13 +176,19 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
             splits[key] = carry.split(functools.partial(_chunk, form, tuple(held)), h, avals, (1,),
                                       saturation=saturation, ranges=ranges,
                                       state_range=_magnitude(declaration.ranges.get("state")))
-        return Prepared((natural, splits[key].prepare(*given)), splits[key])
+        return Prepared((natural, splits[key].prepare(*given)), splits[key], corrected)
 
     def step(state, prepared):
-        decay, h = state
+        decay, h = state[:2]
         natural, values = prepared.values
         (leaving,) = prepared.split.carry(values, h)
-        return _held(decay + natural.astype(decay.dtype)), leaving
+        decay = _held(decay + natural.astype(decay.dtype))
+        if not isinstance(state, Walk):
+            return decay, leaving
+        if prepared.corrected and state.transfer is None:
+            raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
+        transfer = None if state.transfer is None else _transferred(prepared, state.transfer, h)
+        return Walk(decay, leaving, transfer)
 
     def mapped(prepared, state):
         (outputs,) = prepared.split.emit(prepared.values[1], state[1])
@@ -184,12 +196,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
 
     def merge(a, b, operands):
         del operands
-        # A state's decay is its walk's exponent sum per key in natural units. A later walk from zero leaves
-        # the state before it decayed alone only where no token corrects it: refused where one does.
-        if corrects != [False]:
-            raise Refused("a merge of walks whose tokens correct the state, or before any chunk was read")
-        (decay_a, h_a), (decay_b, h_b) = a, b
-        return _held(decay_a + decay_b), jnp.exp(decay_b)[:, None] * h_a + h_b
+        return _merged(a, b, carried)
 
     def finish(state, operands):
         del operands
@@ -211,14 +218,56 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation) -> Derived
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values"], meta_fields=["split"])
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values"],
+                   meta_fields=["split", "corrected"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
     """A chunk's values that read no state (`carry.Split.prepare`), batched as a walk computes them for every
-    chunk at once, and the split that reads them (static)."""
+    chunk at once, the split that reads them and whether its tokens correct the state (static)."""
 
     values: tuple
     split: carry.Split
+    corrected: bool
+
+
+class Walk(NamedTuple):
+    """A derived scan's state that merges (`derive_scan`'s `init` given a chunk's operands): its decay (the
+    exponent sum per key in natural units), its state from the one entering it (zero), and where its tokens
+    correct the state its transfer, the keys-by-keys matrix it applied to the entering state, else None (the
+    decay's diagonal)."""
+
+    decay: jax.Array
+    h: jax.Array
+    transfer: jax.Array | None
+
+
+def _merged(a, b, carried) -> Walk:
+    """Two consecutive walks' states joined (`derive_scan`'s `merge`), the later's from zero applying its
+    transfer to the state before it: its decay per key (its exponent sum in natural units) where no token
+    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype."""
+    if not (isinstance(a, Walk) and isinstance(b, Walk)):
+        raise Refused("a merge of walks init did not start from their operands' shapes")
+    if b.transfer is None:
+        h = jnp.exp(b.decay)[:, None] * a.h + b.h
+        transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
+    else:
+        h = float32_matmul(b.transfer, a.h) + b.h
+        transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
+                    else float32_matmul(b.transfer, a.transfer))
+    return Walk(_held(a.decay + b.decay), h.astype(carried),
+                None if transfer is None else transfer.astype(carried))
+
+
+def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array) -> jax.Array:
+    """The chunk's transfer applied to a walk's (`transfer`, keys by keys): its carry's linear part in the
+    state (`jax.linearize` at the state `h` entering it, the carry affine in it), over the transfer's
+    columns a state's width at a time."""
+    keys, width = h.shape
+    _, linear = jax.linearize(lambda state: prepared.split.carry(prepared.values[1], state)[0], h)
+    blocks = -(-keys // width)
+    padded = jnp.pad(transfer.astype(h.dtype), ((0, 0), (0, blocks * width - keys)))
+    columns = jax.vmap(linear, in_axes=1, out_axes=1)(padded.reshape(keys, blocks, width))
+    return columns.reshape(keys, blocks * width)[:, :keys]
 
 
 DECAYS = 4

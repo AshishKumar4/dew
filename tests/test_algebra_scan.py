@@ -102,8 +102,8 @@ def test_two_walks_merged_give_the_final_state():
 
     def merged(x, dt, B, C):
         values = operands(x, dt, B, C)
-        _, first = walk(forms, values, range(half), forms.init({}))
-        _, second = walk(forms, values, range(half, 2 * half), forms.init({}))
+        _, first = walk(forms, values, range(half), forms.init(chunk_of(values, 0)))
+        _, second = walk(forms, values, range(half, 2 * half), forms.init(chunk_of(values, 0)))
         return forms.finish(forms.merge(first, second, values), values)
 
     assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: tokenwise(*xs)[1]), draw, "ssd merged", seeds=16)
@@ -270,6 +270,26 @@ def test_the_delta_rules_derived_chunks_compute_their_token_scans(update_fn, ope
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     assert_as_exact(jax.jit(gated_walk(forms, operands)), jax.jit(gated_tokenwise(update_fn)), draw_fn,
                     update_fn.__name__, seeds=16)
+
+
+@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
+    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
+def test_two_delta_rule_walks_merged_give_the_final_state(update_fn, operands, draw_fn):
+    """The gated delta rule's and Kimi's delta attention's tokens walked in two halves, the second from a zero
+    state carrying its transfer (the corrections' keys-by-keys map of the state entering it), merged: the
+    final state on par with the token-by-token scan's, against the float64 truth (check 1)."""
+    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    half = TOKENS // CHUNK // 2
+
+    def merged(q, k, v, g, beta):
+        values = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+        states = [walk(forms, values, chunks, forms.init(chunk_of(values, 0, operands)), operands)[1]
+                  for chunks in (range(half), range(half, 2 * half))]
+        return forms.finish(forms.merge(*states, values), values)
+
+    assert_as_exact(jax.jit(merged), jax.jit(lambda *xs: gated_tokenwise(update_fn)(*xs)[1]), draw_fn,
+                    f"{update_fn.__name__} merged", seeds=16)
 
 
 @pytest.mark.parametrize("target", ["sm86", "sm90"])
@@ -478,9 +498,10 @@ def test_a_walk_through_a_vanished_decay_differentiates_and_merges_finite(decays
     g = jnp.asarray(decays, jnp.float32)
     value, gradient = jax.value_and_grad(final)(g)
     _, tangent = jax.jvp(jax.grad(final), (g,), (jnp.ones_like(g),))
-    walked = forms.step(forms.init({}), forms.prepare(ones_chunk(g)))
-    merged = forms.merge(forms.init({}), walked, None)
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in (value, gradient, tangent, *merged))
+    start = forms.init(ones_chunk(g))
+    merged = forms.merge(start, forms.step(start, forms.prepare(ones_chunk(g))), None)
+    leaves = (value, gradient, tangent, *jax.tree.leaves(merged))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in leaves)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float64, jnp.float16, jnp.bfloat16], ids=lambda d: jnp.dtype(d).name)
@@ -699,7 +720,7 @@ def test_two_reset_walks_merged_give_the_final_state():
         given = values(first, tokens)
         states = []
         for chunks in (range(half), range(half, 2 * half)):
-            state = forms.init({})
+            state = forms.init(chunked(given, 0))
             for index in chunks:
                 state = forms.step(state, forms.prepare(chunked(given, index)))
             states.append(state)

@@ -102,7 +102,7 @@ WRAPPERS = {
     "llama4": ("Llama 4", "Images"),
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
     "muse_glimmer": ("Muse Glimmer", "Images"),
-    "lfm3_vl": ("LFM3-VL", "None yet: its language model alone (`text_only`)"),
+    "lfm3_vl": ("LFM3-VL", "Images, video"),
     "qwen2_vl": ("Qwen2-VL", "None yet: its language model alone (`text_only`)"),
     "qwen2_5_vl": ("Qwen2.5-VL", "None yet: its language model alone (`text_only`)"),
     "qwen3_vl": ("Qwen3-VL", "None yet: its language model alone (`text_only`)"),

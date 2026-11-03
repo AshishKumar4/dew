@@ -1,9 +1,8 @@
 """The recurrence mainloop's training pass on its machinery (`mainloop`): the fast backward's launches
-(`gradients`, fla's DAG of the delta rule and, without it, mamba_ssm's rounding of Mamba2's SSD), the forms
-and devices they take (`fast_backward_form`, `backward_holds`), and the plan of a call's launches, forward
-and backward (`planned`, `holds`), from which the template derives its tiles."""
+(`gradients`, fla's DAG of the delta rule and, without it, mamba_ssm's rounding of Mamba2's SSD) and the
+forms they take (`fast_backward_form`). The plan of a call's launches, forward and backward, is the
+template's (`template.planned`, `template.backward_holds`)."""
 
-import contextlib
 import dataclasses
 import functools
 from collections.abc import Sequence
@@ -19,9 +18,7 @@ from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    _PLANNED,
     CHUNK,
-    Launch,
     Tiles,
     _allocated,
     _block_stored,
@@ -54,51 +51,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _vector_views,
     _views,
     _walk_stores,
-    kept_forward,
     whole_blocks,
 )
-
-
-def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
-            max_segments: int | None = None, delta: bool = True, backward: bool = False,
-            floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False, wide: bool = False, ranged: bool = False, skip=None) -> tuple[Launch, ...]:
-    """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
-    `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
-    planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
-    (`_kernel`); with `backward`, the fast backward's too (`gradients`). A `wide` call's output lands in
-    fp32 (`forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
-    (204800 bytes against 188544 on an H100's compile, the resource gate's). A `skip` (`[HV]`, its shape)
-    fused into the output and reverse walk is planned with them: its reverse walk holds a tile more."""
-    found: list[Launch] = []
-
-    def run(q, k, v, g, beta, h0, starts, skip):
-        token = _PLANNED.set(found)
-        try:
-            out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
-                                                       max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded, wide=wide, ranged=ranged,
-                                                       skip=skip)
-            if backward:
-                gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
-                          max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
-                          floor=floor, rounded=rounded, ranged=ranged, skip=skip)
-        finally:
-            _PLANNED.reset(token)
-
-    with contextlib.nullcontext() if target is None else generation.assumed(target):
-        jax.eval_shape(run, q, k, v, g, beta, h0, starts, skip)
-    return tuple(found)
-
-
-def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> bool:
-    """Whether each of `launches` fits a block of `shared` bytes, its consumer threads hold their registers
-    (`Launch.registers` within `Family.registers` at its consumer roles, of the bundle it issues by,
-    `Launch.family`, `family` where it names none) and a multiprocessor holds a program of it
-    (`Launch.resident`): a generated launch spills nothing."""
-    return all(launch.shared <= shared and launch.resident > 0
-               and launch.registers <= (launch.family or family).registers(launch.consumers)
-               for launch in launches)
 
 
 def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
@@ -115,25 +69,6 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     if per_key:
         return delta
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
-
-
-def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family,
-                   target: generation.GpuTarget, starts=None, max_segments: int | None = None,
-                   delta: bool = True, floor: float | None = None, rounded: bool = False,
-                   ranged: bool = False, skip=None) -> bool:
-    """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
-    `tiles` on `target`, planned there and within its block's shared memory (`holds`); where they do not, the
-    rule's gradient is the portable math's. Planned on the device's own target off a GPU, an interpreted
-    call's states launch held no program at the interpreted target's shared budget (`Launch.resident`)."""
-    shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (q, k, v, g, beta, h0,
-                                                                                    starts, skip)]
-    *operands, starts, skip = shapes
-    forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target, skip=skip)
-    both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, floor=floor, rounded=rounded, ranged=ranged, target=target,
-                   skip=skip)
-    return holds(both[len(forward):], family, generation.shared_budget(target))
 
 
 def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
@@ -197,17 +132,14 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     else:
         dv, dbeta, dskip = _gate_back(run, call, dv2, gated, laid_do, skip)
         dk_w, after_w, decay_w = None, 0.0, 0.0
-    # Each token's decay's gradient, the launches' (`algebra.summed_ranges` is linear in its terms) and the
-    # memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from the
-    # chunk's start, every token's.
+    # Each token's decay's gradient from the launches' terms (`algebra.decay_gradient`, linear in them): the
+    # query/key launch's ranges, `after` from each token to the chunk's end and `leaving` from its start to
+    # before it, the keys launch's beside them, and the memory's decay across each chunk.
     memory = memory.reshape(-1, heads, chunks, call.block).sum((0, 3))
     ending = (run.hi + run.lo).reshape(heads, chunks, CHUNK)[..., -1]
-    # The query/key launch's range terms each token's through them (`algebra.summed_ranges`):
-    # `after` from each token to the chunk's end, `leaving` from its start to before it.
     after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
-    ranges = algebra.summed_ranges(after + after_w, leaving)
-    dg = ((decay_pairs + decay_w).reshape(heads, chunks, CHUNK) + ranges
-          + (memory * jnp.exp2(ending))[..., None])
+    dg = algebra.decay_gradient((decay_pairs + decay_w).reshape(heads, chunks, CHUNK), after + after_w,
+                                leaving, memory, ending)
     dg, dbeta = dg.reshape(heads, rows).T, dbeta.T if delta else dbeta
 
     def headed(x, size):
@@ -698,16 +630,17 @@ def _query_key_held(call: _Call) -> _Held:
 
 
 def _query_key_landing(call: _Call, splits: int) -> dict:
-    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient (fp32 where there are two
-    splits or more) and the queries' and keys' sums."""
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule (fp32
+    where there are two splits or more) and the queries' and keys' sums."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    return {"weights": held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32),
-            "sums": ((CHUNK, call.block), jnp.float32)}
+    weights = held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32)
+    return {**({"weights": weights} if call.delta else {}), "sums": ((CHUNK, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
     """`_query_key`'s streams at value split `vq` (`_query_key_split`) and its outputs' types, each split's
-    sums its own (the weights' gradient in fp32 where there are two splits or more)."""
+    sums its own (the weights' gradient, the delta rule's alone, in fp32 where there are two splits or
+    more)."""
     width, held, memories, given = call.width, call.held, call.memories, call.given
     splits = call.value_width // vq
     tiles = _streamed(queries=((CHUNK, call.block), given), keys=((CHUNK, call.block), given),
@@ -719,14 +652,15 @@ def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
     terms = jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.rows), jnp.float32)
     weights = (dataclasses.replace(held, rows=call.rows).shape(call.heads * width) if splits == 1
                else jax.ShapeDtypeStruct((call.rows, splits * call.heads * width), jnp.float32))
-    return tiles, (keyed_out, keyed_out, weights, terms, terms,
+    return tiles, (keyed_out, keyed_out, *((weights,) if call.delta else ()), terms, terms,
                    jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
                                         jnp.float32))
 
 
 @_lowered_once
 def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _Call, *, scale: float):
-    """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held, after, leaving [blocks, HV, R], memory
+    """`(dq, dk [R, H * Dk] fp32, dw [R, HV * Dk] as call.held (None without the delta rule, which forms no
+    weights), after, leaving [blocks, HV, R], memory
     [blocks, HV, chunks * block] fp32)`: each chunk's and key block's queries', keys' and weights' gradients
     (fla's dqkwg's memory products, `algebra.memory_gradients`, given the scores' gradient `ds` in
     `_score_grads`' form, `_scores_back`'s: `[R, HV * C]` with the delta rule, each step's value head's
@@ -748,9 +682,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     keyed_width, key_blocks = call.heads // group * width, width // call.block
 
     def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
-                beta_ref, dq_ref, dk_ref, dw_ref, after_ref, leaving_ref, memory_ref, *, streams, staging,
-                landing):
+                beta_ref, *outs, streams, staging, landing):
         del staging
+        dq_ref, dk_ref, *weights_ref, after_ref, leaving_ref, memory_ref = outs
         c, n, keyed = at["blocks"], at["chunks"], at["heads"]
         split = at["values"]
         row, span, last = n * CHUNK, pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
@@ -781,11 +715,11 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
             columns = pl.ds(split * keyed_width + key_columns, call.block)
             sums = {"dq": dq_ref.at[span, columns], "dk": dk_ref.at[span, columns]}
             weights_at = h * width + c * call.block
-            stored = functools.partial(
-                _gradient_stored, call,
-                weights=(held.views(dw_ref, row, CHUNK, weights_at, call.block) if splits == 1 else
-                         [dw_ref.at[span, pl.ds(split * call.heads * width + weights_at, call.block)]]),
-                sums=sums, first=first_head, landing=landing, apart=splits > 1)
+            weights = (() if not weights_ref else
+                       held.views(weights_ref[0], row, CHUNK, weights_at, call.block) if splits == 1 else
+                       [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
+            stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
+                                       landing=landing, apart=splits > 1)
 
             issue = Issuer(call)
             ds = _tile(slots, "ds", grads) if scores else None
@@ -832,7 +766,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     scores = 2 * CHUNK * CHUNK * call.block
     each = (2 + call.delta) * CHUNK * value_width * call.block + scores * call.delta
     work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
-    dq, dk, dw, after, leaving, memory = _kernel(
+    dq, dk, *weights, after, leaving, memory = _kernel(
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=_taken(10),
@@ -840,9 +774,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:
-        dq, dk, dw = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, dw))
+        dq, dk, *weights = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, *weights))
     after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
-    return dq, dk, dw if splits == 1 else held.split(dw), after, leaving, memory
+    dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
+    return dq, dk, dw, after, leaving, memory
 
 
 def _value_grads(call: _Call) -> _Operand:

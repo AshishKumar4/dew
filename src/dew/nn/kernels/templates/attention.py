@@ -447,18 +447,26 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     start, end = (spans.start, spans.end) if runs else (spans.start[..., None], spans.end[..., None])
     start, end = _blocked(start, block_q, 0), _blocked(end, block_q, 0)
     nonempty = end > start
-    held = jnp.any(nonempty, axis=2)
+    # Every bound the map reads of a block's queries in one reduction, their maxima (a minimum the maximum
+    # of its negation): each its own, XLA ran six kernels of a decode step's map (ET-DECODE5-h100). Each
+    # run's first start and last end of the queries reading it, whether any reads it and whether all do,
+    # and the block's latest start and earliest end.
+    read = nonempty.astype(jnp.int32)
+    bounds = jnp.stack([jnp.where(nonempty, -start, -big), jnp.where(nonempty, end, 0), read, 1 - read,
+                        start, -end], axis=-1)
+    first, last, some, missed, latest, earliest = jnp.moveaxis(jnp.max(bounds, axis=2), -1, 0)
+    held = some > 0
     # Each run's envelope over the block's queries, `(0, 0)` where none of them reads it.
-    lo_r = jnp.where(held, jnp.min(jnp.where(nonempty, start, big), axis=2) // block_k, 0)
-    hi_r = jnp.where(held, -(-jnp.max(jnp.where(nonempty, end, 0), axis=2) // block_k), 0)
+    lo_r = jnp.where(held, -first // block_k, 0)
+    hi_r = jnp.where(held, -(-last // block_k), 0)
     ranges = _merged(lo_r, hi_r, held, key_blocks) if runs else jnp.stack([lo_r, hi_r], axis=-1)
     lo = jnp.where(jnp.any(ranges[..., 1] > ranges[..., 0], axis=-1), ranges[..., 0, 0], 0)
     hi = jnp.max(ranges[..., 1], axis=-1)
     # A run's tile is whole where every query of the block sees all its keys through it: the block's latest
     # start and earliest end bound them, and a query that misses the run leaves none whole.
-    whole_lo = -(-jnp.max(start, axis=2) // block_k)
-    whole_hi = jnp.minimum(jnp.min(end, axis=2), keys) // block_k
-    whole = jnp.all(nonempty, axis=2) & (whole_hi > whole_lo)
+    whole_lo = -(-latest // block_k)
+    whole_hi = jnp.minimum(-earliest, keys) // block_k
+    whole = (missed == 0) & (whole_hi > whole_lo)
     widest = jnp.argmax(jnp.where(whole, whole_hi - whole_lo, -1), axis=-1)[..., None]
     some = jnp.any(whole, axis=-1)
     full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
@@ -467,9 +475,11 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     j = jnp.arange(key_blocks)[None, None, :, None]
     reads = jnp.any((ranges[:, :, None, :, 0] <= j) & (j < ranges[:, :, None, :, 1]), axis=-1)
     i = jnp.arange(lo.shape[1])[None, :, None]
-    q_lo = jnp.min(jnp.where(reads, i, big), axis=1, initial=big)
-    q_hi = jnp.max(jnp.where(reads, i + 1, 0), axis=1, initial=0)
-    q_lo = jnp.where(q_hi > 0, q_lo, 0)
+    # The first and last query block reading each key block, one reduction as the bounds above.
+    first_q, q_hi = jnp.moveaxis(jnp.max(jnp.stack([jnp.where(reads, -i, -big), jnp.where(reads, i + 1, 0)],
+                                                   axis=-1), axis=1, initial=-big), -1, 0)
+    q_hi = jnp.maximum(q_hi, 0)
+    q_lo = jnp.where(q_hi > 0, -first_q, 0)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
 
@@ -544,22 +554,6 @@ class Initial:
     m: jax.Array
     total: jax.Array
     acc: jax.Array
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class Pages:
-    """A paged cache's map from a row's keys to its pool (dew.nn.kv_cache's layout): `table` `[B, pages a
-    row]` int32, row `b`'s key `s` at offset `s % size` of page `table[b, s // size]` of a pool `[KV, P,
-    size, D]`, `size` keys a page (static)."""
-
-    table: jax.Array
-    size: int = dataclasses.field(metadata={"static": True})
-
-    @property
-    def keys(self) -> int:
-        """The keys a row's table maps, its pages' slots."""
-        return self.table.shape[1] * self.size
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -935,7 +929,7 @@ closes; every kernel's default reads it, so the default switches here."""
 
 ACCURATE = False
 """Whether attention's backward takes its accurate products unless a call says otherwise: False, the fast
-form, the template's own D about each query's anchor (`attention_algebra.split_delta`, not
+form, the template's own D about each query's anchor (`attention_gradient.split_delta`, not
 FlashAttention's rowsum(dO * O)) with each bf16 score cotangent narrowed for one product and dQ at that
 first D, as FlashAttention's arithmetic takes them; True, the cotangents' products to fp32's accuracy and
 dQ at the refined D (`attention_algebra.cotangent_product`, `dq_finish`). The template's accurate form is
@@ -1016,13 +1010,18 @@ class PaddedCall:
     output_params: tuple[jax.Array, ...]
     queries: int
     keys: int
-    pages: Pages | None = None
-    """A paged call's table (`Pages`), its `key` and `value` its pools flattened, `[KV, P·size, D]`."""
+    table: jax.Array | None = None
+    """A paged call's page table `[B, pages a row]` int32 (row `b`'s key `s` at offset `s % page` of page
+    `table[b, s // page]`), its `key` and `value` its pools flattened, `[KV, P·page, D]`."""
+    page: int | None = None
+    """A paged call's keys a page: its pools' `[KV, P, page, D]`, their own."""
 
     @property
     def key_rows(self) -> int:
         """The call's padded key count: a paged call's table's slots, else its keys' rows."""
-        return self.pages.keys if self.pages is not None else self.key.shape[1]
+        if self.table is None or self.page is None:
+            return self.key.shape[1]
+        return self.table.shape[1] * self.page
 
     def rows(self, array: jax.Array, fill: float = 0.0) -> jax.Array:
         """A `[B, H, Q, ...]` row statistic at the padded queries."""
@@ -1031,17 +1030,23 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int, pages: Pages | None = None) -> PaddedCall:
+                block: int, table: jax.Array | None = None, *, query_block: int | None = None
+                ) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
-    whole `block`s (a backend's largest tile), its head widths at powers of two. A paged call's (`pages`)
-    `key` and `value` are its pools `[KV, P, size, D]`, flattened, padded in their widths alone: its keys
-    are its table's slots, whole blocks where its page is."""
+    whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two. A
+    paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
+    padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
-    keys, value_width = (key.shape[1] if pages is None else pages.keys), value.shape[-1]
-    padded_q, padded_k = whole(max(queries, 1), block), whole(max(keys, 1), block)
+    page = None if table is None else key.shape[2]
+    keys, value_width = (key.shape[1] if table is None else table.shape[1] * key.shape[2]), value.shape[-1]
+    padded_q, padded_k = whole(max(queries, 1), query_block or block), whole(max(keys, 1), block)
     padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
-    if pages is not None and keys % block:
-        raise ValueError(f"a paged call's {keys} slots are no whole number of {block}-key blocks")
+    if table is not None and keys % block:
+        # A row's pages padded to whole blocks with page 0, whose slots no span of the call reaches.
+        if block % key.shape[2]:
+            raise ValueError(f"a paged call's pages of {key.shape[2]} keys pad to no whole {block}-key block")
+        table = jnp.pad(table, ((0, 0), (0, whole(keys, block) // key.shape[2] - table.shape[1])))
 
     def pad(array, rows, columns):
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
@@ -1056,7 +1061,7 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         flat = array.reshape(array.shape[0], -1, array.shape[-1])
         return jnp.pad(flat, ((0, 0), (0, 0), (0, columns - flat.shape[-1])))
 
-    if pages is not None:
+    if table is not None:
         padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
     else:
         padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
@@ -1065,7 +1070,7 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-                   queries, keys, pages)
+                   queries, keys, table, page)
 
 
 def kept_dtype(dtype) -> str:
@@ -1199,7 +1204,7 @@ def output_split(out: jax.Array) -> Split:
     """The split sums of a forward that keeps its output in place of its anchor's
     (`takes_output_residuals`): its output `[B, Q, H, Dv]` as the normalized sums of every key (shift -1,
     `attention_algebra.split_residuals`), no anchor's own weight and the others' weights 1, so
-    `attention_algebra.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
+    `attention_gradient.split_delta` takes D as `rowsum(dO ⊙ O)` about 0 with no anchor key (each query's
     -1)."""
     others = jnp.swapaxes(out, 1, 2).astype(jnp.float32)
     rows = jnp.zeros(others.shape[:-1], jnp.float32)
@@ -1267,7 +1272,7 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         starts = nothing - jnp.inf, nothing, nothing
     else:
         # The softmax's initial state: its maximum, denominator and its values' mean's product with the
-        # cotangent, in fp32 (`attention_algebra.off_anchor_start`): `acc0 · dO` itself overflows where the
+        # cotangent, in fp32 (`attention_gradient.off_anchor_start`): `acc0 · dO` itself overflows where the
         # state's sums are near fp32's largest; its mean does not.
         total0 = state.total.astype(jnp.float32)
         over = jnp.where(total0 > 0, 1.0 / jnp.where(total0 > 0, total0, 1.0), 0.0)
@@ -1313,10 +1318,10 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
     gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
     rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
-    query the nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the
+    query the nearer, from the forward's split sums (`attention_gradient.split_delta`) or a first pass of the
     dQ launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
     enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
-    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part of
+    head, query and initial state's gradients (`attention_gradient.refinement`). The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
     two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
@@ -1363,14 +1368,14 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
         # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
         # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
-        # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
+        # Bounded as the launch's own carried factor is (`attention_gradient.below`): the forward's
         # maximum is the state's too, whatever its rounding.
         carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
         factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
+        # Its weight before any product, as the launch takes it (`attention_gradient.refinement`).
         moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
         # Its denominator's: D over T in one division, as the reference's derivative of its own division
         # rounds it, not D times T's rounded inverse (row 2466: 1.5 to 1.66 times the reference's error from

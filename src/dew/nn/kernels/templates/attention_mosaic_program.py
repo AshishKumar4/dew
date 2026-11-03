@@ -459,15 +459,15 @@ def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
 
 
 def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
-    """The tiles a backward launch's score-hook pullback forms that vary with its inputs (`algebra.scored`):
-    its output and its slope along each input it differentiates, the logits and each floating parameter of
-    the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or `DKV_GRADS`: the dK/dV launch takes
-    no query's or head's slope, an A100's and an H100's dK/dV under a temperature, a softcap with sinks and
-    ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their slopes priced 4, 4 and 3), but a
-    constant one (a hook linear in an input slopes 1 along it, which ptxas holds no tile of: the fast dQ
-    under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled where four slopes priced 258);
-    traced, never run, on a tile, each slope along its own input alone, or where the hook takes no forward
-    derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
+    """The tiles a backward launch's score-hook pullback forms that vary with its inputs
+    (`attention_gradient.scored`): its output and its slope along each input it differentiates, the logits and
+    each floating parameter of the kinds whose gradients the launch forms (`graded`, `DQ_GRADS` or
+    `DKV_GRADS`: the dK/dV launch takes no query's or head's slope, an A100's and an H100's dK/dV under a
+    temperature, a softcap with sinks and ALiBi, and ALiBi holding 3, 3 and 2 tiles at 64 x 64 where all their
+    slopes priced 4, 4 and 3), but a constant one (a hook linear in an input slopes 1 along it, which ptxas
+    holds no tile of: the fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled
+    where four slopes priced 258); traced, never run, on a tile, each slope along its own input alone, or
+    where the hook takes no forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
     if hooks is None or not callable(hooks.score_mod):
         return 0
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
@@ -517,7 +517,8 @@ def transposable(hooks: Hooks) -> bool:
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
     tile shape a program takes (`TILE_SIDES`), which no operation it has no rule for refuses
     (`layout.Untransposable`), and at each one entry at a time in the logits and its floating parameters
-    (`_entrywise`), as the slopes the backward multiplies its cotangents by assume (`algebra.scored`)."""
+    (`_entrywise`), as the slopes the backward multiplies its cotangents by assume
+    (`attention_gradient.scored`)."""
     if not callable(hooks.score_mod):
         return True
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
@@ -655,7 +656,8 @@ class _Spans(NamedTuple):
     """A spans call's arrays as its programs read them: each query's interval `start`, `end` `[B, Qp]` (a
     call's runs `[B, R, Qp]`, `_spans_of`), and its block map at the launch's tiles (`attention.block_map`):
     the key tiles each query block reads, `lo`, `hi`, and sees whole, `full_lo`, `full_hi` (`[B, Qp //
-    block_q]`), and the query tiles reading each key block, `q_lo`, `q_hi` (`[B, Kp // block_k]`); with
+    block_q]`), and the query tiles reading each key block, `q_lo`, `q_hi` (`[B, Kp // block_k]`, a key
+    block's walk's: None for a launch walking query blocks); with
     documents, the queries' and keys' ids (`[B, Qp]`, `[B, Kp]`) and the blocks' uniform ones (`query_doc`,
     `key_doc`)."""
 
@@ -665,8 +667,8 @@ class _Spans(NamedTuple):
     hi: jax.Array
     full_lo: jax.Array
     full_hi: jax.Array
-    q_lo: jax.Array
-    q_hi: jax.Array
+    q_lo: jax.Array | None
+    q_hi: jax.Array | None
     query_ids: jax.Array | None = None
     key_ids: jax.Array | None = None
     query_doc: jax.Array | None = None
@@ -701,9 +703,12 @@ def stated(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: 
                                               for array in arrays))
 
 
-def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int) -> _Spans | None:
+def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: int, *, readers: bool = False
+              ) -> _Spans | None:
     """A spans call's `_Spans` at `block_q` by `block_k` tiles over its padded keys (None for a full or
-    causal call, whose programs take their tiles from their places). A call's runs (`KeySpans`) lie run by
+    causal call, whose programs take their tiles from their places), with each key block's query readers
+    where a launch walks key blocks (`readers`: the backward's; computed for no other, two reductions a
+    decode step's forward ran for nothing, ET-DECODE8-h100). A call's runs (`KeySpans`) lie run by
     run, `[B, R, Qp]`, so a program reads each run's bounds as a row (`_coords`); its blocks walk their
     runs' envelopes (`attention.block_map`), each tile masked by the union of its queries' runs
     (`algebra.seen`)."""
@@ -712,7 +717,8 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
     blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows),
                        block_q, block_k)
     start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
-    return _Spans(start, end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi, blocks.q_lo, blocks.q_hi,
+    return _Spans(start, end, blocks.lo, blocks.hi, blocks.full_lo, blocks.full_hi,
+                  blocks.q_lo if readers else None, blocks.q_hi if readers else None,
                   call.query_ids, call.key_ids, blocks.query_doc, blocks.key_doc)
 
 
@@ -821,6 +827,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
             doc = spans.key_doc[row, block]
             return inside & (doc != 0) & (doc == spans.query_doc[row, index])
 
+        assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
 
     def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:

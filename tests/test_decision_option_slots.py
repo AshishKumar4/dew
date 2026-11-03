@@ -129,7 +129,7 @@ confirming block, on armada over two streams of draws, 256 and 512 (run-tests ro
 as docs/design/testing.md's check 1 rules (6eafb57ba); both arms read the same head, states and cotangent,
 so their upstream rounding is shared. The head's scalar parameters, the prior's logit scale among them,
 take their gradient's error from one sum over every option, whose ratio to the reference's varies widely
-from draw to draw. The site took 190.1 s at it."""
+from draw to draw. Its draws run as CI's map tasks, 128 a task (`check1_shards`)."""
 
 SCORER_MARGIN = 1e-4
 """The least gap a draw admits between the two sides of the scorer's `abs(repeated - options)` feature at
@@ -195,6 +195,7 @@ def scorer_gap(features, options, *drawn) -> float:
     return float(np.min(np.abs(difference[real])))
 
 
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
     many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
@@ -203,12 +204,9 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     on each real option, its every real option's logit and the gradients of its parameters, of the
     states and of the vocabulary rows it reads are on par with the grid's from float64, the compaction
     only reordering the sums over the grid's option slots. The backbone's own gradient is its backward
-    of those states' gradient, one program on both. The loss reads only the real options."""
-    examples = ragged()
-    objective = ragged_objective(examples)
-    data = decision_rows(examples, len(examples), examples, objective=objective.data())
-    (slotted,) = list(data.val(DataPartition()))
-    slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
+    of those states' gradient, one program on both (the loss's reading only the real options is
+    `test_a_ragged_batchs_loss_reads_its_real_options_alone`)."""
+    objective, slotted = ragged_batch()
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
     assert options.shape[1:] == (bounds.questions, CLAUSES)
@@ -246,6 +244,23 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     assert_as_exact(scored(objective, compact), on_grid, draw, "compacted options logits and gradients",
                     seeds=OPTION_SEEDS, truth_fn=on_grid, terms=True)
 
+
+
+def ragged_batch():
+    """The ragged rows' objective (`ragged_objective`) and their one batch, laid out as the packing
+    slots it."""
+    examples = ragged()
+    objective = ragged_objective(examples)
+    data = decision_rows(examples, len(examples), examples, objective=objective.data())
+    (slotted,) = list(data.val(DataPartition()))
+    return objective, {name: value for name, value in slotted.items() if name != VALID_ROWS}
+
+
+def test_a_ragged_batchs_loss_reads_its_real_options_alone():
+    """Whatever the joint head gives a slot with no real option, a ragged batch's loss and its
+    gradients are the same bits (`ragged_batch`): the model's logits mask those slots."""
+    objective, slotted = ragged_batch()
+    variables = jax.jit(objective.init)(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
     def loss(held, rows):
@@ -253,8 +268,6 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
 
     fewer, fewer_gradient = jax.value_and_grad(loss)(variables, slotted)
 
-    # Whatever the head gives a slot with no real option, the loss and its
-    # gradients are the same bits: the model's logits mask those slots.
     class Noisy(JointSchemaHead):
         def __call__(self, states, inputs, table=None, train=False):
             scores = super().__call__(states, inputs, table, train)

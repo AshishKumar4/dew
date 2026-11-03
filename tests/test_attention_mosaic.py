@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
-from float64_terms import compiled_terms
+from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
 from reference_error import as_given, assert_as_exact, widened
@@ -408,14 +408,14 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
     score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
     logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
-    traces from `reference` (`compiled_terms`, one float64 program on the device for every draw). A call
+    traces from `reference` (`float64_terms`, its static runs compiled once for every draw). A call
     resuming from an initial state (`score` naming sinks or a resumed partial) takes check 1's own terms
     (None): its weights start from the state, which `attention_terms` does not carry."""
     if {"sinks", "resumed"} & set(score):
         return None
     keep = template.dense(spans)[:, None]
-    # The parameters' terms over every draw, one compiled float64 program (`compiled_terms`).
-    traced_terms = None if reference is None else compiled_terms(reference)
+    # The parameters' terms over every draw, traced once and its static runs compiled (`float64_terms`).
+    traced_terms = None if reference is None else functools.partial(float64_terms, reference)
 
     def terms(query, key, value, dout, *hooks):
         params = hooks[0] if hooks else ()

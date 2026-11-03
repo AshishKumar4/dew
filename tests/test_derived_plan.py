@@ -15,15 +15,16 @@ from test_plan import LIMIT, free, needs, one_device
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import MeshSpec, Trainer
 from dew.training.planning import PlanRefused
 
 
 def deep(remat=None):
     """A decoder whose residuals are most of what its step holds, on one device, reading its batch
-    whole: eight layers over 256 tokens, the derivation's case."""
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+    whole: two layers over 256 tokens, the derivation's case (each layer's residuals there are some forty
+    times its parameters)."""
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=remat)
     return one_device(Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0),
                               split=1))
@@ -71,7 +72,7 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
 def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_there(monkeypatch, tmp_path):
     """With room for every rung, the derivation fits the base rung, which the search compiles first,
     as it did before any derivation: no rung above it is read. A device that states no memory leaves
-    the derivation unable to judge, and the search starts at the base rung too."""
+    the derivation nothing to judge against ("unstated"), and the search starts at the base rung too."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "fits"))
     free(monkeypatch, LIMIT)
     trainer = deep()
@@ -82,7 +83,7 @@ def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: None)
     trainer = deep()
     compiled(trainer)
-    assert [entry["label"] for entry in trainer.plan["derived"]] == ["unknown"]
+    assert [entry["label"] for entry in trainer.plan["derived"]] == ["unstated"]
     assert trainer.plan["probes"][0]["remat"] is None
 
 

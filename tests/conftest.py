@@ -14,6 +14,7 @@ import lane_environment
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
+import float64_terms
 import hypothesis
 import jax
 import pytest
@@ -192,7 +193,9 @@ the kernel's limit, leaving the next test the other half to compile in; None whe
 
 
 def release() -> None:
-    """Release every compiled executable JAX holds, and the code XLA mapped for it."""
+    """Release every compiled executable JAX holds, and the code XLA mapped for it, the float64 terms
+    walk's traces and compiled runs among them (`float64_terms.released`)."""
+    float64_terms.released()
     jax.clear_caches()
     gc.collect()
 

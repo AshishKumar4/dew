@@ -101,6 +101,33 @@ def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:
     return [np.asarray(value) for value in whole]
 
 
+def pinned_get(leaves: list) -> list:
+    """`leaves` read home in one transfer (`jax.device_get`), each accelerator's array through its devices'
+    pinned host memory where they all have it: a GH200 read pageable host memory back at 27 GB/s and
+    pinned at 283 (a GH200 audit, 2026-11-02). A host's own arrays, and those already pinned, read back as
+    they are."""
+    staged = [index for index, leaf in enumerate(leaves) if _pinnable(leaf)]
+    if staged:
+        moved = jax.device_put([leaves[index] for index in staged],
+                               [leaves[index].sharding.with_memory_kind("pinned_host") for index in staged])
+        leaves = list(leaves)
+        for index, leaf in zip(staged, moved, strict=True):
+            leaves[index] = leaf
+    return jax.device_get(leaves)
+
+
+def _pinnable(leaf) -> bool:
+    """Whether `leaf` is an accelerator's array, all of it this process's, whose every device has pinned
+    host memory to read it back through (`pinned_get`)."""
+    if not isinstance(leaf, jax.Array) or not leaf.is_fully_addressable:
+        return False
+    if leaf.sharding.memory_kind == "pinned_host":
+        return False
+    return all(device.platform != "cpu"
+               and "pinned_host" in {memory.kind for memory in device.addressable_memories()}
+               for device in leaf.sharding.device_set)
+
+
 @overload
 def collective_host[T](value: T, *, phase: str, held_by: Literal["every"] = "every") -> T: ...
 @overload
@@ -142,7 +169,7 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
             leaves.append(leaf)
         if held:
             # One read for every local leaf: their copies run together.
-            for index, home in zip(local, jax.device_get([leaves[index] for index in local]), strict=True):
+            for index, home in zip(local, pinned_get([leaves[index] for index in local]), strict=True):
                 leaves[index] = np.asarray(home)
         jax.block_until_ready(leaves)
         return plan

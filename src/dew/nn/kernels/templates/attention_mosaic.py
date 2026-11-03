@@ -31,7 +31,6 @@ from dew.nn.kernels.templates.attention import (
     Kept,
     KeySpans,
     Kind,
-    Pages,
     Param,
     Split,
     gradients,
@@ -126,7 +125,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
         past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
-        queries, keys = ba.arguments["query"].shape[1], self.keys
+        queries, keys = ba.arguments["query"].shape[1], _keys(ba)
         padded_queries, padded_keys = _padded(queries, keys, config)
         return 1 - queries * keys / (padded_queries * padded_keys)
 
@@ -187,7 +186,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
-        reach = max(walked * 2, query.shape[1], self.keys)
+        reach = max(walked * 2, query.shape[1], _keys(ba))
         sizes = [size for size in extents(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
@@ -236,12 +235,8 @@ class MosaicForward(_Mainloop[Tiles]):
     splits: int = 1
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""
-    page: int | None = None
-    """A paged call's keys a page (`attention.Pages`): its key and value its pools `[KV, P, page, D]`, its
-    `pages` argument their table."""
-
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, pages=None, *, residuals: Kept, interpret: bool, config: Tiles,
+             drop=None, table=None, sources=None, *, residuals: Kept, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
                       self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
@@ -255,10 +250,9 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _trained_forward(query, key, value, spans, hooks, **form), None
             case Kept.NONE | Kept.OUTPUT:
                 # The inference walk, its rows beside the output where it keeps them.
-                paged = None if self.page is None or pages is None else Pages(pages, self.page)
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                      pages=paged, **form), None
+                                      table=table, sources=sources, **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -289,15 +283,16 @@ class MosaicForward(_Mainloop[Tiles]):
         (`guarded_tiles`), which the launch walks where the plain one overflowed."""
         if not super().legal(ba, config, target):
             return False
-        # A paged call's page whole key tiles of the launch's (and of its natural rewalk's), so no tile
-        # spans two pages (`_paged_views`), its table's slots whole blocks (`attention.padded_call`).
-        tiles = (config.block_k, config.relaunch_k or config.block_k)
-        if self.page is not None and (any(self.page % tile for tile in tiles) or self.keys % _block(config)):
-            return False
+        # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
+        # in them (`_pages_hold`).
         query, value = ba.arguments["query"], ba.arguments["value"]
+        tiles = (config.block_k, config.relaunch_k or config.block_k)
+        page = _page(ba)
+        family = bundle_of(config, query.dtype)
+        if page is not None and not all(_pages_hold(page, tile, family) for tile in tiles):
+            return False
         if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(value.dtype):
             return True
-        family = bundle_of(config, query.dtype)
         columns = guarded_columns(family, value.shape[3], value.dtype)
         width = _width(query.shape[3], family, query.dtype)
         return guarded_tiles(family, config, columns, value.dtype, width) is not None
@@ -316,7 +311,7 @@ class MosaicForward(_Mainloop[Tiles]):
         def tiles(rows: int, walked: int, consumers: int) -> Tiles:
             return Tiles(rows, walked, 2, consumers, family.name)
 
-        config = _derived(family, query.dtype, query.shape[1], self.keys, tiles,
+        config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                           lambda config: self._launch_legal(ba, config, target), overlapped=True)
         return None if config is None else self._relaunched(ba, config, target)
 
@@ -371,7 +366,7 @@ class MosaicForward(_Mainloop[Tiles]):
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         # A launch of a block of the value columns (`Tiles.columns`) stages that block.
         value_width = config.columns or value_width
-        steps = _padded(query.shape[1], self.keys, config)[1] // config.block_k
+        steps = _padded(query.shape[1], _keys(ba), config)[1] // config.block_k
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
@@ -434,7 +429,7 @@ general registers (P2R) until the selects that read them (`_anchor_registers`)."
 
 
 def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
-    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `algebra.grad_scores`)
+    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `gradient.grad_scores`)
     across the step, from the compares that form it to the selects that read it: its predicates packed a
     bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
     (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row
@@ -496,11 +491,34 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     return max(resources.live_registers(family, carried, *phases, *products), scored) + rows
 
 
+def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
+    """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
+    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, each its own copy
+    into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where `family` streams
+    through rings."""
+    if page % tile == 0:
+        return True
+    return tile % page == 0 and page % mosaic.TILE_ROWS == 0 and isinstance(family, mosaic.RingFamily)
+
+
+def _keys(ba: tokamax.BoundArguments) -> int:
+    """A call's keys, from its arrays: its key rows, or a paged call's table's slots, its pages a row times
+    its pools' page (`forward`'s `table`)."""
+    page = _page(ba)
+    return ba.arguments["key"].shape[1] if page is None else ba.arguments["table"].shape[1] * page
+
+
+def _page(ba: tokamax.BoundArguments) -> int | None:
+    """A paged call's keys a page, its pools' own (`forward`'s `table`); None for a call of rows of keys."""
+    return None if ba.arguments.get("table") is None else ba.arguments["key"].shape[2]
+
+
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
-            masked: bool = False, splits: int = 1, pages: Pages | None = None) -> jax.Array:
+            masked: bool = False, splits: int = 1, table: jax.Array | None = None,
+            sources: jax.Array | None = None) -> jax.Array:
     ...
 
 
@@ -508,15 +526,15 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
-            out_dtype=None, masked: bool = False, splits: int = 1, pages: Pages | None = None
-            ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+            out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
+            sources: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
-            pages: Pages | None = None):
+            table: jax.Array | None = None, sources: jax.Array | None = None):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -527,9 +545,13 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `takes_output_residuals`). `natural` keeps the logits natural
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
     family `generation.assumed` names; `out_dtype` the inference walk's output's (`MosaicForward.out_dtype`).
+    A paged call's `key` and `value` are its pools `[Hk, P, page, D]` and `table` its page table `[B, pages
+    a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`. With `sources`
+    `[B]` int32 (a call of rows of keys, inference), batch row `b` reads key row `sources[b]` of `key` and
+    `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied.
     """
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
-                             out_dtype=out_dtype, masked=masked, splits=splits, pages=pages)
+                             out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -544,7 +566,8 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
-                  splits: int = 1, pages: Pages | None = None) -> tuple[MosaicForward, tuple]:
+                  splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None
+                  ) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
@@ -556,11 +579,11 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
-                       splits=splits, page=None if pages is None else pages.size)
+                       splits=splits)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
-                None if pages is None else pages.table)
+                table, sources)
 
 
 def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) -> resources.Scope:
@@ -969,7 +992,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
              interpret: bool = False, rounded: bool = True) -> Gradients:
     """The template's backward on this mainloop (`MosaicBackward`, `gradients`) from a training forward's
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
-    split sums (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
+    split sums (`gradient.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
     them, in the form `accurate` names; or the fast form's one launch (`BackwardTiles.fused`,
     `_launch_backward`), a hookless call's derived default outside deterministic mode
     (`MosaicBackward.derived`). Every

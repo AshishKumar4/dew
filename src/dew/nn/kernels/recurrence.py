@@ -571,15 +571,17 @@ class Launch:
 WARPS = Launch(0, 8)
 """The launch over a whole head."""
 COLUMNS = Launch(32, 4)
-"""The launch over value columns: 32 a program (16 to 64 measured within 3% on an RTX 4080), its four warps
-as fast as eight or faster on an H100 and an A100 at 32 and 128 rows, two percent at Kimi Linear's and
-Mamba-2 2.7B's states (step-configs at b98bf618f)."""
+"""The launch over value columns: 32 a program, four warps (as fast as eight or faster on an H100 and an A100,
+step-configs at b98bf618f). Mamba-2 2.7B's decode token took 1.3 to 1.5% longer on an A100 at 64, its
+program's 164 registers holding three blocks a multiprocessor against 82's five, and an H100 within 2% either
+way (step-ncu2 at 6a4dc937b, 32 and 128 rows)."""
 
 KEYED_COLUMNS = 64
-"""The value columns a program takes under a decay a key dimension: its key dimension's decays, a program's
-own exponentials, amortized over twice the block. Kimi Linear's decode token at 128 rows took 0.209 ms on an
-H100 at 64 against 0.229 at 32, an A100 0.437 against 0.439, where a rated scan's (Mamba-2 2.7B's) took no
-less at 64 than at 32 on an H100 and 14% more on an A100 (step-configs at b98bf618f)."""
+"""The value columns a program takes under a decay a key dimension: its key dimension's decays and
+exponentials amortized over twice the block, 21% fewer instructions a token. Kimi Linear's decode token at
+128 rows took 0.2003 ms on an H100 at 64 against 0.2082 at 32, and on an A100 0.4333 against 0.4268, its 157
+registers three blocks a multiprocessor against 89's five (grid-ab and step-ncu2 at 6a4dc937b): the H100's
+gain the larger."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -620,31 +622,31 @@ class StepLaunch(tuning.KernelOp):
 
         def whole(array):
             """An array every program reads whole."""
-            return pl.BlockSpec(array.shape, lambda c, h, r: (0,) * array.ndim)
+            return pl.BlockSpec(array.shape, lambda r, h, c: (0,) * array.ndim)
 
         def per_row(array):
             """A row's whole block."""
-            return pl.BlockSpec((None, *array.shape[1:]), lambda c, h, r: (r, *(0,) * (array.ndim - 1)))
+            return pl.BlockSpec((None, *array.shape[1:]), lambda r, h, c: (r, *(0,) * (array.ndim - 1)))
 
         def keyed(array):
             """The program's key head's `[rows, Hk, Dk]` block, `[Dk]`."""
             group = value_heads // key_heads
-            return pl.BlockSpec((None, None, key_width), lambda c, h, r: (r, h // group, 0))
+            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h // group, 0))
 
         def valued(array):
             """The program's head's and columns' block of a `[rows, Hv, Dv]` array, `[block]`."""
-            return pl.BlockSpec((None, None, block), lambda c, h, r: (r, h, c))
+            return pl.BlockSpec((None, None, block), lambda r, h, c: (r, h, c))
 
         def one(array, *, rows: bool):
             """The program's head's one entry, `[1]`."""
-            return (pl.BlockSpec((None, 1), lambda c, h, r: (r, h)) if rows
-                    else pl.BlockSpec((1,), lambda c, h, r: (h,)))
+            return (pl.BlockSpec((None, 1), lambda r, h, c: (r, h)) if rows
+                    else pl.BlockSpec((1,), lambda r, h, c: (h,)))
 
         def keyed_by_value(array):
             """The program's value head's `[rows, Hv, Dk]` block, `[Dk]`."""
-            return pl.BlockSpec((None, None, key_width), lambda c, h, r: (r, h, 0))
+            return pl.BlockSpec((None, None, key_width), lambda r, h, c: (r, h, 0))
 
-        held_state = pl.BlockSpec((None, None, key_width, block), lambda c, h, r: (r, h, 0, c))
+        held_state = pl.BlockSpec((None, None, key_width, block), lambda r, h, c: (r, h, 0, c))
         specs = {
             'token': per_row, 'held': per_row, 'taps': whole, 'weight': whole, 'query': keyed, 'key': keyed,
             'value': valued, 'z': valued, 'state': lambda array: held_state,
@@ -653,7 +655,7 @@ class StepLaunch(tuning.KernelOp):
             'skip': functools.partial(one, rows=False), 'rate': functools.partial(one, rows=False),
             'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
         }
-        flags = pl.BlockSpec((None, 1), lambda c, h, r: (r, 0))
+        flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
         in_specs = [flags, *(specs[name](given[name]) for name in given)]
         out_specs = [held_state]
         out_shape = [jax.ShapeDtypeStruct(given['state'].shape, given['state'].dtype)]
@@ -664,12 +666,8 @@ class StepLaunch(tuning.KernelOp):
         out_shape.append(jax.ShapeDtypeStruct((rows, value_heads, value_width), jnp.dtype(dtype)))
         kernel = functools.partial(_kernel, hooks=hooks, group=value_heads // key_heads, key_heads=key_heads,
                                    interpret=interpret)
-        # A head's column blocks the fastest program axis, then heads, then rows: neighbouring programs read
-        # one state row's neighbouring columns. Rows first, Kimi Linear's decode token at 128 rows took
-        # 0.212 ms on an H100 at 64 columns and 0.233 at 32, against 0.201 and 0.209
-        # (step-columns-h100-d69a39d1e).
         return tuple(pl.pallas_call(
-            kernel, grid=(value_width // block, value_heads, rows), in_specs=in_specs, out_specs=out_specs,
+            kernel, grid=(rows, value_heads, value_width // block), in_specs=in_specs, out_specs=out_specs,
             out_shape=out_shape, input_output_aliases={len(given): 0},
             compiler_params=plgpu.CompilerParams(num_warps=config.warps),
             interpret=interpret, name="recurrence_step",

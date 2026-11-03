@@ -1527,6 +1527,14 @@ def summed_ranges(after, leaving):
     return jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
 
 
+def decay_gradient(pairs, after, leaving, memory, ending):
+    """A chunk's per-token decays' gradient `[..., C]` from a backward's terms: its pairs' part, summed per
+    token already (`summed_pairs`'), its ranges' (`summed_ranges` of `after` and `leaving`), and the memory's
+    decay across the chunk, `memory` `[...]` its gradient `sum(S dS)`, through `exp2(ending)` (the chunk's
+    last base-2 prefix) from the chunk's start, every token's."""
+    return pairs + summed_ranges(after, leaving) + (memory * jnp.exp2(ending))[..., None]
+
+
 def summed_pairs(pairs, issue: Issue = portable, columns: Callable[[jax.Array], jax.Array] | None = None):
     """A chunk's per-token decays' gradient from the terms through ranges of its prefix, its pairs' part
     (beside `summed_ranges`): `pairs` `[C, C]` fp32, each `(i, j)` a term through `(j, i]` (strictly lower),

@@ -74,3 +74,28 @@ def test_a_relocatable_compile_decides_a_raising_kernel_at_its_entry_cap():
                                     producer=budget)
     assert budget == 168
     assert kc.decisions(kc.cap_decisions(assemble, model, raising=False, honored=False), model) == (False, 0)
+
+
+SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
+               "serialized due to insufficient register resources for the function "
+               "'recurrence_output_mosaic_gpu_kernel'\n"
+               "ptxas info    : Compiling entry function 'recurrence_output_mosaic_gpu_kernel' for 'sm_90a'\n"
+               "ptxas info    : Used 152 registers, used 1 barriers, 0 bytes smem\n"
+               "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads")
+"""ptxas's report of the recurrence output kernel at a consumer cap of 152 (FS-LT-OUTPUT-CAPS1): spill-free,
+its warpgroup MMAs serialized."""
+
+
+def test_a_kernel_ptxas_serializes_fails_the_gate_as_a_spill_does():
+    """A Mosaic GPU kernel whose warpgroup MMAs ptxas serializes (C7510 to C7515: each HGMMA waited, as a
+    spill-free 152-register recurrence output was) fails the compile gate (`mosaic_failures`), its registers
+    and spills clean: its MMAs run one at a time (row 3615; the kernel challenge's C7511 at 112 registers,
+    C7512 at 96), which the registers and spills the gate read did not state."""
+    read = kc.ptxas_read(SERIALIZING)
+    assert (read.registers, read.spilled, read.serialized) == (152, 0, ("C7512",))
+    record = {"name": "recurrence output", "generation": "sm90", "limit": 232448, "tmem_limit": 0,
+              "kernels": [{"kernel": "recurrence_output_mosaic_gpu_kernel", "shared": 1024, "tmem": 0,
+                           "registers": read.registers, "spilled": read.spilled,
+                           "serialized": read.serialized, "unread": []}]}
+    (failure,) = kc.mosaic_failures([record])
+    assert "serialize" in failure

@@ -47,9 +47,9 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
+from .templates import base, bundles, cost, mosaic, mosaic_sm90, report, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
-from .templates.product import Product
+from .templates.product import EIGHT, Product
 
 
 @dataclasses.dataclass(frozen=True)
@@ -589,6 +589,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     STAGED_ROWS: ClassVar[bool] = False
     """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
     prologue and group zeroing, `registers`)."""
+    FP8: ClassVar[bool] = False
+    """Whether the launch multiplies FP8 operands (`_fp8`): a forward product's alone."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -596,7 +598,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A hooked or exactly summed call runs where its bundle's register model counts what they hold.
         special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
         family = self._family(ba, target)
-        return (first == second and jnp.dtype(first).itemsize == 2
+        return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
                 and family is not None
                 and (family.counts_hooks or not special)
                 and self._hooks_lower(ba, first, target)
@@ -706,6 +708,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         row, a dense call's whole `TMA_ROWS` (its rows padded to them, its tiles starting at whole ones)."""
         del config
         return mosaic_gpu.TMA_ROWS if ba.arguments.get('dense') else 1
+
+    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+        """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
+        K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
+        refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
+        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is mosaic_sm90.WGMMA
+                and ba.arguments['trans_rhs']
+                and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
+                and bool(ba.arguments.get('exact_sums')))
 
     def _family(self, ba, target) -> mosaic.Family | None:
         """The bundle the launch runs on `target`: its instruction family's (`bundles.of`), none where the
@@ -878,9 +889,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicGmm(_Mosaic):
-    """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`)."""
+    """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`), exact sums too: an FP8 product's running sum
+    promoted into fp32 every step (`product.EIGHT`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    EXACT_SUMS: ClassVar[bool] = True
+    FP8: ClassVar[bool] = True
 
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
@@ -916,13 +930,12 @@ class MosaicGmm(_Mosaic):
              *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
-        # Exact sums are ineligible for this launch.
-        del exact_sums
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              dense=dense, paired=paired, **hooks.kernel_options()), None
+                              dense=dense, paired=paired, exact_sums=exact_sums,
+                              **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1609,7 +1622,12 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     Those rows are zeroed going in and coming out, so neither the output
     nor a dropped row's gradient carries them.
     """
-    if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
+    if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
+        # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
+        # (the FP8 contract's reference arm, testing.md, FP8 products), where XLA's FP8 GEMM sums narrower.
+        tokens, kernel = tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16)
+        precision = jax.lax.Precision.DEFAULT
+    elif all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
         precision = jax.lax.Precision.DEFAULT
     elif tokens.dtype != kernel.dtype:
         # A 16-bit operand beside a wider one would reach the TPU kernel

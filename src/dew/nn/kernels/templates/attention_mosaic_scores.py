@@ -9,7 +9,7 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import backward_derived, derived_cotangents
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -121,13 +121,13 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
             chosen, *, masked: bool):
-    """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
-    and the score hook's slopes (`algebra.tile_logits`), from its products `s` and `dp`, its coordinates, its
+    """A backward tile's weights unnormalized and over `total`, its score cotangents (`gradient.grad_scores`)
+    and the score hook's slopes (`gradient.tile_logits`), from its products `s` and `dp`, its coordinates, its
     hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics, each a
     vector or a function reading it where it is used (a stream's stage, `_dkv_step`)."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
-    logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
+    logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
                                          coords.k_pos, params,
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
     # Each query's statistics along a keys-first tile's query axis (`algebra.Coords.queries`); a queries-first
@@ -153,17 +153,17 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
             bool(coords.keys_first), multiplier is not None, seen is not None).mapped(tiles)
         return exponentials, weights, cotangents, slopes, seen
     inverse_total = per_query(algebra.inverse(read(total)))
-    # The fast form's exponent unclamped, its maximum safe where a query saw no key (`algebra.safe_peak`, a
+    # The fast form's exponent unclamped, its maximum safe where a query saw no key (`gradient.safe_peak`, a
     # row's select in place of each entry's clamp).
     fast = not walk.accurate
-    peaks = per_query(algebra.safe_peak(read(peak)) if fast else peak)
-    exponentials, weights = algebra.normalized(logits, peaks, inverse_total, how, safe=fast)
+    peaks = per_query(gradient.safe_peak(read(peak)) if fast else peak)
+    exponentials, weights = gradient.normalized(logits, peaks, inverse_total, how, safe=fast)
     # The anchor key's `dP - c` taken as 0 in the accurate form alone; the fast form's is its product's
     # rounding, FlashAttention 3's math (a query of one key's cotangents a rounding where its float64
     # gradient is 0, a cancelling row the gate sizes by its terms; the select 10.8% of the fused dK/dV
     # launch's instructions, ET-CONFLICTS-h100).
     at_anchor = coords.k_pos == coords.queries(read(chosen), coords.k_pos) if walk.accurate else None
-    cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
+    cotangents = gradient.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
                                      inverse_total, multiplier=multiplier, weights=weights if fast else None)
     return exponentials, weights, cotangents, slopes, seen
 

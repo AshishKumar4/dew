@@ -21,10 +21,10 @@ from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.registry import towers
 
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer')
+PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl')
 """The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
-`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's and Muse
-Glimmer's, whose towers attend within a frame."""
+`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
+Glimmer's and LFM3-VL's, whose towers attend and convolve within a frame."""
 
 VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
 """The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
@@ -219,7 +219,10 @@ class Processor:
     `source` records the directory or repository, revision and subfolder its files came from.
     That identity reloads the processor (`load_processor`), and a media
     processor's geometry from the source config, independently of a task's
-    text tokenizer. Only a media processor reads files from `directory`.
+    text tokenizer. Only a media processor reads files from `directory`, and
+    runs the source's own processor code there (its config's `auto_map`,
+    LFM3-VL's) where its load ran the source's own code
+    (`SourceReference.remote_code`).
     """
 
     reference: HostProcessor
@@ -237,7 +240,9 @@ class Processor:
         from transformers import AutoProcessor
 
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
-        return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
+        trusted = self.source is not None and self.source.remote_code
+        return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True,
+                                             trust_remote_code=trusted, **options)
 
     def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
         """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew

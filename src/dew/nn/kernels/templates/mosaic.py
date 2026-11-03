@@ -30,6 +30,7 @@ from jax import lax, numpy as jnp
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
@@ -326,12 +327,26 @@ def unwalked(family: "Family") -> Callable:
     return walk
 
 
+class Pieces(tuple):
+    """A step's tile loaded as several copies (`viewed`, `Ring.load`): its block's rows in as many equal
+    parts, each a view of its own, in order; a paged pool's key tile across the pages it spans."""
+
+
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
-    `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does."""
+    `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
+    `Pieces` of block indices, each the indices of its part of the block's rows, those parts' views."""
     ref, index_map = view
-    return ref.at[tuple(pl.ds(index * extent, extent)
-                        for index, extent in zip(index_map(step), block, strict=True))]
+    indices = index_map(step)
+
+    def at(indices, block):
+        return ref.at[tuple(pl.ds(index * extent, extent)
+                            for index, extent in zip(indices, block, strict=True))]
+
+    if isinstance(indices, Pieces):
+        part = (block[0] // len(indices), *block[1:])
+        return Pieces(at(piece, part) for piece in indices)
+    return at(indices, block)
 
 
 def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
@@ -725,12 +740,19 @@ class Ring:
 
     def load(self, turn: Turn, view) -> None:
         """The producer's load of `turn`'s step from `view`, once its slot is free: released by the last
-        rotation's step, whose parity is the other."""
+        rotation's step, whose parity is the other; `Pieces` each into its part of the slot's rows, one
+        arrival each at the slot's load barrier, which takes as many (`ring`'s `copies`)."""
         slot = opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], parity=turn.freed))
-        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
-                                collective_axes=self.multicast)
+        if not isinstance(view, Pieces):
+            plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
+                                    collective_axes=self.multicast)
+            return
+        rows = self.block[0] // len(view)
+        for index, piece in enumerate(view):
+            plgpu.copy_gmem_to_smem(piece, self.smem.at[slot, pl.ds(index * rows, rows)], self.full.at[slot],
+                                    collective_axes=self.multicast)
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
@@ -761,15 +783,15 @@ def drained(barriers, end, stages: int) -> None:
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
-         swizzle: int | None = None) -> dict:
+         swizzle: int | None = None, copies: int = 1) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (their rows staged
-    at `swizzle`, `staged`), a load barrier each, and a release barrier each that `consumers` arrive at,
-    with `multicast` the `consumers` of each program of the cluster (`CLUSTER`), whose programs share the
-    ring's blocks. `Ring(**allocated)` once scoped."""
+    at `swizzle`, `staged`), a load barrier each that a step's `copies` arrive at (`Pieces`), and a release
+    barrier each that `consumers` arrive at, with `multicast` the `consumers` of each program of the cluster
+    (`CLUSTER`), whose programs share the ring's blocks. `Ring(**allocated)` once scoped."""
     consumed = (plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers, num_barriers=stages)
                 if multicast else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
-    return {'smem': staged((stages, *block), dtype, swizzle), 'full': plgpu.Barrier(num_barriers=stages),
-            'consumed': consumed}
+    return {'smem': staged((stages, *block), dtype, swizzle),
+            'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages), 'consumed': consumed}
 
 
 SWIZZLE_BYTES = 128
@@ -835,9 +857,34 @@ SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
 uninstantiable)."""
 
 
+TILE_ROWS = 8
+"""The rows of a swizzled shared-memory tile (`swizzle_transforms`): a block's rows are sliced in whole
+multiples of them (a ring slot's `Pieces`)."""
+
+
 def swizzle_transforms(dtype, swizzle: int) -> tuple:
-    """A shared-memory tile's transforms at `swizzle` bytes: 8-row tiles a swizzle's row wide, swizzled."""
-    return TILING((8, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
+    """A shared-memory tile's transforms at `swizzle` bytes: `TILE_ROWS`-row tiles a swizzle's row wide,
+    swizzled."""
+    return TILING((TILE_ROWS, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
+
+
+def plain(shape: tuple, dtype):
+    """A shared-memory block laid out plainly, neither tiled nor swizzled, stated so (`plgpu.PlainTransform`):
+    one read at row offsets no tiling divides, which layout inference would otherwise search every tiling
+    and swizzle for, each subview of it apart (a Kimi delta attention intra launch's out of its fuel at 32-
+    and 64-key blocks on an H100)."""
+    return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
+
+
+def synced(interpret: bool) -> None:
+    """The warpgroup's threads past their shared-memory reads and writes before any goes on: a tile one thread
+    wrote that another reads, or one written again that another still reads (a walk's scratch tile). Mosaic
+    GPU's loads and stores order no other thread's, and `plgpu.commit_smem`'s async-proxy fence exists from
+    sm90 on (an A100's LLVM selects no `fence.proxy.async`); interpreted, a load and a store take the whole
+    tile at once."""
+    if interpret:
+        return
+    plgpu.inline_mgpu()(lambda ctx: mgpu_utils.warpgroup_barrier())()
 
 
 def staged(shape: tuple, dtype, swizzle: int | None = None):
@@ -846,7 +893,9 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     which inference does not take for a block whose products contract over fewer elements than the widest
     swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so); plain where
     `UNSWIZZLED`."""
-    if swizzle is None or swizzle == UNSWIZZLED:
+    if swizzle == UNSWIZZLED:
+        return plain(shape, dtype)
+    if swizzle is None:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
@@ -1399,11 +1448,13 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None) -> Allocated:
+                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
+                copies: dict[str, int] | None = None) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
         share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
-        (`swizzle_for`; inference's own otherwise)."""
+        (`swizzle_for`; inference's own otherwise), each `copies` names a step's tile loaded in that many
+        copies (`Pieces`; one otherwise)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -1668,9 +1719,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None) -> dict:
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
         return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
-                           swizzle=(swizzles or {}).get(name))
+                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:

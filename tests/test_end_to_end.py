@@ -46,7 +46,7 @@ from dew.objectives.diffusion.end_to_end import (
 )
 from dew.objectives.diffusion.objective import DISCRIMINATOR
 from dew.sampling import Euler
-from dew.telemetry.instrumentation import Compiles
+from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

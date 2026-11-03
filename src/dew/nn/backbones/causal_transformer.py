@@ -28,7 +28,6 @@ import math
 from collections.abc import Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
-import flax.core
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -49,13 +48,24 @@ from dew.batch import (
 )
 from dew.mesh import LayoutRefused
 from dew.nn.attention import AttentionImpl
-from dew.nn.continuum import Continuum, ContinuumLevel, HeadTerms, HeadTransform, _head_growth, _squared_norm
+from dew.nn.continuum import (
+    HeadTerms,
+    HeadTransform,
+    Levels,
+    _head_growth,
+    _squared_norm,
+    chain_states,
+    continuum_chain,
+    continuum_modules,
+    level_of,
+    level_parameters,
+    with_level_parameters,
+)
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.quantization import LinearProducts
-from dew.registry import from_record, read_arguments
 
-from ..activations import _SLOPES, UNGATED, GatedActivation, Situ, ungated_activation
+from ..activations import _SLOPES, UNGATED, GatedActivation, ungated_activation
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
@@ -109,13 +119,12 @@ from ..protocols import (
     QuantizesInputs,
     declared_groups,
 )
-from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
+from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
 from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
-    NORM_SITES,
     REMAT_POLICIES,
     BlockWiring,
     DecoderBlock,
@@ -125,10 +134,9 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     feedforward_factories,
-    remat_policy,
     remat_record,
 )
-from .decoder_fields import refuse_unbuildable, softmax_attention_layers
+from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
     DecoderBank,
     Loop,
@@ -382,11 +390,11 @@ class CausalTransformer(LinearProducts):
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
     mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
-    continuum: ContinuumLevel | None = None
-    """A continuum level on the final states before the head (`dew.nn.continuum`): parameters an
-    objective steps in context by its own loss (`LMObjective(adaptation=...)`), every head that
-    reads the states, `__call__`'s and each prediction depth's, reading the level first. It starts
-    as the identity. None gives the plain head."""
+    continuum: Levels | None = None
+    """A continuum level on the final states before the head, or a chain of them (`dew.nn.continuum`):
+    parameters an objective steps in context by its own loss (`LMObjective(adaptation=...)`), every head
+    that reads the states, `__call__`'s and each prediction depth's, reading the levels first. It
+    starts as the identity. None gives the plain head."""
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width; needs sharing
     causal: bool = True
     """Whether attention is causal. False gives full attention, the encoder that
@@ -472,50 +480,7 @@ class CausalTransformer(LinearProducts):
     layout either way."""
 
     def __post_init__(self):
-        if self.layer_types is not None:
-            object.__setattr__(self, "layer_types", tuple(self.layer_types))
-        object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
-        if self.kv_shared_layers is not None:
-            object.__setattr__(self, "kv_shared_layers",
-                               tuple(int(index) for index in self.kv_shared_layers))
-        if isinstance(self.mlp_features, (tuple, list)):
-            object.__setattr__(self, "mlp_features", tuple(int(width) for width in self.mlp_features))
-        if self.activation_sparsity_pattern is not None:
-            object.__setattr__(self, "activation_sparsity_pattern",
-                               tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
-        # A value arrives as a record from a config and as itself from code,
-        # and `models.build` already reads one; reading every field that holds
-        # a record here too, as its annotation declares (`read_arguments`),
-        # means the plain constructor takes the same records, as a test or a
-        # notebook writes them. A bare rotary record and SiTU's betas name no
-        # class, so their own readers take them.
-        records = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
-                   if field.name not in ("rope_scaling", "mlp")
-                   and isinstance(getattr(self, field.name), Mapping)}
-        for name, value in read_arguments(type(self), records).items():
-            object.__setattr__(self, name, value)
-        if isinstance(self.rope_scaling, Mapping):
-            object.__setattr__(self, 'rope_scaling', rope_scaling_from_record(self.rope_scaling))
-        if isinstance(self.mlp, Mapping):
-            # A config states SiTU's betas as a record in the activation's place.
-            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
-        if self.norms is not None:
-            unknown = sorted(set(self.norms) - set(NORM_SITES))
-            if unknown:
-                raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
-                                 f"it builds {list(NORM_SITES)}")
-            # Frozen, because a module's fields are static to jit and a plain
-            # dict cannot be hashed.
-            object.__setattr__(self, "norms", flax.core.freeze(dict(self.norms)))
-        if self.kinds is not None:
-            object.__setattr__(self, "kinds", flax.core.freeze(dict(self.kinds)))
-        if self.mixer is not None and not isinstance(self.mixer, MixerBase):
-            raise ValueError(
-                f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
-        if self.continuum is not None and self.ngpt is not None:
-            raise ValueError("a continuum level reads the final norm's states, which a normalized "
-                             "transformer (ngpt) does not have")
-        object.__setattr__(self, "remat", remat_policy(self.remat))
+        settle_fields(self)
         # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
         _ = self.wiring
         super().__post_init__()
@@ -715,9 +680,14 @@ class CausalTransformer(LinearProducts):
         bound to them reads them. `scanned` records whether those fetches are
         sequenced, which a host layout requires.
         """
+        return (DecoderBank((), self.stored_view(store), scanned=self.scan_layers),)
+
+    def stored_view(self, store: Variables) -> StackView:
+        """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
+        plans its runs (`SteppedFeedForward`)."""
         bound = self if self.scope is not None else self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
+        return StackView(bound.groups)
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
         """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
@@ -775,9 +745,9 @@ class CausalTransformer(LinearProducts):
             sites['lm_head'] = (self.embedding_features or self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             sites['head_dense'] = (self.emb_features, self.emb_features)
-        if self.continuum is not None:
-            sites['continuum_down'] = (self.emb_features, self.continuum.hidden)
-            sites['continuum_up'] = (self.continuum.hidden, self.emb_features)
+        for index, level in enumerate(() if self.continuum is None else continuum_chain(self.continuum)):
+            sites[f'continuum_{index}_down'] = (self.emb_features, level.hidden)
+            sites[f'continuum_{index}_up'] = (level.hidden, self.emb_features)
         return sites
 
     @nn.nowrap
@@ -922,8 +892,8 @@ class CausalTransformer(LinearProducts):
                 dot_general=head_dot_general(self.dtype, self.precision),
                 kernel_axes=DECODER_AXES['lm_head'], name='lm_head', **normal_kernel(self.initializer_range))
         if self.continuum is not None:
-            self.continuum_level = Continuum(self.continuum, self.emb_features, dtype=self.dtype,
-                                             precision=self.precision, name='continuum')
+            self.continuum_level = continuum_modules(self.continuum, self.emb_features, self.dtype,
+                                                     self.precision)
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -931,7 +901,7 @@ class CausalTransformer(LinearProducts):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='head_norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='head_norm')
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', declared(nn.initializers.zeros_init(), DECODER_AXES['head_bias']),
@@ -949,8 +919,7 @@ class CausalTransformer(LinearProducts):
 
         def provides(index: int, layer_type: str) -> bool:
             mixer = kinds[layer_type].mixer or mixer_spec
-            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
-                                          and mixer.publishes(index in sharing))
+            return index in providers or (mixer is not None and mixer.publishes(index in sharing))
 
         return tuple(
             LayerSpec(
@@ -1247,20 +1216,22 @@ class CausalTransformer(LinearProducts):
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with, the continuum
         level first where the model has one."""
-        return self.head_logits(x if self.continuum is None else self.continuum_level(x))
+        return self.head_logits(x if self.continuum is None else chain_states(self.continuum_level, x))
 
     @property
     def in_context(self) -> bool:
-        """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
+        """Whether the model holds a continuum level (`SteppedInContext`)."""
         return self.continuum is not None
 
+    @property
+    def in_context_levels(self) -> int:
+        """The continuum levels the model holds, a chain's count (`SteppedInContext`)."""
+        return 0 if self.continuum is None else len(continuum_chain(self.continuum))
+
     def head_bounds(self, states) -> HeadTerms:
-        """What bounds the curvature and the slope of a slot's cross entropy in the `states` `head_logits`
-        reads (`HeadTerms`, `SteppedInContext`), from the bound model's rows (`vocabulary_rows`, an adapter
-        applied), softcap and transform, a transform's norm read at the states (`BoundedNorm`; a norm that
-        bounds no derivatives is refused), each kernel's norm as Qwix's rounding can grow it, a step
-        following its straight-through gradient (`_head_growth`, which refuses a map an interceptor
-        rounds)."""
+        """What bounds a slot loss's curvature and slope in the `states` `head_logits` reads (`HeadTerms`):
+        the bound rows (`vocabulary_rows`), softcap and transform, its norm read at the states
+        (`BoundedNorm`), each kernel as Qwix's rounding can grow it (`_head_growth`)."""
         table = self._head_table()
         projection = table.projection
         maps = {None if self.tie_embeddings else "lm_head": jnp.shape(table.rows())[-1],
@@ -1274,43 +1245,42 @@ class CausalTransformer(LinearProducts):
             squared = (jnp.square(logits * growth["project_out"]) * _squared_norm(table.rows())
                        * _squared_norm(projection.kernel))
         if self.head_transform is None:
-            return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros(jnp.shape(states)[:-1]))
+            return HeadTerms.of(squared, self.final_logit_softcap, jnp.zeros_like(states[..., 0]))
         if not isinstance(self.head_norm, BoundedNorm):
             raise ValueError(f"a damped step bounds a head transform's curvature through its norm's "
                              f"derivatives, which {type(self.head_norm).__name__} bounds none of")
         dense = self.applied_kernel("head_dense")
         spread = self.head_norm.spread(ungated_activation(self.head_transform, self.head_dense(states)))
-        return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform(
+        return HeadTerms.of(squared, self.final_logit_softcap, spread, HeadTransform.of(
             _SLOPES[UNGATED[self.head_transform]], growth["head_dense"] * jnp.sqrt(_squared_norm(dense)),
             self.head_norm.derivative_bounds(dense.shape[-1])))
 
     @nn.nowrap
     def in_context_level(self, variables):
         """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
-        return None if self.continuum is None else variables["params"]["continuum"]
+        return None if self.continuum is None else level_parameters(self.continuum, variables["params"])
 
     @nn.nowrap
     def with_in_context_level(self, variables, level):
         """`variables` holding `level` as the continuum level's parameters (`SteppedInContext`)."""
-        return {**variables, "params": {**variables["params"], "continuum": level}}
+        return {**variables, "params": with_level_parameters(self.continuum, variables["params"], level)}
 
-    def continuum_states(self, hidden):
-        """Final states `hidden` past the continuum level, the states its head reads (`head_logits`):
-        an objective that steps the level in context reads it with its own parameters here."""
+    def continuum_states(self, hidden, index: int | None = None):
+        """Final states `hidden` past the continuum levels, the head's input, or past level `index` alone
+        (`chain_states`), read at the levels' own parameters (`SteppedInContext`)."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level(hidden)
+        return chain_states(self.continuum_level, hidden, index)
 
-    def level_terms(self, hidden, parts: tuple[str, ...]):
-        """What bounds a damped step of the continuum level's `parts` at final states `hidden`, its maps'
-        inputs as a checkpoint's quantizers round them (`Continuum.step_terms`, `SteppedInContext`)."""
+    def level_terms(self, hidden, parts: tuple[str, ...], index: int = 0, passed: bool = False):
+        """What bounds a damped step of continuum level `index`'s `parts` at its states `hidden`
+        (`Continuum.step_terms`), its maps' inputs as a checkpoint's quantizers round them."""
         if self.continuum is None:
             raise ValueError("this model has no continuum level")
-        return self.continuum_level.step_terms(hidden, parts, self._quantizer)
+        return level_of(self.continuum_level, index).step_terms(hidden, parts, self._quantizer, passed)
 
     def head_logits(self, x):
-        """The fp32 head over states the continuum level already read (`continuum_states`), or a
-        model without one's final states: `_logits` past the level."""
+        """The fp32 head over states past the continuum levels (`continuum_states`), or final states."""
         # A stream-width transform reads the final states before `project_out` takes them to the table's.
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
@@ -2172,7 +2142,7 @@ class CausalTransformer(LinearProducts):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
@@ -2193,7 +2163,7 @@ class CausalTransformer(LinearProducts):
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, specs=self.norms)(name='norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='norm')
 
     @nn.nowrap
     def with_kv_cache(self, layout: KVCache) -> Self:
@@ -2490,7 +2460,7 @@ class CausalTransformer(LinearProducts):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
-        return tuple(mixer for mixer in self.declared_mixers if isinstance(mixer, MLAMixer) and mixer.indexed)
+        return tuple(indexed for mixer in self.declared_mixers for indexed in mixer.indexed_mixers)
 
     @property
     def keeps_triton_gemm(self) -> bool:

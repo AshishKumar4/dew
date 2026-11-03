@@ -71,8 +71,7 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, decode_step, held_scan, over_sequence, sequence_conv
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.norms import unweighted_rmsnorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
 from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
@@ -168,7 +167,8 @@ class MambaRMSNormGated(nn.Module):
     norm over the whole width after, both in fp32 (`at_least_fp32`), the weight applied to the
     cast-back values. `gate_after` norms first and gates the weighted norm, and `scale_wide` applies the
     weight in at least fp32 before the one cast, Falcon-H1's `FalconH1RMSNormGated` in either order
-    (`norm_before_gate`, modeling_falcon_h1.py:256-282)."""
+    (`norm_before_gate`, modeling_falcon_h1.py:256-282). The norm is the RMS norm's one arithmetic
+    (`rms_statistics`, `rms_weighted`) over each group, the gate broadcast over the norm's output."""
 
     epsilon: float = 1e-5
     groups: int = 1
@@ -183,12 +183,19 @@ class MambaRMSNormGated(nn.Module):
         wide = at_least_fp32(x.dtype)
         if self.groups < 1 or x.shape[-1] % self.groups:
             raise ValueError(f"norm groups ({self.groups}) must divide the width ({x.shape[-1]})")
+        scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
+
+        def grouped(value):
+            return value.reshape(*value.shape[:-1], self.groups, -1)
+
         y = x.astype(wide)
         if not self.gate_after:
             y = y * nn.silu(gate.astype(wide))
-        y = unweighted_rmsnorm(y.reshape(*y.shape[:-1], self.groups, -1), self.epsilon).reshape(y.shape)
-        scale = self.param('weight', nn.initializers.ones, (x.shape[-1],), jnp.float32)
-        y = y * scale.astype(wide) if self.scale_wide else scale.astype(dtype) * y.astype(dtype)
+        # Weighted wide, or the normalized values cast back before the weight multiplies them.
+        weight, rounded = ((scale.astype(wide), None) if self.scale_wide
+                           else (scale.astype(dtype), lambda normalized: normalized.astype(dtype)))
+        y = rms_weighted(grouped(y), rms_statistics(grouped(y), self.epsilon)[1], weight=grouped(weight),
+                         rounded=rounded).reshape(y.shape)
         if self.gate_after:
             y = y.astype(wide) * nn.silu(gate.astype(wide))
         return y.astype(dtype)
@@ -459,6 +466,7 @@ class Mamba2Mixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    draws_init_std = True
 
     @property
     def keeps_triton_gemm(self) -> bool:

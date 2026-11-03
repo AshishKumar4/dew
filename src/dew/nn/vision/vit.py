@@ -2,15 +2,17 @@
 
 A family's config states its `ViTLayout`: the patch map and the learned position table it resamples,
 the block (its norm, heads and feed-forward), the 2D rotary's axis order, and per layer the attention
-(full over a frame, a band of keys either side of each query, or a square window of patches), the
-token order the layer runs in and whether it adds attention sinks. Packed pixels arrive as the
+(full over a frame, a band of keys either side of each query, or a square window of patches) or a
+gated convolution over the frame's patch grid, the token order the layer runs in and whether it adds
+attention sinks. Packed pixels arrive as the
 family's processor writes them, `[B, patches, pixels]` with each row's `[time, height, width]` grid;
 NCHW images use either a convolution or packed-pixel projection. The layout also states class and
 register placement, learned-position arithmetic and which rows return after the final norm.
 
 Each family's reference, transformers 5.16.1's `models/qwen3_5/modeling_qwen3_5.py` and
-`models/muse_glimmer/modeling_muse_glimmer.py` and MiMo-V2.6's `modeling_mimo_v2.py`, names its parts;
-`qwen35`, `mimo` and `muse_glimmer` hold the configs and checkpoint maps.
+`models/muse_glimmer/modeling_muse_glimmer.py`, MiMo-V2.6's `modeling_mimo_v2.py` and LFM3-VL's
+`modeling_lfm3_vl.py`, names its parts; `qwen35`, `mimo`, `muse_glimmer` and `lfm3` hold the configs and
+checkpoint maps.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths, projection_flops
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.mixers.short_conv import GatedGridConv
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import float32_dot_general
@@ -46,7 +49,7 @@ from dew.nn.text_encoders import clip_layer
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
-Attention = Literal["full", "band", "window"]
+Attention = Literal["full", "band", "window", "conv"]
 Order = Literal["patches", "columns", "windows"]
 
 
@@ -112,9 +115,11 @@ class ViTLayout:
     """The geometry and wiring of one family's tower.
 
     `attention`, `order` and `sinks` name each layer's: its keys (a frame's every patch, `band` keys
-    either side in the layer's order, or the patches of its `window`-patch square), the order its
-    tokens run in (the processor's, merge blocks column by column, or window by window), and whether
-    a learned logit per head joins the first key of each frame (MiMo's sinks). `rotary_columns_first`
+    either side in the layer's order, or the patches of its `window`-patch square) or, for `conv`, a
+    gated `conv_kernel`-square convolution over its frame's patch grid in the attention's place
+    (LFM3-VL's, `GatedGridConv`, which reads each patch's grid place as its rotary position), the order
+    its tokens run in (the processor's, merge blocks column by column, or window by window), and
+    whether a learned logit per head joins the first key of each frame (MiMo's sinks). `rotary_columns_first`
     turns the first rotary half by the column and the second by the row, both counted from
     `rotary_origin`; `positions` keeps a fixed grid or resizes its square table by its stated
     interpolation. Bilinear sampling without aligned corners gives out-of-range taps zero weight
@@ -124,7 +129,10 @@ class ViTLayout:
     `packed` the attention's queries, keys and values). `post_norm` names the norm after the
     blocks, a layer or an RMS norm, or none. `output` selects the sequence, patches alone or a
     `[B, rows, columns, F]` patch grid; `post_norm_scope` distinguishes CLIP's normalized class row
-    from a normalized whole sequence.
+    from a normalized whole sequence. `pre_norm` names the norm after the patch map, as `post_norm`
+    does. `attention_bias` biases the attention's maps, and `qk_norm` norms each head's queries and keys
+    (an RMS norm at the layers' epsilon) before the rotary; under `scale_after_cast` every RMS norm
+    weighs its normalized input after its cast back, as Llama's does.
     """
 
     depth: int
@@ -152,7 +160,7 @@ class ViTLayout:
     patch_projection: Literal["dense", "conv"] = "dense"
     image_size: int | None = None
     rotary: Literal["half", "adjacent"] | None = "half"
-    pre_norm: bool = False
+    pre_norm: Literal["layer", "rms"] | None = None
     post_norm: Literal["layer", "rms"] | None = None
     post_norm_scope: Literal["sequence", "class"] = "sequence"
     post_norm_affine: bool = True
@@ -167,6 +175,10 @@ class ViTLayout:
     window: int = 0
     merge_blocks: bool = True
     channels_first: bool = True
+    attention_bias: bool = True
+    qk_norm: bool = False
+    conv_kernel: int = 3
+    scale_after_cast: bool = False
 
     def __post_init__(self):
         if not len(self.attention) == len(self.order) == len(self.sinks) == self.depth:
@@ -177,6 +189,11 @@ class ViTLayout:
             raise ValueError("register tokens follow a leading class token")
         if self.post_norm_scope == "class" and self.special_tokens.cls is None:
             raise ValueError("a class-only output norm needs a class token")
+        if "conv" in self.attention and (self.rotary is None or self.rotary_columns_first
+                                         or self.rotary_origin or self.special_tokens.count):
+            raise ValueError("a grid convolution reads each patch's (row, column) from 0 as its rotary "
+                             "position, which a tower without its rotary, turning columns first, counting "
+                             "from another origin or holding special tokens does not state")
 
 
 def _interp_taps(index, size, side: int, align_corners: bool):
@@ -213,15 +230,21 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
               precision: PrecisionLike) -> DecoderBlock:
     """Layer `index`'s block (`clip_layer`): a pre-norm attention over the 2D rotary, over a band of
-    keys where the layout says, and a pre-norm feed-forward, both residual."""
+    keys where the layout says, or a grid convolution in its place, and a pre-norm feed-forward, both
+    residual."""
     band = layout.attention[index] == "band"
+    mixer = None
+    if layout.attention[index] == "conv":
+        mixer = functools.partial(GatedGridConv, emb_features=layout.hidden_size, kernel=layout.conv_kernel,
+                                  dtype=dtype, precision=precision)
     return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
                       kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
                       eps=layout.norm_eps, norm_type=layout.norm_type, norm_bias=layout.norm_bias,
                       mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
                       rotary_axes=None if layout.rotary is None else (layout.head_dim // 2,) * 2,
                       rotary_pairs=layout.rotary or "half", rope_theta=layout.rope_theta,
-                      branch_scale=layout.branch_scale,
+                      branch_scale=layout.branch_scale, attention_bias=layout.attention_bias,
+                      qk_norm=layout.qk_norm, scale_after_cast=layout.scale_after_cast, mixer=mixer,
                       packed=layout.packed, window=layout.band if band else None, dtype=dtype,
                       precision=precision, name=f"blocks_{index}")
 
@@ -261,7 +284,8 @@ class VisionTransformer(nn.Module):
                                        use_bias=lay.post_norm_affine, dtype=self.dtype, name="post_norm")
         elif lay.post_norm == "rms":
             self.post_norm = RMSNorm(epsilon=lay.outer_norm_eps, with_scale=lay.post_norm_affine,
-                                     dtype=self.dtype, name="post_norm")
+                                     scale_after_cast=lay.scale_after_cast, dtype=self.dtype,
+                                     name="post_norm")
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
@@ -311,9 +335,11 @@ class VisionTransformer(nn.Module):
 
         hidden = self._embedded(pixel_values, pixels, rows, columns, heights, widths, images)
         tokens = lay.special_tokens
-        outer = functools.partial(LayerNorm, epsilon=lay.outer_norm_eps, dtype=self.dtype)
-        if lay.pre_norm:
-            hidden = outer(name="pre_norm")(hidden)
+        if lay.pre_norm == "layer":
+            hidden = LayerNorm(epsilon=lay.outer_norm_eps, dtype=self.dtype, name="pre_norm")(hidden)
+        elif lay.pre_norm == "rms":
+            hidden = RMSNorm(epsilon=lay.outer_norm_eps, scale_after_cast=lay.scale_after_cast,
+                             dtype=self.dtype, name="pre_norm")(hidden)
 
         rotary = None
         if lay.rotary is not None:
@@ -346,6 +372,7 @@ class VisionTransformer(nn.Module):
             # An NCHW image is one frame with no padding: its full layers attend unmasked.
             "full": None if images else jnp.where(valid, frame + 1, 0),
             "band": jnp.where(valid, frame + 1, 0),
+            "conv": jnp.where(valid, frame + 1, 0),
             "window": None if windows is None else jnp.where(valid, windows + 1, 0),
         }
         current = "patches"
@@ -506,7 +533,8 @@ class MergeProjector(nn.Module):
     """Each merge block's features as one vector, mapped to the decoder width.
 
     The trunk sequence comes in merge-block order (`VisionTransformer`). With `norm`, a layer norm
-    first (Qwen 3.5's and MiMo's merger); `bias` gives it and both maps their biases. Each block's
+    first at `norm_eps` (Qwen 3.5's, MiMo's and LFM3-VL's); `bias` gives both maps their biases, and the
+    norm its own where `norm_bias` is unset (LFM3-VL's norm keeps its bias either way). Each block's
     `merge**2` features join unit by unit, or channel by channel where `channel_major` (Muse
     Glimmer's `pixel_shuffle`), and pass two maps with the checkpoint's `activation` (its
     `hidden_act` name) between them, and after the second too where `activation_after` (Muse
@@ -518,6 +546,8 @@ class MergeProjector(nn.Module):
     width: int
     out_width: int
     norm: bool = True
+    norm_eps: float = 1e-6
+    norm_bias: bool | None = None
     channel_major: bool = False
     bias: bool = True
     activation: str = "gelu"
@@ -533,7 +563,8 @@ class MergeProjector(nn.Module):
             raise ValueError(f"{count} patch features do not group into "
                              f"{self.spatial_merge_size}x{self.spatial_merge_size} merge blocks")
         if self.norm:
-            image_features = LayerNorm(epsilon=1e-6, use_bias=self.bias, dtype=self.dtype,
+            norm_bias = self.bias if self.norm_bias is None else self.norm_bias
+            image_features = LayerNorm(epsilon=self.norm_eps, use_bias=norm_bias, dtype=self.dtype,
                                        name="norm")(image_features)
         grouped = image_features.reshape(batch, count // block, block, self.hidden_size)
         if self.channel_major:

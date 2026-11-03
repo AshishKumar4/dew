@@ -721,8 +721,8 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
                                           held: int, target, split: int = 1,
-                                          optimizer: optax.GradientTransformation | None = None
-                                          ) -> Footprint:
+                                          optimizer: optax.GradientTransformation | None = None,
+                                          capacity: int | None = None) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
@@ -734,12 +734,13 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     run's axes each of one device, at that device's share of the microbatch (each leaf's shard,
     `shard_shape`), its parameters whole as those layouts gather them. A layout that splits more than the
     rows (stages, tensor, sequence) derives no residuals, which its compile judges, nor does a step for a
-    device whose memory nothing judges (`judged`: a CPU), as its walk ends unknown whatever it derives."""
+    device whose memory nothing judges at `capacity` (`judged`: a CPU, a compile-only GPU no capacity is
+    given), as its walk ends unknown whatever it derives."""
     mesh = jax.sharding.get_abstract_mesh()
     spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
     rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
-    if not spread <= rows or not judged(target):
+    if not spread <= rows or not judged(target, capacity):
         residuals = peak = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)

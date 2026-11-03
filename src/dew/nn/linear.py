@@ -590,8 +590,9 @@ def decode_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
     `[B, 1, H, Dk]` (Kimi delta attention's), through the recurrence's decode step (`decode_step`): the step
     kernel where the decode selector gives it (`DELTA_DECODE`), the state read and written once, else the
     portable step; a row `starts` marks enters a zero memory. Returns the output `[B, 1, H, Dv]` and the
-    state in fp32."""
-    work = jnp.float32
+    state in the operands' dtype, fp32 at least: a float64 run's cached decode in float64, as
+    `recurrent_delta_rule`'s was (Kimi K3's recorded float64 truth)."""
+    work = at_least_fp32(jnp.result_type(query, key, value))
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
     if state is None:
         state = jnp.zeros((*value.shape[:2], key.shape[-1], value.shape[-1]), work)

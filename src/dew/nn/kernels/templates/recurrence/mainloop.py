@@ -486,7 +486,7 @@ def _fragments(call: _Call, *tiles) -> list:
 
 @dataclasses.dataclass(frozen=True)
 class Launch:
-    """A launch as planned (`mainloop_backward.planned`): its name (`recurrence_states`, ...), its programs
+    """A launch as planned (`template.planned`): its name (`recurrence_states`, ...), its programs
     and each one's threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program
     allocates (its streams' slots and barriers and its staging tiles, as its bundle declares them), the
     registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
@@ -513,7 +513,7 @@ class Launch:
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
-"""Where `mainloop_backward.planned` collects its launches; None where they run."""
+"""Where `template.planned` collects its launches; None where they run."""
 
 
 STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype")
@@ -524,7 +524,7 @@ and its constants; its every other argument an array or None."""
 _lowered_once = tuning.lowered_once(STATIC, unless=lambda: _PLANNED.get() is not None)
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
 so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
-Planning (`mainloop_backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
+Planning (`template.planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
 def _allocated(call: _Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
@@ -667,7 +667,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     stores' (`landing`, `_landed`) scoped, named for its launch (`recurrence_solved`, ...; `name` where
     given). The program returns its walk (`mosaic.Walk`), which the kernel runs (`Transport.run`), or None
     where it runs its own roles (`_sequence_walk`'s). `held` is what a consumer thread holds in registers
-    (`_Held`). Where `mainloop_backward.planned` collects launches, the launch's record (`Launch`, its
+    (`_Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
     `work`) and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
@@ -1069,13 +1069,18 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
 
             def stage(pair):
                 # The running pair at rows `CHUNK` on; the `CHUNK` rows above it zero, which its shifts read.
+                # A thread reads other threads' rows: the last shift's reads done before the rows are written
+                # again, and the writes made visible before they are read (`mosaic.synced`).
+                mosaic.synced(call.interpret)
                 for half, value in enumerate(pair):
-                    scanned.at[half, pl.ds(CHUNK, CHUNK)][...] = value
+                    plgpu.store(scanned.at[half, pl.ds(CHUNK, CHUNK)], value, optimized=False)
+                mosaic.synced(call.interpret)
                 return lambda shift: tuple(family.tile_of(scanned.at[half, pl.ds(CHUNK - shift, CHUNK)])
                                            for half in (0, 1))
 
+            mosaic.synced(call.interpret)
             for half in (0, 1):
-                scanned.at[half, pl.ds(0, CHUNK)][...] = family.zeros((CHUNK, keys))
+                plgpu.store(scanned.at[half, pl.ds(0, CHUNK)], family.zeros((CHUNK, keys)), optimized=False)
             prefix = algebra.scanned_prefix(_tile(slots, "decays", gates).value(), stage, chunk=CHUNK)
             stage(prefix)
             if not system:
@@ -1096,8 +1101,10 @@ def _intra_walk(q, k, g, beta, taken, call: _Call, *, scale: float, system: bool
                 """The block's keys and separated prefix staged below `SUB` rows of any values (a pair they
                 reach is masked), each offset's reads its loads shifted by it (`algebra.Shifted`)."""
                 (tiles,) = padded
+                mosaic.synced(call.interpret)
                 for i, value in enumerate((operand("keys")(c), *algebra.separated(*prefix))):
-                    tiles.at[i, pl.ds(algebra.SUB, CHUNK)][...] = value
+                    plgpu.store(tiles.at[i, pl.ds(algebra.SUB, CHUNK)], value, optimized=False)
+                mosaic.synced(call.interpret)
                 return lambda e: tuple(family.tile_of(tiles.at[i, pl.ds(algebra.SUB - e, CHUNK)])
                                        for i in range(3))
 
@@ -1164,8 +1171,9 @@ def _intra_staged(call: _Call, keys: int, *, system: bool) -> tuple:
                    "prefix": call.gates.landing(CHUNK, keys)}
     # Where the call's pairs do not factor (`_Call.factored`), a key block's keys and prefix halves below a
     # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
-    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),)
-    scanned = plgpu.SMEM((2, 2 * CHUNK, keys), jnp.float32)
+    # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
+    scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
     return (_pairing(call, keys), scanned, *padded), landing
 
 
@@ -1922,7 +1930,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     memory fp32. Without the `delta` rule nothing is corrected and each token writes its values gated by
     `beta` (the identity inverse: Mamba2's SSD through its rated decay's log gates, the gated linear
     attentions, GLA's with a decay a key dimension). Keys and values padded to whole blocks (`block_of`), at
-    any width whose launches the device holds (the template's legality, `mainloop_backward.planned`'s shared
+    any width whose launches the device holds (the template's legality, `template.planned`'s shared
     memory and registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`

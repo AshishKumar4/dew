@@ -373,8 +373,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
+        # `emit_pipeline` copies a step's block whole, one view a stream.
+        if any(count > 1 for count in (copies or {}).values()):
+            raise ValueError("an mma.sync family's pipeline loads a step's block in one copy, not in pieces")
         return Pipeline(blocks, stages, dict(swizzles or {}))
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:

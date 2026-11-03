@@ -1,5 +1,6 @@
-"""Step FLOP measurement, MFU accounting, the persistent compilation cache and the programs a jitted
-function needs (`Compiles`): this module owns Dew's listeners on JAX's events.
+"""Step FLOP measurement, MFU accounting and the persistent compilation cache's counts; the programs a jitted
+function needs (`Compiles`) and the processes held to loaded programs (`executable_only`) are
+`dew.telemetry.compiles`'.
 
 The FLOP count is read off the optimized HLO, not out of XLA's
 `cost_analysis()`. Cost analysis reports only the operations the compiler can
@@ -17,10 +18,8 @@ import math
 import re
 import sys
 import threading
-import traceback
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import jax
 import numpy as np
@@ -36,68 +35,6 @@ def _cache_event(event: str, **metadata) -> None:
     if event in _cache_counts:
         with _cache_lock:
             _cache_counts[event] += 1
-
-
-@dataclass(frozen=True)
-class Program:
-    """One program a block needed: `traced` (its jaxpr) or `compiled` (by the backend, or fetched
-    from the persistent compilation cache), its function's name, its seconds, and where it was asked
-    for, the innermost frame outside JAX's and this module's."""
-
-    kind: str
-    name: str
-    seconds: float
-    where: str
-
-
-class Compiles:
-    """Counts the programs jitted functions named `name` need while it is open (every function's with
-    None), each compiled or fetched from the persistent compilation cache, as JAX reports them
-    (`jax.monitoring`'s backend compile event, which names a function `jit(<name>)`): what a warm-up
-    costs, or a compile a measured run should not have paid. `programs` holds every program it
-    heard, the ones traced beside the ones compiled. JAX's events have one listener owner, this
-    module.
-
-        with Compiles("_stepped") as compiles:
-            server.run()
-        assert compiles.count == 0
-    """
-
-    EVENTS: ClassVar[Mapping[str, str]] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
-                                           "/jax/core/compile/backend_compile_duration": "compiled"}
-    """The compile events `jax.monitoring` records a duration for, by what each counts."""
-
-    def __init__(self, name: str | None) -> None:
-        self.name = name
-        self.programs: list[Program] = []
-        """Each program it heard, in the order they were needed."""
-
-    @property
-    def seconds(self) -> list[float]:
-        """Each compiled program's seconds, in the order they were needed."""
-        return [program.seconds for program in self.programs if program.kind == "compiled"]
-
-    @property
-    def count(self) -> int:
-        return len(self.seconds)
-
-    def __enter__(self) -> "Compiles":
-        jax.monitoring.register_event_duration_secs_listener(self._heard)
-        return self
-
-    def __exit__(self, *_) -> None:
-        jax.monitoring.unregister_event_duration_listener(self._heard)
-
-    def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        kind = self.EVENTS.get(event)
-        # A trace names its function bare, a backend compile `jit(<name>)`.
-        named = self.name is None or metadata.get("fun_name") in (self.name, f"jit({self.name})")
-        if kind is not None and named:
-            frame = next((frame for frame in reversed(traceback.extract_stack()[:-1])
-                          if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
-                          and frame.filename != __file__ and "contextlib" not in frame.filename), None)
-            where = "?" if frame is None else f"{frame.filename}:{frame.lineno}"
-            self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where))
 
 
 @functools.cache

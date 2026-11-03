@@ -1060,6 +1060,10 @@ class MLAMixer(MixerBase):
         return self.index_n_heads is not None
 
     @property
+    def indexed_mixers(self) -> tuple["MLAMixer", ...]:
+        return (self,) if self.indexed else ()
+
+    @property
     def reads_blocks(self) -> bool:
         return self.bidirectional_blocks
 

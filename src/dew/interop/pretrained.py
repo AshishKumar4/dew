@@ -522,7 +522,8 @@ class Pretrained:
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
-            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
+            sources.SourceReference(str(name_or_dir), revision, subfolder, remote_code=trust_remote_code),
+            selected, fallback,
             modeling_overrides)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
@@ -1302,7 +1303,9 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     the loader resolved, the identity a run records to reload the processor
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
-    files from its directory and keeps the wrapper's translated `record`.
+    files from its directory and keeps the wrapper's translated `record`, and runs
+    the source's own processor code where the load ran its code
+    (`SourceReference.remote_code`).
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -1331,6 +1334,9 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     the native component's config, as it does for the initial load.
     """
     directory = source.metadata()
+    if source.remote_code:
+        # The source's own modules beside its files, as its load ran them (`sources.remote_code`).
+        sources.remote_code(source.name, sources.snapshot(source.name, source.revision, weights=False))
     description = _composite_description(directory)
     component = None if description is None else description.backbone
     if component is None:
@@ -1487,14 +1493,29 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
+def _processor_code(directory: Path) -> Mapping[str, object]:
+    """The `auto_map` entries a source's processor files name its own code by (LFM3-VL's processor and
+    its image and video processors, each file's own and its components'), the files `Processor` saves
+    beside a bundle (`Processor.save_pretrained`) and its tokenizer's."""
+    named: dict[str, object] = {}
+    for path in sorted({*directory.glob("*processor*.json"), *directory.glob("tokenizer_config.json")}):
+        record = json.loads(path.read_text())
+        for section in (record, *(value for value in record.values() if isinstance(value, Mapping))):
+            if isinstance(section.get("auto_map"), Mapping):
+                named.update(section["auto_map"])
+    return named
+
+
 def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
                reference: sources.SourceReference, root: Path) -> decoder_parts.SourceCode | None:
-    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
-    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
-    source, beside the config the load read (`reference`, its component folder), at the metadata
-    snapshot's commit (`root`), never run."""
-    auto_map = config.get("auto_map")
-    if not isinstance(auto_map, Mapping):
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config or its
+    processor's files name it (`auto_map`, `_processor_code`): in the snapshot a verification from parts
+    ran it from, or, of a natively mapped source, beside the config the load read (`reference`, its
+    component folder), at the metadata snapshot's commit (`root`), never run."""
+    model_code = config.get("auto_map")
+    auto_map = {**_processor_code(reference.directory(root)),
+                **(model_code if isinstance(model_code, Mapping) else {})}
+    if not auto_map:
         return None
     if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
         return decoder_parts.SourceCode(remote, None, auto_map)
@@ -1707,7 +1728,8 @@ def source_route(config: Mapping[str, object], *,
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
     or an unregistered model_type no registered family's convention computes and tier 3 does not run
-    (`torchax_fallback.admitted`; tier 3 reads float weights only).
+    (`torchax_fallback.admitted`; tier 3 reads float weights only), or whose shrunken probe cannot run
+    and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
@@ -1717,7 +1739,15 @@ def source_route(config: Mapping[str, object], *,
     decoder_parts.refuse_drafter(config)
     if (route := _native_route(config)) is not None:
         return route
-    match verified(config) if remote is None else verified(config, remote=remote, pinned=pinned):
+    try:
+        verdict = verified(config) if remote is None else verified(config, remote=remote, pinned=pinned)
+    except verify.ProbeUnavailable as unavailable:
+        # No shrunken model runs: tier 3 qualifies the source on its full config, no weights read.
+        from dew.interop import torchax_fallback
+
+        torchax_fallback.refuse_quantized(config)
+        return TorchRoute(torchax_fallback.qualified(config, unavailable))
+    match verdict:
         case verify.VerifiedMapping() as mapping:
             return VerifiedRoute(mapping)
         case verify.Unmapped() as unmapped:

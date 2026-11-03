@@ -50,7 +50,27 @@ PTX_ENTRY = re.compile(r"\.entry\s+([A-Za-z_$][\w$]*)")
 """A PTX module's kernel function, `<kernel>_mosaic_gpu_kernel` (`report.KERNEL_FUNCTION`)."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
-"""ptxas's report of a kernel's registers a thread and its spills (`_ptxas`)."""
+SERIALIZED = re.compile(r"\((C751\d)\) Potential Performance Loss: wgmma\.mma_async instructions are "
+                        r"serialized")
+"""ptxas's report of a kernel's registers a thread, its spills and its warpgroup MMAs serialized (C7510 to
+C7515: each HGMMA waited for before the next issues), `ptxas_read`."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Assembled:
+    """What ptxas reports of a kernel (`ptxas_read`): its registers a thread, its spilled bytes, and the codes
+    of each note that it serialized its warpgroup MMAs."""
+    registers: int
+    spilled: int
+    serialized: tuple[str, ...]
+
+
+def ptxas_read(text: str) -> Assembled:
+    """ptxas's report `text` of a kernel read: the most registers and spilled bytes it states, and its
+    serialization notes' codes in order."""
+    used = [int(count) for count in REGISTERS.findall(text)]
+    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
+    return Assembled(max(used, default=0), max(spilled, default=0), tuple(SERIALIZED.findall(text)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,8 +81,9 @@ class Report:
     (`inherited`, their only source: None until it reads them), what the reports left `unread`: a kernel no
     binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
     `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
-    process, so a later compile of it prints no PTX of its own; and the digest of the launch that traced it
-    (`launching`), which its name carried, or None."""
+    process, so a later compile of it prints no PTX of its own; the digest of the launch that traced it
+    (`launching`), which its name carried, or None; and ptxas's notes that it serialized the kernel's
+    warpgroup MMAs (`ptxas_read`)."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -71,6 +92,7 @@ class Report:
     unread: tuple[str, ...] = ()
     module: str | None = None
     launch: str | None = None
+    serialized: tuple[str, ...] = ()
 
     @property
     def traced(self) -> str:
@@ -79,9 +101,13 @@ class Report:
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers, or None where it is."""
+        columns without spilling registers and with its warpgroup MMAs in flight together, or None where it
+        is: a kernel ptxas serializes runs its MMAs one at a time, its registers and spills clean (row 3615;
+        the kernel challenge's C7511 at 112 registers, C7512 at 96)."""
         if self.unread:
             return f"its reports state no {', '.join(self.unread)}"
+        if self.serialized:
+            return f"ptxas serializes its warpgroup MMAs ({', '.join(self.serialized)})"
         if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
                 and self.tmem <= tmem_limit and self.spilled == 0):
             return None
@@ -484,9 +510,8 @@ def _ptxas(ptx: str, generation: str, *, cap: int | None, raised: int | None = N
     if raised is not None:
         capped = RAISE.sub(f"setmaxnreg.inc.sync.aligned.u32 {raised};", capped)
     text, took = _ptxas_text(capped, generation, relocatable)
-    used = [int(count) for count in REGISTERS.findall(text)]
-    spilled = [int(stores) + int(loads) for stores, loads in SPILLS.findall(text)]
-    return max(used, default=0), max(spilled, default=0), took
+    read = ptxas_read(text)
+    return read.registers, read.spilled, took
 
 
 def _ptxas_text(ptx: str, generation: str, relocatable: bool) -> tuple[str, bool]:
@@ -598,11 +623,12 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        registers, spilled, took = _ptxas(path.read_text(), generation, cap=None)
+        text, took = _ptxas_text(path.read_text(), generation, RELOCATABLE)
         if not took:
             raise RuntimeError(f"ptxas does not compile {path.name} for {generation}")
-        found[path.stem] = {
-            "registers": registers, "spilled": spilled, "ptxas": "the GPU's compile of its PTX"}
+        read = ptxas_read(text)
+        found[path.stem] = {"registers": read.registers, "spilled": read.spilled,
+                            "serialized": read.serialized, "ptxas": "the GPU's compile of its PTX"}
     return found
 
 

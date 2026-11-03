@@ -474,7 +474,7 @@ def _large_keys(seed):
     # One query a row of zeros over eight keys near fp32's largest, so every logit is 0 and the eight weigh
     # alike, their values drawn: the keys' weighted sum overflows fp32 even at the softmax's scale of 1/4,
     # where their weighted mean does not, and the query's gradient is the cotangents' sum against the keys
-    # (`algebra.DqSums.keyed`).
+    # (`attention_gradient.DqSums.keyed`).
     key = np.zeros((ROWS, 8, 1, 16), np.float32)
     key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 8, 1))
     value, dout = _normal(seed + 1, (ROWS, 8, 1, 16), (ROWS, 1, 1, 16))
@@ -484,8 +484,8 @@ def _large_keys(seed):
 def _far_maximum_in_a_later_tile(seed: int, rows: int = 64):
     # One query a row over 64 keys in two tiles of 32: the first tile's keys 88 to 92 nats below the second
     # tile's, which hold the row's maximum, so the first tile's weights are subnormal beside the maximum
-    # the backward walks at: a dQ pass's running sums over its first tile (`algebra.DqSums`) take only
-    # those, and must stay finite and exact when the maximum's tile joins them.
+    # the backward walks at: a dQ pass's running sums over its first tile (`attention_gradient.DqSums`) take
+    # only those, and must stay finite and exact when the maximum's tile joins them.
     query = np.zeros((rows, 1, 1, 16), np.float32)
     query[..., 0] = 4.0
     key = np.zeros((rows, 64, 1, 16), np.float32)

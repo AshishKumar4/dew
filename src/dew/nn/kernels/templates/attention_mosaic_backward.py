@@ -1,5 +1,5 @@
 """The attention template's Mosaic GPU backward (`attention_mosaic.MosaicBackward`'s launches): D about each
-query's anchor from a training forward's split sums (`algebra.split_delta`), then a dQ launch and a dK/dV
+query's anchor from a training forward's split sums (`gradient.split_delta`), then a dQ launch and a dK/dV
 launch, `dq_finish`'s refinement between them, in either form, or the fast form's one launch, the dK/dV
 program adding each tile's dQ (`_launch_backward`). Each launch's programs walk the bundle's streams as the
 forward's do (`attention_mosaic_program`), the algebra's steps between its products."""
@@ -12,7 +12,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    bundles,
+    mosaic,
+)
 from dew.nn.kernels.templates.attention import DQ_GRADS, Dropout, Hooks, Kind, PaddedCall, Param, by_power
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_launch
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
@@ -41,19 +46,19 @@ from dew.nn.precision import running_sum
 
 
 def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_params: tuple, drop: Dropout, *,
-                   walk: _Backward) -> algebra.Centre:
-    """Dropout's first pass on this mainloop (`algebra.dropout_centre`): each query tile's walk over its keys
+                   walk: _Backward) -> gradient.Centre:
+    """Dropout's first pass on this mainloop (`gradient.dropout_centre`): each query tile's walk over its keys
     (a consumer's, as the dQ program's), each tile's logits `exp(s - m)` and dropped products
-    (`algebra.dropped_products` of `dO Vᵀ` and the call's draw) taken into the query's `Centre`
-    (`algebra.centre_step`). Returns the centre and its seen keys `[B, H, Qp]` and each running sum
-    `[k, B, H, Qp]` (`precision.running_sum`), which `algebra.centre_finish` takes past the launch."""
+    (`gradient.dropped_products` of `dO Vᵀ` and the call's draw) taken into the query's `Centre`
+    (`gradient.centre_step`). Returns the centre and its seen keys `[B, H, Qp]` and each running sum
+    `[k, B, H, Qp]` (`precision.running_sum`), which `gradient.centre_finish` takes past the launch."""
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
     family = program.family
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_q
-    exponent = algebra.centre_scale(walk.spec.keys)
+    exponent = gradient.centre_scale(walk.spec.keys)
     leaves, treedef = jax.tree.flatten((spans, score_params, drop))
     # The centre, whether a key is seen, and each running sum's parts (`precision.running_sum`).
     parts = running_sum((1,), jnp.float32).shape[0]
@@ -88,19 +93,19 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
                 # Every entry's visibility, a tile whole too (`algebra.seen` gives None for one no mask cuts).
                 seen = algebra.seen(walk.spec, coords, s)
                 seen = jnp.ones(shape, bool) if seen is None else seen
-                logits, _ = algebra.tile_logits(walk.spec.score_mod, s, seen, coords.q_pos, coords.k_pos,
+                logits, _ = gradient.tile_logits(walk.spec.score_mod, s, seen, coords.q_pos, coords.k_pos,
                                                 params, scale=walk.spec.scale if walk.how.factor is None
                                                 else 1.0, slopes=False)
-                weights = algebra.below(logits, algebra.expand(peak, logits), walk.how)
-                products = algebra.dropped_products(dp, algebra.drawn(coords, coords.q_pos, coords.k_pos))
-                centred = algebra.centre_step(state, weights, products, seen, coords.k_pos, exponent)
+                weights = gradient.below(logits, algebra.expand(peak, logits), walk.how)
+                products = gradient.dropped_products(dp, algebra.drawn(coords, coords.q_pos, coords.k_pos))
+                centred = gradient.centre_step(state, weights, products, seen, coords.k_pos, exponent)
                 return centred, accumulators
 
-            # Every field a row vector of zeros (`algebra.centre_start`), `seen` false, each running sum
+            # Every field a row vector of zeros (`gradient.centre_start`), `seen` false, each running sum
             # its leading axis's parts (`precision.added_to`): the layouts hold no unit axis.
             zero = family.zeros((block_q,))
             parts = running_sum((1,), jnp.float32).shape[0]
-            start = algebra.Centre(zero, zero > 0, (zero,) * parts, (zero,) * parts)
+            start = gradient.Centre(zero, zero > 0, (zero,) * parts, (zero,) * parts)
             centred, _ = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (),
@@ -133,7 +138,7 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         interpret=walk.interpret, approx_math=False, name="attention_centre",
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 0, query, key, value, dout)
     )(query, key, value, dout, peak, *leaves)
-    return algebra.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])
+    return gradient.Centre(out[0], out[1] > 0, out[2:2 + parts], out[2 + parts:])
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
@@ -141,11 +146,11 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool, drop: Dropout | None = None):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
-    first pass chose it. Two launches: the dQ program's sums, their finish (`algebra.dq_finish`) and the dK/dV
-    program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight on a
-    large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows 1.55e-2), the accurate
-    form's always, and a score hook's and an initial state's, whose gradients need the refined D
-    (`algebra.dq_step`). The fast form's one launch (`tiles.fused`, a hookless call's): the dK/dV program
+    first pass chose it. Two launches: the dQ program's sums, their finish (`gradient.dq_finish`) and the
+    dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight
+    on a large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows 1.55e-2), the
+    accurate form's always, and a score hook's and an initial state's, whose gradients need the refined D
+    (`gradient.dq_step`). The fast form's one launch (`tiles.fused`, a hookless call's): the dK/dV program
     adding each tile's dQ atomically, under the first pass's D and the forward's denominator, the derived
     default of a hookless fast-form call outside deterministic mode (`MosaicBackward.derived`: 1.05 to 1.4
     times as fast as two launches, FUSEDFORM-h100; 384 MB of temporaries against 258 at llama-d128 2 x 4096,
@@ -156,9 +161,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     (`by_power`) at `scale`, the scale left (`gradients`), which `spec` takes."""
     spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
-    _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
+    _, state_total = gradient.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
-    anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
+    anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
                                                 jnp.swapaxes(anchor_value, 1, 2), cotangent, key_index, shift)
     # The family's swizzled tiles hold whole rows (`Family.column_unit`).
     query, key, value, dout = (_columns(array, family.column_unit(array.dtype))
@@ -174,16 +179,16 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
                      approx_math, score_places(hooks), drop is not None)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
-    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
+    spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k, readers=True)
     # The queries taken by the call's power: the logits' operand of the two launches (`_dkv_step`).
     scaled = by_power(query, prescale)
     if drop is not None:
         # A dropping call's D its dropped products' own, centred about each query's least one
-        # (`algebra.dropout_centre`): no anchor, and no key chosen.
+        # (`gradient.dropout_centre`): no anchor, and no key chosen.
         centre = _centre_launch(scaled, key, value, dout, maximum, spans, score_params,
                                 drop, walk=walk)
         anchor = jnp.zeros_like(anchor)
-        delta = algebra.centre_finish(centre, state_total, initial_term, algebra.centre_scale(spec.keys))
+        delta = gradient.centre_finish(centre, state_total, initial_term, gradient.centre_scale(spec.keys))
         chosen = jnp.full_like(chosen, -1)
     # The dK/dV launch on its own layout (`BackwardTiles.dkv`).
     dkv_tiles = tiles.dkv
@@ -202,7 +207,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                        spans, walk=walk)
-        mass = algebra.split_mass(own, others_total, forward_total, shift)
+        mass = gradient.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
     # The dQ program reads its queries for their logits alone.
@@ -212,9 +217,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.
     keyed = jnp.zeros_like(dq_swapped) if keyed is None else jnp.swapaxes(keyed, 1, 2)
-    sums = algebra.DqSums(dq_swapped, rows[0], rows[1], tuple(rows[4:4 + count]), tuple(rows[4 + count:]),
+    sums = gradient.DqSums(dq_swapped, rows[0], rows[1], tuple(rows[4:4 + count]), tuple(rows[4 + count:]),
                           keyed, rows[2], rows[3])
-    dq, refined, denominator, mass, dq_grads = algebra.dq_finish(sums, forward_total, state_total, peak0,
+    dq, refined, denominator, mass, dq_grads = gradient.dq_finish(sums, forward_total, state_total, peak0,
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,

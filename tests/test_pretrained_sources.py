@@ -17,6 +17,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import safetensors.numpy as safetensors_numpy
+from lane_environment import without_flags
 from interop_support import tiny_config
 
 from dew.interop import hf_decoders, sources
@@ -133,8 +134,7 @@ expected = jax.jit(norm.apply)(variables, stored)
 actual = jax.jit(lambda a, b: norm.apply(variables, a + b))(a, b)
 np.testing.assert_array_equal(actual, expected)
 """
-    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                     if not flag.startswith("--xla_allow_excess_precision"))
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_allow_excess_precision")
     result = subprocess.run([sys.executable, "-c", script, str(source)], capture_output=True, text=True,
                             env={**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu"}, timeout=90)
     assert result.returncode == 0, result.stderr[-4000:]
@@ -182,8 +182,7 @@ expected = jax.jit(norm.apply)(variables,stored)
 actual = jax.jit(lambda a,b: norm.apply(variables,a+b))(a,b)
 np.testing.assert_array_equal(actual,expected)
 """
-    flags = " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                     if not flag.startswith("--xla_allow_excess_precision"))
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_allow_excess_precision")
     result = subprocess.run(
         [sys.executable, "-c", script, str(source), entry],
         capture_output=True,
@@ -244,7 +243,9 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     computed in the trace (`functional_rotaries`); BioGPT's
     training forward draws its layer drop on the host, which a traced step would fix; a quantized
     source is refused, tier 3 reading float weights; and one whose shrunken model does not run at the
-    probe's length (a BERT decoder of 8 positions) is `ProbeUnavailable`, not a model none computes."""
+    probe's length qualifies on its full config instead (`torchax_fallback.qualified`, ledger 1595): a
+    BERT decoder of 8 positions runs, causal by its program, and a BERT encoder of 8 is refused, its
+    attention reading later keys."""
     from dew.interop import decoder_parts, verify
     from dew.interop.pretrained import TorchRoute, source_route
 
@@ -267,8 +268,11 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
             source_route(refused)
     with pytest.raises(decoder_parts.DrafterRefused):
         source_route({**cohere, "num_target_layers": 4})
-    with pytest.raises(verify.ProbeUnavailable):
-        source_route(tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict())
+    assert isinstance(source_route(tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict()),
+                      TorchRoute)
+    with pytest.raises(ValueError) as refused:
+        source_route(tiny_config("bert", is_decoder=False, max_position_embeddings=8).to_dict())
+    assert not isinstance(refused.value, verify.ProbeUnavailable)
 
 
 def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
