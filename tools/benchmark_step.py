@@ -43,6 +43,9 @@ Usage:
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
         "num_heads": 8}, "batch_size": 32, "image_size": 32, "mesh": {"fsdp": 2}}]'
+    python tools/benchmark_step.py --cases '[{"architecture": "causal_transformer",
+        "hf_config": "Qwen/Qwen3.5-4B", "dtype": "bfloat16", "batch_size": 2,
+        "seq_len": 2048}]'
     python tools/benchmark_step.py --preset small --architectures causal_transformer \\
         --mesh '{"fsdp": 2, "tensor": 2}' --profile-dir /tmp/dew-trace
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
@@ -97,12 +100,8 @@ Row = dict[str, object]
 
 
 def cases_to_json(cases: Sequence[Case]) -> str:
-    """`cases` as the JSON list `cases_from_json` reads back: each case's fields as they are, a translated
-    config's records (`dew.interop.config_records.NativeFields`) written as the fields they state, which the
-    model's declared field types rebuild them from. `dataclasses.asdict` would rebuild each record by its
-    type, whose constructor takes the native owner beside its fields."""
-    return json.dumps([{field.name: getattr(case, field.name) for field in dataclasses.fields(case)}
-                       for case in cases])
+    """`cases` as the JSON list `cases_from_json` reads back, each its record (`Case.record`)."""
+    return json.dumps([case.record() for case in cases])
 
 
 def cases_from_json(text: str) -> list[Case]:

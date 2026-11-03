@@ -332,12 +332,14 @@ def assert_reloads(loaded, saved: Path, ids: np.ndarray) -> None:
 
 def assert_restores(model, variables, restored, ids: np.ndarray) -> None:
     """`restored`, a checkpoint read back, is `model` with `variables` bit for bit, so it computes
-    the same logits over `ids`."""
+    the same logits over `ids`: the model's forward compiled once, the checkpoint's model being equal
+    to it, where run op by op the two forwards took 38 s of a GLM-5 Next round trip's test (train 521)."""
     assert restored.model == model, "the checkpoint rebuilds a different model"
     assert jax.tree.structure(restored.variables) == jax.tree.structure(variables)
     for original, again in zip(jax.tree.leaves(variables), jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(again), np.asarray(original))
-    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), model.apply(variables, ids))
+    forward = jax.jit(model.apply)
+    np.testing.assert_array_equal(forward(restored.variables, ids), forward(variables, ids))
 
 
 def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:

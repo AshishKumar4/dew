@@ -1735,22 +1735,25 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     read as it is."""
     import argparse
 
+    from tool_support import run_from
+
     from dew.interop.hf_decoders import decoder_config
     from dew.interop.pretrained import Pretrained
-    from tools import kernel_picks
 
+    with run_from("kernel_picks", "tools") as kernel_picks:
+        model_of = kernel_picks.model_of
     native = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
     assert native["text_config"]["tie_word_embeddings"] and not native["tie_word_embeddings"]
-    picked = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-native-tiny"),
-                                                      revision=None, dtype="float32"))
+    picked = model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-native-tiny"), revision=None,
+                                         dtype="float32"))
     loaded = Pretrained.load(FIXTURES / "qwen35-native-tiny", text_only=True, dtype="float32")
     assert not picked.tie_embeddings and picked.tie_embeddings == loaded.model.tie_embeddings
     assert not translate_config(decoder_config(native))["tie_embeddings"]
     assert translate_config(native["text_config"])["tie_embeddings"]
     blocks = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
     assert decoder_config(blocks)["modeling_overrides"] == blocks["modeling_overrides"]
-    built = kernel_picks.model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-blocks-tiny"),
-                                                     revision=None, dtype="float32"))
+    built = model_of(argparse.Namespace(config=str(FIXTURES / "qwen35-blocks-tiny"), revision=None,
+                                        dtype="float32"))
     blocked = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", text_only=True, dtype="float32").model
     assert built.kinds["full_attention"].mixer.bidirectional_blocks
     assert built.kinds == blocked.kinds

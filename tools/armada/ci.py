@@ -1128,6 +1128,17 @@ def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = 
     return f"{python}-{Path(name).stem[:40]}-{digest}{drawn}"
 
 
+def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
+         measured: Mapping[str, float]) -> float | None:
+    """The seconds a unit of test file `name`'s site `test` takes under `python`, over those of its map tasks'
+    `spans` that armada measured (under their task names, `site_task`); None where it measured none. Once a
+    site runs as map tasks, the durations record holds no whole run of it (its test's seconds are one task's,
+    its judge's pooling among them), so its map tasks are what tell a unit's cost."""
+    timed = [(stop - start, seconds) for start, stop in spans
+             if (seconds := measured.get(site_task(python, name, test, (start, stop))))]
+    return sum(seconds for _, seconds in timed) / sum(units for units, _ in timed) if timed else None
+
+
 def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
@@ -1136,8 +1147,11 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     their draws from its inputs and reports the site's row as a run that drew every unit itself would. A site
     whose judge's row ran green on exactly these inputs (`kept`, `reusable`) has none: a kept task reads its
     row, and no draw runs. A map task weighs what armada measured it at, under its task's name
-    (`site_task`), else its units at the site's recorded seconds over the units a whole run takes at least
-    (`Mark`), else the target; a judge, its row's pooling as armada measured it, else the target. A judge
+    (`site_task`), else its units at the rate of the site's map tasks of its kind that armada measured
+    (`rate`: its first stage runs every time, so a later task its judge has not asked for since weighs what
+    its seeds take), else, before any ran, its units at the site's recorded seconds over the units a whole
+    run takes at least (`Mark`), else the target; a judge, its row's pooling as armada measured it, else the
+    target. A judge
     names no row: armada reads one whose map tasks did not all pass red under its task's name, naming them,
     which a named row would leave not graded."""
     measured = timings.get("rows", {})
@@ -1150,13 +1164,19 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             mark = held[test]
             whole = sum(seconds for node, seconds in record.items()
                         if node.split("::")[0] == name and session.test_name(node) == test)
+            spans = draws_of(mark)
             maps = []
-            for start, stop in draws_of(mark):
+            for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
-                # A weighed check's units cost their own: unmeasured, a task of them weighs the target.
-                weight = measured.get(task_name) or (target if start >= mark.units
-                                                     else whole * (stop - start) / mark.timed or target)
+                # A weighed check's units cost their own: unmeasured, and none of them measured, a task of
+                # them weighs the target.
+                weighed = start >= mark.units
+                kind = [span for span in spans if (span[0] >= mark.units) == weighed]
+                each = rate(python, name, test, kind, measured)
+                weight = measured.get(task_name) or (
+                    each * (stop - start) if each is not None
+                    else target if weighed else whole * (stop - start) / mark.timed or target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,

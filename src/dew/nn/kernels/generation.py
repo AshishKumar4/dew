@@ -231,14 +231,19 @@ def family(generation: str) -> str | None:
 
 
 @dataclasses.dataclass(frozen=True)
-class Streamed:
-    """One part's device-memory read against its bytes, measured cold (tools/device_facts.py: one kernel
-    streaming N bytes after the L2 is evicted, the least-squares line over 1 MiB to 1 GiB): `fixed` seconds
-    before the stream (launch and first byte) and `bytes_per_second` after, the plateau a long transfer
-    reaches, below what the memory clock and bus give."""
+class Measured:
+    """One part's facts as its kernels meet them, measured (tools/device_facts.py): its device-memory read
+    against its bytes, cold (one kernel streaming N bytes after the L2 is evicted, the least-squares line over
+    1 MiB to 1 GiB), `fixed` seconds before the stream (launch and first byte) and `bytes_per_second` after,
+    the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
+    kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
+    signal another program of the same launch waits on, where the part's ring families fix tiles up across
+    programs (the balanced tail's partials). None where not measured."""
 
     fixed: float
     bytes_per_second: float
+    launch: float | None = None
+    handoff: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,9 +260,10 @@ class GpuTarget:
     device's own where it reports them (`gpu_target`), which a launch sizes its
     programs by (`dew.nn.kernels.decode_attention`). `clock_hz` and
     `memory_bandwidth` are the canonical device's boost clock and device-memory
-    bytes per second, a real device's own likewise; `streams` maps device-kind
-    prefixes to the stream a part was measured to reach (`streamed`), which
-    prices its device bytes (`memory_rate`). Every other fact a kernel's
+    bytes per second, a real device's own likewise; `measured` maps device-kind
+    prefixes to the facts a part was measured to (`part`): its stream, which
+    prices its device bytes (`memory_rate`), and its launches' and hand-offs'
+    fixed seconds (`launch_seconds`, `handoff_seconds`). Every other fact a kernel's
     cost model reads (`dew.nn.kernels.templates.cost`) is its instruction
     family's (`architecture`): its tensor rates, warpgroup MMA and tensor memory. A row
     states a device's datasheet, its peaks, which MFU reads, and what a compile-only
@@ -279,7 +285,7 @@ class GpuTarget:
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
-    streams: Mapping[str, Streamed] = dataclasses.field(default_factory=dict, hash=False)
+    measured: Mapping[str, Measured] = dataclasses.field(default_factory=dict, hash=False)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -340,17 +346,30 @@ class GpuTarget:
         return self._part(self.dense_peaks) or {}
 
     @property
-    def streamed(self) -> Streamed | None:
-        """The stream this device's part was measured to reach (`streams`); None for a part no one
-        measured."""
-        return self._part(self.streams)
+    def part(self) -> Measured | None:
+        """The facts this device's part was measured to (`measured`); None for a part no one measured."""
+        return self._part(self.measured)
 
     @property
     def memory_rate(self) -> float | None:
-        """Device-memory bytes a second a long transfer streams at: the part's measured plateau (`streamed`),
+        """Device-memory bytes a second a long transfer streams at: the part's measured plateau (`part`),
         else its clocks' bandwidth (`memory_bandwidth`)."""
-        streamed = self.streamed
-        return self.memory_bandwidth if streamed is None else streamed.bytes_per_second
+        part = self.part
+        return self.memory_bandwidth if part is None else part.bytes_per_second
+
+    @property
+    def launch_seconds(self) -> float | None:
+        """The seconds a kernel launch adds to a program of kernels one after another, measured on the part
+        (`Measured.launch`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.launch
+
+    @property
+    def handoff_seconds(self) -> float | None:
+        """A GPU-scope semaphore hand-off's seconds between two programs of one launch, measured on the
+        part (`Measured.handoff`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.handoff
 
     @property
     def bf16_peak(self) -> float | None:
@@ -429,8 +448,9 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
-              # tools/device_facts.py on an A100-SXM4-40GB (FS-DEVICEFACTS2-a100, 1.555 TB/s by its clocks).
-              streams={'NVIDIA A100-SXM4-40GB': Streamed(6.04e-6, 1.486e12)}),
+              # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
+              # its clocks), its launch FS-DEVICEFACTS4-a100's.
+              measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024,
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9),
@@ -448,14 +468,15 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
-              # tools/device_facts.py on an H100 SXM and a GH200 (FS-DEVICEFACTS2-h100 and -gh200); the H200's
-              # the same line through the kernel challenge's best read at each size, 16.8 MB to 805 MB,
-              # cold L2 under graph replay (judge-facts.md:3-18).
+              # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
+              # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
+              # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
+              # replay (judge-facts.md:3-18).
               # The H100 PCIe's two rounds of tools/device_facts.py agreed to 1% (ET-DEVICEFACTS-h100pcie).
-              streams={'NVIDIA H100 80GB HBM3': Streamed(1.87e-6, 3.190e12),
-                       'NVIDIA H100 PCIe': Streamed(2.11e-6, 1.980e12),
-                       'NVIDIA GH200 480GB': Streamed(2.51e-6, 3.812e12),
-                       'NVIDIA H200': Streamed(2.81e-6, 4.617e12)}),
+              measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
+                        'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12),
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,

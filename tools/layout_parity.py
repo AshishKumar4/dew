@@ -140,16 +140,12 @@ and the data axis Explicit (`MeshSpec.explicit`) alone and beside fsdp."""
 
 
 def _fixture(name: str) -> dict[str, Any]:
-    """The decoder config Dew builds from a model's Hugging Face config: a decoder's own, or
-    DiffusionGemma's trunk, the causal text tower its assembly builds (`diffusion_gemma.text_config`),
-    which a text-only load does not take (`decoder_config`)."""
-    from dew.interop import diffusion_gemma
-    from dew.interop.hf_decoders import decoder_config, translate_config
+    """The decoder config Dew builds from a fixture model's Hugging Face config (`checkpoint_fields`)."""
+    from benchmark_cases import checkpoint_fields
 
-    config = json.loads((REPO / "tests/fixtures/hf" / name / "config.json").read_text())
-    trunk = (diffusion_gemma.text_config(config) if config.get("model_type") == "diffusion_gemma"
-             else decoder_config(config))
-    return dict(translate_config(trunk))
+    from dew.interop.sources import SourceReference
+
+    return checkpoint_fields(SourceReference(str(REPO / "tests/fixtures/hf" / name)))
 
 
 def _nemotron_h_moe() -> dict[str, Any]:
@@ -1181,7 +1177,7 @@ def _cache_name(kind: str, case, seed: int) -> tuple[str, dict[str, Any]]:
         digest.update(array.tobytes())
     from dew.nn.precision import wide_cpu_arithmetic
 
-    inputs = {"schema": CACHE_SCHEMA, "kind": kind, "case": dataclasses.asdict(case), "seed": seed,
+    inputs = {"schema": CACHE_SCHEMA, "kind": kind, "case": case.resolved().record(), "seed": seed,
               "batch": digest.hexdigest(), "jax": jax.__version__,
               "jaxlib": importlib.metadata.version("jaxlib"),
               "x64": jax.config.jax_enable_x64, "wide_cpu_arithmetic": wide_cpu_arithmetic(),
