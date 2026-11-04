@@ -110,9 +110,10 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     the recorded durations; a file nothing has timed runs alone; a file
     heavier than the target splits into groups of itself. On a pushed run
     3.14 runs its own files (NEWEST_FILES) the same way and imports every
-    other one in a few collect-only tasks; the daily run (DEW_TEST_CACHE off)
-    runs every file on both, with nothing only collected. Every row is named
-    once, test_gen_api never."""
+    other one in a few collect-only tasks, its cache's policy on or off (a
+    policy-off train ran every file on both Pythons, doubling its suite); the
+    daily run (DEW_WHOLE_SUITE) runs every file on both, with nothing only
+    collected. Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
@@ -137,6 +138,13 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert "3.14:tests/test_heavy.py#collect" in rows
 
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    off = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    assert [(entry["tests"], entry["split"]) for entry in off
+            if entry["python"] == "3.14" and entry["split"] != ci.COLLECT] == [
+        ("tests/test_config.py tests/test_light.py", "")]
+    assert sorted(name for entry in off if entry["python"] == "3.14" and entry["split"] == ci.COLLECT
+                  for name in entry["tests"].split()) == collected
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     daily = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
     for python in ("3.12", "3.14"):
         ran = [(entry["tests"], entry["split"]) for entry in daily if entry["python"] == python]
@@ -175,6 +183,7 @@ def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0}))
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     entries = ci.plan(240.0, {"files": {"3.12:tests/test_heavy.py": 800.0}})
     weighed = {python: sum(entry["weight"] for entry in entries if entry["python"] == python)
                for python in ("3.12", "3.14")}
@@ -2123,8 +2132,8 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
 
 
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
-    """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, every fifth publish's
-    ci/full-whole-* run), and is set aside on every other run, a train's whatever the cache's policy: a
+    """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, the daily run), and is set
+    aside on every other run, a train's whatever the cache's policy: a
     policy-off train runs every file, but not a whole-suite cell (the maintainer, 2026-10-28, via Models:
     train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
     interpreter(tmp_path, "3.12")
@@ -2218,15 +2227,17 @@ def commands(calls: list[list[str]]) -> list[str]:
 def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     """Main's push of a tip the land queue graded green, its own CI run red on a row the regrade passed,
     carries the queue's proof: the suite step submits no suite, whatever the stored verdict or the cache's
-    policy (a train that changed what every test reads runs main's push with the cache off); the background
-    whole suite (ci/full-whole-*), whose commit main's push proved, runs it as ever, and an unproven push
-    with a red verdict too (train 237's review, P1: the proof skipped the gangs alone)."""
+    policy (a train that changed what every test reads runs main's push with the cache off); the daily run,
+    which reads no proof, runs it as ever on main's tip, and an unproven push with a red verdict too (train
+    237's review, P1: the proof skipped the gangs alone)."""
     def ran(ref: str, proven: str, policy: str, verdict: int) -> bool:
-        calls = suite_step(tmp_path / ref.replace("/", "-") / policy, ref, proven, policy, verdict)
+        place = tmp_path / ref.replace("/", "-") / policy / (proven or "unproven")
+        calls = suite_step(place, ref, proven, policy, verdict)
         return "run" in commands(calls)
 
     assert not ran("main", "4242", "on", 1) and not ran("main", "4242", "off", 1)
-    assert ran("ci/full-whole-1", "4242", "off", 0) and ran("fix/lane", "", "on", 1)
+    # The daily run reads no proof (the proven job runs on a push alone): main's tip, run anew.
+    assert ran("main", "", "off", 0) and ran("fix/lane", "", "on", 1)
 
 
 def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
@@ -2315,14 +2326,14 @@ def test_a_staged_trains_suite_asks_no_more_than_its_lease(tmp_path):
 
 
 def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
+    """A push to base/kernels and a base/<producer> promote run their suite
     at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
     or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
     (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
-    for ref in ("base/kernels", "ci/base-abc-1", "ci/full-whole-1"):
+    for ref in ("base/kernels", "ci/base-abc-1"):
         assert priority(ref) == ["--priority=-10"], ref
     assert priority("ci/batch-abc-1") == ["--priority=10"]
     # A train staged on the testing train's tip runs beside it, below it (owner and the maintainer,

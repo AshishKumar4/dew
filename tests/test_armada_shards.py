@@ -263,8 +263,9 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
     units = ci.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
-    # Cold, as a policy-off run plans every site on every Python.
+    # Cold, as the daily run plans every site on every Python.
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     judges = [entry for entry in ci.plan(120.0, {}) if "after" in entry]
     assert len(judges) == 2 * len(ci.PYTHONS)
     assert sum(len(entry["after"]) for entry in judges) > ci.MAX_INPUTS
