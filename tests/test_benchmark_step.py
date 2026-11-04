@@ -101,6 +101,20 @@ def test_a_case_names_a_quantized_wrapper_whose_selection_reads_its_tensors_name
             == to_record(models.build("causal_transformer", **expected), object))
 
 
+def test_a_case_naming_another_file_than_a_checkpoints_config_is_refused(tmp_path):
+    """A checkpoint is named by its directory or its config.json, which a load reads: a case naming another
+    file of a directory (a tweaked config beside the checkpoint's own) is refused rather than measured as the
+    directory's config.json."""
+    step = load("benchmark_step")
+    config = json.loads((FIXTURES / "qwen35-tiny" / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "tweaked.json").write_text(json.dumps({**config, "num_hidden_layers": 1}))
+    case = step.Case("causal_transformer", hf_config=str(tmp_path / "tweaked.json"), dtype="float32",
+                     batch_size=2, seq_len=8)
+    with pytest.raises(ValueError):
+        case.trunk_fields()
+
+
 def test_a_case_naming_a_checkpoint_is_identified_by_the_fields_it_holds_now(tmp_path):
     """What keys a cache of a case's results (`Case.resolved`, layout_parity's references) is the checkpoint's
     translated fields, not the path naming it: the same file with a changed norm epsilon is another case."""
