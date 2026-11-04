@@ -1587,7 +1587,7 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     walk in a conditional, whose products the count bounds apart."""
     import re
 
-    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops, hlo_flops
 
     rows, heads, kv_heads, width = 1, 4, 2, 64
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
@@ -1625,10 +1625,19 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
     assert plain == (forward, forward)
     # A forward whose launches walk its value columns a block apiece: each recomputes `Q K^T`, which the
-    # model owns once.
+    # model owns once. The blocks' launches are one kernel called once a block, as the step's FLOP count
+    # weighs it (`hlo_flops`, against the whole walk's count).
+    def weighed(fn):
+        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+            found = hlo_flops(jax.jit(fn).trace(query, key, key).lower(lowering_platforms=("cuda",))
+                              .as_text(dialect="hlo"))
+        assert found is not None
+        return found.model, found.hardware
+
+    whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
     with _pinned(attention_mosaic.Tiles(64, 64, 2, 1, columns=width // 2)):
-        blocked = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
-    assert blocked == (forward, forward + product)
+        blocked = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
+    assert blocked == (whole[0], whole[1] + product)
     assert counted(trained, query, key, key) == (forward, forward + product)
     assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * forward + product)
 
