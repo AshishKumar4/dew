@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.algebra import rewritten
 from dew.nn.kernels.templates.attention import Kind, differentiable, floating_params
 from dew.nn.kernels.templates.attention_algebra import (
     PLAIN,
@@ -63,18 +64,22 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     if not slopes:
         return hooked(score_mod, logits, q_pos, k_pos, params).astype(jnp.float32), None
     floating = floating_params(params)
-    inputs = (logits, *(params[index] for index in floating))
-    out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
-    along = jax.linear_transpose(pull, out)
 
-    def slope(index):
-        [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
-                                for place, x in enumerate(inputs)))
-        return entries.astype(jnp.float32)
+    def sloped(*inputs):
+        # The hook's value and its slopes, one program the algebra pass rewrites before the tile places it
+        # (docs/design/algebra.md §2): a hook's custom derivative is its rule's, applied in the trace.
+        out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
+        along = jax.linear_transpose(pull, out)
 
-    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
-    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
-                                                  for index in range(len(params))))
+        def slope(index):
+            [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
+                                    for place, x in enumerate(inputs)))
+            return entries.astype(jnp.float32)
+
+        differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
+        return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
+                                                      for index in range(len(params))))
+    return rewritten(sloped)(logits, *(params[index] for index in floating))
 
 
 ROW_SUMS: Mapping[Kind, Callable[[jax.Array], jax.Array]] = MappingProxyType({

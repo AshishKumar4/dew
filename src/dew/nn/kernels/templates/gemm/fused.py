@@ -44,6 +44,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
+from dew import algebra
 from dew.nn import programs
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 from dew.nn.kernels.templates.gemm import template
@@ -176,7 +177,9 @@ def _split(producer, values):
     def flat(*leaves):
         return producer(jax.tree.unflatten(treedef, list(leaves)))
 
-    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(flat)(*leaves)))(*leaves)
+    # The producer as the algebra pass rewrites it, before the fuser stages it (docs/design/algebra.md §2).
+    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(algebra.rewritten(flat))(*leaves)))(
+        *leaves)
     jaxpr = closed.jaxpr
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
