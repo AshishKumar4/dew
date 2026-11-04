@@ -183,6 +183,7 @@ def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0}))
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     entries = ci.plan(240.0, {"files": {"3.12:tests/test_heavy.py": 800.0}})
     weighed = {python: sum(entry["weight"] for entry in entries if entry["python"] == python)
                for python in ("3.12", "3.14")}
@@ -2230,7 +2231,8 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
     which reads no proof, runs it as ever on main's tip, and an unproven push with a red verdict too (train
     237's review, P1: the proof skipped the gangs alone)."""
     def ran(ref: str, proven: str, policy: str, verdict: int) -> bool:
-        calls = suite_step(tmp_path / ref.replace("/", "-") / policy, ref, proven, policy, verdict)
+        place = tmp_path / ref.replace("/", "-") / policy / (proven or "unproven")
+        calls = suite_step(place, ref, proven, policy, verdict)
         return "run" in commands(calls)
 
     assert not ran("main", "4242", "on", 1) and not ran("main", "4242", "off", 1)
