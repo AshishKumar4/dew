@@ -915,8 +915,10 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
 
 
 def _scaled_twice(s, q_pos, k_pos, a, b):
-    """A score hook the pass rewrites: two scales of the logits summed, one product of their sum."""
-    return s * a + s * b
+    """A score hook the pass rewrites: two bounded scales of the bounded logits summed (the magnitudes the
+    pass's reordering reads), one product of their sum."""
+    capped = jnp.tanh(s)
+    return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
 
 def _multiplies(closed) -> int:
@@ -963,7 +965,8 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
 
     def producer(values):
         x, a, b = values
-        return x * a + x * b
+        capped = jnp.tanh(x)
+        return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
