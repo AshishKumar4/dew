@@ -99,7 +99,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     return loader, validation, tokens, steps, loader.examples
 
 
-def resume_admitted(trainer: Trainer, dataset: Loader, resume: Resume = "auto", *,
+def resume_admitted(trainer: "Trainer", dataset: Loader, resume: "Resume" = "auto", *,
                     examples: int | None = None) -> None:
     """Refuse a resume under `resume` whose saved data position `dataset` would not read on from, as
     `trainer.fit` refuses it where it opens its data, before a run writes anything over what it resumes
