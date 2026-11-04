@@ -125,13 +125,13 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     accounts,
-    as_member,
     children,
     consumed_by,
     consumed_forward,
     examples_bound,
     joined,
     member_of,
+    member_record,
     members_held,
 )
 from dew.data.plan import Manifest
@@ -1476,7 +1476,7 @@ class _Build:
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
-            mapped = [parent.map(functools.partial(as_member, member=key)) if tagged else parent
+            mapped = [parent.map(functools.partial(member_record, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source),
@@ -1487,7 +1487,7 @@ class _Build:
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
-            streams = [stream.map(functools.partial(as_member, member=key))
+            streams = [stream.map(functools.partial(member_record, member=key))
                        for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).

@@ -223,14 +223,10 @@ def as_member(made: Record, member: str | None) -> Record: ...
 
 def as_member(made: Record, member: str | None) -> Record:
     """A step's output of a mixture member's row as that member's (`MEMBER`, `Rejected.member`), the
-    examples it completes its member's where it first holds counts (the bound's marks): a mixture tags each
-    member's records so (`functools.partial(as_member, member=key)`). A record of raw bytes holds no field
-    to say it, so a member's bytes, whose examples a mixture counting its members' would credit to none,
-    are refused, not passed on untagged: a mixture's members are decoded before the mix, and a member's
-    rows stay rows."""
-    if isinstance(made, bytes) and member is not None:
-        raise TypeError(f"mixture member {member!r} gives raw byte records, which carry no member, while the "
-                        "run counts its members' examples: decode each member's records before the mix")
+    examples it completes its member's where it first holds counts (the bound's marks). A record of raw
+    bytes holds no field to say it and passes as it is: the mixture refuses a member's bytes where it tags
+    its records (`member_record`), and a step after the bound that makes bytes of a row is refused where its
+    counts are carried (`consumed_by`)."""
     if member is None or made is None or isinstance(made, bytes):
         return made
     if isinstance(made, Rejected):
@@ -239,6 +235,16 @@ def as_member(made: Record, member: str | None) -> Record:
     if CONSUMED in made and MEMBERS not in made:
         tagged[MEMBERS] = members_held(made, member)
     return tagged
+
+
+def member_record(made: Record, member: str) -> Record:
+    """A mixture member's record as the mix reads it, tagged its member's (`as_member`). A member's raw
+    bytes hold no field to say it, so its examples, which a mixture counting its members' would credit to
+    none, are refused, not passed on untagged: a mixture's members are decoded before the mix (row 3746)."""
+    if isinstance(made, bytes):
+        raise TypeError(f"mixture member {member!r} gives raw byte records, which carry no member, while the "
+                        "run counts its members' examples: decode each member's records before the mix")
+    return as_member(made, member)
 
 
 def members_held(row: Batch, member: str | None) -> dict[str, int]:
