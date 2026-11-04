@@ -78,6 +78,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.templates import report
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -1167,7 +1168,8 @@ class Trainer(Generic[Loss, Effects]):
                 # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
                 lowered, launches = lower() if lowering else None, launches or "[]"
             if staging_measured and not lowering:
-                jitted.trace(*apart(prepared), given, part)
+                with report.uncompiled():
+                    jitted.trace(*apart(prepared), given, part)
         window = split * self.accumulation
         footprint = None if shapes is None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), window, prepared, held,

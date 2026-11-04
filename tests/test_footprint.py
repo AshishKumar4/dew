@@ -284,3 +284,36 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
         assert not gradient_peak(ragged, weights, (rows, sizes), platform="gpu", workspace=none).exact
     assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=Workspace(0, 0)).exact
     assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=Workspace(0, 0)).exact
+
+
+def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
+    """The algebra pass rewrites the program a step compiles (`algebra.program_of`, docs/design/algebra.md
+    §6.7): two products of one operand summed become one product of it with the summed others, so the
+    forward holds one 256 x 1024 product, not two, and the backward reads one. The derived peak and
+    residuals are that program's (row 3445): below the unrewritten program's, which the pass turned off
+    (`algebra.passes`) derives, and the derivation's trace records no rewrite as a compile's
+    (`report.uncompiled`)."""
+    from dew import algebra
+    from dew.nn.kernels.templates import report
+    from dew.training.footprint import derived_terms
+
+    def loss(weights, x):
+        shared = jnp.tanh(x)
+        products = shared @ jnp.tanh(weights["first"]) + shared @ jnp.tanh(weights["second"])
+        return jnp.sum(products * products), ()
+
+    weights = {name: jax.ShapeDtypeStruct((64, 1024), jnp.float32) for name in ("first", "second")}
+    x = jax.ShapeDtypeStruct((256, 64), jnp.float32)
+
+    def derived():
+        residuals, peak = derived_terms(loss, weights, (x,), platform="gpu", workspace=Workspace(0, 0))
+        return residuals, peak.bytes
+
+    with report.refusals():
+        rewritten = derived()
+        assert not report.rewrites()
+    with algebra.passes(on=False):
+        plain = derived()
+    product = 256 * 1024 * 4
+    assert rewritten[0] <= plain[0] - product and rewritten[1] <= plain[1] - product, (rewritten, plain)
+
