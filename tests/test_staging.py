@@ -11,6 +11,7 @@ import numpy as np
 import optax
 from jax.sharding import SingleDeviceSharding
 
+from dew.training.inspection import Inspection, stacked, summaries
 from dew.training.staging import chunks, flattened, staged
 
 SHAPES = {"embedding": (64, 32), "bias": (32,), "kernel": (128, 16)}
@@ -34,14 +35,18 @@ def normalized_trace() -> optax.GradientTransformation:
     return optax.GradientTransformation(init, update)
 
 
-def cut_of(optimizer: optax.GradientTransformation) -> list[list[str]]:
-    """The chunks `chunks` cuts `optimizer`'s state into for its update, each by its leaves' paths."""
+def cut_of(optimizer: optax.GradientTransformation, sampled: bool = False) -> list[list[str]]:
+    """The chunks `chunks` cuts `optimizer`'s state into for its update, each by its leaves' paths; a
+    `sampled` update's commit reports its summaries too, as a sampled step's does (`Transaction.commit`)."""
     params = drawn(0)
     state = optimizer.init(params)
     paths, structure = jax.tree_util.tree_flatten_with_path(state)
 
     def update(fields, gradients, params):
-        return jax.tree.leaves(optimizer.update(gradients, structure.unflatten(fields), params)[1])
+        updates, state = optimizer.update(gradients, structure.unflatten(fields), params)
+        reported = summaries(Inspection(every=1), params, gradients, updates,
+                             optax.apply_updates(params, updates)) if sampled else {}
+        return jax.tree.leaves(state), stacked(reported, jnp.asarray(a=True))
 
     traced = jax.make_jaxpr(update)([leaf for _, leaf in paths], params, params)
     equations, _ = flattened(traced.jaxpr, traced.jaxpr.invars, traced.consts)
@@ -62,9 +67,37 @@ def test_an_elementwise_update_stages_each_parameters_moments_alone():
             assert len(names) == 1 and len(chunk) == 2, cut
 
 
+def test_a_sampled_commits_summaries_stage_each_parameters_moments_alone():
+    """A sampled commit's summaries of its update, norms over every leaf stacked into one vector
+    (`dew.training.inspection`), hold a few words, not a leaf: Adam's commit still stages each parameter's
+    moments alone (row 3659), where summing its norms across the leaves joined every chunk into one."""
+    assert cut_of(optax.adamw(1e-3), sampled=True) == cut_of(optax.adamw(1e-3))
+    assert len(cut_of(optax.adamw(1e-3), sampled=True)) == len(SHAPES)
+
+
+def spread_total() -> optax.GradientTransformation:
+    """A trace whose every leaf is its update plus the whole last trace's sum, that scalar spread over the
+    leaf's shape by stacking it once an entry: each new leaf reads every old one, though only a scalar of
+    them meets each update."""
+    def init(params):
+        return optax.TraceState(trace=jax.tree.map(jnp.zeros_like, params))
+
+    def update(updates, state, params=None):
+        del params
+        total = sum(jnp.sum(leaf) for leaf in jax.tree.leaves(state.trace))
+        trace = jax.tree.map(lambda held, new: new + jnp.stack([total] * held.size).reshape(held.shape),
+                             state.trace, updates)
+        return trace, optax.TraceState(trace=trace)
+    return optax.GradientTransformation(init, update)
+
+
 def test_an_update_that_reads_its_whole_state_stages_it_in_one_chunk():
-    """A trace scaled by its own global norm reads every leaf of the state into each update: one chunk."""
+    """A trace scaled by its own global norm reads every leaf of the state into each update: one chunk. So
+    does one that spreads a scalar of every leaf back over each leaf's shape (`spread_total`): a summary
+    is no larger than the distinct scalars it is made of, and a leaf-sized value of one scalar is a leaf
+    each update holds till the last chunk is read."""
     assert [len(chunk) for chunk in cut_of(normalized_trace())] == [len(SHAPES)]
+    assert [len(chunk) for chunk in cut_of(spread_total())] == [len(SHAPES)]
 
 
 def test_a_staged_commit_is_the_whole_commit_and_rests_where_it_rested():
@@ -127,7 +160,7 @@ def test_a_staged_weakly_typed_scalar_scales_as_it_does_unstaged():
 def a_staged_commit_holds_two_layers_of_host_resident_moments_at_once():
     """On a GPU, whose pinned host memory is apart from its own: AdamW's commit over eight layers' moments in
     pinned host memory, staged a layer at a time, compiles to temporaries of at most two layers' moments, the
-    two chunks the derivation counts (`dew.training.footprint.staged_bytes`). Its chunks' barriers hold it
+    two chunks its trace measures (`dew.training.staging.measured`). Its chunks' barriers hold it
     there: without them XLA fetched the moments ahead, as the whole fetch behind the gradient did, 11.5 MB of
     the 16.8 on an H100 against 3.2 staged, and 4.2 MB on an A100 (row 3526's residency probe)."""
     device = jax.devices()[0]

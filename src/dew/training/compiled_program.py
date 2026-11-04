@@ -21,7 +21,7 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
-from dew.nn.programs import platform_branch
+from dew.nn.programs import CALLS, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -109,9 +109,8 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         elif name == "cond" and params.get("branches_platforms") is not None:
             branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
-        elif name in CALLS and len(called := bodies(equation)) == 1 and (
-                len(called[0].invars), len(called[0].outvars)) == (len(operands), len(equation.outvars)):
-            body, consts = called[0], tuple(called[0].consts)
+        elif (program_called := called(equation)) is not None:
+            body, consts = program_called, tuple(program_called.consts)
             if params.get("differentiated"):
                 barrier, reading = prevented(operands, params.get("prevent_cse", False))
                 equations.extend(barrier)
@@ -124,17 +123,6 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
             params = {key: within(value, lowering) for key, value in params.items()}
         equations.append(equation.replace(invars=operands, params=params))
     return program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
-
-
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call"})
-"""The primitives that run a program on their operands, one for one, and return its results. A `jit`
-lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
-`GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a checkpoint
-(`_remat_lowering`, jax/_src/ad_checkpoint.py) and a custom derivative's primal
-(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py) lower to their program in the caller, so
-XLA sees no call. A result that is the program's own parameter is its operand's buffer, and one that is a
-cheap value of another is recomputed where it is read, as it would be without the call."""
 
 
 def prevented(operands: Sequence[jcore.Var | jcore.Literal], prevent_cse: bool | Sequence[bool]
@@ -200,6 +188,32 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The program a call (`CALLS`) runs on `equation`'s operands one for one, returning its results, else
+    None: every reader of a call through its program reads it here (`compiled`, `gradients_read`)."""
+    found = bodies(equation) if equation.primitive.name in CALLS else []
+    if len(found) == 1 and (len(found[0].invars), len(found[0].outvars)) == (
+            len(equation.invars), len(equation.outvars)):
+        return found[0]
+    return None
+
+
+def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
+    """Which gradient leaves each result of `program` reads, its operands reading `read`: a call's
+    (`called`, an optax tree helper's `jit` among them) through its program, any other
+    equation each of its results all its operands read."""
+    reads = dict(zip(program.invars, read, strict=True))
+    for equation in program.eqns:
+        operands = [reads.get(value, frozenset()) if computed(value) else frozenset()
+                    for value in equation.invars]
+        program_called = called(equation)
+        if program_called is not None:
+            reads.update(zip(equation.outvars, gradients_read(program_called, operands), strict=True))
+        else:
+            reads.update(dict.fromkeys(equation.outvars, frozenset().union(*operands)))
+    return [reads.get(value, frozenset()) if computed(value) else frozenset() for value in program.outvars]
 
 
 def evaluable(equation: jcore.JaxprEqn) -> bool:

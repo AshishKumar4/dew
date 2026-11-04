@@ -742,11 +742,20 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
 @pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
-    wave at most half full (`tail.balanced`): its tail's steps balanced over the programs, a
-    program's range crossing a tile's boundary, each tile fixed up across them, on par with XLA's over
-    the draws (check 1), truth float64's; at rows a step does not divide, and at a tile of 256 x 128."""
+    wave at most half full (`tail.balanced`, its hand-off unmeasured, so the tail is taken at these few
+    steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
+    boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
+    at rows a step does not divide, and at a tile of 256 x 128."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
-    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8)
+    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    gradient = grouped_matmul.MosaicTgmm()
+    with generation.assumed(target):
+        call = gradient.bind(spec((rows, depth)), spec((rows, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                             interpret=False, out_dtype="bfloat16", dense=True)
+        tile = gradient.derived(call, target)
+    assert tail.balanced(depth // tile.block_m * (width // tile.block_n), -(-rows // tile.block_k), 8,
+                         handoff_steps=mosaic_gpu.handoff_steps(tile, target)) is not None
 
     def dew(x, w, dy):
         del w
@@ -768,9 +777,12 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
     last wave at most half full (`tail.balanced`, `gmm`'s dense tail): its tail's steps balanced over the
     programs, each program's partial fixed up across them, through an RMS norm's prologue and a bias's
     epilogue, on par with the plain program over the draws (check 1), truth float64's; at rows a tile does
-    not divide. The template's interpreted route launches one program, so this calls the kernel (row 3587)."""
+    not divide. The template's interpreted route launches one program, so this calls the kernel (row 3587),
+    on a Hopper part whose hand-off is unmeasured, so the tail is taken at these few steps a tile."""
+    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     assert tail.balanced(-(-rows // COOPERATIVE.block_m) * (width // COOPERATIVE.block_n),
-                            depth // COOPERATIVE.block_k, 8) is not None
+                         depth // COOPERATIVE.block_k, 8,
+                         handoff_steps=mosaic_gpu.handoff_steps(COOPERATIVE, target)) is not None
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -791,7 +803,7 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
         h = normed(x, ms, nw).astype(wide)
         return biased(jnp.dot(h, w.astype(wide), preferred_element_type=wide), b).astype(out)
 
-    with generation.assumed("sm90"):
+    with generation.assumed(target):
         assert_as_exact(dew, jax.jit(plain), draw, f"balanced dense forward {rows}x{depth}x{width}",
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 

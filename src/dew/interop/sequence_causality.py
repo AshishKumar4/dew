@@ -17,7 +17,7 @@ and its keys' up to its own; attention under a visibility its caller states (`ST
 each position its own query's, key's and value's, the caller's visibility being the call's and not the
 source's; a computation Dew states is token by token (`TOKENWISE`) gives each token its own. Each of
 these three holds for a call of a program Dew's own code bound under it (`attested`), identified as that
-very program and never by a name; a call of any other program is walked inside (`compiled_program.CALLS`).
+very program and never by a name; a call of any other program is walked inside (`dew.nn.programs.CALLS`).
 Every position is an over-approximation: the walk may refuse a causal program, never admit a later
 read. A program is causal where every positional output's entry at a
 position reads no later one; another length's or another call's program may differ (a branch taken on
@@ -36,7 +36,8 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.nn.nested import nested
-from dew.training.compiled_program import CALLS, bodies
+from dew.nn.programs import CALLS
+from dew.training.compiled_program import bodies
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal

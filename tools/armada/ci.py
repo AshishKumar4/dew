@@ -921,13 +921,17 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
     return [(held, sorted(names)) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])]
 
 
-PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/")
+PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutorials/", "site/", ".github/",
+          "kernels/", "stubs/", "licenses/", "images/", ".thresh/")
 """Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
-notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
-elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
-no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
-reused)."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
+notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A native
+kernel package's sources (kernels/), which the environment installs as a built wheel, never as these
+files, a type stub, a license, an image and thresh's annotations are placed alike: each is the input of
+the files whose runs read it, of none where none does. A change elsewhere is placed by none, and runs
+the whole suite (`policy`): a workflow change reran every file while no record placed it (the
+maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused), and a change to
+a kernel package's wrapper ran train 537's whole suite on both Pythons."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md", "MANIFEST.in")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
 it turned the cache off for every train holding such a head, which then ran its whole suite on every

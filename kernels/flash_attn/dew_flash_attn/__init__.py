@@ -16,6 +16,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.custom_batching import custom_vmap
 
 
 def _load(name: str, report: str) -> tuple[ctypes.CDLL, tuple[str, ...]]:
@@ -226,6 +227,136 @@ def _backward(grad, query, key, value, out, lse, starts, longest, scale, causal,
     return _packed_backward2(grad, query, key, value, out, lse, starts, longest, scale, causal, window)
 
 
+def _fold(x):
+    """`x`'s mapped axis, first, folded into the kernel's own leading axis (a batch's rows, or a packed
+    call's tokens): its calls are independent, so one call over the folded rows is every mapped call's at
+    once."""
+    return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+
+
+def _unfold(x, size: int):
+    """`_fold`'s inverse: the kernel's leading axis split back into the mapped axis and its own."""
+    return x.reshape(size, x.shape[0] // size, *x.shape[1:])
+
+
+_GRID_ROWS = 65_535
+"""The most rows one call launches: FlashAttention-2 lays a call's batch, or a packed call's sequences, on
+CUDA's grid.y, which holds 65,535 (row 3740), and FlashAttention-3's backward gives non-finite gradients
+past it (an H100's fold of 98,304 rows, tests/test_kernels.py's mapped flash call, 11-03), so a fold takes
+no more mapped calls than keep it there."""
+
+_OFFSETS = np.iinfo(np.int32).max
+"""The largest offset the kernels bind (int32 `cu_seqlens`, ffi.cpp's S32 buffers)."""
+
+
+def _folded_starts(starts, size: int, tokens: tuple[int, int]):
+    """A packed call's offsets (the queries', the keys') over `size` mapped calls' tokens laid end to end,
+    each call `tokens` (queries, keys) long: each call's sequences in turn, shifted past the calls before
+    it (`_mapped_groups` keeps their total within the int32 offsets the kernels read)."""
+    folded = []
+    for offsets, count in zip(starts, tokens, strict=True):
+        shifted = offsets[:, :-1] + (jnp.arange(size, dtype=offsets.dtype) * count)[:, None]
+        folded.append(jnp.concatenate([shifted.reshape(-1), jnp.full((1,), size * count, offsets.dtype)]))
+    return tuple(folded)
+
+
+def _folded_lse(lse, packed: bool):
+    """A log-sum-exp of mapped calls, `[V, ...]`, in the kernel's layout over their folded rows: a batch's
+    `[V, B, H, S]` and FlashAttention-2's packed `[V, N, H, longest]` folded on their leading axis,
+    FlashAttention-3's packed `[V, H, T]` along its tokens, `[H, V T]`."""
+    if packed and _hopper():
+        return jnp.moveaxis(lse, 0, 1).reshape(lse.shape[1], -1)
+    return lse.reshape(-1, *lse.shape[2:])
+
+
+def _unfolded_lse(lse, size: int, packed: bool):
+    """`_folded_lse`'s inverse."""
+    if packed and _hopper():
+        return jnp.moveaxis(lse.reshape(lse.shape[0], size, -1), 1, 0)
+    return _unfold(lse, size)
+
+
+def _mapped_groups(size: int, rows: int, tokens: int = 0) -> list[tuple[int, int]]:
+    """The `size` mapped calls each kernel call folds, in order: as many as keep its rows, `rows` a mapped
+    call (a batch's, or a packed call's sequences), within `_GRID_ROWS`, and a packed call's tokens, at most
+    `tokens` a mapped call on either side, within the int32 offsets the kernels read (`_OFFSETS`); a call's
+    own offsets name its own tokens, so a group holds at least one."""
+    per = max(1, min(_GRID_ROWS // max(1, rows), _OFFSETS // max(1, tokens)))
+    return [(begin, min(begin + per, size)) for begin in range(0, size, per)]
+
+
+def _unmapped(function, *arguments):
+    """`function`'s results over no mapped call, each empty along the mapped axis, its shapes those of one
+    call over `arguments`' (the mapped calls' operands, mapped axis first) and no kernel launched."""
+    one = jax.eval_shape(function, *jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape[1:], x.dtype),
+                                                 arguments))
+    return jax.tree.map(lambda result: jnp.zeros((0, *result.shape), result.dtype), one)
+
+
+def _broadcast(x, mapped: bool, size: int):
+    """`x` with `jax.vmap`'s mapped axis first, broadcast to `size` where it is unmapped."""
+    return x if mapped else jnp.broadcast_to(x, (size, *x.shape))
+
+
+@functools.cache
+def _mapped_forward(packed: bool, longest, scale: float, causal: bool, window: tuple[int, int]):
+    """`_forward` under `jax.vmap` as one call over the mapped calls' rows (`_fold`), a call a group of them
+    the kernel's grid holds (`_mapped_groups`), however deep the maps nest: `starts` the packed offsets,
+    `()` for a batch."""
+    @custom_vmap
+    def forward(query, key, value, starts):
+        return _forward(query, key, value, starts if packed else None, longest, scale, causal, window)
+
+    @forward.def_vmap
+    def mapped(size, batched, query, key, value, starts):
+        q, k, v = (_broadcast(x, held, size)
+                   for x, held in zip((query, key, value), batched[:3], strict=True))
+        offsets = tuple(_broadcast(x, held, size) for x, held in zip(starts, batched[3], strict=True))
+        if size == 0:
+            return _unmapped(forward, q, k, v, offsets), (True, True)
+        tokens = (query.shape[-3], key.shape[-3])
+        outs, lses = [], []
+        for begin, end in (_mapped_groups(size, starts[0].shape[-1] - 1, max(tokens)) if packed
+                           else _mapped_groups(size, query.shape[-4])):
+            count = end - begin
+            folded = _folded_starts(tuple(x[begin:end] for x in offsets), count, tokens) if packed else ()
+            out, lse = forward(*(_fold(x[begin:end]) for x in (q, k, v)), folded)
+            outs.append(_unfold(out, count))
+            lses.append(_unfolded_lse(lse, count, packed))
+        return (jnp.concatenate(outs), jnp.concatenate(lses)), (True, True)
+
+    return forward
+
+
+@functools.cache
+def _mapped_backward(packed: bool, longest, scale: float, causal: bool, window: tuple[int, int]):
+    """`_backward` under `jax.vmap` as one call over the mapped calls' rows, as `_mapped_forward`."""
+    @custom_vmap
+    def backward(grad, query, key, value, out, lse, starts):
+        return _backward(grad, query, key, value, out, lse, starts if packed else None, longest, scale,
+                         causal, window)
+
+    @backward.def_vmap
+    def mapped(size, batched, grad, query, key, value, out, lse, starts):
+        g, q, k, v, o, held = (_broadcast(x, mapped_, size) for x, mapped_ in
+                               zip((grad, query, key, value, out, lse), batched[:6], strict=True))
+        offsets = tuple(_broadcast(x, mapped_, size) for x, mapped_ in zip(starts, batched[6], strict=True))
+        if size == 0:
+            return _unmapped(backward, g, q, k, v, o, held, offsets), (True, True, True)
+        tokens = (query.shape[-3], key.shape[-3])
+        grads = []
+        for begin, end in (_mapped_groups(size, starts[0].shape[-1] - 1, max(tokens)) if packed
+                           else _mapped_groups(size, query.shape[-4])):
+            count = end - begin
+            folded = _folded_starts(tuple(x[begin:end] for x in offsets), count, tokens) if packed else ()
+            dq, dk, dv = backward(*(_fold(x[begin:end]) for x in (g, q, k, v, o)),
+                                  _folded_lse(held[begin:end], packed), folded)
+            grads.append(tuple(_unfold(x, count) for x in (dq, dk, dv)))
+        return tuple(jnp.concatenate(part) for part in zip(*grads, strict=True)), (True, True, True)
+
+    return backward
+
+
 def _row_lse(lse, starts, tokens: int):
     """The kernel's log-sum-exp a query row, `[B, S, H]`, or `[T, H]` over packed sequences, from
     its layouts: `[B, H, S]` over a batch, and over packed sequences FlashAttention-3's `[H, T]` and
@@ -252,7 +383,8 @@ def _attend(query, key, value, sinks, starts, longest, scale, causal, window):
 
 
 def _attend_forward(query, key, value, sinks, starts, longest, scale, causal, window):
-    out, lse = _forward(query, key, value, starts, longest, scale, causal, window)
+    out, lse = _mapped_forward(starts is not None, longest, scale, causal, window)(
+        query, key, value, () if starts is None else starts)
     if sinks is None:
         return out, (query, key, value, sinks, starts, out, lse)
     # A sink adds e^s to each row's denominator and nothing to its sum of values, so the kernel's
@@ -282,7 +414,8 @@ def _attend_backward(longest, scale, causal, window, residuals, grad):
         # Every layout holds a row's log-sum-exp under its head, [..., H, rows].
         out = _sunk(out, lse, starts, sinks)
         lse = jnp.logaddexp(lse, sinks.astype(jnp.float32)[:, None])
-    dq, dk, dv = _backward(grad, query, key, value, out, lse, starts, longest, scale, causal, window)
+    dq, dk, dv = _mapped_backward(starts is not None, longest, scale, causal, window)(
+        grad, query, key, value, out, lse, () if starts is None else starts)
     zeros = jax.custom_derivatives.zero_from_primal
     offsets = None if starts is None else tuple(zeros(part) for part in starts)
     return dq, dk, dv, dsinks, offsets
