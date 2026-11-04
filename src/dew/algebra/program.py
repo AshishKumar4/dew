@@ -209,10 +209,10 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced: dict[int, list[jcore.JaxprEqn]] = {}
     windows = _windows(jaxpr)
-    target = cost.target() if windows else None
+    deriving = _deriving(accurate, saturation) if windows else None
     for window, yielded in windows:
         began = time.perf_counter()
-        done, reused = _derived(window, accurate, saturation, target)
+        done, reused = _derived(window, accurate, saturation, deriving)
         seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
@@ -260,14 +260,22 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
 
 
+def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
+    """What a rewrite's derivation reads beside its program, which keeps every rewrite the pass holds
+    (`_derived`, `_closed`): the numerics' forms, the saturation, the device it is priced for (`cost.target`,
+    resolved: a named target, an assumed generation or the process's own) and the rule sets the registry
+    admits for those numerics (`rules.admitted`, by name), so a target assumed or a set registered later
+    derives afresh."""
+    return accurate, saturation, cost.target(), tuple(sets.name for sets in rules.admitted(accurate))
+
+
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
-             target: generation.GpuTarget | None) -> tuple[Rewrite, bool]:
+             deriving: Hashable) -> tuple[Rewrite, bool]:
     """`window`'s rewrite (`_region`) and whether an earlier window derived it: one derivation for each
-    structure (`structure`), numerics' forms, saturation and target it is priced for (`cost.target`, which
-    the pricing reads where it runs), the process's latest `WINDOWS_HELD` kept. The planner's candidates and
-    a resumed run's relowering trace one step's program again and again, each window of it as the last
-    trace's."""
-    key = (structure(window), accurate, saturation, target)
+    structure (`structure`) and what else it reads (`deriving`, `_deriving`), the process's latest
+    `WINDOWS_HELD` kept. The planner's candidates and a resumed run's relowering trace one step's program
+    again and again, each window of it as the last trace's."""
+    key = (structure(window), deriving)
     with _HOLDING:
         done = _DERIVED.get(key)
         if done is not None:
@@ -709,7 +717,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
     rewrites = _REWRITTEN.setdefault(closed, {})
-    key = (accurate, saturation, ALGEBRA.value.target)
+    key = _deriving(accurate, saturation)
     if key not in rewrites:
         made = _rewritten(closed, accurate, saturation)
         rewrites[key] = None if made is closed else made
