@@ -559,6 +559,17 @@ def test_a_fetched_program_runs_the_executable_of_its_first_call():
         Fetched(owned_program(lambda scale, x: scale * x, static_argnums=0))
 
 
+def test_a_fetched_step_called_in_another_trace_context_runs_that_contexts_program():
+    """A fetched step (`Fetched`) keeps an executable for each trace context it is called in, as the program
+    compiles one for each: a step first run in float32 and then with 64-bit types on runs the program that
+    context traces (its default float the wider one), not the executable it fetched first."""
+    widened = Fetched(owned_program(lambda x: jnp.asarray(x, jnp.float_) * 3.0))
+    narrow = jnp.ones(3, jnp.float32)
+    assert widened(narrow).dtype == jnp.float32
+    with jax.enable_x64(True):
+        assert widened(narrow).dtype == jnp.float64
+
+
 def test_a_program_within_another_takes_the_enclosing_programs_options():
     """A program called within another trace (a kernel's own program inside a step) is the enclosing
     program's part and compiles under its options, as JAX takes compiler options on the outermost jit
