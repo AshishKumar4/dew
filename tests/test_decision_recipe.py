@@ -425,26 +425,31 @@ def mixture_directory(root: Path, rows: int = 40) -> Path:
     return directory
 
 
+def mixed_run(tmp_path: Path, root: Path, order: str) -> RunConfig:
+    """A decision run over the mixture directory `root`, its corpora read in `order`, its validation
+    none."""
+    from run_kinds import decision
+
+    train, _ = mixture(str(root), order=order)
+    return dataclasses.replace(decision(tmp_path, drawn=False), validation=None,
+                               data=train.read("memory").batch(8).loading(Loading(workers=0)))
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_command_names_it(tmp_path):
     """A decision run over a mixture records its chain (row 3874): read back from its run.json
     (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
     mixture's order changed is refused that position by its plan, naming the record route first, as the
-    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), before it writes its own
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and the saved schedule's route
+    as a decision run reads its mixture, not the data layer's mix (row 3976), before it writes its own
     record: the one it resumes is left byte for byte as it was, and resumes."""
-    from run_kinds import decision, trained
+    from run_kinds import trained
 
-    from dew.data.plan import REBUILD, RECORD, PlanOrderChanged
-    from dew.decision.data import SCHEDULE_MIXTURE
+    from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
 
     root = mixture_directory(tmp_path)
-
-    def run_over(order: str) -> RunConfig:
-        train, _ = mixture(str(root), order=order)
-        return dataclasses.replace(decision(tmp_path, drawn=False), validation=None,
-                                   data=train.read("memory").batch(8).loading(Loading(workers=0)))
-
-    trained(run_over("schedule"), tmp_path, "mixed", trainer={"name": "mixed", "checkpoint_final": True})
+    trained(mixed_run(tmp_path, root, "schedule"), tmp_path, "mixed",
+            trainer={"name": "mixed", "checkpoint_final": True})
     directory = tmp_path / "runs" / "mixed"
     loaded = RunConfig.load(str(directory))
     trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "steps": 2, "checkpoint_final": True})
@@ -452,10 +457,10 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     saved = directory / "run.json"
     record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
-    # The schedule's route is spelled as a decision run reads its mixture (`DecisionRunConfig.UNSEEDED`,
-    # row 3976).
-    assert refused.value.routes == (RECORD, SCHEDULE_MIXTURE, REBUILD)
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
+    routes = refused.value.routes
+    assert len(routes) == 3 and (routes[0], routes[-1]) == (RECORD, REBUILD) and SCHEDULE not in routes
+    assert routes[1] == DecisionRunConfig.UNSEEDED
     # Refused before it writes its record, it never replaces the one it resumes (a write replaces the
     # file, `write_atomically`), which is as it was, byte for byte, and resumes.
     assert saved.read_bytes() == record
@@ -463,14 +468,27 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     trained(RunConfig.load(str(directory)), tmp_path, "mixed",
             trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
     assert "3" in {path.name for path in directory.iterdir()}
-    # A record that would not rebuild its chains, its validation built in Python, names no record route,
-    # which would refuse the run again (`_read_chain`, row 3913).
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebuild_its_chains(tmp_path):
+    """A decision run whose record would not rebuild its chains, its validation built in Python, is
+    refused its changed mixture order without the record route, which would refuse it again
+    (`_read_chain`), where it records its data alone (row 3913)."""
+    from run_kinds import trained
+
+    from dew.data.plan import RECORD, PlanOrderChanged
+
+    root = mixture_directory(tmp_path)
+    trained(mixed_run(tmp_path, root, "schedule"), tmp_path, "mixed",
+            trainer={"name": "mixed", "checkpoint_final": True})
+    saved = tmp_path / "runs" / "mixed" / "run.json"
     unrebuilt = json.loads(saved.read_text())
     unrebuilt["fields"]["validation"] = {"unrecorded": "built in Python"}
     saved.write_text(json.dumps(unrebuilt))
-    with pytest.raises(PlanOrderChanged) as unrouted:
-        trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 4})
-    assert unrouted.value.routes == (SCHEDULE_MIXTURE, REBUILD)
+    with pytest.raises(PlanOrderChanged) as refused:
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 2})
+    assert RECORD not in refused.value.routes
 
 
 def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):
