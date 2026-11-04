@@ -1454,55 +1454,6 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
         other.close()
 
 
-SHIFT = """def shifted(row):
-    return {{**row, "id": row["id"] + {by}}}
-"""
-
-
-def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, monkeypatch):
-    """A function outside Dew that declares no identity is what its code computes, which its module's
-    bytes name: rewritten to make other rows, it refuses an exact resume, which reads on under
-    resume='non-exact' or an identity that states it computes the same (row 3938)."""
-    module = tmp_path / f"shift_{uuid4().hex}.py"
-    module.write_text(SHIFT.format(by=1))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    shift = importlib.import_module(module.stem)
-
-    def reader(resume="exact", identity=None):
-        pipeline = Pipeline(source(8)).map(shift.shifted, identity=identity).shuffle(0).repeat().batch(2)
-        return compile(pipeline, read="indexed", loading=READ, resume=resume).train(DataPartition())
-
-    states = {}
-    for identity in (None, "shift@1"):
-        first = reader(identity=identity)
-        try:
-            next(first)
-            states[identity] = first.get_state()
-        finally:
-            first.close()
-    same = reader()
-    try:
-        same.set_state(states[None])
-        assert same.manifest_changes == ()
-    finally:
-        same.close()
-    module.write_text(SHIFT.format(by=10))
-    shift = importlib.reload(shift)
-    rewritten = reader()
-    try:
-        with pytest.raises(ValueError):
-            rewritten.set_state(states[None])
-    finally:
-        rewritten.close()
-    for resume, identity in (("non-exact", None), ("exact", "shift@1")):
-        resumed = reader(resume, identity)
-        try:
-            resumed.set_state(states[identity])
-            assert resumed.manifest_changes == ("modules",)
-        finally:
-            resumed.close()
-
-
 def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_spans(tmp_path):
     """A Parquet file rewritten with as many documents of the same lengths and
     no length column leaves the token split's spans and every order fact

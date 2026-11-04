@@ -20,7 +20,7 @@ import functools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -235,7 +235,7 @@ def _summary(steps: Transition, returns: jax.Array):
     return returns, jax.tree.map(sequences, batch), ended_returns, jnp.sum(ended)
 
 
-class Saved(TypedDict, total=False):
+class Saved(TypedDict):
     """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`):
     every key but `served`, which one written before the rollout counted its own lacks."""
 
@@ -244,7 +244,7 @@ class Saved(TypedDict, total=False):
     collected: Mapping[str, np.ndarray]
     order: np.ndarray
     ended: np.ndarray
-    served: np.ndarray
+    served: NotRequired[np.ndarray]
 
 
 @dataclass

@@ -164,8 +164,6 @@ OPTIMIZERS = {
          "adam": stage_local_adam(1e-2)},
         lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params))),
         {}),
-    # optax's own LAMB, given as it is: its trust ratio a stateless transform reducing over a whole leaf.
-    "optax_lamb": (optax.lamb(1e-2, eps=1e-4, weight_decay=0.1), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
@@ -174,7 +172,8 @@ OPTIMIZERS = {
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
 every named optimizer Dew stacks (`STACKED_OPTIMIZERS`), its weight-decay mask's rank, Muon's matrix axes,
 QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group's patterns, int8 moments'
-threshold and Muon's variants; and transformations given as they are, M3's and optax's LAMB."""
+threshold and Muon's variants; and a transformation given as it is whose every state names its transform,
+M3's (one that may read a leaf whole keeps every layer whole: optax's LAMB, row 3934)."""
 
 LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
 """What the LoRA cell trains its factors with."""
@@ -292,8 +291,7 @@ def test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_op
     Read whole, a layer's norm scales stacked would decay as a matrix, Muon would find three sides,
     QK-Clip would find no maxima, LAMB would take one ratio over both stages, LaProp would clip both
     stages by one norm (row 3933), a group's pattern would miss, and int8 would quantize a moment one
-    layer keeps in float32; a transformation given as it is whose state cannot say it reads a leaf a
-    number at a time (optax's LAMB, a stateless trust ratio) keeps every layer whole (row 3934)."""
+    layer keeps in float32."""
     optimizer, fields = OPTIMIZERS[name]
     assert_trains_as_replicated(decoder(**fields), optimizer, f"stage-local {name}")
 
@@ -462,10 +460,11 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     every layer whole on every stage, given built or named by its import path in an `OptimConfig`, and the
     run's plan names what kept them whole. No per-layer view of a transform whose reductions only its own
     code knows is exact short of each layer a leaf of its own, which one program can hold on every stage
-    alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
+    alone, so the run trains as `Layout(stage_local=False)` trains it, and steps: optax's LAMB, whose trust
+    ratio over a stacked leaf would take one ratio over both stages, among them."""
     model = decoder()
     assert saving(functools.partial(trainer, model, stage_local_adam(1e-3), STAGED, 8, ema=None)) > 0
-    for given in (optax.adam(1e-3), optax.adafactor(1e-3),
+    for given in (optax.adam(1e-3), optax.lamb(1e-3), optax.adafactor(1e-3),
                   OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
