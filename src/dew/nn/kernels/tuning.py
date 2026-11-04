@@ -534,13 +534,6 @@ class KernelOp(tokamax.Op):
                                            **ba.kwargs)
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
-    def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
-        """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
-        one, else a config pinned for its kernel (`pinned`, raising `Unpinnable` where its key's legal
-        configs do not hold it), else in a tuning run its key's pick (`_pick`), else its own shapes'
-        heuristic."""
-        return self.config if self.config is not None else self._chosen(ba)
-
     def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
