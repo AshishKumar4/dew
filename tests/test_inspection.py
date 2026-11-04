@@ -14,6 +14,7 @@ import optax
 import pytest
 import test_run_budgets
 from objective_cases import cases
+from optim_support import stage_local_sgd
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, lm, scalars
 
@@ -573,7 +574,8 @@ def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool =
     indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
     staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])} if pipelined
               else {})
-    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
+    # A schedule's rate, so a pipelined run keeps its layers stage-local (`stage_local_sgd`, row 3996).
+    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), stage_local_sgd(RATE),
                   key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
                   **staged)
     tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
@@ -647,7 +649,7 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
 
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+    run = Trainer(LMObjective(model, 16), stage_local_sgd(RATE), key=jax.random.key(0), microbatches=2,
                   mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
@@ -811,7 +813,7 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
     def cotangents(**placed) -> dict[str, float]:
         model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                              num_kv_heads=2)
-        run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+        run = Trainer(LMObjective(model, 16), stage_local_sgd(RATE), key=jax.random.key(0), **placed,
                       inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
         tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
         return {name: value for name, value in inspected(run, {"text": tokens}).items()

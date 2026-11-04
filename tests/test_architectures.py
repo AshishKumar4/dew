@@ -30,7 +30,7 @@ from diffusion_support import images_of
 from flax import linen as nn
 from jepa_cases import MASK
 from map_judge import judging, pooled_units, record_units
-from optim_support import stage_local_adam
+from optim_support import stage_local_adam, stage_local_sgd
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -127,13 +127,14 @@ def make_objective(case: Case, model, encoder):
 
 
 LEARNING_RATE, MOMENTUM = 1e-2, 0.9
-LINEAR = optax.sgd(LEARNING_RATE, momentum=MOMENTUM)
+LINEAR = stage_local_sgd(LEARNING_RATE, momentum=MOMENTUM)
 """The optimizer the layouts are compared under: SGD with momentum moves the
 parameters and the momentum by each gradient linearly, so a layout's state
 differs from one device's by its gradients' rounding alone. Adam divides by
 each gradient's own size, so where a gradient is zero in exact arithmetic
 (a zero-initialised modulation's shift, a key bias) its rounding becomes a
-full step whose sign no order of summation fixes."""
+full step whose sign no order of summation fixes. Its rate is a schedule's,
+so a pipelined layout keeps its stacks stage-local (`stage_local_sgd`)."""
 
 
 def make_trainer(case: Case, tmp_path, mesh: MeshSpec, tracker=None, devices=None, optimizer=LINEAR):
@@ -586,6 +587,9 @@ def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: 
     the optimizer's state and the EMA following the parameters without the optimizer or the model ever
     describing a layout."""
     run, fitted = run_case(case, tmp_path, mesh, devices=devices, state=state, steps=steps)[:2]
+    # Its optimizer's every state names its transform, so a pipelined layout keeps whatever stacks its
+    # objective declares stage-local, none kept whole for the optimizer's sake (`StageLocal.of`, row 3996).
+    assert "layers_whole_for" not in run.plan
     stored = run.stored(fitted)
     for name, tree in ours.items():
         held = jax.device_get(getattr(stored, name))
