@@ -35,18 +35,10 @@ from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
-from dew.nn.programs import bodies
+from dew.nn.programs import bodies, computed
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.compiled_program import (
-    VIEWS,
-    Slicing,
-    compiled,
-    computed,
-    deviceless,
-    dimensions,
-    lowering_platform,
-)
+from dew.training.compiled_program import VIEWS, Slicing, compiled, deviceless, dimensions, lowering_platform
 from dew.training.memory import judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step

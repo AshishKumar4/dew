@@ -32,6 +32,7 @@ from dew.cache import ALGEBRA
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
+from dew.nn.programs import inlined
 
 
 @dataclasses.dataclass(frozen=True)
@@ -659,23 +660,13 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
             equations.append(equation)
             continue
         body = _opened(equation.params["call_jaxpr"])
-        inner: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(
-            zip(body.invars, equation.invars, strict=True))
-        for var, value in zip(body.constvars, body.consts, strict=True):
-            fresh = jcore.Var(var.aval)
-            inner[var] = fresh
-            constvars.append(fresh)
-            consts.append(value)
-
-        def within(atom: jcore.Var | jcore.Literal, inner=inner) -> jcore.Var | jcore.Literal:
-            return atom if isinstance(atom, jcore.Literal) else inner.get(atom, atom)
-
-        for made in body.eqns:
-            outvars = [jcore.DropVar(var.aval) if isinstance(var, jcore.DropVar) else jcore.Var(var.aval)
-                       for var in made.outvars]
-            inner.update(zip(made.outvars, outvars, strict=True))
-            equations.append(made.replace(invars=[within(atom) for atom in made.invars], outvars=outvars))
-        computed.update(zip(equation.outvars, map(within, body.outvars), strict=True))
+        # The body's constants the program's own, each a fresh variable of it (`inlined`).
+        fresh = [jcore.Var(var.aval) for var in body.constvars]
+        constvars += fresh
+        consts += list(body.consts)
+        made, results = inlined(body, equation.invars, fresh)
+        equations += made
+        computed.update(zip(equation.outvars, results, strict=True))
     return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
