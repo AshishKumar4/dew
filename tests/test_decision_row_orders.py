@@ -25,6 +25,7 @@ from dew.decision.layout import (
     State,
     StateFirstLayout,
     Text,
+    default_layout,
 )
 from dew.registry import from_record, to_record
 
@@ -332,3 +333,29 @@ def test_a_label_that_merges_with_the_text_before_it_leaves_options_found_alike_
         return encoded
 
     assert row(1).options_alike and not row(2).options_alike
+
+
+def test_a_fresh_heads_row_writes_a_choices_option_as_its_text():
+    """A fresh head's layout (`default_layout`) writes a choice's option as its description, the option's
+    text, so a key that only names it (`option_0`) writes nothing the row reads, and an option of no
+    description as its key; Laya's release reads its rows as it was trained, `key: description`. A fresh
+    layout's record reloads its writing, and a layout's record of the release's writing names none."""
+    question = Choice("What is the capital of France?",
+                      {"option_0": "Paris", "option_1": "London", "Rome": None})
+    names = LABELS.names_for(3)
+
+    def written(layout: QuestionLayout) -> str:
+        [row] = layout.rows(GPT2, SPECIALS, "a question about cities", {"q": question})
+        return GPT2.decode(list(row.tokens))
+
+    fresh = dataclasses.replace(default_layout(causal=True, one_question=True), labels=LABELS)
+    released = StateFirstLayout(labels=LABELS)
+    def lines(texts) -> str:
+        return "\n".join(f"{name}. {text}" for name, text in zip(names, texts, strict=True))
+
+    assert lines(("Paris", "London", "Rome")) in written(fresh) and "option_0" not in written(fresh)
+    assert lines(("option_0: Paris", "option_1: London", "Rome")) in written(released)
+    recorded = json.loads(json.dumps(to_record(fresh, StateFirstLayout)))
+    assert from_record(StateFirstLayout, recorded, dtypes=False) == fresh
+    assert "option_text" not in to_record(released, StateFirstLayout)
+
