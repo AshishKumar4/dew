@@ -39,10 +39,46 @@ _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a n
 """How a run whose saved data position this Dew cannot read goes on: every such refusal names both routes
 (row 3534)."""
 
-_REBUILT = ("resume it with the chain it saved, read back from its record "
-            "(`dew train <run directory>/run.json`, `RunConfig.load`), or build its chain as it was")
-"""How a run whose chain changed since it saved its position goes on: its record holds the chain it read
-(a default a later Dew changed, a decision mixture's corpus order among them, row 3870)."""
+REBUILD = "build its chain as it was"
+RECORD = "resume it from its record, which holds the chain it read (`dew train <run directory>/run.json`)"
+SCHEDULE = 'read its decision mixture in the schedule it saved (`mixture(..., order="schedule")`)'
+"""The routes a run whose chain changed since it saved its position takes (`PlanOrderChanged.routes`):
+built as it was; resumed from a record that holds its chain (`RunConfig.train` names it where the saved
+run's record does); a decision mixture saved before its corpus order was seeded read in that schedule
+(rows 3870, 3881)."""
+
+
+def _absent(value: JSON | None) -> str:
+    return "absent" if value is None else repr(value)
+
+
+class PlanOrderChanged(ValueError):
+    """A saved data position's plan whose order is not the chain's now: each order key `changed`, its saved
+    value and its value now (None where one holds none), and the `routes` its run goes on by (`REBUILD`,
+    `RECORD`, `SCHEDULE`), a mix's changed selection seed naming `SCHEDULE`."""
+
+    def __init__(self, changed: Mapping[str, tuple[JSON | None, JSON | None]], routes: tuple[str, ...]):
+        self.changed, self.routes = dict(changed), routes
+        keys = "; ".join(f"{key}: {_absent(before)} -> {_absent(now)}"
+                         for key, (before, now) in changed.items())
+        super().__init__(f"saved data plan order changed ({keys}); {', or '.join(routes)}")
+
+    @classmethod
+    def between(cls, saved: Mapping[str, object], now: Mapping[str, object]) -> PlanOrderChanged:
+        """The refusal of a position saved under order `saved`, read under `now`: each top-level key
+        whose value differs."""
+        changed = {key: (json_value(saved.get(key), key) if key in saved else None,
+                         json_value(now.get(key), key) if key in now else None)
+                   for key in sorted(set(saved) | set(now)) if saved.get(key) != now.get(key)}
+        return cls(changed, (*((SCHEDULE,) if "selection_seed" in changed else ()), REBUILD))
+
+    def routed(self, *, recorded: bool) -> PlanOrderChanged:
+        """This refusal with the record route first where the saved run's record holds its chain."""
+        return PlanOrderChanged(self.changed, ((RECORD,) if recorded else ()) + self.routes)
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.changed, self.routes)
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -862,8 +898,8 @@ class Plan:
         saved_order = unplaced(json_value(saved.get("order"), "saved order"))
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
-            raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> "
-                             f"{current['order']!r}; {_REBUILT}")
+            raise PlanOrderChanged.between(record(saved.get("order"), "saved order"),
+                                           record(current["order"], "order"))
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
@@ -935,7 +971,7 @@ class Plan:
         current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
         before_order = {name: value for name, value in order.items() if name not in mixture}
         if unplaced(before_order) != unplaced(current):
-            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}; {_REBUILT}")
+            raise PlanOrderChanged.between(before_order, current)
         return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
                 *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
                 *(("weights changed",) if order.get("weights") != self.order.get("weights") else ()))

@@ -22,6 +22,7 @@ too (`ModelConfig.defaults`), so a default changed since leaves the record
 building what it built.
 """
 
+import contextlib
 import copy
 import dataclasses
 import datetime
@@ -34,7 +35,7 @@ import shlex
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Required, Self, TypedDict, Union
@@ -54,6 +55,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
+from dew.data.plan import PlanOrderChanged
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.interop.weights import AUTO
@@ -1004,6 +1006,19 @@ def _with[T: "DataclassInstance"](holder: T, path: str, field: str | int | None)
     name, _, rest = path.partition(".")
     inner = field if not rest else _with(getattr(holder, name), rest, field)
     return dataclasses.replace(holder, **{name: inner})
+
+
+@contextlib.contextmanager
+def _routed(saved: Mapping[str, object] | None) -> Iterator[None]:
+    """Within the block, a refusal of a resumed run's changed chain (`PlanOrderChanged`) names the route of
+    the record it resumes where that record holds its chain, as a run.json written of a chain the codec
+    could not describe does not (`{"unrecorded": reason}`)."""
+    try:
+        yield
+    except PlanOrderChanged as refused:
+        named = None if saved is None else registry.class_record(saved)
+        data = None if named is None else named[1].get("data")
+        raise refused.routed(recorded=isinstance(data, Mapping) and "unrecorded" not in data) from None
 
 
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1961,12 +1976,16 @@ class RunConfig:
             checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
+            saved_file = epath.Path(checkpoints.directory) / RUN_FILE
+            # The record of the run this one resumes, read before it is written over: whether it holds
+            # its chain says which routes a changed chain's refusal names (`PlanOrderChanged`).
+            saved_record = json.loads(saved_file.read_text()) if saved_file.exists() else None
+
             def check_resumed() -> None:
                 """Refuse a checkpoint of another run under the name, or a directory `resume` refuses
                 (`Checkpoints.resumed`), on every rank, before the record is written over it."""
-                saved = epath.Path(checkpoints.directory) / RUN_FILE
-                if checkpoints.resumed(trainer.resume) is not None and saved.exists():
-                    self.check_resume(earlier_run(json.loads(saved.read_text())))
+                if checkpoints.resumed(trainer.resume) is not None and saved_record is not None:
+                    self.check_resume(earlier_run(saved_record))
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -1988,7 +2007,7 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             # Every program the run traces takes its recorded precision policy.
-            with generation.run_precision(trainer.precision):
+            with generation.run_precision(trainer.precision), _routed(saved_record):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).

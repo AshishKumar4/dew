@@ -494,14 +494,10 @@ class Decide(SavedRunTask, InItsForm):
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n"
-        # The weights' own file first, kept when a later step is fitted, then the run's latest. A latest a
-        # Dew that kept no file by step wrote is kept by its own weights before it is replaced.
+        # The weights' own file first, kept when a later step is fitted, then the run's latest.
         kept = _fitted_file(directory, self.weights)
         kept.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(kept, written)
-        latest = _calibrated(directory)
-        if latest is not None and not (held := _fitted_file(directory, latest[1])).exists():
-            write_atomically(held, json.dumps(latest[0], indent=1) + "\n")
         write_atomically(epath.Path(directory) / TASK_FILE, written)
         if self.weights.averaged:
             # The calibration file first: a save stopped before its checkpoint lands leaves a directory
