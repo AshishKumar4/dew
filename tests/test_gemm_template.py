@@ -738,6 +738,21 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
     np.testing.assert_array_equal(np.stack(walk, axis=1), np.asarray(expected))
 
 
+def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
+    """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a test
+    part's 8 multiprocessors move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
+    where a step at the device's peak over its multiprocessors read 16 times too short). At an H100's
+    measured 0.78 us hand-off, a tail of 2 to 5 steps a tile takes no balancing, as the walk whole is
+    cheaper, and one of 16 does."""
+    h100 = generation.gpu_target("sm90")
+    few = dataclasses.replace(h100, multiprocessors=8)
+    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, h100)
+    handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
+    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, h100) > 1
+    assert all(tail.balanced(11, steps, 8, handoff_steps=handoff) is None for steps in range(2, 6))
+    assert tail.balanced(11, 16, 8, handoff_steps=handoff) is not None
+
+
 @runs("sm90")
 @pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):

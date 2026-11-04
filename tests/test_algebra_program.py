@@ -99,8 +99,8 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
 def test_a_program_no_rule_changes_is_staged_once():
     """An outer program (`options.program`) whose math no rule changes (an opaque equation beside an unbounded
     sum), lowered with the pass on: each of its equations staged once, by jit's own trace, which lowers as it
-    is (`program.program_of`), where the pass's replay of its traced program staged each again (a Dory-4B
-    training step's 1.8 seconds of compile, nothing rewritten)."""
+    is (`program.rewritten_program`), where the pass's replay of its traced program staged each again (a
+    Dory-4B training step's 1.8 seconds of compile, nothing rewritten)."""
     from jax.extend import core as jex_core
     from jax.interpreters import mlir
 
@@ -759,14 +759,14 @@ def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
 
 def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
     """An Algebra span opened for the pass, around which no form is cheaper, leaves the program jit traced as
-    it is, its marked call kept (`program_of`: the same object, lowered as traced)."""
+    it is, its marked call kept (`rewritten_program`: the same object, lowered as traced)."""
     from dew.nn.derivatives import Algebra, marked
 
     def stepped(x):
         return marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x) * 2.0
 
     traced = jax.make_jaxpr(stepped)(rows(14, (8, 48))[0])
-    assert algebra.program_of(traced) is traced
+    assert algebra.rewritten_program(traced) is traced
 
 
 def _parameter_pairs():
