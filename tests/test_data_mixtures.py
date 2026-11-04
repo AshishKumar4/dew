@@ -626,7 +626,7 @@ def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares
 def test_a_seeded_mix_is_its_own_record_and_plan_and_ends_where_a_corpus_would_read_past_its_records():
     """A seeded mix's record carries its seed (`dew.data.records`): read back, it reads its corpora in the
     order it did. Its plan names the seed, so a plan of another seed refuses it (`Plan.check`) where one of
-    its own resumes. Read by index or streamed, a seeded mix of corpora too short for a whole window ends
+    its own resumes, as a shuffle's streamed window names its own. Read by index or streamed, a seeded mix of corpora too short for a whole window ends
     at the first position that would read past one, alike either way, each record once."""
     from dew.data.records import decode, encode
 
@@ -643,6 +643,12 @@ def test_a_seeded_mix_is_its_own_record_and_plan_and_ends_where_a_corpus_would_r
     assert plan.check(plan.record()) == ()
     with pytest.raises(ValueError):
         plan.check(other.record())
+    # A shuffle's streamed window is its step's identity too (an added field), its stage named as before.
+    whole, windowed = (compile(corpus(0, 600).shuffle(0, **form).batch(4), read="memory", loading=READ).plan
+                       for form in ({}, {"streamed": 16}))
+    assert whole.check(whole.record()) == ()
+    with pytest.raises(ValueError):
+        whole.check(windowed.record())
     short = mix([corpus(0, 3), corpus(1000, 5)], seed=0)
     indexed, streamed = ([int(row["id"]) for row in iterate(short, read=read)]
                          for read in ("memory", "streamed"))
