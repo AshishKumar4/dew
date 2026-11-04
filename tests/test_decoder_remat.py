@@ -164,9 +164,23 @@ def committed(step):
     return run
 
 
-@pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("scan", [False, True])
+@pytest.mark.parametrize(("shape", "scan"), [(shape, scan) for scan in (False, True) for shape in SHAPES
+                                             if (shape, scan) != ("altup", True)])
 def test_recomputed_blocks_train_the_same_model(shape, scan):
+    """`assert_recomputed_blocks_train_the_same_model` over every block but the scanned AltUp one, whose
+    128 seeds run as map tasks of their own
+    (`test_a_recomputed_scanned_altup_block_trains_the_same_model`)."""
+    assert_recomputed_blocks_train_the_same_model(shape, scan=scan)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_a_recomputed_scanned_altup_block_trains_the_same_model():
+    """`assert_recomputed_blocks_train_the_same_model` over the scanned AltUp block, its step's 128 sized
+    seeds drawn in map tasks of 32 (ledger 3827: 141 s in one task)."""
+    assert_recomputed_blocks_train_the_same_model("altup", scan=True)
+
+
+def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
     """Dropout, MTP, MoE balancing and shared K/V retain their derivatives.
 
     Both models start from the same initialized variables and the same
@@ -276,7 +290,7 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     """A checkpoint saved under one remat policy restores, value for value, into a template of the other,
     and the other model steps from it as from the state saved: the restore is exact, and so is the same
     program on the same values (that the two policies train alike is
-    `test_recomputed_blocks_train_the_same_model`'s)."""
+    `assert_recomputed_blocks_train_the_same_model`'s)."""
     model = model_for("shared", scan_layers=True, remat=saved_remat)
     variables = nn.unbox(model.init(jax.random.key(0), batch()["text"][:, :-1]))
     run, optimizer = training_step(model)

@@ -50,6 +50,10 @@ class Gemma3nProjector(ProjectorBase):
     vocab_size: int = 128
     vocab_offset: int = 262144
     norm_eps: float = 1e-6
+    scales_soft: bool = True
+    """Whether soft features are multiplied by sqrt(`vision_width`) before the embedder reads them:
+    Gemma 3n's image features are (modeling_gemma3n.py:1983 at transformers 5.17.0), and its audio
+    embedder reads its encoder's features as they are (:2192), which its norm's epsilon tells apart."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -73,10 +77,12 @@ class Gemma3nProjector(ProjectorBase):
 
     def __call__(self, features):
         features = jnp.asarray(features)
-        return self.soft_embeddings(features * jnp.asarray(self.vision_width ** 0.5, features.dtype))
+        if self.scales_soft:
+            features = features * jnp.asarray(self.vision_width ** 0.5, features.dtype)
+        return self.soft_embeddings(features)
 
     def soft_embeddings(self, features):
-        """The reference embedder over soft features, without vision-only scaling."""
+        """The reference embedder over soft features, without `scales_soft`'s scaling."""
         features = jnp.asarray(features)
         if features.ndim != 3 or features.shape[-1] != self.vision_width:
             raise ValueError(f"soft features must be [B, N, {self.vision_width}], got {features.shape}")

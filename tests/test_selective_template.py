@@ -82,9 +82,19 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["one row", "packed documents"])
-def test_the_template_is_as_exact_as_the_portable_scan_interpreted(packed):
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed)
+# The template's scan interpreted, each case a check-1 site of its own, its eight draws in armada map tasks of
+# four (`check1_shards`): whole, both took 200 s (site-tasks2 at d87423e30), a task of two seeds of both 91 s
+# (site-tasks at c17a54df2).
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_is_as_exact_as_the_portable_scan_interpreted():
+    """`the_template_is_as_exact_as_the_portable_scan` over one row."""
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted():
+    """`the_template_is_as_exact_as_the_portable_scan` over packed documents."""
+    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
 
 
 SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
@@ -199,14 +209,31 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
                     seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(run(truth, template=False))))
 
 
-@pytest.mark.parametrize("packed, held", [(False, None), (True, None), (False, "into the template"),
-                                          (False, "out of the template")],
-                         ids=["one row", "packed documents", "a held state into the template",
-                              "a held state out of the template"])
-def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
-    """The layer's cases interpreted, a held state's into the template and out of it apart: through it on
-    both calls it took 189 s on armada (6f7a1978a), each call 11 s a draw, past a test's two minutes."""
-    the_layer_is_as_exact_under_the_template(packed, held)
+# The layer's cases interpreted, each a check-1 site of its own, its eight draws in armada map tasks of
+# two (`check1_shards`): whole, each took 125 to 157 s (test_durations at 8e7d4ce444, row 3758), a task of
+# two seeds of the four 170 s (site-tasks at c17a54df2), about 20 s a case's seed.
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_is_as_exact_under_the_template_interpreted():
+    """`the_layer_is_as_exact_under_the_template` over one row."""
+    the_layer_is_as_exact_under_the_template(packed=False, held=None)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_packed_mamba_layer_is_as_exact_under_the_template_interpreted():
+    """`the_layer_is_as_exact_under_the_template` over packed documents."""
+    the_layer_is_as_exact_under_the_template(packed=True, held=None)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_from_a_held_state_into_the_template_is_as_exact_interpreted():
+    """`the_layer_is_as_exact_under_the_template` from a held state, the template on the second call."""
+    the_layer_is_as_exact_under_the_template(packed=False, held="into the template")
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpreted():
+    """`the_layer_is_as_exact_under_the_template` from a held state, the template on the first call."""
+    the_layer_is_as_exact_under_the_template(packed=False, held="out of the template")
 
 
 def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast", named: bool = False):
