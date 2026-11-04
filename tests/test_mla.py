@@ -79,7 +79,8 @@ GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
 SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
-         "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8}
+         "yarn": 16, "visibility": 16, "mla_v3 int8 latent decode": 8, "mla_v32 int8 latent decode": 8,
+         "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
@@ -257,7 +258,8 @@ def test_a_float16_indexer_weighs_its_heads_in_float32():
     its reference keeps that module in a float16 load (`_keep_in_fp32_modules`,
     modeling_deepseek_v32.py:689, modeling_utils.py:3826-3830), and its kernel stays float32 through the
     storage generation casts float32 master weights to (`decoding_storage`): the weights are bit for bit a
-    float32 indexer's over the float16 input cast up, as float32."""
+    float32 indexer's over the float16 input cast up, as float32, the two computed in one program (ledger
+    3178)."""
     hidden = jnp.asarray(np.random.default_rng(0x3080).standard_normal((2, 5, 32)), jnp.float16)
 
     def weigh(module, x):
@@ -267,9 +269,10 @@ def test_a_float16_indexer_weighs_its_heads_in_float32():
     variables = nn.unbox(half.init(jax.random.key(0), hidden, method=weigh))
     stored = decoding_storage(half, variables)
     assert stored["params"]["weights_proj"]["kernel"].dtype == jnp.float32
-    weights = half.apply(stored, hidden, method=weigh)
     single = SparseIndexer(n_heads=4, head_dim=16, rope_head_dim=8, dtype=jnp.float32)
-    wide = single.apply(variables, hidden.astype(jnp.float32), method=weigh)
+    weights, wide = jax.jit(lambda stored, variables, hidden: (
+        half.apply(stored, hidden, method=weigh),
+        single.apply(variables, hidden.astype(jnp.float32), method=weigh)))(stored, variables, hidden)
     assert weights.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(weights), np.asarray(wide))
 
@@ -355,20 +358,16 @@ def test_decode_matches_prefill(name):
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
     """A latent attention's cache takes the layer's layout: paged, it decodes every step as the compact
-    cache does at the same format, bit for bit, full precision or quantized, over the latents (V3) and
-    over the expanded keys the indexer selects among (V3.2), the quantized keys read back in the basis
-    their queries or their expansion take."""
+    cache does at the same format, bit for bit, both decoded in one program (ledger 3178), full precision
+    or quantized, over the latents (V3) and over the expanded keys the indexer selects among (V3.2), the
+    quantized keys read back in the basis their queries or their expansion take."""
     settings = CONFIG[SETTINGS[name]]
     variables = block_variables(fixture(name))
     hidden = block_draw(name)(0)[0]
-
-    def decoded(layout):
-        module = mla_module(settings, kv_cache=layout)
-        return np.asarray(jax.jit(lambda variables, hidden: decode_loop(module, variables, hidden))(
-            variables, hidden))
-
-    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
-                                  decoded(KVCache(quantized=quantized)))
+    paged, compact = (mla_module(settings, kv_cache=layout)
+                      for layout in (KVCache(quantized=quantized, page_size=4), KVCache(quantized=quantized)))
+    np.testing.assert_array_equal(*jax.jit(lambda variables, hidden: [
+        decode_loop(module, variables, hidden) for module in (paged, compact)])(variables, hidden))
 
 
 def uncached_dequantized_steps(module, variables, hidden, quantized: str):
@@ -429,11 +428,13 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
 def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_computes(name, quantized):
     """A quantized latent cache's decode held to no cache at all: each step as the block computes
     it over latents (V3) or expanded keys and values (V3.2) dequantized in their own basis
-    (`dequantized_in_own_basis`, plain jnp from the layout's rule). Bit for bit in float8, which
-    stores unrotated values the cache reads back as they are; int8 rotates its keys, which the cache
-    does in float32 and the own-basis run in float64 (the dense latents rotated back plain, the sparse
-    step's logits formed in the rotated basis from a rotated query), so each int8 decode is on par with
-    the own-basis run from that run in float64 over its declared draws (check 1). A basis conversion
+    (`dequantized_in_own_basis`, plain jnp from the layout's rule), each decode on par with the own-basis
+    run from that run in float64 over its declared draws (check 1): the cached steps project a step at a
+    time, where the own-basis run projects every position at once, two programs whose floats XLA keeps
+    no common bits between (ledger 3178). Float8 stores unrotated values the cache reads back as they
+    are; int8 rotates its keys, which the cache does in float32 and the own-basis run in float64 (the
+    dense latents rotated back plain, the sparse step's logits formed in the rotated basis from a
+    rotated query). A basis conversion
     dropped on either side, the sparse query's or the dense latents' plain read-back, moves the cached
     steps off this computation, where a paged-against-compact comparison at one format runs the same
     conversion on both arms."""
@@ -446,14 +447,10 @@ def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_com
     def draw(seed):
         return (block_draw(name)(seed)[0][:, :8],)
 
-    if quantized == "int8":
-        assert_as_exact(decoded, own, draw, f"{name} int8 latent decode",
-                        seeds=SEEDS[f"{name} int8 latent decode"],
-                        truth_fn=lambda hidden: uncached_dequantized_steps(module, widened(variables), hidden,
-                                                                           quantized))
-    else:
-        (hidden,) = draw(0)
-        np.testing.assert_array_equal(np.asarray(decoded(hidden)), np.asarray(own(hidden)))
+    assert_as_exact(decoded, own, draw, f"{name} {quantized} latent decode",
+                    seeds=SEEDS[f"{name} {quantized} latent decode"],
+                    truth_fn=lambda hidden: uncached_dequantized_steps(module, widened(variables), hidden,
+                                                                       quantized))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])
@@ -519,7 +516,8 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
     """A value narrower than the query rides into the fused kernel padded to
     the query's width, so the call has to hand back the value's own columns:
     the same numbers as the call where the caller writes that padding out,
-    and on par with the reference kernel from its float64 run (check 1). A
+    both in one program (ledger 3178), and on par with the reference kernel
+    from its float64 run (check 1). A
     value wider than the query has no such rewrite, since padding the query
     would move the kernel's own 1/sqrt(d) scale, and is refused.
     """
@@ -533,10 +531,10 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
     query, key, value = draw(0)
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
     with generation.assumed("sm80"):
-        narrow = fused(value)
+        narrow, padded = jax.jit(lambda value: (
+            fused(value), fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8]))(value)
         assert narrow.shape == (2, 7, 4, 8)
-        assert jnp.array_equal(
-            narrow, fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8])
+        assert jnp.array_equal(narrow, padded)
         with pytest.raises(ValueError):
             fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
         xla, reference = (functools.partial(scaled_dot_product_attention, implementation=name, causal=True)

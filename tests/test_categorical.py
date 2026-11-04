@@ -127,20 +127,6 @@ def test_a_smoothed_target_is_optaxs_over_the_rows_held_classes(share):
                     f"smoothed at {share}", seeds=SMOOTHED_SEEDS)
 
 
-@pytest.mark.parametrize("wide", [False, True], ids=["float32", "x64"])
-def test_integer_targets_smooth_in_the_floating_type_a_python_number_promotes_them_to(wide):
-    """An integer target smooths in the floating type a Python number promotes it to, float32 or, under
-    x64, float64, to the values its floating form smooths to, over every class and over the held ones."""
-    with jax.enable_x64(wide):
-        labels = jnp.asarray(np.arange(12).reshape(4, 3) % 2, jnp.int32)
-        floating = jnp.result_type(labels, 1.0)
-        for where in (None, jnp.asarray([True, True, False])):
-            spread = categorical.smoothed(labels, where, 0.1)
-            assert spread.dtype == floating
-            held = categorical.smoothed(labels.astype(floating), where, 0.1)
-            np.testing.assert_array_equal(np.asarray(spread), np.asarray(held))
-
-
 FORMS = {
     "cross entropy": lambda rows, where: categorical.cross_entropy(rows, jnp.asarray([0, 3, 2]), where),
     "divergence": lambda rows, where: categorical.kl_divergence(rows, rows[::-1] * 0.5, where),

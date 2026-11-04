@@ -124,53 +124,36 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
     walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
-    (`strategies.block_step`), crossing in the replay of what the block emits; a prompt that starts so
-    walks a token a block and still fills its budget."""
-    model, params = longrope_speculator(kind)
-    for held, steps in LONGROPE_CASES:
-        prompts = jnp.asarray(held)
+    (`strategies.block_step`), crossing in the replay of what the block emits, so a block's program holds
+    the rebuild, a whole prefill of the history, once: its candidates' verify compiles none (ledger 3703:
+    it held a second, 27 s of the DSpark program's compile on CPU). A prompt that starts so walks a token
+    a block and still fills its budget."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prediction_depths, prefill_state
+
+    model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
+    cases = [(jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32), 6),
+             (jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32), 2)]
+    params = jax.jit(model.init)(jax.random.key(0), cases[0][0])
+    for prompts, steps in cases:
         speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
                               sampling=Sampling(temperature=0), strategy=Speculative(block=3))
         np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
                                       greedy_walk(model, params, prompts, steps))
         np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
-
-LONGROPE_CASES = [(np.asarray([[1, 2, 3], [7, 8, 9]], np.int32), 6),
-                  (np.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], np.int32), 2)]
-"""Two rows' prompts that cross LongRoPE's change past their third token, and two that start at it, each
-with its budget."""
-
-
-def longrope_speculator(kind: str):
-    """`kind`'s model whose rotary changes tables past its sixth position, and its variables."""
-    model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
-    return model, jax.jit(model.init)(jax.random.key(0), jnp.asarray(LONGROPE_CASES[0][0]))
-
-
-@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
-def test_a_speculative_block_holds_a_longrope_rebuild_once(kind):
-    """A block's program holds the rebuild, a whole prefill of the history, once: its candidates' verify
-    compiles none, its replay the one (ledger 3703: the candidates' verify held a second, 27 s of the
-    DSpark program's compile on CPU). The speculative loop traced over the decode's own operations
-    (`DecodeOps`), each verify's program counted, run as traced."""
-    from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import decode_ops, prediction_depths, prefill_state
-
-    model, params = longrope_speculator(kind)
+    # The speculative loop traced over the decode's own operations (`DecodeOps`), each verify's program
+    # held: its conds, the rebuild's among them.
     ops = decode_ops(model, params, 0, prediction_depths(model))
     verified, conds = ops.verify, []
     assert verified is not None
 
     def verify(state, tokens, valid, **options):
-        program, shape = jax.make_jaxpr(lambda *operands: verified(*operands, **options),
-                                        return_shape=True)(state, tokens, valid)
+        program = jax.make_jaxpr(lambda *operands: verified(*operands, **options))(state, tokens, valid)
         conds.append(sum(equation.primitive.name == "cond" for equation in program.eqns))
-        outputs = jax.core.eval_jaxpr(program.jaxpr, program.consts, *jax.tree.leaves((state, tokens, valid)))
-        return jax.tree.unflatten(jax.tree.structure(shape), outputs)
+        return verified(state, tokens, valid, **options)
 
-    held, steps = LONGROPE_CASES[0]
-    prompts = jnp.asarray(held)
+    prompts, steps = cases[0]
     rows, width = prompts.shape
 
     def speculate(prompts):

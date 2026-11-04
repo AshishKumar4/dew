@@ -230,9 +230,11 @@ def a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis: str
                     truth_fn=module.clone(dtype=jnp.float64).apply)
 
 
-def mainloop_forward_cells() -> list[Cell]:
-    """The Mosaic mainloop's forward at the cases the CPU leaves to a GPU, and every hook it takes."""
-    return [
+def test_the_recurrences_run_on_this_gpu():
+    """Every recurrence cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
+    together; every direct mainloop call keeps its own bound."""
+    templates_finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
+    run_cells([
         *(Cell(f"the Mosaic forward is as exact as its reference: {name}",
                functools.partial(forward.the_mosaic_forward_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(forward.FORWARD_GRID, forward.INTERPRETED_FORWARD)),
@@ -241,12 +243,6 @@ def mainloop_forward_cells() -> list[Cell]:
                    forward.every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token,
                    hooks, packed)))
           for hooks in forward.TAKEN for packed in (False, True)),
-    ]
-
-
-def mainloop_gradient_cells() -> list[Cell]:
-    """The Mosaic mainloop's gradient at the cases the CPU leaves to a GPU, and a two-role walk's."""
-    return [
         *(Cell(f"the Mosaic gradient is as exact as its reference: {name}",
                functools.partial(gradient.the_mosaic_gradient_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(gradient.GRADIENT_GRID, gradient.INTERPRETED_GRADIENT)),
@@ -254,22 +250,10 @@ def mainloop_gradient_cells() -> list[Cell]:
                functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),
                "sm90")
           for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)),
-    ]
-
-
-def template_stability_cells() -> list[Cell]:
-    """The template finite and on par where chunked forms break, every form, regime and product."""
-    finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
-    return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
-                 f"{'' if forms is None else f' ({forms} forms)'}",
-                 functools.partial(finite, name, regime, product, forms))
-            for name, regime, product, forms in template_stability.CASES]
-
-
-def portable_and_ssd_port_cells() -> list[Cell]:
-    """The portable backward as a GPU compiles it, and the SSD port's forward and gradient under every
-    regime, and the SSD on the template against mamba_ssm."""
-    return [
+        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+               f"{'' if forms is None else f' ({forms} forms)'}",
+               functools.partial(templates_finite, name, regime, product, forms))
+          for name, regime, product, forms in template_stability.CASES),
         *(Cell(f"the portable backward as a GPU compiles it is as exact as the recurrence's: {name} {regime}",
                functools.partial(stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences,
                                  name, regime))
@@ -280,15 +264,6 @@ def portable_and_ssd_port_cells() -> list[Cell]:
           for regime in stability.REGIMES),
         Cell("the SSD on the template under the fast forms is as exact as mamba_ssm",
              mamba_ssd.the_template_is_as_exact_as_mamba_ssm),
-        *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
-               functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
-          for regime in stability.REGIMES),
-    ]
-
-
-def selective_cells() -> list[Cell]:
-    """Mamba's selective scan on the template against recorded mamba_ssm, and a Mamba layer under it."""
-    return [
         *(Cell(f"the selective scan on the template under the fast forms is as exact as mamba_ssm: {case}",
                functools.partial(selective_template.the_template_is_as_exact_as_mamba_ssm, case), "sm90")
           for case in selective_support.SEEDED_CASES),
@@ -297,23 +272,15 @@ def selective_cells() -> list[Cell]:
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
                "sm90")
           for packed, held in ((False, None), (True, None), (False, "through the template"))),
-    ]
-
-
-def short_conv_cells() -> list[Cell]:
-    """The short conv's kernels against XLA's conv at the training shapes."""
-    return [Cell(f"the short conv's kernels are as exact as XLA's at the training shapes: {model} "
-                 f"{dtype.__name__}{' packed' if packed else ''}",
-                 functools.partial(short_conv.the_kernels_are_as_exact_as_xla_at_the_training_shapes,
-                                   model, dtype, packed))
-            for model in sorted(short_conv.CONV_SHAPES) for dtype in (jnp.bfloat16, jnp.float32)
-            for packed in (False, True)]
-
-
-def port_training_cells() -> list[Cell]:
-    """Each recurrence layer trained on its port's kernels, its step repeating bit for bit, and the ports
-    against fla's own."""
-    return [
+        *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
+               functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
+          for regime in stability.REGIMES),
+        *(Cell(f"the short conv's kernels are as exact as XLA's at the training shapes: {model} "
+               f"{dtype.__name__}{' packed' if packed else ''}",
+               functools.partial(short_conv.the_kernels_are_as_exact_as_xla_at_the_training_shapes,
+                                 model, dtype, packed))
+          for model in sorted(short_conv.CONV_SHAPES) for dtype in (jnp.bfloat16, jnp.float32)
+          for packed in (False, True)),
         Cell(f"a gated delta net trains on its port on par with the portable rule ({PORT_KERNELS['fla']})",
              functools.partial(trains_on_its_port, gated_delta_net)),
         Cell(f"a Kimi delta attention layer trains on its port on par with the portable rule "
@@ -324,15 +291,6 @@ def port_training_cells() -> list[Cell]:
                functools.partial(repeats_bit_for_bit, make, kernel))
           for make, kernels in ((gated_delta_net, ("fla", "mosaic_gpu")), (kimi_delta_attention, ("fla",)))
           for kernel in kernels),
-        *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
-               functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
-          for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
-    ]
-
-
-def decode_cells() -> list[Cell]:
-    """The decode launches as a server runs them."""
-    return [
         *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step, its state "
                f"held in {jnp.dtype(held).name}", functools.partial(decodes_on_its_kernel, kernel, held))
           for kernel in ("fused", "step") for held in (jnp.float32, jnp.bfloat16)),
@@ -343,19 +301,7 @@ def decode_cells() -> list[Cell]:
                when(jax.device_count() >= 2, "needs two GPUs", functools.partial(
                    a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device, axis)))
           for axis in ("data", "tensor")),
-    ]
-
-
-FAMILIES = {"mainloop forward": mainloop_forward_cells, "mainloop gradient": mainloop_gradient_cells,
-            "template stability": template_stability_cells,
-            "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
-            "short conv": short_conv_cells, "port training": port_training_cells, "decode": decode_cells}
-"""The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
-family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes)."""
-
-
-@pytest.mark.parametrize("family", list(FAMILIES))
-def test_the_recurrences_run_on_this_gpu(family):
-    """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together; every direct mainloop call keeps its own bound."""
-    run_cells(FAMILIES[family]())
+        *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
+               functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
+          for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
+    ])

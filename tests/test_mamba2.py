@@ -162,12 +162,9 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(seeded_referenc
     assert_recorded_as_exact(seeded_reference, "layer_bf16")
 
 
-@pytest.mark.check1_shards(seeds=64, per_task=32)
 def test_the_layer_decodes_as_it_prefills(seeded_reference):
     """A prefill against the cache and single-token steps after it, against transformers' mixer at each step's
-    width ('decoded'): the conv tail and the SSM state both cross the step boundary. Its 64 recorded seeds,
-    a decode's prefill and steps compiled at each seed's widths, took 115 s of 143 cold on armada's CI CPU:
-    CI draws them in map tasks of 32 (ledger 3821)."""
+    width ('decoded'): the conv tail and the SSM state both cross the step boundary."""
     module = mamba2_layer()
     variables = mamba2_layer_params(mamba2_layer_draw(0))
     hidden = jnp.asarray(mamba2_layer_draw(0)["hidden"])

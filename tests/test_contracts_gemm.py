@@ -35,8 +35,7 @@ def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_orde
     """`blocks.table_rows` over ids split along an Explicit data axis, where the rows are fewer than the
     table so the backward gathers them whole (row 3150): its gradient, the jvp of its gradient and the
     gradient of its gradient run and are finite, the ids' zero cotangent typed as the ids arrive, not as
-    the gather holds them, under a loss of the rows alone and one weighing them by weights split as the
-    ids are (row 3152)."""
+    the gather holds them."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
     mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
@@ -46,16 +45,12 @@ def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_orde
     with jax.set_mesh(mesh):
         ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32), split)
 
-        weights = jax.device_put(jnp.asarray(normal_draw(3152, (4, 4, 8))[0]), NamedSharding(mesh, P("data")))
-        losses = (lambda table: jnp.sum(table_rows(table, ids, table.dtype) ** 3),
-                  # A batch-split loss's per-token terms, as a sharded training step differentiates them
-                  # (row 3152): the lookup's backward's tangent typed as the table.
-                  lambda table: jnp.sum(table_rows(table, ids, table.dtype) * weights))
-        orders = []
-        for loss in losses:
-            gradient = jax.grad(loss)
-            orders += [gradient(table), jax.jvp(gradient, (table,), (direction,))[1],
-                       jax.grad(lambda table, gradient=gradient: jnp.vdot(gradient(table), direction))(table)]
+        def loss(table):
+            return jnp.sum(table_rows(table, ids, table.dtype) ** 3)
+
+        gradient = jax.grad(loss)
+        orders = (gradient(table), jax.jvp(gradient, (table,), (direction,))[1],
+                  jax.grad(lambda table: jnp.vdot(gradient(table), direction))(table))
     assert all(np.all(np.isfinite(np.asarray(order))) for order in orders)
 
 

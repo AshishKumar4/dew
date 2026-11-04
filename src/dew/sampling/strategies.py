@@ -773,7 +773,7 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
                                 jnp.minimum(matched, block_size - 1)[:, None, None], axis=1)[:, 0]
-    residual = jnp.maximum(categorical.probabilities(target) - categorical.probabilities(draft), 0.0)
+    residual = jnp.maximum(jax.nn.softmax(target) - jax.nn.softmax(draft), 0.0)
     weight = jnp.sum(residual, axis=-1, keepdims=True)
     rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
     stopped = jnp.any(jnp.stack(ending, axis=1)

@@ -163,10 +163,6 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-        # Every commit and tree, and the tip's files as it is checked out: the scope reads names, merge bases and an
-        # earlier .armada.json, whose one blob is fetched as it is read. A full fetch of every branch's history took
-        # 3.4 minutes of a 33-minute train on a slow day, and 17 s against 2 s blobless on armada.
-        filter: blob:none
     # tools/armada/ci.py runs itself under the one Python every key is computed by (HASHED_BY), through uv.
     - uses: astral-sh/setup-uv@v6
     - id: policy

@@ -359,13 +359,14 @@ def next_token_cross_entropy(logits, ids):
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_scanned_init_is_the_plain_init(shape):
     """`init` draws the same way whatever `scan_layers` says, so the tree
-    holds the same leaves with the same values, and the scanned model reads
-    a checkpoint of the plain one leaf for leaf."""
+    holds the same leaves with the same values, both drawn in one program,
+    and the scanned model reads a checkpoint of the plain one leaf for leaf
+    (ledger 3178)."""
     build = SHAPES[shape]
     plain, scanned = build(), build(scan_layers=True)
     ids = jnp.ones((1, 4), jnp.int32)
-    first = nn.unbox(plain.init(jax.random.key(0), ids))
-    second = nn.unbox(scanned.init(jax.random.key(0), ids))
+    first, second = jax.jit(lambda key: [nn.unbox(model.init(key, ids)) for model in (plain, scanned)])(
+        jax.random.key(0))
 
     assert paths(first) == paths(second)
     assert all(jax.tree.leaves(jax.tree.map(
