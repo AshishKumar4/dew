@@ -320,20 +320,20 @@ class MosaicForward(_Mainloop[Tiles]):
         ring still streams at: a program pays its ring's first `stages` tiles before its first product, and
         a launch of more programs than the device runs at once pays it a program, so the least tile pays
         least, where its `stages` slots hold the bytes a program's share of the device's stream keeps in
-        flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's measured `Streamed.fixed`):
+        flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's measured `Measured.fixed`):
         a decode step of 128 rows over 4096 keys took 0.70 ms at 64-key tiles against 0.73 at 128 on an
         H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
         Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
         holds, or the part's stream is unmeasured."""
         query, value = ba.arguments["query"], ba.arguments["value"]
-        rate, streamed = target.memory_rate, target.streamed
-        if not (streams(query, target) and rate and streamed and target.multiprocessors):
+        rate, part = target.memory_rate, target.part
+        if not (streams(query, target) and rate and part and target.multiprocessors):
             return config
         family = bundle_of(config, query.dtype)
         itemsize = jnp.dtype(query.dtype).itemsize
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
-        in_flight = rate / target.multiprocessors * streamed.fixed
+        in_flight = rate / target.multiprocessors * part.fixed
         for extent in reversed(extents(family, query.dtype, config.block_k)):
             candidate = dataclasses.replace(config, block_k=extent)
             if config.stages * extent * per_key >= in_flight and self._launch_legal(ba, candidate, target):

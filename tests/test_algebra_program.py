@@ -482,7 +482,7 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
 
 
 def test_device_memory_is_priced_at_the_parts_measured_stream():
-    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.streamed`,
+    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
     reaches; a part no one measured, at its clocks' (row 3612)."""
     hopper = generation.TARGETS["sm90"]

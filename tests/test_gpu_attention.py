@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import test_attention_accurate_form as accurate_form
+import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
@@ -139,6 +140,9 @@ def test_the_attention_kernels_run_on_this_gpu():
           for name, softcap in (("plain", None), ("softcap", decode.SOFTCAP))),
         Cell("the decode kernel's attention differentiates as the folded attention",
              decode.attention_the_decode_kernel_takes_differentiates_as_the_folded_attention),
+        *(Cell(f"a verify block of {drafts} through the route is on par",
+               functools.partial(decode_template.a_verify_block_through_the_route_is_on_par, drafts))
+          for drafts in (4, 8, 16)),
     ])
 
 
@@ -176,6 +180,8 @@ KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misre
                 kernels.triton_trains_at_large_logits_on_par_with_xla,
                 kernels.triton_at_saturated_large_logits_is_finite_where_xla_is,
                 kernels.flash_trains_and_agrees_with_xla,
+                kernels.a_mapped_flash_call_is_each_rows_own,
+                kernels.a_fold_holds_the_kernels_grid_and_its_offsets,
                 kernels.packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time,
                 kernels.queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents,
                 kernels.fused_kernels_are_as_exact_as_the_xla_kernel_from_float64,

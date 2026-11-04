@@ -25,22 +25,18 @@ from typing import NamedTuple
 import jax
 import jax.extend.core as jcore
 import numpy as np
-import optax
 from jax.core import ShapedArray
 
 from dew._records import JSON
-from dew.averaging import ema_update
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
-from dew.gauss_newton import solves_equations
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
-    CALLS,
     VIEWS,
     Slicing,
     bodies,
@@ -50,10 +46,9 @@ from dew.training.compiled_program import (
     dimensions,
     lowering_platform,
 )
-from dew.training.memory import head_fused_of, head_tile_of, judged
+from dew.training.memory import judged
 from dew.training.narrow import forward_variables
-from dew.training.staging import chunks, flattened
-from dew.training.transaction import COMMIT_FIELDS, attempt_step
+from dew.training.transaction import attempt_step
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,7 +76,8 @@ class Footprint:
     admits on it provisionally, its compile deciding."""
     staged: int = 0
     """The bytes of the state's host-resident fields its commit holds on the device at once, beside the
-    whole gradient it reads (`staged_bytes`): none for a state the device holds."""
+    whole gradient it reads: the step's own staged cut as it is traced (`dew.training.staging.measured`),
+    none for a state the device holds."""
 
     @property
     def temporaries(self) -> int | None:
@@ -211,7 +207,7 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     forward and backward (`traced_gradient`, its outputs the gradient's), as JAX lowers it for `lowering`
     (`compiled`; `platform`'s own name where none is given, a GPU's CUDA's). Each gradient is held to the
     end, or, `consumed`, while it is made and no longer (`peak_bytes`'s): where the step reads it there
-    into the buffers the state donates (`consumed_where_made`), the optimizer's update or the
+    into the buffers the state donates (`transaction.consumed_where_made`), the optimizer's update or the
     accumulator's sum written in place (the donated state's outputs alias its arguments,
     `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
     operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
@@ -254,119 +250,6 @@ def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
     return total
 
 
-def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                                          optimizer: optax.GradientTransformation | None, state: TrainState,
-                                          window: int) -> bool:
-    """Whether the step reads each gradient where it is made into the buffers its state donates, so it
-    holds none beside another (`gradient_peak`'s `consumed`): with the state it commits (`COMMIT_FIELDS`,
-    the optimizer's and the EMA) in device memory, a window of several microbatches sums each into its
-    accumulator's gradient leaf in device memory, and a window of one updates each by `optimizer`, where
-    its update reads each gradient into its own leaf's results alone (`leaf_local`). A dynamically scaled
-    loss commits only once every gradient is known finite, a committed state fetched from the host is
-    fetched behind one barrier over every gradient (`Transaction.past`), a window
-    that replays its microbatches keeps their gradients for the replay, and an update that reads them
-    together (clipping by the global norm) holds them all until it has read the last. A head that takes its
-    gradient in the backward a tile at a time (`head_tile`, unfused) has XLA hold the layers' gradients to
-    the step's end: Qwen3.5-4B's step at 2 x 2048 tokens under 'minimal', compiled for an H100 at 59.4 GiB,
-    ran every layer's weight gradient and update after the whole backward, 20.1 GB of temporaries against
-    the 10.3 derived, where the whole logits' step ran them beside the backward; on an H100 itself the 13
-    layers its backward reached last waited (row 3653)."""
-    if head_tile_of(objective) is not None and not head_fused_of(objective):
-        return False
-    if state.scale is not None or not in_device((state.opt_state, state.ema)):
-        return False
-    if window > 1:
-        accumulated = None if state.accumulation is None else state.accumulation.gradient
-        return accumulated is not None and in_device(accumulated)
-    params, opt_state = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
-                                     (state.variables["params"], state.opt_state))
-    return optimizer is not None and leaf_local(optimizer, params, opt_state)
-
-
-def leaf_local(optimizer: optax.GradientTransformation, gradients, state) -> bool:
-    """Whether `optimizer`'s update of `gradients` from `state`, over parameters of their shapes, reads each
-    leaf of `gradients` into results that read no other gradient's leaf: no reduction, product or
-    concatenation across them. An update taking extra arguments is handed the run's progress and no
-    statistics of attention logits, as a step without them hands it (`Transaction.commit`); one solving its
-    objective's system (`dew.gauss_newton.solves_equations`) reads every leaf into each result. An equation
-    running a program of its own (a call, a loop) is read as reading every operand into each result."""
-    if solves_equations(state):
-        return False
-
-    def update(gradients, state, params, progress):
-        if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-            return optimizer.update(gradients, state, params, qk_stats=None, progress=progress)
-        return optimizer.update(gradients, state, params)
-
-    program = jax.make_jaxpr(update)(gradients, state, gradients, jax.ShapeDtypeStruct((), np.float32)).jaxpr
-    leaves = len(jax.tree.leaves(gradients))
-    read = [frozenset([index]) if index < leaves else frozenset() for index in range(len(program.invars))]
-    return all(len(leaves_read) <= 1 for leaves_read in gradients_read(program, read))
-
-
-def staged_bytes(optimizer: optax.GradientTransformation | None, state: TrainState, window: int) -> int:
-    """The bytes of `state`'s host-resident commit fields (`COMMIT_FIELDS`) its commit holds on the device
-    at once (`dew.training.staging`): the chunk it computes and the one it fetches as it stores the chunk
-    before, the two largest of those the optimizer's update and the average read together (`chunks`); or
-    the whole fields where the commit reads them at once, as a window of several microbatches commits under
-    a conditional, a dynamically scaled loss admits the commit on the whole committed state's finiteness,
-    and an update that solves its system reads the whole state. A device's share of each leaf."""
-    resting = {field: getattr(state, field) for field in COMMIT_FIELDS
-               if getattr(state, field) is not None and not in_device(getattr(state, field))}
-    whole = placed_bytes(list(resting.values()))
-    if (not resting or optimizer is None or window > 1 or state.scale is not None
-            or solves_equations(state)):
-        return whole
-    fields, structure = jax.tree.flatten(resting)
-    held = {field: getattr(state, field) for field in COMMIT_FIELDS if field not in resting}
-
-    def commit(fields, held, gradients, variables, progress):
-        current = {**held, **structure.unflatten(fields)}
-        extra = {"qk_stats": None, "progress": progress} if isinstance(
-            optimizer, optax.GradientTransformationExtraArgs) else {}
-        update, opt_state = optimizer.update(gradients, current["opt_state"], variables["params"], **extra)
-        moved = {**variables, "params": optax.apply_updates(variables["params"], update)}
-        return opt_state, None if current["ema"] is None else ema_update(current["ema"], moved, 0.5)
-
-    variables = abstract(state.variables)
-    traced = jax.make_jaxpr(commit)(abstract(fields), abstract(held), variables["params"], variables,
-                                    jax.ShapeDtypeStruct((), np.float32))
-    equations, _ = flattened(traced.jaxpr, traced.jaxpr.invars, traced.consts)
-    # Cut by the fields' whole bytes, as the commit cuts them (`staged`), each chunk held as a device's share.
-    cut, _, _ = chunks(equations, traced.jaxpr.invars[:len(fields)],
-                       [math.prod(leaf.shape) * leaf.dtype.itemsize for leaf in fields])
-    shares = sorted((placed_bytes([fields[index] for index in chunk]) for chunk in cut), reverse=True)
-    return min(whole, sum(shares[:2]))
-
-
-def abstract(tree):
-    """`tree`'s leaves as their shapes, dtypes and weak types alone, in no memory space of their own."""
-    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
-                                                          weak_type=jax.typeof(leaf).weak_type), tree)
-
-
-def in_device(tree) -> bool:
-    """Whether every leaf of `tree` is in device memory."""
-    return all(jax.typeof(leaf).memory_space == jax.memory.Space.Device for leaf in jax.tree.leaves(tree))
-
-
-def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list[frozenset[int]]:
-    """Which gradient leaves each result of `program` reads, its operands reading `read`: a call's
-    (`CALLS`, an optax tree helper's `jit` among them) through its program, any other equation each of its
-    results all its operands read."""
-    reads = dict(zip(program.invars, read, strict=True))
-    for equation in program.eqns:
-        operands = [reads.get(value, frozenset()) if computed(value) else frozenset()
-                    for value in equation.invars]
-        called = bodies(equation)
-        if equation.primitive.name in CALLS and len(called) == 1 and (
-                len(called[0].invars), len(called[0].outvars)) == (len(operands), len(equation.outvars)):
-            reads.update(zip(equation.outvars, gradients_read(called[0], operands), strict=True))
-        else:
-            reads.update(dict.fromkeys(equation.outvars, frozenset().union(*operands)))
-    return [reads.get(value, frozenset()) if computed(value) else frozenset() for value in program.outvars]
-
-
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
     """Whether `program`'s derived peak bounds what XLA makes of it from below: on a GPU, where it runs a
     ragged product, which holds at least its output while XLA lays the rest out as its target, dtype
@@ -387,10 +270,11 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
-    (`Frontier.fusing` says no: a matrix product, a call, a loop) holds beside them each operand a fused
-    chain computes, while it runs, and a cuBLAS matrix product its workspace too (`Workspace`); a
-    call's, a loop's or a checkpoint's own peak, its results among them, stands in for its results while
-    it runs, its body read with what it slices of the loop it runs in (`slicing`). A loop's carried
+    (`Frontier.fusing` says no: a matrix product, a loop) holds beside them each operand a fused chain
+    computes, while it runs, and a cuBLAS matrix product its workspace too (`Workspace`); a loop's or a
+    conditional's own peak, its results among them, stands in for its results while it runs, its body
+    read with what it slices of the loop it runs in (`slicing`); `program` has its calls inlined
+    (`compiled`). A loop's carried
     value is one buffer from its initial value, where that is a buffer of the program's the loop reads
     last, to its result, its body's returned value of it among them (`carry`; `carried`, the values
     `program`, a loop's body, returns into it). With `consumed`, an output is held while the equation
@@ -653,11 +537,8 @@ def element_type(value) -> np.dtype | None:
 def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     """Whether XLA's fusion on `platform` recomputes what `equation` computes in each consumer rather than
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
-    `REAL_CHEAP` over real values); a call, or a custom derivative's primal, of nothing else."""
+    `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
     name = equation.primitive.name
-    if name in ("pjit", "jit", "custom_jvp_call"):
-        inner = equation.params["jaxpr" if name != "custom_jvp_call" else "call_jaxpr"].jaxpr
-        return all(recomputed(each, platform) for each in inner.eqns)
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:
@@ -720,15 +601,16 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
-                                          held: int, target, split: int = 1,
-                                          optimizer: optax.GradientTransformation | None = None,
-                                          capacity: int | None = None) -> Footprint:
+                                          held: int, target, split: int, consumed: Callable[[], bool],
+                                          staged: int, capacity: int | None = None) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
-    (`gemm_workspace`), each gradient held while it is made where the step's `optimizer` or accumulator
-    reads it there (`consumed_where_made`), its trained parameters' gradient, laid out as they are, and
-    `held`. Over
+    (`gemm_workspace`), each gradient held while it is made where the step reads it there (`consumed`,
+    `transaction.consumed_where_made`, asked only where the peak is derived), its trained parameters'
+    gradient, laid out as they are, and
+    `held`, and `staged`, the bytes of its host-resident commit fields its own staged cut holds at
+    once (`dew.training.staging.measured`, as the step is traced). Over
     several devices that split the microbatch's rows alone (data and fully sharded data parallelism,
     `row_axes`) the residuals are one device's: the loss traced as one device's step, over a mesh of the
     run's axes each of one device, at that device's share of the microbatch (each leaf's shard,
@@ -764,12 +646,9 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             lowering = lowering_platform(target)
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering,
-                                            consumed=consumed_where_made(objective, optimizer, prepared,
-                                                                         window))
+                                            lowering=lowering, consumed=consumed())
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
-                     None if peak is None else peak.bytes, peak is None or peak.exact,
-                     staged_bytes(optimizer, prepared, window))
+                     None if peak is None else peak.bytes, peak is None or peak.exact, staged)

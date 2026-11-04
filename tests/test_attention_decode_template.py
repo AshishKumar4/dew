@@ -106,10 +106,9 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 @pytest.mark.parametrize("hook", ["plain", "sinks", "far"])
 def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted(hook):
     """A decode step of 17 rows over 8 key heads (136 programs, past an H100's 132 multiprocessors), so its
-    work list takes one slice a row (`plan`), its launches walk their tiles persistent (`_persistent`, a
-    program a multiprocessor) and the walk finishes each row itself from the initial state (a sink's), in
-    the query's dtype; `far` its first row's query 2^16 times a drawn one, past the fold's reach, so the
-    masked rewalk walks that row's tile alone among inactive ones: on par with the reference path
+    work list takes one slice a row (`plan`) and the walk finishes each row itself from the initial state (a
+    sink's), in the query's dtype; `far` its first row's query 2^16 times a drawn one, past the fold's reach,
+    so the masked rewalk walks that row's query block alone: on par with the reference path
     (check 1)."""
     batch, heads, keys = 17, 8, 128
     lengths = jnp.asarray([keys - 7 * row for row in range(batch)], jnp.int32)
@@ -184,6 +183,36 @@ def test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted(drafts):
 
     assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
                     lambda seed: drawn(seed)[:3], f"template verify block of {drafts}", seeds=SEEDS)
+
+
+def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
+    """A GPU cell (tests/test_gpu_attention.py): a speculative verify block as the layer's cached call states
+    it (`CrossDocuments` of its drafts over each row's held keys, causal), through the attention template's
+    route, which runs a memory-bound inference call as the decode's work list (`attention_decode.serves`), 32
+    query heads over 8 key heads, rows of their own lengths over 4096 keys: on par with the reference path
+    over the same documents (check 1)."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.documents import CrossDocuments
+
+    rows, keys = 2, 4096
+    held = jnp.asarray([keys - drafts, 1000], jnp.int32)
+    documents = CrossDocuments(jnp.ones((rows, drafts), jnp.int32),
+                               (jnp.arange(keys)[None] < (held + drafts)[:, None]).astype(jnp.int32))
+
+    def attended(implementation):
+        def attend(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                                implementation=implementation)
+        return attend
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (rows, drafts, 32, 128), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (rows, keys, 8, 128), jnp.bfloat16) for stream in streams[1:])
+        return query, key, value
+
+    assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), draw,
+                    f"verify block of {drafts} through the route", seeds=SEEDS)
 
 
 PAGE = 128

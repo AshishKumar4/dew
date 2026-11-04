@@ -8,7 +8,6 @@ slice count its work list takes (every count a case, Hypothesis drawing the rows
 pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
 the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
-import dataclasses
 
 import hypothesis
 import jax
@@ -122,26 +121,47 @@ def _decode_spans(lengths):
     return template.spans(1, DECODE_KEYS, DECODE_ROWS, lengths=jnp.asarray(lengths, jnp.int32))
 
 
-PERSISTENT = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=2)
-"""An H100 of two multiprocessors: a decode step's launches of more programs than two walk their tiles
-persistent (`attention_mosaic_forward._persistent`), a slice's among them."""
+@INTERPRETS
+def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
+    """A decode step cut into 8 slices a row, its first row's query 2^16 times a drawn one (past the fold's
+    reach, so the masked rewalk walks it) and 70 keys long, two key tiles: its six slices of no key store
+    their empty walks' start in the rewalk for the merge to read (row 3778). On par with the step walked
+    whole (check 1)."""
+    spans = _decode_spans((70, DECODE_KEYS))
+
+    def far(seed: int):
+        query, key, value = _decode_draw(seed)
+        return query.at[0].multiply(2.0 ** 16), key, value
+
+    def sliced(query, key, value):
+        with generation.assumed("sm90"):
+            rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
+            config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
+                                           target=generation.gpu_target()).config
+            with tuning.pinned({attention_mosaic.MosaicForward: config}):
+                out, maximum, total = attention_mosaic.forward(
+                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
+                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=8)[:3]
+            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
+            merged = attention_decode.merged(spec, out, maximum, total)
+            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
+
+    assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
+                    "a far short row's slices through its masked rewalk", seeds=SEEDS)
 
 
 @INTERPRETS
 @INTERPRETED
-@pytest.mark.parametrize("gpu", ["sm90", "persistent"])
 @pytest.mark.parametrize("slices", [1, 2, 4, 8])
 @hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
-def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, gpu,
-                                                                                        lengths):
+def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
     decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
-    lengths: on par with the step walked whole, on an H100 and on one of two multiprocessors (`PERSISTENT`),
-    whose programs walk the slices' tiles in turn."""
+    lengths: on par with the step walked whole."""
     spans = _decode_spans(lengths)
 
     def sliced(query, key, value):
-        with generation.assumed("sm90" if gpu == "sm90" else PERSISTENT):
+        with generation.assumed("sm90"):
             rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
             config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                            target=generation.gpu_target()).config
