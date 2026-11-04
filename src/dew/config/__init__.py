@@ -1983,29 +1983,6 @@ class RunConfig:
             built = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead)
 
-            # The record of the run this one resumes, as each rank read it once the pool agreed it.
-            resumed: dict[str, Mapping[str, object]] = {}
-
-            def check_resumed() -> None:
-                """Refuse a checkpoint of another run under the name, or a directory `resume` refuses
-                (`Checkpoints.resumed`), on every rank, before the record is written over it."""
-                saved = epath.Path(checkpoints.directory) / RUN_FILE
-                if checkpoints.resumed(trainer.resume) is not None and saved.exists():
-                    record = json.loads(saved.read_text())
-                    self.check_resume(earlier_run(record))
-                    resumed["record"] = record
-
-            def check_data() -> None:
-                """Refuse a saved data position the run's data does not read on from (`resume_admitted`),
-                once the pool agreed its record resumes, before that record is written over: a changed
-                chain's refusal names the record it resumes where that holds its chain."""
-                if "record" in resumed and isinstance(dataset, Loader):
-                    from dew.training.startup import resume_admitted
-
-                    with _routed(resumed["record"]):
-                        resume_admitted(built, dataset, trainer.resume,
-                                        examples=dataset.examples if steps is None else None)
-
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
@@ -2020,9 +1997,7 @@ class RunConfig:
 
             # The whole pool accepts the resume, its data among it, before its record is replaced or its
             # state restored.
-            agreed("run resume", check_resumed)
-            # Its data position read apart, a restore every rank enters only once all accept the record.
-            agreed("run data", check_data)
+            self._agree_resume(checkpoints, built, dataset, steps)
             agreed("run metadata", record_run)
             # Every program the run traces takes its recorded precision policy.
             with generation.run_precision(trainer.precision):
@@ -2130,6 +2105,37 @@ class RunConfig:
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
             self.optim, param_groups=groups)
+
+    def _agree_resume[LossT, EffectsT](self, checkpoints: Checkpoints,
+                                       built: "Trainer[LossT, EffectsT]", dataset: Loader,
+                                       steps: int | None) -> None:
+        """Refuse, on every rank and before the run's record is written over what it resumes, a checkpoint
+        of another run under the name or a directory `resume` refuses (`Checkpoints.resumed`,
+        `check_resume`); then, in an agreement of its own, so every rank enters the position's restore
+        only once all accept the record, a saved data position the run's data does not read on from
+        (`resume_admitted`), a changed chain's refusal naming the record it resumes where that holds its
+        chain (`_routed`)."""
+        resume = self.trainer.resume
+        # The record of the run this one resumes, as each rank read it once the pool agreed it.
+        resumed: dict[str, Mapping[str, object]] = {}
+
+        def check_resumed() -> None:
+            saved = epath.Path(checkpoints.directory) / RUN_FILE
+            if checkpoints.resumed(resume) is not None and saved.exists():
+                record = json.loads(saved.read_text())
+                self.check_resume(earlier_run(record))
+                resumed["record"] = record
+
+        def check_data() -> None:
+            from dew.training.startup import resume_admitted
+
+            if "record" in resumed:
+                with _routed(resumed["record"]):
+                    resume_admitted(built, dataset, resume,
+                                    examples=dataset.examples if steps is None else None)
+
+        agreed("run resume", check_resumed)
+        agreed("run data", check_data)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
