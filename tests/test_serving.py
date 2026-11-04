@@ -819,15 +819,32 @@ one-entry-booked-twice's at 512."""
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
+    ids=["by-default", "in-pieces", "every-page", "restores-past-admission"])
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
+                                                                             site):
+    """`assert_reads_a_shared_prefix`'s sites of 256 seeds, which CI draws in map tasks of 64: the default
+    store's took 92 to 108 s in one task with its bundle on armada, its first task of 128 cold 115 s
+    (ledger 3759)."""
+    assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+
+
+@pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None,
      NARROW_HYBRID_TAILED),
     ((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))), {"prefix_states": 1},
-     (0, 8), (2, 2), NARROW_HYBRID_TAILED),
-    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
-    ids=["by-default", "in-pieces", "every-page", "evicted", "one-entry-booked-twice",
-         "restores-past-admission"])
-def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
-                                                                             site):
+     (0, 8), (2, 2), NARROW_HYBRID_TAILED)],
+    ids=["evicted", "one-entry-booked-twice"])
+@pytest.mark.check1_shards(seeds=512, per_task=128)
+def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry(requests, options, hits, rounds,
+                                                                        site):
+    """`assert_reads_a_shared_prefix`'s sites of 512 seeds, a store of one entry's, which CI draws in map
+    tasks of 128."""
+    assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+
+
+def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     """A shared prefix's pages hold its keys, and a hybrid stack's rows keep their recurrent memory and
     conv tail beside them: the server keeps the state a prompt leaves at its deepest shareable page
     boundary (and every `prefix_state_every` pages below it), a piece cut to end there, and a later prompt
