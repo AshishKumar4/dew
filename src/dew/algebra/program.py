@@ -263,10 +263,12 @@ def structure(window: jcore.Jaxpr) -> Hashable:
 def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
     """What a rewrite's derivation reads beside its program, which keeps every rewrite the pass holds
     (`_derived`, `_closed`): the numerics' forms, the saturation, the device it is priced for (`cost.target`,
-    resolved: a named target, an assumed generation or the process's own) and the rule sets the registry
-    admits for those numerics (`rules.admitted`, by name), so a target assumed or a set registered later
-    derives afresh."""
-    return accurate, saturation, cost.target(), tuple(sets.name for sets in rules.admitted(accurate))
+    resolved: a named target, an assumed generation or the process's own), the matmul precision a product
+    of none stated is priced at (`cost._mode`) and the rule sets the registry admits for those numerics
+    (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later derives
+    afresh."""
+    return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
+            tuple(sets.name for sets in rules.admitted(accurate)))
 
 
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
