@@ -585,6 +585,44 @@ def test_a_member_shuffled_for_its_read_continues_its_order_into_the_next_phase(
         assert sorted(own) == list(range(start, start + 40)) and own != sorted(own)
 
 
+def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares():
+    """A mix seeded (`mix(seed=)`) reads its corpora in an order each window of the mix draws, its
+    proportions' sum of positions (300 for three equal weights), not Grain's schedule, which reads one of
+    each in the members' order every three positions: its opening and its windows differ by seed and
+    from that schedule, every window reads each corpus 100 times, and the counts a prefix of it holds
+    (`Proportions.counts`) are the ones it read at every prefix, indexed or streamed. A phase after
+    100 steps of it reads on each corpus where the mix left it, each record once."""
+    from dew.data.mixing import Proportions
+
+    def corpus(start: int) -> Pipeline:
+        return Pipeline(Memory({"id": np.arange(start, start + 600, dtype=np.int32)}))
+
+    def ids(seed, read) -> list[int]:
+        chain = mix([corpus(0), corpus(1000), corpus(2000)], seed=seed)
+        return [int(row["id"]) for row in iterate(chain, read=read)]
+
+    schedule = [0, 1, 2] * 600
+    for read in ("memory", "streamed"):
+        drawn = {seed: [value // 1000 for value in ids(seed, read)] for seed in (0, 1)}
+        assert ([value // 1000 for value in ids(None, read)] == schedule and drawn[0] != drawn[1]
+                and drawn[0][:6] != drawn[1][:6] and schedule not in drawn.values()), read
+        for seed, corpora in drawn.items():
+            proportions = Proportions.of((1.0, 1.0, 1.0), seed)
+            assert all(np.bincount(corpora[start:start + 300], minlength=3).tolist() == [100] * 3
+                       for start in range(0, len(corpora), 300))
+            assert all(proportions.counts(prefix) == tuple(np.bincount(corpora[:prefix], minlength=3))
+                       for prefix in range(0, len(corpora) + 1, 37))
+    def both() -> Pipeline:
+        return mix([corpus(0).repeat(), corpus(1000).repeat()], seed=3)
+
+    stream = trained(phases((both(), 100), (both(), None)))
+    read = [int(value) for batch in itertools.islice(stream.train(DataPartition()), 300)
+            for value in batch["id"]]
+    for start in (0, 1000):
+        own = [value for value in read if start <= value < start + 1000]
+        assert own[:600] and sorted(own[:600]) == list(range(start, start + 600)), start
+
+
 def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp_path):
     """Packed phases step one program: a phase whose windows hold one document each and one whose
     windows hold four both declare four (`Coordinates.max_segments`), not their own most nor the
