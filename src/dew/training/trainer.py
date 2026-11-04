@@ -106,6 +106,7 @@ from dew.training._fit import (
     _rollout_admitted,
     _rollout_resumed,
     _rollout_saved,
+    admitted,
     afresh,
     check_inputs,
     clocked,
@@ -1635,6 +1636,20 @@ class Trainer(Generic[Loss, Effects]):
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
+
+    def admits(self, dataset: Loader, resume: Resume = "auto") -> None:
+        """Refuse a resume under `resume` whose saved data position `dataset` would not read on from, as
+        `fit` refuses it where it opens its data, before the run writes anything over what it resumes:
+        the position of this process's share at the step it continues (`Checkpoints.resumed`,
+        `Checkpoints.position`), restored on a stream opened and closed (`_fit.admitted`). Nothing
+        where it continues no step or saved no position."""
+        checkpoints = self.checkpoints
+        step = None if checkpoints is None else checkpoints.resumed(resume)
+        if checkpoints is None or step is None:
+            return
+        partition = DataPartition.of(self.device_mesh)
+        if (saved := checkpoints.position(step, partition)) is not None:
+            admitted(dataset, partition, saved)
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
