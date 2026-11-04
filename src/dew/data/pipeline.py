@@ -582,13 +582,6 @@ class Shuffle:
     """Where `window` is None, the records a streamed read draws its order from, whose records no index
     permutes whole (`Pipeline.shuffle`); None for a shuffle a streamed read refuses."""
 
-    def __repr__(self) -> str:
-        """The shuffle as a plan names its stage (`dew.data.analysis`): its streamed window only where
-        it has one, so a shuffle without one names itself as it always did."""
-        streamed = "" if self.streamed is None else f", streamed={self.streamed}"
-        return (f"Shuffle(seed={self.seed!r}, window={self.window!r}, "
-                f"block_shards={self.block_shards!r}{streamed})")
-
 
 @dataclasses.dataclass(frozen=True)
 class Repeat:
