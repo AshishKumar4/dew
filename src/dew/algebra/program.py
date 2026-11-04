@@ -29,6 +29,7 @@ from jax.extend import core as jcore
 from dew.algebra import cost, extract, rules, terms
 from dew.algebra.extract import Linear
 from dew.cache import ALGEBRA
+from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -140,7 +141,7 @@ def program_of(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.Jaxpr:
     if not _rewriting(accurate):
         return closed
     began = time.perf_counter()
-    made = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+    made = _rewritten(closed, accurate, saturation)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
@@ -183,7 +184,7 @@ def _dynamic(args: tuple, kwargs: Mapping, numbers: Iterable[int],
 def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation: Saturation) -> list:
     """The outputs of `closed` (a jaxpr and its constants) over `arguments` (flattened), its bodies rewritten
     in place first (`_within`), then its own math (`_windowed`)."""
-    rewritten = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+    rewritten = _rewritten(closed, accurate, saturation)
     return eval_jaxpr(rewritten, rewritten.consts, *arguments)
 
 
@@ -239,10 +240,10 @@ _HOLDING = threading.Lock()
 def structure(window: jcore.Jaxpr) -> Hashable:
     """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
     type and placement, the sharding and memory its forms' values take); each equation's primitive, its
-    parameters as a region holds them (`terms.parameters_key`), whether it is protected
-    (`terms.protected`), its operands (an input's or an earlier output's position, or a literal's value and
-    type) and its outputs' types; and which values it yields. Two windows of one structure, their values
-    named apart, derive one rewrite: every layer of a stack's, every compile's of one step."""
+    parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
+    output's position, or a literal's value and type) and its outputs' types; and which values it yields.
+    Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
+    every compile's of one step."""
     position = {var: index for index, var in enumerate(window.invars)}
 
     def operand(atom) -> Hashable:
@@ -254,8 +255,7 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     equations = []
     for equation in window.eqns:
         equations.append((terms.parameters_key(equation.primitive, equation.params),
-                          terms.protected(equation), tuple(map(operand, equation.invars)),
-                          tuple(var.aval for var in equation.outvars)))
+                          tuple(map(operand, equation.invars)), tuple(var.aval for var in equation.outvars)))
         position.update({var: len(position) for var in equation.outvars})
     return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
 
@@ -593,13 +593,82 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore
     changed = False
     equations = []
     for equation in jaxpr.eqns:
-        if equation.primitive.name in BODIES:
+        if equation.primitive.name in BODIES or _marked(equation, WITHIN):
             params = {name: _body(value, accurate, saturation) for name, value in equation.params.items()}
-            if any(params[name] is not value for name, value in equation.params.items()):
-                equation = equation.replace(params=params)
-                changed = True
+        elif _marked(equation, (Algebra,)):
+            # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
+            params = {**equation.params, "call_jaxpr": _within(equation.params["call_jaxpr"], accurate,
+                                                               saturation)}
+        else:
+            params = equation.params
+        if any(params[name] is not value for name, value in equation.params.items()):
+            equation = equation.replace(params=params)
+            changed = True
         equations.append(equation)
     return jaxpr.replace(eqns=equations) if changed else jaxpr
+
+
+WITHIN = (Surrogate, KernelGlue)
+"""The marked spans' kinds (`dew.nn.derivatives.marked`) whose body the pass rewrites within its call, as it
+rewrites a body (`BODIES`): a surrogate's bodies and a kernel derivative's glue (docs/design/algebra.md §1.2).
+A protected span is an opaque leaf, its body untouched; an Algebra span opens into the region around it
+(`_opened`)."""
+
+
+def _marked(equation: jcore.JaxprEqn, kinds: tuple[type, ...]) -> bool:
+    """Whether `equation` is a marked span of one of `kinds`."""
+    return equation.primitive is marked_call_p and isinstance(equation.params["kind"], kinds)
+
+
+def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
+    """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
+    span's body opened into it (`_opened`), so a window reaches across the span's boundary; the program
+    with its spans kept as traced where no window's form lands (`closed` itself where no body changed
+    either)."""
+    within = _within(closed, accurate, saturation)
+    opened = _opened(within)
+    made = _windowed(opened, accurate, saturation)
+    return within if made is opened else made
+
+
+def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`jaxpr` with each Algebra span's call (`_marked`) replaced by its body's equations, nested spans
+    opened too, over the call's operands, its body's constants the program's, and each reader of the call's
+    results reading what its body computes them as; `jaxpr` itself where it holds none."""
+    if not any(_marked(equation, (Algebra,)) for equation in jaxpr.eqns):
+        return jaxpr
+    constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
+    computed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
+    equations: list[jcore.JaxprEqn] = []
+
+    def outer(atom: jcore.Var | jcore.Literal) -> jcore.Var | jcore.Literal:
+        return atom if isinstance(atom, jcore.Literal) else computed.get(atom, atom)
+
+    for equation in jaxpr.eqns:
+        equation = equation.replace(invars=[outer(atom) for atom in equation.invars])
+        if not _marked(equation, (Algebra,)):
+            equations.append(equation)
+            continue
+        body = _opened(equation.params["call_jaxpr"])
+        inner: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(
+            zip(body.invars, equation.invars, strict=True))
+        for var, value in zip(body.constvars, body.consts, strict=True):
+            fresh = jcore.Var(var.aval)
+            inner[var] = fresh
+            constvars.append(fresh)
+            consts.append(value)
+
+        def within(atom: jcore.Var | jcore.Literal, inner=inner) -> jcore.Var | jcore.Literal:
+            return atom if isinstance(atom, jcore.Literal) else inner.get(atom, atom)
+
+        for made in body.eqns:
+            outvars = [jcore.DropVar(var.aval) if isinstance(var, jcore.DropVar) else jcore.Var(var.aval)
+                       for var in made.outvars]
+            inner.update(zip(made.outvars, outvars, strict=True))
+            equations.append(made.replace(invars=[within(atom) for atom in made.invars], outvars=outvars))
+        computed.update(zip(equation.outvars, map(within, body.outvars), strict=True))
+    return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
+                         outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
 def _body(value, accurate: bool, saturation: Saturation):
@@ -633,7 +702,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcor
     rewrites = _REWRITTEN.setdefault(closed, {})
     key = (accurate, saturation, ALGEBRA.value.target)
     if key not in rewrites:
-        made = _windowed(_within(closed, accurate, saturation), accurate, saturation)
+        made = _rewritten(closed, accurate, saturation)
         rewrites[key] = None if made is closed else made
     made = rewrites[key]
     return closed if made is None else made

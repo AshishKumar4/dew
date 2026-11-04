@@ -39,8 +39,6 @@ from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew.nn.precision import PROTECTED
-
 BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter", "and",
                     "or", "xor"})
 UNARY = frozenset({"neg", "exp", "exp2", "log", "log2", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign",
@@ -266,12 +264,6 @@ def declarations(language: object) -> Declarations:
     return language.__egg_decls__
 
 
-def protected(equation: jcore.JaxprEqn) -> bool:
-    """Whether an equation lies in a region a precision module marks protected (`PROTECTED`, an error-free
-    transform's), which survives autodiff in the name stack its traced equations carry."""
-    return PROTECTED in str(equation.source_info.name_stack)
-
-
 Magnitude = int
 """A bound on a value's magnitude (docs/design/algebra.md §6.3): its power of two, `|x| <= 2**log2`, a number
 its constants', its declared ranges' and its equations' prove; a value no number bounds has none (None). A
@@ -303,8 +295,8 @@ def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
 def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
            forms: type[Term] | type[Skeleton] = Term) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
-    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms, each of `forms`
-    (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
+    one (a protected span's marked call among them) a leaf for each output, after its inputs' terms, each of
+    `forms` (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
     magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index, the
     constants apart: a bound on its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its
     exponential by 2, one power past the reals' 1 for a native exponential; an input with none is
@@ -370,7 +362,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     opaque: list[Opaque] = []
     for equation in jaxpr.eqns:
-        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+        if (equation.primitive is jax.lax.broadcast_in_dim_p
                 and not isinstance(equation.invars[0], jcore.Literal) and equation.invars[0] in laid):
             source, inner = laid[equation.invars[0]]
             outer = tuple(equation.params["broadcast_dimensions"])
@@ -384,10 +376,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             laid[out] = (source, composed["broadcast_dimensions"])
             depths[out] = depths.get(source, 0) + 1
             continue
-        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+        if (equation.primitive is jax.lax.broadcast_in_dim_p
                 and not isinstance(equation.invars[0], jcore.Literal)):
             laid[equation.outvars[0]] = (equation.invars[0], tuple(equation.params["broadcast_dimensions"]))
-        term = None if protected(equation) else _term(equation, read, param)
+        term = _term(equation, read, param)
         if term is not None:
             out = equation.outvars[0]
             env[out] = term
@@ -639,9 +631,10 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
 
 
 def spoken(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is of the language (`_term` makes a term of it), outside every protected region."""
+    """Whether `equation` is of the language (`_term` makes a term of it): a protected span is one marked
+    call (`dew.nn.derivatives.Protected`), no equation of it."""
     name, arity = equation.primitive.name, len(equation.invars)
-    if len(equation.outvars) != 1 or protected(equation):
+    if len(equation.outvars) != 1:
         return False
     binary = name in BINARY or name in COMPARISONS or name == "dot_general"
     unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"

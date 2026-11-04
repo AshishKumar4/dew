@@ -680,3 +680,73 @@ def test_a_region_holds_its_own_copy_of_a_literal_a_captured_scalar_views():
     captured[...] = 4.0
     [held] = region.literals
     assert (float(held), np.asarray(held).dtype) == (0.5, np.float32)
+
+
+SHAPES_MARKED = ((8, 48), (8, 48), (8, 48))
+"""The operands of the marked spans' programs below: their shapes no other test of this module draws."""
+
+
+def _marked_kinds(closed) -> list:
+    """The kind of every marked call `closed` holds, its bodies' included."""
+    from dew.nn.derivatives import marked_call_p
+
+    return [equation.params["kind"] for equation in equations(closed) if equation.primitive is marked_call_p]
+
+
+def test_a_protected_span_is_kept_as_traced_however_often_the_pass_runs():
+    """A protected span (`dew.nn.derivatives.Protected`: an error-free transform's) is a boundary no region
+    crosses and whose inside no rule touches (docs/design/algebra.md §1.2): two sums the pass joins unmarked
+    stay two inside their one marked call, once rewritten and again, a program already rewritten rewritten
+    anew."""
+    from dew.nn.derivatives import Protected, marked
+
+    operands_ = rows(11, *SHAPES_MARKED)
+    assert reductions(jax.make_jaxpr(algebra.rewritten(two_sums))(*operands_)) == 1
+    spanned = marked(Protected(), two_sums)
+    for rewrite in (algebra.rewritten(spanned), algebra.rewritten(algebra.rewritten(spanned))):
+        rewritten = jax.make_jaxpr(rewrite)(*operands_)
+        assert (reductions(rewritten), _marked_kinds(rewritten)) == (2, [Protected()])
+
+
+@pytest.mark.parametrize("kind", ["Surrogate", "KernelGlue"])
+def test_a_surrogates_and_a_kernel_glues_body_is_rewritten_within_its_call(kind):
+    """A surrogate's bodies and a kernel derivative's glue are rewritten as any other math, within their
+    marked call, which stays one call of its kind (§1.2): two sums inside join into one there, and the
+    program computes what it computes (check 1)."""
+    from dew.nn import derivatives
+
+    spanned = derivatives.marked(getattr(derivatives, kind)(), two_sums)
+    rewritten = jax.make_jaxpr(algebra.rewritten(spanned))(*rows(12, *SHAPES_MARKED))
+    assert (reductions(rewritten), len(_marked_kinds(rewritten))) == (1, 1)
+    assert_as_exact(jax.jit(algebra.rewritten(spanned)), jax.jit(two_sums),
+                    lambda seed: rows(seed, *SHAPES_MARKED), f"{kind}'s body", seeds=8)
+
+
+def test_an_algebra_span_joins_the_windows_around_it():
+    """A derivative written only to restructure algebra (`Algebra`) is rewritten freely (§6.10): its body
+    opens into the region around it, so a sum inside it joins a sum outside it, and the program computes
+    what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def inside(x, a):
+        return jnp.sum(jnp.tanh(a) * jnp.tanh(x), axis=-1)
+
+    def spanning(x, y, a):
+        return marked(Algebra(), inside)(x, a) + jnp.sum(jnp.tanh(a) * jnp.tanh(y), axis=-1)
+
+    rewritten = jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))
+    assert (reductions(rewritten), _marked_kinds(rewritten)) == (1, [])
+    assert_as_exact(jax.jit(algebra.rewritten(spanning)), jax.jit(two_sums),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
+
+
+def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
+    """An Algebra span opened for the pass, around which no form is cheaper, leaves the program jit traced as
+    it is, its marked call kept (`program_of`: the same object, lowered as traced)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def stepped(x):
+        return marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x) * 2.0
+
+    traced = jax.make_jaxpr(stepped)(rows(14, (8, 48))[0])
+    assert algebra.program_of(traced) is traced

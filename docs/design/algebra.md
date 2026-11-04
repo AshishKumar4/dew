@@ -846,10 +846,11 @@ def derive(declaration: Declaration, numerics, cost: CostModel) -> Derived: ... 
 ### 6.10 Marked regions and custom derivatives
 
 These live in `dew.nn.derivatives`, below `dew.algebra`; `dew.nn.surrogate` is row 3271's declaration, exported
-from there. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test, and
-`surrogate`. Not yet: the pass reading a marked call's kind, the precision transforms and the custom-derivative
-sites marked, and the slop check; the bullets below state that design, which the pass reads the name scope in
-place of until then.
+from there. What exists: the four kinds, `marked_call_p` with its transform rules and their prototype test,
+`surrogate`, the precision transforms marked `Protected`, and the pass reading a marked call's kind
+(`program._within`, `program._opened`: a protected call an opaque leaf, a surrogate's and a kernel glue's body
+rewritten within its call, an Algebra span opened into the region around it, its call kept where no form
+lands). Not yet: the custom-derivative sites marked, and the slop check.
 
 ```python
 class Protected: ...                  # error-free transforms and numerics bodies (§1.2, §1.3)
