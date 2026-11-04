@@ -226,14 +226,13 @@ sums of sixteen products near the largest and the least normal, where `EDGES`' s
 root of each."""
 
 
-@pytest.mark.parametrize("edge", [edge for edge in LINEAR_EDGES if edge != "near the largest"])
+@pytest.mark.parametrize("edge", LINEAR_EDGES)
 def test_a_frozen_fp8_product_holds_every_order(edge):
     """A frozen FP8 kernel's product (`quantization.frozen_fp8_product`, its tangent the decoded kernel's):
     every order in the input finite wherever float64 is a normal float32 and the product with the kernel its
     codes decode to (each row's codes times its scale) is, the kernel a unit draw and the input at
-    `LINEAR_EDGES`, so the product itself nears
-    float32's ends. Near the largest its input's scale overflows before the kernel's applies (ledger 2715),
-    that row's head adds the edge."""
+    `LINEAR_EDGES`, so the product itself nears float32's ends: near the largest, the input's block scale
+    applied before the kernel's had overflowed a product that did not (ledger 2715)."""
     from dew.quantization import FROZEN_FP8, frozen_fp8_leaves
 
     (kernel,) = normal_draw(475, (16, 8))
