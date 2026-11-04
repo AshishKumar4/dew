@@ -1018,10 +1018,10 @@ def _routed(saved: Mapping[str, object] | None, directory: str) -> Iterator[None
         yield
     except PlanOrderChanged as refused:
         named = None if saved is None else registry.class_record(saved)
-        data = None if named is None else named[1].get("data")
+        chain = None if named is None else named[1].get("data")
         if saved is not None and jax.process_index() == 0:
             write_atomically(epath.Path(directory) / RUN_FILE, json.dumps(saved, indent=2, sort_keys=True))
-        raise refused.routed(recorded=isinstance(data, Mapping) and "unrecorded" not in data) from None
+        raise refused.routed(recorded=isinstance(chain, Mapping) and "unrecorded" not in chain) from None
 
 
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
