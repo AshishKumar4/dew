@@ -1575,18 +1575,24 @@ def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     ids=["causal", "causal-fewer-queries", "causal-more-queries", "full"])
 def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
     """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
-    for an H100: every launch states its cost (`attention_mosaic_program.stated`), which Dew's FLOP count
-    reads to size it (`instrumentation._stated_flops`: no launch unsized), and together they state the
-    library's fused attention's own count, a multiply-add a reached pair, head and product column (a causal
-    call's `pairs` each query's keys up to its own place, written out: the first key aligned to the first
-    query, as the mainloop masks them): the forward's two products, the training forward's two and the
-    backward's four
+    for an H100: every launch states its hardware work (`attention_mosaic_program.stated`), which Dew's FLOP
+    count reads to size it (`instrumentation._stated_flops`: no launch unsized), and declares the model's
+    share of it; together the model's are the library's fused attention's own count, a multiply-add a
+    reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
+    written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
+    products, the training forward's two and the backward's four, the hardware's one recomputed `Q K^T`
+    more in the training forward and in the backward
     (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
     none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
     walk in a conditional, whose products the count bounds apart."""
     import re
 
-    from dew.telemetry.instrumentation import _stated_flops
+    from dew.nn.kernels.templates import report
+    from dew.telemetry.instrumentation import _stated_flops, hlo_flops
+
+    def step_flops_of(text):
+        # Each launch's model share as it declared it this process (`report.declared_model_flops`).
+        return hlo_flops(text, declared=report.declared_model_flops())
 
     rows, heads, kv_heads, width = 1, 4, 2, 64
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
@@ -1599,11 +1605,13 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def counted(fn, *arrays):
+        """The launches' stated hardware work and the model's share of it each declares (`hlo_flops`)."""
         with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
         launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
         assert launches and all(_stated_flops(line) is not None for line in launches)
-        return sum(_stated_flops(line) or 0.0 for line in launches)
+        flops = step_flops_of(text)
+        return flops.model, flops.hardware
 
     def trained(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.SPLIT)
@@ -1614,9 +1622,12 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     def backward(query, key, value, dout, residuals):
         return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
 
-    assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
-    assert counted(trained, query, key, key) == forward
-    assert counted(backward, query, key, key, query, residuals) == 2 * forward
+    # The training forward recomputes its walk's `Q K^T`; the fast backward its `S` beside its four.
+    product = forward // 2
+    plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
+    assert plain == (forward, forward)
+    assert counted(trained, query, key, key) == (forward, forward + product)
+    assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * forward + product)
 
 
 @pytest.mark.parametrize("axis", [0, 1])
