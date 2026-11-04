@@ -672,6 +672,25 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
         return {each: found for each, found in zip(rows, pool.map(hit, rows), strict=True) if found}
 
 
+def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
+    """The check-1 sites of `sites` (each its file and test) whose judge's last run on a class the tasks run
+    on (`pinned_classes`) needed its later map tasks (`LATER_JUDGED`), which the plan then draws in the first
+    wave (`site_entries`): read with the plan's read token from each class's last-run record (`record_key`,
+    whatever inputs it ran on and whatever its key), apart from reuse, which it never grants. A site no class's
+    record says so of, a record or field missing, or a Worker that did not answer, keeps its later tasks
+    later."""
+    token, held = os.environ.get(READ_TOKEN), pinned_classes()
+    if not sites or not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
+        return set()
+
+    def needed(site: tuple[str, str]) -> bool:
+        return any(((recorded(record_key(python, row(python, *site), each), token) or {}).get("row") or {})
+                   .get(LATER_JUDGED) is True for each in held)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        return {site for site, later in zip(sites, pool.map(needed, sites), strict=True) if later}
+
+
 KEPT_AT = "@"
 """What joins a kept row's file to where its green run is kept in a plan entry's tests (`reusable`):
 `tests/test_a.py@<class>:<key>`, or a group's, `tests/test_a.py#2/3@<class>:<key>`, which the task reads
@@ -1006,6 +1025,12 @@ under POOL and judges them as a test that took every unit itself would (tests/ma
 `record_units` and `pooled_units`): a check-1 site its seeds' draws (tests/reference_error.py), and a test
 marked `shards` the units of its own work, given alike. A judge whose judgement needs units its later map
 tasks draw writes the file LATER names (`ask_later`), and its row asks for them (armada's `more`)."""
+STAGES = "DEW_CHECK1_STAGES"
+"""Check 1's stages log (tests/reference_error.py's STAGES_LOG, which the plan cannot import: it has no
+JAX): the file a judge appends each judgement it completes to, its stage among it (`later_judged`)."""
+LATER_JUDGED = "check1_later"
+"""A check-1 site judge's row's word that its judgement needed its later map tasks (`later_judged`), which the
+next plan reads to draw them in the first wave (`eager_sites`)."""
 INPUTS = "/armada/inputs"
 """Where a judge's task finds its map tasks' artifacts (armada's `{inputs}`), each task's under
 `<job>/<index>`, where armada names none (`armada_dir`)."""
@@ -1151,7 +1176,8 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
 
 
 def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
-                 kept: Mapping[tuple[str, str], str], timings: dict, target: float) -> list[dict]:
+                 kept: Mapping[tuple[str, str], str], timings: dict, target: float,
+                 eager: Container[tuple[str, str]] = ()) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
     `per_task` of its units (`draws_of`), which runs its test over them alone, records their draws among its
     artifacts and judges nothing; and its judge, which runs once they all passed (armada's `after`), pools
@@ -1164,7 +1190,11 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     run reused has none, and the durations record times its judge's pooling, no measure of its draws
     (`folded`); a judge, its row's pooling as armada measured it, else the target. A judge
     names no row: armada reads one whose map tasks did not all pass red under its task's name, naming them,
-    which a named row would leave not graded."""
+    which a named row would leave not graded. A check-1 site's tasks past its first stage are later, run
+    only where its judge asks for them, but a site of `eager` (its judge's last run needed them,
+    `eager_sites`), whose later tasks, its second stage's and its weighed check's alike, run in the first wave
+    beside its first stage's: its judge reads each stage's seeds alone (`_staged` slices them), so its verdict
+    is the one it reaches asking, and it asks for nothing its pool holds."""
     measured = timings.get("rows", {})
     entries = []
     for name, held in sorted(marked.items()):
@@ -1183,10 +1213,11 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 each = rate(python, name, test, kind, measured)
                 weight = measured.get(task_name) or (each * (stop - start) if each is not None else target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
-                # them (armada's `later`).
+                # them (armada's `later`), or at once where its last judgement needed them (`eager`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
                              "rows": [row(python, name, group)], "weight": weight,
-                             **({"later": True} if start >= mark.timed else {})})
+                             **({"later": True} if start >= mark.timed and (name, test) not in eager
+                                else {})})
             entries += [*maps, {"name": site_task(python, name, test), "python": python, "tests": name,
                                 "split": test, "after": [each["name"] for each in maps],
                                 "weight": measured.get(row(python, name, test)) or target}]
@@ -1264,9 +1295,12 @@ def plan(target: float, timings: dict) -> list[dict]:
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
                             "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
                             "whole": cells})
+        # The sites to run whose judge's last run needed its later map tasks draw them at once (`eager_sites`).
+        eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
+                                     if (name, test) not in found])
         entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
                      "cache": cache, "whole": cells}
-                    for entry in site_entries(python, marked, found, timings, target)]
+                    for entry in site_entries(python, marked, found, timings, target, eager)]
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if cells == "1" else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
@@ -1486,9 +1520,12 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
     if site is None:
         return {}
     if site["start"] is None:
-        # A judge's ask for its later map tasks (`ask_later`) is its own run's alone.
+        # A judge's ask for its later map tasks (`ask_later`), and its stages (`later_judged`), are its own
+        # run's alone.
         later_file().unlink(missing_ok=True)
-        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file())}
+        stages_file().unlink(missing_ok=True)
+        return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file()),
+                STAGES: str(stages_file())}
     return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
 
 
@@ -1501,6 +1538,26 @@ def asked(site: re.Match | None) -> dict[str, bool]:
 def later_file() -> Path:
     """Where a judge writes that its judgement needs its later map tasks (LATER, `ask_later`)."""
     return armada_dir("ARMADA_ARTIFACTS", ARTIFACTS) / "check1-later.json"
+
+
+def later_judged(site: re.Match | None) -> dict[str, bool]:
+    """A check-1 site judge's row's `LATER_JUDGED`: true where its judgement needed its later map tasks, as
+    it asked for them (`asked`) or as a judgement it completed reached check 1's second stage (its stages log,
+    STAGES; a weighed check runs only past an undecided second stage), false where every judgement it
+    completed decided at its first, absent where it completed none and asked nothing; nothing for any other
+    row. The row's record (`record`) keeps it, which the next plan reads (`eager_sites`)."""
+    if not site or site["start"] is not None:
+        return {}
+    logged = [json.loads(line) for line in stages_file().read_text().splitlines() if line.strip()] \
+        if stages_file().is_file() else []
+    if later_file().is_file() or any(entry.get("stage") == 2 for entry in logged):
+        return {LATER_JUDGED: True}
+    return {LATER_JUDGED: False} if logged else {}
+
+
+def stages_file() -> Path:
+    """Where a judge's check 1 logs each judgement it completes (STAGES)."""
+    return armada_dir("ARMADA_ARTIFACTS", ARTIFACTS) / "check1-stages.jsonl"
 
 
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
@@ -1679,7 +1736,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site)})
+                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
+                     **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
