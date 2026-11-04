@@ -425,14 +425,7 @@ def test_a_site_whose_last_judgement_needed_its_later_draws_draws_them_in_the_fi
     the next plan of its file, its inputs changed, draws them in the first wave beside its first stage's, the
     judge then asking for nothing; a site its first stage decided keeps them later. The halved site's judge is
     red, its record keyed by nothing, and the plan reads it all the same."""
-    out = site_checkout(tmp_path, GATED)
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    monkeypatch.setenv("DEW_XLA_CACHE_READ_TOKEN", "token")
-    config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": "GenuineIntel", "family": 6, "model": 143}
-    (tmp_path / ".armada.json").write_text(json.dumps(config))
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, GATED)
 
     def judged(test: str, drawn: list[dict], entries: dict[str, dict], run: str) -> dict:
         inputs = tmp_path / f".verdict/inputs-{run}-{test}-{len(drawn)}"
@@ -471,10 +464,10 @@ def test_a_site_whose_last_judgement_needed_its_later_draws_draws_them_in_the_fi
     assert eager["first_failure"].partition(":")[0] == whole["first_failure"].partition(":")[0]
 
 
-def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
-    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
-    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
-    those, and the file's own row."""
+def cached_checkout(ci, tmp_path: Path, monkeypatch, cache_worker, site: str) -> Path:
+    """Site `site`'s checkout (`site_checkout`) with the test cache on at the Worker standing in, its tasks
+    pinned to one CPU class and the plan reading with its read token, as CI runs it: where its verdict is
+    written."""
     out = site_checkout(tmp_path, site)
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
@@ -483,6 +476,14 @@ def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: 
     config = json.loads((ROOT / ".armada.json").read_text())
     config["task"]["cpu"] = {"vendor": "GenuineIntel", "family": 6, "model": 143}
     (tmp_path / ".armada.json").write_text(json.dumps(config))
+    return out
+
+
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
+    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
+    those, and the file's own row."""
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, site)
     entries = list(planned(ci).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
