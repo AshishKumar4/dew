@@ -18,7 +18,7 @@ import tokamax
 from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
+from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -529,13 +529,14 @@ def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
 def streams(query, target: generation.GpuTarget) -> bool:
     """Whether a call's walk the device's memory bounds: the products its keys and values feed, a query row
     of `query`'s `[B, Q, H, D]` each (4 flops a key entry, its logit's and its weighted value's), fewer a byte
-    of them than the device's dense products a byte its memory streams (`GpuTarget.peaks` over
-    `memory_rate`): a decode step's few rows a key head, never a prefill's. False where either fact is
+    of them than the device's 16-bit products a byte its memory streams, both the cost model's device rates
+    (`cost.rates`: the tensor rate its instruction family, clock and multiprocessors derive, no catalog's
+    peak, row 3799): a decode step's few rows a key head, never a prefill's. False where either rate is
     unknown."""
-    peak, rate = target.bf16_peak, target.memory_rate
-    if not (peak and rate):
+    tensor, *_, memory = cost.rates(target, device=True)
+    if not (tensor and memory):
         return False
-    return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < peak / rate
+    return 2 * query.shape[1] / jnp.dtype(query.dtype).itemsize < tensor / memory
 
 
 def _keys(ba: tokamax.BoundArguments) -> int:
