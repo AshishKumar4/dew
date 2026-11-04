@@ -160,12 +160,12 @@ def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_pa
 
 
 def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updates_moved(tmp_path):
-    """A batch ramp from two rows by two over two examples to the batch's four, its updates two
-    microbatches each (`trainer.accumulation`), begins its next stage where an update does, record 4 not
-    2 (`Ramp.stages`): a run saved there resumes, its data position admitted as the run's stream reads
-    it (`resume_admitted`, the stream's window its accumulation's) before its record is written."""
+    """A batch ramp from four rows to the batch's eight after four examples, its updates two microbatches
+    each (`trainer.accumulation`), begins its next stage where an update does, record 8 not 4
+    (`Ramp.stages`): a run saved there resumes, its data position admitted as the run's stream reads it
+    (`resume_admitted`, the stream's window its accumulation's) before its record is written."""
     kind = next(kind for kind in KINDS if kind in GLOBAL_ORDER)
-    settings = {"trainer.batch_ramp": {"start": 2, "increment": 2, "samples": 2}, "trainer.accumulation": 2}
+    settings = {"trainer.batch_ramp": {"start": 4, "increment": 4, "samples": 4}, "trainer.accumulation": 2}
     run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 2, **settings})
     first = saved(run)[-1]
     trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, **settings})
