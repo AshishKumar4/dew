@@ -597,7 +597,7 @@ def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: 
         for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
             mine, theirs = np.asarray(mine), np.asarray(theirs)
             assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
-            assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
+            assert mine.tobytes() == theirs.tobytes(), name
     if not placed:
         return
     if mesh.fsdp == 1:
