@@ -284,7 +284,7 @@ def _refuse_numpy_arms(draw, *arms) -> None:
     given on them (a window's, for a window loop's arm), an arm returning NumPy arrays is a NumPy reference,
     compiled computing in JAX, in float32 where its draw is float64; it passes `as_given`. A draw holding no
     NumPy array runs none: the gate compiles each plain arm (`_compiled`), whose trace refuses a NumPy call on
-    its inputs (a model arm run eagerly here took a minute of a check, M43)."""
+    its inputs (a model arm run eagerly here took a minute of a check, ledger 3774)."""
     plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
     drawn = draw(0) if plain else ()
     if not any(isinstance(leaf, np.ndarray | np.generic) for leaf in jax.tree.leaves(drawn)):
@@ -1516,7 +1516,7 @@ def _cancelling_terms(draw, truth, program=None):
     truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's).
     `program`, the truth as the draws run it (`_truth_program`), evaluates the first draw's truth, so its
     first call's run and trace serve the draws too, once a process (a map task's draws, DRAWS); a reference
-    standing for it runs compiled, not eagerly (M43)."""
+    standing for it runs compiled, not eagerly (ledger 3774)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose

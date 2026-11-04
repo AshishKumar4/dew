@@ -618,7 +618,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     net that stops writing its memory back (`recurrent.value = final`
     dropped) moves the logits by 3.8e+00. Each call is one compiled program,
     the decode's prefill and step the ones its check reads (`decode_steps`),
-    where run op by op they took a minute of the test (M43)."""
+    where run op by op they took a minute of the test (ledger 3774)."""
     model = hybrid()
     ids = tokens(rng)
     params = nn.unbox(model.init(rng, ids))
