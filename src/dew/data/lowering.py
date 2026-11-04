@@ -125,13 +125,13 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     accounts,
-    as_member,
     children,
     consumed_by,
     consumed_forward,
     examples_bound,
     joined,
     member_of,
+    member_record,
     members_held,
 )
 from dew.data.plan import Manifest
@@ -1323,21 +1323,20 @@ class _EndedIterator(pygrain.DatasetIterator):
 
 def _for_rows(stage: Stage, rows: Rows) -> Stage:
     """`stage` as `rows` take it: a shuffle of every record (`Shuffle.streamed`) within its streamed window
-    where they stream, whole where they are indexed."""
-    if isinstance(stage, Shuffle) and stage.streamed is not None and not isinstance(rows, pygrain.MapDataset):
-        return dataclasses.replace(stage, window=stage.streamed, streamed=None)
+    where they stream (`Shuffle.streaming`), whole where they are indexed."""
+    if isinstance(stage, Shuffle) and not isinstance(rows, pygrain.MapDataset):
+        return stage.streaming()
     return stage
 
 
 def _for_read(pipeline: Pipeline, read: Read) -> Pipeline:
     """`pipeline` as a `read` lowers it: a streamed read's shuffles of every record (`Shuffle.streamed`)
-    within their streamed windows, so its loading workers hand on where a window shuffle stands
-    (`_carried`)."""
+    within their streamed windows (`Shuffle.streaming`), so its loading workers hand on where a window
+    shuffle stands (`_carried`)."""
     if read != "streamed":
         return pipeline
     return dataclasses.replace(pipeline, stages=tuple(
-        dataclasses.replace(stage, window=stage.streamed, streamed=None)
-        if isinstance(stage, Shuffle) and stage.streamed is not None else stage for stage in pipeline.stages))
+        stage.streaming() if isinstance(stage, Shuffle) else stage for stage in pipeline.stages))
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
@@ -1477,7 +1476,7 @@ class _Build:
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
-            mapped = [parent.map(functools.partial(as_member, member=key)) if tagged else parent
+            mapped = [parent.map(functools.partial(member_record, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
             selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source),
@@ -1488,7 +1487,7 @@ class _Build:
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
         ]
         if tagged:
-            streams = [stream.map(functools.partial(as_member, member=key))
+            streams = [stream.map(functools.partial(member_record, member=key))
                        for key, stream in zip(keys, streams, strict=True)]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).

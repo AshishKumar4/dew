@@ -10,6 +10,7 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypeGuard
 
 import jax.extend.core as jcore
 
@@ -52,3 +53,30 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
                      if isinstance(each, jcore.Jaxpr))
     return found
+
+
+def computed(value) -> TypeGuard[jcore.Var]:
+    """Whether `value` is a program's variable, not a literal it reads."""
+    return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
+
+
+def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
+            consts: Sequence = ()) -> tuple[list[jcore.JaxprEqn], list[jcore.Var | jcore.Literal]]:
+    """`body`'s equations, each value its own fresh variable, read over `operands` and its constants over
+    `consts`, and its results: a program run in its caller as one of its own, as one body traced once may
+    be run more than once. A constant is the caller's variable or literal where `consts` gives one (a
+    constant the caller holds among its own, `dew.algebra.program`'s span opened), else a literal of the
+    value given (a program compiled whole, `dew.training.compiled_program`)."""
+    local: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(zip(body.invars, operands, strict=True))
+    for var, value in zip(body.constvars, consts, strict=True):
+        local[var] = value if isinstance(value, jcore.Var | jcore.Literal) else jcore.Literal(value, var.aval)
+
+    def read(value):
+        return local.get(value, value) if computed(value) else value
+
+    equations = []
+    for equation in body.eqns:
+        fresh = [out if isinstance(out, jcore.DropVar) else jcore.Var(out.aval) for out in equation.outvars]
+        equations.append(equation.replace(invars=[read(value) for value in equation.invars], outvars=fresh))
+        local.update(zip(equation.outvars, fresh, strict=True))
+    return equations, [read(value) for value in body.outvars]

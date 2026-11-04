@@ -154,15 +154,14 @@ def test_a_sum_its_platform_picks_carries_the_terms_of_the_branch_it_runs_where_
 
 
 PLACED_DENSE = """
+import json
 import sys
-sys.path[:0] = [f"{sys.argv[3]}/src", f"{sys.argv[3]}/tests", sys.argv[3]]
-import numpy as np
 import test_float64_terms as T
 values, terms = T.placed_terms(T.placed_programs(), sys.argv[1])
-np.savez(sys.argv[2], *values, *terms)
+print(json.dumps([leaf.tolist() for leaf in [*values, *terms]]))
 """
-"""A fresh process's float64 terms of `placed_programs` at one placement, saved where its second argument
-says, its product code and tests the checkout's its third names."""
+"""A fresh process's float64 terms of `placed_programs` at the placement its argument names, printed as
+JSON, whose floats are their shortest exact repr, so float64 reads back bit for bit (`fresh`)."""
 
 
 def placed_programs():
@@ -211,20 +210,12 @@ def a_dense_layers_terms_are_its_placements_own_on_a_gpu_host(tmp_path):
     (`JAX_PLATFORMS=cpu`), so none of its branches can be the GPU's. A branch its platform picks is read
     where the inputs are placed, not on the host's default device, and no compiled evaluation of one
     placement is reused by the other (`evaluated_on`)."""
-    import os
-    import subprocess
-    import sys
-    from pathlib import Path
+    from process_support import fresh as evaluated_apart
 
-    root = str(Path(__file__).resolve().parents[1])
-    fresh = {}
-    for platform in ("cpu", "gpu"):
-        saved = tmp_path / f"{platform}.npz"
-        alone = {**os.environ, "JAX_PLATFORMS": "cpu"} if platform == "cpu" else None
-        subprocess.run([sys.executable, "-c", PLACED_DENSE, platform, str(saved), root], check=True,
-                       env=alone)
-        with np.load(saved) as held:
-            fresh[platform] = [held[f"arr_{index}"] for index in range(len(held.files))]
+    # The CPU's process sees no GPU, so none of its branches can be the GPU's.
+    fresh = {platform: [np.asarray(leaf) for leaf in evaluated_apart(
+        PLACED_DENSE, platform, platforms="cpu" if platform == "cpu" else None)]
+        for platform in ("cpu", "gpu")}
     for order in (("cpu", "gpu"), ("gpu", "cpu")):
         programs = placed_programs()
         for platform in order:

@@ -95,7 +95,7 @@ Preparing a Hub dataset happens on first use, with one log line naming what is p
 | Columns | `rename_columns({"old": "new"})`, `select_columns(*names)`, `remove_columns(*names)` (Hugging Face's names) |
 | Other | `take(n)`, `named(name)` |
 | Sequence | `pack(seq_len, fields=, bins=, segments=, policy=, along=)`, the options every read lays out alike; `text.Chunks(length, overlap=)` cuts long documents first; `windows(seq_len, stride=)` cuts one stream of tokens across documents at a stride, for perplexity over overlapping windows; `shuffle` after `pack` orders the windows |
-| Order | `shuffle(seed=, window=)`, `repeat(epochs=)` |
+| Order | `shuffle(seed=, window=, block_shards=, streamed=)`, whole, within a window of records, by blocks of physical shards, or whole where the read is indexed and within `streamed` records where it streams; `repeat(epochs=)` |
 | Combine | `mix(datasets, weights=, by="records" \| "tokens", seed=)`, which ends at its first exhausted member, as Grain's does (repeat a member to read on), and with `seed=` (by records) reads each window of its proportions in an order the seed draws, every window at its exact shares; `concat(datasets)`; `interleave(cycle_length=)` over a store's shards; `schedule([(dataset, tokens), ...])` |
 | Split | `holdout(0.01)`, `holdout(val=, test=)`, `holdout(records=)`, `holdout(split="validation" | ("validation", "test"))`, each with `key=`; `holdout(tokens=0.01, fields=("text",))`, the first hundredth of a finite order's tokens, its per-token fields cut together |
 | Batch | `batch(n)`, the global training batch; a `map` after it receives the whole batch |
