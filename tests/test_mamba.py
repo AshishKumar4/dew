@@ -8,7 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decode_through
+from model_support import as_stepped, decode_through, float64_twin
+from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
 from dew.nn.mixers.mamba import Mamba, selective_scan
@@ -61,14 +62,28 @@ def test_a_document_start_drops_the_state_entering_it():
 
 
 
+DECODE_SEEDS = 8
+"""The layer's cached decode's declared check-1 seeds against its parallel forward at each step's width,
+sized by `seeds_for` on armada."""
+
+
 def test_the_layer_decodes_as_it_prefills():
+    """Over drawn layers and inputs, the layer's single-token steps through its cache on par with its
+    parallel forward at each step's width (`as_stepped`) from the float64 layer's forward (check 1,
+    ledger 2739), its cache holding a state per channel and state dimension."""
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
-    x = jax.random.normal(jax.random.key(0), (2, 9, 8))
-    variables = mixer.init(jax.random.key(1), x)
-    whole = mixer.apply(variables, x)
-    decoded, _, cache = decode_through(mixer, variables, x, prefill=1)
-    np.testing.assert_allclose(decoded, whole, rtol=1e-5, atol=1e-5)
-    assert cache['ssm_state'].shape == (2, 16, 4)
+
+    def draw(seed):
+        key, inputs = jax.random.split(jax.random.key(seed))
+        x = jax.random.normal(inputs, (2, 9, 8))
+        return mixer.init(key, x), x
+
+    wide = float64_twin(mixer)
+    assert_as_exact(lambda variables, x: decode_through(mixer, variables, x, prefill=1)[0],
+                    lambda variables, x: as_stepped(lambda held: mixer.apply(variables, held), x, 1),
+                    draw, "mamba decode", seeds=DECODE_SEEDS, truth_fn=wide.apply)
+    variables, x = draw(0)
+    assert decode_through(mixer, variables, x, prefill=1)[2]['ssm_state'].shape == (2, 16, 4)
 
 
 

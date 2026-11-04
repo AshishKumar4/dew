@@ -15,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import transformers_arms, transformers_model
+from model_support import decode_logits
 from reference_error import assert_as_exact
-from test_causal_transformer import decode_logits
 
 from dew.interop.pretrained import Pretrained
 

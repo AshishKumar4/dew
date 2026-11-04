@@ -322,7 +322,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 13,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
@@ -330,7 +330,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 19,
+   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_modernbert.py": {
@@ -402,11 +402,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 31,
+   "comparisons": 29,
    "lane": "Kernels"
   },
   "tests/test_llama4.py": {
-   "comparisons": 7,
+   "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_llama_cpp_export.py": {
@@ -434,7 +434,7 @@
    "lane": "Training"
   },
   "tests/test_mamba.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_masked_diffusion.py": {
@@ -598,7 +598,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_qualification.py": {
-   "comparisons": 13,
+   "comparisons": 11,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rae.py": {

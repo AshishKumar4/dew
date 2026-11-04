@@ -33,8 +33,10 @@ def selects(config) -> bool:
     return bool(fields.get("index_topk") or any(sparsities) or routes(config))
 
 
-def capture(model):
-    """`model`'s forward capturing its discontinuous selections, compiled once: the lightning indexer's
+def capture(model, method=None):
+    """`model`'s forward of its tokens (or its `method` of the arguments given, a decoder's prediction
+    depths over its trunk's states) capturing its discontinuous selections, compiled once: the lightning
+    indexer's
     scores and its heads' agreements before their relu, which it sows together under `SELECTIONS` for a
     caller that opens that collection, Gemma 3n's gate from its gated MLP's Dense, a
     Router's selection scores, group scores and group mask from its own methods, and gpt-oss's and
@@ -58,8 +60,9 @@ def capture(model):
         gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
         return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
 
-    return jax.jit(lambda variables, tokens: model.apply(
-        variables, tokens, capture_intermediates=selecting, mutable=["intermediates", SELECTIONS])[1])
+    return jax.jit(lambda variables, *arguments: model.apply(
+        variables, *arguments, method=method, capture_intermediates=selecting,
+        mutable=["intermediates", SELECTIONS])[1])
 
 
 def gate_margin(values: np.ndarray, sparsity: float) -> float:
