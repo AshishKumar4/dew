@@ -179,17 +179,23 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     return algebra.headroomed(algebra.guarded(walk, walk))
 
 
-def _guarded(launch: Callable[[algebra.Forward], jax.Array], spec: algebra.Forward) -> jax.Array:
-    """`launch(spec)`'s output with its sums guarded only where they overflow: under headroom
-    (`algebra.Forward.headroom`) the plain launch first, then the guarded one where some row's output is not
-    finite (an overflowed sum's, or a merge's of two finite slices; or a call's own non-finite input, which
-    the guarded launch gives again), so ordinary inputs take the one plain launch, its outputs and cost
-    unchanged but for that check (`algebra.walked_launches`' order, for a kernel that walks its keys once).
-    The guarded launch is a kernel of its own name (`_headroom`), as the Triton forward's is."""
+def _guarded(launch: Callable[[algebra.Forward, jax.Array], jax.Array], spec: algebra.Forward,
+             spans: jax.Array) -> jax.Array:
+    """`launch(spec, spans)`'s output with its sums guarded only where they overflow: under headroom
+    (`algebra.Forward.headroom`) the plain launch first, then the guarded one over the rows some output of
+    which is not finite (an overflowed sum's, or a merge's of two finite slices; or a call's own non-finite
+    input, which the guarded launch gives again), every other row's span empty, so it walks no key of them,
+    and its rows taken where they overflowed. The guarded launch runs every step, no branch: a branch's
+    predicate is read on the host before its launch may run, a decode step's round trip (row 1978: 0.280 ms
+    wall against 0.015 on the device), where a launch of empty walks costs its prologue (the template's
+    `algebra.walked_launches` with `masked`). The guarded launch is a kernel of its own name (`_headroom`),
+    as the Triton forward's is."""
     if not spec.headroom:
-        return launch(spec)
-    out = launch(dataclasses.replace(spec, headroom=False))
-    return jax.lax.cond(jnp.all(jnp.isfinite(out)), lambda: out, lambda: launch(spec))
+        return launch(spec, spans)
+    out = launch(dataclasses.replace(spec, headroom=False), spans)
+    over = ~jnp.all(jnp.isfinite(out), axis=tuple(range(1, out.ndim)))
+    guarded = launch(spec, jnp.where(over[:, None], spans, 0))
+    return jnp.where(over.reshape(-1, *(1,) * (out.ndim - 1)), guarded, out)
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -348,7 +354,7 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        def launch(spec: algebra.Forward) -> jax.Array:
+        def launch(spec: algebra.Forward, spans: jax.Array) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                             headroom=spec.headroom)
             out = launches.pallas_call(
@@ -366,7 +372,7 @@ class DecodeAttention(tuning.KernelOp):
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
         spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
-        return _guarded(launch, spec), None
+        return _guarded(launch, spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))
@@ -417,7 +423,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
 
-        def launch(spec: algebra.Forward) -> jax.Array:
+        def launch(spec: algebra.Forward, spans: jax.Array) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                             headroom=spec.headroom)
             out = launches.pallas_call(
@@ -436,7 +442,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
         spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
-        return _guarded(launch, spec), None
+        return _guarded(launch, spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))
