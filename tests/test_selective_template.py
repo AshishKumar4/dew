@@ -293,3 +293,32 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     held = selective.backward_programs(need, target)
     assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
         need, held, resident, positions)
+
+
+@lowers('sm90')
+def test_a_launchs_backward_kernel_carries_its_launch():
+    """The selective scan's training step lowered for an H100 (`kernel_compile.lowered_for`): its backward
+    kernel, which JAX traces on the pullback after the launch's scope ended, carries the launch that traced
+    its forward (`report.relaunched`), so a compile that finds it spilling refuses that launch and steps the
+    backward's tokens down (row 3851)."""
+    from kernel_compile import lowered_for
+
+    from dew.training._lowering import kernel_calls
+
+    rows, length, channels, states = 1, 2048, 256, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+
+    def trained(*given):
+        out, pull = jax.vjp(lambda *a: selective.SELECTIVE(*a)[0], *given)
+        return pull(out)
+
+    lowered = lowered_for(trained, operands, 'sm90')
+    launches = {call.name: call.launch for call in kernel_calls(lowered, unrun=True)
+                if call.kind == 'mosaic_gpu'}
+    assert set(launches) == {'selective_scan', 'selective_scan_backward'}, launches
+    assert launches['selective_scan'] is not None
+    assert launches['selective_scan_backward'] == launches['selective_scan'], launches
+
