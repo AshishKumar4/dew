@@ -280,15 +280,15 @@ def _compiles(fn) -> bool:
 
 
 def _refuse_numpy_arms(draw, *arms) -> None:
-    """Refuse an arm the gate would compile that computes in NumPy: called once as it is given on a
-    draw's inputs (a window's, for a window loop's arm), a JAX arm returns JAX arrays, and an arm that
-    returns NumPy arrays is a NumPy reference, which compiled would compute in JAX, in float32 where
-    its draw is float64, by other sums. It passes `as_given`; a Dew arm that only converts its
-    outputs returns them unconverted instead."""
+    """Refuse an arm the gate would compile that computes in NumPy on a draw of NumPy inputs: called once as
+    given on them (a window's, for a window loop's arm), an arm returning NumPy arrays is a NumPy reference,
+    which compiled would compute in JAX, in float32 where its draw is float64, by other sums; it passes
+    `as_given`. A draw holding no NumPy array runs none: the gate compiles each plain arm (`_compiled`), whose
+    trace refuses a NumPy call on its inputs, where a model arm run eagerly took a minute of a check (M43)."""
     plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
-    if not plain:
+    drawn = draw(0) if plain else ()
+    if not any(isinstance(leaf, np.ndarray | np.generic) for leaf in jax.tree.leaves(drawn)):
         return
-    drawn = draw(0)
     for fn in plain:
         inputs = drawn
         if isinstance(fn, _Windowed):
