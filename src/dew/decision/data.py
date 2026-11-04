@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
+import grain.python as pygrain
 import numpy as np
 
 from dew import _records
@@ -275,11 +276,15 @@ def _slots(stated: Mapping[str, object]) -> dict[str, int]:
             for name, value in record(stated.get("slots", {}), "slots").items()}
 
 @dataclass(frozen=True)
-class ParseExample:
+class ParseExample(pygrain.MapTransform):
     """A row of an example's fields as its `Example`, a row of grouped examples' fields (`examples`) as
-    its `GroupedExamples`, or a row that holds either already as it is."""
+    its `GroupedExamples`, or a row that holds either already as it is. A Grain transform, so a chain
+    that parses its rows by it is recorded and read back (`dew.data.records`)."""
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
+        return self.map(row)
+
+    def map(self, row: Mapping[str, object]) -> Mapping[str, object]:
         held = row.get("example")
         if isinstance(held, (Example, GroupedExamples)):
             return {"example": held}
