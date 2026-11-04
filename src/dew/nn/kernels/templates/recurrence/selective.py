@@ -461,9 +461,9 @@ class Tiles:
 
 
 CHUNK = 32
-"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward keeps
-for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are the
-portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
+"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
+keeps for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are
+the portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
 
 
 class Selective(base.Template[Tiles]):
@@ -494,10 +494,9 @@ class Selective(base.Template[Tiles]):
         to half its tokens; and the forward's chunk, from `CHUNK` the longest whose ring a block's shared
         memory holds (`staged_bytes`), up to a warpgroup's tokens (a chunk dividing every backward block) and
         the call's tokens: on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
-        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to
-        6.40 (sel-chunk-sxm at 5bf70d36b)."""
-        interpreted = ba.arguments.get("interpret", False)
-        facts = generation.gpu_target(generation.INTERPRETED_GENERATION) if interpreted else target
+        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34
+        to 6.40 (sel-chunk-sxm at 5bf70d36b)."""
+        facts = self._facts(ba, target)
         positions, resident = backward_plan(facts)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
         while (2 * chunk <= min(block_scan.THREADS, length) and self.staged_bytes(
@@ -508,6 +507,16 @@ class Selective(base.Template[Tiles]):
             fewer = tiles.positions // 2
             tiles = Tiles(chunk, fewer, backward_programs(backward_registers(fewer), facts))
         return tiles
+
+    @staticmethod
+    def _facts(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> generation.GpuTarget:
+        """The facts a call's launches run by: `target`'s, interpreted the interpreted bundle's generation's
+        (`generation.INTERPRETED_GENERATION`)."""
+        interpreted = ba.arguments.get("interpret", False)
+        return generation.gpu_target(generation.INTERPRETED_GENERATION) if interpreted else target
+
+    def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
+        return super().legal(ba, config, self._facts(ba, target))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int | None:
         """The backward thread's registers at the config's tokens (`backward_registers`)."""
