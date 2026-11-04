@@ -148,8 +148,9 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
 # ----------------------------------------------------------- options a saved task is built with (row 2285)
 
 WITNESSED_ON = {"DecideSettings": {
-    "decision": ("context_encoder", "layout", "layout.framing", "layout.head_max_len", "layout.option_tokens",
-                 "layout.order", "layout.parallel", "layout.reads", "options", "questions"),
+    "decision": ("context_encoder", "layout", "layout.framing", "layout.head_max_len", "layout.option_text",
+                 "layout.option_tokens", "layout.order", "layout.parallel", "layout.reads", "options",
+                 "questions"),
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
     "lettered": ("layout.labels",),
     "merged": ("layout.unit",)}}
@@ -200,7 +201,7 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.shards(units=18, per_task=1)
+@pytest.mark.shards(units=19, per_task=1)
 def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_line(tmp_path):
     """`test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line`'s witness of
     DecideSettings, each option on the run that witnesses it (`WITNESSED_ON`), one option a unit of armada's
@@ -219,7 +220,7 @@ def test_each_option_a_decision_task_is_built_with_reaches_it_from_the_command_l
 
     units = [(name, option, part) for name, options in WITNESSED_ON["DecideSettings"].items()
              for option in options for part in parts(option)]
-    assert len(units) == 18, "the shards mark counts each option's units"
+    assert len(units) == 19, "the shards mark counts each option's units"
     label = "the options DecideSettings' runs witness"
 
     def witness(start: int, stop: int) -> list[tuple[list[str], dict[str, str], bool, list[str], str]]:
