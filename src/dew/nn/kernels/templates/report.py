@@ -286,7 +286,7 @@ def record_rewrite(made) -> None:
 
 
 def record_pass(seconds: float) -> None:
-    """Record one program's whole algebra pass, its seconds (`dew.algebra.program.program_of`)."""
+    """Record one program's whole algebra pass, its seconds (`dew.algebra.program.rewritten_program`)."""
     with _GUARD:
         _registry().passes.append(seconds)
 
@@ -472,7 +472,10 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
     from dew.training._lowering import kernel_calls
 
     executable = lowered.compile(options)
-    if not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered)):
+    # A program of Pallas-Triton launches alone spills as a Mosaic one does: both kinds' binaries are read
+    # (`binaries`, a Triton launch's by its custom kernel's tag), so a launch's feedback is the same whatever
+    # kernels share its program (row 3960: a Triton-only program's 15,752-byte frame went unread).
+    if not any(call.kind in ("mosaic_gpu", "triton") for call in kernel_calls(lowered)):
         return executable, []
     return executable, [found for found in binaries(executable) if found.frame]
 
