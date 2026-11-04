@@ -10,8 +10,8 @@ the Worker announced, and each status as an outcome or a typed error. A 404 and 
 (401, 403 or any other status) is `Refused`, an unmet precondition (409, 412) `Conflict`, and a Worker that is
 busy or down (429, 5xx), or a request that did not complete, `Unavailable`. Each caller keeps its own policy:
 what a failure costs it, and whether to retry. What sends a request is a `Sender`: the standard library's
-(`urllib_send`) by default, or the caller's own, such as dew-ops' pooled one, which carries the same
-protocol.
+(`urllib_send`, a connection a request) by default, `KeptSend` (a connection a thread keeps), or the caller's
+own, such as dew-ops' pooled one, which carries the same protocol.
 
 The standard library alone: tools/armada/ci.py imports it as its sibling and tests/remote_cache.py loads it by
 its path, both before any environment exists to import Dew from."""
@@ -21,6 +21,7 @@ import http.client
 import json
 import re
 import socket
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator, Mapping
@@ -108,6 +109,92 @@ def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes |
     sock = connection.sock
     response = connection.getresponse()
     return response.status, dict(response.headers), _Answer(connection, sock, response)
+
+
+DRAINED = 2 ** 16
+"""The most of an unread answer's body a kept connection reads off to be used again (`KeptSend`): a miss's or
+a refusal's few bytes, never an object's."""
+DRAIN_SECONDS = 1.0
+"""The longest a kept connection waits for an unread answer's body to read it off (`DRAINED`), past which it
+is closed: a trickling refusal holds up no caller."""
+
+
+class KeptSend:
+    """A sender that keeps a connection a thread and host open across its requests, where `urllib_send` opens
+    one a request and every request pays its TCP and TLS handshakes: a plan's thousands of record lookups
+    from a CI runner took 103 s, the same plan's on armada, beside the Worker, 28 s. An answer read to its
+    end, or a miss's or a refusal's unread body of at most `DRAINED` bytes that it reads off within
+    `DRAIN_SECONDS`, gives its connection back to its thread; any other, or one the Worker said it would
+    close, closes it. A request a kept connection could not send, as
+    the Worker had closed it meanwhile, goes once on a new one. A connection is never shared between
+    threads, so a `Store` with this sender is shared as one with `urllib_send` is."""
+
+    def __init__(self):
+        self.local = threading.local()
+
+    def __call__(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None,
+                 timeout: float) -> tuple[int, Mapping[str, str], Stream]:
+        parts = urllib.parse.urlsplit(url)
+        place = (parts.scheme, parts.hostname, parts.port)
+        kept = getattr(self.local, "connections", None)
+        if kept is None:
+            kept = self.local.connections = {}
+        target = f"{parts.path or '/'}{f'?{parts.query}' if parts.query else ''}"
+        opened = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        held = kept.pop(place, None)
+        while True:
+            connection = held or opened(parts.hostname, parts.port, timeout=timeout)
+            connection.timeout = timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(timeout)
+            try:
+                connection.request(method, target, body=body, headers=dict(headers))
+                # Held before the answer, which detaches it from a connection the Worker closes after it, as
+                # `urllib_send` holds it.
+                sock = connection.sock
+                response = connection.getresponse()
+            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+                connection.close()
+                if held is None:
+                    raise
+                held = None
+                continue
+            return response.status, dict(response.headers), _Kept(kept, place, connection, sock, response)
+
+
+class _Kept(_Answer):
+    """A `KeptSend` answer: closed, its connection goes back to its thread's where it can carry another."""
+
+    def __init__(self, kept: dict, place: tuple, connection: http.client.HTTPConnection, sock: socket.socket,
+                 response: http.client.HTTPResponse):
+        super().__init__(connection, sock, response)
+        self.kept, self.place = kept, place
+
+    def close(self) -> None:
+        response = self.response
+        # An answer with nothing left to read (a PUT's 204, a HEAD's) ends at once. A success's body is the
+        # `Body`'s to read, and one it left unread (past its limit or its deadline) closes the connection; a
+        # miss's or a refusal's, which no `Body` reads, is read off in its bounds.
+        if not response.isclosed() and response.length == 0:
+            response.read()
+        elif (not response.isclosed() and not 200 <= response.status < 300 and response.length is not None
+                and response.length <= DRAINED):
+            self.drained()
+        if response.isclosed() and not response.will_close and self.place not in self.kept:
+            self.kept[self.place] = self.connection
+        else:
+            super().close()
+
+    def drained(self) -> None:
+        """The answer's unread body read off until it ends or `DRAIN_SECONDS` pass, each receive waiting at
+        most what is left of them; a body that does not come whole in time leaves the answer open, and its
+        connection is closed."""
+        ends = time.monotonic() + DRAIN_SECONDS
+        # A body cut short or refused leaves the answer open, which `close` reads as a connection to close.
+        with contextlib.suppress(OSError, http.client.HTTPException):
+            while not self.response.isclosed() and (left := ends - time.monotonic()) > 0:
+                if not self.read1(DRAINED, left):
+                    break
 
 
 class Body:
