@@ -20,7 +20,7 @@ import functools
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -236,23 +236,27 @@ def _summary(steps: Transition, returns: jax.Array):
 
 
 class Saved(TypedDict):
-    """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`)."""
+    """What a `ControlRollout` carries between calls, as a checkpoint holds it (`ControlRollout.saved`):
+    every key but `served`, which one written before the rollout counted its own lacks."""
 
     carry: Carry
     returns: jax.Array
     collected: Mapping[str, np.ndarray]
     order: np.ndarray
     ended: np.ndarray
+    served: NotRequired[np.ndarray]
 
 
 @dataclass
 class ControlRollout:
     """The trainer's rollout (`dew.training.rollout.Rollout`) of a `ControlPPOObjective` in `env`, a
-    batched `Env` or a `Simulator`: every `epochs` x `minibatches` updates it collects `unrolls` sequences
-    of `unroll_length` steps from each environment with the live policy, then serves them as `epochs`
-    shuffled passes of `minibatches` minibatches, one an update. Its carry, the environments mid
-    episode, stays on the device between collections. `metrics` reports the mean return of the
-    episodes that ended in the last collection."""
+    batched `Env` or a `Simulator`: it collects `unrolls` sequences of `unroll_length` steps from each
+    environment with the live policy, then serves them as `epochs` shuffled passes of `minibatches`
+    minibatches, the next one each call, and collects again once it has served them all. Its count of
+    those served is its own, so a run whose update pools several calls (`accumulation`), or whose
+    optimizer holds or rejects an update, serves each collection whole, once a pass. Its carry, the
+    environments mid episode, stays on the device between collections. `metrics` reports the mean
+    return of the episodes that ended in the last collection."""
 
     objective: ControlPPOObjective
     env: Env | Simulator
@@ -265,6 +269,10 @@ class ControlRollout:
     _collected: Mapping[str, np.ndarray] | None = field(default=None, init=False, repr=False)
     _order: np.ndarray | None = field(default=None, init=False, repr=False)
     _ended: float = field(default=float("nan"), init=False, repr=False)
+    _served: int | None = field(default=None, init=False, repr=False)
+    """The minibatches of the collection served; None before a call that set it: a run's first, or the
+    first of a run resumed from a checkpoint written before the rollout counted them, which reads it off
+    the updates as that run did."""
 
     def __post_init__(self) -> None:
         if min(self.unroll_length, self.unrolls, self.epochs, self.minibatches) < 1:
@@ -280,25 +288,27 @@ class ControlRollout:
         it: its environments mid episode, the collection it serves and their order. Nothing it carries is
         donated, so what the run left is kept as it is; a begun `Simulator` keeps its own environments
         (`dew.rl.simulator.branched`)."""
-        env, kept = self.env, (self._carry, self._returns, self._collected, self._order, self._ended)
+        env = self.env
+        kept = (self._carry, self._returns, self._collected, self._order, self._ended, self._served)
         try:
             with (branched(env) if isinstance(env, Simulator) and self._carry is not None
                   else contextlib.nullcontext()):
                 yield
         finally:
-            self._carry, self._returns, self._collected, self._order, self._ended = kept
+            self._carry, self._returns, self._collected, self._order, self._ended, self._served = kept
 
     def saved(self) -> Saved | None:
         """What the rollout carries between calls, for the run's checkpoint (`Rollout`'s `saved`): every
         environment mid episode and its running return, the collection it serves its minibatches from,
-        their order and the collection's mean ended return; None before its first call, and over a
-        `Simulator`, whose environments live outside JAX and start afresh on a resume."""
+        their order, the collection's mean ended return and how many of them it served; None before its
+        first call, and over a `Simulator`, whose environments live outside JAX and start afresh on a
+        resume."""
         carry, returns, collected, order = self._carry, self._returns, self._collected, self._order
-        if carry is None or returns is None or collected is None or order is None or isinstance(
-                self.env, Simulator):
+        if carry is None or returns is None or collected is None or order is None or self._served is None or (
+                isinstance(self.env, Simulator)):
             return None
         return Saved(carry=carry, returns=returns, collected=dict(collected), order=order,
-                     ended=np.asarray(self._ended, np.float32))
+                     ended=np.asarray(self._ended, np.float32), served=np.asarray(self._served, np.int32))
 
     def saved_shapes(self) -> Mapping[str, object] | None:
         """`saved`'s leaves' shapes and dtypes, before any call; None over a `Simulator`."""
@@ -316,13 +326,16 @@ class ControlRollout:
         gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
         order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
         return {"carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
-                "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32)}
+                "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32),
+                "served": jax.ShapeDtypeStruct((), jnp.int32)}
 
     def restored(self, tree: Saved) -> None:
-        """The rollout carrying on from a `saved` tree."""
+        """The rollout carrying on from a `saved` tree; one saved before the rollout counted the minibatches
+        it served reads them off the updates at its next call, as the run that saved it did."""
         self._carry, self._returns = tree["carry"], tree["returns"]
         self._collected = jax.tree.map(np.asarray, dict(tree["collected"]))
         self._order, self._ended = np.asarray(tree["order"]), float(tree["ended"])
+        self._served = int(tree["served"]) if "served" in tree else None
 
     def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
         """The collection for the rollout's environment as it is now: a run may change it between
@@ -352,13 +365,15 @@ class ControlRollout:
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
-        served = int(state.updates) % (self.epochs * self.minibatches)
+        passes = self.epochs * self.minibatches
+        # The rollout's own count of the minibatches served (row 3932); none yet, the updates' as before.
+        served = (int(state.updates) % passes or passes) if self._served is None else self._served
         carry, returns = self._carry, self._returns
         if carry is None or returns is None:
             carry = rollout_start(self.env, key)
             returns = jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
         collected, order = self._collected, self._order
-        if served == 0 or collected is None or order is None:
+        if served >= passes or collected is None or order is None:
             carry, steps = self._collector()(state.variables, carry)
             returns, gathered, ended, count = program(_summary)(steps, returns)
             collected = jax.device_get(gathered)
@@ -368,7 +383,9 @@ class ControlRollout:
                 raise ValueError(f"{sequences} sequences do not split into {self.minibatches} minibatches")
             rng = np.random.default_rng(np.asarray(jax.random.key_data(key)).ravel())
             order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)]).astype(np.int32)
+            served = 0
         self._carry, self._returns, self._collected, self._order = carry, returns, collected, order
+        self._served = served + 1
         size = len(collected["reward"]) // self.minibatches
         rows = order[served * size:(served + 1) * size]
         return jax.tree.map(lambda values: values[rows], collected)

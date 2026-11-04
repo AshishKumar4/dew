@@ -65,6 +65,14 @@ def test_label_accuracy_is_the_share_of_prompts_whose_best_label_is_their_answer
         label_accuracy(scores, [0])
 
 
+def test_label_scores_refuse_a_prompt_with_no_token_to_score_a_label_from():
+    """A label's first token is scored from the token before it, which an empty prompt does not have:
+    the scores refuse it, where a score read from position -1, the row's last, left the first token of
+    every label unscored and a one-token label scored 0 (row 3941)."""
+    with pytest.raises(ValueError):
+        label_scores(lambda rows: jnp.zeros(rows.shape, jnp.float32), [[]], [[1], [2, 3]])
+
+
 @pytest.mark.parametrize("adapted", [False, True], ids=["plain", "in-context"])
 def test_label_scores_are_the_labels_summed_log_likelihood(adapted):
     """Each label's score after each prompt is the sum of its tokens' log-likelihoods as the objective

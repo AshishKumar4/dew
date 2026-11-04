@@ -197,6 +197,7 @@ class EnvRunConfig(RunConfig):
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "env": "env",
                                                    "teacher": "teacher"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes", "rollout")
+    BUILT: ClassVar[tuple[str, ...]] = (*RunConfig.BUILT, "teacher.step")
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("dew.objectives.rl.dreamer:WorldModel"))
@@ -333,7 +334,8 @@ class EnvRunConfig(RunConfig):
     def pinned(self) -> Self:
         """This run with its sources pinned (`RunConfig.pinned`), and its teacher's step and the step of the
         run it starts from named as each resolves now (`Checkpoints.pinned`: the latest, or the best), so
-        its record names the steps it read and a resume reads them again."""
+        its record names the steps it read and a resume reads them again: a resumed run that leaves its
+        teacher's step to this takes the saved run's first (`BUILT`, `RunConfig.resumed`, row 3931)."""
         run = super().pinned()
         teacher = run.teacher
         if teacher is not None and not isinstance(teacher.step, int):

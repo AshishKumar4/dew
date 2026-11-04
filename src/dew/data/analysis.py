@@ -506,11 +506,8 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
         bound = ran.configured
         factory = _identity(bound.step)
         binding = {"factory": factory.semantic(), "scope": bound.step.scope, "values": bound.values}
-        identity = dataclasses.replace(
-            identity,
-            config=json.dumps({"step": identity.config, "configured": binding}, sort_keys=True),
-            modules=(*identity.modules, *factory.modules),
-        )
+        identity = identity.composed(
+            factory, json.dumps({"step": identity.config, "configured": binding}, sort_keys=True))
     if isinstance(stage, Batched):
         # The group size and whether the rows keep their count decide what a resume reads.
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"

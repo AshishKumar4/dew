@@ -1232,8 +1232,7 @@ def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as
     ahead for the run (`step_batch`) is handed a batch of that one signature, so the run takes the saved
     program as its own (rows 2527, 2434)."""
     from dew.training import Cooldowns
-    from dew.training._fit import first_batch
-    from dew.training.ahead import step_batch
+    from dew.training.ahead import first_step_batch, step_batch
 
     (x,) = clocked_records(0)
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
@@ -1248,8 +1247,8 @@ def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as
     assert logged and logged[0] == logged[-1]
     trainer = Trainer(Pulled(), optim, key=0)
     loader, _ = fitted(clocked_chain(x), None, objective=Pulled().data(), examples=CLOCKED_RECORDS)
-    trainer.reading(loader, examples=CLOCKED_RECORDS)
-    assert batch_signature(step_batch(trainer, first_batch(loader, trainer.device_mesh))) == signed.signed[0]
+    first = first_step_batch(trainer, loader, None, CLOCKED_RECORDS)
+    assert batch_signature(step_batch(trainer, first)) == signed.signed[0]
 
 
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():

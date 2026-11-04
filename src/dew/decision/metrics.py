@@ -158,6 +158,10 @@ class ECE:
         return expected_calibration_error(accumulated)
 
 
+type _Chunks = tuple[list[np.ndarray], list[np.ndarray]]
+"""A pass's answers so far, batch by batch: each one's top probabilities and whether each top is right."""
+
+
 @dataclass(frozen=True)
 class AURC:
     """The area under the risk-coverage curve.
@@ -172,13 +176,16 @@ class AURC:
     reads = Decisions
     shown = Shown(better="lower")
 
-    def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[np.ndarray, np.ndarray]:
-        return _tops(artifact)
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> _Chunks:
+        tops, correct = _tops(artifact)
+        return [tops], [correct]
 
-    def merge(self, accumulated: tuple[np.ndarray, np.ndarray],
-              contribution: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        return (np.concatenate([accumulated[0], contribution[0]]),
-                np.concatenate([accumulated[1], contribution[1]]))
+    def merge(self, accumulated: _Chunks, contribution: _Chunks) -> _Chunks:
+        # Each batch's answers kept as they came, joined once (`finalize`): a pass copies each row once,
+        # where joining every batch copied the pass's rows a batch (row 3942).
+        accumulated[0].extend(contribution[0])
+        accumulated[1].extend(contribution[1])
+        return accumulated
 
-    def finalize(self, accumulated: tuple[np.ndarray, np.ndarray]) -> float:
-        return risk_coverage_area(*accumulated)
+    def finalize(self, accumulated: _Chunks) -> float:
+        return risk_coverage_area(np.concatenate(accumulated[0]), np.concatenate(accumulated[1]))

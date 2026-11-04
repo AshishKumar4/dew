@@ -78,6 +78,7 @@ from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
+    from dew.checkpoints import Resume
     from dew.data.dataset import DataPartition, Loader
     from dew.training.trainer import Trainer
 
@@ -605,43 +606,50 @@ class AheadTarget:
         return devices
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
-                                  steps: int | None, examples: int | None = None) -> CompiledAhead:
+                                  steps: int | None, examples: int | None = None,
+                                  resume: Resume = "auto") -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only`), its first step compiled ahead
         (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
-        (`first_step_batch`), at the rung a resumed run's checkpoint left it. A run whose step reads a
-        rollout's batches, which it makes as it trains, is refused."""
+        (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it. A run whose
+        step reads a rollout's batches, which it makes as it trains, is refused."""
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples), self.capacity,
-                              frontier=self.frontier)
+        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
+                              self.capacity, frontier=self.frontier)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
 
 def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader: Loader, steps: int | None,
-                                      examples: int | None = None) -> Batch:
+                                      examples: int | None = None, resume: Resume = "auto") -> Batch:
     """The batch `trainer`'s first step takes from `loader`, as `fit` would start the run: an input its
     objective names alone declared first (`Trainer._declare_input`), the loader read through its device
     steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer.reading`), the
-    run checked (`Trainer.validate`), and the loader's first batch from the position its checkpoint left
-    a resumed run at (`Checkpoints.position`). A run its checkpoint completes has no step to take, and
-    is refused. What a step compiled ahead (`AheadTarget.compiled`) and an offline view of a run
-    (`dew.config.RunConfig.viewed`) start from."""
+    run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
+    (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
+    checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,
+    as the run's resume reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
+    completes has no step to take, and is refused. What a step compiled ahead (`AheadTarget.compiled`)
+    and an offline view of a run (`dew.config.RunConfig.viewed`) start from."""
+    from flax import linen as nn
+
     from dew.data.dataset import DataPartition
     from dew.training._fit import first_batch
 
-    trainer._declare_input(lambda: first_batch(loader, trainer.device_mesh))
+    trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
     trainer.reading(loader, examples=examples, steps=steps)
     trainer.validate(steps=steps)
     checkpoints = trainer.checkpoints
-    resumed = None if checkpoints is None else checkpoints.resumed("auto")
+    resumed = None if checkpoints is None else checkpoints.resumed(resume)
     if resumed is not None and steps is not None and resumed >= steps:
         raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
                          "step to take")
-    position = None if checkpoints is None or resumed is None else checkpoints.position(
-        resumed, DataPartition.of(trainer.device_mesh))
-    return first_batch(loader, trainer.device_mesh, position)
+    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    with nn.logical_axis_rules(trainer.layout.axis_rules):
+        position = None if checkpoints is None or resumed is None else checkpoints.position(
+            resumed, DataPartition.of(trainer.device_mesh))
+        return first_batch(loader, trainer._stream_partition(), position)
 
 
 class CompiledAhead(SystemExit):

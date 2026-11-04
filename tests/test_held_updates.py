@@ -9,7 +9,7 @@ import optax
 import pytest
 from affine_run import FEATURES, Affine, Counting, dataset
 from recording import RecordingTracker
-from test_trainer import TokenRegression, make_trainer
+from test_trainer import PaddedTokenRegression, TokenRegression, make_trainer
 
 from dew.data.dataset import Loader
 from dew.held_updates import phased
@@ -95,6 +95,18 @@ def test_an_optimizer_that_holds_updates_back_counts_its_clocks_by_the_updates_i
                                                                      jax.tree.leaves(after), strict=True)]
         applied = call % 2 == 1
         assert (any(moved), int(stepped.updates)) == (applied, (call + 1) // 2)
+
+
+def test_a_token_budget_ends_at_the_update_whose_held_tokens_reach_it():
+    """Rows of four token positions, of which step k's score k + 1, under an optimizer that applies every
+    third update: its first update, at step 3, commits 8 + 16 + 24 = 48, past a budget of 40, so the run
+    ends there, as the trainer's own window of three does. The clock's bound counts the tokens the
+    optimizer holds back (`TrainState.deferred`) as pending, where it dropped them at its read after step 2
+    and stepped once more past the budget (row 3930)."""
+    multi = optax.MultiSteps(optax.sgd(0.1), every_k_schedule=3).gradient_transformation()
+    held = make_trainer(objective=PaddedTokenRegression(), optimizer=multi).fit(dataset(), tokens=40)
+    window = make_trainer(objective=PaddedTokenRegression(), accumulation=3).fit(dataset(), tokens=40)
+    assert (int(held.step), int(held.updates)) == (int(window.step), int(window.updates)) == (3, 1)
 
 
 @pytest.mark.parametrize("held", ["multi_steps", "apply_every"])

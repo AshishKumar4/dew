@@ -13,7 +13,7 @@ import numpy as np
 
 from dew import position
 from dew._records import record
-from dew.batch import EXAMPLES_CONSUMED, Batch
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -31,6 +31,10 @@ from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, Plan, earlier_position
 
+READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
+"""A batch's fields its reader owns, which a host step after the batch neither reads nor writes
+(`_HostSteps`): the examples it consumes and which of its rows are real."""
+
 
 @dataclasses.dataclass(frozen=True)
 class _HostSteps:
@@ -39,14 +43,14 @@ class _HostSteps:
     def __call__(self, value: Batch) -> Batch:
         from dew.data.lowering import _outputs
 
-        # The examples the batch consumes are the trainer's accounting, which no step of the batch's
-        # own sees or changes: a projection or a fresh model-input dict keeps them.
-        consumed = value.get(EXAMPLES_CONSUMED)
-        held = value if consumed is None else {name: column for name, column in value.items()
-                                               if name != EXAMPLES_CONSUMED}
+        # The examples the batch consumes and which of its rows are real are the reader's accounting,
+        # which no step of the batch's own sees or changes: a projection or a fresh model-input dict
+        # keeps them (row 3937: a projection dropped an evaluation's real-row mask).
+        kept = {name: value[name] for name in READER_FIELDS if name in value}
+        held = {name: column for name, column in value.items() if name not in kept}
         for step in self.steps:
             held = record(_outputs(Map(step), None, held)[0], "host map result")
-        return held if consumed is None else {**held, EXAMPLES_CONSUMED: consumed}
+        return {**held, **kept}
 
 
 class _Host(_CheckpointableMapping):

@@ -1075,7 +1075,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     """A four-layer decoder on the stage axis, the same model and seed on
     every topology."""
     import jax
-    import optax
+    from optim_support import stage_local_adam
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
@@ -1083,7 +1083,8 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
-    return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
+    # Adam whose states each name their transform, so a pipelined run keeps its layers stage-local.
+    return Trainer(LMObjective(model, SEQ_LEN), stage_local_adam(1e-3), key=jax.random.key(0),
                    mesh=MeshSpec(fsdp=fsdp, stage=stage), microbatches=microbatches,
                    layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
 

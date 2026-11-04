@@ -21,7 +21,7 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
-from dew.nn.programs import CALLS, platform_branch
+from dew.nn.programs import CALLS, bodies, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
@@ -168,26 +168,6 @@ def interpreter(interpret) -> Callable:
     if isinstance(interpret, mosaic_gpu.InterpretGPUParams):
         return functools.partial(on_gpu, interpret_params=interpret)
     return hlo_interpreter.pallas_call_hlo_interpret
-
-
-def opaque(equation: jcore.JaxprEqn) -> bool:
-    """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's, one custom call whose
-    results are its outputs alone, its body's values in registers and shared memory, its products
-    Triton's (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py). `compiled`
-    leaves no interpreted one: it is its interpreter's program (`interpreter`)."""
-    return equation.primitive.name == "pallas_call"
-
-
-def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
-    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's. A
-    native Pallas kernel runs none XLA sees (`opaque`)."""
-    if opaque(equation):
-        return []
-    found = []
-    for value in equation.params.values():
-        found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
-                     if isinstance(each, jcore.Jaxpr))
-    return found
 
 
 def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
