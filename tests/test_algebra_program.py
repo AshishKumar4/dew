@@ -857,7 +857,8 @@ def computed():
 before = computed()
 variable, params = var("x", Term), var("params", i64)
 exponential = ruleset(rewrite(variable.unary("exp", params)).to(variable), name="registered after")
-rules.register(rules.Rules("registered after", "reorders", exponential, receipt="a test's"))
+rules.register(rules.Rules("registered after", "reorders", exponential, receipt="a test's",
+                           instances={"the exponential as its argument": (jnp.exp, lambda x: x, None)}))
 print(json.dumps({"before": before, "after": computed()}))
 """
 """A process that rewrites a program's window and a branch body of one held program, registers a rule set

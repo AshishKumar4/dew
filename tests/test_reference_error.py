@@ -2445,7 +2445,8 @@ from dew.nn.kernels import options
 x, params = var("x", Term), var("params", i64)
 rules.register(rules.Rules("faulty exponential", "reorders",
                            ruleset(rewrite(x.unary("exp", params)).to(x), name="faulty exponential"),
-                           receipt="tests/test_reference_error.py"))
+                           receipt="tests/test_reference_error.py",
+                           instances={"the exponential as its argument": (jnp.exp, lambda x: x, None)}))
 
 
 def sums(x, y):
