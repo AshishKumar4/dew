@@ -40,7 +40,6 @@ from dew.pool import (
     PROCESS_COUNT,
     PROCESS_ID,
     joins_pool,
-    local_gpu_count,
     pool_cluster,
     refuse_idle_gpus,
     runs_on_gpu,
@@ -213,7 +212,8 @@ def _join_process_pool(multi_host: bool | None) -> None:
             and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
-        refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
+        gpus = communicators.local_gpus()
+        refuse_idle_gpus(tasks, None if gpus is None else len(gpus), "this slurm step")
     if not joins_pool(multi_host, cluster):
         return
     if PROCESS_COUNT in os.environ:

@@ -160,16 +160,25 @@ def product_magnitude(left: tuple, right: tuple, length) -> tuple[list, i64]:
     return facts + more, power + other + length
 
 
+Instance = tuple[Callable, Callable, Callable]
+"""A rule written as JAX: its left side, its right side, and draws of its operands by seed."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Rules:
     """A named set of rules: its rounding class (`exact`: each rewrite rounds as the form it replaces;
-    `reorders`: it reorders rounding, admitted under default numerics alone), its egglog ruleset, and the
-    measurement it ships with."""
+    `reorders`: it reorders rounding, admitted under default numerics alone), its egglog ruleset, the
+    measurement it ships with, and its rules written as JAX (`instances`), which its accuracy test holds each
+    right side to its left side by."""
 
     name: str
     rounding: Literal["exact", "reorders", "bounded"]
     ruleset: Ruleset
     receipt: str
+    instances: Mapping[str, Instance] = dataclasses.field(default_factory=dict)
+    """Each rule written as JAX by its name: a registered set states some (`register`); a derivation's own
+    set (`derive.DECOUPLED`, `carry.CARRIED`), whose rules read its readings and never run among the
+    registry's, is qualified by its derivation's tests."""
     dev: bool = False
     """Whether it runs at dev time alone, where each candidate's error is measured before it is taken
     (`dew.algebra.error.choose`): a set whose forms are chosen for their accuracy, at a cost the program pass
@@ -407,19 +416,56 @@ RULES: dict[str, Rules] = {}
 
 
 def register(rules: Rules) -> None:
-    """Add a set of rules to the registry, which runs them in the order they were registered."""
+    """Add a set of rules to the registry, which runs them in the order they were registered: a set states
+    its rules as JAX (`Rules.instances`), which qualify it (`instances`), or is refused."""
     if rules.name in RULES:
         raise ValueError(f"a rule set named {rules.name!r} is registered already")
+    if not rules.instances:
+        raise ValueError(f"the rule set {rules.name!r} states no instances to qualify it by")
     RULES[rules.name] = rules
 
 
-register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", aid=True))
+def _drawn(*shapes, scale: Callable[[np.random.Generator, tuple[int, ...]], np.ndarray] | None = None):
+    """Draws of operands of `shapes` by seed: each element's magnitude across six decades, a large and a
+    small term together in every row, the same family each seed; `scale`'s draw instead where a rule's
+    operands lie in a domain of their own."""
+    def drawn(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape)
+                                 if scale is None else scale(rng, shape), jnp.float32) for shape in shapes)
+    return drawn
+
+
+_ROWS, _SCALED = _drawn((64, 1024), (64, 1024), (64, 1024)), _drawn((64, 1024), (64,))
+_SMALL = _drawn((64, 1024), scale=lambda rng, shape: (rng.uniform(-0.5, 0.5, shape)
+                                                      * 10.0 ** rng.uniform(-6, 0, shape)))
+_FOLDED = _drawn((64, 1024), (64, 1), (64, 1), scale=lambda rng, shape: (
+    rng.standard_normal(shape) * 4.0 if shape[-1] > 1 else np.exp(rng.standard_normal(shape) * 2.0)))
+
+register(Rules("identities", "exact", _identities(), receipt="docs/design/algebra.md §1", aid=True,
+               instances={"commutativity": (lambda x, y, a: x + y, lambda x, y, a: y + x, _ROWS)}))
 register(Rules("contracted", "exact", _contracted(), aid=True,
-               receipt="docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721"))
+               receipt="docs/design/algebra.md §6.5; the scaled softmax's maximum, ledger 3721",
+               instances={"a multiply its add reads, contracted": (lambda x, y, a: a * x + y,
+                                                                   lambda x, y, a: a * x + y, _ROWS)}))
 register(Rules("stable", "bounded", _stable(), dev=True,
-               receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba"))
-register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308"))
-register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md §1; ledger 1308"))
+               receipt="docs/design/algebra.md §1.5; the log-sum-exp fold, feat/attention-derived 12f9398ba",
+               instances={"the logarithm of one more": (lambda x: jnp.log(1 + x), jnp.log1p, _SMALL),
+                          "one less than the exponential": (lambda x: jnp.exp(x) - 1, jnp.expm1, _SMALL),
+                          "a sum's logarithm out of the exponent": (
+                              lambda x, m, t: jnp.exp(x - (m + jnp.log(t))),
+                              lambda x, m, t: jnp.exp(x - m) / t, _FOLDED)}))
+register(Rules("linear", "reorders", _linear(), receipt="docs/design/algebra.md §1; ledger 1308",
+               instances={"distributivity": (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y),
+                                             _ROWS),
+                          "a row scalar out of a sum": (lambda x, s: jnp.sum(s[:, None] * x, -1),
+                                                        lambda x, s: s * jnp.sum(x, -1), _SCALED),
+                          "a power of two's scale through a contraction": (
+                              lambda x, y, a: jnp.dot(x, y.T) * 0.5, lambda x, y, a: jnp.dot(x * 0.5, y.T),
+                              _ROWS)}))
+register(Rules("joined", "reorders", _joined(), receipt="docs/design/algebra.md §1; ledger 1308",
+               instances={"two sums along an axis": (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1),
+                                                     lambda x, y, a: jnp.sum(x + y, -1), _ROWS)}))
 
 
 HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
@@ -481,26 +527,8 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
                  if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
 
 
-def instances() -> Mapping[str, tuple[Callable, Callable, Callable]]:
-    """Each rule written as JAX, its left side and its right side, with draws of its operands (drawn rows and
-    adversarial ones: a large and a small term together), for its accuracy test."""
-    def draw(*shapes):
-        def drawn(seed):
-            # Each element's magnitude drawn across six decades, a large and a small term together in every
-            # row, the same family each seed.
-            rng = np.random.default_rng(seed)
-            return tuple(jnp.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape),
-                                     jnp.float32) for shape in shapes)
-        return drawn
-
-    rows, scaled = draw((64, 1024), (64, 1024), (64, 1024)), draw((64, 1024), (64,))
-    return {
-        "linear: two sums along an axis": (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1),
-                                           lambda x, y, a: jnp.sum(x + y, -1), rows),
-        "linear: distributivity": (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), rows),
-        "linear: a row scalar out of a sum": (lambda x, s: jnp.sum(s[:, None] * x, -1),
-                                              lambda x, s: s * jnp.sum(x, -1), scaled),
-        "linear: a scale through a contraction": (lambda x, y, a: jnp.dot(x, y.T) * 0.3,
-                                                  lambda x, y, a: jnp.dot(x * 0.3, y.T), rows),
-        "identities: commutativity": (lambda x, y, a: x + y, lambda x, y, a: y + x, rows),
-    }
+def instances() -> Mapping[str, Instance]:
+    """Every registered rule written as JAX, by its set's name and its own (`Rules.instances`): the
+    qualification inventory its accuracy test holds each right side to its left side over."""
+    return {f"{rules.name}: {name}": instance for rules in RULES.values()
+            for name, instance in rules.instances.items()}
