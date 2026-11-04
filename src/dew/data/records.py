@@ -434,8 +434,10 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Mixture):
         tokens = (None if source.tokens is None
                   else _typed(source.tokens, declared_type(Mixture, "tokens"), "a mixture's token count"))
+        # A mix's seed is written only where it has one, so a record of an unseeded mix is as it was.
+        seeded: dict[str, JSON] = {} if source.seed is None else {"seed": source.seed}
         return {"mix": [_chain(child) for child in source.pipelines], "weights": list(source.weights),
-                "tokens": tokens}
+                "tokens": tokens, **seeded}
     if isinstance(source, Phases):
         clock = "until_steps" if source.clock == "steps" else "until_tokens"
         return {"phases": [_chain(child) for child in source.pipelines], clock: list(source.ends)}
@@ -589,8 +591,10 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
         counted = None if tokens is None else from_record(counting, json_value(tokens, "tokens"))
         if counted is not None and not _counts(counted):
             raise ValueError("a mixture's token count reads back as no function")
+        seed = written.get("seed")
         return Mixture(tuple(_read_chain(record(child, "corpus")) for child in corpora),
-                       numbers(written.get("weights"), "weights"), counted)
+                       numbers(written.get("weights"), "weights"), counted,
+                       None if seed is None else integer(seed, "mix seed"))
     if "phases" in written:
         clock = "until_tokens" if "until_tokens" in written else "until_steps"
         until = _entries(written.get(clock), clock)

@@ -668,6 +668,17 @@ class ProportionalSelection(pygrain.DatasetSelectionMap):
         if any(span == 0 for span in spans):
             raise ValueError("every corpus of a mix needs a record")
         self._length = min(sys.maxsize, int(min(spans)))
+        if seed is not None:
+            # A seeded window may draw a corpus's records sooner than its share: the mix ends before
+            # the first position that would read past a corpus, the most positions whose counts every
+            # corpus holds (`Proportions.counts`, monotone in its positions).
+            low, high = 0, min(sys.maxsize, self._length + total)
+            while low < high:
+                middle = (low + high + 1) // 2
+                held = all(count <= length for count, length
+                           in zip(self._proportions.counts(middle), lengths, strict=True))
+                low, high = (middle, high) if held else (low, middle - 1)
+            self._length = low
         self._run: tuple[int, np.ndarray, np.ndarray] | None = None
         self._last = -2
         self._lock = threading.Lock()

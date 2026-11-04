@@ -623,6 +623,32 @@ def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares
         assert own[:600] and sorted(own[:600]) == list(range(start, start + 600)), start
 
 
+def test_a_seeded_mix_is_its_own_record_and_plan_and_ends_where_a_corpus_would_read_past_its_records():
+    """A seeded mix's record carries its seed (`dew.data.records`): read back, it reads its corpora in the
+    order it did. Its plan names the seed, so a plan of another seed refuses it (`Plan.check`) where one of
+    its own resumes. Read by index or streamed, a seeded mix of corpora too short for a whole window ends
+    at the first position that would read past one, alike either way, each record once."""
+    from dew.data.records import decode, encode
+
+    def corpus(start: int, size: int) -> Pipeline:
+        return Pipeline(Memory([{"id": index} for index in range(start, start + size)]))
+
+    chain = mix([corpus(0, 600), corpus(1000, 600)], seed=4)
+    again = decode(json.loads(json.dumps(encode(chain))))
+    assert ([int(row["id"]) for row in iterate(again, read="memory")]
+            == [int(row["id"]) for row in iterate(chain, read="memory")])
+    plan = compile(chain.batch(4), read="memory", loading=READ).plan
+    other = compile(mix([corpus(0, 600), corpus(1000, 600)], seed=5).batch(4), read="memory",
+                    loading=READ).plan
+    assert plan.check(plan.record()) == ()
+    with pytest.raises(ValueError):
+        plan.check(other.record())
+    short = mix([corpus(0, 3), corpus(1000, 5)], seed=0)
+    indexed, streamed = ([int(row["id"]) for row in iterate(short, read=read)]
+                         for read in ("memory", "streamed"))
+    assert indexed == streamed and len(set(indexed)) == len(indexed) and indexed, indexed
+
+
 def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp_path):
     """Packed phases step one program: a phase whose windows hold one document each and one whose
     windows hold four both declare four (`Coordinates.max_segments`), not their own most nor the
