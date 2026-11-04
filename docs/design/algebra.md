@@ -320,44 +320,43 @@ the primitive's parameters as primitive sorts:
 ```python
 class Term(Expr):
     @classmethod
-    def input(cls, index: i64Like) -> Term: ...                 # a region's argument
+    def leaf(cls, index: i64Like) -> Term: ...                 # an input, or an equation outside the language
     @classmethod
-    def literal(cls, value: f64Like, dtype: StringLike) -> Term: ...
+    def literal(cls, index: i64Like) -> Term: ...              # by its index in the region's literals
     @classmethod
-    def opaque(cls, equation: i64Like, output: i64Like) -> Term: ...  # never rewritten (§1.2)
+    def bundle(cls, roots: Vec[Term]) -> Term: ...             # a region's roots, extracted together
+    def binary(self, name: StringLike, other: Term, params: i64Like) -> Term: ...  # add, sub, mul, div, max, ...
+    def compare(self, name: StringLike, other: Term, params: i64Like) -> Term: ...  # lt, le, eq, ne, ge, gt
+    def unary(self, name: StringLike, params: i64Like) -> Term: ...  # neg, exp, exp2, log, log1p, sqrt, ...
+    def select(self, false: Term, true: Term) -> Term: ...
+    def convert(self, params: i64Like) -> Term: ...
+    def shaped(self, name: StringLike, params: i64Like) -> Term: ...  # broadcast_in_dim, reshape, transpose, ...
+    def reduce(self, monoid: StringLike, axes: Vec[i64], params: i64Like) -> Term: ...  # sum, max or min (§6.3)
+    def dot(self, other: Term, params: i64Like) -> Term: ...   # dot_general
+    # the derivation's readings (§6.9), rewritten into the language and never extracted themselves
     @classmethod
-    def semantic(cls, name: StringLike, operands: Vec[Term], output: i64Like) -> Term: ...
-    def __add__(self, other: Term) -> Term: ...                 # add, sub, mul, div, max, min, ...
-    def unary(self, name: StringLike) -> Term: ...             # neg, exp, exp2, log, sqrt, rsqrt, abs, sign
-    def compare(self, kind: StringLike, other: Term) -> Term: ...  # lt, le, eq, ne, ge, gt
-    @classmethod
-    def iota(cls, shape: Vec[i64], dimension: i64Like) -> Term: ...
-    def prefix(self, monoid: StringLike, axis: i64Like, reverse: BoolLike) -> Term: ...  # cumsum, cummax, ...
-    def convert(self, dtype: StringLike) -> Term: ...
-    def broadcast(self, shape: Vec[i64], dimensions: Vec[i64]) -> Term: ...
-    def reshape(self, shape: Vec[i64]) -> Term: ...
-    def transpose(self, permutation: Vec[i64]) -> Term: ...
-    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # sum, max or min (§6.3)
-    @classmethod
-    def dot(cls, lhs: Term, rhs: Term, contracting: Vec[i64], batch: Vec[i64], result: StringLike) -> Term: ...
-    @classmethod
-    def select(cls, predicate: Term, true: Term, false: Term) -> Term: ...
+    def state(cls, index: i64Like, side: i64Like) -> Term: ...
+    def held(self, side: i64Like) -> Term: ...
+    def stepped(self) -> Term: ...
+    def merged(self) -> Term: ...
+    def finished(self) -> Term: ...
 ```
 
-- `semantic` is a primitive whose meaning is declared, not computed by the e-graph. No rule rewrites inside it,
-  and no compile-time set equates it with anything. At dev time the `stable` and `error_free` sets may equate it
-  with another form, which extraction admits only where its error estimate meets the declared accuracy (§1.5).
-  These primitives are:
-  - the error-free transformations, `two_sum`, `two_product` and scaling by `2**k`, exact barring overflow;
-  - `bounded_split(x, dtype)`, hi = dtype(x) and lo = dtype(x − hi), whose declared error bound is the dtype's
-    rounding of lo;
-  - `triangular_inverse`.
-- `terms.region(jaxpr, equations) -> (Term roots, Leaves)` converts a region of equations:
-  - every equation outside the language becomes `opaque`;
-  - a `Protected` span (§6.10) becomes one `opaque` leaf for each of its outputs, its equations kept as they are;
-  - every value the region reads but does not compute becomes an `input`.
-- `terms.rebuilt(roots, leaves) -> jax.extend.core.Jaxpr` converts an extracted term back to equations, and drops the
-  markers, which lower to nothing.
+- A term's `params` index the region's table of its equation's parameters (`terms.parameter_key`'s structural
+  key, `Region.params`), so a rule reads a parameter as a fact of its own (a product's dimension numbers, a
+  literal's value) and an equation's every parameter rebuilds it as traced.
+- The error-free transformations (`two_sum`, `two_product`, the correctly rounded divide's significand) are
+  `Protected` spans (§6.10): one leaf of the region each, no rule touching them, rather than a `semantic`
+  constructor. An `iota`, a prefix sum (`cumsum`, `cummax`) and every other primitive outside the language are
+  leaves; a recurrence's prefix is the scan derivation's (`linear_scan`, §6.9), which reads the token update,
+  not a prefix term.
+- `terms.region(closed) -> Region` converts a window's equations (`program._windows`):
+  - every equation outside the language becomes a `leaf` for each of its outputs;
+  - a `Protected` span (§6.10) is one marked call, a `leaf` for each of its outputs, its equations kept as
+    they are;
+  - every value the window reads but does not compute becomes a `leaf`.
+- `terms.form_value(region, form, values)` evaluates an extracted form over its leaves' values, each equation
+  rebuilt from its interned parameters, which a splice traces into the window's place (`program._splices`).
 - A surviving custom-derivative call (`custom_jvp_call`, `custom_vjp_call`, in a program no transform has traced
   through) is a region of its own: its `call_jaxpr` is rewritten in place by its marked kind, and the call, its
   rules and their derivative programs are rebuilt as they were, so the custom derivative stays the site's. Its
