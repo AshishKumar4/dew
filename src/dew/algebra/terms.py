@@ -10,8 +10,11 @@ from an equation states its shape (`rules.shape`), which rules read before they 
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
+import hashlib
 import math
+import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import overload
 
@@ -250,10 +253,72 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[str, str]:
-    """An equation's primitive and parameters as a region holds them: two whose parameters print alike share
-    one entry of its table (`Region.params`), the first's."""
-    return primitive.name, repr(sorted(values.items(), key=lambda named: named[0]))
+def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
+    """An equation's primitive and parameters as a region holds them: two equations of one primitive whose
+    parameters are one (`parameter_key`) share one entry of its table (`Region.params`), the first's."""
+    return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
+
+
+def parameter_key(value) -> Hashable:
+    """An equation's parameter as what it is, the one structural key the algebra pass (`parameters_key`,
+    `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
+    every process, tagged with its kind. A number by its value whatever its Python or NumPy type (a float by
+    its bits, so a NaN is one key and -0.0 another than 0.0); a sequence's parts, a named tuple's with its
+    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity);
+    a dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
+    its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
+    its mesh, partitions and memory; an array by its dtype, shape and bytes' digest; a function by its module
+    and name. Any other object is its type's name and the object itself, compared by its own equality, never
+    by its printed form. `value` is any parameter JAX's primitives take, which share no type."""
+    if value is None or isinstance(value, (bool, str)):
+        return type(value).__name__, value
+    if isinstance(value, (int, np.integer)):
+        return "int", int(value)
+    if isinstance(value, (float, np.floating)):
+        return "float", float(value).hex()
+    if isinstance(value, complex):
+        return "complex", value.real.hex(), value.imag.hex()
+    if isinstance(value, np.dtype):
+        return "dtype", value.name
+    if isinstance(value, enum.Enum):
+        return "enum", _named(type(value)), value.name
+    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
+        array = np.asarray(jax.random.key_data(value) if jnp.issubdtype(value.dtype, jax.dtypes.prng_key)
+                           else value)
+        return ("array", str(value.dtype), array.shape, str(array.dtype),
+                hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+    if isinstance(value, jax.sharding.Mesh):
+        return ("mesh", parameter_key(value.device_ids), parameter_key(value.axis_names),
+                parameter_key(value.axis_types))
+    if isinstance(value, jax.sharding.AbstractMesh):
+        return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
+                parameter_key(value.axis_types), parameter_key(value.abstract_device))
+    if isinstance(value, jax.sharding.NamedSharding):
+        return ("named sharding", parameter_key(value.mesh), parameter_key(value.spec),
+                parameter_key(value.memory_kind))
+    if isinstance(value, jax.sharding.PartitionSpec):
+        return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
+                parameter_key(value.reduced), parameter_key(value.unreduced_kind))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = dataclasses.fields(value)
+        return "record", _named(type(value)), tuple((field.name, parameter_key(getattr(value, field.name)))
+                                                    for field in fields)
+    if isinstance(value, (tuple, list)):
+        # A named tuple's type names its fields, which its parts take in order.
+        return "sequence", _named(type(value)), tuple(parameter_key(part) for part in value)
+    if isinstance(value, (set, frozenset)):
+        return "set", tuple(sorted((parameter_key(part) for part in value), key=repr))
+    if isinstance(value, Mapping):
+        return "mapping", tuple(sorted(((parameter_key(name), parameter_key(part))
+                                        for name, part in value.items()), key=repr))
+    if isinstance(value, types.FunctionType):
+        return "function", value.__module__, value.__qualname__
+    return "object", _named(type(value)), value
+
+
+def _named(kind: type) -> str:
+    """A type's import path, which names it in every process."""
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 def declarations(language: object) -> Declarations:
@@ -311,7 +376,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     """`region`'s terms, each of `forms`."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
-    indexed: dict[tuple[str, str, tuple | None], int] = {}
+    indexed: dict[tuple[jcore.Primitive, Hashable, tuple | None], int] = {}
     literals: list = []
     shapes: list[tuple[Node, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}

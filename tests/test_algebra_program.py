@@ -769,7 +769,7 @@ def _parameter_pairs():
     numbers = jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
                                              start_index_map=(0,))
     unequal = [(ordered, reordered), (long, changed)]
-    equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(np.float32), jnp.float32),
+    equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(jnp.bfloat16), jnp.dtype("bfloat16")),
              (NamedSharding(abstract, P("data", None)), NamedSharding(abstract, P("data", None))),
              (numbers, jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
                                                       start_index_map=(0,))),
