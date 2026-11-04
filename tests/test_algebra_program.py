@@ -750,3 +750,50 @@ def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
 
     traced = jax.make_jaxpr(stepped)(rows(14, (8, 48))[0])
     assert algebra.program_of(traced) is traced
+
+
+def _parameter_pairs():
+    """Equation parameters the algebra pass and the kernel tuner key (`terms.parameter_key`), as pairs of
+    values each (equal, unequal) and the value as JAX holds it: two that print alike but differ (a mesh over
+    the same devices in another order; two long arrays apart in an element their printed forms elide), and
+    two that are one parameter however they were built (an integer and NumPy's, a dtype and its scalar
+    type, two shardings, dimension numbers and precisions built apart)."""
+    from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec as P
+
+    devices = jax.devices()[:4]
+    ordered, reordered = (jax.sharding.Mesh(np.asarray(order), ("data",))
+                          for order in (devices, devices[::-1]))
+    long, changed = np.arange(4096, dtype=np.int32), np.arange(4096, dtype=np.int32)
+    changed[2048] = -1
+    abstract = AbstractMesh((4,), ("data",), axis_types=(AxisType.Explicit,))
+    numbers = jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
+                                             start_index_map=(0,))
+    unequal = [(ordered, reordered), (long, changed)]
+    equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(np.float32), jnp.float32),
+             (NamedSharding(abstract, P("data", None)), NamedSharding(abstract, P("data", None))),
+             (numbers, jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
+                                                      start_index_map=(0,))),
+             (jax.lax.Precision.HIGHEST, jax.lax.Precision("highest")),
+             (jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jax.lax.DotAlgorithmPreset.BF16_BF16_F32)]
+    return equal, unequal
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_parameter_is_keyed_by_what_it_is_not_by_its_printed_form():
+    """A window's derivation and a kernel launch's program are keyed by each equation's parameters
+    (`terms.parameter_key`, the one structural key both read): parameters that print alike but differ take
+    two keys, so a window derived for one is never another's; one parameter however built takes one; and
+    a key is plain data, the same in every process (its printed form reads back as itself), never an
+    object's printed form."""
+    import ast
+
+    equal, unequal = _parameter_pairs()
+    for first, second in unequal:
+        assert terms.parameter_key(first) != terms.parameter_key(second), (first, second)
+        assert (terms.parameters_key(jax.lax.add_p, {"p": first})
+                != terms.parameters_key(jax.lax.add_p, {"p": second}))
+    for first, second in equal:
+        assert terms.parameter_key(first) == terms.parameter_key(second), (first, second)
+    for value in [value for pair in (*equal, *unequal) for value in pair]:
+        key = terms.parameter_key(value)
+        assert ast.literal_eval(repr(key)) == key, value
