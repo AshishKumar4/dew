@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
@@ -27,7 +26,7 @@ from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import accumulated, capped_logits, float32_dot_general
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, float32_dot_general
 from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.nn.sharding import abstract
 from dew.registry import from_record
@@ -174,17 +173,17 @@ class CumulativeGroupNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        dtype = x.dtype
-        fp32 = x.astype(jnp.float32)
+        dtype, wide = x.dtype, at_least_fp32(x.dtype)
+        widened = x.astype(wide)
         axes = tuple(range(2, x.ndim))
-        count = jnp.arange(1, x.shape[1] + 1, dtype=jnp.float32) * math.prod(x.shape[2:])
+        count = jnp.arange(1, x.shape[1] + 1, dtype=wide) * math.prod(x.shape[2:])
         count = count.reshape((1, x.shape[1]) + (1,) * (x.ndim - 2))
-        mean = jnp.cumsum(jnp.sum(fp32, axis=axes, keepdims=True), axis=1) / count
+        mean = jnp.cumsum(jnp.sum(widened, axis=axes, keepdims=True), axis=1) / count
         # The reference accumulates each frame's squared difference from its
         # own prefix mean. It is not the usual E[x^2] - E[x]^2 variance.
-        variance = jnp.cumsum(jnp.sum(jnp.square(fp32 - mean), axis=axes, keepdims=True), axis=1) / count
+        variance = jnp.cumsum(jnp.sum(jnp.square(widened - mean), axis=axes, keepdims=True), axis=1) / count
         scale = self.param("scale", nn.initializers.ones, (x.shape[-1],), jnp.float32)
-        return ((fp32 - mean) * jax.lax.rsqrt(variance + self.epsilon) * scale).astype(dtype)
+        return ((widened - mean) * jax.lax.rsqrt(variance + self.epsilon) * scale).astype(dtype)
 
 
 def _every_nth_frame(z, stride: int):
@@ -262,10 +261,10 @@ def _block_context(x, chunk: int, left: int, right: int):
 
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
-    half = width // 2
+    half, wide = width // 2, at_least_fp32(dtype)
     # `exp(-ln(10000) i / (half - 1))`, which is `10000 ** (-i / (half - 1))`, rounded once from float64.
-    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1), dtype=np.float32))
-    return sinusoids(positions.astype(jnp.float32)[:, None] * inv[None, :]).astype(dtype)
+    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1), dtype=wide))
+    return sinusoids(positions.astype(wide)[:, None] * inv[None, :]).astype(dtype)
 
 
 def _relative_logits(query, key, positional, precision: PrecisionLike = None):
@@ -314,7 +313,7 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     distance = left + jnp.arange(chunk)[:, None] - jnp.arange(chunk + left + right)[None, :]
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
-    probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
+    probabilities = jax.nn.softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1).astype(value.dtype)
     out = accumulated(functools.partial(jnp.matmul, precision=precision),
                       probabilities, value.transpose(0, 3, 1, 2, 4))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
@@ -370,8 +369,9 @@ class Gemma4Attention(nn.Module):
         cfg = self.config
         heads, dim = cfg.num_attention_heads, cfg.hidden_size // cfg.num_attention_heads
         linear = _clippable(cfg, self.dtype, self.precision)
+        wide = at_least_fp32(x.dtype)
         projected = [
-            linear(cfg.hidden_size, name=name)(x).astype(jnp.float32).reshape(*x.shape[:2], heads, dim)
+            linear(cfg.hidden_size, name=name)(x).astype(wide).reshape(*x.shape[:2], heads, dim)
             for name in ("q_proj", "k_proj", "v_proj")
         ]
         query, key, value = projected
@@ -383,7 +383,7 @@ class Gemma4Attention(nn.Module):
         signal = _position_signal(cfg.hidden_size, jnp.arange((chunk + left + right) // 2, -1, -1), x.dtype)
         positional = _dense(cfg, self.dtype, self.precision)(cfg.hidden_size, name="relative_k_proj")(signal)
         out = _chunked_attention(
-            query, key, value, positional.astype(jnp.float32), valid, chunk, left, right,
+            query, key, value, positional.astype(wide), valid, chunk, left, right,
             cap=cfg.attention_logit_cap,
             window=lambda distance: (((distance >= 0) & (distance < left))
                                      | ((distance < 0) & (distance > -right))),
