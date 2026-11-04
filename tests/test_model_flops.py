@@ -684,12 +684,16 @@ def test_a_norm_gated_on_the_routed_layers_counts_there_alone():
     assert gated[0] - plain[0] == gated[1] - plain[1] == 2 * 2 * 2 * 8 * 2 * 8
 
 
-@pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
+@pytest.mark.parametrize("family", ["decoder", "loop", "projected", "mlp", "attention", "dit", "jepa"])
 def test_analytical_count_equals_every_forward_dot_and_convolution(family):
+    """Each model's count is every product its forward traces: a decoder's, one looping, and one whose
+    embedding is narrower than its stream (`embedding_features`), whose forward projects the lookup in
+    once, and so on."""
     lengths = np.array([4, 4], np.int64)
-    if family in ("decoder", "loop"):
+    if family in ("decoder", "loop", "projected"):
         model = decoder(causal=False, attention_impl="reference",
-                        loop=Loop(2) if family == "loop" else None)
+                        loop=Loop(2) if family == "loop" else None,
+                        embedding_features=4 if family == "projected" else None)
         operands = (jnp.ones((2, 4), jnp.int32),)
         count = model.model_flops(lengths) + model.logits_flops(lengths)
     elif family == "mlp":
