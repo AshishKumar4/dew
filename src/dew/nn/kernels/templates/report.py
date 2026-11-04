@@ -544,8 +544,8 @@ def custom_kernel(proto: bytes) -> tuple[bytes, int] | None:
     if len(kernels) != 1:
         return None
     kernel = _fields(kernels[0])
-    cubins = [data for spec in kernel.get(2, []) for cubin in _fields(spec).get(2, [])
-              for data in _fields(cubin).get(1, [])]
+    cubins = [elf for spec in kernel.get(2, []) for cubin in _fields(spec).get(2, [])
+              for elf in _fields(cubin).get(1, [])]
     if len(cubins) != 1 or cubins[0][:4] != ELF:
         return None
     # proto3 omits a zero.

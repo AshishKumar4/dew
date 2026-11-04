@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +72,10 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     which a release moves without jaxlib, so a launch measured under another jax is read by none here,
     kept in its own jax's store for its own checkout, and measured anew here into this jax's, which holds
     no copy of the other's (row 3837: one store for every jax kept each fork's copy, parsed by every read)."""
-    monkeypatch.setattr(tuning.cache, "default_compilation_cache_dir", lambda: str(tmp_path))
+    # The store's own path (its jax's file), moved under `tmp_path`, not the suite's cache.
+    cache, picks_path = tuning.cache, tuning.cache.kernel_picks_path
+    monkeypatch.setattr(cache, "kernel_picks_path", lambda kind: str(
+        tmp_path / Path(picks_path(kind)).relative_to(cache.default_compilation_cache_dir())))
     ba, derived, other = _norm_launch_and_two_configs()
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
