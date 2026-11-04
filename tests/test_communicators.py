@@ -465,29 +465,26 @@ def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path
 
 
 def test_the_gpus_counted_are_those_jax_opens_where_its_own_setting_selects_some(tmp_path):
-    """JAX's own selection of a process's GPUs (`jax_cuda_visible_devices`, from JAX_CUDA_VISIBLE_DEVICES or
-    set in the process) is what the process opens: on a host whose driver finds four, a process selecting two
-    counts those two, by the driver's ordinals its memory reads take, for its pool's sizing and its Slurm
-    check alike; one selecting none counts every GPU."""
+    """JAX's own selection of a process's GPUs (`jax_cuda_visible_devices`, set in the process) is what the
+    process opens: on a host whose driver finds four, a process selecting two measures its communicators'
+    room on those two (its configuration's GPUs, which its pool's sizing reads), and one selecting none on
+    every GPU."""
     compiler = shutil.which("cc")
     assert compiler is not None, "the stand-in driver library is built by the host's C compiler, cc"
     (tmp_path / "libcuda.c").write_text("int cuInit(unsigned flags) { return 0; }\n"
                                         "int cuDeviceGetCount(int *count) { *count = 4; return 0; }\n")
     subprocess.run([compiler, "-shared", "-fPIC", "-o", str(tmp_path / "libcuda.so.1"),
                     str(tmp_path / "libcuda.c")], check=True)
-    environment = {name: value for name, value in os.environ.items()
-                   if name not in ("CUDA_VISIBLE_DEVICES", "JAX_CUDA_VISIBLE_DEVICES")}
+    environment = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
     environment.update(PATH=str(tmp_path), PYTHONPATH=str(SOURCE), LD_LIBRARY_PATH=str(tmp_path),
                        JAX_PLATFORMS="cpu")
     counted = ("import jax, sys\n"
                "if len(sys.argv) > 1: jax.config.update('jax_cuda_visible_devices', sys.argv[1])\n"
-               "from dew.communicators import local_gpus\n"
-               "print(list(local_gpus()))\n")
-    for selection, setting, expected in ((None, None, [0, 1, 2, 3]), ("1,2", None, [1, 2]),
-                                         (None, "3", [3])):
-        env = environment if selection is None else {**environment, "JAX_CUDA_VISIBLE_DEVICES": selection}
+               "from dew.communicators import configuration\n"
+               "print(len(configuration()['gpus']))\n")
+    for setting, expected in ((None, 4), ("1,2", 2), ("3", 1)):
         done = subprocess.run([sys.executable, "-c", counted, *([setting] if setting else [])],
-                              capture_output=True, text=True, check=True, env=env)
+                              capture_output=True, text=True, check=True, env=environment)
         assert json.loads(done.stdout.strip().splitlines()[-1]) == expected
 
 
