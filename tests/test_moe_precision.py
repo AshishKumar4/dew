@@ -19,7 +19,7 @@ import pytest
 from flax import linen as nn
 from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients, without_ynn
 from scipy.special import erfc
 from tuned import each_config, taken
 
@@ -625,32 +625,62 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
             )
 
 
+DISPATCH_TANGENT_SEEDS = 8
+"""Check 1's declared seeds for the exchange dispatch's JVP against the global one's, sized by `seeds_for`
+on armada."""
+
+
 @pytest.mark.mesh
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 def test_both_dispatches_carry_the_same_tangents(activation):
-    """A JVP through the whole routed layer, parameters, tokens and router
-    weights all perturbed, agrees exactly between the dispatches."""
+    """A JVP through the whole routed layer, parameters, tokens and router weights all perturbed: the
+    exchange dispatch's output and tangent on par with the global dispatch's from the float64 layer's
+    over the declared draws (check 1), that truth on a CPU device, which has the float64 ragged dot a
+    TPU has none of. The dispatches are two programs, the exchange splitting each expert's rows over
+    the devices, whose floats XLA keeps no common bits between (ledger 3178)."""
     mesh = MeshSpec(expert=4, fsdp=2).build()
-    model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, skewed=False, scale_inputs=False, limit=None)
-    rng = np.random.default_rng(523)
-    dp = jax.device_put(jax.tree.map(
-        lambda value: jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype), parameters), specs)
-    dx = jax.device_put(jnp.asarray(rng.normal(scale=.05, size=x.shape), x.dtype), tokens)
-    dw = jax.device_put(jnp.asarray(rng.normal(scale=.05, size=weights.shape), weights.dtype), tokens)
-    results = []
-    for dispatch in ('global', 'exchange'):
-        network = model.clone(dispatch=dispatch)
+    model, _, specs, tokens, *_ = placed_experts(mesh, activation, skewed=False, scale_inputs=False,
+                                                 limit=None)
 
-        def run(parameters, x, weights, dp, dx, dw, choices, *, network=network):
-            return jax.jvp(lambda parameters, x, weights, network=network: jnp.asarray(
+    def jvp(network):
+        def run(parameters, x, weights, choices, dp, dx, dw):
+            return jax.jvp(lambda parameters, x, weights: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
+        return run
 
-        with jax.set_mesh(mesh):
-            results.append(jax.jit(run, out_shardings=(tokens, tokens))(
-                parameters, x, weights, dp, dx, dw, choices))
-    for a, b in zip(*results, strict=True):
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    def dispatched(dispatch):
+        """The bf16 layer's JVP under `dispatch` on the mesh, compiled as the gate compiles two Dew arms
+        (`without_ynn`) and run as given."""
+        compiled = without_ynn(jvp(model.clone(dispatch=dispatch)), out_shardings=(tokens, tokens))
+
+        @as_given
+        def placed(*inputs):
+            with jax.set_mesh(mesh):
+                return compiled(*jax.device_put(inputs, (specs, *(tokens,) * 3, specs, tokens, tokens)))
+        return placed
+
+    def draw(seed):
+        rng = np.random.default_rng([0x3178, seed])
+        x = jnp.asarray(rounded(rng.normal(size=(24, 8))), jnp.bfloat16)
+        weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
+        choices = jnp.asarray(np.argsort(rng.normal(size=(24, 8)), axis=-1)[:, :2], jnp.int32)
+        drawn = nn.unbox(model.init(jax.random.key(seed), x, weights, choices))
+
+        def tangent(value):
+            return jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype)
+        return drawn, x, weights, choices, *jax.tree.map(tangent, (drawn, x, weights))
+
+    host = jax.devices("cpu")[0]
+    wide = jax.jit(jvp(model.clone(dispatch='global', dtype=jnp.float64)))
+
+    @as_given
+    def truth(*inputs):
+        """Its inputs moved to the host, then `wide` run there: a placement, which the gate runs as given."""
+        with jax.default_device(host):
+            return wide(*jax.device_put(inputs, host))
+
+    assert_as_exact(dispatched('exchange'), dispatched('global'), draw,
+                    f"exchange dispatch's JVP, {activation}", seeds=DISPATCH_TANGENT_SEEDS, truth_fn=truth)
 
 
 def exchange_residue_case():

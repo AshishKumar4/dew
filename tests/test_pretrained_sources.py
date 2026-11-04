@@ -372,13 +372,15 @@ HY_V3 = {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1, "m
     ("smollm3", {"num_hidden_layers": 36}, 4),
     ("smollm3", {"num_hidden_layers": 36, "no_rope_layers": [1, 1, 1, 0] * 9}, 4),
     ("smollm3", {"num_hidden_layers": 12, "no_rope_layers": [1] * 11 + [0]}, 12),
+    ("falcon_h1", {"num_hidden_layers": 32}, 2),
 ])
 def test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds(model_type, fields, depth):
     """The probe runs a stated depth's fewest first layers that hold every kind of layer it builds
     (`verify.shallow`), each stated per-layer list cut alike, and the stated depth where the last layer is
     a kind of its own: HY-3's 80 layers as its dense first and a routed second, SmolLM3's 36 as its
     first four, the fourth without positions, whether its config states the per-layer list or its class
-    derives it."""
+    derives it; Falcon-H1's 32 like layers as two, the two entries of a list of its that is no layer's
+    (`mlp_multipliers`) no layer's kind at two layers either (ledger 3776)."""
     from dew.interop import verify
 
     source = verify.ModelSource(model_type)
@@ -392,7 +394,7 @@ def test_the_probe_runs_the_first_layers_that_hold_every_kind_its_depth_builds(m
     assert built.num_hidden_layers == depth
     if model_type == "smollm3":
         assert built.no_rope_layers[depth - 1] == 0 and all(built.no_rope_layers[:depth - 1])
-    else:
+    elif model_type == "hy_v3":
         assert built.mlp_layer_types == ["dense", "sparse"]
 
 

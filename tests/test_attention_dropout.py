@@ -243,16 +243,19 @@ def test_a_dropping_decode_step_drops_as_the_reference_path_does():
 
 def test_a_dropping_call_at_eval_takes_no_dropout():
     """A call that is not training (`deterministic=True`) takes no dropout whatever its rate, on every
-    route: each route's output is its own undropped output, bit for bit."""
+    route: each route's output is its own undropped output, both in one program, bit for bit (ledger
+    3178)."""
     keys = jax.random.split(jax.random.PRNGKey(0), 3)
     query = jax.random.normal(keys[0], (ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jax.random.normal(keys[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
     value = jax.random.normal(keys[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
     for implementation in ("reference", "template"):
-        plain = scaled_dot_product_attention(query, key, value, implementation=implementation)
-        out = scaled_dot_product_attention(query, key, value, implementation=implementation,
-                                           dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
-                                           deterministic=True)
+        out, plain = jax.jit(lambda query, key, value, implementation=implementation: (
+            scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                         dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
+                                         deterministic=True),
+            scaled_dot_product_attention(query, key, value, implementation=implementation)))(
+                query, key, value)
         np.testing.assert_array_equal(np.asarray(out), np.asarray(plain))
 
 
