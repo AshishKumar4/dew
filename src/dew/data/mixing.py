@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import logging
 import math
@@ -538,18 +539,35 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 class Proportions:
     """A weighted mix's selection policy, Grain's (`MapDataset.mix`): the weights scaled so the least
     is 100 and truncated to whole proportions, and position k of the mix read from the corpus whose
-    count of records a prefix holds grows from k to k + 1. A phase counts its prefix by it
-    (`counts`) as the mix reads by it (`ProportionalSelection`), so the two never disagree."""
+    count of records a prefix holds grows from k to k + 1. That schedule repeats every window of the
+    mix, its proportions' sum of positions, in which each corpus reads its proportion; a `seed`
+    permutes the corpus choices within each window by a permutation of its own (`window`), so the
+    mix reads its corpora in no fixed order and every window still holds each at its share. A phase
+    counts its prefix by it (`counts`) as the mix reads by it (`ProportionalSelection`), so the two
+    never disagree."""
 
     proportions: tuple[int, ...]
+    seed: int | None = None
 
     @classmethod
-    def of(cls, weights: Sequence[float]) -> Proportions:
+    def of(cls, weights: Sequence[float], seed: int | None = None) -> Proportions:
         scale = 100 / min(weights)
-        return cls(tuple(int(weight * scale) for weight in weights))
+        return cls(tuple(int(weight * scale) for weight in weights), seed)
+
+    def window(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """The `index`th window of the mix: the corpus each of its positions reads, and how many of that
+        corpus's records the window read before it. Unseeded, every window is Grain's schedule; seeded,
+        window `index` is it permuted by `np.random.default_rng([seed, index])`, as a shard order's
+        epochs are (`dew.data.ordering`)."""
+        return _window(self.proportions, self.seed, index)
 
     def counts(self, records: int) -> tuple[int, ...]:
         """How many records of each corpus the first `records` positions of the mix read."""
+        if self.seed is not None:
+            windows, offset = divmod(records, sum(self.proportions))
+            read = np.bincount(self.window(windows)[0][:offset], minlength=len(self.proportions))
+            return tuple(windows * proportion + int(count)
+                         for proportion, count in zip(self.proportions, read, strict=True))
         counts, remaining, left = [], sum(self.proportions), records
         for proportion in self.proportions:
             rest = left * (remaining - proportion) // remaining
@@ -575,6 +593,11 @@ class Proportions:
     def at(self, position: int) -> tuple[int, int]:
         """The corpus position `position` of the mix reads, the one whose count grows with it, and
         which of that corpus's records: the next it hasn't read."""
+        if self.seed is not None:
+            windows, offset = divmod(position, sum(self.proportions))
+            corpora, before = self.window(windows)
+            corpus = int(corpora[offset])
+            return corpus, windows * self.proportions[corpus] + int(before[offset])
         before, after = self.counts(position), self.counts(position + 1)
         grown = (corpus for corpus, (was, now) in enumerate(zip(before, after, strict=True)) if now != was)
         corpus = next(grown)
@@ -588,6 +611,17 @@ class Proportions:
         remaining = sum(self.proportions)
         if (start + positions + 1) * remaining >= 2**62:
             return None
+        if self.seed is not None:
+            place = np.arange(start, start + positions, dtype=np.int64)
+            windows, offsets = np.divmod(place, remaining)
+            corpus, record = np.empty(positions, np.int64), np.empty(positions, np.int64)
+            for index in np.unique(windows):
+                held = windows == index
+                corpora, before = self.window(int(index))
+                corpus[held] = corpora[offsets[held]]
+                record[held] = (int(index) * np.asarray(self.proportions, np.int64)[corpus[held]]
+                                + before[offsets[held]])
+            return corpus, record
         left = np.arange(start, start + positions + 1, dtype=np.int64)
         corpus = np.full(positions, -1, np.int64)
         record = np.zeros(positions, np.int64)
@@ -602,16 +636,32 @@ class Proportions:
         return corpus, record
 
 
+@functools.lru_cache(maxsize=8)
+def _window(proportions: tuple[int, ...], seed: int | None, index: int) -> tuple[np.ndarray, np.ndarray]:
+    """`Proportions.window`: the corpus each position of window `index` reads, and how many of its
+    corpus's records the window read before it."""
+    size = sum(proportions)
+    run = Proportions(proportions).run(0, size)
+    if run is None:
+        raise ValueError(f"a mix of proportions {proportions} counts past 64-bit integers in one window")
+    corpora = run[0] if seed is None else run[0][np.random.default_rng([seed, index]).permutation(size)]
+    before = np.empty(size, np.int64)
+    for corpus in range(len(proportions)):
+        places = np.flatnonzero(corpora == corpus)
+        before[places] = np.arange(len(places))
+    return corpora, before
+
+
 class ProportionalSelection(pygrain.DatasetSelectionMap):
     """Grain's weighted mix of corpora of `lengths` records as a selection map
-    (`MapDataset.select_from_datasets`), by `Proportions`: as long as the mix reads no record of
-    any corpus twice."""
+    (`MapDataset.select_from_datasets`), by `Proportions`, its corpus choices permuted within each
+    window by `seed` where one is given: as long as the mix reads no record of any corpus twice."""
 
     RUN = 4096
     """The positions read ahead together once a reader reads one after another (`Proportions.run`)."""
 
-    def __init__(self, lengths: Sequence[int], weights: Sequence[float]):
-        self._proportions = Proportions.of(weights)
+    def __init__(self, lengths: Sequence[int], weights: Sequence[float], seed: int | None = None):
+        self._proportions = Proportions.of(weights, seed)
         total = sum(self._proportions.proportions)
         spans = [length / (proportion / total)
                  for length, proportion in zip(lengths, self._proportions.proportions, strict=True)]
@@ -650,7 +700,8 @@ class ProportionalSelection(pygrain.DatasetSelectionMap):
             return int(corpora[index - start]), int(records[index - start])
 
     def __repr__(self) -> str:
-        return f"ProportionalSelection(proportions={self._proportions.proportions}, length={self._length})"
+        return (f"ProportionalSelection(proportions={self._proportions.proportions}, "
+                f"seed={self._proportions.seed}, length={self._length})")
 
 
 class TokenDeficit(pygrain.IterDataset[Batch]):
@@ -801,19 +852,62 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     """Grain's weighted mix of corpora, each read as it is drawn (`_MixReads`), and
     each keyed by its member's key (`keys`): Grain saves a keyed mix's positions by key and
     restores those it finds, so a member that joins starts at its first row and one that left is
-    dropped while the others resume where they were."""
+    dropped while the others resume where they were. With a `seed`, the corpus each position reads is
+    `Proportions(seed=...)`'s, its windows' choices permuted (`_SeededMix`), its position saved alike."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str]):
+                 keys: Sequence[str], seed: int | None = None):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
+        self._seed = seed
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
+        if self._seed is not None:
+            reads = {key: _MixRead(group, index) for index, key in enumerate(self._keys)}
+            return _SeededMix(reads, Proportions.of(self._weights, self._seed))
         parents = {key: _ReadDataset(parent, group, index)
                    for index, (key, parent) in enumerate(zip(self._keys, self._corpora, strict=True))}
         weights = dict(zip(self._keys, self._weights, strict=True))
         return iter(pygrain.IterDataset.mix(parents, weights))
+
+
+class _SeededMix(pygrain.DatasetIterator[Batch]):
+    """A keyed mix's reads (`KeyedMix`) in the corpus order a seeded `Proportions` gives each position,
+    its position saved as Grain saves its own mix's: each corpus's under its key, the positions read
+    and whether a corpus ended the mix, so a restore finds the corpora it holds and starts the rest."""
+
+    def __init__(self, reads: Mapping[str, _MixRead], proportions: Proportions):
+        super().__init__()
+        self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
+        self._index, self._stop = 0, False
+
+    def __next__(self) -> Batch:
+        if self._stop:
+            raise StopIteration
+        corpus, _ = self._proportions.at(self._index)
+        self._index += 1
+        try:
+            return next(self._reads[self._keys[corpus]])
+        except StopIteration:
+            self._stop = True
+            raise
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parents": {key: read.get_state() for key, read in self._reads.items()},
+                "index": self._index, "stop": self._stop}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        parents = record(state["parents"], "seeded mix")
+        for key, read in self._reads.items():
+            if (held := parents.get(key)) is not None:
+                read.set_state(record(held, "mixed corpus"))
+        self._index = integer(state["index"], "seeded mix index")
+        self._stop = boolean(state["stop"], "seeded mix stop")
+
+    def close(self) -> None:
+        for read in self._reads.values():
+            read.close()
 
 
 @runtime_checkable
