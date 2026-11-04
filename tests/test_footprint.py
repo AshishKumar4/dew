@@ -18,6 +18,33 @@ def test_resident_device_bytes_do_not_include_host_state():
     assert device_bytes({"params": device, "optimizer": host}) == 8 * 16 * 4
 
 
+def test_a_marked_spans_peak_is_its_bodys_as_xla_inlines_it():
+    """A marked span (`dew.nn.derivatives.marked`, an error-free transform's `Protected` among them) lowers
+    to its body in the caller, as a call does (`dew.nn.programs.CALLS`): its derived peak and residuals are
+    the inline body's, its sum and its compensation fused into their reader, where read as an opaque op
+    each held a buffer of its own (row 3830)."""
+    from dew.nn.derivatives import Protected, marked
+    from dew.training.footprint import derived_terms
+
+    def two_sum(a, b):
+        total = a + b
+        rounded = total - a
+        return total, (a - (total - rounded)) + (b - rounded)
+
+    def loss(weights, x, *, span):
+        total, error = span(jnp.tanh(x @ weights), jnp.sin(x @ weights))
+        return jnp.sum(total * total + error), ()
+
+    weights = jax.ShapeDtypeStruct((64, 1024), jnp.float32)
+    x = jax.ShapeDtypeStruct((256, 64), jnp.float32)
+
+    def derived(span):
+        residuals, peak = derived_terms(lambda weights, x: loss(weights, x, span=span), weights, (x,),
+                                        platform="gpu", workspace=Workspace(0, 0))
+        return residuals, peak.bytes
+
+    assert derived(marked(Protected(), two_sum)) == derived(two_sum)
+
 def test_a_pullback_counts_new_residuals_not_input_storage():
     """On a CPU the exponential needed to differentiate exp is new storage, an expensive value XLA keeps.
     A dot product needs the other operand, already resident as an input, which must not count again as
