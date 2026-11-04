@@ -566,7 +566,7 @@ def test_a_fetched_step_called_in_another_trace_context_runs_that_contexts_progr
     widened = Fetched(owned_program(lambda x: jnp.asarray(x, jnp.float_) * 3.0))
     narrow = jnp.ones(3, jnp.float32)
     assert widened(narrow).dtype == jnp.float32
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         assert widened(narrow).dtype == jnp.float64
 
 
