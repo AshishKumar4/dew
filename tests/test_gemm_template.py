@@ -746,9 +746,12 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
     cheaper, and one of 16 does."""
     h100 = generation.gpu_target("sm90")
     few = dataclasses.replace(h100, multiprocessors=8)
-    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, h100)
+    # The catalogue's dense peak over the H100's 132 multiprocessors sits 0.04% under the generation's rate
+    # a clock, and lowers it there (`GpuTarget.tensor_rate`); fewer multiprocessors never raise it.
+    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == pytest.approx(
+        mosaic_gpu.step_seconds(COOPERATIVE, h100), rel=1e-3)
     handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
-    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, h100) > 1
+    assert handoff == pytest.approx(mosaic_gpu.handoff_steps(COOPERATIVE, h100), rel=1e-3) and handoff > 1
     assert all(tail.balanced(11, steps, 8, handoff_steps=handoff) is None for steps in range(2, 6))
     assert tail.balanced(11, 16, 8, handoff_steps=handoff) is not None
 
