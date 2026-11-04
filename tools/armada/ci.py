@@ -138,6 +138,7 @@ def _beside(name: str):
 
 child_groups = _beside("child_groups")
 session = _beside("session")
+coverage_report = _beside("coverage_report")
 r2 = _beside("r2")
 watched = _beside("watched")
 followed = _beside("followed")
@@ -673,12 +674,12 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
-    """The check-1 sites of `sites` (each its file and test) whose judge's last run on a class the tasks run
-    on (`pinned_classes`) needed its later map tasks (`LATER_JUDGED`), which the plan then draws in the first
-    wave (`site_entries`): read with the plan's read token from each class's last-run record (`record_key`,
-    whatever inputs it ran on and whatever its key), apart from reuse, which it never grants. A site no class's
-    record says so of, a record or field missing, or a Worker that did not answer, keeps its later tasks
-    later."""
+    """The check-1 sites of `sites` (each its file and test) whose judge's last run on a class the tasks
+    run on (`pinned_classes`) needed its later map tasks (`LATER_JUDGED`), which the plan then draws in the
+    first wave (`site_entries`): read with the plan's read token from each class's last-run record
+    (`record_key`, whatever inputs it ran on and whatever its key), apart from reuse, which it never grants.
+    A site no class's record says so of, a record or field missing, or a Worker that did not answer, keeps
+    its later tasks later."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not sites or not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
@@ -2207,7 +2208,7 @@ INTERRUPTED = "the task ran past its deadline"
 """How a row says its task was interrupted: tests after the point it reached did not run."""
 COVERAGE_DEADLINE = 5400.0
 """A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
-its files' coverage partial, which `coverage_report` refuses."""
+its files' coverage partial, which `coverage_report.report` refuses."""
 
 
 def coverage_items(target: float, timings: dict) -> list[str]:
@@ -2219,47 +2220,6 @@ def coverage_items(target: float, timings: dict) -> list[str]:
             f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}"
             for entry in plan(target, timings)
             if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
-
-
-def coverage_report(directory: Path) -> int:
-    """Combine the coverage data `coverage_items`' tasks left under `directory` and write its report:
-    coverage.py's own JSON, and a table a module a line, the least covered first. It runs where the
-    artifacts were downloaded, under this interpreter, which must have coverage.py."""
-    if importlib.util.find_spec("coverage") is None:
-        print(f"coverage.py is not importable from {sys.executable}; install the test extra", file=sys.stderr)
-        return 1
-    python = sys.executable
-    data = directory / ".coverage"
-    parts = sorted(str(path) for path in directory.glob("*/.coverage.*"))
-    if not parts:
-        print(f"no coverage data under {directory}", file=sys.stderr)
-        return 1
-    # A task that wrote no rows or was interrupted left the coverage of its files' later tests out.
-    def ran_short(task: Path) -> bool:
-        verdict = task / "rows.json"
-        return not verdict.exists() or any(found["exitCode"] and found["kind"] == "deadline"
-                                           for found in json.loads(verdict.read_text())["rows"])
-
-    # armada keeps each task's artifacts in a directory named by its index.
-    short = [task.name for task in sorted(directory.iterdir())
-             if task.is_dir() and task.name.isdecimal() and ran_short(task)]
-    if short:
-        print(f"{len(short)} tasks ran short, so the pass is partial; run them again with a longer deadline: "
-              f"{', '.join(short)}", file=sys.stderr)
-        return 1
-    subprocess.run([python, "-m", "coverage", "combine", "--keep", f"--data-file={data}", *parts], check=True)
-    report = directory / "coverage.json"
-    subprocess.run([python, "-m", "coverage", "json", f"--data-file={data}", "-o", str(report)], check=True)
-    files = json.loads(report.read_text())["files"]
-    rows = sorted((measured["summary"]["percent_covered"], name, measured["summary"])
-                  for name, measured in files.items())
-    lines = ["| module | statements | missed | branches | partial | covered |", "|---|---|---|---|---|---|"]
-    lines += [f"| {name} | {summary['num_statements']} | {summary['missing_lines']} "
-              f"| {summary['num_branches']} | {summary['num_partial_branches']} | {percent:.1f}% |"
-              for percent, name, summary in rows]
-    (directory / "coverage.md").write_text("\n".join(lines) + "\n")
-    print(f"{len(rows)} modules from {len(parts)} data files: {directory / 'coverage.md'}")
-    return 0
 
 
 GANG = 4
@@ -2471,7 +2431,7 @@ def main() -> int:
                         deadline=args.deadline, network=args.network)
     if args.operation == "coverage":
         if args.stage == "report":
-            return coverage_report(args.directory)
+            return coverage_report.report(args.directory)
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps(coverage_items(args.target, timings)))
         return 0
@@ -2492,7 +2452,7 @@ def pinned(argv: list[str]) -> None:
     """This file run again under HASHED_BY, as uv finds or fetches it, with `argv`, where another Python
     runs it: on a planner's machine, a GitHub runner or a GPU node. Not `coverage report`, which keys nothing
     and reads coverage.py's data under the interpreter its caller installed coverage.py in
-    (`coverage_report`)."""
+    (`coverage_report.report`)."""
     running = f"{sys.version_info.major}.{sys.version_info.minor}"
     if argv[:2] != ["coverage", "report"] and running != HASHED_BY:
         os.execvp("uv", ["uv", "run", "--no-project", "--python", HASHED_BY, "python",
