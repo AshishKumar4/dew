@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from dew.lora import LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.autoencoders import AutoEncoder
+    from dew.objectives.base import Objective
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
 
@@ -80,20 +81,29 @@ def is_saved_run(name_or_dir: str | Path) -> bool:
     return path.is_dir() and (path / RUN_FILE).is_file()
 
 
+def step_records(objective: type[Objective], directory: str, step: int) -> tuple[epath.Path, ...]:
+    """The files the task of `objective`'s runs keeps by the `step` of the run in `directory`
+    (`SavedRunTask.step_records`); none for a task that keeps none, or an objective that names none."""
+    from dew.inference.tasks import SavedRunTask
+
+    task = objective.saved_task
+    if task is None or not issubclass(task, SavedRunTask):
+        return ()
+    return task.step_records(directory, step)
+
+
 def _fingerprint(run: SavedRun, ema: bool | None) -> str:
     """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
     the EMA choice, the code that writes it (`package_digest`, ledger 2775), the contents of the run's
     own records beside its checkpoints (its run record and a task's assets, a decision task's
-    calibration among them, its latest and those fitted on the step, `step_calibrations`), and the
+    calibration among them) and those its task keeps by the step (`SavedRunTask.step_records`), and the
     step's metadata files, by size and write time, which a new save of the step rewrites."""
-    from dew.decision.task import step_calibrations
-
     root = epath.Path(run.directory)
     digest = hashlib.sha256(json.dumps([str(root), run.step, ema, package_digest()]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
-    for path in step_calibrations(str(root), run.step):
-        digest.update(f"{path.parent.name}/{path.name}\0".encode() + path.read_bytes())
+    for path in step_records(run.objective, run.directory, run.step):
+        digest.update(f"{path.relative_to(root)}\0".encode() + path.read_bytes())
     for path in sorted((root / str(run.step)).iterdir(), key=str):
         if path.is_file():
             stat = path.stat()

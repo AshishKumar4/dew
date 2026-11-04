@@ -1636,6 +1636,11 @@ class Trainer(Generic[Loss, Effects]):
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
 
+    def _stream_partition(self) -> DataPartition:
+        """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
+        beginning where updates do (`window`, `Ramp.stages`)."""
+        return DataPartition.of(self.device_mesh, window=self.accumulation)
+
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
         per-example shape its model reads (`Field.of`) of the run's first batch, `first`'s, placed as the
@@ -1681,8 +1686,7 @@ class Trainer(Generic[Loss, Effects]):
         run.current = current
         self._refusal = None
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
-            # A ramp's stages begin where updates do (`Ramp.stages`).
-            partition = DataPartition.of(mesh, window=self.accumulation)
+            partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
