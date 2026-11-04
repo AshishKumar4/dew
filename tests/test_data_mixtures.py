@@ -189,7 +189,9 @@ def test_a_validation_pass_keeps_its_rows_mask_through_a_host_projection():
     held = validation(Pipeline(Memory(Indexed(1, 3))).batch(2).map(projected), batch=2,
                       loading=READ)(DataPartition())
     try:
-        masks = [np.asarray(batch[VALID_ROWS]).tolist() for batch in held]
+        # A whole batch marks no row, each one real (`Objective.row_weights`).
+        masks = [np.asarray(batch[VALID_ROWS]).tolist() if VALID_ROWS in batch else [True] * len(batch["id"])
+                 for batch in held]
     finally:
         held.close()
     assert masks == [[True, True], [True, False]]
