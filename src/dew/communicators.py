@@ -204,7 +204,7 @@ class CommunicatorRoom(ValueError):
 def local_gpus() -> tuple[int, ...] | None:
     """The GPUs this process's JAX opens, by the driver's ordinals (`dew.pool.local_gpus` under JAX's own
     selection, `jax_cuda_visible_devices`); None where they could not be counted."""
-    return pool.local_gpus(jax.config.jax_cuda_visible_devices)
+    return pool.local_gpus(jax.config.read("jax_cuda_visible_devices"))
 
 
 def configuration() -> dict:
@@ -258,7 +258,7 @@ def _child(configured: Mapping) -> Needs:
     began = time.perf_counter()
     # The child opens the GPUs this process does, its selection set in this process or in the environment.
     environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                   "JAX_CUDA_VISIBLE_DEVICES": jax.config.jax_cuda_visible_devices}
+                   "JAX_CUDA_VISIBLE_DEVICES": jax.config.read("jax_cuda_visible_devices")}
     done = subprocess.run([sys.executable, "-m", "dew.communicators"], capture_output=True,
                           text=True, env=environment, check=False)
     if done.returncode != 0:
