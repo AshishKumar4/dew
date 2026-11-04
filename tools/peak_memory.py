@@ -59,9 +59,11 @@ class CompiledWhileMeasured(RuntimeError):
 
 def keeps_high_water() -> bool:
     """Whether this process's devices may keep a high-water: not where JAX runs on its CPU devices alone
-    (`jax_platforms`, read without opening a backend), whose every peak `measured` reports is None. The
-    one place a caller asks so: a tool skips its peak processes by it, not by a check of its own, and
-    keeps a test that runs `measured` over its peak run where it does (benchmark_lm_serving's)."""
+    (`jax_platforms`, read without opening a backend), whose every peak `measured` reports is None. A
+    caller that skips its peak processes where none is kept asks here, not by a check of its own:
+    benchmark_lm_serving skips a slot count's two, its test running `measured` over a peak run where
+    they run. Every other tool runs its peak processes on every platform, the CPU's runs its tests of
+    them (ledger 3856)."""
     import jax
 
     return jax.config.jax_platforms != "cpu"
