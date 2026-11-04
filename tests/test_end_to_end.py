@@ -422,12 +422,19 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
     def loss(tree):
         return task.scalar_loss({**variables, "params": tree}, batch, step)
 
+    def stepped(tree):
+        # The step, and the posterior sample and running statistics it reads, in one program.
+        (value, aux), gradients = jax.value_and_grad(loss, has_aux=True)(tree)
+        tuned = task._end_to_end_latents({**variables, "params": tree}, unit_range(batch["image"]),
+                                         jax.random.split(step.key, 5)[0], step, batch)
+        return value, aux, gradients, tuned
+
     # One compiled program, as a run's step is: run op by op, the step compiled each of its 2,900
     # operations apart, most of the fixture's two minutes (row 3817).
-    (value, aux), gradients = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
+    value, aux, gradients, tuned = jax.jit(stepped)(params)
     roundings = chain_roundings(jax.make_jaxpr(jax.grad(lambda tree: loss(tree)[0]))(params))
     return SimpleNamespace(task=task, variables=variables, params=params, batch=batch, step=step, value=value,
-                           aux=aux, gradients=gradients, roundings=roundings)
+                           aux=aux, gradients=gradients, roundings=roundings, tuned=tuned)
 
 
 def _flat(tree) -> np.ndarray:
@@ -494,17 +501,16 @@ def test_a_repae_step_moves_the_model_as_train_repae_does(repae_step):
 def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_step):
     """The batch norm's running statistics and the tuned autoencoder's
     latent scale and bias, as REPA-E's `extract_latents_stats` takes them."""
-    task, variables, params, batch, step, aux = (repae_step.task, repae_step.variables, repae_step.params,
-                                                 repae_step.batch, repae_step.step, repae_step.aux)
+    task, variables, params, aux, tuned = (repae_step.task, repae_step.variables, repae_step.params,
+                                           repae_step.aux, repae_step.tuned)
     # The running statistics are eight numbers, too few for the float64
     # rule's RMS to settle: a runner's vector width alone moved its ratio
     # from 1.00 to 2.46. So the rule holds the posterior's sample they are
     # computed from, 2048 entries, and they are held to the reference's
     # batch norm of Dew's own sample within that computation's float32
     # rounding, the reference's batch norm being that function in float64.
+    # The sample is the step's own, drawn in its program (`repae_step`), whose statistics it reports.
     statistics = aux.variables[LATENT_STATS]
-    tuned = task._end_to_end_latents({**variables, "params": params}, unit_range(batch["image"]),
-                                     jax.random.split(step.key, 5)[0], step, batch)
     for name in ("mean", "var"):
         np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
     assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],
