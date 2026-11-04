@@ -515,10 +515,40 @@ def test_a_programs_key_holds_what_its_equations_evaluate_under():
 
 
 UNORDERED = """
-from dew.nn.kernels import tuning
-print(repr(tuning._parameter(frozenset({"data", "model", "expert", "pipeline"}))))
+from dew.algebra.terms import parameter_key
+print(repr(parameter_key(frozenset({"data", "model", "expert", "pipeline"}))))
 """
-"""A parameter JAX holds as a set of axis names (`shard_map`'s manual axes), as `program` reads it."""
+"""A parameter JAX holds as a set of axis names (`shard_map`'s manual axes), as `program` reads it
+(`dew.algebra.terms.parameter_key`)."""
+
+
+CALLED_BACK = """
+import functools
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dew.nn.kernels import tuning
+
+def scaled(x, factor):
+    return np.asarray(x) * factor
+
+def hook(x):
+    shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    return jax.pure_callback(functools.partial(scaled, factor=2.0), shape, x)
+
+print(tuning.program(hook, jax.ShapeDtypeStruct((4,), jnp.float32)))
+"""
+"""A launch's hook calling back into a module's function with an argument bound (`functools.partial`), as
+`program` keys it."""
+
+
+def test_a_programs_key_reads_a_callback_alike_in_every_process():
+    """A hook calling back into a function with an argument bound is keyed alike in every process, whose
+    functions sit at other addresses: every process keys the launch alike and a pick persists across runs."""
+    read = {subprocess.run([sys.executable, "-c", CALLED_BACK], capture_output=True, text=True, check=True,
+                           env={**os.environ, "JAX_PLATFORMS": "cpu"}).stdout
+            for _ in range(2)}
+    assert len(read) == 1
 
 
 def test_a_programs_key_reads_a_set_alike_in_every_process():

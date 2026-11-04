@@ -73,6 +73,7 @@ from jax.extend.backend import get_default_device
 
 from dew import _coordination, _records, cache
 from dew._records import JSON
+from dew.algebra.terms import opaque, parameter_key
 from dew.files import write_atomically
 from dew.nn.kernels.options import owned_program
 
@@ -724,6 +725,11 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     def update(*parts) -> None:
         digest.update(repr(parts).encode())
 
+    def read(parameter) -> Hashable:
+        # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
+        # same in every process (`terms.opaque`).
+        return opaque(parameter_key(parameter))
+
     def constants(values) -> None:
         for constant in values:
             if isinstance(constant, jax.core.Tracer):
@@ -741,7 +747,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", str(value.aval), _parameter(value.val)
+                return "literal", str(value.aval), read(value.val)
             return bound(value)
 
         update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
@@ -750,9 +756,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
                    tuple((bound(var), str(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
-                   _parameter((context.compute_type, context.threefry_partitionable, context.xla_metadata,
-                               str(context.cur_abstract_mesh), str(context.cur_layout_mode),
-                               context.remove_size_one_mesh_axis)))
+                   read((context.compute_type, context.threefry_partitionable, context.xla_metadata,
+                         str(context.cur_abstract_mesh), str(context.cur_layout_mode),
+                         context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
@@ -761,7 +767,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
                         constants(inner.consts)
                         walk(inner)
                     else:
-                        update(name, _parameter(inner))
+                        update(name, read(inner))
         update("outputs", *(atom(value) for value in jaxpr.outvars))
 
     constants(closed.consts)
@@ -775,31 +781,6 @@ def _host(value) -> np.ndarray:
     if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jax.dtypes.prng_key):
         return np.asarray(jax.random.key_data(value))
     return np.asarray(value)
-
-
-def _parameter(value) -> Hashable:
-    """An equation's parameter as `program`'s digest reads it, the same in every process: a number or a
-    string as it is, a sequence's and a set's parts in order (a set's sorted by their own, which a process's
-    hash seed does not order), a mapping's items sorted, an array by its shape, dtype and bytes' digest, a
-    function by its module and name, any other object by its type and its representation less a memory
-    address (which no two processes share); each tagged with its kind."""
-    if value is None or isinstance(value, (bool, int, float, complex, str)):
-        return type(value).__name__, value
-    if isinstance(value, (tuple, list)):
-        return type(value).__name__, tuple(_parameter(part) for part in value)
-    if isinstance(value, (set, frozenset)):
-        return "set", tuple(sorted((_parameter(part) for part in value), key=repr))
-    if isinstance(value, dict):
-        return "mapping", tuple(sorted(((_parameter(key), _parameter(part)) for key, part in value.items()),
-                                       key=repr))
-    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
-        array = _host(value)
-        return ("array", str(value.dtype), array.shape, str(array.dtype),
-                hashlib.sha256(array.tobytes()).hexdigest()[:16])
-    if isinstance(value, types.FunctionType):
-        return "function", value.__module__, value.__qualname__
-    text = repr(value)
-    return type(value).__qualname__, None if " at 0x" in text else text
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:

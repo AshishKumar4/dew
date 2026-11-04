@@ -21,7 +21,16 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import ACCURATE, Numerics, fp32_result_dot_general
+from dew.nn.precision import (
+    ACCURATE,
+    Numerics,
+    _rounded_significand,
+    compensated_add,
+    compensated_difference,
+    fp32_result_dot_general,
+    two_product,
+    two_sum,
+)
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
@@ -236,6 +245,78 @@ def test_a_bit_split_keeps_large_factors_finite(barrier, subtract):
         rounding=jax.lax.optimization_barrier if barrier else None))(left, right)
     truth = left.astype(np.float64) * right.astype(np.float64)
     np.testing.assert_array_equal(high, truth.astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
+
+
+ERROR_FREE = {
+    "two_sum": two_sum,
+    "two_product": two_product,
+    "two_product bit-split": functools.partial(two_product, bit_split=True, subtract=True),
+    "compensated_add": lambda a, b: compensated_add((a, b), (b, a)),
+    "compensated_difference": lambda a, b: compensated_difference((a, b), (b, a)),
+    "rounded significand": _rounded_significand,
+    "two_sum by name": lambda a, b: two_sum(a, right=b),
+    "two_sum by names": lambda a, b: two_sum(left=a, right=b),
+}
+"""Each error-free transform of `dew.nn.precision` over two arrays, the correctly rounded division's
+significand among them, and one given its operands by name."""
+
+
+@pytest.mark.parametrize("name", ERROR_FREE)
+def test_an_error_free_transform_is_one_protected_span_its_derivative_keeps(name):
+    """An error-free transform traces as one marked span of kind `Protected` (`dew.nn.derivatives.marked`)
+    holding the whole of it, every array it is given by position or by name an operand of the span (a
+    compensated sum's pairs repeat them) and none other, and
+    its derivative's program keeps the mark, so the algebra pass reads what it may never reassociate as an
+    object, not a name scope (ledger 3640). A composite (a compensated sum, the significand's rounding)
+    is its own span, not only the spans of the transforms it calls."""
+    from reference_error import equations
+
+    from dew.nn.derivatives import Protected, marked_call_p
+
+    transform = ERROR_FREE[name]
+    a, b = (jnp.asarray(np.random.default_rng(seed).uniform(0.5, 2.0, 8), jnp.float32) for seed in (1, 2))
+    program = jax.make_jaxpr(transform)(a, b).jaxpr
+    (span,) = program.eqns
+    assert (span.primitive, span.params["kind"]) == (marked_call_p, Protected())
+    assert set(span.invars) == set(program.invars)
+
+    def summed(a, b):
+        return sum(jnp.sum(leaf) for leaf in jax.tree.leaves(transform(a, b)))
+
+    derivative = jax.make_jaxpr(jax.grad(summed, argnums=(0, 1)))(a, b)
+    assert Protected() in [equation.params["kind"] for equation in equations(derivative)
+                           if equation.primitive is marked_call_p]
+
+
+def test_a_transform_given_its_operands_by_name_computes_and_differentiates_as_by_position():
+    """An operand passed by name is the span's like one passed by position (`_protected` binds the
+    transform's signature), so a compiled program and its derivative take it as an input of the span, not
+    a constant of its body, and compute what the positional call does."""
+    a, b = (jnp.asarray(np.random.default_rng(seed).uniform(0.5, 2.0, 8), jnp.float32) for seed in (4, 5))
+    for call in (lambda a, b: two_sum(a, right=b), lambda a, b: two_sum(left=a, right=b)):
+        for left, right in zip(jax.jit(call)(a, b), jax.jit(two_sum)(a, b), strict=True):
+            np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+        by_name = jax.jit(jax.grad(lambda a, b, call=call: jnp.sum(call(a, b)[0]), argnums=(0, 1)))(a, b)
+        by_position = jax.jit(jax.grad(lambda a, b: jnp.sum(two_sum(a, b)[0]), argnums=(0, 1)))(a, b)
+        for left, right in zip(by_name, by_position, strict=True):
+            np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_a_constant_factor_splits_on_the_host_outside_its_protected_span():
+    """A factor known when the product traces (a kernel's static one) splits where it is known: the
+    protected span takes the traced operand alone, the constant's halves bound into it, and the product
+    and residual are the float64 product's, as an unmarked split's are."""
+    from dew.nn.derivatives import marked_call_p
+
+    left = jnp.asarray(np.random.default_rng(3).uniform(-4.0, 4.0, 8), jnp.float32)
+    factor = np.float32(1.4426950408889634)
+    program = jax.make_jaxpr(lambda a: two_product(a, factor, bit_split=True))(left)
+    (span,) = [equation for equation in program.jaxpr.eqns if equation.primitive is marked_call_p]
+    assert len(span.invars) == 1
+    high, low = jax.jit(lambda a: two_product(a, factor, bit_split=True))(left)
+    truth = np.asarray(left, np.float64) * np.float64(factor)
+    np.testing.assert_array_equal(np.asarray(high), truth.astype(np.float32))
     np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
 
 
