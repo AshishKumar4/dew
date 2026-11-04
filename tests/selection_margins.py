@@ -19,50 +19,67 @@ median and 2.5e-6 at the 99th percentile."""
 
 
 def routes(config) -> bool:
-    """Whether the model's mixture routes by its router's scores: hash routing selects by the token
-    alone, which no rounding moves."""
+    """Whether the model's mixture routes any of its layers by its router's scores: hash routing selects
+    by the token alone, which no rounding moves, and DeepSeek V4 hashes only its first layers."""
     mixture = config.get("mixture")
-    return mixture is not None and not mixture.get("hash_layers")
+    if mixture is None:
+        return False
+    hashed = set(mixture.get("hash_layers") or ())
+    # A mixture that names no layers is every decoder layer's (`CausalTransformer.sparse_layers`).
+    layers = mixture.get("layers")
+    return bool(set(range(config["num_layers"]) if layers is None else layers) - hashed)
 
 
 def selects(config) -> bool:
-    """Whether a decoder built from `config` selects discontinuously: a lightning indexer's top-k, Gemma
-    3n's gaussian top-k or a mixture's routing."""
-    fields = config.get("mixer", {}).get("fields", {})
+    """Whether a decoder built from `config` selects discontinuously: a lightning indexer's top-k, the
+    model's own or a layer kind's (DeepSeek V4's compressed sparse attention), Gemma 3n's gaussian top-k
+    or a mixture's routing."""
+    mixers = [config.get("mixer", {}), *(kind.get("mixer", {}) for kind in config.get("kinds", {}).values())]
     sparsities = config.get("activation_sparsity_pattern", ())
-    return bool(fields.get("index_topk") or any(sparsities) or routes(config))
+    indexed = any((mixer or {}).get("fields", {}).get("index_topk") for mixer in mixers)
+    return bool(indexed or any(sparsities) or routes(config))
+
+
+def capturing(model, variables, *arguments, method=None, mutable=(), **options):
+    """`model.apply` of `variables` and `arguments` (its forward, or its `method`) capturing its
+    discontinuous selections, within a caller's own program: its output and the collections it
+    mutated, the selections' (`capture`) and those of `mutable`."""
+    from dew.nn.mla import SELECTIONS
+
+    return model.apply(variables, *arguments, method=method, capture_intermediates=_selecting,
+                       mutable=["intermediates", SELECTIONS, *mutable], **options)
+
+
+def _selecting(module, method) -> bool:
+    """Whether `capturing` keeps `module`'s call of `method`: a Router's selection scores, group scores
+    and group mask, gpt-oss's and Gemma 4's router logits from their Dense, and Gemma 3n's gate from its
+    gated MLP's Dense."""
+    from dew.nn.gemma4_moe import Gemma4TextRouter
+    from dew.nn.gpt_oss import GptOssMLP
+    from dew.nn.mlp import GatedMLP
+    from dew.nn.moe import Router
+
+    if isinstance(module, Router):
+        return method in ("selection", "group_scores", "group_mask")
+    if isinstance(module, nn.Dense) and method == "__call__" and (
+            (isinstance(module.parent, GptOssMLP) and module.name == "router")
+            or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
+        return True
+    parent = module.parent
+    gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
+    return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
 
 
 def capture(model, method=None):
     """`model`'s forward of its tokens (or its `method` of the arguments given, a decoder's prediction
-    depths over its trunk's states) capturing its discontinuous selections, compiled once: the lightning
-    indexer's
-    scores and its heads' agreements before their relu, which it sows together under `SELECTIONS` for a
-    caller that opens that collection, Gemma 3n's gate from its gated MLP's Dense, a
-    Router's selection scores, group scores and group mask from its own methods, and gpt-oss's and
-    Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
+    depths over its trunk's states) capturing its discontinuous selections (`capturing`), compiled
+    once: the lightning indexer's scores and its heads' agreements before their relu, which it sows
+    under `SELECTIONS` for a caller that opens that collection, Gemma 3n's gate from its gated MLP's
+    Dense, a Router's selection scores, group scores and group mask from its own methods, and gpt-oss's
+    and Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
     XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
     capture compiles."""
-    from dew.nn.gemma4_moe import Gemma4TextRouter
-    from dew.nn.gpt_oss import GptOssMLP
-    from dew.nn.mla import SELECTIONS
-    from dew.nn.mlp import GatedMLP
-    from dew.nn.moe import Router
-
-    def selecting(module, method):
-        if isinstance(module, Router):
-            return method in ("selection", "group_scores", "group_mask")
-        if isinstance(module, nn.Dense) and method == "__call__" and (
-                (isinstance(module.parent, GptOssMLP) and module.name == "router")
-                or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
-            return True
-        parent = module.parent
-        gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
-        return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
-
-    return jax.jit(lambda variables, *arguments: model.apply(
-        variables, *arguments, method=method, capture_intermediates=selecting,
-        mutable=["intermediates", SELECTIONS])[1])
+    return jax.jit(lambda variables, *arguments: capturing(model, variables, *arguments, method=method)[1])
 
 
 def gate_margin(values: np.ndarray, sparsity: float) -> float:
@@ -80,14 +97,23 @@ def gate_margin(values: np.ndarray, sparsity: float) -> float:
     return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
 
 
+def scale_of(ranked: np.ndarray) -> np.ndarray:
+    """Each row's size, the largest magnitude of its finite values: of scores of either sign, which a
+    rounding of that size moves (a row of negative scores is as near a flip as its gap over the
+    largest of them)."""
+    finite = np.where(np.isfinite(ranked), np.abs(ranked), 0.0)
+    return np.maximum(finite.max(axis=-1), np.finfo(np.float32).tiny)
+
+
 def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
-    """Each row's gap between its `kept`-th largest value and the next, over its largest's size: how
+    """Each row's gap between its `kept`-th largest value and the next, over its size (`scale_of`): how
     far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
     holds no more than `kept` finite values, which decide nothing."""
     ranked = -np.sort(-values, axis=-1)
     chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
-    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-    return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
+    with np.errstate(invalid="ignore"):
+        gap = chosen - next_best
+    return np.where(np.isfinite(next_best), gap / scale_of(ranked), np.inf)
 
 
 def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.ndarray, budget: int, *,
@@ -108,13 +134,33 @@ def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.n
         return np.full(ranked.shape[:-1], np.inf)
     kept, rejected = ranked[..., budget - 1], ranked[..., budget]
     tied = (kept == 0) & (rejected == 0)
-    gap = kept - rejected
+    with np.errstate(invalid="ignore"):
+        gap = kept - rejected
     best = np.min(np.where(candidates & (scores == 0), np.abs(agreements.max(axis=-2)), np.inf), axis=-1)
     if relative:
-        gap = gap / np.maximum(np.abs(ranked[..., 0]), tiny)
+        gap = gap / scale_of(ranked)
         largest = np.max(np.where(candidates, np.abs(agreements).max(axis=-2), 0), axis=-1)
         best = best / np.maximum(largest, tiny)
     return np.where(tied, best if stable else 0.0, np.where(np.isfinite(rejected), gap, np.inf))
+
+
+def pool_margins(scores: np.ndarray, visible: np.ndarray, blocks: int, block_size: int) -> np.ndarray:
+    """Each query's margin `[..., S]` of a candidate pool's block choice (`dew.nn.sparse_selection.
+    candidate_pool`) over its `scores` of the entries `visible` to it: the pool always holds the block of
+    the query's newest entry and takes the other `blocks - 1` by their best score, so the margin is
+    `top_margin` of the other blocks' best scores at `blocks - 1`; infinite where no more of them are
+    reachable than it takes, which decides nothing."""
+    total = scores.shape[-1]
+    count = -(-total // block_size)
+    ranked = np.where(visible, scores, -np.inf)
+    ranked = np.pad(ranked, [(0, 0)] * (ranked.ndim - 1) + [(0, count * block_size - total)],
+                    constant_values=-np.inf)
+    best = ranked.reshape(*ranked.shape[:-1], count, block_size).max(axis=-1)
+    newest = (visible.sum(axis=-1) - 1) // block_size
+    others = np.where(np.arange(count) == newest[..., None], -np.inf, best)
+    if blocks - 1 < 1 or count <= blocks - 1:
+        return np.full(others.shape[:-1], np.inf)
+    return top_margin(others, blocks - 1)
 
 
 def causal(scores: np.ndarray) -> np.ndarray:
@@ -145,7 +191,11 @@ def margin(config, captured, label: str, *, stable: bool = True) -> float:
     held = {"intermediates": captured.get("intermediates", {}), "selections": captured.get("selections", {})}
     for path, values in jax.tree_util.tree_flatten_with_path(held)[0]:
         seen += 1
-        names = [str(getattr(part, "key", part)) for part in path]
+        names = [str(getattr(part, "key", getattr(part, "idx", part))) for part in path]
+        if names[0] == "selections" and len(names) >= 3 and names[-3] == "selection":
+            # A selection sown whole (`dew.nn.mla.sow_selection`), keyed by its module and its call.
+            indexers.setdefault(tuple(names[:-1]), {})[names[-1]] = np.asarray(values)
+            continue
         if names[-2] in ("selection", "group_scores", "group_mask"):
             routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
             continue
@@ -165,9 +215,17 @@ def margin(config, captured, label: str, *, stable: bool = True) -> float:
             continue
         raise AssertionError(f"{label}: a selection {names} was captured that no margin reads")
     for operands in indexers.values():
-        scores = operands["scores"]
-        smallest = min(smallest, float(np.min(indexer_margins(scores, operands["agreements"], causal(scores),
-                                                              fields["index_topk"], stable=stable))))
+        # A selection sown whole states the keys it may take and its budget; V3.2's sows its scores
+        # alone, over the causal keys, at its model's budget.
+        scores = np.asarray(operands["scores"], np.float64)
+        visible = operands["visible"].astype(bool) if "visible" in operands else causal(scores)
+        budget = int(operands["budget"]) if "budget" in operands else fields["index_topk"]
+        agreements = np.asarray(operands["agreements"], np.float64)
+        smallest = min(smallest, float(np.min(indexer_margins(scores, agreements, visible, budget,
+                                                              stable=stable))))
+        if "blocks" in operands:
+            smallest = min(smallest, float(np.min(pool_margins(scores, visible, int(operands["blocks"]),
+                                                               int(operands["block_size"])))))
     # A model that selects shows its selections here, or the draw would pass unfiltered.
     for operands in routers.values():
         # A Router chooses its best groups by their scores, then its experts among the groups kept.

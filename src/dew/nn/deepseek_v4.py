@@ -61,7 +61,7 @@ from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
 from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from dew.nn.mla import IndexerFront
+from dew.nn.mla import IndexerFront, sow_selection
 from dew.nn.norms import RMSNorm, unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
@@ -447,19 +447,19 @@ class IndexScorer(nn.Module):
     """The lightning indexer's score of every query against every entry:
     `sum_h w_h relu(q_h . k) / sqrt(head_dim)` with `w = weights_proj(x) /
     sqrt(n_heads)`, in fp32 (`DeepseekV4IndexerScorer`,
-    modeling_deepseek_v4.py:437-450)."""
+    modeling_deepseek_v4.py:437-450), from the heads' `agreements` `q_h . k`
+    (`index_agreements`) of queries `width` wide."""
 
     n_heads: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, query, keys, x):
+    def __call__(self, agreements, x, width: int):
         weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype, precision=self.precision,
                         name='weights_proj', dot_general=float32_dot_general,
                         kernel_axes=('embed', 'index'))(x)
-        return index_scores(index_agreements(query, keys, self.precision), weights, query.shape[-1],
-                            self.precision)
+        return index_scores(agreements, weights, width, self.precision)
 
 
 class LightningIndexer(CompressedEntries):
@@ -501,9 +501,11 @@ class LightningIndexer(CompressedEntries):
                 else self.cached_entries(x, *cache, places=places)[0])
         query = _rotate_rope(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
-        scores = self.scorer(query, keys, x)
+        agreements = index_agreements(query, keys, self.precision)
+        scores = self.scorer(agreements, x, self.width)
         seen = (entries_visible(positions, keys.shape[1], self.rate) if windows is None
                 else windows.visible(self.rate))
+        sow_selection(self, scores, agreements, seen, self.top_k)
         return top_k_keys(scores, seen, self.top_k)
 
 
@@ -577,10 +579,11 @@ class Csa2Indexer(IndexerFront, FakeQuantizing):
         windows' positions (v41:537-547)."""
         return self._fp4(_rotate_rope(self.k_norm(self.wk(jax.lax.stop_gradient(latents))), cos, sin))
 
-    def scores(self, x, q_resid, keys, cos, sin):
-        """Every query's score of every entry, `[B, S, T]` (v41:550-557)."""
+    def agreements(self, q_resid, keys, cos, sin):
+        """Each head's agreement of every query with every entry before its relu, `[B, S, H, T]`
+        (`index_agreements`), of which `weighed` makes the scores (v41:550-557)."""
         query = _rotate_rope(self.queries(q_resid), cos, sin)
-        return self.scored(self._fp4(query), jax.lax.stop_gradient(keys), x)
+        return index_agreements(self._fp4(query), jax.lax.stop_gradient(keys), self.precision)
 
 
 def _published(kv_store, name: str, layer: str):
@@ -769,17 +772,24 @@ class DeepseekV4Attention(FakeQuantizing):
             # gathered per query (section 2.3.2): O(pool), not O(entries).
             pool = _published(kv_store, _CSA2_CANDIDATES, 'Reindex')
             held = jnp.maximum(pool, 0)
-            scores = self.indexer.scores(x, q_resid, keys[jnp.arange(x.shape[0])[:, None, None], held],
-                                         cos, sin)
-            picks = top_k_selection(scores, (pool >= 0) & jnp.take_along_axis(seen, held, -1), top_k)
+            agreements = self.indexer.agreements(q_resid, keys[jnp.arange(x.shape[0])[:, None, None], held],
+                                                 cos, sin)
+            scores = self.indexer.weighed(agreements, x)
+            allowed = (pool >= 0) & jnp.take_along_axis(seen, held, -1)
+            sow_selection(self, scores, agreements, allowed, top_k)
+            picks = top_k_selection(scores, allowed, top_k)
             chosen = jnp.where(picks >= 0, jnp.take_along_axis(pool, jnp.maximum(picks, 0), -1), -1)
             selected = selection_mask(chosen, entries.shape[1])
         else:
-            scores = self.indexer.scores(x, q_resid, keys, cos, sin)
-            if (self.candidates == 'source' and self.candidate_blocks and self.candidate_block_size
-                    and kv_store is not None):
-                kv_store[_CSA2_CANDIDATES] = candidate_pool(
-                    scores, seen, self.candidate_blocks, self.candidate_block_size)
+            agreements = self.indexer.agreements(q_resid, keys, cos, sin)
+            scores = self.indexer.weighed(agreements, x)
+            blocks, block_size = self.candidate_blocks, self.candidate_block_size
+            pooled = self.candidates == 'source' and kv_store is not None
+            if pooled and blocks and block_size:
+                sow_selection(self, scores, agreements, seen, top_k, blocks=blocks, block_size=block_size)
+                kv_store[_CSA2_CANDIDATES] = candidate_pool(scores, seen, blocks, block_size)
+            else:
+                sow_selection(self, scores, agreements, seen, top_k)
             selected = top_k_keys(scores, seen, top_k)
         if kv_store is not None:
             if not self.reindex:
