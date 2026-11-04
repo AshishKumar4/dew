@@ -1012,7 +1012,7 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None) -> Conditioning
     arm runs (`summed_as_run`, a window loop's by window), its heavy elements over `seeds` as `ran`, its
     compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
     from rounding_bound import rounding_scale
-    scaled = unrewritten(reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn)
+    scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
         with summed_as_run():
@@ -1504,10 +1504,10 @@ def _cancelling_terms(draw, truth, program=None):
     # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
     # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
     # failure of its own.
-    truth = unrewritten(truth)
+    run = program or unrewritten(jax.jit(truth))
     try:
         with jax.enable_x64(new_val=True):
-            leaves = [*map(np.asarray, jax.tree.leaves((program or jax.jit(truth))(*widened(draw(0)))))]
+            leaves = [*map(np.asarray, jax.tree.leaves(run(*widened(draw(0)))))]
             if not np.any(_LaidTruths.of(leaves).sizes == 0):
                 return None
             truths, terms = float64_terms(truth, *widened(draw(0)))
@@ -1787,7 +1787,7 @@ def _site_terms(terms_fn, terms, draw, truth, truth_program):
         program = truth_program if isinstance(truth_program, Truth) else None
         terms_fn = _cancelling_terms(draw, truth, program)
     return terms_fn if terms_fn is None or isinstance(terms_fn, _SiteTerms) else functools.partial(
-        float64_terms, unrewritten(terms_fn))
+        float64_terms, terms_fn)
 
 
 def _narrow(draws: _Draws) -> list[str]:
@@ -2068,6 +2068,10 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     undecided, the verdict then ", conditioned"'s."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
+    # The reference and the truth run their programs unrewritten, as a site's do (`_arms`, `_truth_program`).
+    reference_fn = (_Windowed(unrewritten(reference_fn.fn)) if isinstance(reference_fn, _Windowed)
+                    else unrewritten(reference_fn))
+    truth_fn = unrewritten(truth_fn)
     verdicts = []
     # Each run's draws: both budgets whole, the unweighted check's and the weighed one's, and the
     # reference's own beside them where unpaired, so no two runs share a draw.
