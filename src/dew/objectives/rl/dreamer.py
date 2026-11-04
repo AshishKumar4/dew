@@ -1045,8 +1045,12 @@ class DreamerRollout:
         prefill fills."""
         count = self.env.count if isinstance(self.env, Simulator) else self.env.reset(key)[1].reward.shape[0]
         # The live state is donated to the steps that advance it, each buffer once, so each leaf gets a buffer
-        # of its own: an environment's state may hold one array in two of its fields (Playground's do).
-        carry = jax.tree.map(jnp.copy, self._begin(key, self.objective.memory(count)))
+        # of its own: an environment's state may hold one array in two of its fields (Playground's do). Each
+        # holds its dtype strongly, as a restored state's leaves do: a weakly typed one (a Python number a
+        # reset folds in, the flight race's `ramp`) lowers the rollout to another program than a resumed
+        # run's, which compiles again (ledger 3451).
+        carry = jax.tree.map(lambda leaf: jnp.array(leaf, dtype=leaf.dtype),
+                             self._begin(key, self.objective.memory(count)))
         returns = jnp.zeros(count)
         if self.replay is not None:
             return _Live(carry, self.replay, returns)
