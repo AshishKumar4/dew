@@ -61,6 +61,10 @@ MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
 SHARED_BYTES = 10
 """The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
+CUSTOM_KERNEL_THUNK = 36
+"""The `ThunkProto` field of a custom kernel's thunk, a Pallas-Triton launch's (`CustomKernelThunkProto`): its
+kernel (3, `CustomKernelProto`), whose loader spec (2) holds its cubin (2, `CudaCubinProto`; 1) and which
+states the dynamic shared memory its launch asks for (6, `shared_memory_bytes`)."""
 ELF = b"\x7fELF"
 """A cubin's first bytes."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
@@ -478,8 +482,8 @@ class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
     the launch it carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its
     stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and
-    the dynamic shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto
-    states none."""
+    the dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
+    `shared_memory_bytes`), None where its proto states none."""
     kernel: str
     launch: str | None
     registers: int
@@ -492,11 +496,12 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
     form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
     compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
     process), or the executable was loaded from the persistent cache, and a Pallas-Triton template
-    launch's on its thunk itself (its `binary`, which a Mosaic thunk leaves empty), its kernel naming its
-    launch. Nothing is read from or written to the process's environment or disk: a compile that set
-    Mosaic's dump settings around itself handed its directory to every other thread's compile and removed
-    it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has (row
-    2816)."""
+    launch's in its custom kernel's (`custom_kernel`), its kernel naming its launch: the thunk's own
+    `binary` is its module's, which in a program holding a constant is that constant's module alone, no
+    kernel's code in it. Nothing is read from or written to the process's environment or disk: a compile
+    that set Mosaic's dump settings around itself handed its directory to every other thread's compile and
+    removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
+    (row 2816)."""
     from jax._src.thunky import thunky
 
     found: list[Binary] = []
@@ -507,13 +512,15 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
                 attributes = operation.attributes
-                found.extend(thunk_kernels(ir.StringAttr(attributes["thunk_proto"]).value_bytes))
-                elf = ir.StringAttr(attributes["binary"]).value_bytes if "binary" in attributes else b""
+                proto = ir.StringAttr(attributes["thunk_proto"]).value_bytes
+                found.extend(thunk_kernels(proto))
                 name = ir.StringAttr(attributes["kernel_name"]).value
-                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins so too: a template
+                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template
                 # launch's names its launch (`named`).
-                if elf[:4] == ELF and LAUNCH_SUFFIX.search(name):
-                    found.append(_binary(name, elf))
+                kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
+                if kernel is not None:
+                    elf, shared = kernel
+                    found.append(dataclasses.replace(_binary(name, elf), shared=shared))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
@@ -529,19 +536,42 @@ def thunk_kernels(proto: bytes) -> list[Binary]:
     return kernels
 
 
+def custom_kernel(proto: bytes) -> tuple[bytes, int] | None:
+    """The cubin of the custom kernel a thunk's serialized proto launches and the shared bytes its launch
+    asks for (`CUSTOM_KERNEL_THUNK`), None where the thunk launches no custom kernel's cubin."""
+    kernels = [kernel for thunk in _fields(proto).get(CUSTOM_KERNEL_THUNK, [])
+               for kernel in _fields(thunk).get(3, [])]
+    if len(kernels) != 1:
+        return None
+    kernel = _fields(kernels[0])
+    cubins = [data for spec in kernel.get(2, []) for cubin in _fields(spec).get(2, [])
+              for data in _fields(cubin).get(1, [])]
+    if len(cubins) != 1 or cubins[0][:4] != ELF:
+        return None
+    # proto3 omits a zero.
+    return cubins[0], kernel.get(6, [0])[0]
+
+
+def _fields(message: bytes) -> dict[int, list]:
+    """A serialized proto's fields by number, each its values (a varint's int, a length-delimited field's
+    bytes), read without its schema; none where `message` parses as no proto."""
+    parsed = empty_pb2.Empty()
+    try:
+        parsed.ParseFromString(message)
+    except DecodeError:
+        return {}
+    fields: dict[int, list] = {}
+    for field in UnknownFieldSet(parsed):
+        fields.setdefault(field.field_number, []).append(field.data)
+    return fields
+
+
 def _kernels(message: bytes) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
     `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
     (`MOSAIC_TARGET`, a custom call thunk's target)."""
-    parsed = empty_pb2.Empty()
-    try:
-        parsed.ParseFromString(message)
-    except DecodeError:
-        return [], 0
-    fields: dict[int, list] = {}
-    for field in UnknownFieldSet(parsed):
-        fields.setdefault(field.field_number, []).append(field.data)
+    fields = _fields(message)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):

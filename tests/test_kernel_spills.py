@@ -480,11 +480,14 @@ def test_a_program_called_under_another_mesh_of_its_shape_runs_on_that_meshs_dev
 
 
 @lowers("sm90")
-def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
+@pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
+def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):
     """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
-    H100: `report.binaries` reads the launch once, its cubin from its thunk's own binary, and the Mosaic
-    kernel once, from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers; the
-    fusion, whose thunk carries its cubin too, names no launch and is no template's."""
+    H100, with or without a constant: `report.binaries` reads the launch once, its cubin from its custom
+    kernel's proto (a program holding a constant gives every thunk that constant's module alone as its
+    binary, which states no registers: row 3858), and the Mosaic kernel once, from its kernel proto, each
+    stating its registers; the fusion, whose thunk carries its cubin too, names no launch and is no
+    template's."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as pltriton
     from jax.sharding import NamedSharding, PartitionSpec
@@ -498,11 +501,12 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
 
     copy = staged_copy((128, 128), jnp.float32)
     shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
+    table = np.arange(128 * 128, dtype=np.float32).reshape(128, 128) if constant else 0
 
     def program(x, y):
         launched = pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added__l0123456789",
                                   compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y)
-        return jnp.concatenate([copy(launched), jnp.sin(x)]).sum(axis=1)
+        return jnp.concatenate([copy(launched), jnp.sin(x) + table]).sum(axis=1)
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
