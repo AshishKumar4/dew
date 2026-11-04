@@ -23,10 +23,22 @@ DPM-Karras's schedule; every train walks the same native-source path under DDIM,
 PNDM, row 647's proof."""
 
 
-@pytest.mark.parametrize("case", timed(PAST_TARGET, "parity", ["ddim-linspace", "pndm-linspace", "ddim-clip",
-                                                                "euler-zero-snr", "dpm-karras", "norm", "odd",
-                                                                "dropped"]))
+@pytest.mark.parametrize("case", timed(PAST_TARGET, "parity", ["ddim-linspace", "ddim-clip", "euler-zero-snr",
+                                                                "dpm-karras", "norm", "odd", "dropped"]))
 def test_native_source_control_and_gradient_parity(edges, case):
+    checked(edges, case)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_native_source_control_and_gradient_parity_under_pndm(edges):
+    """`checked` over PNDM's linspace walk, whose 128 draws, each its own table's walk compiled again, took
+    143 s in one task (ledger 3896): CI draws them in map tasks of 32, the tool's process inheriting the
+    task's draws (`map_judge`)."""
+    checked(edges, "pndm-linspace")
+
+
+def checked(edges, case):
+    """tools/check_native_diffusion_edges.py's `case` over the extracted fixture, in a process of its own."""
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools/check_native_diffusion_edges.py"), str(edges), case],
         cwd=ROOT,

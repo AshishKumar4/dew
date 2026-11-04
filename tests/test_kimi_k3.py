@@ -53,12 +53,14 @@ draw = drawn_batch
 dew = recorded_dew(TINY, OUTPUTS)
 
 
+@pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_forward_and_cached_decode_match_the_reference_over_left_padding():
     """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, and the
     first row's cached decode (40 tokens prefilled, then one a step), on par with fla 0.5.2's on CUDA with
     its intra-chunk solve in IEEE fp32, the decode against the release's forwards at the shapes each step
     computes (ledger 1543), over the recorded seeds (check 1, tools/venv_reference.py kimi-k3), Dew's
-    float64 forward the truth."""
+    float64 forward the truth. Its seeds are drawn in map tasks of 8 (ledger 3900: 75 s of draws in one
+    task)."""
     assert_as_exact_as_recorded(FIXTURE, "kimi-k3", SEEDS, draw, dew,
                                 "Kimi K3's logits and cached decode")
 

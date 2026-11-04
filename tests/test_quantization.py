@@ -1160,6 +1160,7 @@ armada."""
 
 
 @pytest.mark.mesh
+@pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     """The int8 trunk over two stages on the eight simulated devices: finite
     loss and gradients, and the loss on par with the plain wrapped loop's
@@ -1169,7 +1170,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     rounding. (The gradients are not drawn: int8 rounding is
     discontinuous, so a gradient's error from the float model jumps where a
     value crosses a level, and the loop's own does not resolve within 512
-    seeds.)"""
+    seeds.) Its seeds are drawn in map tasks of 128 (ledger 3890: they took
+    most of 140 s in one task)."""
     pytest.importorskip("qwix")
     model = tiny(num_layers=4)
     qmodel = Quantization().apply(model)

@@ -539,31 +539,32 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
     reference = np.load(directory / "updated_logits.npy")[valid]
     updated = np.load(directory / "updated_logits_f64.npy")[valid]
 
-    def trained(gradient, destination):
+    def trained(gradient):
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
-        loaded.save(
-            destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)}
-        )
-        restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
-        return restored, np.asarray(
-            restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
-        )[valid]
+        return {**loaded.variables, "params": optax.apply_updates(params, updates)}
 
-    def terms(model):
+    # Compiled, where op by op the forwards took a third of the test (ledger 3894).
+    forward = jax.jit(lambda model, variables: model.apply(variables, inputs.tokens, **inputs.kwargs()),
+                      static_argnums=0)
+
+    def terms(model, variables):
         """Each valid logit's float64 terms over `model`'s step, which size its row's rounding: the
         whole model widened, its language model and towers with the wrapper."""
-        wide = ModelConfig.from_model(model.model).with_dtype("float64").build()
-        _, sized = float64_forward(wide, model.variables, inputs.tokens, **inputs.kwargs())
+        wide = ModelConfig.from_model(model).with_dtype("float64").build()
+        _, sized = float64_forward(wide, variables, inputs.tokens, **inputs.kwargs())
         return np.asarray(sized)[valid]
 
-    restored, output = trained(gradient, tmp_path / "trained")
+    loaded.save(tmp_path / "trained", variables=trained(gradient))
+    restored = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="reference")
+    output = np.asarray(forward(restored.model, restored.variables))[valid]
     assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits",
-                                     terms=terms(restored))
+                                     terms=terms(restored.model, restored.variables))
     # The rule still catches one layer's gradient with its sign flipped.
-    slip, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
+    slip = trained(_one_layer_negated(gradient))
+    slipped = np.asarray(forward(loaded.model, slip))[valid]
     with pytest.raises(GateFailure):
         assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip",
-                                         terms=terms(slip))
+                                         terms=terms(loaded.model, slip))
     for collection, tree in restored.variables.items():
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree),

@@ -1377,6 +1377,7 @@ def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(g
     assert_padded_speculation_is_greedy(glm5_next_source)
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     """A prefill and single-token steps on par with the parallel forward at each step's width from float64
     over drawn rows that clear its indexer's and its routing's selections (check 1, ledger 2739)."""
