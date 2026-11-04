@@ -2437,10 +2437,15 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
 FAULTY_REWRITE = """
 import json
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import i64, rewrite, var
+from float64_terms import float64_terms
 from reference_error import GateFailure, assert_as_exact, dew_programs
+from rounding_bound import rounding_scale
+
+from dew import algebra
 
 from dew.algebra import rules
 from dew.algebra.terms import Term
@@ -2473,7 +2478,14 @@ except GateFailure:
     failed = True
 assert_as_exact(dew_programs(lambda x, y: sums(x, y)), arm, draw,
                 "the program as written against the reference run unrewritten", seeds=8, truth_fn=arm)
-print(json.dumps({"moved": moved, "failed": failed}))
+# The gate's evaluators of a truth's terms and a reference's rounding scale trace their program as written.
+rewritten = algebra.rewritten(sums)
+with jax.enable_x64(new_val=True):
+    wide = [np.asarray(leaf, np.float64) for leaf in draw(0)]
+    written = np.asarray(sums(*wide))
+    termed = float(np.max(np.abs(np.asarray(float64_terms(rewritten, *wide)[0]) - written)))
+scaled = float(np.max(np.abs(np.asarray(rounding_scale(rewritten, *draw(0))[0]) - written)))
+print(json.dumps({"moved": moved, "failed": failed, "termed": termed, "scaled": scaled}))
 """
 """A process whose registry holds a faulty rule set (an exponential rewritten to its argument: a real
 rewrite the engine saturates and extracts, a leaf being cheaper than a transcendental), which checks a
@@ -2484,7 +2496,8 @@ def test_a_reference_and_its_truth_run_their_programs_unrewritten():
     """The gate runs a check's reference arm and its float64 truth with the algebra pass off and the
     candidate as its users run it, the pass on (docs/design/algebra.md §3): a program a faulty rule set
     rewrites, passed as both arms of a check running Dew's own programs, fails it, its reference computing
-    the program as written, which its truth, the same program, agrees with."""
+    the program as written, which its truth, the same program, agrees with; and the evaluators of a truth's
+    terms and a reference's rounding scale trace a rewritten function as written."""
     tests = Path(__file__).resolve().parent
     done = subprocess.run([sys.executable, "-c", FAULTY_REWRITE], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu",
@@ -2492,3 +2505,4 @@ def test_a_reference_and_its_truth_run_their_programs_unrewritten():
     found = json.loads(done.stdout.strip().splitlines()[-1])
     assert found["moved"] > 0.1
     assert found["failed"]
+    assert found["termed"] < 1e-9 and found["scaled"] < 1e-3
