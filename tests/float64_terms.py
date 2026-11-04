@@ -14,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn import programs
+
 SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
                   "scatter-add"})
 """The operations that sum terms: a leaf's terms are those its own sums add,
@@ -34,8 +36,7 @@ A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
-                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr", "marked_call"})
+CALLS = programs.CALLS | {"remat", "custom_vjp_call_jaxpr"}
 """The calls whose bodies are evaluated op by op, as the computation's own:
 a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal, a
 marked span (`dew.nn.derivatives.marked`, lowered as its body). A

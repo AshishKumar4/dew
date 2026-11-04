@@ -77,7 +77,7 @@ from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
-    from dew.data.dataset import Loader
+    from dew.data.dataset import DataPartition, Loader
     from dew.training.trainer import Trainer
 
 _log = logging.getLogger(__name__)
@@ -648,17 +648,21 @@ class CompiledAhead(SystemExit):
                       len(probes), json.dumps(ahead.plan))
 
 
-def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
-    """`batch`, a global batch as a loader gives it, as `fit` hands it to its step: its work counted
+def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
+                                 partition: DataPartition | None = None) -> Batch:
+    """`batch`, the rows a loader gives this process, its share `partition` of the step's (the mesh's,
+    `DataPartition.of`, where None), as `fit` hands it to its step: its work counted
     (`Trainer._counted_batch`), each row marked with its place among the step's records
     (`dew.training.distributed.marked`), its host fields set apart (`split_fields`), and on the examples
-    clock whether it closes its update window (`closes_window`)."""
+    clock whether it closes its update window (`closes_window`). A batch of every row, read whole on
+    each process, is `DataPartition()`'s."""
     from dew.data.dataset import DataPartition
     from dew.distributed.batches import split_fields
     from dew.training._fit import closes_window
     from dew.training.distributed import marked
 
-    device, _ = split_fields(marked(DataPartition.of(trainer.device_mesh), trainer._counted_batch)(batch))
+    partition = DataPartition.of(trainer.device_mesh) if partition is None else partition
+    device, _ = split_fields(marked(partition, trainer._counted_batch)(batch))
     return closes_window(device, trainer._examples)
 
 
