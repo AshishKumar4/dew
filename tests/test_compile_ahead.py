@@ -335,6 +335,48 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
         loaded.derived_for(fewer)
 
 
+GATED_DELTA_AHEAD = """
+import sys
+sys.path[:0] = [f"{sys.argv[1]}/src", f"{sys.argv[1]}/tests"]
+import jax
+import optax
+from token_support import token_rows
+
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.objectives.lm import LMObjective
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.ahead import compile_ahead, compile_only_gpus
+
+mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=64,
+                           linear_value_head_dim=64)
+model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=1, num_heads=2, head_dim=64,
+                          mlp_features=256, max_seq_len=128, dtype="bfloat16", mixer=mixer)
+trainer = Trainer(LMObjective(model, 128), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=MeshSpec().build(compile_only_gpus("sm80", 1)), layout=Layout(min_shard=256))
+compile_ahead(trainer, token_rows(64, 2, 129), capacity=2**34)
+"""
+"""A bf16 gated-delta decoder's step compiled ahead for a compile-only A100, in a process of its own: its
+checkout is its argument."""
+
+
+def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets():
+    """A bf16 gated-delta decoder's step compiled ahead for a compile-only A100 (`compile_only_gpus("sm80")`)
+    lowers its Mosaic GPU kernels for the architecture its trace's abstract device states, the A100's 8.0
+    (row 3885): a mesh's abstract device stated none, so Mosaic lowered for an H100's, and its
+    `nvvm.elect.sync` failed sm80's LLVM instruction selection and aborted the process, every A100 prepare
+    of a model with a Mosaic route among them. The compile runs in a process of its own, as Mosaic compiles
+    for one capability a process (`kernel_compile.compile_mosaic_kernels`)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = str(Path(__file__).resolve().parents[1])
+    ran = subprocess.run([sys.executable, "-c", GATED_DELTA_AHEAD, root], capture_output=True, text=True,
+                         check=False)
+    assert ran.returncode == 0, ran.stderr[-3000:]
+
+
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
