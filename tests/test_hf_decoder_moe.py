@@ -18,6 +18,7 @@ from interop_support import (
     transformers_model,
 )
 from model_support import decode_steps, flat_tree, stepped_outputs
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     as_given,
@@ -242,43 +243,24 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
 
 
-GPT_OSS_20B = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
-"""The released GPT OSS 20B and the commit both sides read."""
-
-
 @pytest.mark.network
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
-    """The released MXFP4 checkpoint through the loader against transformers'
-    own dequantized bf16 forward at the same prompt. Tolerance on the top-32
-    logits 5e-2 for bf16 accumulation over 24 layers; the argmax must agree
-    everywhere. The largest observed difference is not recorded here: the
-    test needs the download. The weights stay in the bf16 the MXFP4 blocks
-    decode to (`param_dtype="auto"`), as the reference holds them: 42 GB on
-    the device, where FP32 master weights would take 84."""
-    import torch
-    from transformers import AutoTokenizer, GptOssForCausalLM
+    """The released MXFP4 checkpoint through the loader, its weights in the bf16 the blocks decode to
+    (`param_dtype="auto"`, 42 GB on the device, where FP32 master weights would take 84), on the prompt
+    the recording read: Dew's bf16 logits as near the float64 truth as transformers' own bf16 forward
+    on a GPU, its experts dequantized as Dew's are (the one-draw rule, ledger 1719). Both are recorded
+    by tools/gpt_oss_20b_reference.py: the truth holds the released weights in float64, 168 GB, which
+    no test process holds."""
+    from tools.fetched_fixtures import local
+    from tools.gpt_oss_20b_reference import FIXTURE, RELEASED
 
-    repo, revision = GPT_OSS_20B
-    prompt = "The Cascade Range runs from northern California through Oregon"
-    ids = AutoTokenizer.from_pretrained(repo, revision=revision)(
-        prompt, return_tensors="np")["input_ids"].astype(np.int32)
+    with np.load(local(FIXTURE)) as recorded:
+        ids, reference, truth = (recorded[name] for name in ("input_ids", "reference", "truth"))
+    repo, revision = RELEASED
     pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
                                  max_seq_len=int(ids.shape[1]), revision=revision)
-    model, variables = pretrained.model, pretrained.variables
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
-
-    reference = GptOssForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, revision=revision)
-    reference.eval()
-    reference.set_attn_implementation("eager")
-    with torch.no_grad():
-        theirs = reference(input_ids=torch.from_numpy(ids.astype(np.int64))).logits[0].float().numpy()
-
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(theirs, axis=-1))
-    top_ids = np.argsort(-theirs, axis=-1)[:, :32]
-    difference = float(np.max(np.abs(np.take_along_axis(logits, top_ids, axis=-1)
-                                     - np.take_along_axis(theirs, top_ids, axis=-1))))
-    assert difference < 5e-2, f"max |top-32 logit difference| {difference:.3e}"
-
+    logits = np.asarray(pretrained.model.apply(pretrained.variables, jnp.asarray(ids)), np.float32)[0]
+    assert_as_exact_as_the_reference(logits, reference, truth, "GPT OSS 20B logits")
 
 
 # --------------------------------------------------------------------------
