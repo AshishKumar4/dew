@@ -358,6 +358,12 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     # The refusal names what changed, the mix's selection seed it now draws by, and the routes it goes on.
     assert refused.value.changed == {"selection_seed": (None, 0)}
     assert refused.value.routes == (SCHEDULE, REBUILD)
+    # A mix saved under one seed and read under another is rebuilt as it was, not read unseeded.
+    seeded = loader(mixture(str(root), seed=4)[0])
+    next(seeded)
+    with pytest.raises(PlanOrderChanged) as reseeded:
+        loader(mixture(str(root), seed=5)[0]).set_state(seeded.get_state())
+    assert reseeded.value.changed["selection_seed"] == (4, 5) and reseeded.value.routes == (REBUILD,)
 
 
 def mixture_directory(root: Path, rows: int = 40) -> Path:
@@ -380,7 +386,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     """A decision run over a mixture records its chain (row 3874): read back from its run.json
     (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
     mixture's order changed is refused that position by its plan, naming the record route first, as the
-    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881)."""
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and that record, put back,
+    resumes."""
     from run_kinds import decision, trained
 
     from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
@@ -400,6 +407,10 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     with pytest.raises(PlanOrderChanged) as refused:
         trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
     assert refused.value.routes == (RECORD, SCHEDULE, REBUILD)
+    # The route it names holds: the record it resumes is put back, and resumes.
+    trained(RunConfig.load(str(directory)), tmp_path, "mixed",
+            trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
+    assert "3" in {path.name for path in directory.iterdir()}
 
 
 def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):

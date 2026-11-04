@@ -1009,15 +1009,18 @@ def _with[T: "DataclassInstance"](holder: T, path: str, field: str | int | None)
 
 
 @contextlib.contextmanager
-def _routed(saved: Mapping[str, object] | None) -> Iterator[None]:
-    """Within the block, a refusal of a resumed run's changed chain (`PlanOrderChanged`) names the route of
-    the record it resumes where that record holds its chain, as a run.json written of a chain the codec
-    could not describe does not (`{"unrecorded": reason}`)."""
+def _routed(saved: Mapping[str, object] | None, directory: str) -> Iterator[None]:
+    """Within the block, a refusal of a resumed run's changed chain (`PlanOrderChanged`) puts back the
+    record `saved` of the run it resumes, which the run's own record replaced in `directory`, and names
+    it as a route where it holds its chain, as a run.json written of a chain the codec could not describe
+    does not (`{"unrecorded": reason}`)."""
     try:
         yield
     except PlanOrderChanged as refused:
         named = None if saved is None else registry.class_record(saved)
         data = None if named is None else named[1].get("data")
+        if saved is not None and jax.process_index() == 0:
+            write_atomically(epath.Path(directory) / RUN_FILE, json.dumps(saved, indent=2, sort_keys=True))
         raise refused.routed(recorded=isinstance(data, Mapping) and "unrecorded" not in data) from None
 
 
@@ -1976,16 +1979,17 @@ class RunConfig:
             checkpoints = trainer.checkpoints(name)
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
-            saved_file = epath.Path(checkpoints.directory) / RUN_FILE
-            # The record of the run this one resumes, read before it is written over: whether it holds
-            # its chain says which routes a changed chain's refusal names (`PlanOrderChanged`).
-            saved_record = json.loads(saved_file.read_text()) if saved_file.exists() else None
+            # The record of the run this one resumes, read as the pool agrees to resume it, before it is
+            # written over: a changed chain's refusal puts it back and names it (`PlanOrderChanged`).
+            resumed: dict[str, Mapping[str, object]] = {}
 
             def check_resumed() -> None:
                 """Refuse a checkpoint of another run under the name, or a directory `resume` refuses
                 (`Checkpoints.resumed`), on every rank, before the record is written over it."""
-                if checkpoints.resumed(trainer.resume) is not None and saved_record is not None:
-                    self.check_resume(earlier_run(saved_record))
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                if checkpoints.resumed(trainer.resume) is not None and saved.exists():
+                    resumed["record"] = json.loads(saved.read_text())
+                    self.check_resume(earlier_run(resumed["record"]))
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -2007,7 +2011,8 @@ class RunConfig:
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
             # Every program the run traces takes its recorded precision policy.
-            with generation.run_precision(trainer.precision), _routed(saved_record):
+            with generation.run_precision(trainer.precision), _routed(resumed.get("record"),
+                                                                       checkpoints.directory):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).

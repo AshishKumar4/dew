@@ -41,7 +41,8 @@ _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a n
 
 REBUILD = "build its chain as it was"
 RECORD = "resume it from its record, which holds the chain it read (`dew train <run directory>/run.json`)"
-SCHEDULE = 'read its decision mixture in the schedule it saved (`mixture(..., order="schedule")`)'
+SCHEDULE = ('read its mix unseeded, in the schedule it saved (`mix(..., seed=None)`, a decision mixture\'s '
+            '`mixture(..., order="schedule")`)')
 """The routes a run whose chain changed since it saved its position takes (`PlanOrderChanged.routes`):
 built as it was; resumed from a record that holds its chain (`RunConfig.train` names it where the saved
 run's record does); a decision mixture saved before its corpus order was seeded read in that schedule
@@ -55,7 +56,7 @@ def _absent(value: JSON | None) -> str:
 class PlanOrderChanged(ValueError):
     """A saved data position's plan whose order is not the chain's now: each order key `changed`, its saved
     value and its value now (None where one holds none), and the `routes` its run goes on by (`REBUILD`,
-    `RECORD`, `SCHEDULE`), a mix's changed selection seed naming `SCHEDULE`."""
+    `RECORD`, `SCHEDULE`), a mix saved unseeded and seeded now naming `SCHEDULE`."""
 
     def __init__(self, changed: Mapping[str, tuple[JSON | None, JSON | None]], routes: tuple[str, ...]):
         self.changed, self.routes = dict(changed), routes
@@ -70,7 +71,10 @@ class PlanOrderChanged(ValueError):
         changed = {key: (json_value(saved.get(key), key) if key in saved else None,
                          json_value(now.get(key), key) if key in now else None)
                    for key in sorted(set(saved) | set(now)) if saved.get(key) != now.get(key)}
-        return cls(changed, (*((SCHEDULE,) if "selection_seed" in changed else ()), REBUILD))
+        # A mix saved unseeded and seeded now reads as it was saved unseeded again; another seed, as built.
+        seeded = changed.get("selection_seed")
+        unseeded = seeded is not None and seeded[0] is None
+        return cls(changed, (*((SCHEDULE,) if unseeded else ()), REBUILD))
 
     def routed(self, *, recorded: bool) -> PlanOrderChanged:
         """This refusal with the record route first where the saved run's record holds its chain."""
