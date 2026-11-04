@@ -1,5 +1,5 @@
 #!/bin/sh
-# The test suite's environment, locked: pyproject.toml's ci, tutorials and mutation extras under constraints.txt,
+# The test suite's environment, locked: pyproject.toml's ci and tutorials extras under constraints.txt,
 # resolved as PyPI stood at RESOLVED, so the same inputs always give the same locks. Torch is the CPU
 # build in every lock: Dew runs torch only on the host (interop, vision), and a CUDA torch built for
 # another CUDA loads its own cuDNN over JAX's. Dew's CUDA extra is the locks' one difference, by driver: locks/cpu.txt for CI and every host
@@ -43,7 +43,7 @@ dated() {
 lock() {
   name=$1
   shift
-  uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials --extra mutation -c constraints.txt \
+  uv pip compile -q --no-header pyproject.toml --extra ci --extra tutorials -c constraints.txt \
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     $(for package in $UNDATED; do echo --exclude-newer-package "$package=false"; done) \
