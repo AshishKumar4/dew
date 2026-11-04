@@ -201,7 +201,7 @@ A first-fit or best-fit `Pipeline.pack(seq_len)` places each document whole and 
 
 `Decisions` reads examples or a produced mixture manifest. `DecisionObjective.data()` supplies fit, layout and packing steps. The source owns rows and validation; the objective owns layout and model-specific budgets. See [decision models](../guides/decision-models.md).
 
-A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers` and `prefetch` to choose that order; a `map` after `batch` is a host step on the training batch. A global shuffle requires an indexed pipeline.
+A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `windows`, `pack`, `batch`, `workers` and `prefetch` to choose that order; a `map` after `batch` is a host step on the training batch. A global shuffle requires an indexed read; `shuffle(streamed=n)` shuffles globally where the read is indexed and within `n` records where it streams.
 
 ## Cache and storage publication
 

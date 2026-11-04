@@ -1323,21 +1323,20 @@ class _EndedIterator(pygrain.DatasetIterator):
 
 def _for_rows(stage: Stage, rows: Rows) -> Stage:
     """`stage` as `rows` take it: a shuffle of every record (`Shuffle.streamed`) within its streamed window
-    where they stream, whole where they are indexed."""
-    if isinstance(stage, Shuffle) and stage.streamed is not None and not isinstance(rows, pygrain.MapDataset):
-        return dataclasses.replace(stage, window=stage.streamed, streamed=None)
+    where they stream (`Shuffle.streaming`), whole where they are indexed."""
+    if isinstance(stage, Shuffle) and not isinstance(rows, pygrain.MapDataset):
+        return stage.streaming()
     return stage
 
 
 def _for_read(pipeline: Pipeline, read: Read) -> Pipeline:
     """`pipeline` as a `read` lowers it: a streamed read's shuffles of every record (`Shuffle.streamed`)
-    within their streamed windows, so its loading workers hand on where a window shuffle stands
-    (`_carried`)."""
+    within their streamed windows (`Shuffle.streaming`), so its loading workers hand on where a window
+    shuffle stands (`_carried`)."""
     if read != "streamed":
         return pipeline
     return dataclasses.replace(pipeline, stages=tuple(
-        dataclasses.replace(stage, window=stage.streamed, streamed=None)
-        if isinstance(stage, Shuffle) and stage.streamed is not None else stage for stage in pipeline.stages))
+        stage.streaming() if isinstance(stage, Shuffle) else stage for stage in pipeline.stages))
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:

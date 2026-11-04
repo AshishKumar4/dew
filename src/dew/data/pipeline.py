@@ -582,6 +582,14 @@ class Shuffle:
     """Where `window` is None, the records a streamed read draws its order from, whose records no index
     permutes whole (`Pipeline.shuffle`); None for a shuffle a streamed read refuses."""
 
+    def streaming(self) -> Shuffle:
+        """This shuffle as a read that streams takes it: within its `streamed` window where it states one,
+        as a window shuffle, so its loading workers hand on where it stands; itself otherwise. Every
+        lowering of a streamed read resolves it here (`dew.data.lowering`)."""
+        if self.streamed is None:
+            return self
+        return dataclasses.replace(self, window=self.streamed, streamed=None)
+
 
 @dataclasses.dataclass(frozen=True)
 class Repeat:
