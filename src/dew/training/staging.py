@@ -52,12 +52,12 @@ def flattened(program: jcore.Jaxpr, operands: Sequence, consts: Sequence = ()) -
 
     for equation in equations:
         reading = [read(value) for value in equation.invars]
-        program = called(equation)
+        body = called(equation)
         placing = [sharding for key in ("in_shardings", "out_shardings")
                    for sharding in equation.params.get(key, ())
                    if isinstance(sharding, jax.sharding.Sharding)]
-        if program is not None and equation.primitive.name in PURE_CALLS and not placing:
-            inner, outputs = flattened(program, reading, tuple(program.consts))
+        if body is not None and equation.primitive.name in PURE_CALLS and not placing:
+            inner, outputs = flattened(body, reading, tuple(body.consts))
             expanded.extend(inner)
             renamed.update(zip(equation.outvars, outputs, strict=True))
         else:
