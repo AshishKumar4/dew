@@ -421,6 +421,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
     x, w, dy = shaped((rows, depth)), shaped((groups, depth, width)), shaped((rows, width))
     x16, w16, dy16 = (jax.ShapeDtypeStruct(array.shape, jnp.float16) for array in (x, w, dy))
+    # An FP8 product's operands (E4M3), its matrix K-major as Hopper's FP8 tensor cores read it (row 3620).
+    x8, w8 = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn)
+              for shape in ((rows, depth), (groups, width, depth)))
     gmm, tgmm, hooks = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm(), grouped_matmul.Hooks
     norm = hooks(normed, (("rows",), ("depth",)))
     forward = {"interpret": False, "out_dtype": "bfloat16", "trans_rhs": False}
@@ -429,6 +432,8 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("forward", gmm, (x, w, sizes), {**forward, "out_dtype": "float32"}),
         ("forward bf16", gmm, (x, w, sizes), forward),
         ("forward fp16", gmm, (x16, w16, sizes), {**forward, "out_dtype": "float16"}),
+        ("forward fp8", gmm, (x8, w8, sizes),
+         {**forward, "out_dtype": "float32", "trans_rhs": True, "exact_sums": True}),
         ("input gradient", gmm, (dy, w, sizes), {**backward, "trans_rhs": True}),
         ("input gradient fp16", gmm, (dy16, w16, sizes),
          {**forward, "out_dtype": "float16", "trans_rhs": True}),
