@@ -13,12 +13,14 @@ import pytest
 from decision_support import decision_rows
 from flax import linen as nn
 
+import dew.decision.metrics as decision_metrics
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, VALID_ROWS
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
+    AURC,
     ECE,
     Accuracy,
     Brier,
@@ -95,6 +97,39 @@ def test_ece_and_accuracy_merge_across_batches_as_one_pass():
     assert whole == pytest.approx(laya, abs=1e-12) and merged == pytest.approx(laya, abs=1e-12)
     accuracy = Accuracy()
     assert accuracy.finalize(accuracy(decisions(tops, correct), {})) == pytest.approx(correct.mean())
+
+
+class _CountedJoins:
+    """numpy as a module reads it, counting the values each join (`np.concatenate`) copies."""
+
+    def __init__(self) -> None:
+        self.copied = 0
+
+    def __getattr__(self, name: str):
+        return getattr(np, name)
+
+    def concatenate(self, arrays, *args, **kwargs):
+        self.copied += sum(np.size(array) for array in arrays)
+        return np.concatenate(arrays, *args, **kwargs)
+
+
+def test_aurc_over_a_pass_of_many_batches_copies_each_answer_a_bounded_number_of_times(monkeypatch):
+    """AURC merged batch by batch is the whole pass's, its answers copied a bounded number of times
+    however many batches the pass holds: joining every batch onto the answers before it copied them once
+    a batch after, quadratic in a pass's batches (row 3942). The bound is two copies of each answer's two
+    values, which one join at the pass's end meets, as a buffer doubling as it fills would."""
+    rng = np.random.default_rng(2)
+    tops = rng.uniform(0.5, 1.0, 400)
+    correct = rng.uniform(size=400) < tops
+    metric = AURC()
+    whole = metric.finalize(metric(decisions(tops, correct), {}))
+    joins = _CountedJoins()
+    monkeypatch.setattr(decision_metrics, "np", joins)
+    held = metric(decisions(tops[:10], correct[:10]), {})
+    for start in range(10, len(tops), 10):
+        held = metric.merge(held, metric(decisions(tops[start:start + 10], correct[start:start + 10]), {}))
+    assert metric.finalize(held) == whole
+    assert joins.copied <= 2 * 2 * len(tops), joins.copied
 
 
 TOKENIZER = ByteTokenizer()
