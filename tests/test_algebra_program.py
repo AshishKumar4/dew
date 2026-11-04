@@ -835,7 +835,7 @@ from dew.algebra.terms import Term
 
 
 def sums(x, y):
-    return jnp.sum(jnp.exp(jnp.tanh(x)), -1) + jnp.sum(jnp.exp(jnp.tanh(y)), -1)
+    return jnp.sum(jnp.exp(x), -1) + jnp.sum(jnp.tanh(y), -1)
 
 
 def branched(x, y):

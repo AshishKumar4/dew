@@ -2449,7 +2449,7 @@ rules.register(rules.Rules("faulty exponential", "reorders",
 
 
 def sums(x, y):
-    return jnp.sum(jnp.exp(jnp.tanh(x)), -1) + jnp.sum(jnp.exp(jnp.tanh(y)), -1)
+    return jnp.sum(jnp.exp(x), -1) + jnp.sum(jnp.tanh(y), -1)
 
 
 exponential = options.program(sums)
@@ -2473,7 +2473,7 @@ print(json.dumps({"moved": moved, "failed": failed}))
 """
 """A process whose registry holds a faulty rule set (an exponential rewritten to its argument: a real
 rewrite the engine saturates and extracts, a leaf being cheaper than a transcendental), which checks a
-program of Dew's it rewrites (two sums of bounded exponentials, a window the pass reads) against itself."""
+program of Dew's it rewrites (two sums, one of a bounded term, a window the pass reads) against itself."""
 
 
 def test_a_reference_and_its_truth_run_their_programs_unrewritten():
