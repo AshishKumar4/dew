@@ -461,8 +461,9 @@ class Tiles:
 
 
 CHUNK = 32
-"""The tokens a forward chunk takes: a ring stage of its operands, whose entering state the forward keeps for
-each backward block it opens (`Scan.opening`)."""
+"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward keeps
+for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are the
+portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
 
 
 class Selective(base.Template[Tiles]):
@@ -488,16 +489,24 @@ class Selective(base.Template[Tiles]):
                               interpret=interpret, plan=(config.positions, config.resident)), None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
-        """The call's config on `target`: the forward's `CHUNK`, the backward's tokens a thread and residency
-        from its register model (`backward_plan`), past the token counts a compile found spilling
-        (`report.spilled`), each a step down to half its tokens."""
+        """The call's config on `target`: the backward's tokens a thread and residency from its register model
+        (`backward_plan`), past the token counts a compile found spilling (`report.spilled`), each a step down
+        to half its tokens; and the forward's chunk, from `CHUNK` the longest whose ring a block's shared
+        memory holds (`staged_bytes`), up to a warpgroup's tokens (a chunk dividing every backward block) and
+        the call's tokens: on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
+        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to
+        6.40 (sel-chunk-sxm at 5bf70d36b)."""
         interpreted = ba.arguments.get("interpret", False)
         facts = generation.gpu_target(generation.INTERPRETED_GENERATION) if interpreted else target
         positions, resident = backward_plan(facts)
-        tiles = Tiles(CHUNK, positions, resident)
+        chunk, length = CHUNK, ba.arguments["x"].shape[1]
+        while (2 * chunk <= min(block_scan.THREADS, length) and self.staged_bytes(
+                ba, Tiles(2 * chunk, positions, resident), facts) <= generation.shared_budget(facts)):
+            chunk *= 2
+        tiles = Tiles(chunk, positions, resident)
         while report.spilled(self, ba, tiles) and tiles.positions > 1:
             fewer = tiles.positions // 2
-            tiles = Tiles(CHUNK, fewer, backward_programs(backward_registers(fewer), facts))
+            tiles = Tiles(chunk, fewer, backward_programs(backward_registers(fewer), facts))
         return tiles
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int | None:
