@@ -557,6 +557,7 @@ dew.decision.config.DecisionRunConfig
   head_max_len: int | None = None
   option_tokens: int | None = None
   max_state_tokens: int | None = None
+  option_text: Literal['named', 'described'] | None = None
   segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
   reads: Annotated[Reads, record_argument(Reads)] | None = None
   parallel: bool | None = None

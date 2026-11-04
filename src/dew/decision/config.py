@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 import jax
 
+from dew import _records
 from dew._records import integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
@@ -136,6 +137,13 @@ class DecisionRunConfig(DecoderRunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
+    option_text: Literal["named", "described"] | None = dataclasses.field(
+        default=None, metadata={_records.SAVED: "named"})
+    """How a question row writes a choice's option (`QuestionLayout.option_text`): its key and
+    description (`named`, as Laya's release reads its rows), or its description alone (`described`).
+    None keeps the layout's own: a release's, and a fresh head's described. A run saved before this
+    field reads `named`, as it ran. A joint row names each option by its key beside its description
+    in its schema, the named writing, and has no other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
     """The row's parts in order, as its layout reads them. A joint row's user turn
     (`JointLayout.segments`): the schema first, or read as the row's context through
@@ -445,8 +453,12 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     """`layout` with the `budgets` the run states, each but those left None, which keep the
     layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
     field for is refused: a joint row has no question budget, and a row per question no state
-    budget, its state taking what is left."""
+    budget, its state taking what is left. A joint row's schema writes each option named, by its key
+    beside its description (`JointLayout.options`), so it takes `named` option text as its own and
+    refuses `described`."""
     stated = {name: value for name, value in budgets.items() if value is not None}
+    if isinstance(layout, JointLayout) and stated.get("option_text") == "named":
+        del stated["option_text"]
     if isinstance(layout, QuestionLayout) and "framing" in stated and (
             stated.get("segments", layout.segments) is None):
         raise ValueError("--framing frames a joint row or a question row of --segments; a question layout's "

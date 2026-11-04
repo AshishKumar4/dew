@@ -131,6 +131,28 @@ def test_default_retains_the_weights_with_lowest_validation_loss(tmp_path):
     assert float(restored['variables']['params']['w']) == pytest.approx(0.488)
 
 
+def test_a_saved_runs_kept_steps_are_read_from_their_records_alone(tmp_path, monkeypatch):
+    """A save prunes the frozen store by its kept steps, and a store opened again lists them, each step's
+    metrics and custom metadata read from its own metadata file: no array of a kept step is opened, where
+    the manager's metadata opened every array's TensorStore (11.8 s of a U-Net run's two saves, row 3763)."""
+    import tensorstore
+
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=12, log_every=1, eval_every=1, checkpoint_every=6)
+    run.checkpoints.wait()
+    opened = []
+    real = tensorstore.open
+
+    def counted(*arguments, **options):
+        opened.append(arguments)
+        return real(*arguments, **options)
+
+    monkeypatch.setattr(tensorstore, "open", counted)
+    reopened = Checkpoints(str(tmp_path / 'run'), keep=1)
+    assert {entry.step for entry in reopened.kept()} == {3, 12} and reopened.best == 3
+    assert not opened
+
+
 def test_an_aggregate_score_that_fails_fails_its_run(tmp_path):
     """An aggregate score whose own code fails, here by reading a score no split records, fails
     the run that asked for it, where it once ranked nothing and the run went on without a best."""
