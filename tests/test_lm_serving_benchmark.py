@@ -57,7 +57,8 @@ def test_the_benchmark_serves_weights_a_mesh_splits(tmp_path):
     assert all(repeat["output_tokens"] == REQUESTS * OUTPUT
                for run in (whole, record) for point in run["sweep"] for repeat in point["repeats"])
     # Each slot count's measured peak, in a process of its own that loaded every program from the cache a
-    # first run filled (tools/peak_memory.py); on the CPU, whose allocator keeps no high-water, unmeasured.
+    # first run filled (tools/peak_memory.py); on the CPU, whose allocator keeps no high-water, unmeasured,
+    # and no peak process run.
     assert all(point["peak_device_bytes"] is None for run in (whole, record) for point in run["sweep"])
 
 
