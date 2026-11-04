@@ -23,11 +23,11 @@ from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
 from tuned import each_config, taken
 
-from dew.nn.activations import exact_gelu
+from dew.nn.activations import exact_gelu, gated_product, swiglu_clamped
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.generation import chosen as kernel_choices
-from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
+from dew.nn.moe import EXPERT_AXES, ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 from tools import grouped_oracle as oracle
 
@@ -488,6 +488,57 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation
     parameters = jax.device_put(parameters, specs)
     x, weights, choices = (jax.device_put(value, tokens) for value in (x, weights, jnp.asarray(choices)))
     return model, parameters, specs, tokens, x, weights, choices
+
+
+PAIRED_CHOICES = np.argsort(np.random.default_rng(3699).normal(size=(24, 8)) - np.arange(8) / 4,
+                            axis=-1)[:, :2].astype(np.int32)
+"""Each of 24 tokens' two experts, the earlier experts more often, so the groups differ in size."""
+
+
+@pytest.mark.usefixtures('x64')
+@pytest.mark.parametrize('activation, limit', [('swiglu', None), ('swiglu', .7), ('geglu', None)])
+def test_a_layers_gate_and_up_as_one_paired_product_hold_check_1_against_the_two_products(activation, limit):
+    """A routed layer multiplies its rows by its gate's and up projection's matrices as one paired
+    product (`moe.paired_projections`), which reads the rows once where its launch takes the pair: the
+    layer's output and the gradients of its parameters, tokens and router weights on par from float64
+    with the two products computed apart over the same dispatch (check 1, ledger 3699), clamped
+    (`swiglu_limit`) and not, and under each gate."""
+    model = ExpertMLP(8, 16, 8, dtype=jnp.bfloat16, activation=activation, swiglu_limit=limit)
+    names = tuple(EXPERT_AXES)
+
+    def apart(parameters, x, weights, dtype=jnp.bfloat16):
+        """The layer as two products: its gate's and up projection's apart, then its down projection
+        and its experts' outputs summed in fp32 under the router weights and rounded once."""
+        def project(tokens, sizes, _ids, kernels):
+            def linear(rows, kernel):
+                return jnp.asarray(expert_projection(rows, kernel, sizes, dtype, 'auto', None))
+            gate, up = swiglu_clamped(linear(tokens, kernels[0]), linear(tokens, kernels[1]), limit)
+            return linear(gated_product(activation)(gate, up), kernels[2])
+
+        kernels = tuple(parameters['params'][name]['kernel'] for name in names)
+        slots = expert_dispatch(project, x, jnp.asarray(PAIRED_CHOICES), kernels,
+                                tuple(EXPERT_AXES[name] for name in names), num_experts=8, dispatch='global',
+                                output_dtype=dtype)
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return jnp.einsum('tke,tk->te', slots.astype(wide), weights.astype(wide)).astype(dtype)
+
+    def paired(parameters, x, weights):
+        return jnp.asarray(model.apply(parameters, x, weights, jnp.asarray(PAIRED_CHOICES)))
+
+    def truth(parameters, x, weights):
+        return apart(*jax.tree.map(lambda value: value.astype(jnp.float64), (parameters, x, weights)),
+                     dtype=jnp.float64)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        x = jnp.asarray(rng.normal(size=(24, 8)), jnp.bfloat16)
+        weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
+        parameters = nn.unbox(model.init(jax.random.key(seed), x, weights, jnp.asarray(PAIRED_CHOICES)))
+        return parameters, x, weights, jnp.asarray(rng.normal(size=(24, 8)), jnp.bfloat16)
+
+    label = f"paired gate and up, {activation}{'' if limit is None else ' clamped'}"
+    assert_as_exact(jax.jit(with_gradients(paired)), jax.jit(with_gradients(apart)), draw, label, seeds=8,
+                    truth_fn=jax.jit(with_gradients(truth)))
 
 
 def test_a_bf16_combine_weighs_its_experts_in_fp32_and_rounds_once():

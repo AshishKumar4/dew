@@ -571,10 +571,36 @@ def expert_projection(x: jax.Array, kernel: jax.Array | Layered, group_sizes: ja
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     compute = canonicalize_dtype(x, stack, dtype=dtype)
-    xla = implementation == 'xla'
-    with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
+    with _named(implementation):
         return template.gemm(x, stack, group_sizes, compute=compute, out_dtype=compute, precision=precision,
                              layer=layer)
+
+
+def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Array | Layered,
+                       group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
+                       precision: PrecisionLike) -> tuple[jax.Array, jax.Array]:
+    """`expert_projection` of the same rows through two expert matrices of one shape (a gate's and an up
+    projection's), as one paired product (`template.gemm`'s `paired`): a launch that takes the pair reads
+    the rows once for both, and the call hands the two products on apart where its launch takes none
+    (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
+    to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
+    outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). A stack's layer (`Layered`) is
+    multiplied apart, the template pairing no stacked layer."""
+    if isinstance(first, Layered) or isinstance(second, Layered):
+        return (expert_projection(x, first, group_sizes, dtype, implementation, precision),
+                expert_projection(x, second, group_sizes, dtype, implementation, precision))
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
+    compute = canonicalize_dtype(x, first, second, dtype=dtype)
+    with _named(implementation):
+        return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
+                             out_dtypes=(compute, compute), precision=precision, paired=second)
+
+
+def _named(implementation: str) -> contextlib.AbstractContextManager:
+    """The launch choice an expert projection's `implementation` names: XLA's ragged dot for 'xla', the
+    template's own for 'auto' and 'pallas' (`expert_projection`)."""
+    return generation.chosen(grouped_matmul='xla') if implementation == 'xla' else contextlib.nullcontext()
 
 
 
@@ -1059,8 +1085,10 @@ class ExpertMLP(nn.Module):
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
-        gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
-        up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
+        # The gate and up projections read the same rows: one paired product (`paired_projections`).
+        gate, up = paired_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
+                                      self.precision)
+        gate, up = checkpoint_name(gate, 'gate_proj'), checkpoint_name(up, 'up_proj')
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
 
