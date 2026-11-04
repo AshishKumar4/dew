@@ -73,11 +73,12 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
     """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
     (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
-    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`)."""
+    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`): each pair
+    drawn or computed in one program (ledger 3178)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
-    variables = theirs.init(jax.random.key(0), x)
-    drawn = mine.init(jax.random.key(0), x)
+    variables, drawn = jax.jit(lambda key: [layer.init(key, x) for layer in (theirs, mine)])(
+        jax.random.key(0))
     if getattr(theirs, "batch_dims", ()):
         # The kernel draws a member at a time; its structure, shape, dtype and box are flax's, and
         # every other leaf flax's bit for bit.
@@ -93,8 +94,8 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
     if dtype == jnp.bfloat16:  # variables restored at a dtype other than the one declared
         variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), nn.unbox(variables))
     with jax.default_matmul_precision(FP32_SUMS):
-        expected = theirs.apply(variables, x)
-        got = mine.apply(variables, x)
+        expected, got = jax.jit(lambda variables, x: [layer.apply(variables, x) for layer in (theirs, mine)])(
+            variables, x)
     assert got.dtype == expected.dtype
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(expected, np.float32))
 
@@ -365,17 +366,17 @@ def test_a_biased_bf16_layer_quantizes_its_product(general):
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
 def test_a_layer_quantized_as_the_whole_model_quantizes_as_flaxs_does(general):
     """Quantized on its own, the layer its own root, a Dew layer trains and serves through
-    Qwix's quantized products exactly as flax's does, and both differ from the unquantized
-    layer, so neither skipped its quantization."""
+    Qwix's quantized products exactly as flax's does, the two computed in one program (ledger
+    3178), and both differ from the unquantized layer, so neither skipped its quantization."""
     x = jnp.asarray(np.random.default_rng(5).standard_normal((4, 32)), jnp.float32)
-    plain, trained, served = [], [], []
+    layers = []
     for dense, dense_general in ((Dense, DenseGeneral), (nn.Dense, nn.DenseGeneral)):
         layer = dense_general((2, 16)) if general else dense(32)
         variables = layer.init(jax.random.key(0), x)
-        plain.append(np.asarray(layer.apply(variables, x)))
-        trained.append(np.asarray(Quantization().apply(layer).apply(variables, x)))
-        model, stored = quantize_for_serving(layer, variables, Quantization(), x)
-        served.append(np.asarray(model.apply(stored, x)))
+        layers.append((layer, variables, *quantize_for_serving(layer, variables, Quantization(), x)))
+    plain, trained, served = (list(map(np.asarray, outputs)) for outputs in zip(*jax.jit(lambda x: [
+        (layer.apply(variables, x), Quantization().apply(layer).apply(variables, x), model.apply(stored, x))
+        for layer, variables, model, stored in layers])(x), strict=True))
     np.testing.assert_array_equal(*trained)
     np.testing.assert_array_equal(*served)
     assert np.abs(trained[0] - plain[0]).max() > 0
