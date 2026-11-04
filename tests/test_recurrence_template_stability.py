@@ -45,9 +45,15 @@ HOOKS = SITES['scalar delta']
 
 def forms_of(hooks) -> tuple[str | None, ...]:
     """The run's forms a form's checks run under: the rated scan's fast and accurate both, whose numbers
-    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts), any other form's the run's
-    own (None), which its numbers do not read."""
-    return ('fast', 'accurate') if hooks.rated else (None,)
+    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts); the accurate ones for a form
+    whose queries and keys its l2 norm widens, an fp32 call, whose fast numbers take its operands in two
+    bf16 parts past TF32's bits (`mainloop.FAST_PARTS`), held to recorded fla-core's TF32 by
+    test_recurrence_mosaic and not to an fp32 arm (the gated net's final memory 42 to 52 times its fp32
+    port's distance from float64, interpreted and on an H100, row 3962); any other form's the run's own
+    (None), which its numbers do not read."""
+    if hooks.rated:
+        return ('fast', 'accurate')
+    return ('accurate',) if hooks.l2norm else (None,)
 
 
 CASES = [(name, regime, product, forms) for name in SITES for forms in forms_of(SITES[name])
