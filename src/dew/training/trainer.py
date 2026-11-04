@@ -106,7 +106,6 @@ from dew.training._fit import (
     _rollout_admitted,
     _rollout_resumed,
     _rollout_saved,
-    admitted,
     afresh,
     check_inputs,
     clocked,
@@ -1637,19 +1636,10 @@ class Trainer(Generic[Loss, Effects]):
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
 
-    def admits(self, dataset: Loader, resume: Resume = "auto") -> None:
-        """Refuse a resume under `resume` whose saved data position `dataset` would not read on from, as
-        `fit` refuses it where it opens its data, before the run writes anything over what it resumes:
-        the position of this process's share at the step it continues (`Checkpoints.resumed`,
-        `Checkpoints.position`), restored on a stream opened and closed (`_fit.admitted`). Nothing
-        where it continues no step or saved no position."""
-        checkpoints = self.checkpoints
-        step = None if checkpoints is None else checkpoints.resumed(resume)
-        if checkpoints is None or step is None:
-            return
-        partition = DataPartition.of(self.device_mesh)
-        if (saved := checkpoints.position(step, partition)) is not None:
-            admitted(dataset, partition, saved)
+    def _stream_partition(self) -> DataPartition:
+        """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
+        beginning where updates do (`window`, `Ramp.stages`)."""
+        return DataPartition.of(self.device_mesh, window=self.accumulation)
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
@@ -1696,8 +1686,7 @@ class Trainer(Generic[Loss, Effects]):
         run.current = current
         self._refusal = None
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
-            # A ramp's stages begin where updates do (`Ramp.stages`).
-            partition = DataPartition.of(mesh, window=self.accumulation)
+            partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)

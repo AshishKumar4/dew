@@ -159,6 +159,21 @@ def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_pa
     assert len(recorded(run, "StepCompiled")) == 2
 
 
+def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updates_moved(tmp_path):
+    """A batch ramp from two rows by two over two examples to the batch's four, its updates two
+    microbatches each (`trainer.accumulation`), begins its next stage where an update does, record 4 not
+    2 (`Ramp.stages`): a run saved there resumes, its data position admitted as the run's stream reads
+    it (`resume_admitted`, the stream's window its accumulation's) before its record is written."""
+    kind = next(kind for kind in KINDS if kind in GLOBAL_ORDER)
+    settings = {"trainer.batch_ramp": {"start": 2, "increment": 2, "samples": 2}, "trainer.accumulation": 2}
+    run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 2, **settings})
+    first = saved(run)[-1]
+    trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, **settings})
+    started = recorded(run, "FitStarted")[-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (first, True)
+    assert saved(run)[-1] > first
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, tmp_path):
     """Set to lower for an A100 (`lower_for`), a kind's run lowers its first step for that GPU on this
