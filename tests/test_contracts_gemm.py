@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, assert_contract, normal_draw
 from reference_error import assert_as_exact
 
 from dew.nn import precision
@@ -175,11 +175,11 @@ def softly_rectified(scores):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
-    """A custom derivative within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule
-    held entry by entry, `_custom.held`): every order it takes finite wherever float64 is a normal float32
-    and the hook on the tile as its caller holds it is; it takes no forward-derivative order, under a nested
-    jit and a scan too (ledger 2658)."""
+def test_a_transposed_hooks_custom_derivative_holds_every_order(edge):
+    """A custom JVP within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule held
+    entry by entry, `_custom`): every order, forward ones too, under a nested jit and a scan, finite wherever
+    float64 is a normal float32 and the hook on the tile as its caller holds it is (ledger 2658: the held
+    rule was a custom VJP whatever the call's own, so it took no forward order)."""
     from dew.nn.kernels.templates import layout
 
     (tile,) = normal_draw(105, (6, 4), scale=EDGES[edge])
@@ -190,8 +190,7 @@ def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
         return softly_rectified(tile.T).T
 
     assert_contract(layout.transposed(softly_rectified), (tile,), (direction,), cotangent,
-                    f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain,
-                    without=FORWARD_ORDERS)
+                    f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
