@@ -599,10 +599,14 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
             walks = (grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             # Its step is its products and its waits (the prologue's rewrite apart), small enough that a
-            # rotation of its ring unrolled takes fewer instructions an HGMMA (`mosaic.stepping`).
+            # rotation of its ring unrolled takes fewer instructions an HGMMA (`mosaic.stepping`); an exactly
+            # summed step is not (its product apart and its IEEE add of the tile beside the running sum), and
+            # a rotation of them spilled as the ring deepened (row 3620: FP8 at 128 x 128 x 128 spilled 152
+            # bytes at five stages and 424 at six, a tile 34% slower than at four, FS-3620-SERIAL2,
+            # FS-3620-STAGES1-h100).
             family.persist(streams, walks, schedule, consumer, consumers=consumers,
-                           axis="programs", outputs=allocations.outputs,
-                           interpret=bool(interpret), in_flight=family.in_flight, unrolled=prologue is None)
+                           axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
+                           in_flight=family.in_flight, unrolled=prologue is None and not exact_sums)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
