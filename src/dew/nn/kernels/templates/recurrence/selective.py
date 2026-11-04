@@ -13,15 +13,17 @@ backward does."""
 
 import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import tokamax
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import cost, mosaic, resources, scan as block_scan
+from dew.nn.kernels.templates import base, cost, mosaic, report, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -371,14 +373,16 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
-                   block: int = 128, interpret: bool = False):
+                   block: int = block_scan.THREADS, interpret: bool = False,
+                   plan: tuple[int, int] | None = None):
     """`dew.nn.mixers.mamba.selective_scan` on the template: `x`, `dt` `[B, S, D]` (after the softplus),
     `A` `[D, N]`, `B`, `C` `[B, S, N]`, `D` `[D]`, `state` `[B, D, N]` or None, `starts` `[B, S]` or None.
     Returns `(y [B, S, D], final state [B, D, N])` in `x`'s dtype. The sequence is padded to whole chunks
     with a zero step, which neither decays nor writes. `chunk` divides the backward's block
     (`block_positions`), which starts from a chunk's entering state the forward keeps."""
-    # Interpreted, the interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`).
-    positions, resident = backward_plan(generation.gpu_target(
+    # The backward's plan its caller derived (`Selective.derived`), else this device's, interpreted the
+    # interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`).
+    positions, resident = plan or backward_plan(generation.gpu_target(
         generation.INTERPRETED_GENERATION if interpret else None))
     if block_scan.THREADS * positions % chunk:
         raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
@@ -444,3 +448,74 @@ def _scan_backward(scan: Scan, residuals, grads):
 
 
 _scan.defvjp(_scan_forward, _scan_backward)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tiles:
+    """The selective scan's launches' config: the forward's chunk of tokens, the backward's tokens a thread
+    and the programs a multiprocessor holds of it (`backward_plan`)."""
+
+    chunk: int
+    positions: int
+    resident: int
+
+
+CHUNK = 32
+"""The tokens a forward chunk takes: a ring stage of its operands, whose entering state the forward keeps for
+each backward block it opens (`Scan.opening`)."""
+
+
+class Selective(base.Template[Tiles]):
+    """Mamba's selective scan on the recurrence template (`selective_scan`), its config derived from the
+    device's facts (`derived`), its launches named for the compile's reports (`report.launching`), so a launch
+    whose kernels spilled steps its backward's tokens down (`report.spilled`). Its operands are
+    `dew.nn.mixers.mamba.selective_scan`'s: `x`, `dt` `[B, S, D]`, `A` `[D, N]`, `B`, `C` `[B, S, N]`, `D`
+    `[D]`, the entering state `[B, D, N]` or None and documents' first tokens `[B, S]` or None."""
+
+    name: ClassVar[str] = "mosaic_gpu"
+    config_cls: ClassVar[type[Tiles]] = Tiles
+    GENERATES: ClassVar[bool] = True
+
+    def _fwd(self, x, dt, A, B, C, D, state=None, starts=None, *, interpret: bool = False, config: Tiles,
+             return_residuals: bool = False):
+        from dew.nn.kernels.templates import bundles
+
+        del return_residuals
+        family = (bundles.INTERPRETED if interpret
+                  else bundles.of(generation.device_generation(), jnp.result_type(x)))
+        assert family is not None, "a bundle claims the device's family (`recurrence_chunk.selective_kernel`)"
+        return selective_scan(x, dt, A, B, C, D, state, starts, family=family, chunk=config.chunk,
+                              interpret=interpret, plan=(config.positions, config.resident)), None
+
+    def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
+        """The call's config on `target`: the forward's `CHUNK`, the backward's tokens a thread and residency
+        from its register model (`backward_plan`), past the token counts a compile found spilling
+        (`report.spilled`), each a step down to half its tokens."""
+        interpreted = ba.arguments.get("interpret", False)
+        facts = generation.gpu_target(generation.INTERPRETED_GENERATION) if interpreted else target
+        positions, resident = backward_plan(facts)
+        tiles = Tiles(CHUNK, positions, resident)
+        while report.spilled(self, ba, tiles) and tiles.positions > 1:
+            fewer = tiles.positions // 2
+            tiles = Tiles(CHUNK, fewer, backward_programs(backward_registers(fewer), facts))
+        return tiles
+
+    def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int | None:
+        """The backward thread's registers at the config's tokens (`backward_registers`)."""
+        return backward_registers(config.positions)
+
+    def register_budget(self, config: Tiles) -> int:
+        """A thread's share of a multiprocessor's registers at the config's residency."""
+        return resources.entry_registers(1, config.resident)
+
+    def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
+        """The forward's ring of two chunks of its operands, a program's channel block's `x` and `dt` and the
+        chunk's `B` and `C` rows, and its chunk of outputs."""
+        x, b = ba.arguments["x"], ba.arguments["B"]
+        block, states = block_scan.THREADS, b.shape[-1]
+        ring = 2 * config.chunk * (2 * block * x.dtype.itemsize + 2 * states * b.dtype.itemsize)
+        return ring + config.chunk * block * x.dtype.itemsize
+
+
+SELECTIVE = Selective()
+"""The selective scan's template launch (`Selective`)."""
