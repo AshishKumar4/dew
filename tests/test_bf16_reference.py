@@ -87,8 +87,22 @@ BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
 sized by `seeds_for` paired with Dew's gradients on the CPU."""
 
 
-@pytest.mark.parametrize("name", ["qwen2-tiny", "llama-tiny"])
+@pytest.mark.parametrize("name", ["llama-tiny"])
 def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does(name):
+    """A bfloat16 model's projection biases sum their gradients over every token of the batch
+    (`assert_biases_sum_as_torch`), Llama's."""
+    assert_biases_sum_as_torch(name)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=32)
+def test_qwen2s_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does():
+    """`assert_biases_sum_as_torch` over Qwen2, whose 64 declared seeds, each a batch's transformers backward
+    in bfloat16 and in float64, took 113 to 124 s in one task on armada: CI draws them in map tasks of 32
+    (ledger 3788)."""
+    assert_biases_sum_as_torch("qwen2-tiny")
+
+
+def assert_biases_sum_as_torch(name):
     """A bfloat16 model's projection biases sum their gradients over every token of the batch. Over
     drawn batches of 8192 tokens Dew's are on par with transformers' own bfloat16 gradients, which
     accumulate those sums at float32, from the float64 twin's of the same bfloat16 weights (check 1),
