@@ -769,6 +769,14 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     return parity, _LOGITS_PARITY
 
 
+def _as_run(dtype: str):
+    """How a parity runs Dew's decoder at `dtype`: a float32 run op by op, as the source's eager float32
+    rounds each op on its own, so two roundings of one computation sit at parity one (a compiled
+    program fuses what the source rounds apart); the float64 truth compiled, its rounding far below
+    what a parity measures."""
+    return (lambda function: function) if dtype == 'float32' else jax.jit
+
+
 def _users_arithmetic(dtype: str):
     """The precision the parities run Dew's decoder at (`logits_parity`, `gradient_parity`): a float32 run
     as a user's process runs it, its products summed in float32 (`precision.FP32_SUMS`), not in TF32 on a
@@ -795,7 +803,7 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
     def logits(dtype: str, network: nn.Module) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
         with _users_arithmetic(dtype):
-            return np.asarray(network.apply(held, ids), np.float64)
+            return np.asarray(_as_run(dtype)(network.apply)(held, ids), np.float64)
 
     ours = logits('float32', model)
     with jax.enable_x64(new_val=True):
@@ -870,7 +878,7 @@ def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFam
 
         with _users_arithmetic(dtype):
             return {path: np.asarray(leaf, np.float64) for path, leaf in
-                    flax_traverse.flatten_dict(jax.grad(loss)(held['params'])).items()}
+                    flax_traverse.flatten_dict(_as_run(dtype)(jax.grad(loss))(held['params'])).items()}
 
     ours = gradient('float32')
     with jax.enable_x64(new_val=True):
