@@ -1433,14 +1433,25 @@ def normalized_start(initial: tuple[jax.Array, jax.Array] | None, total: jax.Arr
     return expand(carried, acc0) * acc0 * expand(inverse(total), acc0)
 
 
+NORMALIZED = -1.0
+"""A split row's shift (`Split.shift`) where its sums are normalized over its natural denominator, a guarded
+walk's live row's (`split_residuals`), not at `2^-shift`: every shift a walk takes (`room`) is at least 0,
+so the sentinel needs no residual beside the shift (`normalized_rows`)."""
+
+
+def normalized_rows(shift: jax.Array) -> jax.Array:
+    """Which rows of a split's `shift` hold normalized sums (`NORMALIZED`)."""
+    return shift < 0
+
+
 def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
                     normalized: Callable[[], tuple[jax.Array, jax.Array, jax.Array]]
                     ) -> tuple[jax.Array, ...]:
     """A training walk's split sums for the backward and their shift: as the walk left them (shift 0
     unguarded), and on the guarded walk a live row's normalized ones, which the mainloop's pass
     `normalized()` gives (the other keys' weighted values, the anchor's weight and the other keys' weights
-    over the natural denominator, `normalized_terms`), with shift -1, which tells `split_delta` they are
-    normalized; the plain walk takes no such pass."""
+    over the natural denominator, `normalized_terms`), at the shift `NORMALIZED`, which tells `split_delta`
+    they are normalized; the plain walk takes no such pass."""
     sums = split.acc, own, others_total, jnp.zeros_like(own)
     if split.guard is None:
         return sums
@@ -1448,7 +1459,7 @@ def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
     # The pass only where some row is live: a guarded program none of whose rows overflowed takes none.
     terms = jax.lax.cond(jnp.max(live.astype(jnp.int32)) > 0, normalized,
                          lambda: (jnp.zeros_like(split.acc), jnp.zeros_like(own), jnp.zeros_like(own)))
-    fresh = (*terms, jnp.full_like(own, -1.0))
+    fresh = (*terms, jnp.full_like(own, NORMALIZED))
 
     def chosen(new, old):
         return jnp.where(expand(live, old) if old.ndim > own.ndim else live, new, old)

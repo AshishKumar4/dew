@@ -27,6 +27,7 @@ from dew.nn.kernels.templates.attention_algebra import (
     finite,
     hooked,
     inverse,
+    normalized_rows,
     power2,
     split_output,
     summed_products,
@@ -212,11 +213,11 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
     `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
     little beside the anchor are not lost from a total; each query takes the one nearer its D. The split
-    sums are at each row's `2^-shift` (`room`), and `total` is taken there; a row whose shift is negative
-    holds normalized sums (`split_residuals`), its total 1. Each sum is taken over the total before its
-    product with dO, as the reference's output is, so none overflows where the sums are near fp32's
-    largest (a state's)."""
-    over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
+    sums are at each row's `2^-shift` (`room`), and `total` is taken there; a row at the shift `NORMALIZED`
+    holds normalized sums (`split_residuals`, `normalized_rows`), its total 1. Each sum is taken over the
+    total before its product with dO, as the reference's output is, so none overflows where the sums are
+    near fp32's largest (a state's)."""
+    over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
@@ -235,7 +236,7 @@ def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift:
     """The keys' share of a query's weights from a training forward's split sums (`split_delta`'s), the
     initial state's the rest: 0 exactly where no key weighs anything (`dq_finish`'s mass, for a backward
     with no dQ pass)."""
-    over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
+    over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     return (own + others_total) * over
 
 
