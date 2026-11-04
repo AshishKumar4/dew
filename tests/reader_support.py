@@ -1,5 +1,6 @@
 """What an exact reader owes: a resumed reader reads on where the uninterrupted one does, and a write
-that keeps a file's size changes its identity, so a position saved before the write is refused after it."""
+that keeps a file's size changes its identity, so a position saved before the write is refused after it;
+and the position a reader saves, which another restores, reporting what changed."""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -57,3 +58,23 @@ def assert_resumes_where_it_stopped(opened: Callable, read: Callable, stopped: i
     finally:
         resumed.close()
     return expected, saved
+
+
+def saved_after_one(opened: Callable) -> bytes:
+    """The position a reader `opened()` makes saves after its first batch, the reader then closed."""
+    reader = opened()
+    try:
+        next(reader)
+        return reader.get_state()
+    finally:
+        reader.close()
+
+
+def resumed_changes(reader, position: bytes) -> tuple[str, ...]:
+    """What `reader`, restoring `position`, reports changed of the environment its plan saved under
+    (`manifest_changes`), the reader then closed; a refused position raises."""
+    try:
+        reader.set_state(position)
+        return reader.manifest_changes
+    finally:
+        reader.close()
