@@ -1,7 +1,6 @@
 """Check 1 of a server's draws against a full forward of its decoder, shared by the serving tests."""
 
 import dataclasses
-import functools
 import itertools
 from collections.abc import Mapping, Sequence
 
@@ -45,28 +44,17 @@ def drawn_scores(forward, weights: Variables, prompt: np.ndarray, tokens: np.nda
     tokens and their `held` fields) after `prompt` `[1, P]` and the tokens drawn before it: with
     `per_step`, from a forward of its own over the prompt and those tokens, at the width the step that
     drew it reads (ledger 1543: a step's reference at the shapes the step computes); else from one
-    forward over the whole row, as a float64 truth, whose products round alike at every shape. Every
-    step's forward, each at its own width, runs in one program a request's shapes (`_scores`), where a call
-    a step and a draw each took seconds of a hybrid site's 256 draws (M43)."""
-    held = {name: jnp.asarray(value) for name, value in held.items()}
-    return np.asarray(_scores(forward, per_step)(weights, jnp.asarray(prompt), jnp.asarray(tokens), held))
+    forward over the whole row, as a float64 truth, whose products round alike at every shape."""
+    def at(step: int) -> jax.Array:
+        tail = np.full((1, step), -1, np.int32)
+        logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :step]], 1)),
+                         {name: jnp.asarray(np.concatenate([value, tail], 1))
+                          for name, value in held.items()})
+        return logits[0, prompt.shape[1] - 1:]
 
-
-@functools.cache
-def _scores(forward, per_step: bool):
-    """`drawn_scores`' program for `forward`: compiled once a request's shapes, every draw of them its."""
-    @jax.jit
-    def scores(weights, prompt, tokens, held):
-        def at(step: int) -> jax.Array:
-            tail = jnp.full((1, step), -1, jnp.int32)
-            logits = forward(weights, jnp.concatenate([prompt, tokens[None, :step]], 1),
-                             {name: jnp.concatenate([value, tail], 1) for name, value in held.items()})
-            return logits[0, prompt.shape[1] - 1:]
-
-        steps = tokens.shape[0]
-        read = jnp.stack([at(step)[step] for step in range(steps)]) if per_step else at(steps - 1)
-        return jnp.take_along_axis(read, tokens[:, None], -1)[:, 0]
-    return scores
+    steps = len(tokens)
+    read = jnp.stack([at(step)[step] for step in range(steps)]) if per_step else at(steps - 1)
+    return np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0])
 
 
 def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
