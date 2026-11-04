@@ -666,7 +666,7 @@ def mode_layout_rows(args) -> dict:
     import layout_parity as tool
 
     case, _ = tool.model_case("dense", "float32", {}, {})
-    _, data, _, _, _ = tool.compiled_step(case, {"data": jax.device_count()}, tool.drawn_batch(case, 0))
+    _, data, _, _, _ = tool.compiled_step(case, {"fsdp": jax.device_count()}, tool.drawn_batch(case, 0))
     return {"rows": [int(row) for row in as_numpy(data[EXAMPLE_ROWS])], "batch": case.batch_size}
 
 
