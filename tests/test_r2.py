@@ -11,6 +11,11 @@ import pytest
 from remote_cache import r2
 from tool_support import load
 
+SENDERS = pytest.mark.parametrize("send", [r2.urllib_send, r2.KeptSend()],
+                                  ids=["a connection a request", "kept"])
+"""Each sender the Store sends by: the standard library's, a connection a request, and one that keeps a
+connection a thread (`KeptSend`)."""
+
 
 def test_an_object_round_trips_a_miss_is_none_and_a_listing_pages_to_its_end(cache_worker):
     url, _, _ = cache_worker
@@ -75,7 +80,8 @@ def test_what_the_contract_refuses_never_reaches_the_worker(cache_worker):
     assert seen == [] and stored == {}
 
 
-def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_head_has_no_body():
+@SENDERS
+def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_head_has_no_body(send):
     """A Worker whose answer stops short, the connection closed before the length it announced, gave no
     object: a read of it, whole or at once, is `Unavailable`, which a caller counts as a failure, never a
     shorter object. A HEAD's Content-Length is the object's, and its answer has no body to read."""
@@ -97,7 +103,8 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_he
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Short)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10)
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10,
+                         send=send)
         with pytest.raises(r2.Unavailable):
             store.get("records/short")
         with pytest.raises(r2.Unavailable), store.request("GET", "records/short") as reply:
@@ -108,7 +115,8 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_he
         server.shutdown()
 
 
-def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline():
+@SENDERS
+def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline(send):
     """A Worker that sends its answer's body a few bytes at a time, each within the socket's timeout, gave
     no object in time: its read is `Unavailable` at `timeout` plus its length at `MIN_RATE`, each receive
     waiting at most what is left of that, never after the whole trickle's 12.8 s (2026-11-03: a test cache's
@@ -133,7 +141,8 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=1)
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=1,
+                         send=send)
         began = time.monotonic()
         with pytest.raises(r2.Unavailable):
             store.get("records/slow")
@@ -156,3 +165,70 @@ def test_the_records_one_thread_reads_in_turn_share_its_connections_to_the_worke
     assert [ci.recorded(f"records/{index}", "token") for index in range(10)] == [
         {"index": index} for index in range(10)]
     assert len(seen) == 10 and len(seen.connections) == 4
+
+
+def served(handler: type[http.server.BaseHTTPRequestHandler]) -> http.server.ThreadingHTTPServer:
+    """A server of `handler`'s answers on a port of its own, each connection in a daemon thread."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_a_kept_connection_the_worker_closes_after_an_answer_reads_that_answer_whole():
+    """An answer the Worker says it closes its connection after (Connection: close) is read whole on a
+    connection `KeptSend` keeps, which then opens a new one for the next request."""
+
+    class Closing(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            body = self.path.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = served(Closing)
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10,
+                         send=r2.KeptSend())
+        assert [store.get(f"records/{name}") for name in ("a", "b")] == [b"/records/a", b"/records/b"]
+    finally:
+        server.shutdown()
+
+
+def test_a_miss_whose_body_trickles_is_none_within_the_kept_connections_drain():
+    """A miss (a 404) whose few bytes of body the Worker sends slowly is None as soon as it is answered: a
+    kept connection reads such a body off for its next request at most `DRAIN_SECONDS`, then closes it,
+    never after the whole trickle's 12.8 s."""
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(404)
+            self.send_header("Content-Length", str(64 * 64))
+            self.end_headers()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                for _ in range(64):
+                    self.wfile.write(b"x" * 64)
+                    self.wfile.flush()
+                    time.sleep(0.2)
+
+    server = served(Trickle)
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10,
+                         send=r2.KeptSend())
+        began = time.monotonic()
+        assert store.get("records/missing") is None
+        assert time.monotonic() - began < r2.DRAIN_SECONDS + 2
+    finally:
+        server.shutdown()
