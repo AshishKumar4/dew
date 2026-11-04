@@ -584,14 +584,16 @@ def paired_projections(x: jax.Array, first: jax.Array | Layered, second: jax.Arr
     the rows once for both, and the call hands the two products on apart where its launch takes none
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
-    outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). A stack's layer (`Layered`) is
-    multiplied apart, the template pairing no stacked layer."""
+    outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). Both products take one compute dtype,
+    the rows' and both matrices' however a matrix is held; a stack's layer (`Layered`) is multiplied
+    apart, the template pairing no stacked layer."""
+    compute = canonicalize_dtype(x, *(kernel.stack if isinstance(kernel, Layered) else kernel
+                                      for kernel in (first, second)), dtype=dtype)
     if isinstance(first, Layered) or isinstance(second, Layered):
-        return (expert_projection(x, first, group_sizes, dtype, implementation, precision),
-                expert_projection(x, second, group_sizes, dtype, implementation, precision))
+        return (expert_projection(x, first, group_sizes, compute, implementation, precision),
+                expert_projection(x, second, group_sizes, compute, implementation, precision))
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
-    compute = canonicalize_dtype(x, first, second, dtype=dtype)
     with _named(implementation):
         return template.gemm(x, first, group_sizes, compute=compute, out_dtype=compute,
                              out_dtypes=(compute, compute), precision=precision, paired=second)

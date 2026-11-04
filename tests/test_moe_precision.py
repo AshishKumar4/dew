@@ -27,7 +27,7 @@ from dew.nn.activations import exact_gelu, gated_product, swiglu_clamped
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.generation import chosen as kernel_choices
-from dew.nn.moe import EXPERT_AXES, ExpertMLP, expert_dispatch, expert_projection
+from dew.nn.moe import EXPERT_AXES, ExpertMLP, Layered, expert_dispatch, expert_projection, paired_projections
 from dew.training import MeshSpec
 from tools import grouped_oracle as oracle
 
@@ -539,6 +539,21 @@ def test_a_layers_gate_and_up_as_one_paired_product_hold_check_1_against_the_two
     label = f"paired gate and up, {activation}{'' if limit is None else ' clamped'}"
     assert_as_exact(jax.jit(with_gradients(paired)), jax.jit(with_gradients(apart)), draw, label, seeds=8,
                     truth_fn=jax.jit(with_gradients(truth)))
+
+
+def test_paired_projections_take_one_compute_dtype_however_a_matrix_is_held():
+    """The gate's and up projection's products take the rows' and both matrices' one compute dtype
+    (`paired_projections`), a matrix read in place from a bank (`Layered`, multiplied apart) as one held
+    whole: a bf16 gate beside a float32 up projection gives two float32 products either way, where each
+    product promoting alone gave the bf16 gate's a bf16 one."""
+    rng = np.random.default_rng(3699)
+    x = jnp.asarray(rng.normal(size=(6, 8)), jnp.bfloat16)
+    gate = jnp.asarray(rng.normal(size=(2, 8, 4)), jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(2, 8, 4)), jnp.float32)
+    sizes = jnp.asarray([4, 2], jnp.int32)
+    for first in (gate, Layered(gate[None], jnp.asarray(0))):
+        products = paired_projections(x, first, up, sizes, None, 'auto', None)
+        assert [product.dtype for product in products] == [jnp.float32, jnp.float32]
 
 
 def test_a_bf16_combine_weighs_its_experts_in_fp32_and_rounds_once():

@@ -753,7 +753,13 @@ def _functional_experts() -> type:
 
     from dew.interop.parts import gated_activation
     from dew.nn.activations import gated_product
-    from dew.nn.moe import EXPERT_AXES, expert_compute_dtype, expert_dispatch, expert_projection
+    from dew.nn.moe import (
+        EXPERT_AXES,
+        expert_compute_dtype,
+        expert_dispatch,
+        expert_projection,
+        paired_projections,
+    )
 
     class FunctionalExperts(torch.nn.Module):
         """Routed experts beside identity experts at static shapes, through Dew's grouped expert
@@ -795,10 +801,10 @@ def _functional_experts() -> type:
                 compute = expert_compute_dtype(x, *kernels, dtype=None)
 
                 def project(tokens, sizes, _ids, held):
-                    def linear(rows, kernel):
-                        return jnp.asarray(expert_projection(rows, kernel, sizes, compute, "xla", None))
-                    gated = gated_product(self.activation)(linear(tokens, held[0]), linear(tokens, held[1]))
-                    return linear(gated, held[2])
+                    # The gate's and the up projection's products of the same rows, one paired product.
+                    gate, up = paired_projections(tokens, held[0], held[1], sizes, compute, "xla", None)
+                    gated = gated_product(self.activation)(gate, up)
+                    return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None))
 
                 slots = expert_dispatch(project, x, jnp.where(identity, self.routed, index), kernels,
                                         tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj",
