@@ -526,8 +526,10 @@ def test_packed_projections_serve_the_models_numbers(name):
     logits moved by 1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5
     on another CPU), so the drawn tokens are the model's and the logits its
     bits or as exact as them. A bidirectional decoder packs as a causal one does
-    and serves no decode step, so its logits alone are judged."""
-    source, read = loaded(name), reads(name, "float32")
+    and serves no decode step, so its logits alone are judged. The greedy decodes
+    run as the check runs its arms (`summed_as_run`), whose programs they share,
+    over the rows the checkpoint is read over (ledger 3868)."""
+    source, rows = loaded(name), tokens(name)
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
     widths = flatten_dict(variables["params"])
@@ -546,8 +548,9 @@ def test_packed_projections_serve_the_models_numbers(name):
         return
     call = (("decode", True),)
     own = _programs(name, "model", call)
-    _, drawn, _ = _greedy(own, variables, read.tokens)
-    _, packed_drawn, _ = _greedy(own, packed, read.tokens)
+    with summed_as_run():
+        _, drawn, _ = _greedy(own, variables, rows)
+        _, packed_drawn, _ = _greedy(own, packed, rows)
     same(packed_drawn, drawn)
     reference, truth = _reference(name, call)
     assert_as_exact(_scored(own, packed), reference, _continued(model), label, seeds=CACHED_SEEDS,
