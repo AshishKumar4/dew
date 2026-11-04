@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, integer, json_value, record, set_added, without_removed
+from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -192,6 +192,13 @@ class StepIdentity:
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
 
+    @property
+    def stated(self) -> bool:
+        """Whether the identity states what the step computes: declared, or configured (a frozen step's
+        fields, a configured step's factory and values). A function's is its name alone, and what it
+        computes is its code, which only its modules' bytes name (`Plan.check`)."""
+        return self.declared is not None or self.config != self.name
+
     def keyable(self, *, function: bool, external: bool) -> bool:
         """Whether a cache can key what the step computes: a stable identity,
         declared wherever the step is a function or its code is outside Dew,
@@ -312,7 +319,9 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
     module's bytes, for the steps a memory read ran and then the plan's own.
     A step states a change to what it computes in its configuration or
     declared identity; its modules' bytes change with any edit to their
-    files, as Dew's revision does with any edit to Dew."""
+    files, as Dew's revision does with any edit to Dew. A function outside
+    Dew states none, so its modules' bytes are what it computes, which an
+    exact resume holds (`Plan.check`)."""
     steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
     return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
             "modules": [step["modules"] for step in steps]}
@@ -873,7 +882,8 @@ class Plan:
     ) -> tuple[str, ...]:
         """Refuse a saved plan whose rows this plan does not make again: another
         version, order, derived order fact, per-share topology or semantic
-        manifest (`Manifest.semantic`). A changed environment
+        manifest (`Manifest.semantic`), or, resumed exactly, a step outside Dew
+        whose code changed and that declares no identity. A changed environment
         (`Manifest.environment`) is returned and warned of, and refused for a
         per-share plan."""
         current = self.record()
@@ -944,6 +954,19 @@ class Plan:
         # The plan's steps state what they compute (`Manifest.semantic`), so a resume of an unchanged plan
         # and topology reads on under another Dew, a global order's or a share's, the change reported.
         changes = _changed(saved_environment, environment)
+        if resume != "non-exact" and edited is None:
+            # A step outside Dew that declares no identity is what its code computes: its module's bytes
+            # changed, it may make other rows from the same records (row 3938).
+            saved_modules = listed(saved_environment.get("modules", []), "saved data modules",
+                                   read=json_value, what="each step's module digests")
+            rewritten = [step.name for step, before in zip(
+                (*self.manifest.ran, *self.manifest.steps), saved_modules, strict=False)
+                if not step.stated and step.modules and before != list(step.modules)]
+            if rewritten:
+                raise ValueError(
+                    f"the code of data step {', '.join(rewritten)} changed since the position was saved, "
+                    "and it declares no identity saying it computes the same; declare one "
+                    "(identity='name@version') to resume exactly, or resume='non-exact'")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
