@@ -265,6 +265,19 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped_and_keeps_what_it_trai
         run.override({"trainer.steps": 8, **trained}).prepare().train("stopped")
 
 
+def test_a_dreamer_rollout_begins_its_live_state_as_its_checkpoint_restores_it(tmp_path):
+    """A DreamerV3 rollout over the race begins its environments' state holding each leaf's dtype strongly,
+    as a run resumed from its checkpoint restores it, so the resumed run lowers its rollout to the program
+    the run that never stopped compiled and reads it from the compilation cache (ledger 3451): the race's
+    `ramp`, a Python number its reset folds in, was held weakly, and each resumed run compiled it again."""
+    run, objective, _ = dreamer(tmp_path)
+    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
+                             length=8, train_ratio=16.0, prefill=8, checkpointed_replay=True)
+    fitted(run, objective, rollout, 1)
+    assert [path for path, leaf in jax.tree_util.tree_leaves_with_path(rollout.saved())
+            if getattr(leaf, "weak_type", False)] == []
+
+
 def test_a_dreamer_run_resumed_in_a_later_phase_trains_on_and_at_another_horizon_is_refused(tmp_path):
     """A DreamerV3 run trained to its second update and resumed under its name in a later phase of its
     training, drawing longer windows at a lower entropy (SkyDreamer's last phases), trains on to its fourth:
