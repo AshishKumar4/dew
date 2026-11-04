@@ -570,9 +570,12 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
-    unit, step = family.column_unit(jnp.bfloat16), min(family.depths(jnp.bfloat16))
 
     def takes(form: str) -> bool:
+        # Each form at its operands' units: an FP8 product's column unit and narrowest step are FP8's (128
+        # elements a 128-byte swizzle), the others' bf16's.
+        dtype = jnp.float8_e4m3fn if form in FP8_FORMS else jnp.bfloat16
+        unit, step = family.column_unit(dtype), min(family.depths(dtype))
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
