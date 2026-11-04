@@ -11,7 +11,10 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew.checkpoints import frozen_entries, is_uri
+from dew._records import text
+from dew.checkpoints import frozen_entries, is_uri, step_artifact
+from dew.interop.saved_sources import step_records
+from dew.registry import objectives
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
@@ -25,7 +28,9 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
 
     `directory` is one step directory (`Checkpoints.path(step)`). The artifact
     holds it under its own name, every file at the run's root (its `run.json`,
-    and what the run wrote beside it, a decision run's calibrated task) and the
+    and what the run wrote beside it, a decision run's calibrated task), those
+    its task keeps by the step (`SavedRunTask.step_records`: a decision run's
+    calibration fitted on it), and the
     `dew.checkpoints.FROZEN_STORE` entries the step records, each at its place
     in the run directory, so a download is a run directory `from_run` and
     `Checkpoints.restore` read. The artifact carries 'latest' and `aliases`;
@@ -47,18 +52,23 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     artifact = wandb.Artifact(name=name, type="model")
     path = epath.Path(directory)
     run = path.parent
-    files = sorted((entry for entry in run.iterdir() if entry.is_file()), key=lambda entry: entry.name)
+    # The run's root files, and those its task keeps by the step, by their places in the run.
+    declared = step_artifact(directory)
+    kept = () if not isinstance(declared, dict) or "objective" not in declared else step_records(
+        objectives[text(declared["objective"], "objective")], str(run), int(path.name))
+    files = [*sorted((entry for entry in run.iterdir() if entry.is_file()), key=lambda entry: entry.name),
+             *kept]
     entries = frozen_entries(directory)
     if is_uri(directory):
         artifact.add_reference(str(path), name=path.name)
         for file in files:
-            artifact.add_reference(str(file), name=file.name)
+            artifact.add_reference(str(file), name=str(file).removeprefix(f"{run}/"))
         for entry in entries:
             artifact.add_reference(str(run / entry), name=entry)
     else:
         artifact.add_dir(directory, name=path.name)
         for file in files:
-            artifact.add_file(str(file), name=file.name)
+            artifact.add_file(str(file), name=str(file).removeprefix(f"{run}/"))
         for entry in entries:
             artifact.add_dir(str(run / entry), name=entry)
     logged = tracker.run.log_artifact(artifact, aliases=["latest", *aliases])

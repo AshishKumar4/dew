@@ -746,10 +746,15 @@ class TrainerConfig:
         with self.checkpoints(self.name) as checkpoints:
             return checkpoints.latest is not None
 
+    def directory(self, name: str) -> str:
+        """The directory of the run `name`'s checkpoints and record, in `checkpoint_dir`."""
+        return os.path.join(self.checkpoint_dir, name)
+
     def checkpoints(self, name: str) -> Checkpoints:
-        """The checkpoints of the run `name` in `checkpoint_dir`, keeping `keep`, with its local tier
-        under `name` in `local_directory`, so runs sharing a local disk resume each only its own."""
-        return Checkpoints(os.path.join(self.checkpoint_dir, name), keep=self.keep,
+        """The checkpoints of the run `name` in `checkpoint_dir` (`directory`), keeping `keep`, with its
+        local tier under `name` in `local_directory`, so runs sharing a local disk resume each only its
+        own."""
+        return Checkpoints(self.directory(name), keep=self.keep,
                            local_directory=None if self.local_directory is None else os.path.join(
                                self.local_directory, name), local_every=self.local_every)
 
@@ -990,22 +995,6 @@ def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -
                 if name not in resumable}
 
     return kept(before) == kept(now)
-
-
-def _at(run: "RunConfig", path: str) -> str | int | None:
-    """The field of `run` at the dotted `path` (`RunConfig.BUILT`), a name, a step or None."""
-    *owners, name = path.split(".")
-    holder: DataclassInstance = run
-    for owner in owners:
-        holder = getattr(holder, owner)
-    return getattr(holder, name)
-
-
-def _with[T: "DataclassInstance"](holder: T, path: str, field: str | int | None) -> T:
-    """`holder` with its field at the dotted `path` replaced by `field`."""
-    name, _, rest = path.partition(".")
-    inner = field if not rest else _with(getattr(holder, name), rest, field)
-    return dataclasses.replace(holder, **{name: inner})
 
 
 @contextlib.contextmanager
@@ -1263,6 +1252,15 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     if not isinstance(held, dict):
         raise KeyError(f"{key} holds {held!r}, not a record of fields")
     return held
+
+
+def _recorded_at(config: "RunConfig", path: str) -> JSON:
+    """The value `config`'s record holds at the dotted `path` (`_placed`), as `override` writes it."""
+    *groups, field = _placed(config, path)[0]
+    node = config._fields_record()
+    for group in groups:
+        node = _within(node, group)
+    return node.get(field)
 
 
 def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
@@ -1563,12 +1561,10 @@ class RunConfig:
         keeps every shape, so it would otherwise continue the old weights under new semantics. The
         saved fields are read back as this class reads them (`from_dict`), so a field the record
         predates takes its default."""
-        named = registry.class_record(saved)
-        if named is None or registry.runs[named[0]] is not type(self):
+        recorded = self._saved_as(saved)
+        if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        recorded = type(self).from_dict({name: value for name, value in named[1].items()
-                                         if name not in _CHAINS})
         before, now = recorded._fields_record(), self._fields_record()
         changed = sorted(name for name in now.keys() | before.keys()
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
@@ -1581,6 +1577,21 @@ class RunConfig:
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
+
+    def _saved_as(self, saved: Mapping[str, object]) -> Self | None:
+        """The saved run whose record is `saved` read as this class reads it (`from_dict`), a field the
+        record predates at its default and its chains apart; None where it records another class."""
+        named = registry.class_record(saved)
+        if named is None or registry.runs[named[0]] is not type(self):
+            return None
+        return type(self).from_dict({name: value for name, value in named[1].items() if name not in _CHAINS})
+
+    @staticmethod
+    def _saved_record(directory: str) -> Mapping[str, object] | None:
+        """The record of the saved run in its checkpoints' `directory`, read as every earlier shape of a
+        saved run is (`earlier_run`); None where none was saved."""
+        saved = epath.Path(directory) / RUN_FILE
+        return earlier_run(json.loads(saved.read_text())) if saved.exists() else None
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1700,21 +1711,14 @@ class RunConfig:
         (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
         build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _at(self, path) is None]
+        unset = [path for path in self.BUILT if _recorded_at(self, path) is None]
         if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
             return self
-        saved = epath.Path(trainer.checkpoint_dir) / trainer.name / RUN_FILE
-        if not saved.exists():
+        saved = self._saved_record(trainer.directory(trainer.name))
+        recorded = None if saved is None else self._saved_as(saved)
+        if recorded is None:
             return self
-        named = registry.class_record(earlier_run(json.loads(saved.read_text())))
-        if named is None or registry.runs[named[0]] is not type(self):
-            return self
-        recorded = type(self).from_dict({name: value for name, value in named[1].items()
-                                         if name not in _CHAINS})
-        run = self
-        for path in unset:
-            run = _with(run, path, _at(recorded, path))
-        return run
+        return self.override({path: _recorded_at(recorded, path) for path in unset})
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
@@ -2120,10 +2124,9 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
-            saved = epath.Path(checkpoints.directory) / RUN_FILE
-            if checkpoints.resumed(resume) is not None and saved.exists():
-                record = json.loads(saved.read_text())
-                self.check_resume(earlier_run(record))
+            if checkpoints.resumed(resume) is not None and (
+                    record := self._saved_record(checkpoints.directory)) is not None:
+                self.check_resume(record)
                 resumed["record"] = record
 
         def check_data() -> None:

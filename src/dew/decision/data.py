@@ -282,9 +282,6 @@ class ParseExample(pygrain.MapTransform):
     its `GroupedExamples`, or a row that holds either already as it is. A Grain transform, so a chain
     that parses its rows by it is recorded and read back (`dew.data.records`)."""
 
-    def __call__(self, row: Batch) -> Batch:
-        return self.map(row)
-
     def map(self, element: Batch) -> Batch:
         held = element.get("example")
         if isinstance(held, (Example, GroupedExamples)):
@@ -312,7 +309,7 @@ class ParseTable:
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
         if ("state" in row and "questions" in row) or "examples" in row:
-            return ParseExample()(row)
+            return ParseExample().map(row)
         label = row[self.label]
         if not isinstance(label, (str, int, float, bool)):
             raise ValueError(f"decision label {self.label} must name an option")
@@ -517,10 +514,10 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
         kept.append(weight)
     if not training:
         raise ValueError(f"no corpus of {root_url} has a positive weight")
-    # Each corpus states the mixture it is read in: its positive weights and the manifest that made
-    # it, which a run's summary reports (`DecisionRunConfig`).
+    # Each corpus states the mixture it is read in: its positive weights and where the manifest that made
+    # it is read, which a run's summary reads it from (`made_by`), a few words a corpus, not its copy.
     made = {"mixture_weights": {name: weight for name, weight in sorted(shares.items()) if weight > 0},
-            "mixture_made": dict(stated)}
+            "mixture_root": root_url, **({} if descriptor is None else {"mixture_descriptor": descriptor})}
     training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
                 for child in training]
     if order not in ("seeded", "schedule"):
@@ -547,6 +544,17 @@ def corpus(root_url: str, name: str, split: Literal["train", "held"] = "held",
     this, whatever its weight."""
     stated, pinned = _stated(root_url, descriptor)
     return _corpus(root_url, stated, pinned, name, split)
+
+
+def made_by(facts: Mapping[str, object]) -> Mapping[str, object]:
+    """The manifest a decision mixture's corpora state they were made by (`mixture`): read again from
+    the root and descriptor they name, or the copy a chain recorded before they named them."""
+    root = facts.get("mixture_root")
+    if root is None:
+        return record(facts.get("mixture_made", {}), "mixture_made")
+    descriptor = facts.get("mixture_descriptor")
+    return _stated(_records.text(root, "mixture_root"),
+                   None if descriptor is None else _records.text(descriptor, "mixture_descriptor"))[0]
 
 
 def _stated(root_url: str, descriptor: str | None) -> tuple[Mapping[str, object], Mapping[str, object]]:

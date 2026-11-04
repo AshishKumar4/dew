@@ -345,7 +345,13 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     reader = loader(saved)
     states(next(reader) for _ in range(2))
     position = reader.get_state()
-    for rebuilt in (decode(json.loads(json.dumps(encode(saved)))), mixture(str(root), order="schedule")[0]):
+    # A mixture read before its corpus order was seeded wrote no selection seed in its plan's order; one
+    # read in the schedule writes none either, so this position is one such a run saved (row 3875).
+    assert "selection_seed" not in json.dumps(json.loads(position))
+    # Its record names where each corpus's manifest is read, not a copy of it a corpus (row 3884).
+    written = json.dumps(encode(saved))
+    assert "mixture_made" not in written and written.count('"mixture_root"') == 2
+    for rebuilt in (decode(json.loads(written)), mixture(str(root), order="schedule")[0]):
         again = loader(rebuilt)
         again.set_state(position)
         assert states(next(again) for _ in range(4)) == whole[8:]

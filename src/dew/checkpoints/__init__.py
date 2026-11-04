@@ -307,6 +307,16 @@ def _kept(step: int, metrics: Mapping[str, float], custom: Mapping) -> Kept:
                 rankings=copy.deepcopy(rules))
 
 
+def step_artifact(step_directory: str) -> JSON:
+    """The inference declaration the step at `step_directory` records (`Checkpoints.artifact`), Orbax
+    reading the step's metadata alone, opening no manager; None where it records none or is no Orbax
+    step."""
+    if not (epath.Path(step_directory) / "_CHECKPOINT_METADATA").exists():
+        return None
+    custom = ocp.metadata.get_step_metadata(step_directory).custom_metadata or {}
+    return json_value(custom.get("artifact"), "artifact")
+
+
 def frozen_entries(step_directory: str) -> list[str]:
     """The `FROZEN_STORE` entries the step at `step_directory` records,
     relative to its run directory, which `dew.io.publish` carries beside it.
