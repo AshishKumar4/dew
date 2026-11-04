@@ -665,19 +665,25 @@ evidence on the template; their reference arm in a 16-bit call is open)."""
 
 
 def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The chunked op on the mainloop, each hook combination it takes, its output and final memory on par with
-    the recurrence a token at a time's from float64 over the site's declared draws (check 1), as
-    test_recurrence_chunk holds the portable math; a call the template refuses (a launch's registers past a
-    thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`)."""
+    """The chunked op on the mainloop under the accurate forms, each hook combination it takes, its output and
+    final memory on par with the recurrence a token at a time's from float64 over the site's declared draws
+    (check 1), as test_recurrence_chunk holds the portable math; a call the template refuses (a launch's
+    registers past a thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`).
+    The draws are fp32, whose products the accurate forms take in three bf16 parts, an fp32 product's
+    accuracy, as the fp32 recurrence's; under the fast forms an fp32 call's are two (`mainloop.FAST_PARTS`),
+    held to recorded fla-core instead (`the_mosaic_forward_is_as_exact_as_its_reference`): run under the
+    fast forms, the run's default since 82e5eabd30, this check put the template 42 to 83 times the fp32
+    recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
     (sample,) = hooked_draw(hooks, packed, 0)
-    if not taken(sample, hooks):
+    if not formed('accurate', taken)(sample, hooks):
         with pytest.raises(REFUSED):
-            jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
+            formed('accurate', jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(functools.partial(chunk_on, 'mosaic_gpu', hooks))
+    dew = jax.jit(formed('accurate', functools.partial(chunk_on, 'mosaic_gpu', hooks)))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
-                    f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])
+                    f'the mosaic forward, {hooks} packed={packed} under the accurate forms',
+                    seeds=HOOK_SEEDS[hooks, packed])
 
 
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
