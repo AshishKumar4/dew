@@ -566,7 +566,7 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
     rows cast by the FP8 block cast, both sides' codes multiplied exactly and
     summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
-    bf16 value) and both rows' scales applied after. The widened codes are
+    bf16 value) and both rows' scales applied after (`_scaled`). The widened codes are
     held apart from the product (an optimization barrier), so XLA's GPU
     compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
     keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
@@ -581,7 +581,18 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     held_codes, held_rows = jax.lax.optimization_barrier(
         (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
     product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
-    return product * scales * row_scales.T
+    return _scaled(product, scales, row_scales.T)
+
+
+def _scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax.Array:
+    """`product` times two scales, each entry in the order whose intermediate is a normal float32: an
+    input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
+    the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
+    way (ledger 2715), so no one order holds both ends; the result overflows only where the product does."""
+    tiny = jnp.finfo(product.dtype).tiny
+    once = product * first
+    kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (product == 0))
+    return jnp.where(kept, once * second, product * second * first)
 
 
 def _frozen_fp8_value(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
