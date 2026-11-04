@@ -686,6 +686,38 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
                     seeds=HOOK_SEEDS[hooks, packed])
 
 
+HOOK_CELLS = [(hooks, packed) for hooks in TAKEN for packed in (False, True)]
+"""The mainloop's hook cells, each hook combination over one sequence and packed documents."""
+
+LONG_HOOK_CELLS = {(FORMED[1], True), (FORMED[4], True)}
+"""The hook cells past two minutes interpreted, each a check-1 site of its own in map tasks (`check1_shards`):
+the step write gate's packed documents (128 declared seeds, 384 s whole) and the rated scan's (64, 172 s),
+hooks-accurate at 136c07a5a."""
+
+
+@pytest.mark.parametrize(('hooks', 'packed'), [cell for cell in HOOK_CELLS if cell not in LONG_HOOK_CELLS])
+def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted(hooks, packed):
+    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` interpreted off a
+    GPU, check 1 from float64 at each cell's declared seeds: the arithmetic the GPU flow alone judged, which
+    the CPU suite took no accuracy check of (its fast-form numbers 42 to 83 times the fp32 recurrence's
+    distance reached main unseen, row 3962)."""
+    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=32)
+def test_the_step_gated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
+    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the step write
+    gate over packed documents (`LONG_HOOK_CELLS`)."""
+    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[1], packed=True)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=32)
+def test_the_rated_hook_over_packed_documents_is_as_exact_as_the_recurrence_interpreted():
+    """`every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token` at the rated scan
+    over packed documents (`LONG_HOOK_CELLS`)."""
+    every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(FORMED[4], packed=True)
+
+
 RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
                    'kimi-linear-kda, no floor': (32, 32, 128, 128, True),
                    'nemotron-h-4b-ssd': (8, 96, 128, 80, False),
