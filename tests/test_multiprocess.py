@@ -556,7 +556,8 @@ def test_the_layout_tools_step_reads_each_row_at_its_place_among_the_examples_on
     `fit` would (`step_batch`): each row's place among the step's examples is its place in that batch
     on every process, as on its one-device reference, so a recording arm draws what the reference
     draws; marked as a share of the mesh's, process 1's rows took other places (row 3832's review)."""
-    pool = run_pool("layout_rows", tmp_path / "pool", 2, fsdp_size=1)
+    script = Path(__file__).with_name("layout_rows_worker.py")
+    pool = run_pool("layout_rows", tmp_path / "pool", 2, script=script)
     for report in pool:
         assert report["rows"] == list(range(report["batch"])), report
 
