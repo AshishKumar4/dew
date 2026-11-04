@@ -303,7 +303,31 @@ def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a
     from map_judge import DRAWS, POOL, RECORDS
 
     assert (ci.DRAWS, ci.RECORDS, ci.POOL, ci.REDRAW) == (DRAWS, RECORDS, POOL, REDRAW)
-    out = site_checkout(tmp_path, GATED)
+    out = site_checkout(tmp_path, f"""import sys
+from pathlib import Path
+
+sys.path.insert(0, {str(ROOT / "tests")!r})
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import assert_as_exact
+
+
+def draw(seed):
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def test_light():
+    with Path("runs-light").open("a") as runs:
+        runs.write("x")
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_site():
+    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product sharded across map tasks", seeds=16)
+""")
     entries = planned(ci)
     judge = entries[ci.site_task("3.12", "tests/test_site.py", "test_site")]
     inputs = tmp_path / ".verdict/inputs"
@@ -331,34 +355,7 @@ def test_a_judge_asks_for_its_later_draws_only_where_its_first_stage_finds_somet
     for more (armada's `more`); once the later map tasks have drawn, the judge over them all judges as one
     that drew every seed (Main, 2026-11-02: the second stage drawn every run, read only where the first
     found something)."""
-    out = site_checkout(tmp_path, f"""import sys
-
-sys.path.insert(0, {str(ROOT / "tests")!r})
-import jax.numpy as jnp
-import numpy as np
-import pytest
-from reference_error import assert_as_exact
-
-
-def draw(seed):
-    rng = np.random.default_rng([2641, seed])
-    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
-            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
-
-
-def halved(x, w):
-    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=40)
-def test_on_par():
-    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=40)
-def test_halved():
-    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
-""")
+    out = site_checkout(tmp_path, GATED)
     entries = planned(ci)
 
     def judged(test: str, drawn: list[dict]) -> dict:
