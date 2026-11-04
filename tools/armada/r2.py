@@ -114,14 +114,18 @@ def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes |
 DRAINED = 2 ** 16
 """The most of an unread answer's body a kept connection reads off to be used again (`KeptSend`): a miss's or
 a refusal's few bytes, never an object's."""
+DRAIN_SECONDS = 1.0
+"""The longest a kept connection waits for an unread answer's body to read it off (`DRAINED`), past which it
+is closed: a trickling refusal holds up no caller."""
 
 
 class KeptSend:
     """A sender that keeps a connection a thread and host open across its requests, where `urllib_send` opens
     one a request and every request pays its TCP and TLS handshakes: a plan's thousands of record lookups
     from a CI runner took 103 s, the same plan's on armada, beside the Worker, 28 s. An answer read to its
-    end, or with at most `DRAINED` bytes left that it reads off, gives its connection back to its thread; any
-    other, or one the Worker said it would close, closes it. A request a kept connection could not send, as
+    end, or a miss's or a refusal's unread body of at most `DRAINED` bytes that it reads off within
+    `DRAIN_SECONDS`, gives its connection back to its thread; any other, or one the Worker said it would
+    close, closes it. A request a kept connection could not send, as
     the Worker had closed it meanwhile, goes once on a new one. A connection is never shared between
     threads, so a `Store` with this sender is shared as one with `urllib_send` is."""
 
@@ -145,6 +149,9 @@ class KeptSend:
                 connection.sock.settimeout(timeout)
             try:
                 connection.request(method, target, body=body, headers=dict(headers))
+                # Held before the answer, which detaches it from a connection the Worker closes after it, as
+                # `urllib_send` holds it.
+                sock = connection.sock
                 response = connection.getresponse()
             except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
                 connection.close()
@@ -152,27 +159,40 @@ class KeptSend:
                     raise
                 held = None
                 continue
-            return response.status, dict(response.headers), _Kept(kept, place, connection, response)
+            return response.status, dict(response.headers), _Kept(kept, place, connection, sock, response)
 
 
 class _Kept(_Answer):
     """A `KeptSend` answer: closed, its connection goes back to its thread's where it can carry another."""
 
-    def __init__(self, kept: dict, place: tuple, connection: http.client.HTTPConnection,
+    def __init__(self, kept: dict, place: tuple, connection: http.client.HTTPConnection, sock: socket.socket,
                  response: http.client.HTTPResponse):
-        super().__init__(connection, connection.sock, response)
+        super().__init__(connection, sock, response)
         self.kept, self.place = kept, place
 
     def close(self) -> None:
         response = self.response
-        if not response.isclosed() and response.length is not None and response.length <= DRAINED:
-            # A body that does not come whole leaves the connection unusable, and it is closed below.
-            with contextlib.suppress(OSError, http.client.HTTPException):
-                response.read()
+        # A success's body is the `Body`'s to read, and one it left unread (past its limit or its deadline)
+        # closes the connection; a miss's or a refusal's, which no `Body` reads, is read off in its bounds.
+        if (not response.isclosed() and not 200 <= response.status < 300 and response.length is not None
+                and response.length <= DRAINED):
+            self.drained()
         if response.isclosed() and not response.will_close and self.place not in self.kept:
             self.kept[self.place] = self.connection
         else:
             super().close()
+
+    def drained(self) -> None:
+        """The answer's unread body read off until it ends or `DRAIN_SECONDS` pass, each receive waiting at
+        most what is left of them; a body that does not come whole in time leaves the answer open, and its
+        connection is closed."""
+        ends = time.monotonic() + DRAIN_SECONDS
+        while not self.response.isclosed() and (left := ends - time.monotonic()) > 0:
+            try:
+                if not self.read1(DRAINED, left):
+                    return
+            except (OSError, http.client.HTTPException):
+                return
 
 
 class Body:
