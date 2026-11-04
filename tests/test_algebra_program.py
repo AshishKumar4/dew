@@ -895,3 +895,20 @@ def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
     narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
     assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
     assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
+
+
+def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
+    """A window's derivation is keyed by the matmul precision its pricing reads for a product of no stated
+    precision (`jax.default_matmul_precision`: TF32 at the default, the CUDA cores' IEEE fp32 above it): a
+    held program rewritten again under another precision is derived afresh, not read from the first."""
+    def scaled(x, y, b):
+        x, y = jnp.tanh(x), jnp.tanh(y)
+        return jnp.dot(x, y.T) * 0.5 + jnp.dot(b, y.T) * 0.5
+
+    closed = jax.make_jaxpr(scaled)(*rows(16, (12, 72), (12, 72), (12, 72)))
+    reused = []
+    for precision in ("default", "highest"):
+        with report.refusals(), jax.default_matmul_precision(precision):
+            algebra.program_of(closed)
+            reused.append([made.reused for made in report.rewrites()])
+    assert reused[0] and not any(reused[0]) and not any(reused[1])
