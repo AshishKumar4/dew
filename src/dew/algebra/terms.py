@@ -267,9 +267,11 @@ def parameter_key(value) -> Hashable:
     type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity);
     a dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
     its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
-    its mesh, partitions and memory; an array by its dtype, shape and bytes' digest; a function by its module
-    and name. Any other object is its type's name and the object itself, compared by its own equality, never
-    by its printed form. `value` is any parameter JAX's primitives take, which share no type."""
+    its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
+    function by its module and name, a partial one with its bound arguments. Any other object is its type's
+    name and the object itself, compared by its own equality, never by its printed form, which a key kept in
+    another process cannot read (`opaque`). `value` is any parameter JAX's primitives take, which share no
+    type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
     if isinstance(value, (int, np.integer)):
@@ -296,8 +298,11 @@ def parameter_key(value) -> Hashable:
         return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
                 parameter_key(value.axis_types), parameter_key(value.abstract_device))
     if isinstance(value, jax.sharding.NamedSharding):
-        return ("named sharding", parameter_key(value.mesh), parameter_key(value.spec),
-                parameter_key(value.memory_kind))
+        # Its mesh, partitions, memory and logical device order, as JAX pickles it, which its equality reads.
+        _, arguments = value.__reduce__()
+        return "named sharding", parameter_key(arguments)
+    if isinstance(value, functools.partial):
+        return "partial", parameter_key(value.func), parameter_key(value.args), parameter_key(value.keywords)
     if isinstance(value, jax.sharding.PartitionSpec):
         return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
                 parameter_key(value.reduced), parameter_key(value.unreduced_kind))
@@ -316,6 +321,17 @@ def parameter_key(value) -> Hashable:
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
     return "object", _named(type(value)), value
+
+
+def opaque(key) -> Hashable:
+    """`key` (`parameter_key`'s) with each object no structural key reads as its type's name alone: what a
+    key kept beyond this process reads (`dew.nn.kernels.tuning.program`'s digest), the same in every
+    process, where the object itself would print its process's address."""
+    if isinstance(key, tuple) and len(key) == 3 and key[0] == "object":
+        return key[:2]
+    if isinstance(key, tuple):
+        return tuple(opaque(part) for part in key)
+    return key
 
 
 def _named(kind: type) -> str:

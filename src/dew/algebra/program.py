@@ -593,9 +593,10 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore
     changed = False
     equations = []
     for equation in jaxpr.eqns:
-        if equation.primitive.name in BODIES or _marked(equation, WITHIN):
+        if equation.primitive.name in BODIES or _marked(equation, WITHIN) or (
+                _marked(equation, (Algebra,)) and not _opens(equation)):
             params = {name: _body(value, accurate, saturation) for name, value in equation.params.items()}
-        elif _marked(equation, (Algebra,)):
+        elif _opens(equation):
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = {**equation.params, "call_jaxpr": _within(equation.params["call_jaxpr"], accurate,
                                                                saturation)}
@@ -620,6 +621,14 @@ def _marked(equation: jcore.JaxprEqn, kinds: tuple[type, ...]) -> bool:
     return equation.primitive is marked_call_p and isinstance(equation.params["kind"], kinds)
 
 
+def _opens(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is an Algebra span the pass opens into the region around it (`_opened`): one of no
+    effects over arrays alone, whose renamed variables no effect names (a reference's would). Any other
+    Algebra span is rewritten within its call."""
+    return (_marked(equation, (Algebra,)) and not equation.effects
+            and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
+
+
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
     span's body opened into it (`_opened`), so a window reaches across the span's boundary; the program
@@ -632,10 +641,10 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> j
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`jaxpr` with each Algebra span's call (`_marked`) replaced by its body's equations, nested spans
-    opened too, over the call's operands, its body's constants the program's, and each reader of the call's
-    results reading what its body computes them as; `jaxpr` itself where it holds none."""
-    if not any(_marked(equation, (Algebra,)) for equation in jaxpr.eqns):
+    """`jaxpr` with each Algebra span's call it opens (`_opens`) replaced by its body's equations, nested
+    spans opened too, over the call's operands, its body's constants the program's, and each reader of the
+    call's results reading what its body computes them as; `jaxpr` itself where it holds none."""
+    if not any(_opens(equation) for equation in jaxpr.eqns):
         return jaxpr
     constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
     computed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
@@ -646,7 +655,7 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
 
     for equation in jaxpr.eqns:
         equation = equation.replace(invars=[outer(atom) for atom in equation.invars])
-        if not _marked(equation, (Algebra,)):
+        if not _opens(equation):
             equations.append(equation)
             continue
         body = _opened(equation.params["call_jaxpr"])

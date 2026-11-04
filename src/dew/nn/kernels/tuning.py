@@ -73,7 +73,7 @@ from jax.extend.backend import get_default_device
 
 from dew import _coordination, _records, cache
 from dew._records import JSON
-from dew.algebra.terms import parameter_key
+from dew.algebra.terms import opaque, parameter_key
 from dew.files import write_atomically
 from dew.nn.kernels.options import owned_program
 
@@ -725,6 +725,11 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     def update(*parts) -> None:
         digest.update(repr(parts).encode())
 
+    def read(parameter) -> Hashable:
+        # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
+        # same in every process (`terms.opaque`).
+        return opaque(parameter_key(parameter))
+
     def constants(values) -> None:
         for constant in values:
             if isinstance(constant, jax.core.Tracer):
@@ -742,7 +747,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", str(value.aval), parameter_key(value.val)
+                return "literal", str(value.aval), read(value.val)
             return bound(value)
 
         update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
@@ -751,9 +756,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
                    tuple((bound(var), str(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
-                   parameter_key((context.compute_type, context.threefry_partitionable, context.xla_metadata,
-                               str(context.cur_abstract_mesh), str(context.cur_layout_mode),
-                               context.remove_size_one_mesh_axis)))
+                   read((context.compute_type, context.threefry_partitionable, context.xla_metadata,
+                         str(context.cur_abstract_mesh), str(context.cur_layout_mode),
+                         context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
@@ -762,7 +767,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
                         constants(inner.consts)
                         walk(inner)
                     else:
-                        update(name, parameter_key(inner))
+                        update(name, read(inner))
         update("outputs", *(atom(value) for value in jaxpr.outvars))
 
     constants(closed.consts)
