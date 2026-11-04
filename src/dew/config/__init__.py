@@ -1310,13 +1310,14 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype",)
-    """The fields, by their dotted paths, a run may leave None for its build to resolve, whose
-    resolution a later Dew may change: the storage of the source it reads (`SourceOptions.param_dtype`),
-    and in a kind of run that adds them its own (a decision run's option text). A run that leaves one
-    None and resumes a saved run under its name takes the saved run's value (`resumed`), so running the
-    same command again resumes what it trained; one it sets is its own, and a resume refuses it where it
-    differs (`check_resume`)."""
+    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step")
+    """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
+    whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
+    source it reads (`SourceOptions.param_dtype`), the step of a saved Dew run it starts from, which
+    that run's later checkpoints move (`with_pinned_run`), and in a kind of run that adds them its own
+    (a decision run's option text). A run that leaves one None and resumes a saved run under its name
+    takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
+    one it sets is its own, and a resume refuses it where it differs (`check_resume`)."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: Annotated[Dataset | None, tyro.conf.Suppress] = None

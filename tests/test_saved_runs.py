@@ -221,6 +221,24 @@ def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refus
     dataclasses.replace(prepared, option_text="named").check_resume(saved)
 
 
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("kind", ["decision", "decision-lettered"])
+def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record(tmp_path,
+                                                                                              kind):
+    """A decision run saved by this Dew, its option text left to its layout (a release's named, a fresh
+    lettered head's described) and so recorded None, resumes when its command runs again and when read
+    back from its record: the writing each resolves to is the one the saved run trained."""
+    from run_kinds import trained
+
+    first = SAVED_KINDS[kind](tmp_path, drawn=False)
+    trained(first, tmp_path, kind, trainer={"name": kind, "checkpoint_final": True})
+    directory = tmp_path / "runs" / kind
+    assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] is None
+    for steps, run in ((2, first), (3, RunConfig.load(str(directory)))):
+        trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
+        assert str(steps) in {path.name for path in directory.iterdir()}
+
+
 def test_a_packed_projections_products_count_at_each_of_its_members():
     """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
     q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member

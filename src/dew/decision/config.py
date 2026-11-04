@@ -140,11 +140,11 @@ class DecisionRunConfig(DecoderRunConfig):
     option_text: Literal["named", "described"] | None = None
     """How a question row writes a choice's option (`QuestionLayout.option_text`): its key and
     description (`named`, as Laya's release reads its rows), or its description alone (`described`).
-    None keeps the layout's own, a release's named and a fresh head's described, and the run records
-    the writing it trained (`build_run`); a run that leaves it None and resumes takes the saved run's
-    (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran
-    (`dew.config.earlier_option_text`). A joint row names each option by its key beside its description
-    in its schema, the named writing, and has no other."""
+    None keeps the layout's own, a release's named and a fresh head's described, as its record keeps
+    None; a run that leaves it None and resumes takes the saved run's (`BUILT`, `RunConfig.resumed`). A
+    run saved before this field reads `named`, as it ran (`dew.config.earlier_option_text`). A joint row
+    names each option by its key beside its description in its schema, the named writing, and has no
+    other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
     """The row's parts in order, as its layout reads them. A joint row's user turn
     (`JointLayout.segments`): the schema first, or read as the row's context through
@@ -339,11 +339,7 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        # The run as it records itself names the writing its rows took, its layout's own where it named none.
-        layout = objective.layout
-        written = layout.option_text if isinstance(layout, QuestionLayout) else "named"
-        run = self if self.option_text == written else dataclasses.replace(self, option_text=written)
-        return Prepared(run, objective, dataset, metrics=metrics, summary=summary, after=after,
+        return Prepared(self, objective, dataset, metrics=metrics, summary=summary, after=after,
                         validation=held)
 
     def _row_fields(self) -> Budgets:

@@ -3,6 +3,7 @@ release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`
 own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
+import json
 from pathlib import Path
 
 import jax
@@ -59,6 +60,37 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         released_run(exported, step="latest")
     with pytest.raises(ValueError):
         load_diffusion_source(str(source))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on(tmp_path, monkeypatch):
+    """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
+    default resumes that step when its command runs again, though the saved run has trained on since and
+    its selection now names a later one (`RunConfig.BUILT`, `source.step`); the same command naming the
+    later step is refused its resume, where the step it read resumes."""
+    from dew.config import earlier_run
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    first = decision(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    read = SavedRun.pinned(str(source)).step
+
+    def command(*flags: str) -> DecisionRunConfig:
+        return DecisionRunConfig.cli(["--pretrained", str(source), *flags], default=first)
+
+    trained(command(), tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    later = SavedRun.pinned(str(source)).step
+    assert later != read
+    trained(command(), tmp_path, "after", trainer={"name": "after", "steps": 2, "checkpoint_final": True})
+    assert DecisionRunConfig.load(str(tmp_path / "runs" / "after")).source.step == read
+    saved = earlier_run(json.loads((tmp_path / "runs" / "after" / "run.json").read_text()))
+    named = dataclasses.replace(command("--source.step", str(later)), trainer=dataclasses.replace(
+        first.trainer, name="after", checkpoint_dir=str(tmp_path / "runs")))
+    with pytest.raises(ValueError):
+        named.resumed().pinned().check_resume(saved)
+    dataclasses.replace(named, source=dataclasses.replace(named.source, step=read)).check_resume(saved)
 
 
 def leaves_alike(tree, alike) -> None:
