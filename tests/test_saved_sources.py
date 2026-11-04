@@ -104,11 +104,11 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     earlier Dew kept alone by its own weights before replacing it): a reader pinned to the first step, a
     run started from it among them, loads it after the second was fitted, where only the latest was kept
     and refused it (rows 3865, 3877)."""
+    import shutil
+
     from dew.decision.calibration import Calibration
     from dew.decision.task import Decide
     from dew.registry import from_record
-
-    import shutil
 
     first = decision(tmp_path, drawn=False)
     trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
