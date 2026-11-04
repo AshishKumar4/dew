@@ -642,11 +642,14 @@ def _module_kind(path: str, module: torch.nn.Module) -> tuple:
                 *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
 
 
-def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[list[tuple], tuple] | None:
+def _layer_kinds(source: ModelSource, fields: Mapping[str, object], listed: Collection[str] | None = None
+                 ) -> tuple[list[tuple], tuple, tuple[str, ...]] | None:
     """The kinds of the model `fields` builds (`_skeleton`): each decoder layer's, its entry in each of the
     config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's `no_rope_layers`,
-    HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
-    as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
+    HY-3's `mlp_layer_types`; those `listed` by name where given, so a list as long as a shallower depth
+    by chance, Falcon-H1's two `mlp_multipliers` at two layers, is no layer's) and each of its modules'
+    (`_module_kind`) across every module list as long as the depth; every module's outside those lists
+    (its table, its rotary, its final norm); and the lists' names. None
     where no module list is as long as the depth, or where the model is not built by transformers' own
     code of transformers' and torch's own classes (a remote source; a config class, or a causal LM class
     the auto registry resolves it to, registered from elsewhere), whose layers differ only as their kinds
@@ -672,14 +675,15 @@ def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[lis
     if not stacks:
         return None
     lists = sorted((name, tuple(value)) for name, value in vars(config).items()
-                   if isinstance(value, (list, tuple)) and len(value) == depth)
+                   if isinstance(value, (list, tuple))
+                   and (len(value) == depth if listed is None else name in listed))
     inside = {id(module) for stack in stacks for module in stack.modules()}
     outside = tuple(_module_kind(path, module) for path, module in model.named_modules()
                     if id(module) not in inside)
     layers = [(tuple(json.dumps(values[index], sort_keys=True, default=str) for _, values in lists),
                tuple(tuple(_module_kind(path, module) for path, module in stack[index].named_modules())
                      for stack in stacks)) for index in range(depth)]
-    return layers, outside
+    return layers, outside, tuple(name for name, _ in lists)
 
 
 def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
@@ -692,7 +696,7 @@ def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, o
     deep = _layer_kinds(source, fields)
     if deep is None:
         return fields
-    kinds, outside = deep
+    kinds, outside, listed = deep
     firsts = {}
     for index, layer in enumerate(kinds):
         firsts.setdefault(layer, index)
@@ -703,7 +707,7 @@ def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, o
     cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
                   and name != key else value) for name, value in fields.items()}
     cut[key] = count
-    return cut if _layer_kinds(source, cut) == (kinds[:count], outside) else fields
+    return cut if _layer_kinds(source, cut, listed) == (kinds[:count], outside, listed) else fields
 
 
 def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
