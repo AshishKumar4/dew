@@ -2446,27 +2446,34 @@ x, params = var("x", Term), var("params", i64)
 rules.register(rules.Rules("faulty exponential", "reorders",
                            ruleset(rewrite(x.unary("exp", params)).to(x), name="faulty exponential"),
                            receipt="tests/test_reference_error.py"))
-exponential = options.program(lambda x: jnp.exp(jnp.tanh(x)) * 2.0)
+
+
+def sums(x, y):
+    return jnp.sum(jnp.exp(jnp.tanh(x)), -1) + jnp.sum(jnp.exp(jnp.tanh(y)), -1)
+
+
+exponential = options.program(sums)
 
 
 def draw(seed):
-    return (jnp.asarray(np.random.default_rng(seed).standard_normal((6, 34)), jnp.float32),)
+    rng = np.random.default_rng(seed)
+    return tuple(jnp.asarray(rng.standard_normal((6, 34)), jnp.float32) for _ in range(2))
 
 
-arm = dew_programs(lambda x: exponential(x))
-moved = float(jnp.max(jnp.abs(arm(*draw(0)) - 2.0 * jnp.exp(jnp.tanh(draw(0)[0])))))
+arm = dew_programs(lambda x, y: exponential(x, y))
+moved = float(jnp.max(jnp.abs(arm(*draw(0)) - sums(*draw(0)))))
 try:
     assert_as_exact(arm, arm, draw, "a faulty rewrite against its program as written", seeds=8)
     failed = False
 except GateFailure:
     failed = True
-assert_as_exact(dew_programs(lambda x: 2.0 * jnp.exp(jnp.tanh(x))), arm, draw,
+assert_as_exact(dew_programs(lambda x, y: sums(x, y)), arm, draw,
                 "the program as written against the reference run unrewritten", seeds=8, truth_fn=arm)
 print(json.dumps({"moved": moved, "failed": failed}))
 """
 """A process whose registry holds a faulty rule set (an exponential rewritten to its argument: a real
 rewrite the engine saturates and extracts, a leaf being cheaper than a transcendental), which checks a
-program of Dew's it rewrites against itself."""
+program of Dew's it rewrites (two sums of bounded exponentials, a window the pass reads) against itself."""
 
 
 def test_a_reference_and_its_truth_run_their_programs_unrewritten():
