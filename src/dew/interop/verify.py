@@ -53,7 +53,6 @@ from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
 from dew.nn.blocks import padded_row
-from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -787,13 +786,12 @@ def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.
     rounding: infinite. The candidate's float32 runs as a user's process runs it: its products summed in
     float32 (`precision.FP32_SUMS`), not in TF32 on a GPU, nor in float64 as a test process's wide CPU
     arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
-    users get and the ratio past what users' rounding reaches. Each forward is one compiled program, as a
-    user's runs."""
+    users get and the ratio past what users' rounding reaches."""
 
     def logits(dtype: str, network: nn.Module) -> np.ndarray:
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
         with _users_arithmetic(dtype):
-            return np.asarray(owned_program(network.apply, network)(held, ids), np.float64)
+            return np.asarray(network.apply(held, ids), np.float64)
 
     ours = logits('float32', model)
     with jax.enable_x64(new_val=True):
@@ -867,7 +865,7 @@ def _parity_of(theirs: Mapping[str, np.ndarray], reference: PreTrainedModel,
                family: decoder_parts.DecoderFamily, record: decoder_parts.DecoderFields,
                variables: Variables) -> float:
     """`gradient_parity` of the source's eval-mode gradients `theirs` over the probe's draw (`_probe_draw`),
-    by its parameters' names, against Dew's: each gradient one compiled program, as a user's runs."""
+    by its parameters' names, against Dew's."""
     ids, cotangent = _probe_draw()
     stored = _as_stored(reference, theirs)
     their_tree = flax_traverse.flatten_dict(decoders.translate_weights(stored, record, family)['params'])
@@ -882,7 +880,7 @@ def _parity_of(theirs: Mapping[str, np.ndarray], reference: PreTrainedModel,
 
         with _users_arithmetic(dtype):
             return {path: np.asarray(leaf, np.float64) for path, leaf in
-                    flax_traverse.flatten_dict(owned_program(jax.grad(loss), model)(held['params'])).items()}
+                    flax_traverse.flatten_dict(jax.grad(loss)(held['params'])).items()}
 
     ours = gradient('float32')
     with jax.enable_x64(new_val=True):
