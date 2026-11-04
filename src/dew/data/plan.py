@@ -41,12 +41,11 @@ _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a n
 
 REBUILD = "build its chain as it was"
 RECORD = "resume it from its record, which holds the chain it read (`dew train <run directory>/run.json`)"
-SCHEDULE = ('read its mix unseeded, in the schedule it saved (`mix(..., seed=None)`, a decision mixture\'s '
-            '`mixture(..., order="schedule")`)')
+SCHEDULE = "read its mix unseeded, in the schedule it saved (`mix(..., seed=None)`)"
 """The routes a run whose chain changed since it saved its position takes (`PlanOrderChanged.routes`):
 built as it was; resumed from a record that holds its chain (`RunConfig.train` names it where the saved
-run's record does); a decision mixture saved before its corpus order was seeded read in that schedule
-(rows 3870, 3881)."""
+run's record does); a mix saved before its order was seeded read in that schedule (rows 3870, 3881), which
+a layer above spells as its own API reads it (`PlanOrderChanged.routed`, a decision mixture's)."""
 
 
 def _absent(value: JSON | None) -> str:
@@ -54,9 +53,10 @@ def _absent(value: JSON | None) -> str:
 
 
 class PlanOrderChanged(ValueError):
-    """A saved data position's plan whose order is not the chain's now: each order key `changed`, its saved
-    value and its value now (None where one holds none), and the `routes` its run goes on by (`REBUILD`,
-    `RECORD`, `SCHEDULE`), a mix saved unseeded and seeded now naming `SCHEDULE`."""
+    """A saved data position's plan whose order is not the chain's now: each path of the order `changed`
+    (`selection_seed`, `phases[1].selection_seed`), its saved value and its value now (None where one holds
+    none), and the `routes` its run goes on by (`REBUILD`, `RECORD`, `SCHEDULE`), a mix saved unseeded and
+    seeded now, nothing else changed, naming `SCHEDULE`."""
 
     def __init__(self, changed: Mapping[str, tuple[JSON | None, JSON | None]], routes: tuple[str, ...]):
         self.changed, self.routes = dict(changed), routes
@@ -66,23 +66,40 @@ class PlanOrderChanged(ValueError):
 
     @classmethod
     def between(cls, saved: Mapping[str, object], now: Mapping[str, object]) -> PlanOrderChanged:
-        """The refusal of a position saved under order `saved`, read under `now`: each top-level key
-        whose value differs."""
-        changed = {key: (json_value(saved.get(key), key) if key in saved else None,
-                         json_value(now.get(key), key) if key in now else None)
-                   for key in sorted(set(saved) | set(now)) if saved.get(key) != now.get(key)}
-        # A mix saved unseeded and seeded now reads as it was saved unseeded again; another seed, as built.
-        seeded = changed.get("selection_seed")
-        unseeded = seeded is not None and seeded[0] is None
+        """The refusal of a position saved under order `saved`, read under `now`, as the check compares
+        them (`unplaced`, `Plan.check`): each path whose value differs, a mix's corpora, a phase's and a
+        mix of mixes' members by their places (row 3914)."""
+        changed = dict(_differing(unplaced(json_value(saved, "saved order")),
+                                  unplaced(json_value(now, "order"))))
+        # Mixes saved unseeded and seeded now, and nothing else, read as they were saved unseeded again;
+        # another seed, or a seed beside another change, as built.
+        unseeded = bool(changed) and all(path.rpartition(".")[2] == "selection_seed" and before is None
+                                         for path, (before, _) in changed.items())
         return cls(changed, (*((SCHEDULE,) if unseeded else ()), REBUILD))
 
-    def routed(self, *, recorded: bool) -> PlanOrderChanged:
-        """This refusal with the record route first where the saved run's record holds its chain."""
-        return PlanOrderChanged(self.changed, ((RECORD,) if recorded else ()) + self.routes)
+    def routed(self, *, recorded: bool, unseeded: str = SCHEDULE) -> PlanOrderChanged:
+        """This refusal with the record route first where the saved run's record holds its chain, and the
+        schedule's route as the run's own layer spells it (`unseeded`)."""
+        routes = tuple(unseeded if route == SCHEDULE else route for route in self.routes)
+        return PlanOrderChanged(self.changed, ((RECORD,) if recorded else ()) + routes)
 
     def __reduce__(self):
         # Rebuilt from its own fields, as a pickle or a process boundary carries it.
         return type(self), (self.changed, self.routes)
+
+
+def _differing(saved: JSON, now: JSON, path: str = "") -> Iterator[tuple[str, tuple[JSON, JSON]]]:
+    """Each path at which `now` differs from `saved`, with both values there (None where one holds none):
+    into the records and lists of equal length both hold, a record's field by its name and a list's entry
+    by its place."""
+    if isinstance(saved, dict) and isinstance(now, dict):
+        for name in sorted(set(saved) | set(now)):
+            yield from _differing(saved.get(name), now.get(name), f"{path}.{name}" if path else name)
+    elif isinstance(saved, list) and isinstance(now, list) and len(saved) == len(now):
+        for index, (before, after) in enumerate(zip(saved, now, strict=True)):
+            yield from _differing(before, after, f"{path}[{index}]")
+    elif saved != now:
+        yield path, (saved, now)
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:

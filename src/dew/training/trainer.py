@@ -1613,7 +1613,7 @@ class Trainer(Generic[Loss, Effects]):
         under "never" into a directory that holds no run either. An objective that names its input field
         alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        self._declare_input(lambda: first_batch(dataset, self.device_mesh))
+        self._declare_input(lambda: first_batch(dataset, self._stream_partition()))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")

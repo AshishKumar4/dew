@@ -99,11 +99,11 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     return loader, validation, tokens, steps, loader.examples
 
 
-def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", dataset: Loader,
-                                     resume: "Resume" = "auto", *, examples: int | None = None) -> None:
-    """Refuse a resume under `resume` whose saved data position `dataset` would not read on from, as
+def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader: Loader,
+                                     resume: "Resume" = "auto") -> None:
+    """Refuse a resume under `resume` whose saved data position `loader` would not read on from, as
     `trainer.fit` refuses it where it opens its data, before a run writes anything over what it resumes
-    (`RunConfig.train`): the data fit reads, bounded by `examples` as it bounds it (`fitted`), the
+    (`RunConfig.train`): the data fit reads, compiled once as the run reads it (`RunConfig.readied`), the
     position of this process's share at the step it continues (`Checkpoints.resumed`,
     `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
     the layout's rules, restored and closed (`_fit.admitted`). Nothing where it continues no step or
@@ -116,5 +116,4 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", datase
     with nn.logical_axis_rules(trainer.layout.axis_rules):
         saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
         if saved is not None:
-            loader, _ = fitted(dataset, None, objective=trainer.objective.data(), examples=examples)
             admitted(loader, trainer._stream_partition(), saved)
