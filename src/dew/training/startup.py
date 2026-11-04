@@ -9,15 +9,22 @@ import dataclasses
 import logging
 import time
 from collections.abc import Iterator, Mapping
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+import flax.linen as nn
 
 from dew.data.compile import Handed, fitted
-from dew.data.dataset import Loader
+from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.telemetry.instrumentation import count_compilation_cache
+from dew.training._fit import admitted
 from dew.training.budget import run_length, run_steps, run_tokens
 from dew.training.evaluation import EvalSuite, Split
 from dew.training.runtime import ready_process
+
+if TYPE_CHECKING:
+    from dew.checkpoints import Resume
+    from dew.training.trainer import Trainer
 
 _log = logging.getLogger(__name__)
 
@@ -90,3 +97,24 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
         steps = run_steps(loader, steps, epochs, tokens, accumulation, examples)
     count_compilation_cache()
     return loader, validation, tokens, steps, loader.examples
+
+
+def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", dataset: Loader,
+                                     resume: "Resume" = "auto", *, examples: int | None = None) -> None:
+    """Refuse a resume under `resume` whose saved data position `dataset` would not read on from, as
+    `trainer.fit` refuses it where it opens its data, before a run writes anything over what it resumes
+    (`RunConfig.train`): the data fit reads, bounded by `examples` as it bounds it (`fitted`), the
+    position of this process's share at the step it continues (`Checkpoints.resumed`,
+    `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
+    the layout's rules, restored and closed (`_fit.admitted`). Nothing where it continues no step or
+    saved no position."""
+    checkpoints = trainer.checkpoints
+    step = None if checkpoints is None else checkpoints.resumed(resume)
+    if checkpoints is None or step is None:
+        return
+    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    with nn.logical_axis_rules(trainer.layout.axis_rules):
+        saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
+        if saved is not None:
+            loader, _ = fitted(dataset, None, objective=trainer.objective.data(), examples=examples)
+            admitted(loader, trainer._stream_partition(), saved)

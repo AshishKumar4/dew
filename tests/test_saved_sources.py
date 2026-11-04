@@ -127,6 +127,11 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
         assert task.weights is not None and task.weights.step == step
         (kept,) = step_calibrations(str(source), step)
         assert task.calibration == from_record(Calibration, json.loads(kept.read_text())["calibration"])
+    # A run started from the first step trains, as `dew train --pretrained <run> --source.step` starts it
+    # (row 3880).
+    pinned = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", str(read)], default=first)
+    trained(pinned, tmp_path, "from_first", trainer={"checkpoint_final": True})
+    assert DecisionRunConfig.load(str(tmp_path / "runs" / "from_first")).source.step == read
     # The release of the first step is written again where its own calibration changes, the run's latest
     # as it was (`released_run`'s fingerprint holds the step's calibrations).
     release = released_run(source, step=read)
