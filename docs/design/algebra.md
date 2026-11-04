@@ -299,7 +299,7 @@ because its Python API is still marked as subject to change.
 |---|---|
 | `dew.algebra.terms` | The term language and its conversion to and from jaxprs |
 | `dew.algebra.facts` | Facts about each value (e-class analyses) |
-| `dew.algebra.rules` | `Rules`, `Monoid`, their registries and the sets registered: `identities`, `stable`, `linear`, `joined` (`reuse`, `decoupled` and `error_free`, §1, are not registered yet) |
+| `dew.algebra.rules` | `Rules` and `Family`, the registry and the sets registered: `identities`, `contracted`, `stable`, `linear`, `joined`, each declared as its rewrites with their instances (`reuse` and `error_free`, §1, are not built; `decoupled` and `carried` are the derivations' own sets, never registered) |
 | `dew.algebra.linear_scan` | A recurrence's token update read as an affine map by rules, and its chunk form derived by identities and extracted under the work-span model (§6.9) |
 | `dew.algebra.cost` | `Price`, `CostModel` and error-aware DAG extraction |
 | `dew.algebra.error` | Dev time: each candidate DAG's error, sampled on its declaration's cases against the float64 truth |
@@ -337,7 +337,7 @@ class Term(Expr):
     def broadcast(self, shape: Vec[i64], dimensions: Vec[i64]) -> Term: ...
     def reshape(self, shape: Vec[i64]) -> Term: ...
     def transpose(self, permutation: Vec[i64]) -> Term: ...
-    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # a registered monoid (§6.3)
+    def reduce(self, monoid: StringLike, axes: Vec[i64]) -> Term: ...   # sum, max or min (§6.3)
     @classmethod
     def dot(cls, lhs: Term, rhs: Term, contracting: Vec[i64], batch: Vec[i64], result: StringLike) -> Term: ...
     @classmethod
@@ -435,22 +435,15 @@ Two notes on the table:
   (§1.5, §6.5).
 - The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
 
-Monoids are an open registry, so a reduction, a prefix and a derived form's merge all name one:
-
-```python
-@dataclass(frozen=True)
-class Monoid:
-    name: str                          # "sum", "max", "softmax" (m, total, acc), "affine" (A, b),
-                                       # "compensated" (sum, error), "argmax", "moments", ...
-    combine: jax.extend.core.ClosedJaxpr      # (state, state) -> state
-    identity: jax.extend.core.ClosedJaxpr     # () -> state
-    associative: bool                  # False: an ordered fold, never reassociated
-    rounding: str                      # its combine's rounding class
-    tie_break: str | None = None       # a total order where combine chooses (argmax: lowest position)
-
-MONOIDS: Mapping[str, Monoid]
-def register_monoid(monoid: Monoid) -> None: ...
-```
+A reduction names its monoid in the language (`Term.reduce`'s name), from the closed set the language holds
+(`terms.REDUCTIONS`: `sum`, `max`, `min`). There is no open registry: the derivation reads each monoid's
+algebra in its own rules (`derive.py`'s `summed` and `peaked` facts, the walked merge's `max` and `add`, the
+softmax's rescaling by `exp(k_carried - k_new)`) and its identity in `derive._identity` (a sum's zero, a
+maximum's least value), so a new reduction is a new name in `terms.REDUCTIONS` with the rules and the identity
+that read it, each held by the laws (`tests/test_algebra_laws.py`). An open `Monoid` registry, whose
+combine and identity were jaxprs a rule could read, was the earlier draft: no reduction the templates take
+needs one, and a monoid's rules cannot be written from its combine alone (the softmax's rescaling is a rule
+about `exp`, not about the monoid).
 
 ### 6.4 Rules
 
