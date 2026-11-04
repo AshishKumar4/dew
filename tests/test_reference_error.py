@@ -267,7 +267,7 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
 
     host = as_given(lambda x: np.asarray(x) + np.asarray(x))
     mine, theirs = _arms(dew, host)
-    assert theirs is host and not getattr(mine, "without_ynn", False)
+    assert theirs.__wrapped__ is host and not getattr(mine, "without_ynn", False)
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
