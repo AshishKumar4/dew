@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
 from reference_error import assert_as_exact
 
 from dew.nn import precision
@@ -146,6 +146,36 @@ def test_a_portable_grouped_projection_holds_every_order(edge):
 
     assert_contract(projected, primals, direction, cotangent, f"a portable grouped projection {edge}",
                     truth_fn=masked_grouped_product, plain_fn=masked_grouped_product)
+
+
+@jax.custom_vjp
+def straight_through(scores):
+    """A score hook through a custom VJP entry by entry: a rounding to bfloat16 whose cotangent passes
+    unchanged."""
+    return scores.astype(jnp.bfloat16).astype(scores.dtype)
+
+
+straight_through.defvjp(lambda scores: (straight_through(scores), None), lambda _, cotangent: (cotangent,))
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_transposed_hooks_custom_vjp_holds_every_reverse_order(edge):
+    """A custom VJP within a hook a mainloop runs on transposed tiles (`layout.transposed`, its pullback held
+    entry by entry, `_custom.held`): every reverse order, under a nested jit and a scan, finite wherever
+    float64 is a normal float32 and the hook on the tile as its caller holds it is; it takes no forward
+    order, as the call itself does not (ledger 2658)."""
+    from dew.nn.kernels.templates import layout
+
+    (tile,) = normal_draw(108, (6, 4), scale=EDGES[edge])
+    (direction,) = normal_draw(109, (6, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(110, (6, 4))
+
+    def plain(tile):
+        return straight_through(tile.T).T
+
+    assert_contract(layout.transposed(straight_through), (tile,), (direction,), cotangent,
+                    f"a transposed hook's custom VJP {edge}", truth_fn=plain, plain_fn=plain,
+                    without=FORWARD_ORDERS)
 
 
 def rms_producer(lhs, scale):
