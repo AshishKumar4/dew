@@ -976,3 +976,27 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
     with report.refusals():
         fused._split(producer, _scaled_operands(1, (64, 128)))
         assert any(made.spliced for made in report.rewrites())
+
+
+def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
+    """A tile's hook is often a closure made for its trace (a keys-first tile's transposed hook,
+    `layout.transposed`), which the pass's rewrite of it holds no longer than the trace: once traced and
+    dropped, it is collected."""
+    import gc
+    import weakref
+
+    from dew.nn.kernels.templates.attention_algebra import hooked
+
+    def made():
+        def transient(s, q_pos, k_pos, a, b):
+            return _scaled_twice(s, q_pos, k_pos, a, b)
+        return transient
+
+    hook = made()
+    held = weakref.ref(hook)
+    operands = _scaled_operands(2, (16, 32))
+    jax.make_jaxpr(lambda s, a, b: hooked(hook, s, jnp.arange(16)[:, None], jnp.arange(32)[None, :],
+                                          (a, b)))(*operands)
+    del hook
+    gc.collect()
+    assert held() is None

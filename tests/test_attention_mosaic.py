@@ -1624,6 +1624,11 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     product = forward // 2
     plain = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
     assert plain == (forward, forward)
+    # A forward whose launches walk its value columns a block apiece: each recomputes `Q K^T`, which the
+    # model owns once.
+    with _pinned(attention_mosaic.Tiles(64, 64, 2, 1, columns=width // 2)):
+        blocked = counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
+    assert blocked == (forward, forward + product)
     assert counted(trained, query, key, key) == (forward, forward + product)
     assert counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * forward + product)
 
