@@ -112,8 +112,9 @@ def resume_admitted(trainer: Trainer, dataset: Loader, resume: Resume = "auto", 
     step = None if checkpoints is None else checkpoints.resumed(resume)
     if checkpoints is None or step is None:
         return
-    saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
-    if saved is not None:
-        loader, _ = fitted(dataset, None, objective=trainer.objective.data(), examples=examples)
-        with nn.logical_axis_rules(trainer.layout.axis_rules):
+    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    with nn.logical_axis_rules(trainer.layout.axis_rules):
+        saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
+        if saved is not None:
+            loader, _ = fitted(dataset, None, objective=trainer.objective.data(), examples=examples)
             admitted(loader, trainer._stream_partition(), saved)
