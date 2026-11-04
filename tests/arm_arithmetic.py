@@ -52,7 +52,7 @@ def unrewritten(fn):
 
 
 class Unrewritten:
-    """`wrapped`, called or lowered (`lower`, a compiled arm's) with the algebra pass off
+    """`wrapped`, called or lowered (`lower`, where it has one: a compiled arm's) with the algebra pass off
     (`dew.algebra.passes(on=False)`), its other attributes `wrapped`'s (an arm's marks: `as_given`,
     `pilots`). The switch is in JAX's trace context, which jit's and Dew's programs key their traces and
     executables on: a reference's program never stands in for the candidate's, and a function's own, wrapped
@@ -67,14 +67,18 @@ class Unrewritten:
         with passes(on=False):
             return self.wrapped(*inputs, **options)
 
-    def lower(self, *inputs, **options):
-        from dew.algebra import passes
-
-        with passes(on=False):
-            return self.wrapped.lower(*inputs, **options)
-
     def __getattr__(self, name):
-        return getattr(self.wrapped, name)
+        found = getattr(self.wrapped, name)
+        if name != "lower":
+            return found
+
+        # A compiled arm's lowering, under the switch its calls run under; an arm of no lowering has none.
+        def lower(*inputs, **options):
+            from dew.algebra import passes
+
+            with passes(on=False):
+                return found(*inputs, **options)
+        return lower
 
 
 class Truth:
