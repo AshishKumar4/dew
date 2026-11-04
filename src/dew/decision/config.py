@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 import jax
 
-from dew import _records
 from dew._records import integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.pipeline import Dataset, cut_unit
@@ -98,6 +97,7 @@ class DecisionRunConfig(DecoderRunConfig):
     """A run, plus the decision objective's own knobs."""
 
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "calibrate")
+    BUILT: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.BUILT, "option_text")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
@@ -137,12 +137,13 @@ class DecisionRunConfig(DecoderRunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
-    option_text: Literal["named", "described"] | None = dataclasses.field(
-        default=None, metadata={_records.SAVED: "named"})
+    option_text: Literal["named", "described"] | None = None
     """How a question row writes a choice's option (`QuestionLayout.option_text`): its key and
     description (`named`, as Laya's release reads its rows), or its description alone (`described`).
-    None keeps the layout's own: a release's, and a fresh head's described. A run saved before this
-    field reads `named`, as it ran. A joint row names each option by its key beside its description
+    None keeps the layout's own, a release's named and a fresh head's described, and the run records
+    the writing it trained (`build_run`); a run that leaves it None and resumes takes the saved run's
+    (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran
+    (`dew.config.earlier_option_text`). A joint row names each option by its key beside its description
     in its schema, the named writing, and has no other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
     """The row's parts in order, as its layout reads them. A joint row's user turn
@@ -338,7 +339,11 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        return Prepared(self, objective, dataset, metrics=metrics, summary=summary, after=after,
+        # The run as it records itself names the writing its rows took, its layout's own where it named none.
+        layout = objective.layout
+        written = layout.option_text if isinstance(layout, QuestionLayout) else "named"
+        run = self if self.option_text == written else dataclasses.replace(self, option_text=written)
+        return Prepared(run, objective, dataset, metrics=metrics, summary=summary, after=after,
                         validation=held)
 
     def _row_fields(self) -> Budgets:
