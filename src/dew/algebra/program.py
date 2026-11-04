@@ -664,9 +664,9 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
         fresh = [jcore.Var(var.aval) for var in body.constvars]
         constvars += fresh
         consts += list(body.consts)
-        made, results = inlined(body, equation.invars, fresh)
+        made, returned = inlined(body, equation.invars, fresh)
         equations += made
-        computed.update(zip(equation.outvars, results, strict=True))
+        computed.update(zip(equation.outvars, returned, strict=True))
     return jaxpr.replace(constvars=constvars, consts=consts, eqns=equations,
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 

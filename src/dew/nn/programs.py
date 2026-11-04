@@ -68,8 +68,8 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
     constant the caller holds among its own, `dew.algebra.program`'s span opened), else a literal of the
     value given (a program compiled whole, `dew.training.compiled_program`)."""
     local: dict[jcore.Var, jcore.Var | jcore.Literal] = dict(zip(body.invars, operands, strict=True))
-    local.update({var: value if isinstance(value, jcore.Var | jcore.Literal)
-                  else jcore.Literal(value, var.aval) for var, value in zip(body.constvars, consts, strict=True)})
+    for var, value in zip(body.constvars, consts, strict=True):
+        local[var] = value if isinstance(value, jcore.Var | jcore.Literal) else jcore.Literal(value, var.aval)
 
     def read(value):
         return local.get(value, value) if computed(value) else value

@@ -237,6 +237,14 @@ def as_member(made: Record, member: str | None) -> Record:
     return tagged
 
 
+@overload
+def member_record(made: Batch, member: str) -> Batch: ...
+
+
+@overload
+def member_record(made: Record, member: str) -> Record: ...
+
+
 def member_record(made: Record, member: str) -> Record:
     """A mixture member's record as the mix reads it, tagged its member's (`as_member`). A member's raw
     bytes hold no field to say it, so its examples, which a mixture counting its members' would credit to

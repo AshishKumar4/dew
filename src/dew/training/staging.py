@@ -27,11 +27,12 @@ from dew.distributed.placement import placed_bytes
 from dew.nn.programs import CALLS, computed, inlined
 from dew.training.compiled_program import called
 
-PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call"}
+PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "marked_call"}
 """The calls (`dew.nn.programs.CALLS`) that run a program on their operands and do nothing else, which
 `flattened` runs in their caller: an optax helper's `jit` over a whole tree reads each leaf apart from the
 rest within it. A checkpoint's and a custom derivative's call do more than their program, a rule of their
-own, and stay calls."""
+own, and a marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected
+span's inside no rule touches), so each stays a call."""
 
 CHUNKS = 16
 """The most chunks the fields' bytes are cut into where no group of leaves read together is larger
