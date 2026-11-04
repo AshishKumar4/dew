@@ -12,7 +12,6 @@ import pytest
 
 from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
-from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
 from dew.decision import Choice, Decide, decisions, mixture
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
@@ -351,8 +350,11 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
         again.set_state(position)
         assert states(next(again) for _ in range(4)) == whole[8:]
     changed = loader(mixture(str(root))[0])
-    with pytest.raises(PlanOrderChanged) as refused:
+    with pytest.raises(ValueError) as refused:
         changed.set_state(position)
+    from dew.data.plan import REBUILD, SCHEDULE, PlanOrderChanged
+
+    assert isinstance(refused.value, PlanOrderChanged)
     # The refusal names what changed, the mix's selection seed it now draws by, and the routes it goes on.
     assert refused.value.changed == {"selection_seed": (None, 0)}
     assert refused.value.routes == (SCHEDULE, REBUILD)
@@ -380,6 +382,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     mixture's order changed is refused that position by its plan, naming the record route first, as the
     run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881)."""
     from run_kinds import decision, trained
+
+    from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
 
     root = mixture_directory(tmp_path)
 
