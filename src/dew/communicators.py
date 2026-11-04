@@ -47,6 +47,7 @@ import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxlib.xla_client import LoadedExecutable
 
+from dew import pool
 from dew.cache import dew_cache_dir, package_digest
 from dew.devices import (
     backend_open,
@@ -61,7 +62,6 @@ from dew.devices import (
     pool_bound,
 )
 from dew.files import write_atomically
-from dew.pool import local_gpu_count
 from dew.telemetry.instrumentation import hlo_instructions
 from dew.telemetry.trace import collective
 
@@ -201,14 +201,20 @@ class CommunicatorRoom(ValueError):
                          f"{self.room}, short by {short}")
 
 
+def local_gpus() -> tuple[int, ...] | None:
+    """The GPUs this process's JAX opens, by the driver's ordinals (`dew.pool.local_gpus` under JAX's own
+    selection, `jax_cuda_visible_devices`); None where they could not be counted."""
+    return pool.local_gpus(jax.config.jax_cuda_visible_devices)
+
+
 def configuration() -> dict:
     """What a measurement holds for: this host's GPUs by name and by place (PCI bus id, which their links
     follow), the driver's CUDA version, NCCL's version and every NCCL setting in the environment, each XLA
     flag that sets NCCL's communicators, and the JAX build that makes them."""
-    count = local_gpu_count() or 0
+    gpus = local_gpus() or ()
     flags = os.environ.get("XLA_FLAGS", "").split()
-    return {"gpus": [gpu_name(index) for index in range(count)],
-            "placement": [gpu_place(index) for index in range(count)], "driver": cuda_driver_version(),
+    return {"gpus": [gpu_name(index) for index in gpus],
+            "placement": [gpu_place(index) for index in gpus], "driver": cuda_driver_version(),
             "nccl": nccl_version(), "nccl_env": {name: value for name, value in sorted(os.environ.items())
                                                  if name.startswith("NCCL_")},
             "xla_nccl": [setting for setting in flags if "nccl" in setting], "jax": jax.__version__}
@@ -241,7 +247,7 @@ def needs_of(gpus: int | None = None) -> Needs | None:
     host of fewer than two GPUs, or in a process that asks JAX for no GPU, where no communicator is made."""
     platforms = os.environ.get("JAX_PLATFORMS", "")
     asks_no_gpu = bool(platforms) and not {"cuda", "gpu"} & set(platforms.split(","))
-    count = (local_gpu_count() or 0) if gpus is None else gpus
+    count = len(local_gpus() or ()) if gpus is None else gpus
     if count < 2 or asks_no_gpu:
         return None
     return measured(configuration(), measure=_child)
@@ -250,7 +256,9 @@ def needs_of(gpus: int | None = None) -> Needs | None:
 def _child(configured: Mapping) -> Needs:
     """The measurement a child process of this interpreter makes (`main`), its environment the parent's."""
     began = time.perf_counter()
-    environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
+    # The child opens the GPUs this process does, its selection set in this process or in the environment.
+    environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                   "JAX_CUDA_VISIBLE_DEVICES": jax.config.jax_cuda_visible_devices}
     done = subprocess.run([sys.executable, "-m", "dew.communicators"], capture_output=True,
                           text=True, env=environment, check=False)
     if done.returncode != 0:
@@ -403,8 +411,9 @@ class Sizing:
 
 
 def gpu_memories() -> dict[int, tuple[int, int]]:
-    """Each visible GPU's free and total bytes, by ordinal, as the driver reports them (`gpu_memory`)."""
-    return {index: answered for index in range(local_gpu_count() or 0)
+    """Each GPU this process's JAX opens (`local_gpus`), its free and total bytes by the driver's ordinal, as
+    the driver reports them (`gpu_memory`)."""
+    return {index: answered for index in local_gpus() or ()
             if (answered := gpu_memory(index)) is not None}
 
 
@@ -557,7 +566,7 @@ def main() -> None:
     import jax.numpy as jnp
     import numpy as np
 
-    before = {index: gpu_free_bytes(index) or 0 for index in range(local_gpu_count() or 0)}
+    before = {index: gpu_free_bytes(index) or 0 for index in local_gpus() or ()}
     devices = jax.local_devices()
 
     def held_now() -> dict[int, tuple[int, int]]:
