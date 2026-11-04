@@ -182,7 +182,7 @@
    "lane": "Training"
   },
   "tests/test_deepseek_v41.py": {
-   "comparisons": 10,
+   "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
   "tests/test_depthwise_conv.py": {
@@ -326,7 +326,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
-   "comparisons": 15,
+   "comparisons": 14,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
@@ -590,7 +590,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
@@ -799,10 +799,6 @@
   },
   "tools/diffusers_limits_reference.py": {
    "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tools/diffusers_qwen_image_reference.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tools/diffusers_sd3_reference.py": {

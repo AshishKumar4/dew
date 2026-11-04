@@ -10,16 +10,24 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import fixture_ids, transformers_arms, transformers_model
-from model_support import flat_tree, stepped_outputs
+from interop_support import (
+    clearing_selections,
+    fixture_ids,
+    token_draw,
+    transformers_arms,
+    transformers_model,
+)
+from model_support import decode_steps, flat_tree, stepped_outputs
 from reference_error import (
     FACTOR,
+    as_given,
     assert_as_exact,
     declared_seeds,
     distance,
     indexed_recording,
     recording,
     widened,
+    without_ynn,
 )
 from test_hf_decoders import (
     GEMMA4_MOE,
@@ -601,33 +609,60 @@ def test_deepseek_v4_public_speculation_preserves_padded_rows():
     assert_padded_speculation_is_greedy(source)
 
 
+V4_CHUNKS = (3, 1, 5, 3)
+"""The cached calls' widths: they end both inside and on compressor boundaries, and the third closes
+several windows and must retain the preceding CSA Ca series."""
+V4_CACHED_SEEDS = 16
+"""DeepSeek V4's cached chunks' declared check-1 seeds against transformers' cached chunks, sized by
+`seeds_for` on armada."""
+V4_TRIES = 256
+"""Draws a seed takes to clear V4's selections against transformers' (`clearing_selections`): its
+indexer scores a key every head disagrees with zero, a tie torch's `topk` breaks in no stated order,
+which 1 in 18 of the fixture's two-row draws keeps clear of (22 of 400 on armada), so a seed takes
+under 2e-6 chance of none in this many."""
+
+
 def test_deepseek_v4_cached_chunks_match_transformers():
+    """Calls of `V4_CHUNKS` tokens through the decode cache on par with transformers' calls of the same
+    widths through its own cache, from its float64 twin's (check 1, ledger 2739), over drawn rows whose
+    indexer top-k and routing clear `selection_margins.MARGIN` with no tie at a budget
+    (`clearing_selections`, `stable=False`): a row whose indexer budget ends in keys scored zero is one
+    torch's own cached and uncached calls disagree on by up to 0.3, which its `topk` breaks in no
+    stated order."""
     import torch
 
     from tools.decoder_export_reference import Case, reference_model
 
     source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
-    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
-    cache = source.model.apply(source.variables, ids.shape[0], method=source.model.init_cache,
-                               mutable=['cache'])[1]['cache']
+    model, variables = source.model, source.variables
+    rows = np.load(DEEPSEEK_V4 / 'input_ids.npy').shape[0]
     reference, _ = reference_model(Case('deepseek_v4', 'deepseek-v4-tiny'), DEEPSEEK_V4)
     reference.eval()
     reference.set_attn_implementation('eager')
-    past, begin = None, 0
-    # End calls both inside and on compressor boundaries; the third call
-    # closes several windows and must retain the preceding CSA Ca series.
-    for size in (3, 1, 5, 3):
-        tokens = ids[:, begin:begin + size]
-        actual, updated = source.model.apply(
-            {**source.variables, 'cache': cache}, jnp.asarray(tokens),
-            decode=True, mutable=['cache'])
-        cache = updated['cache']
-        with torch.no_grad():
-            output = reference(input_ids=torch.from_numpy(tokens.astype(np.int64)),
-                               past_key_values=past, use_cache=True)
-        past = output.past_key_values
-        np.testing.assert_allclose(actual, output.logits.numpy(), atol=1e-4, rtol=0)
-        begin += size
+
+    made, step = decode_steps(model, without_ynn)
+
+    @as_given
+    def cached(ids):
+        cache, begin, logits = made(variables, rows), 0, []
+        for size in V4_CHUNKS:
+            out, cache = step(variables, cache, ids[:, begin:begin + size])
+            logits.append(out)
+            begin += size
+        return jnp.concatenate(logits, axis=1)
+
+    def chunked(network, ids):
+        past, begin, logits = None, 0, []
+        for size in V4_CHUNKS:
+            output = network(input_ids=ids[:, begin:begin + size], past_key_values=past, use_cache=True)
+            past, begin = output.past_key_values, begin + size
+            logits.append(output.logits)
+        return torch.cat(logits, 1)
+
+    run, truth = transformers_arms(reference, chunked)
+    draw = clearing_selections(source, token_draw(0x2739, model.vocab_size, (rows, sum(V4_CHUNKS))),
+                               "deepseek_v4 cached chunks", stable=False, tries=V4_TRIES)
+    assert_as_exact(cached, run, draw, "deepseek_v4 cached chunks", seeds=V4_CACHED_SEEDS, truth_fn=truth)
 
 
 def test_deepseek_v4_public_prediction_states_preserve_raw_streams():

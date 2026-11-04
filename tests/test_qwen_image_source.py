@@ -5,15 +5,18 @@
 with its real config and safetensors, and runs each the way
 `QwenImage21Pipeline` runs it for text-to-image, recording the prediction at
 the image's tokens and the gradients of the latent, the prompt states and
-every parameter against a fixed cotangent. A row padded behind a longer
+every parameter against a fixed cotangent, in float32 and in float64 (the
+float64 rule's reference and truth, `one_draw`). A row padded behind a longer
 prompt is recorded as the source's call for its own prompt alone. It also
 saves one tiny pipeline - Qwen3-VL text encoder, 2.1 VAE, transformer,
-published scheduler config, processor - and walks it once per prompt.
+published scheduler config, processor - and walks it once per prompt, in
+float32 and in float64.
 
 The pipeline packs its latent as a plain row-major flatten of the grid, so
 these tests reshape between that and NHWC with numpy's own reshape.
 """
 
+import functools
 import json
 from pathlib import Path
 
@@ -21,7 +24,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays, scaled_gap as relative_gap
+from float64_terms import float64_terms
+from interop_support import extract_fixture, fixture_arrays
+from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import widened
 
 from dew.batch import coordinates
 from dew.diffusion.process import DenoisingCondition
@@ -62,7 +68,8 @@ def transformer_case(source, arrays, name: str):
 
 
 def qwen_walk(source, arrays, record, name: str):
-    """The native forward and every gradient of one case."""
+    """The native forward and every gradient of one case, and the terms each entry's final sums add,
+    from Dew's own path in float64 (`float64_terms`)."""
     model, params, layouts = transformer_case(source, arrays, name)
     rows, columns = record["cases"][name]["grid"]
     latent = jnp.asarray(nhwc(arrays[f"{name}.packed"], rows, columns))
@@ -71,33 +78,49 @@ def qwen_walk(source, arrays, record, name: str):
     times = jnp.asarray(arrays[f"{name}.times"])
     probe = jnp.asarray(nhwc(arrays[f"{name}.probe"], rows, columns))
 
-    def forward(params, latent, context):
-        return model.apply({"params": params}, latent, times, DenoisingCondition(context, mask=mask))
+    def walk(model, params, latent, context):
+        def forward(params, latent, context):
+            return model.apply({"params": params}, latent, times.astype(latent.dtype),
+                               DenoisingCondition(context, mask=mask))
 
-    output, pullback = jax.vjp(forward, params, latent, context)
-    return output, pullback(probe), {entry.name: entry for entry in layouts}
+        output, pullback = jax.vjp(forward, params, latent, context)
+        return output, pullback(probe.astype(output.dtype))
+
+    output, gradients = walk(model, params, latent, context)
+    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+        _, terms = float64_terms(functools.partial(walk, model.clone(dtype=jnp.float64)),
+                                 *widened((params, latent, context)))
+    return output, gradients, terms, {entry.name: entry for entry in layouts}
 
 
 @pytest.mark.parametrize("name", CASES)
 def test_native_qwen_image_matches_the_source_forward_and_every_gradient(
         name, source, arrays, record):
-    """The source at the suite's fixed bounds: 1e-5 scaled error on the
-    prediction, 1e-4 on every gradient, every parameter included."""
+    """The prediction, the latent's and the prompt's gradients and every parameter's, each as near
+    float64 as the source's float32 (the one-draw rule, ledger 2094), an entry whose sum cancels (the
+    queries' and keys' path through the softmax) held to its terms' rounding."""
     rows, columns = record["cases"][name]["grid"]
-    output, (grad_params, grad_latent, grad_context), layouts = qwen_walk(
+    output, (grad_params, grad_latent, grad_context), terms, layouts = qwen_walk(
         source, arrays, record, name)
-    assert relative_gap(output, nhwc(arrays[f"{name}.output"], rows, columns)) < 1e-5
-    assert relative_gap(grad_latent, nhwc(arrays[f"{name}.grad_packed"], rows, columns)) < 1e-4
-    assert relative_gap(grad_context, arrays[f"{name}.grad_context"]) < 1e-4
-    gaps = {}
+    output_terms, (param_terms, latent_terms, context_terms) = terms
+    for key, value, size, packed in (("output", output, output_terms, True),
+                                     ("grad_packed", grad_latent, latent_terms, True),
+                                     ("grad_context", grad_context, context_terms, False)):
+        expected, truth = (arrays[f"{name}.{kind}{key}"] for kind in ("", "fp64."))
+        if packed:
+            expected, truth = nhwc(expected, rows, columns), nhwc(truth, rows, columns)
+        assert_as_exact_as_the_reference(value, expected, truth, f"{name} {key}", terms=size)
     prefix = f"{name}.grad_param."
-    for key in (key for key in arrays if key.startswith(prefix)):
-        tensor = key.removeprefix(prefix)
-        gaps[tensor] = relative_gap(layouts[f"transformer/{tensor}"].export({"params": grad_params}),
-                                    arrays[key])
-    assert len(gaps) == len(layouts) == 27
-    worst = max(gaps.items(), key=lambda item: item[1])
-    assert worst[1] < 1e-4, worst
+    tensors = [key.removeprefix(prefix) for key in arrays if key.startswith(prefix)]
+    assert len(tensors) == len(layouts) == 27
+
+    def exported(tree):
+        return {tensor: np.asarray(layouts[f"transformer/{tensor}"].export({"params": tree}), np.float64)
+                for tensor in tensors}
+
+    assert_leaves_as_exact(exported(grad_params), {tensor: arrays[prefix + tensor] for tensor in tensors},
+                           {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors},
+                           terms=exported(param_terms))
 
 
 def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
@@ -117,7 +140,9 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     np.testing.assert_allclose(run(filled), run(context), atol=1e-6)
     # Without the mask the short row reads its padding as prompt.
     unmasked = model.apply({"params": params}, latent, times, DenoisingCondition(jnp.asarray(context)))
-    assert relative_gap(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1]) > 1e-3
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1],
+                                         nhwc(arrays["padded.fp64.output"], rows, columns)[1], "unmasked")
 
 
 def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
@@ -197,7 +222,8 @@ def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded
         length = expected.shape[0]
         np.testing.assert_array_equal(np.asarray(condition.mask[row]),
                                       np.arange(encoder.tokens) < length)
-        assert relative_gap(condition.context[row, :length], expected) < 1e-5
+        assert_as_exact_as_the_reference(condition.context[row, :length], expected,
+                                         arrays[f"pipeline.fp64.context.{row}"][0], f"prompt {row}")
         assert not np.asarray(condition.context[row, length:]).any()
     assert encoder.captions(encoder.tokenize(prompts)) == tuple(prompts)
     # The pipeline encodes an empty prompt as one space.
@@ -312,12 +338,15 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, r
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     for row, prompt in enumerate(pipeline["prompts"]):
-        expected = nhwc(arrays[f"pipeline.latents.{row}"], rows, columns)[0]
-        assert relative_gap(np.asarray(walked.latents)[row], expected) < 2e-5
-        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5
+        expected, truth = (nhwc(arrays[f"pipeline.{kind}latents.{row}"], rows, columns)[0]
+                           for kind in ("", "fp64."))
+        assert_as_exact_as_the_reference(np.asarray(walked.latents)[row], expected, truth, f"latents {row}")
+        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
+                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")
         alone = task(task.prepare([prompt], initial=initial[row:row + 1], key=0),
                      key=jax.random.PRNGKey(0)).host()
-        assert relative_gap(np.asarray(alone.latents)[0], expected) < 2e-5
+        assert_as_exact_as_the_reference(np.asarray(alone.latents)[0], expected, truth,
+                                         f"latents {row} alone")
 
 
 def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, record, tmp_path):
@@ -387,8 +416,6 @@ def test_diffusers_reads_a_qwen_image_export(tmp_path):
     transformer run on fixed inputs in float32 and float64. The same export
     written here is the one that was read, file for file by SHA-256, and Dew's
     forward on the perturbed weights holds the float64 rule against it."""
-    from one_draw import assert_as_exact_as_the_reference
-
     from tools.qwen_image_export_reference import GRID, digests, perturbed_export
 
     loaded, variables = perturbed_export(tmp_path / "export", tmp_path / "scratch")
