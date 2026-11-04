@@ -142,8 +142,11 @@ class Case:
             return dict(self.config)
         from dew.interop.sources import SourceReference
 
-        # A checkpoint's config.json names the directory holding it.
+        # A checkpoint's config.json names the directory holding it; no other file names a checkpoint.
         named = Path(self.hf_config)
+        if named.is_file() and named.name != "config.json":
+            raise ValueError(f"{self.hf_config} is no checkpoint's config.json; name its checkpoint's "
+                             f"directory, or a Hub repo")
         source = SourceReference.parse(str(named.parent) if named.is_file() else self.hf_config)
         return {**checkpoint_fields(source), **self.config}
 
