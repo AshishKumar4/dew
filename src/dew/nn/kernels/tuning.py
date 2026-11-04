@@ -28,9 +28,10 @@ process has to itself (`dew.cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
-the whole family. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public API
-leaves to its callers. Wall-clock timing is
+the whole family, which `gaps` names for maintainers. Picks persist per GPU model and jaxlib beside XLA's own
+(`dew.cache.kernel_picks_path`), each launch's under the jax it was measured with (Pallas lowers a kernel in
+jax, which a release moves without jaxlib), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public
+API leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
 Tile choice changes a kernel's reduction order, and its error is not
@@ -362,9 +363,46 @@ def loads_launches(text: str) -> list[tokamax.BoundArguments]:
 
 def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
-    them (`_read`): each launch with the configs that ran."""
+    them (`_read`): each launch with the jax it was measured under, its derived config (`gaps`) and
+    the configs that ran."""
     return json.dumps({"device_kind": device_kind, "data": [
-        {**_launch_json(ba), "timings": _timings_json(timings)} for ba, timings in picks]})
+        {**_launch_json(ba), "jax": jax.__version__, "derived": encoded(ba.heuristics_config),
+         "timings": _timings_json(timings)} for ba, timings in picks]})
+
+
+@dataclasses.dataclass(frozen=True)
+class Gap:
+    """A stored launch whose fastest config is not its derived one: a gap in the derivation, which a
+    maintainer fixes for the whole family (bible §6). `derived_ms` is None where the derived config did
+    not run."""
+
+    kernel: str
+    key: str
+    derived: Hashable
+    picked: Hashable
+    derived_ms: float | None
+    picked_ms: float
+
+    @property
+    def gain(self) -> float | None:
+        """The derived config's time over the pick's."""
+        return None if self.derived_ms is None else self.derived_ms / self.picked_ms
+
+
+def gaps(device_kind: str) -> list[Gap]:
+    """The launches stored for GPUs of `device_kind` under this jax whose derived config lost
+    (`Gap`), each named once."""
+    found = []
+    ours, _ = _partitioned(cache.kernel_picks_path(device_kind))
+    for entry, (ba, timings) in ours:
+        derived, fastest = _key(decoded(entry["derived"])), timings.fastest_config
+        if fastest == derived:
+            continue
+        time = timings.get(derived)
+        found.append(Gap(type(ba.op).__name__, str(dict(ba.autotuning_cache_key)), derived, fastest,
+                         time.median_evaluation_time_ms if isinstance(time, tokamax.BenchmarkData) else None,
+                         timings[fastest].median_evaluation_time_ms))
+    return found
 
 
 class _Picks(dict):
@@ -997,30 +1035,41 @@ def _read(path: str) -> tuple[Keyed, list]:
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
     config fields, or another signature of a kernel, with an operand more or
-    one fewer), which a write keeps as they are. An entry is read only where
-    its argument names are exactly its kernel's parameters. Each launch is
-    read alone, so one launch
-    this checkout cannot read leaves the others readable. A missing file, or
-    one that is not JSON, holds nothing."""
-    if not os.path.exists(path):
-        return {}, []
-    try:
-        with open(path) as file:
-            stored = json.load(file)
-        entries = list(stored["data"])
-    except (ValueError, KeyError, TypeError) as error:
-        _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
-        return {}, []
-    read: Keyed = {}
-    foreign = []
-    for entry in entries:
-        try:
-            launch = _launch(entry), _timings(entry.get("timings") if isinstance(entry, dict) else None)
-        except Unreadable:
+    one fewer, or a launch measured under another jax), which a write keeps
+    as they are. An entry is read only where its argument names are exactly
+    its kernel's parameters. Each launch is read alone, so one launch this
+    checkout cannot read leaves the others readable. A missing file, or one
+    that is not JSON, holds nothing."""
+    ours, foreign = _partitioned(path)
+    return _keyed([launch for _, launch in ours]), foreign
+
+
+def _partitioned(path: str) -> tuple[list[tuple[dict, tuple[tokamax.BoundArguments, Timings]]], list]:
+    """The entries of the store at `path` this checkout reads, each with its launch and timings, and the
+    entries it does not (`_read`): another checkout's, or one measured under another jax or written
+    before the store kept its jax."""
+    ours, foreign = [], []
+    for entry in _stored(path):
+        if not isinstance(entry, dict) or entry.get("jax") != jax.__version__:
             foreign.append(entry)
             continue
-        read.update(_keyed([launch]))
-    return read, foreign
+        try:
+            ours.append((entry, (_launch(entry), _timings(entry.get("timings")))))
+        except Unreadable:
+            foreign.append(entry)
+    return ours, foreign
+
+
+def _stored(path: str) -> list:
+    """The entries of the store at `path`, as JSON; none where it is missing or no store."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as file:
+            return list(json.load(file)["data"])
+    except (ValueError, KeyError, TypeError) as error:
+        _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
+        return []
 
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
