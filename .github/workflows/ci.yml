@@ -197,10 +197,12 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about five minutes each on Dew's own armada
-    # deployment, on at most 375 containers (armada's most for one run): with
-    # the gangs' 12, a run holds 387 of the deployment's 725 (its 2900-vCPU
-    # fleet cap, the account's 3000 less the site's) and leaves the rest to the
-    # lanes' own jobs.
+    # deployment, on at most 700 containers (.armada.json's pool): with the
+    # gangs' 12, a run holds up to 712 of the deployment's 725 (its 2900-vCPU
+    # fleet cap, the account's 3000 less the site's). A train's suite fills the
+    # fleet while it runs alone, and armada's priorities share it with a staged
+    # train's and the lanes' jobs, which a train's outranks: the same task-time
+    # on twice the containers of a cap of 375 halves the suite's first wave.
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
