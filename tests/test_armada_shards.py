@@ -355,34 +355,7 @@ def test_a_judge_asks_for_its_later_draws_only_where_its_first_stage_finds_somet
     for more (armada's `more`); once the later map tasks have drawn, the judge over them all judges as one
     that drew every seed (Main, 2026-11-02: the second stage drawn every run, read only where the first
     found something)."""
-    out = site_checkout(tmp_path, f"""import sys
-
-sys.path.insert(0, {str(ROOT / "tests")!r})
-import jax.numpy as jnp
-import numpy as np
-import pytest
-from reference_error import assert_as_exact
-
-
-def draw(seed):
-    rng = np.random.default_rng([2641, seed])
-    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
-            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
-
-
-def halved(x, w):
-    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=40)
-def test_on_par():
-    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=40)
-def test_halved():
-    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
-""")
+    out = site_checkout(tmp_path, GATED)
     entries = planned(ci)
 
     def judged(test: str, drawn: list[dict]) -> dict:
@@ -412,10 +385,89 @@ def test_halved():
         assert whole["first_failure"].partition(":")[0].rpartition(".")[2] == "GateFailure"
 
 
-def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
-    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
-    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
-    those, and the file's own row."""
+GATED = f"""import sys
+
+sys.path.insert(0, {str(ROOT / "tests")!r})
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import assert_as_exact
+
+
+def draw(seed):
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def halved(x, w):
+    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_on_par():
+    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_halved():
+    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
+"""
+"""Two check-1 sites of 16 seeds, each a map task of 40: a product on par, which its first stage decides,
+and a halved one, which its first stage finds something in, so its judge asks for its second stage and then
+fails it."""
+
+
+def test_a_site_whose_last_judgement_needed_its_later_draws_draws_them_in_the_first_wave(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Check 1 as armada runs a site with the test cache on, each task recording its row on its class: a
+    judge that needed its later map tasks (it asked for them, then judged them all) says so in its row, and
+    the next plan of its file, its inputs changed, draws them in the first wave beside its first stage's, the
+    judge then asking for nothing; a site its first stage decided keeps them later. The halved site's judge is
+    red, its record keyed by nothing, and the plan reads it all the same."""
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, GATED)
+
+    def judged(test: str, drawn: list[dict], entries: dict[str, dict], run: str) -> dict:
+        inputs = tmp_path / f".verdict/inputs-{run}-{test}-{len(drawn)}"
+        for index, entry in enumerate(drawn):
+            assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        assert entry_task(ci, monkeypatch, judge, out, artifacts=tmp_path / f".verdict/judge-{run}-{test}",
+                          inputs=inputs) == 0
+        [row] = json.loads(out.read_text())["rows"]
+        return row
+
+    def maps(entries: dict[str, dict], test: str) -> list[dict]:
+        return [entries[name] for name in entries[ci.site_task("3.12", "tests/test_site.py", test)]["after"]]
+
+    def waves(entries: dict[str, dict], test: str) -> list[bool]:
+        return [entry.get("later", False) for entry in maps(entries, test)]
+
+    entries = planned(ci)
+    assert waves(entries, "test_on_par") == waves(entries, "test_halved") == [False, True, True]
+    first = judged("test_on_par", maps(entries, "test_on_par")[:1], entries, "first")
+    assert (first["exitCode"], first.get("check1_later")) == (0, False)
+    halved = maps(entries, "test_halved")
+    asked = judged("test_halved", halved[:1], entries, "first")
+    assert (asked["exitCode"], asked.get("more"), asked.get("check1_later")) == (1, True, True)
+    whole = judged("test_halved", halved, entries, "first")
+    assert (whole["exitCode"], whole.get("more"), whole.get("check1_later")) == (1, None, True)
+    # The file changed, so both sites run again: the halved site's later draws are in the first wave.
+    source = tmp_path / "tests/test_site.py"
+    source.write_text(source.read_text() + "\n# changed\n")
+    again = planned(ci)
+    assert (waves(again, "test_on_par"), waves(again, "test_halved")) == ([False, True, True],
+                                                                          [False, False, False])
+    # Its judge over them all asks for nothing, and judges as the one that asked did.
+    eager = judged("test_halved", maps(again, "test_halved"), again, "again")
+    assert (eager["exitCode"], eager.get("more"), eager.get("check1_later")) == (1, None, True)
+    assert eager["first_failure"].partition(":")[0] == whole["first_failure"].partition(":")[0]
+
+
+def cached_checkout(ci, tmp_path: Path, monkeypatch, cache_worker, site: str) -> Path:
+    """Site `site`'s checkout (`site_checkout`) with the test cache on at the Worker standing in, its tasks
+    pinned to one CPU class and the plan reading with its read token, as CI runs it: where its verdict is
+    written."""
     out = site_checkout(tmp_path, site)
     url, _, _ = cache_worker
     monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
@@ -424,6 +476,14 @@ def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: 
     config = json.loads((ROOT / ".armada.json").read_text())
     config["task"]["cpu"] = {"vendor": "GenuineIntel", "family": 6, "model": 143}
     (tmp_path / ".armada.json").write_text(json.dumps(config))
+    return out
+
+
+def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
+    """Site `site`'s run as armada runs it with the test cache on, each task recording its rows: its map
+    tasks, its later ones too where `later` (its judge's first stage asked for them), then its judge over
+    those, and the file's own row."""
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker, site)
     entries = list(planned(ci).values())
     [judge] = [entry for entry in entries if "after" in entry]
     inputs = tmp_path / ".verdict/inputs"
