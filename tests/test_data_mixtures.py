@@ -1527,6 +1527,33 @@ def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route
     assert (int(state.step), int(state.microstep), int(state.updates)) == (4, 2, 1)
 
 
+def test_a_resumed_runs_step_compiled_ahead_reads_the_batch_its_resume_reads(tmp_path):
+    """The batch a resumed run's first step is compiled ahead over and inspected on (`first_step_batch`) is
+    the one its resume reads: its stream cut as fit cuts it, each ramp stage beginning where an update of
+    its accumulation does. A ramp of a step of eight records, one of sixteen, then twenty-four, read two
+    steps to an update, reads two of eight and then twenty-four, its stage of sixteen dropped where no
+    update begins it: resumed after its first update, its next step reads the twenty-four records after
+    the first sixteen, where the stream cut a step at a time reads sixteen (row 3917)."""
+    from dew.training.ahead import first_step_batch
+
+    records, seed = 4096, 7
+    ramp = Ramp(start=8, increment=8, samples=16)
+    stream = ramped(indexed_data(records, 24, seed), ramp).train(DataPartition(window=2))
+    try:
+        read = [np.asarray(batch["id"]).tolist() for batch in itertools.islice(stream, 3)]
+    finally:
+        stream.close()
+
+    def trainer():
+        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                       layout=Layout(min_shard=1, tolerance=1.0),
+                       checkpoints=Checkpoints(str(tmp_path / "run"), keep=8))
+
+    trainer().fit(ramped(indexed_data(records, 24, seed), ramp), steps=2, log_every=100, checkpoint_every=2)
+    batch = first_step_batch(trainer(), ramped(indexed_data(records, 24, seed), ramp), steps=6)
+    assert np.asarray(batch["id"]).tolist() == read[2] and [len(ids) for ids in read] == [8, 8, 24]
+
+
 def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():
     """Every stage's start moves to the update boundary at or after its own, not after the moved
     start before it, so no stage drifts past its end; a stage whose start and the next's meet

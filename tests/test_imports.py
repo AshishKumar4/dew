@@ -168,11 +168,13 @@ data, its text encoders' decoder blocks its own; a decision task's no image gene
 the vision towers its multimodal reader reads its own (row 2042); and the shared modules an objective, a
 sampler or a model imports (row 2043): a LoRA reads a stack's layer names, not its plan's mixers; a
 sampler's tokens and rounding stream and a saved run's record are the categorical's, the precision's and
-the records' own, not an objective's."""
+the records' own, not an objective's; and a source's causality walk reads the programs an equation runs
+as `dew.nn.programs` reads them, not as training's compiled program does (row 3959)."""
 FOREIGN |= {"dew.lora": ("dew.nn.backbones.layer_plan", "dew.nn.mixer_base", "dew.objectives"),
             "dew.sampling.text": ("dew.objectives",),
             "dew.sampling.strategies": ("dew.objectives",),
-            "dew.inference.tasks": ("dew.objectives",)}
+            "dew.inference.tasks": ("dew.objectives",),
+            "dew.interop.sequence_causality": ("dew.training",)}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
