@@ -221,6 +221,13 @@ default records the configuration it always did (a data step's identity, `dew.da
 and resumes under this Dew, and one that sets it records it (`set_added`)."""
 
 
+SAVED = "saved"
+"""The metadata key of a configuration field whose meaning a run saved before it existed held: a record that
+names none reads it as this value (`dew.registry._declared`), where a new configuration takes the field's
+default. A changed default keeps every saved run as it ran: a decision run's option text (`named`, its rows'
+writing before `QuestionLayout.option_text`), where a new run's layout writes its own."""
+
+
 def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[str, DataclassInstance] | JSON
               ) -> bool:
     """Whether `value`, a configuration, or one it holds (in a sequence or a mapping), sets a field added

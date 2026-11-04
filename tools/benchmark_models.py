@@ -2,6 +2,7 @@
 
 import contextlib
 import dataclasses
+import functools
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
@@ -55,6 +56,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
+from dew.training.ahead import step_batch
 from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
@@ -432,12 +434,15 @@ class CompiledStep:
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
     """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
     with the trials a run's compile takes (`Trials`), which profile only its admitted step where
-    JAX's AutoPGLE asks, on a copy of the state, and yield it.
+    JAX's AutoPGLE asks, on a copy of the state, and yield it. Each batch is the one `fit` hands its step
+    (`step_batch`: its rows marked, its work counted, its host fields apart), so the step is the program a
+    run's first step compiles.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.
     """
-    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
+    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh,
+                                prepare=functools.partial(step_batch, trainer)) as source:
         state, _, _ = trainer.place()
         first = next(source)
         jax.block_until_ready((state, first))
