@@ -315,12 +315,13 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
 
 def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_changed_default(tmp_path):
     """A decision mixture read in Grain's schedule (`order="schedule"`), as one saved before its corpus
-    order was seeded read, saves its position; its chain built as it was resumes there and reads on as
-    the uninterrupted read does (a decision chain parses its examples in code, which no record holds, so
-    its command is its record), and the command left at today's default, which seeds the order, is
-    refused that position, its plan's order another (row 3870)."""
+    order was seeded read, saves its position; its chain read back from its record (`dew.data.records`,
+    the route a run takes from its run.json, row 3874) and its chain built as it was each resume there
+    and read on as the uninterrupted read does, and the command left at today's default, which seeds
+    the order, is refused that position, its plan's order another (row 3870)."""
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
+    from dew.data.records import decode, encode
 
     root = tmp_path / "mixture"
     root.mkdir()
@@ -344,9 +345,10 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     reader = loader(saved)
     states(next(reader) for _ in range(2))
     position = reader.get_state()
-    again = loader(mixture(str(root), order="schedule")[0])
-    again.set_state(position)
-    assert states(next(again) for _ in range(4)) == whole[8:]
+    for rebuilt in (decode(json.loads(json.dumps(encode(saved)))), mixture(str(root), order="schedule")[0]):
+        again = loader(rebuilt)
+        again.set_state(position)
+        assert states(next(again) for _ in range(4)) == whole[8:]
     changed = loader(mixture(str(root))[0])
     with pytest.raises(ValueError):
         changed.set_state(position)
