@@ -19,17 +19,13 @@ def test_resident_device_bytes_do_not_include_host_state():
 
 
 def test_a_marked_spans_peak_is_its_bodys_as_xla_inlines_it():
-    """A marked span (`dew.nn.derivatives.marked`, an error-free transform's `Protected` among them) lowers
-    to its body in the caller, as a call does (`dew.nn.programs.CALLS`): its derived peak and residuals are
-    the inline body's, its sum and its compensation fused into their reader, where read as an opaque op
-    each held a buffer of its own (row 3830)."""
-    from dew.nn.derivatives import Protected, marked
+    """A marked span (`dew.nn.derivatives.marked`, an error-free transform's `Protected` among them:
+    `precision.two_sum`) lowers to its body in the caller, as a call does (`dew.nn.programs.CALLS`): its
+    derived peak and residuals are the inline body's (`two_sum.__wrapped__`), its sum and its
+    compensation fused into their reader, where read as an opaque op each held a buffer of its own (row
+    3830)."""
+    from dew.nn.precision import two_sum
     from dew.training.footprint import derived_terms
-
-    def two_sum(a, b):
-        total = a + b
-        rounded = total - a
-        return total, (a - (total - rounded)) + (b - rounded)
 
     def loss(weights, x, *, span):
         total, error = span(jnp.tanh(x @ weights), jnp.sin(x @ weights))
@@ -43,7 +39,8 @@ def test_a_marked_spans_peak_is_its_bodys_as_xla_inlines_it():
                                         platform="gpu", workspace=Workspace(0, 0))
         return residuals, peak.bytes
 
-    assert derived(marked(Protected(), two_sum)) == derived(two_sum)
+    assert derived(two_sum) == derived(two_sum.__wrapped__)
+
 
 def test_a_pullback_counts_new_residuals_not_input_storage():
     """On a CPU the exponential needed to differentiate exp is new storage, an expensive value XLA keeps.
