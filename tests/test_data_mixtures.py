@@ -626,8 +626,9 @@ def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares
 def test_a_seeded_mix_is_its_own_record_and_plan_and_ends_where_a_corpus_would_read_past_its_records():
     """A seeded mix's record carries its seed (`dew.data.records`): read back, it reads its corpora in the
     order it did. Its plan names the seed, so a plan of another seed refuses it (`Plan.check`) where one of
-    its own resumes, as a shuffle's streamed window names its own. Read by index or streamed, a seeded mix of corpora too short for a whole window ends
-    at the first position that would read past one, alike either way, each record once."""
+    its own resumes, as a shuffle's streamed window names its own. Read by index or streamed, a seeded mix
+    of corpora too short for a whole window ends at the first position that would read past one, alike
+    either way, each record once."""
     from dew.data.records import decode, encode
 
     def corpus(start: int, size: int) -> Pipeline:
