@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from float64_terms import float64_terms
 from interop_support import extract_fixture, fixture_arrays
-from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import widened
 
 from dew.batch import coordinates
@@ -114,13 +114,13 @@ def test_native_qwen_image_matches_the_source_forward_and_every_gradient(
     tensors = [key.removeprefix(prefix) for key in arrays if key.startswith(prefix)]
     assert len(tensors) == len(layouts) == 27
 
-    def exported(tree):
-        return {tensor: np.asarray(layouts[f"transformer/{tensor}"].export({"params": tree}), np.float64)
-                for tensor in tensors}
+    def exported(tree, tensor):
+        return np.asarray(layouts[f"transformer/{tensor}"].export({"params": tree}), np.float64)
 
-    assert_leaves_as_exact(exported(grad_params), {tensor: arrays[prefix + tensor] for tensor in tensors},
-                           {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors},
-                           terms=exported(param_terms))
+    for tensor in tensors:
+        assert_as_exact_as_the_reference(exported(grad_params, tensor), arrays[prefix + tensor],
+                                         arrays[f"{name}.fp64.grad_param.{tensor}"],
+                                         f"{name} {tensor}'s gradient", terms=exported(param_terms, tensor))
 
 
 def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
