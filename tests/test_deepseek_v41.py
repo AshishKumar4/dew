@@ -409,33 +409,44 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     counts, the block the decode ops draft is the one the drafter drafts
     uncached over each row's real history: the prompt's and the stretch's
     context reach its windows at their own positions. Two runs each within
-    FACTOR of the reference's rounding lie within twice that of each other."""
+    FACTOR of the reference's rounding lie within twice that of each other.
+    Each side is one compiled program, where run op by op they took two
+    minutes of the test on armada (3820)."""
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    ops = decode_ops(plain, loaded.variables, 0, 0)
-    assert ops.record is not None and ops.draft is not None and ops.verify is not None
-    state, _ = prefill_state(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
     kept = jnp.asarray([3, 1])
-    keep = jnp.arange(3)[None, :] < kept[:, None]
-    state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
-    assert context is not None
-    state = ops.record(state, context, keep)
-    drawn, scored = ids[:, prompt + 3], []
+    drawn = ids[:, prompt + 3]
 
-    def choose(index, logits):
-        scored.append(logits)
-        return jnp.argmax(logits, axis=-1)
+    @jax.jit
+    def drafted(variables):
+        ops = decode_ops(plain, variables, 0, 0)
+        assert ops.record is not None and ops.draft is not None and ops.verify is not None
+        state, _ = prefill_state(plain, variables, ModelInputs(ids[:, :prompt]), ops)
+        keep = jnp.arange(3)[None, :] < kept[:, None]
+        state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
+        assert context is not None
+        state = ops.record(state, context, keep)
+        scored = []
 
-    ops.draft(state, drawn, choose)
+        def choose(index, logits):
+            scored.append(logits)
+            return jnp.argmax(logits, axis=-1)
+
+        ops.draft(state, drawn, choose)
+        return jnp.stack(scored, 1)
+
+    @jax.jit
+    def uncached(variables, history, token):
+        _, sown = plain.apply(variables, history, mutable=["prediction_inputs"])
+        whole = plain.apply(variables, sown["prediction_inputs"], method="draft_context")
+        return plain.apply(variables, whole, token, decode=False, method="draft")[1]
+
+    scored = drafted(loaded.variables)
     for row in range(2):
-        history = ids[row:row + 1, :prompt + int(kept[row])]
-        _, sown = plain.apply(loaded.variables, history, mutable=["prediction_inputs"])
-        whole = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
-        _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
-                                   method="draft")
-        assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+        logits = uncached(loaded.variables, ids[row:row + 1, :prompt + int(kept[row])], drawn[row:row + 1])
+        assert distance(scored[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
 
 
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
