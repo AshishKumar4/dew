@@ -19,6 +19,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    modelled,
+    part_count,
     stated,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
@@ -163,9 +165,13 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         entry, out_type=() if grouped else (gradient, gradient), grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused",
-        # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
-        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
-                    dout))
+        # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
+        # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+                    width + 2 * value.shape[-1] + 2 * part_count(query.dtype, walk.accurate) * width,
+                    query, key, value, dout),
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
+                             2 * width + 2 * value.shape[-1]))
     # dQ added into zeros in place, and grouped dK and dV in one ref of both (`mosaic.stacked_zeros`): one
     # copy, or dQ each consumer's own interpreted (`Family.added`), a consumer's keys its own.
     copies = consumers if walk.interpret else 1

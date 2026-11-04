@@ -32,10 +32,12 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost, product, report, resources
 from dew.nn.sharding import per_shard
+from dew.telemetry.instrumentation import MODEL_FLOPS
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
 Operand = Ref | jax.Array
@@ -126,10 +128,11 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           reduction_scratch: int = 0, resident: int = 1) -> Callable:
+           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
-    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`)."""
+    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
+    the hardware's work and `model_flops` the model's share of it (`checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(dependent(entry, interpret), out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
@@ -138,7 +141,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                          interpret=interpreted(interpret),
                          kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
-    return checked(built, name or family, resident)
+    return checked(built, name or family, resident, model_flops)
 
 
 def dependent(entry: Callable, interpret) -> Callable:
@@ -170,12 +173,20 @@ _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", defa
 raise their registers to that residency's share (`roles`)."""
 
 
-def checked(built: Callable, kernel: str, resident: int = 1) -> Callable:
+def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None) -> Callable:
     """The launch `built`, each call checked against the mesh it runs in (`per_shard`) and traced at its
     residency (`_RESIDENT`): a launch built once for every call of its facts checks each call's own; and
     refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
-    `stacked_zeros` makes one ref (row 3180)."""
+    `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
+    its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
+    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads."""
     def launch(*operands):
+        if model_flops is not None:
+            with set_xla_metadata(**{MODEL_FLOPS: str(model_flops)}):
+                return checked_launch(*operands)
+        return checked_launch(*operands)
+
+    def checked_launch(*operands):
         per_shard(kernel)
         refs = [jax.typeof(operand) for operand in operands if _is_ref(operand)]
         kinds = [(ref.shape, ref.dtype) for ref in refs]
@@ -1417,7 +1428,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
@@ -1425,7 +1436,8 @@ class Transport[Allocated, Opened](abc.ABC):
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
         `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
         programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
-        work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`); its
+        hardware's work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`),
+        and `model_flops`, the model's share of it, where its own recomputation is the rest (`checked`); its
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`)."""
 
@@ -1700,13 +1712,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1, cost: pl.CostEstimate | None = None,
+               cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
-                      name=name, approx_math=approx_math, cluster=cluster, cost=cost, resident=resident,
+                      name=name, approx_math=approx_math, cluster=cluster, cost=cost,
+                      model_flops=model_flops, resident=resident,
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch

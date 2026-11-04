@@ -67,6 +67,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     issued_into,
+    modelled,
     reducing,
     refused,
     score_places,
@@ -1084,16 +1085,19 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         else:
             pl.when(_walked_program(program, walks, lax.axis_index("batch"), queries))(scoped_body)
 
-    # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
-    # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
-    # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
-    widths = width if peaks else value_width if training else width + value_width
-    cost = (stated(spec, batch, heads, spec.queries or queries, widths, query, key, value) if counted
+    # The products this launch issues (`stated`), and the model's of them it owns (`modelled`): the forward's
+    # two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed; a rerun (a guarded
+    # launch, the fold's natural walk) none, as the FLOP count bounds a conditional by every branch, which
+    # would count the call twice.
+    issued = width if peaks else width + value_width
+    owned = width if peaks else value_width if training else width + value_width
+    cost = (stated(spec, batch, heads, spec.queries or queries, issued, query, key, value) if counted
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
+    model = modelled(spec, batch, heads, spec.queries or queries, owned) if counted else 0
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair * splits, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
-                         approx_math=approx_math, name=name, cost=cost,
+                         approx_math=approx_math, name=name, cost=cost, model_flops=model,
                          reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod,
                                                       guarded=read.guard is not None)
                          )(query, key, value, *leaves)

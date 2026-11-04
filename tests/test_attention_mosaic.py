@@ -1587,12 +1587,7 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     walk in a conditional, whose products the count bounds apart."""
     import re
 
-    from dew.nn.kernels.templates import report
     from dew.telemetry.instrumentation import _stated_flops, hlo_flops
-
-    def step_flops_of(text):
-        # Each launch's model share as it declared it this process (`report.declared_model_flops`).
-        return hlo_flops(text, declared=report.declared_model_flops())
 
     rows, heads, kv_heads, width = 1, 4, 2, 64
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
@@ -1610,7 +1605,8 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
             text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
         launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
         assert launches and all(_stated_flops(line) is not None for line in launches)
-        flops = step_flops_of(text)
+        flops = hlo_flops(text)
+        assert flops is not None
         return flops.model, flops.hardware
 
     def trained(query, key, value):

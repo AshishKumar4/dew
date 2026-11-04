@@ -24,6 +24,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     holders,
     issued_into,
+    modelled,
+    part_count,
     reducing,
     split_queries,
     stated,
@@ -488,11 +490,17 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
-        # The model's products this launch owns (`stated`): its shares of dK's and dV's, dP's in the first
-        # share's and dQ's where it adds it; its `S` (and a later share's dP) recomputed.
+        # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
+        # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it owns
+        # (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
-                    (width if walk.fused else 0) + shares[0][1] + shares[1][1]
-                    + (value_width if shares[0][0] == 0 else 0), query, key, value, dout))
+                    width + value_width + shares[1][1]
+                    + part_count(query.dtype, walk.accurate)
+                    * (shares[0][1] + (width if walk.fused else 0)),
+                    query, key, value, dout),
+        model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
+                             (width if walk.fused else 0) + shares[0][1] + shares[1][1]
+                             + (value_width if shares[0][0] == 0 else 0)))
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                 score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward
