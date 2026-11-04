@@ -1587,7 +1587,7 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     walk in a conditional, whose products the count bounds apart."""
     import re
 
-    from dew.telemetry.instrumentation import _stated_flops, hlo_flops
+    from dew.telemetry.instrumentation import _MODEL_FLOPS, _stated_flops
 
     rows, heads, kv_heads, width = 1, 4, 2, 64
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
@@ -1600,14 +1600,16 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def counted(fn, *arrays):
-        """The launches' stated hardware work and the model's share of it each declares (`hlo_flops`)."""
+        """The model's share of the launches' work each declares (`instrumentation.MODEL_FLOPS`) and the
+        hardware's work each states."""
         with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
             text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
         launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
         assert launches and all(_stated_flops(line) is not None for line in launches)
-        flops = hlo_flops(text)
-        assert flops is not None
-        return flops.model, flops.hardware
+        declared = [_MODEL_FLOPS.search(line) for line in launches]
+        assert all(declared)
+        return (sum(float(found.group(1)) for found in declared if found),
+                sum(_stated_flops(line) or 0.0 for line in launches))
 
     def trained(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.SPLIT)
