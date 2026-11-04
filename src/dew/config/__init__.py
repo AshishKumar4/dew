@@ -1254,6 +1254,17 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
+def _holds(config: "RunConfig", path: str) -> bool:
+    """Whether `config` holds every record along the dotted `path` up to its field: false past an optional
+    record it holds none of (a teacher of None)."""
+    held: object = config
+    for group in path.split(".")[:-1]:
+        held = getattr(held, group, None)
+        if held is None:
+            return False
+    return True
+
+
 def _recorded_at(config: "RunConfig", path: str) -> JSON:
     """The value `config`'s record holds at the dotted `path` (`_placed`), as `override` writes it."""
     *groups, field = _placed(config, path)[0]
@@ -1711,14 +1722,15 @@ class RunConfig:
         (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
         build."""
         trainer = self.trainer
-        unset = [path for path in self.BUILT if _recorded_at(self, path) is None]
+        unset = [path for path in self.BUILT if _holds(self, path) and _recorded_at(self, path) is None]
         if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
             return self
         saved = self._saved_record(trainer.directory(trainer.name))
         recorded = None if saved is None else self._saved_as(saved)
         if recorded is None:
             return self
-        return self.override({path: _recorded_at(recorded, path) for path in unset})
+        # A field of a record the saved run held none of (a teacher it had not) takes nothing.
+        return self.override({path: _recorded_at(recorded, path) for path in unset if _holds(recorded, path)})
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`

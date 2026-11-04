@@ -44,6 +44,11 @@ class Residuals(Objective[Ratio | NormalEquations | RowEquations]):
         jacobian, residual = self._linearized(variables, batch, step)
         rows, size = residuals.shape[0], jacobian.shape[1]
         per_row = jacobian.shape[0] // rows
+        # The system is the real rows' alone, as the loss counts them (`row_weights`): a row the batch marks
+        # unreal (an exhausted share's, row 3929) is selected to zero, its residuals and their Jacobian.
+        real = jnp.repeat(self.row_weights(batch, rows) > 0, per_row)
+        jacobian = jnp.where(real[:, None], jacobian, jnp.zeros((), jacobian.dtype))
+        residual = jnp.where(real, residual, jnp.zeros((), residual.dtype))
         # The update's examples, of which this microbatch's rows are a share (the trainer's geometry).
         update = rows if step.example_count is None else step.example_count
         held = jnp.asarray(rows, jnp.float32)

@@ -1114,6 +1114,9 @@ class Trainer(Generic[Loss, Effects]):
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, probes, search, above)
+        if self._staging.read_whole:
+            # A transformation given built that kept every layer whole on every stage (`StageLocal.of`).
+            self.plan = {**self.plan, "layers_whole_for": list(self._staging.read_whole)}
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
