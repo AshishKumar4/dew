@@ -673,7 +673,9 @@ def test_both_dispatches_carry_the_same_tangents(activation):
     host = jax.devices("cpu")[0]
     wide = jax.jit(jvp(model.clone(dispatch='global', dtype=jnp.float64)))
 
+    @as_given
     def truth(*inputs):
+        """Its inputs moved to the host, then `wide` run there: a placement, which the gate runs as given."""
         with jax.default_device(host):
             return wide(*jax.device_put(inputs, host))
 
