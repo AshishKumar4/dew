@@ -850,23 +850,9 @@ def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFam
     (`translate_weights`; a gradient rearranges as its parameter does), the truth
     Dew's decoder of the same record and weights in float64. Per parameter, so a wrong gradient of a
     small one is not hidden by another's rounding."""
-    ids, cotangent = _probe_draw()
-    return _parity_of(_probe_gradients(reference, ids, cotangent, train=False)[1], reference, family, record,
-                      variables)
-
-
-def _probe_draw() -> tuple[np.ndarray, np.ndarray]:
-    """The probe's ids and the cotangent its logits' gradients are taken against (`gradient_parity`)."""
-    return (probe_ids(_VOCAB),
-            np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32))
-
-
-def _parity_of(theirs: Mapping[str, np.ndarray], reference: PreTrainedModel,
-               family: decoder_parts.DecoderFamily, record: decoder_parts.DecoderFields,
-               variables: Variables) -> float:
-    """`gradient_parity` of the source's eval-mode gradients `theirs` over the probe's draw (`_probe_draw`),
-    by its parameters' names, against Dew's."""
-    ids, cotangent = _probe_draw()
+    ids = probe_ids(_VOCAB)
+    cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
+    _, theirs = _probe_gradients(reference, ids, cotangent, train=False)
     stored = _as_stored(reference, theirs)
     their_tree = flax_traverse.flatten_dict(decoders.translate_weights(stored, record, family)['params'])
 
@@ -909,7 +895,8 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
     not show). `_Mismatch` names what differs."""
     for path, attribute in assembly.dropouts:
         setattr(reference.get_submodule(path), attribute, 0.0)
-    ids, cotangent = _probe_draw()
+    ids = probe_ids(_VOCAB)
+    cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
     trained, evaluated = (_probe_gradients(reference, ids, cotangent, train=train) for train in (True, False))
     if not (np.array_equal(trained[0], evaluated[0]) and trained[1].keys() == evaluated[1].keys()
             and all(np.array_equal(trained[1][key], evaluated[1][key]) for key in trained[1])):
@@ -918,8 +905,7 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
     with tempfile.TemporaryDirectory() as folder:
         reference.save_pretrained(folder)
         variables = decoders.translate_weights(sources.load_shards(Path(folder)), record, family)
-    # The eval-mode gradients just probed are `gradient_parity`'s, a third run of the source not taken.
-    parity = _parity_of(evaluated[1], reference, family, record, variables)
+    parity = gradient_parity(reference, family, record, variables)
     if not parity <= _GRADIENT_PARITY:
         raise _Mismatch(f"{name}'s gradients are {parity:.2f} times as far from the float64 truth as Dew's, "
                         f"past the {_GRADIENT_PARITY:.0f} that tells rounding from another backward")
