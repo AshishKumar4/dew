@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, ove
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import JSON, integer, record, text
+from dew._records import ADDED, JSON, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -578,6 +578,9 @@ class Shuffle:
     seed: int
     window: int | None = None
     block_shards: int | None = None
+    streamed: int | None = dataclasses.field(default=None, repr=False, metadata={ADDED: True})
+    """Where `window` is None, the records a streamed read draws its order from, whose records no index
+    permutes whole (`Pipeline.shuffle`); None for a shuffle a streamed read refuses."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1098,19 +1101,23 @@ class Dataset:
                                                   for stage in self.stages)
 
     def shuffle(
-        self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None
+        self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None,
+        streamed: int | None = None,
     ) -> Pipeline:
         """The records in an order drawn from `seed`: whole, within a `window` of records, or by blocks of
-        `block_shards` physical shards. The seed is 0 where none is given, where Grain derives an unseeded
-        shuffle from its pipeline's seed (`ds.seed`), in Dew the run's (`compile(seed=)`): this stage's
+        `block_shards` physical shards; or whole where the read is indexed and within `streamed` records
+        where it streams, as the read the run takes decides. The seed is 0 where none is given, where Grain
+        derives an unseeded shuffle from its pipeline's seed (`ds.seed`), in Dew the run's
+        (`compile(seed=)`): this stage's
         order is the chain's own, the one every run of the chain reads and its saved plan names, so a run's
         seed changes neither it nor what a resume reads by it. What the run's seed does draw are its random
         steps and the order a streamed read deals its physical shards in (`dew.data.shards.streamed`)."""
-        if window is not None and block_shards is not None:
-            raise ValueError("shuffle uses a window or physical shard blocks, not both")
-        if block_shards is not None and block_shards < 1:
-            raise ValueError("block_shards must be positive")
-        return self._then(Shuffle(seed, window, block_shards))
+        if sum(given is not None for given in (window, block_shards, streamed)) > 1:
+            raise ValueError("shuffle uses a window, physical shard blocks or a streamed read's window, "
+                             "one of them")
+        if any(given is not None and given < 1 for given in (block_shards, streamed)):
+            raise ValueError("block_shards and streamed are counts of at least one")
+        return self._then(Shuffle(seed, window, block_shards, streamed))
 
     def repeat(self, epochs: int | None = None) -> Pipeline:
         return self._then(Repeat(epochs))
