@@ -113,7 +113,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
+from interop_support import (
+    assert_decodes_as_it_scores,
+    fixture_ids,
+    respelled,
+    transformers_arms,
+    transformers_model,
+)
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, declared_seeds, recording
@@ -1372,21 +1378,14 @@ def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(g
 
 
 def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
-    source = glm5_next_source
-    model, variables = source.model, source.variables
-    ids = jnp.asarray(np.load(source.source / 'input_ids.npy'), jnp.int32)
-    full = np.asarray(model.apply(variables, ids))
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply(
-            {**variables, **state}, ids[:, index : index + 1], decode=True, mutable=["cache"]
-        )
-        pieces.append(np.asarray(out))
-    actual = np.concatenate(pieces, axis=1)
-    assert scaled_difference(actual, full) < 1e-4
-    np.testing.assert_array_equal(actual.argmax(-1), full.argmax(-1))
+    """A prefill and single-token steps on par with the parallel forward at each step's width from float64
+    over drawn rows that clear its indexer's and its routing's selections (check 1, ledger 2739)."""
+    assert_decodes_as_it_scores(glm5_next_source, "glm5_next decode", seeds=GLM5_DECODE_SEEDS, prefill=4,
+                                length=12, salt=0x2739)
+
+
+GLM5_DECODE_SEEDS = 8
+"""GLM-5 next's cached decode's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])

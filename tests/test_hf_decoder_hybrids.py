@@ -11,12 +11,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from interop_support import assert_decodes_as_it_scores
 from model_support import flat_tree
 from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
+DECODE_SEEDS = {"qwen35": 8, "qwen3_next": 8, "gemma3n": 32}
+"""Each checkpoint's declared check-1 seeds for its cached decode against its parallel forward, sized by
+`seeds_for` on armada."""
 
 # --------------------------------------------------------------------------
 # Gemma 4 gaps: per-layer input embeddings and cross-layer KV sharing
@@ -184,30 +189,12 @@ def test_qwen35_logits_match_the_reference_implementation():
 
 
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
-    """The loaded weights through the cache: a prefill and single-token
-    steps against the parallel forward, every argmax equal. Largest
-    observed logit difference 1.3e-05. The products run in float32, which
-    a GPU's default precision rounds through TF32, so that the two orders
-    differ by float32's rounding there too."""
-    directory = FIXTURES / "qwen35-tiny"
-    model, variables = fp32_decoder(directory, max_seq_len=16)
-    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-    with jax.default_matmul_precision("highest"):
-        full = jnp.asarray(model.apply(variables, ids))
-        cache = model.apply(variables, ids.shape[0], method="init_cache",
-                            mutable=["cache"])[1]["cache"]
-        logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
-                                      decode=True, mutable=["cache"])
-        steps = [logits[:, -1]]
-        for position in range(4, ids.shape[1]):
-            logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
-                                          decode=True, mutable=["cache"])
-            steps.append(logits[:, -1])
-    incremental = jnp.stack(steps, axis=1)
-
-    difference = float(jnp.abs(full[:, 3:] - incremental).max())
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+    """The loaded weights through the cache: a prefill and single-token steps on par with the parallel
+    forward at each step's width from float64 over drawn rows (check 1, ledger 2739)."""
+    assert_decodes_as_it_scores(Pretrained.load(FIXTURES / "qwen35-tiny", dtype="float32", max_seq_len=16,
+                                                attention_impl="reference"),
+                                "qwen35 decode", seeds=DECODE_SEEDS["qwen35"], prefill=4, length=12,
+                                salt=0x2739)
 
 
 # --------------------------------------------------------------------------
@@ -284,28 +271,13 @@ def test_the_fused_delta_net_projection_is_read_by_key_head_group():
 
 
 def test_a_qwen3_next_checkpoint_decodes_as_it_scores_in_parallel():
-    """The fused delta net's conv and recurrent states through the cache: a
-    prefill and single-token steps against the parallel forward, every
-    argmax equal."""
-    model, variables = fp32_decoder(QWEN3_NEXT, max_seq_len=16)
-    ids = jnp.asarray(np.load(QWEN3_NEXT / "input_ids.npy"), jnp.int32)
-    full = jnp.asarray(model.apply(variables, ids))
-
-    cache = model.apply(variables, ids.shape[0], method="init_cache",
-                        mutable=["cache"])[1]["cache"]
-    logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
-                                  decode=True, mutable=["cache"])
-    steps = [logits[:, -1]]
-    for position in range(4, ids.shape[1]):
-        logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
-                                      decode=True, mutable=["cache"])
-        steps.append(logits[:, -1])
-    incremental = jnp.stack(steps, axis=1)
-
-    assert scaled_difference(np.asarray(incremental), np.asarray(full[:, 3:])) < 1e-4
-    assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
-
-
+    """The fused delta net's conv and recurrent states through the cache: a prefill and single-token
+    steps on par with the parallel forward at each step's width from float64 over drawn rows that clear
+    its routing (check 1, ledger 2739)."""
+    assert_decodes_as_it_scores(Pretrained.load(QWEN3_NEXT, dtype="float32", max_seq_len=16,
+                                                attention_impl="reference"),
+                                "qwen3_next decode", seeds=DECODE_SEEDS["qwen3_next"], prefill=4, length=12,
+                                salt=0x2739)
 
 
 # ---------------------------------------------------------------------------
@@ -334,18 +306,10 @@ def test_gemma3n_logits_match_the_reference_implementation():
 
 
 def test_gemma3n_decodes_through_the_cache_as_it_scores_in_parallel():
-    """The stream of copies rides the decode path: a prefill and single-token
-    steps through the KV cache agree with the whole sequence."""
-    model, variables = fp32_decoder(GEMMA3N, max_seq_len=16)
-    ids = jnp.asarray(np.load(GEMMA3N / "input_ids.npy")[:1, :12], jnp.int32)
-    full = jnp.asarray(model.apply(variables, ids))
-    state = nn.unbox(model.init(jax.random.PRNGKey(0), ids[:, :1], decode=True))
-    steps = []
-    for position in range(ids.shape[1]):
-        step, state = model.apply(
-            {**variables, "cache": state["cache"]}, ids[:, position:position + 1],
-            decode=True, mutable=["cache"])
-        steps.append(step)
-    incremental = jnp.concatenate(steps, axis=1)
-    difference = float(jnp.max(jnp.abs(incremental - full)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    """The stream of copies rides the decode path: single-token steps through the KV cache on par with
+    the whole sequence at each step's width from float64 over drawn rows that clear its gaussian top-k
+    (check 1, ledger 2739)."""
+    assert_decodes_as_it_scores(Pretrained.load(GEMMA3N, dtype="float32", max_seq_len=16,
+                                                attention_impl="reference"),
+                                "gemma3n decode", seeds=DECODE_SEEDS["gemma3n"], prefill=1, length=12,
+                                salt=0x2739, rows=1)

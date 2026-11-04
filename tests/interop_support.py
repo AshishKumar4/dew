@@ -497,6 +497,32 @@ def clearing_selections(loaded, draw, label: str, *, stable: bool = True):
     return selection_margins.clearing(draw, clears)
 
 
+def assert_decodes_as_it_scores(loaded, label: str, *, seeds: int, prefill: int, length: int, salt: int,
+                                rows: int = 2) -> None:
+    """Check 1 (ledger 2739): `loaded`'s (a `Pretrained`) prefill of the first `prefill` of `length` drawn
+    tokens and its single-token steps through the decode cache, every position's logits, on par with its
+    full forward at each step's width (`as_stepped`) over its declared `seeds`; the truth its float64
+    build's one full pass. A decoder that selects draws rows that clear its selections
+    (`clearing_selections`), so the runs select alike. Both arms are host loops over Dew's programs,
+    compiled as the gate compiles two Dew arms (`without_ynn`) and run as given."""
+    from model_support import as_stepped, decode_logits, decode_steps
+    from reference_error import without_ynn
+
+    model, variables = loaded.model, loaded.variables
+    steps, forward = decode_steps(model, without_ynn), without_ynn(model.apply)
+
+    def decoded(ids):
+        return decode_logits(model, variables, ids[:, :prefill], ids[:, prefill:], steps, prefilled=True)
+
+    def stepped(ids):
+        return as_stepped(lambda held: forward(variables, held), ids, prefill)
+
+    wide = loaded.model.clone(dtype=jnp.float64, attention_impl="reference")
+    draw = clearing_selections(loaded, token_draw(salt, model.vocab_size, (rows, length)), label)
+    assert_as_exact(as_given(decoded), as_given(stepped), draw, label, seeds=seeds,
+                    truth_fn=lambda ids: wide.apply(widened(variables), ids))
+
+
 def torch_logits(source, precision=None):
     """A transformers causal LM's logits over int ids as float64 numpy, inside `precision` (a context
     manager factory, `tools.torch_precision.float64` for a float64 twin, whose code's float32 casts it

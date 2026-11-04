@@ -20,7 +20,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
+from model_support import (
+    TINY_DECODER,
+    decode_logits,
+    decode_steps,
+    model_draw,
+    stepped_logits,
+    with_logit_cotangent,
+)
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -312,18 +319,6 @@ def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
         nn.unbox(tiny(**{field: rate}).init(rng, tokens(rng, length=4)))
 
 
-def decode_logits(model, params, prompt, rest, steps=None):
-    """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V], by `steps`, the
-    model's compiled cache and step where its caller holds them (`decode_steps`)."""
-    made, step = steps or decode_steps(model)
-    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
-    steps = [logits[:, -1]]
-    for position in range(rest.shape[1]):
-        logits, cache = step(params, cache, rest[:, position:position + 1])
-        steps.append(logits[:, -1])
-    return jnp.stack(steps, axis=1)
-
-
 def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ, **shape):
     """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full passes
     from position `prompt - 1` over drawn variables and tokens, each step's at the width it reads
@@ -335,7 +330,7 @@ def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ,
     forward = jax.jit(model.apply)
 
     def stepped(params, ids):
-        return as_stepped(lambda tokens: forward(params, tokens), ids, prompt)[:, prompt - 1:]
+        return stepped_logits(lambda tokens: forward(params, tokens), ids, prompt)
 
     def full(model, divided=1.0):
         return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)

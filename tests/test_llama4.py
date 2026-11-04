@@ -16,7 +16,7 @@ import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
 from model_support import as_stepped
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.inference import TextGeneration
@@ -38,13 +38,13 @@ def fixture(name: str) -> dict:
     return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
-def attention(*, use_rope: bool, attention_chunk_size: int | None = None):
+def attention(*, use_rope: bool, attention_chunk_size: int | None = None, dtype=None):
     """A layer of the kinds Llama 4's translator emits, with the fixture's geometry: a rotated one
     turning adjacent pairs under the weightless L2 norm, or one without positions scaling its queries
-    by their place at floor_scale 4."""
+    by their place at floor_scale 4; computing in `dtype`, its context's."""
     context = MixerContext(emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM,
                            max_seq_len=32, rope_theta=500000.0, attention_chunk=attention_chunk_size,
-                           qk_norm=use_rope)
+                           qk_norm=use_rope, dtype=dtype)
     mixer = (AttentionMixer(rotary_pairs="adjacent", qk_norm_weight=False) if use_rope
              else AttentionMixer(nope=True, temperature_tuning=(4.0, 0.1)))
     return mixer.build(context)()
@@ -74,28 +74,42 @@ def test_a_global_layer_matches_the_reference():
     assert float(np.max(np.abs(np.asarray(output) - tensors["global_output"]))) < 1e-5
 
 
-def test_decode_matches_prefill_on_both_rules():
-    """The cache path: a prefill of 7 tokens then 5 single steps agree with
-    the whole sequence on a chunked local layer and a global layer, the
-    chunk and the temperature reading the cache slot as the position.
-    Tolerance 1e-5; observed 2.4e-07 and 3.6e-07."""
+DECODE_SEEDS = {"local": 8, "global": 8}
+"""Each rule's cached decode's declared check-1 seeds against its parallel forward at each step's width,
+sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("rule", ["local", "global"])
+def test_decode_matches_prefill_on_both_rules(rule):
+    """The cache path on the fixture's weights over drawn inputs of its hidden states' shape and scale:
+    a prefill of 7 tokens then 5 single steps on par with the parallel forward at each step's width
+    (`as_stepped`) from the float64 layer's forward, on a chunked local layer and a global layer, the
+    chunk and the temperature reading the cache slot as the position (check 1, ledger 2739)."""
     tensors = fixture("attention")
-    hidden = jnp.asarray(tensors["hidden"])
-    for settings in ({"use_rope": True, "attention_chunk_size": 4}, {"use_rope": False}):
-        module = attention(**settings)
-        variables = attention_variables(tensors)
-        whole = jnp.asarray(module.apply(variables, hidden))
-        # The first decode call allocates the cache without writing it.
-        cache = nn.unbox(module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)))
+    recorded = tensors["hidden"]
+    settings = {"local": {"use_rope": True, "attention_chunk_size": 4}, "global": {"use_rope": False}}[rule]
+    module, wide = attention(**settings), attention(**settings, dtype=jnp.float64)
+    variables = attention_variables(tensors)
+    # The first decode call allocates the cache without writing it.
+    cache = nn.unbox(module.init(jax.random.key(0), jnp.asarray(recorded)[:, :1], MixerCall(decode=True)))
+
+    def cached(hidden):
         state = {**cache, **variables}
         steps = []
-        for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, 12)]:
+        for start, stop in [(0, 7)] + [(position, position + 1) for position in range(7, hidden.shape[1])]:
             step, mutated = module.apply(state, hidden[:, start:stop], MixerCall(decode=True),
                                          mutable=["cache"])
             state = {**state, "cache": mutated["cache"]}
             steps.append(step)
-        incremental = jnp.concatenate(steps, axis=1)
-        assert float(jnp.max(jnp.abs(incremental - whole))) < 1e-5
+        return jnp.concatenate(steps, axis=1)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x2739, seed])
+        return (jnp.asarray(rng.standard_normal(recorded.shape) * recorded.std(), jnp.float32),)
+
+    assert_as_exact(cached, lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden, 7),
+                    draw, f"llama4 {rule} decode", seeds=DECODE_SEEDS[rule],
+                    truth_fn=lambda hidden: wide.apply(widened(variables), hidden))
 
 
 def test_a_left_padded_row_scores_its_tokens_as_the_row_alone_cached_or_not():
