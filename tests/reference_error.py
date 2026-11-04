@@ -282,9 +282,9 @@ def _compiles(fn) -> bool:
 def _refuse_numpy_arms(draw, *arms) -> None:
     """Refuse an arm the gate would compile that computes in NumPy on a draw of NumPy inputs: called once as
     given on them (a window's, for a window loop's arm), an arm returning NumPy arrays is a NumPy reference,
-    which compiled would compute in JAX, in float32 where its draw is float64, by other sums; it passes
-    `as_given`. A draw holding no NumPy array runs none: the gate compiles each plain arm (`_compiled`), whose
-    trace refuses a NumPy call on its inputs, where a model arm run eagerly took a minute of a check (M43)."""
+    compiled computing in JAX, in float32 where its draw is float64; it passes `as_given`. A draw holding no
+    NumPy array runs none: the gate compiles each plain arm (`_compiled`), whose trace refuses a NumPy call on
+    its inputs (a model arm run eagerly here took a minute of a check, M43)."""
     plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
     drawn = draw(0) if plain else ()
     if not any(isinstance(leaf, np.ndarray | np.generic) for leaf in jax.tree.leaves(drawn)):
@@ -1515,8 +1515,8 @@ def _cancelling_terms(draw, truth, program=None):
     its rounding's residue Dew's and the reference's alike). None where no row is zero, or where the
     truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's).
     `program`, the truth as the draws run it (`_truth_program`), evaluates the first draw's truth, so its
-    first call's run and trace serve the draws too, once a process: a map task's draws (DRAWS) each pay it
-    once, not twice."""
+    first call's run and trace serve the draws too, once a process (a map task's draws, DRAWS); a reference
+    standing for it runs compiled, not eagerly (M43)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
     # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
@@ -1527,7 +1527,7 @@ def _cancelling_terms(draw, truth, program=None):
     # failure of its own.
     try:
         with jax.enable_x64(new_val=True):
-            leaves = [np.asarray(leaf) for leaf in jax.tree.leaves((program or truth)(*widened(draw(0))))]
+            leaves = [*map(np.asarray, jax.tree.leaves((program or jax.jit(truth))(*widened(draw(0)))))]
             if not np.any(_LaidTruths.of(leaves).sizes == 0):
                 return None
             truths, terms = float64_terms(truth, *widened(draw(0)))
