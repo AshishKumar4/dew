@@ -856,8 +856,8 @@ def computed():
 
 before = computed()
 variable, params = var("x", Term), var("params", i64)
-exponential = rules.Family("the exponential as its argument",
-                           (rewrite(variable.unary("exp", params)).to(variable),), (jnp.exp, lambda x: x, None))
+exponential = rules.Family("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
+    variable),), (jnp.exp, lambda x: x, None))
 rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
 print(json.dumps({"before": before, "after": computed()}))
 """
