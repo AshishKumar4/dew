@@ -911,7 +911,7 @@ def _pass_examples(train: Pipeline, read: Read) -> int | None:
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
             return None
-        count = Proportions.of(_weights(source)).covering(known)
+        count = Proportions.of(_weights(source), source.seed).covering(known)
     elif read == "streamed" and not _in_memory(source):
         stated = [shard.rows for shard in source.manifest().shards]
         held = [rows for rows in stated if rows is not None]
@@ -1285,7 +1285,7 @@ def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None
         raise ValueError("nested phases have no single corpus share")
     if isinstance(source, Mixture):
         # The counts the indexed mix reads its corpora by (`ProportionalSelection`).
-        counts = Proportions.of(_weights(source)).counts(count)
+        counts = Proportions.of(_weights(source), source.seed).counts(count)
         for child, taken in zip(source.pipelines, counts, strict=True):
             _delivered(child, taken, consumed)
     else:

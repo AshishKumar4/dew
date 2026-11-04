@@ -1480,7 +1480,8 @@ class _Build:
             mapped = [parent.map(functools.partial(as_member, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
-            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source))
+            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source),
+                                              source.seed)
             return pygrain.MapDataset.select_from_datasets(mapped, selection)
         streams = [
             Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
@@ -1500,7 +1501,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return KeyedMix(streams, source.weights, keys)
+        return KeyedMix(streams, source.weights, keys, source.seed)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
@@ -2219,7 +2220,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         known = [size for size in sizes if size is not None]
         if len(known) != len(sizes):
             return None
-        return Proportions.of(_weights(source)).covering(known)
+        return Proportions.of(_weights(source), source.seed).covering(known)
 
     def covered(pipeline: Pipeline, build: _Build) -> int | None:
         """The records of a part a mix reads on past its end in which it comes round once: a view a
