@@ -1,7 +1,9 @@
 """The arithmetic a check's arms and truths run in (tests/reference_error.py): the scope each arm runs in
-(`summed_as_run`) and the float64 truth's inputs (`widened`)."""
+(`summed_as_run`), the programs a reference and a truth run (`unrewritten`) and the float64 truth's inputs
+(`widened`)."""
 
 import contextlib
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -40,3 +42,21 @@ def summed_as_run():
     if jax.default_backend() == "cpu":
         return jax.default_matmul_precision(FP32_SUMS)
     return contextlib.nullcontext()
+
+
+def unrewritten(fn):
+    """`fn` run with the algebra pass off (`dew.algebra.passes(on=False)`), the one scope of every reference
+    arm (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`) the gate runs: the
+    programs they trace or run are Dew's as written, never a rewrite the candidate's check judges
+    (docs/design/algebra.md §3). The switch is in JAX's trace context, which jit's and Dew's programs key
+    their executables on, so a reference's never stands in for the candidate's. A recorded arm, which
+    replays values and runs no program, is as it is."""
+    if fn is None or getattr(fn, "recorded", False):
+        return fn
+    from dew.algebra import passes
+
+    @functools.wraps(fn)
+    def run(*inputs, **options):
+        with passes(on=False):
+            return fn(*inputs, **options)
+    return run
