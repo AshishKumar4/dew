@@ -352,6 +352,12 @@ class Decide(SavedRunTask, InItsForm):
         return saved[1].step if saved[1].step == best else None
 
     @classmethod
+    def step_records(cls, directory: str, step: int) -> tuple[epath.Path, ...]:
+        """The calibrations the run in `directory` keeps fitted on `step`'s weights (`step_calibrations`),
+        which a load of the step reads beside its latest."""
+        return step_calibrations(directory, step)
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:

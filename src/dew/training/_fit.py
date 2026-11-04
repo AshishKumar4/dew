@@ -841,24 +841,40 @@ def _pooled_first(loader: Loader, partition: DataPartition, *, kept: bool = Fals
     return next((read for read in reads if read is not None), None)
 
 
-def _first_read(loader: Loader, partition: DataPartition, position: bytes | None = None, *,
-                kept: bool = False) -> Batch | None:
-    """The first batch `loader`'s training stream gives `partition`'s share, from `position` where given,
-    the stream then closed; None where it holds none. A batch `kept` holds copies of its arrays, which
-    outlive the stream, as a batch a stream yields does only until its next read (`Loader`)."""
+@contextlib.contextmanager
+def _opened_at(loader: Loader, partition: DataPartition, position: bytes | None) -> Iterator[Iterator[Batch]]:
+    """`loader`'s training stream of `partition`'s share, restored to `position` where given, which
+    refuses a position its plan does not read on from (`dew.data.plan.Plan.check`), closed after."""
     stream = loader.train(partition)
     try:
         if position is not None:
             if not isinstance(stream, Checkpointable):
                 raise TypeError("the training stream keeps no position a resume reads its batch from")
             restore_position(stream, position)
+        yield stream
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+
+
+def admitted(loader: Loader, partition: DataPartition, position: bytes) -> None:
+    """Refuse `position` where `loader`'s training stream of `partition`'s share would not resume from it,
+    as it refuses it where the run opens its data (`_opened_at`), reading no record: a run checks it
+    before it writes anything a refusal would leave behind (`RunConfig.train`)."""
+    with _opened_at(loader, partition, position):
+        pass
+
+
+def _first_read(loader: Loader, partition: DataPartition, position: bytes | None = None, *,
+                kept: bool = False) -> Batch | None:
+    """The first batch `loader`'s training stream gives `partition`'s share, from `position` where given,
+    the stream then closed; None where it holds none. A batch `kept` holds copies of its arrays, which
+    outlive the stream, as a batch a stream yields does only until its next read (`Loader`)."""
+    with _opened_at(loader, partition, position) as stream:
         batch = next(iter(stream), None)
         if kept and batch is not None:
             batch = jax.tree.map(lambda leaf: np.array(leaf) if isinstance(leaf, np.ndarray) else leaf, batch)
         return batch
-    finally:
-        if isinstance(stream, Closeable):
-            stream.close()
 
 
 type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset

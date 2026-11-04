@@ -193,3 +193,27 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     restored, _ = Checkpoints(str(local)).restore()
     for left, right in zip(jax.tree.leaves(original), jax.tree.leaves(restored), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_published_earlier_step_of_a_decision_run_downloads_with_the_calibration_fitted_on_it(tmp_path,
+                                                                                               monkeypatch):
+    """A decision run calibrated at its first step and again at its second, its first step published
+    through wandb's own artifact, downloads with the calibration fitted on that step beside the run's
+    latest (`SavedRunTask.step_records`), so `Decide.from_run` loads the downloaded step it was handed,
+    where the download held only the latest calibration and refused it (row 3879)."""
+    from run_kinds import decision, trained
+
+    from dew.decision.task import Decide
+    from dew.inference.tasks import SavedRun
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    first = decision(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
+    run = tmp_path / "runs" / "first"
+    read = SavedRun.pinned(str(run)).step
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    logged = dew.io.publish(Checkpoints(str(run)).path(read), "decide", tracker=Tracker())
+    local = downloaded(logged, tmp_path / "download")
+    task = Decide.from_run(str(local), step=read)
+    assert task.weights is not None and task.weights.step == read

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
 import jax
 import jax.numpy as jnp
 import numpy as np
+from etils import epath
 from flax import linen as nn
 from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -458,6 +459,14 @@ class SavedRunTask:
         best step)."""
         del directory
         return None
+
+    @classmethod
+    def step_records(cls, directory: str, step: int) -> tuple[epath.Path, ...]:
+        """The files of the run in `directory` beside its root's own a load of its `step` reads, which an
+        export of the step is a function of and a publication of it carries (`dew.io.publish`): none,
+        unless the task keeps them by step (`Decide`'s calibration of each step it was fitted on)."""
+        del directory, step
+        return ()
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
