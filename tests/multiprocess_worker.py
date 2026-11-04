@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 from flax import linen as nn
 from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
-from process_support import serve_mode, worker_parser
+from process_support import REPO_ROOT, serve_mode, worker_parser
 
 from dew.data import Loading
 from dew.data.dataset import Loader
@@ -650,6 +650,24 @@ def mode_schedule_fit(args) -> dict:
     _, saved = restored_state(trainer)
     completed = [] if saved is None else position.read(saved.encode()).completed
     return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
+
+
+def mode_layout_rows(args) -> dict:
+    """The rows the layout tool's step reads on this process (`layout_parity.compiled_step`): each row's
+    place among the step's examples (`EXAMPLE_ROWS`), as the global batch every process places holds
+    them."""
+    import sys
+
+    import jax
+
+    from dew.batch import EXAMPLE_ROWS
+
+    sys.path.insert(0, str(REPO_ROOT / "tools"))
+    import layout_parity as tool
+
+    case, _ = tool.model_case("dense", "float32", {}, {})
+    _, data, _, _, _ = tool.compiled_step(case, {"data": jax.device_count()}, tool.drawn_batch(case, 0))
+    return {"rows": [int(row) for row in as_numpy(data[EXAMPLE_ROWS])], "batch": case.batch_size}
 
 
 def mode_steps(args) -> dict:
@@ -2431,7 +2449,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
          "replicated_rollout": mode_replicated_rollout,
-         "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
+         "steps": mode_steps, "layout_rows": mode_layout_rows, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,

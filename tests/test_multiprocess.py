@@ -551,6 +551,17 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
 
 
 @pytest.mark.distributed
+def test_the_layout_tools_step_reads_each_row_at_its_place_among_the_examples_on_two_processes(tmp_path):
+    """The layout tool places one global batch on every process (`layout_parity.placed`) and marks it as
+    `fit` would (`step_batch`): each row's place among the step's examples is its place in that batch
+    on every process, as on its one-device reference, so a recording arm draws what the reference
+    draws; marked as a share of the mesh's, process 1's rows took other places (row 3832's review)."""
+    pool = run_pool("layout_rows", tmp_path / "pool", 2, fsdp_size=1)
+    for report in pool:
+        assert report["rows"] == list(range(report["batch"])), report
+
+
+@pytest.mark.distributed
 def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     """A two-stage pipeline over a pool of two processes, each holding half
     of every stage's devices, against this process running the same twenty
