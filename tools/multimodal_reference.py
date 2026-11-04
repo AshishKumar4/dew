@@ -3,15 +3,19 @@
 Run with transformers 5.16.1, Torch and tokenizers installed:
     PYTHONPATH=src python tools/multimodal_reference.py
     PYTHONPATH=src:. python tools/multimodal_reference.py float64 [family ...]  # the float64 truths
+    PYTHONPATH=src:. python tools/multimodal_reference.py sgd [family ...]  # SGD steps over seeds; timm
 
 No network access or pretrained downloads are used. Each family's existing
 tiny fixture supplies the weights, and every reference lands in
 tests/fixtures/hf/<family>-native-tiny: the padded batch encoding, the
-reference logits, a cached greedy continuation, the pixel gradient and the
-logits after one SGD step. Unequal image counts per row exercise numeric
-batch alignment.
+reference logits, a cached greedy continuation, and Gemma 3's pixel gradient
+and logits after one SGD step. Unequal image counts per row exercise numeric
+batch alignment. The native families' SGD steps over drawn media, summarized
+over check 1's seeds, land in tests/fixtures/multimodal_sgd (`sgd`).
 """
 
+import contextlib
+import copy
 import json
 import sys
 from pathlib import Path
@@ -154,8 +158,9 @@ def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Te
 
 
 def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
-                            audio: list[np.ndarray] | None = None) -> None:
-    """Actual wrapper forward, cached continuation, pixel gradient and SGD output.
+                            audio: list[np.ndarray] | None = None, *, step: bool = True) -> None:
+    """Actual wrapper forward, cached continuation, and with `step` the pixel gradient and SGD output: a
+    native family's SGD step is recorded over drawn media instead (`write_sgd_recording`).
 
     The padded batch encoding is what Dew consumes; every reference quantity
     comes from the reference model over one row of it at a time.
@@ -173,14 +178,16 @@ def _write_forward_backward(model, processor, destination: Path, images: np.ndar
             generated = model.generate(**single, max_new_tokens=3, do_sample=False,
                                        eos_token_id=None, use_cache=True, return_dict_in_generate=False)
             continuation.append(generated[0, single["input_ids"].shape[1]:])
-    loss, pixel_inputs = _sgd_step(model, singles, valid)
-    np.save(destination / "pixel_gradient.npy", torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
-    with torch.no_grad():
-        for row, single in enumerate(singles):
-            updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
-    np.save(destination / "updated_logits.npy", updated.numpy())
-    (destination / "training.json").write_text(json.dumps(
-        {"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
+    if step:
+        loss, pixel_inputs = _sgd_step(model, singles, valid)
+        np.save(destination / "pixel_gradient.npy",
+                torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
+        with torch.no_grad():
+            for row, single in enumerate(singles):
+                updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
+        np.save(destination / "updated_logits.npy", updated.numpy())
+        (destination / "training.json").write_text(json.dumps(
+            {"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
 
     np.save(destination / "raw_images.npy", images)
     np.save(destination / "logits.npy", logits.numpy())
@@ -213,7 +220,7 @@ def write_gemma3n_native() -> None:
     audio = [np.load(source / "waveform_0.npy"), np.load(source / "waveform_1.npy")]
     images = np.random.default_rng(2604).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["listen <audio> <image> ok", "say <image> <audio> again <image> ok"]
-    _write_forward_backward(model, processor, destination, images, prompts, audio=audio)
+    _write_forward_backward(model, processor, destination, images, prompts, audio=audio, step=False)
 
 
 
@@ -315,7 +322,7 @@ def write_gemma4_native() -> None:
     images = np.random.default_rng(1304).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <image_soft_token> token9",
                "token5 <image_soft_token> token8 <image_soft_token> token6"]
-    _write_forward_backward(model, processor, destination, images, prompts)
+    _write_forward_backward(model, processor, destination, images, prompts, step=False)
 
 
 
@@ -411,11 +418,10 @@ def write_gemma4_unified_native() -> None:
 
 def write_float64_truths(references: str, checkpoint: str) -> None:
     """The float64 truth of what `_write_forward_backward` recorded in `references` from the fixture
-    `checkpoint`'s model: its float64 twin (tools/torch_precision.py) over the same stored batch
-    encoding, one row at a time: its logits, then its summed next-token loss, pixel gradient and logits
-    after one SGD step of LEARNING_RATE, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy
-    and updated_logits_f64.npy. The Dew side's checks hold Dew and the fp32 reference to it
-    (tests/test_multimodal_model.py)."""
+    `checkpoint`'s model: its float64 twin's (tools/torch_precision.py) logits over the same stored batch
+    encoding, one row at a time, in logits_f64.npy. The Dew side's checks hold Dew and the fp32
+    reference to it (tests/test_multimodal_model.py); the family's SGD step is recorded over drawn media
+    (`write_sgd_recording`)."""
     from transformers import AutoModelForImageTextToText
 
     from tools.torch_precision import float64, float64_twin
@@ -423,7 +429,7 @@ def write_float64_truths(references: str, checkpoint: str) -> None:
     destination, source = ROOT / references, ROOT / checkpoint
     model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,
                                                         attn_implementation="eager").eval()
-    recorded = ("logits", "updated_logits", "pixel_gradient", "continuation", "raw_images")
+    recorded = ("logits", "continuation", "raw_images")
     encoded = {path.stem: torch.from_numpy(np.load(path)) for path in destination.glob("*.npy")
                if path.stem not in recorded and not path.stem.endswith("_f64")}
     twin = float64_twin(model)
@@ -433,20 +439,64 @@ def write_float64_truths(references: str, checkpoint: str) -> None:
         valid = widened["attention_mask"].bool()
         singles = _row_slices(widened, twin)
         shape = (*widened["input_ids"].shape, twin.config.get_text_config().vocab_size)
-        logits, updated = torch.zeros(shape, dtype=torch.float64), torch.zeros(shape, dtype=torch.float64)
+        logits = torch.zeros(shape, dtype=torch.float64)
         with torch.no_grad():
             for row, single in enumerate(singles):
                 logits[row, valid[row]] = twin(**single, use_cache=False).logits[0]
-        loss, pixel_inputs = _sgd_step(twin, singles, valid)
-        with torch.no_grad():
-            for row, single in enumerate(singles):
-                updated[row, valid[row]] = twin(**single, use_cache=False).logits[0]
-    np.save(destination / "pixel_gradient_f64.npy",
-            torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
     np.save(destination / "logits_f64.npy", logits.numpy())
-    np.save(destination / "updated_logits_f64.npy", updated.numpy())
-    (destination / "training_f64.json").write_text(json.dumps({"loss": float(loss.detach())}) + "\n")
-    print(destination, "float64 loss", float(loss.detach()), flush=True)
+    print(destination, "float64 logits", flush=True)
+
+
+def write_sgd_recording(name: str) -> None:
+    """Family `name`'s SGD step over drawn media (tests/multimodal_training.py's `drawn`), recorded over the
+    seeds check 1 draws for tests/test_multimodal_model.py: the reference's summed next-token loss, pixel
+    gradient and logits after one SGD step of LEARNING_RATE (`_sgd_step`), one row at a time over the
+    padded batch encoding of a seed's media (`_encode`), from the checkpoint's weights at every seed, and
+    those of its float64 twin, summarized (`record_case`'s summary: each leaf's error from its truth and
+    its truth's sketch), the count sized paired with Dew's own step. Needs timm, Gemma 3n's vision tower."""
+    import jax
+    import transformers
+    from multimodal_families import FAMILIES
+    from multimodal_training import drawn, family_of, recorded, stepped
+    from transformers import AutoModelForImageTextToText
+
+    from tools.recorded_references import provenance, record_case, save
+    from tools.torch_precision import float64, float64_twin
+
+    checkpoint = ROOT / FAMILIES[name][1]
+    processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
+    model = AutoModelForImageTextToText.from_pretrained(checkpoint, dtype=torch.float32,
+                                                        attn_implementation="eager").eval()
+    twin = float64_twin(model)
+    start = [(net, copy.deepcopy(net.state_dict()), wide) for net, wide in ((model, False), (twin, True))]
+    prompts = family_of(name).prompts
+
+    def evaluate(inputs):
+        clips = [inputs[f"audio.{index}"] for index in range(sum(key.startswith("audio.") for key in inputs))]
+        encoded = _encode(processor, inputs["images"], prompts, clips or None)
+        valid = encoded["attention_mask"].bool()
+        outputs = []
+        for net, state, wide in start:
+            net.load_state_dict(state)
+            with float64() if wide else contextlib.nullcontext():
+                held = {key: value.double() if wide and value.is_floating_point() else value
+                        for key, value in encoded.items()}
+                singles = _row_slices(held, net)
+                loss, pixels = _sgd_step(net, singles, valid)
+                with torch.no_grad():
+                    logits = torch.cat([net(**single, use_cache=False).logits[0] for single in singles])
+            outputs.append({"loss": loss.detach().reshape(1).numpy(),
+                            "pixel_gradient": torch.cat([value.grad for value in pixels]).numpy(),
+                            "updated_logits": logits.numpy()})
+        return tuple(outputs)
+
+    dew = jax.jit(stepped(name))
+    arrays = record_case("sgd", drawn(name), evaluate, store_inputs=False, summary=True,
+                         dew=lambda inputs: dew(inputs)[0])
+    written = save(recorded(name), {**arrays, "provenance": provenance(
+        "transformers", transformers.__version__, "cpu", f"python tools/multimodal_reference.py sgd {name}",
+        torch=torch.__version__)}, reference=f"transformers {transformers.__version__}", license="Apache-2.0")
+    print(f"{written}: {int(arrays['sgd.seeds'])} seeds", flush=True)
 
 
 def write_llama4_native() -> None:
@@ -467,7 +517,7 @@ def write_llama4_native() -> None:
     processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
     images = np.random.default_rng(1707).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <|image|> token9", "token5 <|image|> token8 <|image|> token6"]
-    _write_forward_backward(model, processor, destination, images, prompts)
+    _write_forward_backward(model, processor, destination, images, prompts, step=False)
 
 
 
@@ -482,13 +532,21 @@ def write_qwen35_native() -> None:
     prompts = ["token7 <start_of_image><image_soft_token><end_of_image> token9",
                "token5 <start_of_image><image_soft_token><end_of_image> token8 "
                "<start_of_image><image_soft_token><end_of_image> token6"]
-    _write_forward_backward(model, processor, destination, images, prompts)
+    _write_forward_backward(model, processor, destination, images, prompts, step=False)
 
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["gemma4-unified"]:
         write_gemma4_unified_native()
+        sys.exit()
+    if sys.argv[1:2] == ["sgd"]:
+        # The tests' modules (multimodal_training), and the checkout's root for tools.*.
+        sys.path[:0] = [str(ROOT.parents[1]), str(ROOT.parents[2])]
+        from multimodal_families import FAMILIES
+
+        for family in sys.argv[2:] or FAMILIES:
+            write_sgd_recording(family)
         sys.exit()
     if sys.argv[1:2] == ["float64"]:
         # Which references each family's test reads, and the checkpoint they were written from: the
