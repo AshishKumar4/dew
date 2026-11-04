@@ -10,7 +10,6 @@ image counts and left padding exercise per-row conditioning and cache
 addressing.
 """
 
-import contextlib
 import dataclasses
 import json
 from pathlib import Path
@@ -20,19 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from float64_terms import float32_values
+from float64_terms import float32_values, float64_forward
 from multimodal_families import FAMILIES
-from multimodal_training import drawn, family_of, recorded, stepped
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import (
-    GateFailure,
-    as_given,
-    assert_as_exact,
-    declared_seeds,
-    indexed_recording,
-    recording,
-    widened,
-)
+from reference_error import GateFailure, widened
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -73,6 +63,7 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), reference[valid].argmax(-1))
     from reference_error import assert_moves
 
+    from dew.registry import ModelConfig
 
     language = model.language_model
     ordinary = language.mixer or AttentionMixer()
@@ -302,6 +293,25 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
 
 
 
+def _one_layer_negated(gradient):
+    """The gradient with the first decoder layer's subtree negated: a sign
+    slip in one layer's backward that leaves every shape alone."""
+    def walk(node):
+        if not isinstance(node, dict):
+            return node, False
+        if "layers_0" in node:
+            return {**node, "layers_0": jax.tree.map(jnp.negative, node["layers_0"])}, True
+        out, found = {}, False
+        for key, value in node.items():
+            out[key], hit = walk(value) if not found else (value, False)
+            found = found or hit
+        return out, found
+
+    negated, found = walk(gradient)
+    assert found, "no layers_0 subtree in the gradient"
+    return negated
+
+
 def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
     """One plausible integration bug per family that the parity assertion must catch."""
     if family == "gemma4":
@@ -324,6 +334,16 @@ def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
     pixels = inputs.conditioning["pixel_values"]
     return dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels[:, ::-1]})
 
+
+
+def _real_pixels(inputs: ModelInputs, gradient: jax.Array) -> jax.Array:
+    """The per-image gradient in the reference's flat image order, without padding."""
+    lengths = np.asarray(inputs.conditioning["image_lengths"])
+    grid = inputs.conditioning.get("image_grid_thw")
+    if grid is None:
+        return jnp.concatenate([gradient[row, :int(count)] for row, count in enumerate(lengths)])
+    return jnp.concatenate([gradient[row, image, :int(np.prod(np.asarray(grid[row, image])))]
+                            for row, count in enumerate(lengths) for image in range(int(count))])
 
 
 def _family(family: str):
@@ -478,16 +498,99 @@ def test_source_processor_forward_and_cached_generation_match_reference(family_s
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
 
 
-@pytest.mark.parametrize("name", sorted(FAMILIES))
-def test_a_float64_wrapper_takes_its_step_in_float64_throughout(name):
-    """A family's wrapper built in float64 (`ModelConfig.with_dtype`) takes its SGD step, forward and
-    backward, with no float32 value (`float32_values`): its towers' statistics, softmaxes, sinusoids and
-    position taps, float32 in a narrower model, read `at_least_fp32`, so the float64 build is the float64
-    truth of the float32 one, as the reference's float64 twin retargets its float32 casts (ledger 3332)."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
+def test_source_backward_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
+    """Loss, pixel gradient and all-parameter SGD against the reference backward.
+
+    The loss, the pixel gradient and the post-SGD logits are each as exact as the
+    reference's (`assert_as_exact_as_the_reference`), the truth the reference's float64 twin taking
+    the same step, and the rule still fails one layer's gradient with its sign flipped. Whatever
+    order a backend sums Gemma 3n's layer-scale gradients in moves Dew's error and the reference's
+    alike, so no margin for it is chosen. The trained model exports under the
+    source's tensor names and reloads to the reference's updated logits; every
+    non-parameter collection (Gemma4's standardization and clipping buffers)
+    survives training bitwise. Qwen3.5's root tie_word_embeddings=False
+    overrides its nested text flag: tying the head keeps the initial logits
+    but misses this update by 0.00167.
+    """
+    family, loaded, inputs, directory = family_source
+    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
+                            ema_decay=None, pad_id=0)
+    step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
+
+    def loss(variables, pixels):
+        values = {**loaded.variables, "params": variables}
+        data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+        statistics, _ = objective.loss(values, {"text": data}, step)
+        return objective.reduce_loss(statistics)[0]
+
+    value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
+        loaded.variables["params"], inputs.conditioning["pixel_values"])
+    expected = json.loads((directory / "training.json").read_text())
+    truth = json.loads((directory / "training_f64.json").read_text())
+    assert_as_exact_as_the_reference(np.asarray(value), np.asarray(expected["loss"]),
+                                     np.asarray(truth["loss"]), f"{family} loss")
+    assert_as_exact_as_the_reference(_real_pixels(inputs, pixels),
+                                     np.load(directory / "pixel_gradient.npy"),
+                                     np.load(directory / "pixel_gradient_f64.npy"),
+                                     f"{family} pixel gradient")
+    optimizer = optax.sgd(expected["learning_rate"])
+    params = loaded.variables["params"]
+    valid = np.asarray(inputs.token_fields["attention_mask"])
+    reference = np.load(directory / "updated_logits.npy")[valid]
+    updated = np.load(directory / "updated_logits_f64.npy")[valid]
+
+    def trained(gradient, destination):
+        updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+        loaded.save(
+            destination, variables={**loaded.variables, "params": optax.apply_updates(params, updates)}
+        )
+        restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
+        return restored, np.asarray(
+            restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
+        )[valid]
+
+    def terms(model):
+        """Each valid logit's float64 terms over `model`'s step, which size its row's rounding: the
+        whole model widened, its language model and towers with the wrapper."""
+        wide = ModelConfig.from_model(model.model).with_dtype("float64").build()
+        _, sized = float64_forward(wide, model.variables, inputs.tokens, **inputs.kwargs())
+        return np.asarray(sized)[valid]
+
+    restored, output = trained(gradient, tmp_path / "trained")
+    assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits",
+                                     terms=terms(restored))
+    # The rule still catches one layer's gradient with its sign flipped.
+    slip, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
+    with pytest.raises(GateFailure):
+        assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip",
+                                         terms=terms(slip))
+    for collection, tree in restored.variables.items():
+        if collection != "params":
+            for actual, original in zip(jax.tree.leaves(tree),
+                                        jax.tree.leaves(loaded.variables[collection]), strict=True):
+                np.testing.assert_array_equal(actual, original)
+
+
+def _float32_values_in_float64(loaded, inputs) -> int:
+    """The float32 values the gradient of `loaded`'s summed logits over `inputs` makes, the model built in
+    float64 (`ModelConfig.with_dtype`, its towers too) over its variables and inputs widened."""
     with jax.enable_x64(new_val=True):
-        graph = jax.make_jaxpr(stepped(name, wide=True))(widened(drawn(name)(0)))
-    assert float32_values(graph.jaxpr) == 0
+        wide = ModelConfig.from_model(loaded.model).with_dtype("float64").build()
+        variables, data = widened((loaded.variables, inputs))
+
+        def summed(params):
+            return jnp.sum(wide.apply({**variables, "params": params}, data.tokens, **data.kwargs()))
+
+        return float32_values(jax.make_jaxpr(jax.grad(summed))(variables["params"]).jaxpr)
+
+
+def test_a_float64_wrapper_computes_in_float64_throughout(family_source):
+    """A family's wrapper built in float64 differentiates its logits in every parameter, through its
+    towers, with no float32 value (`float32_values`): their statistics, softmaxes, sinusoids and position
+    taps, float32 in a narrower model, read `at_least_fp32`, so the float64 build is the float64 truth of
+    the float32 one, as the reference's float64 twin is of its own (ledger 3332)."""
+    _, loaded, inputs, _ = family_source
+    assert _float32_values_in_float64(loaded, inputs) == 0
 
 
 def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
@@ -499,63 +602,31 @@ def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
     meta = json.loads((directory / "meta.json").read_text())
     inputs = loaded.processor(meta["prompts"],
                               audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
-    with jax.enable_x64(new_val=True):
-        wide = ModelConfig.from_model(loaded.model).with_dtype("float64").build()
-        variables, data = widened((loaded.variables, inputs))
-
-        def summed(params):
-            return jnp.sum(wide.apply({**variables, "params": params}, data.tokens, **data.kwargs()))
-
-        graph = jax.make_jaxpr(jax.grad(summed))(variables["params"])
-    assert float32_values(graph.jaxpr) == 0
+    assert _float32_values_in_float64(loaded, inputs) == 0
 
 
-def _once_a_seed(truth):
-    """`truth` computed once a seed, which the slip's check reads again."""
-    held = {}
+def test_gemma3ns_audio_embedder_reads_its_encoders_features_as_they_are():
+    """Gemma 3n's embedders take soft features as its source does: its image features scaled by the
+    square root of the vision width first (modeling_gemma3n.py:1983 at transformers 5.17.0), its audio
+    encoder's features as they are (:2192), the two told apart by its embedders' norm epsilon, so the
+    loaded wrapper's audio soft tokens are the embedder's over the encoder's output (ledger 3332)."""
+    directory = FIXTURE.parent / "gemma-3n-audio-tiny"
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    config = json.loads((directory / "config.json").read_text())
+    rng = np.random.default_rng(0x3332)
+    audio, vision = (jnp.asarray(rng.standard_normal((1, 5, config[part]["hidden_size"])), jnp.float32)
+                     for part in ("audio_config", "vision_config"))
+    scale = config["vision_config"]["hidden_size"] ** 0.5
 
-    @as_given
-    def kept(index, inputs):
-        if int(index) not in held:
-            held[int(index)] = truth(index, inputs)
-        return held[int(index)]
-    return kept
+    def embedded(model, audio, vision):
+        return ((model.audio_conditioner.audio_projector(audio),
+                 model.audio_conditioner.audio_projector.soft_embeddings(audio)),
+                (model.conditioner.projector(vision),
+                 model.conditioner.projector.soft_embeddings(vision * jnp.asarray(scale, vision.dtype))))
 
-
-@pytest.mark.parametrize("name", sorted(FAMILIES))
-def test_source_backward_trained_export_and_frozen_buffers_match_reference(name, tmp_path):
-    """One all-parameter SGD step through each family's wrapper over drawn media
-    (tests/multimodal_training.py): its loss, pixel gradient and logits after the step are on par with the
-    reference's from float64 over the recorded seeds (check 1, ledger 3332). The reference is transformers'
-    own step, recorded because Gemma 3n's vision tower needs timm, which the suite runs without; the truth
-    is Dew's step in float64, held to the recording's sketch of the reference's float64 twin. Whatever
-    order a backend sums Gemma 3n's layer-scale gradients in moves Dew's error and the reference's alike,
-    so no margin for it is chosen, and the rule still fails one layer's gradient with its sign flipped.
-    The trained model exports under the source's tensor names and reloads to the trained variables bit
-    for bit, and every non-parameter collection (Gemma4's standardization and clipping buffers) survives
-    training bitwise. Qwen3.5's root tie_word_embeddings=False overrides its nested text flag: tying the
-    head keeps the initial logits but misses this update by 0.00167."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
-    seeds = declared_seeds(recorded(name))["sgd"]
-    wide = stepped(name, wide=True)
-    draw, reference, truth = indexed_recording(recording(recorded(name)), "sgd", seeds, inputs_of=drawn(name),
-                                               truth_fn=lambda arrays: wide(arrays)[0])
-    truth = _once_a_seed(truth)
-    # One program for the step and its slip, the slip's sign an input: the arms run it as given.
-    program = jax.jit(stepped(name))
-    for sign, label in ((1.0, "SGD step"), (-1.0, "SGD step of a slip")):
-        with pytest.raises(GateFailure) if sign < 0 else contextlib.nullcontext():
-            assert_as_exact(as_given(lambda index, arrays, sign=sign: program(arrays, sign)[0]),
-                            as_given(reference), draw, f"{name} {label}", seeds=seeds, truth_fn=truth)
-    loaded = family_of(name).loaded
-    variables = program(draw(0)[1], 1.0)[1]
-    loaded.save(tmp_path, variables=variables)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    assert set(restored.variables) == set(variables)
-    for collection, tree in restored.variables.items():
-        kept = variables if collection == "params" else loaded.variables
-        for actual, expected in zip(jax.tree.leaves(tree), jax.tree.leaves(kept[collection]), strict=True):
-            np.testing.assert_array_equal(actual, expected)
+    for called, reference in jax.jit(lambda variables, audio, vision: loaded.model.apply(
+            variables, audio, vision, method=embedded))(loaded.variables, audio, vision):
+        np.testing.assert_array_equal(np.asarray(called), np.asarray(reference))
 
 
 @pytest.mark.parametrize("fixture", ["gemma4-unified-native-tiny", "gemma-4-audio-tiny",
