@@ -25,7 +25,6 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 import dataclasses
 import functools
 import math
-import weakref
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, NamedTuple
 
@@ -1595,23 +1594,10 @@ def inverse(total: jax.Array) -> jax.Array:
 
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
     """`score_mod` on a tile, rewritten by the algebra pass before the tile places it (docs/design/algebra.md
-    §2, `rewritten_hook`); a custom-derivative call in it lowers as its primal function (Dew's JAX build,
-    constraints.txt)."""
-    return rewritten_hook(score_mod)(logits, q_pos, k_pos, *params)
-
-
-_HOOKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-"""Each hook's rewritten program (`rewritten_hook`), held while the hook lives."""
-
-
-def rewritten_hook(hook: Callable) -> Callable:
-    """`hook` as the algebra pass rewrites it (`dew.algebra.rewritten`), made once a hook, which every tile
-    of a launch calls (the pass's derivations held across them, `program._derived`); the hook as written
-    where the pass is off."""
-    made = _HOOKS.get(hook)
-    if made is None:
-        made = _HOOKS[hook] = rewritten(hook)
-    return made
+    §2, `dew.algebra.rewritten`; the hook as written where the pass is off), each window's derivation held
+    across a launch's tiles (`program._derived`); a custom-derivative call in it lowers as its primal
+    function (Dew's JAX build, constraints.txt)."""
+    return rewritten(score_mod)(logits, q_pos, k_pos, *params)
 
 
 def _scaled(x: jax.Array, rows: bool = False) -> tuple[jax.Array, jax.Array]:

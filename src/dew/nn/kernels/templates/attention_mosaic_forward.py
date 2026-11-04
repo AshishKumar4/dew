@@ -243,7 +243,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                                 family=family, training=False, interpret=interpret,
                                 counted=form.natural == spec.natural and not again, kept=again,
                                 finishes=rows, columns=first, splits=splits, table=paged, sources=sources,
-                                out_dtype=jnp.float32 if split else out_dtype, walks=walks)
+                                out_dtype=jnp.float32 if split else out_dtype, walks=walks,
+                                shared_by=len(blocks))
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
@@ -939,7 +940,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
             kept: bool = False, finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
-            walks: jax.Array | None = None, sources: jax.Array | None = None):
+            walks: jax.Array | None = None, sources: jax.Array | None = None, shared_by: int = 1):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -959,9 +960,11 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     pools flattened, `[KV, P·size, D]`, and a step's key tile is read where the table maps it; with
     `sources` (`forward`'s) batch row `b`'s keys and values are their row `sources[b]`. With
     `column_width`, it walks `value`'s columns `columns` to `columns + column_width` where they lie, its
-    output that block's. With `walks` (a masked launch's, `algebra.walked_launches`': `[B, Qp // block_q]`
-    int32, nonzero at a query block holding a row it walks), a program none of whose query blocks it names
-    loads and writes nothing, its outputs there unread.
+    output that block's, the model's `Q K^T` its share among the `shared_by` blocks of an inference call's
+    columns (each block's launch recomputes it whole). With `walks` (a masked launch's,
+    `algebra.walked_launches`': `[B, Qp // block_q]` int32, nonzero at a query block holding a row it
+    walks), a program none of whose query blocks it names loads and writes nothing, its outputs there
+    unread.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call with no initial state")
@@ -987,16 +990,16 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      counted=counted, finishes=finishes, target=target,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_width=column_width)
+                     column_width=column_width, shared_by=shared_by)
 
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
-                      "counted", "finishes", "target", "name", "splits", "page", "column_width"))
+                      "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None):
+              column_width: int | None = None, shared_by: int = 1):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
@@ -1086,14 +1089,19 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             pl.when(_walked_program(program, walks, lax.axis_index("batch"), queries))(scoped_body)
 
     # The products this launch issues (`stated`), and the model's of them it owns (`modelled`): the forward's
-    # two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed; a rerun (a guarded
-    # launch, the fold's natural walk) none, as the FLOP count bounds a conditional by every branch, which
-    # would count the call twice.
+    # two, a peak walk's `Q K^T`, a training walk's `P V` beside its `Q K^T` recomputed, a block of an
+    # inference call's columns its `P V` and its share of `Q K^T` (`shared_by`); a rerun (a guarded launch,
+    # the fold's natural walk) none, as the FLOP count bounds a conditional by every branch, which would
+    # count the call's work twice every step where it reruns at most rarely.
     issued = width if peaks else width + value_width
-    owned = width if peaks else value_width if training else width + value_width
+    owned_value = 0 if peaks else value_width
+    owned_query = 0 if training and not peaks else width
     cost = (stated(spec, batch, heads, spec.queries or queries, issued, query, key, value) if counted
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
-    model = modelled(spec, batch, heads, spec.queries or queries, owned) if counted else 0
+    query_share = modelled(spec, batch, heads, spec.queries or queries, owned_query)
+    value_share = modelled(spec, batch, heads, spec.queries or queries, owned_value)
+    model = (0 if not counted else None if query_share is None or value_share is None
+             else query_share // shared_by + value_share)
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair * splits, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
