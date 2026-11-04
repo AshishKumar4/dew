@@ -106,8 +106,9 @@ def _call(eqn, *operands, **params):
 
 def _custom(eqn, *operands, **params):
     # A custom derivative whose program and rule act one entry at a time (`_axis_free`): its program and its
-    # rule's pullback, both traced at its own shapes, run entry for entry on the held tiles (`_run`), the
-    # rule kept as the held call's own (`jax.custom_vjp`), so no tile is reshaped (Mosaic GPU lowers none).
+    # rule, both traced at its own shapes, run entry for entry on the held tiles (`_run`), the rule kept the
+    # call's own kind, so no tile is reshaped (Mosaic GPU lowers none): a custom JVP's tangent program, which
+    # reverse mode transposes and a higher order differentiates (`_held_jvp`), a custom VJP's pullback.
     traced = [var.aval for var in eqn.invars]
     cotangents = [var.aval for var in eqn.outvars]
 
@@ -116,6 +117,8 @@ def _custom(eqn, *operands, **params):
 
     floating = [index for index, aval in enumerate(traced)
                 if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
+    if eqn.primitive.name == "custom_jvp_call":
+        return _held_jvp(params["call_jaxpr"], call, traced, floating)(*operands)
 
     def pulled(*values_and_cotangents):
         values, given = values_and_cotangents[:len(traced)], values_and_cotangents[len(traced):]
@@ -141,6 +144,39 @@ def _custom(eqn, *operands, **params):
 
     held.defvjp(lambda *values: (held(*values), values), held_pullback)
     return held(*operands)
+
+
+def _held_jvp(primal, call, traced: list, floating: list[int]) -> Callable:
+    """A custom JVP call (`call`, at `traced` avals, its inexact operands at `floating`) held entry for entry:
+    its program and its JVP's, both traced at its own shapes, run on the held tiles (`_run`); the JVP is the
+    call's own rule, so forward mode, its transpose and every higher order meet that rule as on the call."""
+    def tangent(*values_and_tangents):
+        values, tangents = values_and_tangents[:len(traced)], values_and_tangents[len(traced):]
+
+        def chosen(*picked):
+            return call(*[picked[floating.index(index)] if index in floating else value
+                          for index, value in enumerate(values)])
+
+        picked = tuple(values[index] for index in floating)
+        outputs, output_tangents = jax.jvp(chosen, picked, tuple(tangents))
+        return [*outputs, *output_tangents]
+
+    tangents = jax.make_jaxpr(tangent)(*traced, *(traced[index] for index in floating))
+    shapes = {aval.shape for aval in traced} - {()}
+    if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
+                                  for program in (primal, tangents)):
+        raise Untransposable("a custom_jvp_call whose program or derivative reads an axis or a constant tile")
+
+    @jax.custom_jvp
+    def held(*values):
+        return _run(primal.jaxpr, primal.consts, values)
+
+    @held.defjvp
+    def held_tangent(values, directions):
+        both = _run(tangents.jaxpr, tangents.consts, [*values, *(directions[index] for index in floating)])
+        return both[:len(both) // 2], both[len(both) // 2:]
+
+    return held
 
 
 def _tiles_in(closed) -> bool:
