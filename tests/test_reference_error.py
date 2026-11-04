@@ -242,7 +242,8 @@ def test_a_without_ynn_arm_runs_over_windows():
 
 def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
     """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
-    both arms once, a window loop's arm within it, an arm compiled so already as it is; beside an arm
+    both arms twice (its reference unrewritten), a window loop's arm within it, an arm compiled so already
+    as it is; beside an arm
     run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
     fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
     from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
@@ -256,8 +257,9 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     mine, theirs = _arms(dew, written)
     assert mine.without_ynn and theirs.without_ynn
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    # One function as both arms compiles twice: the reference runs its programs unrewritten.
     same, again = _arms(dew, dew)
-    assert same is again and same.without_ynn
+    assert same is not again and same.without_ynn and again.without_ynn
     compiled = without_ynn(dew)
     assert _arms(compiled, written)[0] is compiled
     windowed, _ = _arms(over_windows(dew), written)
@@ -892,8 +894,9 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
         with pytest.raises(jax.errors.TracerArrayConversionError):
             hosted(x, w)
+    # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
-    assert _truth_program(given) is given and _truth_program(_product) is _product
+    assert _truth_program(given).__wrapped__ is given and _truth_program(_product).__wrapped__ is _product
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
     assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, _Truth)

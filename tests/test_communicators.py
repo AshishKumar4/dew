@@ -467,12 +467,19 @@ def test_a_hosts_gpus_are_counted_by_its_cuda_driver_without_nvidia_smi(tmp_path
 def test_the_gpus_counted_are_those_jax_opens_where_its_own_setting_selects_some(tmp_path):
     """JAX's own selection of a process's GPUs (`jax_cuda_visible_devices`, set in the process) is what the
     process opens: on a host whose driver finds four, a process selecting two measures its communicators'
-    room on those two (its configuration's GPUs, which its pool's sizing reads), and one selecting none on
-    every GPU."""
+    room on those two, by the driver's ordinals (its configuration's places, which its pool's sizing reads),
+    and one selecting none on every GPU."""
     compiler = shutil.which("cc")
     assert compiler is not None, "the stand-in driver library is built by the host's C compiler, cc"
-    (tmp_path / "libcuda.c").write_text("int cuInit(unsigned flags) { return 0; }\n"
-                                        "int cuDeviceGetCount(int *count) { *count = 4; return 0; }\n")
+    # A driver of four GPUs, each placed at a PCI bus id of its ordinal.
+    (tmp_path / "libcuda.c").write_text(
+        "int cuInit(unsigned flags) { return 0; }\n"
+        "int cuDeviceGetCount(int *count) { *count = 4; return 0; }\n"
+        "int cuDeviceGet(int *device, int ordinal) { *device = ordinal; return 0; }\n"
+        "int cuDeviceGetName(char *name, int size, int device) { name[0] = 'G'; name[1] = 0; return 0; }\n"
+        "int cuDeviceGetPCIBusId(char *id, int size, int device) {\n"
+        "  id[0] = '0' + device; id[1] = 0; return 0; }\n"
+        "int cuDriverGetVersion(int *version) { *version = 13000; return 0; }\n")
     subprocess.run([compiler, "-shared", "-fPIC", "-o", str(tmp_path / "libcuda.so.1"),
                     str(tmp_path / "libcuda.c")], check=True)
     environment = {name: value for name, value in os.environ.items() if name != "CUDA_VISIBLE_DEVICES"}
@@ -481,8 +488,8 @@ def test_the_gpus_counted_are_those_jax_opens_where_its_own_setting_selects_some
     counted = ("import jax, sys\n"
                "if len(sys.argv) > 1: jax.config.update('jax_cuda_visible_devices', sys.argv[1])\n"
                "from dew.communicators import configuration\n"
-               "print(len(configuration()['gpus']))\n")
-    for setting, expected in ((None, 4), ("1,2", 2), ("3", 1)):
+               "import json; print(json.dumps(configuration()['placement']))\n")
+    for setting, expected in ((None, ["0", "1", "2", "3"]), ("1,2", ["1", "2"]), ("3", ["3"])):
         done = subprocess.run([sys.executable, "-c", counted, *([setting] if setting else [])],
                               capture_output=True, text=True, check=True, env=environment)
         assert json.loads(done.stdout.strip().splitlines()[-1]) == expected
