@@ -12,7 +12,8 @@ A probe measures one row a process, so the high-water is that row's.
 
     peaks = measured(["tools/benchmark_step.py", "--cases", ..., "--peak-run"])
 
-A device whose allocator keeps no high-water (JAX's CPU devices, as this JAX builds them) reports None.
+A device whose allocator keeps no high-water (JAX's CPU devices, as this JAX builds them) reports None,
+which a caller may know before it runs a process (`keeps_high_water`).
 """
 
 import json
@@ -54,6 +55,16 @@ device's high-water written as it exits."""
 class CompiledWhileMeasured(RuntimeError):
     """The measured process compiled a program its cache did not hold, whose compile, and autotuning,
     joined the high-water it read: the program compiles otherwise on its second run than its first."""
+
+
+def keeps_high_water() -> bool:
+    """Whether this process's devices may keep a high-water: not where JAX runs on its CPU devices alone
+    (`jax_platforms`, read without opening a backend), whose every peak `measured` reports is None. The
+    one place a caller asks so: a tool skips its peak processes by it, not by a check of its own, and
+    keeps a test that runs `measured` over its peak run where it does (benchmark_lm_serving's)."""
+    import jax
+
+    return jax.config.jax_platforms != "cpu"
 
 
 def measured(argv: list[str]) -> list[int | None]:
