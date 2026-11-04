@@ -1267,7 +1267,8 @@ def plan(target: float, timings: dict) -> list[dict]:
         entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
                      "cache": cache, "whole": cells}
                     for entry in site_entries(python, marked, found, timings, target)]
-    rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
+    # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
+    rest = [] if cells == "1" else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
     return entries + [{**entry, "cache": cache, "whole": cells} for entry in collecting]
 
