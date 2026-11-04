@@ -88,6 +88,14 @@ PARAMETER_ROWS = 8
 rows come in."""
 
 
+def forward_scope(family: mosaic.Family, chunk: int, states: int, dtypes: tuple,
+                  packed: bool) -> resources.Scope:
+    """`forward`'s shared memory by lifetime at `chunk` tokens (`forward_allocations`), its streams where the
+    family states they live (`mainloop.allocation_scope`, `Family.lifetimes`), no reduction across warps."""
+    streams, allocations = forward_allocations(family, chunk, block_scan.THREADS, states, dtypes, packed)
+    return mainloop.allocation_scope(family, streams, allocations, reduces=False)
+
+
 def forward_allocations(family: mosaic.Family, chunk: int, block: int, states: int, dtypes: tuple,
                         packed: bool) -> tuple[dict, tuple]:
     """`forward`'s shared memory at `chunk` tokens and `block` channels a program: its streams (a ring of two
@@ -386,7 +394,13 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     return dx, ddt, dbc[0].sum(0), dbc[1].sum(0), da, dd, dstate
 
 
-def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
+CHUNK = 32
+"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
+keeps for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are
+the portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
+
+
+def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = CHUNK,
                    block: int = block_scan.THREADS, interpret: bool = False,
                    plan: tuple[int, int] | None = None):
     """`dew.nn.mixers.mamba.selective_scan` on the template: `x`, `dt` `[B, S, D]` (after the softplus),
@@ -477,12 +491,6 @@ class Tiles:
     resident: int
 
 
-CHUNK = 32
-"""The fewest tokens a forward chunk takes, a ring stage of its operands whose entering state the forward
-keeps for each backward block it opens (`Scan.opening`), and the fewest a call takes (a decode step's are
-the portable math's, `recurrence_chunk.SELECTIVE_SUPPORTS`)."""
-
-
 class Selective(base.Template[Tiles]):
     """Mamba's selective scan on the recurrence template (`selective_scan`), its config derived from the
     device's facts (`derived`), its launches named for the compile's reports (`report.launching`), so a launch
@@ -508,12 +516,12 @@ class Selective(base.Template[Tiles]):
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """The call's config on `target`: the backward's tokens a thread and residency from its register model
         (`backward_plan`), past the token counts a compile found spilling (`report.spilled`), each a step down
-        to half its tokens; and the forward's chunk, from `CHUNK` the longest whose ring a block's shared
-        memory holds (`staged_bytes`), up to a warpgroup's tokens (a chunk dividing every backward block),
-        dividing the call's tokens padded to `CHUNK`'s (a longer chunk walks no more padding): on an H100
-        Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a chunk, 1.14 at 32 and 1.12 to
-        1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to 6.40 (sel-chunk-sxm at
-        5bf70d36b)."""
+        to half its tokens (None where a spill no token count clears); and the forward's chunk, from `CHUNK`
+        the longest whose ring a block's shared memory holds (`staged_bytes`), up to a warpgroup's tokens (a
+        chunk dividing every backward block), dividing the call's tokens padded to `CHUNK`'s (a longer chunk
+        walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at 16 tokens a
+        chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and 6.34 to
+        6.40 (sel-chunk-sxm at 5bf70d36b)."""
         facts = self._facts(ba, target)
         positions, resident = backward_plan(facts)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
@@ -522,16 +530,15 @@ class Selective(base.Template[Tiles]):
                 ba, Tiles(2 * chunk, positions, resident), facts) <= generation.shared_budget(facts)):
             chunk *= 2
         tiles = Tiles(chunk, positions, resident)
-        # A launch whose compile found a kernel spilling steps that kernel's own tiles down: the backward's
-        # tokens, else the forward's chunk.
+        # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
+        # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
+        # a forward spill, or a backward's at one token, leaves no config.
         while spilled := report.spilled(self, ba, tiles):
-            if any(name.startswith("selective_scan_backward") for name in spilled) and tiles.positions > 1:
-                fewer = tiles.positions // 2
-                tiles = Tiles(tiles.chunk, fewer, backward_programs(backward_registers(fewer), facts))
-            elif tiles.chunk > CHUNK:
-                tiles = dataclasses.replace(tiles, chunk=tiles.chunk // 2)
-            else:
+            backward = all(name.startswith("selective_scan_backward") for name in spilled)
+            if not backward or tiles.positions == 1:
                 return None
+            fewer = tiles.positions // 2
+            tiles = Tiles(tiles.chunk, fewer, backward_programs(backward_registers(fewer), facts))
         return tiles
 
     @staticmethod
@@ -559,12 +566,19 @@ class Selective(base.Template[Tiles]):
 
         arguments = ba.arguments
         x, dt, b, c = (arguments[name] for name in ("x", "dt", "B", "C"))
-        family = (bundles.INTERPRETED if arguments.get("interpret", False)
-                  else bundles.of(target.generation, x.dtype)) or bundles.INTERPRETED
-        streams, allocations = forward_allocations(family, config.chunk, block_scan.THREADS, b.shape[-1],
-                                                   (x.dtype, dt.dtype, b.dtype, c.dtype),
-                                                   arguments.get("starts") is not None)
-        return resources.shared_bytes(family, resources.Scope(program=(streams, allocations)))
+        family = bundles.INTERPRETED if arguments.get("interpret", False) else bundles.of(target.generation,
+                                                                                            x.dtype)
+        assert family is not None, f"no bundle of the template claims {target.generation} (`eligible`)"
+        return resources.shared_bytes(family, forward_scope(family, config.chunk, b.shape[-1],
+                                                            (x.dtype, dt.dtype, b.dtype, c.dtype),
+                                                            arguments.get("starts") is not None))
+
+    def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether a bundle of the template claims the call's GPU (interpreted, the interpreted bundle)."""
+        from dew.nn.kernels.templates import bundles
+
+        return (ba.arguments.get("interpret", False)
+                or bundles.of(target.generation, ba.arguments["x"].dtype) is not None)
 
 
 SELECTIVE = Selective()

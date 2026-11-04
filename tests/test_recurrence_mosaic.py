@@ -1101,3 +1101,34 @@ def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
         tiles = op.derived(ba, target)
         assert tiles is not None and (tiles.block_v, tiles.stages) == (32, 5)
         assert op.states_held(ba, tiles, target) == 1
+
+
+@lowers('sm90')
+def test_a_training_launchs_backward_kernels_carry_its_launch():
+    """The gated delta rule's 16-bit training step on the template lowered for an H100: its fast backward's
+    kernels, which JAX traces on the pullback after the launch's scope ended, carry the launch that traced
+    its forward (`report.relaunched`), so a compile that finds one spilling refuses that launch and steps
+    its training tiles (row 3851)."""
+    from kernel_compile import lowered_for
+
+    from dew.training._lowering import kernel_calls
+
+    name = 'qwen3.5-27b-gdn'
+    args = resource_operands(name, jnp.bfloat16, 1, 256)
+
+    def call(*given):
+        return template.MOSAIC(*given, None, bound=1.0, **_form(name, jnp.bfloat16))[0]
+
+    def trained(*given):
+        out, pull = jax.vjp(call, *given)
+        return pull(out)
+
+    def launches(fn) -> dict:
+        lowered = lowered_for(fn, args, 'sm90')
+        return {found.name: found.launch for found in kernel_calls(lowered, unrun=True)
+                if found.kind == 'mosaic_gpu'}
+
+    forward, training = launches(call), launches(trained)
+    assert set(forward) < set(training), (forward, training)
+    assert len(set(training.values())) == 1 and None not in training.values(), training
+

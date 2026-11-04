@@ -28,7 +28,7 @@ from selective_support import selective_draw, selective_xla
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence_chunk
-from dew.nn.kernels.templates import bundles, mosaic_sm90
+from dew.nn.kernels.templates import bundles, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
 
@@ -321,4 +321,80 @@ def test_a_launchs_backward_kernel_carries_its_launch():
     assert set(launches) == {'selective_scan', 'selective_scan_backward'}, launches
     assert launches['selective_scan'] is not None
     assert launches['selective_scan_backward'] == launches['selective_scan'], launches
+
+
+def _bound(length: int):
+    """The selective scan's template launch bound to a bf16 call of `length` tokens (one row, 256 channels,
+    Mamba's 16 states), interpreted."""
+    operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((256, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, length, 16), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((256,), jnp.float32))
+    return selective.SELECTIVE.bind(*operands, interpret=True)
+
+
+def test_a_spill_steps_the_kernel_that_spilled():
+    """`Selective.derived` past a compile's spill (`report.refuse`, a refusals scope): a backward kernel that
+    spilled halves the backward's tokens, its residency the planner's at their registers, the forward's
+    chunk kept; a forward kernel's spill, whose registers no tile sets, leaves the call no config (rows 3851,
+    3861)."""
+    bound = _bound(2048)
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        derived = selective.SELECTIVE.derived(bound, target)
+        identity = report._identity(selective.SELECTIVE, bound)
+        with report.refusals():
+            report.refuse([(identity, derived, {'selective_scan_backward'})])
+            stepped = selective.SELECTIVE.derived(bound, target)
+        with report.refusals():
+            report.refuse([(identity, derived, {'selective_scan'})])
+            assert selective.SELECTIVE.derived(bound, target) is None
+    facts = generation.gpu_target(generation.INTERPRETED_GENERATION)
+    fewer = derived.positions // 2
+    assert stepped == selective.Tiles(derived.chunk, fewer,
+                                      selective.backward_programs(selective.backward_registers(fewer), facts))
+
+
+@pytest.mark.parametrize(('length', 'chunk'), [(129, 32), (2048, 128)], ids=['129 tokens', '2048 tokens'])
+def test_a_chunk_walks_no_more_padding_than_the_shortest(length, chunk):
+    """The forward's derived chunk on an H100's facts: the longest whose ring a block holds, dividing the
+    call's tokens padded to the shortest chunk's, so 129 tokens walk 160 at 32 a chunk, not 256 at 128
+    (row 3853)."""
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        assert selective.SELECTIVE.derived(_bound(length), target).chunk == chunk
+
+
+@lowers('sm90')
+@pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
+def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed):
+    """The forward's shared memory as the template counts it (`forward_scope`, `resources.scratch_bytes`) the
+    scratch Mosaic GPU's resource estimate gives its kernel lowered for an H100, at the derived chunk; and
+    counted for an A100's family, whose walks scope their streams (row 3854, 3859)."""
+    from kernel_compile import SHARED, _estimates, _printed, lowered_for
+
+    from dew.nn.kernels.templates import resources
+    from dew.training._lowering import kernel_calls
+
+    length, states = 2048, 16
+    operands = (jax.ShapeDtypeStruct((1, length, 256), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((256, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((256,), jnp.float32), None,
+        jax.ShapeDtypeStruct((1, length), bool) if packed else None)
+    target = generation.gpu_target('sm90')
+    with generation.assumed(target):
+        chunk = selective.SELECTIVE.derived(selective.SELECTIVE.bind(*operands), target).chunk
+    with _printed(MOSAIC_GPU_DUMP_RESOURCES='1') as printed:
+        lowered = lowered_for(lambda *given: selective.SELECTIVE(*given)[0], operands, 'sm90')
+    calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == 'mosaic_gpu']
+    estimates = _estimates(calls, ''.join(printed))
+    (estimate,) = [found for name, found in estimates.items() if name.startswith('selective_scan__')
+                   or name == 'selective_scan']
+    dtypes = (jnp.bfloat16,) * 4
+    scope = selective.forward_scope(mosaic_sm90.WGMMA, chunk, states, dtypes, packed)
+    counted = resources.scratch_bytes(mosaic_sm90.WGMMA, scope)
+    assert counted == int(SHARED.search(estimate).group(1)), (counted, estimate)
+    ampere = bundles.of('sm80', jnp.bfloat16)
+    assert resources.shared_bytes(ampere, selective.forward_scope(ampere, chunk, states, dtypes, packed)) > 0
 

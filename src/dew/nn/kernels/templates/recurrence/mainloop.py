@@ -548,12 +548,12 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return _scope(family, allocations(depth), staged, reduces=reduces, after=after)
+        return allocation_scope(family, allocations(depth), staged, reduces=reduces, after=after)
 
     return allocations, scope, staged, landed
 
 
-def _scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
+def allocation_scope(family: mosaic.Family, streams: dict, staged: tuple, *, reduces: bool = True,
            after: tuple = ()) -> resources.Scope:
     """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
     Mosaic GPU's resource estimate does): its `streams`' as the family states where they live

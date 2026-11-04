@@ -47,7 +47,7 @@ from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_al
 from .generation import INHERENT, triton_runs
 from .selection import Kernel, KernelRefused, Op, Requirement, select, selected
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
-from .templates import base
+from .templates import base, scan as block_scan
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -1518,8 +1518,8 @@ class SelectiveCase:
 
 
 def _selective():
-    """The template's selective scan (`templates.recurrence.selective`), its constants read where a
-    requirement asks: its least chunk (`CHUNK`) and a program's channels, one a thread of its warpgroup."""
+    """The template's selective scan (`templates.recurrence.selective`), its least chunk (`CHUNK`) read where
+    a requirement asks."""
     from .templates.recurrence import selective
 
     return selective
@@ -1540,9 +1540,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
                 "interprets, as the CPU suite runs it where a call names it", row=INHERENT, kind='measured'),
     Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16, jnp.float32),
                 lambda case: f"{case.dtype} operands; the template takes 16-bit and fp32 ones", row=INHERENT),
-    Requirement('channels', lambda case: case.channels % _selective().block_scan.THREADS == 0,
+    Requirement('channels', lambda case: case.channels % block_scan.THREADS == 0,
                 lambda case: f"{case.channels} channels, no whole number of the template's blocks of "
-                             f"{_selective().block_scan.THREADS}", row='ledger 1300'),
+                             f"{block_scan.THREADS}", row='ledger 1300'),
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
