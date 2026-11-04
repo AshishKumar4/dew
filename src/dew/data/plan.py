@@ -88,7 +88,9 @@ class PlanOrderChanged(ValueError):
         return type(self), (self.changed, self.routes)
 
 
-def _differing(saved: JSON, now: JSON, path: str = "") -> Iterator[tuple[str, tuple[JSON, JSON]]]:
+def _differing(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+               now: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+               path: str = "") -> Iterator[tuple[str, tuple[JSON, JSON]]]:
     """Each path at which `now` differs from `saved`, with both values there (None where one holds none):
     into the records and lists of equal length both hold, a record's field by its name and a list's entry
     by its place."""

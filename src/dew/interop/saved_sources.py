@@ -81,7 +81,8 @@ def is_saved_run(name_or_dir: str | Path) -> bool:
     return path.is_dir() and (path / RUN_FILE).is_file()
 
 
-def step_records(artifact: JSON, directory: str, step: int) -> tuple[epath.Path, ...]:
+def step_records(artifact: dict[str, JSON] | list[JSON] | str | int | float | bool | None, directory: str,
+                 step: int) -> tuple[epath.Path, ...]:
     """The files the task of the objective `artifact`, a step's inference declaration
     (`Checkpoints.artifact`), names keeps by the `step` of the run in `directory`
     (`SavedRunTask.step_records`); none for a step that declares no objective, an objective that names no
