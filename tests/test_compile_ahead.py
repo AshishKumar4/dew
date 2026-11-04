@@ -372,8 +372,9 @@ def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets
     from pathlib import Path
 
     root = str(Path(__file__).resolve().parents[1])
+    # Its compile took 45 to 75 s on armada; past ten minutes it is stuck, not slow.
     ran = subprocess.run([sys.executable, "-c", GATED_DELTA_AHEAD, root], capture_output=True, text=True,
-                         check=False)
+                         timeout=600, check=False)
     assert ran.returncode == 0, ran.stderr[-3000:]
 
 
