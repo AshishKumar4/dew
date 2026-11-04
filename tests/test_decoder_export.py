@@ -331,12 +331,15 @@ def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
 
 
 def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
+    """The trained depth's logits, compiled (op by op they took 44 s of the test, ledger 3842), read
+    as the reference's composition reads the export."""
     trip = trips('glm5_next')
     model = trip.source.model
-    states, _ = model.apply(trip.trained, trip.ids, method=model.states_and_logits)
+    states, _ = jax.jit(functools.partial(model.apply, method=model.states_and_logits))(trip.trained,
+                                                                                       trip.ids)
     assert np.shape(states) == (*trip.ids.shape, model.emb_features)
-    actual = np.asarray(model.apply(
-        trip.trained, states, trip.ids, method=model.mtp_logits)[0])
+    actual = np.asarray(jax.jit(functools.partial(model.apply, method=model.mtp_logits))(
+        trip.trained, states, trip.ids)[0])
     expected = tool.glm5_prediction_logits(trip.case, trip.export, trip.ids)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
     difference = float(np.max(np.abs(actual - expected)))
@@ -404,10 +407,12 @@ def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
     from tools.deepseek_v4_reference import load_mtp_reference
 
     trip = trips('deepseek_v4')
-    _, streams = trip.source.model.apply(trip.trained, trip.ids,
-                                         method=trip.source.model.hidden_and_mtp_inputs)
-    actual = trip.source.model.apply(trip.trained, streams, trip.ids,
-                                     method=trip.source.model.mtp_logits)[0]
+    model = trip.source.model
+    # Compiled: op by op the two reads took most of the test's Dew side (ledger 3842).
+    _, streams = jax.jit(functools.partial(model.apply, method=model.hidden_and_mtp_inputs))(
+        trip.trained, trip.ids)
+    actual = jax.jit(functools.partial(model.apply, method=model.mtp_logits))(trip.trained, streams,
+                                                                             trip.ids)[0]
     reference, _ = tool.reference_model(trip.case, trip.export)
     reference.eval()
     reference.set_attn_implementation('eager')
