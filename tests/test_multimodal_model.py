@@ -19,10 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from float64_terms import float64_forward
+from float64_terms import float32_values, float64_forward
 from multimodal_families import FAMILIES
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import GateFailure
+from reference_error import GateFailure, widened
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -61,7 +61,7 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
     reference = np.load(FIXTURE / "logits.npy")
     np.testing.assert_allclose(np.asarray(output)[valid], reference[valid], atol=1e-4, rtol=0)
     np.testing.assert_array_equal(np.asarray(output)[valid].argmax(-1), reference[valid].argmax(-1))
-    from reference_error import assert_moves, widened
+    from reference_error import assert_moves
 
     from dew.registry import ModelConfig
 
@@ -569,6 +569,64 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
             for actual, original in zip(jax.tree.leaves(tree),
                                         jax.tree.leaves(loaded.variables[collection]), strict=True):
                 np.testing.assert_array_equal(actual, original)
+
+
+def _float32_values_in_float64(loaded, inputs) -> int:
+    """The float32 values the gradient of `loaded`'s summed logits over `inputs` makes, the model built in
+    float64 (`ModelConfig.with_dtype`, its towers too) over its variables and inputs widened."""
+    with jax.enable_x64(new_val=True):
+        wide = ModelConfig.from_model(loaded.model).with_dtype("float64").build()
+        variables, data = widened((loaded.variables, inputs))
+
+        def summed(params):
+            return jnp.sum(wide.apply({**variables, "params": params}, data.tokens, **data.kwargs()))
+
+        return float32_values(jax.make_jaxpr(jax.grad(summed))(variables["params"]).jaxpr)
+
+
+def test_a_float64_wrapper_computes_in_float64_throughout(family_source):
+    """A family's wrapper built in float64 differentiates its logits in every parameter, through its
+    towers, with no float32 value (`float32_values`): their statistics, softmaxes, sinusoids and position
+    taps, float32 in a narrower model, read `at_least_fp32`, so the float64 build is the float64 truth of
+    the float32 one, as the reference's float64 twin is of its own (ledger 3332)."""
+    _, loaded, inputs, _ = family_source
+    assert _float32_values_in_float64(loaded, inputs) == 0
+
+
+def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
+    """Gemma 4's audio tower built in float64 attends, forward and backward, with no float32 value: its
+    projections and relative positions, float32 in a narrower model, read `at_least_fp32` (ledger 3332)."""
+    pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
+    directory = FIXTURE.parent / "gemma-4-audio-tiny"
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    meta = json.loads((directory / "meta.json").read_text())
+    inputs = loaded.processor(meta["prompts"],
+                              audio=[np.load(directory / f"waveform_{index}.npy") for index in range(2)])
+    assert _float32_values_in_float64(loaded, inputs) == 0
+
+
+def test_gemma3ns_audio_embedder_reads_its_encoders_features_as_they_are():
+    """Gemma 3n's embedders take soft features as its source does: its image features scaled by the
+    square root of the vision width first (modeling_gemma3n.py:1983 at transformers 5.17.0), its audio
+    encoder's features as they are (:2192), the two told apart by its embedders' norm epsilon, so the
+    loaded wrapper's audio soft tokens are the embedder's over the encoder's output (ledger 3332)."""
+    directory = FIXTURE.parent / "gemma-3n-audio-tiny"
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    config = json.loads((directory / "config.json").read_text())
+    rng = np.random.default_rng(0x3332)
+    audio, vision = (jnp.asarray(rng.standard_normal((1, 5, config[part]["hidden_size"])), jnp.float32)
+                     for part in ("audio_config", "vision_config"))
+    scale = config["vision_config"]["hidden_size"] ** 0.5
+
+    def embedded(model, audio, vision):
+        return ((model.audio_conditioner.audio_projector(audio),
+                 model.audio_conditioner.audio_projector.soft_embeddings(audio)),
+                (model.conditioner.projector(vision),
+                 model.conditioner.projector.soft_embeddings(vision * jnp.asarray(scale, vision.dtype))))
+
+    for called, reference in jax.jit(lambda variables, audio, vision: loaded.model.apply(
+            variables, audio, vision, method=embedded))(loaded.variables, audio, vision):
+        np.testing.assert_array_equal(np.asarray(called), np.asarray(reference))
 
 
 @pytest.mark.parametrize("fixture", ["gemma4-unified-native-tiny", "gemma-4-audio-tiny",

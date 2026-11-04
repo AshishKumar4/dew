@@ -354,7 +354,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
             vision_width=encoder.hidden_size, text_width=text_width,
             vocab_size=_records.integer(audio.get("vocab_size", 128), "vocab_size"),
             vocab_offset=_records.integer(audio.get("vocab_offset", 262272), "vocab_offset"),
-            norm_eps=encoder.rms_norm_eps)}
+            norm_eps=encoder.rms_norm_eps, scales_soft=False)}
     return {"audio": {"class": _records.text(audio["model_type"], "audio_config model_type"), "fields": {
                       **asdict(encoder)}},
             "audio_token_id": audio_token_id, "audio_soft_tokens": slots, "audio_projector": projector}

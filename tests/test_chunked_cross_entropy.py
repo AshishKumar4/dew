@@ -27,6 +27,7 @@ import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
 from flax import linen as nn
+from float64_terms import float32_values
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for, with_gradients
 from residual_orders import order
 from sharded import collectives
@@ -636,14 +637,6 @@ def eighths(*values):
     order, so two products of them give the same logits, and the same bf16
     rounding of them, whatever order each sums in."""
     return tuple((jnp.round(value.astype(jnp.float32) * 8) / 8).astype(value.dtype) for value in values)
-
-
-def float32_values(jaxpr) -> int:
-    """How many values of float32 `jaxpr`, and every jaxpr it holds, makes."""
-    made = sum(any(getattr(getattr(var, "aval", None), "dtype", None) == jnp.float32
-                   for var in eqn.outvars) for eqn in jaxpr.eqns)
-    return made + sum(float32_values(inner) for eqn in jaxpr.eqns
-                      for inner in jax.extend.core.jaxprs_in_params(eqn.params))
 
 
 # --- the mutations, each one a loss that would still train ------------------
