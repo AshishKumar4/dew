@@ -288,7 +288,9 @@ def parameter_key(value) -> Hashable:
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, jax.sharding.Mesh):
-        return ("mesh", parameter_key(value.device_ids), parameter_key(value.axis_names),
+        # An empty mesh (a jit's context outside any) holds no devices.
+        devices = () if value.empty else value.device_ids
+        return ("mesh", parameter_key(devices), parameter_key(value.axis_names),
                 parameter_key(value.axis_types))
     if isinstance(value, jax.sharding.AbstractMesh):
         return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
