@@ -14,8 +14,9 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
-  # Daily, main's every test file runs, the test cache aside (tools/armada/ci.py), so nothing it
-  # skipped can hide.
+  # Daily, main's every test file runs on every Python, the whole_suite cells and the release checks among them,
+  # the test cache aside (tools/armada/ci.py), so nothing it skipped can hide: the one whole suite, which the land
+  # queue reads (its daily runs), each red a P1 of its file's owner.
   schedule:
     - cron: "17 9 * * *"
   # The release workflow runs all of this on the release's own commit and
@@ -28,9 +29,11 @@ permissions:
 # A newer push to the same ref makes the older run's verdict moot, but on base/kernels, whose lanes push more
 # often than a run takes (about 47 minutes), a running run finishes: GitHub keeps the newest push pending behind it,
 # cancelling an older pending one, so each run that finishes grades the newest tip it could and its reds page
-# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished).
+# (2026-11-02: seven base runs in a row cancelled by the next push, 2 to 26 minutes in, none finished). The daily
+# run takes a group of its own: a push to main, a train's publish, makes no whole suite moot (the daily of 10-28,
+# 10-29 and 11-02 was cancelled so, its verdict never written).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'schedule' && 'daily' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' }}
 
 env:
@@ -143,7 +146,7 @@ jobs:
         done
 
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
-  # group depends on it: the daily run and a land-queue train's full run (ci/full-*) run every file; any other
+  # group depends on it: the daily run runs every file with the cache off; any other
   # run reruns what its change reaches, and the whole suite where it cannot place it: from main, for a fix on a
   # train (ci/fix-*) from the train's tip it fixes, its first parent, for a base/<producer> promote
   # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>, and for a push to base/kernels from
@@ -164,7 +167,7 @@ jobs:
     - uses: astral-sh/setup-uv@v6
     - id: policy
       env:
-        DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
+        DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || '' }}
         BEFORE: ${{ github.event.before }}
         GH_TOKEN: ${{ github.token }}
       run: |
@@ -224,17 +227,13 @@ jobs:
     # of waiting holders gives a gang's ranks their containers in turn
     # (armada#49). Any other run takes `armada`, one at a time. A base/<producer>
     # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
-    # change reaches or the whole suite, and so does the whole suite on main,
-    # every fifth publish, in the background (ci/full-whole-*): both run no
-    # gangs, which every train runs, and each takes a bounded share of the
-    # fleet (`BACKGROUND_POOL`), so a train never waits on them and its gangs
-    # find their containers: 387 for a train, 48 for a base promote and 48
-    # for the whole suite leave the rest of the 725 to the lanes' runs (at
-    # most 96 each). On fewer containers a whole suite takes longer, so these
-    # two have a longer deadline.
+    # change reaches or the whole suite: they run no gangs, which every train runs, and take a bounded share of
+    # the fleet (`BACKGROUND_POOL`), so a train never waits on them and its gangs find their containers; on fewer
+    # containers a whole suite takes longer, so they have a longer deadline. The daily run, the one whole suite,
+    # takes a group of its own, so a direct push to main never waits on it.
     concurrency:
       group: >-
-        ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
+        ${{ (github.event_name == 'schedule' && 'armada-daily')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
         || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
         || ((startsWith(github.ref_name, 'ci/batch-') || startsWith(github.ref_name, 'ci/fix-'))
@@ -243,8 +242,8 @@ jobs:
         || 'armada' }}
       cancel-in-progress: false
       queue: max
-    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/full-whole-') || startsWith(github.ref_name, 'ci/base-')
-      || github.ref_name == 'base/kernels' || needs.scope.outputs.policy == 'off') && 110 || 60 }}
+    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels'
+      || needs.scope.outputs.policy == 'off') && 110 || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -270,12 +269,12 @@ jobs:
         # It reads records and never writes them; a fork's pull request receives no repository secret.
         DEW_XLA_CACHE_READ_TOKEN: ${{ secrets.DEW_XLA_CACHE_READ_TOKEN }}
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
-        # The whole suite's run alone runs the whole_suite cells (tools/armada/ci.py `selected`).
-        DEW_WHOLE_SUITE: ${{ startsWith(github.ref_name, 'ci/full-whole-') && '1' || '' }}
+        # The daily run alone runs the whole_suite cells, every file on the newest Python and the release checks
+        # (tools/armada/ci.py `selected`, `plan`, `release-plan`).
+        DEW_WHOLE_SUITE: ${{ github.event_name == 'schedule' && '1' || '' }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
-          ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '48')
-          || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
+          ${{ ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
       run: |
         armada=armada
         # The test cache's policy, as the scope job read it.
@@ -283,13 +282,12 @@ jobs:
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        # A base/<producer> promote, a push to base/kernels and the background whole suite run no gangs: main's
-        # trains run them.
-        case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
+        # A base/<producer> promote and a push to base/kernels run no gangs: main's trains run them.
+        case "$GITHUB_REF_NAME" in ci/base-*|base/kernels) gangless=1 ;; *) gangless= ;; esac
         # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the
         # fleet is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in
         # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
-        # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
+        # base/kernels and a base/<producer> promote run at a lane's whole-suite priority
         # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
         # lane's targeted run (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease
         # ledger). A train staged on the testing train's tip (ci/stage-*, its own concurrency group above)
@@ -303,7 +301,7 @@ jobs:
         case "$GITHUB_REF_NAME" in
           ci/batch-*|ci/fix-*) priority=--priority=10 ;;
           ci/stage-*|main) priority=--priority=5 ;;
-          ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
+          ci/base-*|base/kernels) priority=--priority=-10 ;;
           *) priority= ;;
         esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
@@ -334,10 +332,9 @@ jobs:
         case "$GITHUB_REF_NAME" in ci/stage-*-p[0-9]*) bound="$bound --pool=${GITHUB_REF_NAME##*-p}" ;; esac
         # A commit the proven job found proved (a run that passed, or, on main, the land queue's proof of the tip it
         # graded green, red rows its regrade passed included) runs no suite again, whatever its stored verdict or the
-        # cache's policy; but for the background whole suite, which proves main's tip anew (train 237's review).
-        proven=$PROVEN
-        case "$GITHUB_REF_NAME" in ci/full-whole-*) proven= ;; esac
-        if [ -z "$proven" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
+        # cache's policy; the daily run reads no proof (the proven job runs on a push alone), so it proves main's
+        # tip anew.
+        if [ -z "$PROVEN" ] && { [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; }; then
           setsid $armada run ${{ github.sha }} $bound $priority --label="$GITHUB_REF_NAME" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
           suite=$!
