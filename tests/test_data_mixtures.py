@@ -33,7 +33,7 @@ from token_support import write_token_corpus
 from dew import position
 from dew.batch import VALID_ROWS, freeze, thaw
 from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
-from dew.data.compile import compile, held, publish, validation
+from dew.data.compile import compile, held, iterate, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, PhasedStream, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
@@ -559,6 +559,30 @@ def test_phases_switch_the_mixture_at_a_step(tmp_path):
 
     assert all(corpus_of(row) == 0 for step in steps[:3] for row in step)
     assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
+
+
+def test_a_member_shuffled_for_its_read_continues_its_order_into_the_next_phase():
+    """A member whose order its read decides (`shuffle(streamed=)`: every record permuted where read by
+    index, within a window where streamed) continues into a later phase from where the last left it, in
+    its own order: two steps of a mix of `first` and `second` read four of `first`'s 40 ids, and the
+    phase of `first` alone reads the other 36 next, each once, all of them in the order `first` reads
+    alone. A pass of the mix read as a stream reads each member's ids once, not in their stored order."""
+    def member(name: str, start: int) -> Pipeline:
+        ids = np.arange(start, start + 40, dtype=np.int32)
+        return Pipeline(Memory({"id": ids})).named(name).shuffle(7, streamed=16)
+
+    first, second = member("first", 0), member("second", 100)
+    alone = [int(value) for batch in itertools.islice(trained(first.repeat()).train(DataPartition()), 10)
+             for value in batch["id"]]
+    stream = trained(phases((mix([first.repeat(), second.repeat()]), 2), (first.repeat(), None)))
+    read = [int(value) for batch in itertools.islice(stream.train(DataPartition()), 11)
+            for value in batch["id"]]
+    firsts = [value for value in read if value < 100]
+    assert firsts[:40] == alone[:40] and sorted(firsts[:40]) == list(range(40))
+    ids = [int(row["id"]) for row in iterate(mix([first, second]), read="streamed")]
+    for start in (0, 100):
+        own = [value for value in ids if start <= value < start + 40]
+        assert sorted(own) == list(range(start, start + 40)) and own != sorted(own)
 
 
 def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp_path):

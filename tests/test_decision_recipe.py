@@ -313,6 +313,56 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
         mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
 
 
+def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):
+    """A mixture's corpora train each in an order drawn from its seed (`mixture`), the mix taking each's next
+    row: over a pass, 300 rows of `tickets` at weight 3 and 100 each of `billing` and `legacy` at 1, every
+    row once, every window of five rows three, one and one, and each corpus's rows out of its file's
+    order, read by its shards' index, in memory or as a stream. One seed draws one order, another
+    another, and `seed=None` reads each corpus in its file's order."""
+    import collections
+
+    from dew.data.compile import iterate
+    from dew.decision import mixture
+
+    root = tmp_path / "mixture"
+    root.mkdir()
+    files, counts = {}, {"tickets": 300, "billing": 100, "legacy": 100}
+    for name, count in counts.items():
+        shard = root / f"{name}.jsonl"
+        shard.write_text("".join(json.dumps(ticket(f"{name} {index}", answers="billing")) + "\n"
+                                 for index in range(count)))
+        # The corpus's one shard and its index, as a manifest lists a corpus's shards.
+        Files(str(shard), format="jsonl").provision()
+        listed = np.load(root / f"{name}.index.npy")
+        listed["shard"] = 0
+        np.save(root / f"{name}.index.npy", listed, allow_pickle=False)
+        index = {"path": f"{name}.index.npy", "bytes": (root / f"{name}.index.npy").stat().st_size}
+        files[name] = {"train": {"sha256": "unread", "index": index,
+                                 "shards": [{"path": f"{name}.jsonl", "bytes": shard.stat().st_size,
+                                             "sha256": hashlib.sha256(shard.read_bytes()).hexdigest()}]}}
+    (root / "mixture.json").write_text(json.dumps({"weights": {"tickets": 3.0, "billing": 1.0, "legacy": 1.0},
+                                                   "slots": {"questions": 1, "options": 2}, "files": files}))
+
+    def read(reading, **options) -> list[tuple[str, int]]:
+        train, _ = mixture(str(root), **options)
+        return [(name, int(index)) for name, index in
+                (row["example"].state.split() for row in iterate(train, **reading))]
+
+    def in_file_order(rows) -> dict[str, bool]:
+        return {name: [index for corpus, index in rows if corpus == name] == list(range(count))
+                for name, count in counts.items()}
+
+    for reading in ({"read": "indexed"}, {"read": "memory"}, {"read": "streamed"}):
+        rows = read(reading)
+        assert sorted(rows) == sorted((name, index) for name, count in counts.items()
+                                      for index in range(count))
+        assert {tuple(sorted(collections.Counter(name for name, _ in rows[start:start + 5]).items()))
+                for start in range(0, len(rows), 5)} == {(("billing", 1), ("legacy", 1), ("tickets", 3))}
+        assert not any(in_file_order(rows).values()), reading
+        assert read(reading, seed=0) == rows and read(reading, seed=1) != rows
+    assert all(in_file_order(read({"read": "indexed"}, seed=None)).values())
+
+
 def test_a_benchmark_reads_one_corpus_split_whatever_its_weight_under_the_descriptor_that_pins_it(tmp_path):
     """`corpus` reads one corpus's split as a decision run reads it, whatever its weight: the shards its
     manifest lists, in their order, through the index of their rows, each row the example it states, a

@@ -1096,8 +1096,9 @@ def _checked(
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
         laid = laid or (read == "memory" and cuts((stage,)) and examples_bound((*ran, *prefix)) is not None)
-        if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion and not laid:
-            raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
+        if (isinstance(stage, Shuffle) and stage.window is None and stage.streamed is None and not indexed
+                and not promotion and not laid):
+            raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window= or streamed=")
         if isinstance(stage, Slice) and not indexed and not promotion:
             raise ValueError(f"{type(stage).__name__} in {name} needs an indexed pipeline")
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (

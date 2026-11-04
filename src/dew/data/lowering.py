@@ -1321,6 +1321,25 @@ class _EndedIterator(pygrain.DatasetIterator):
             self._rows.set_state(parent)
 
 
+def _for_rows(stage: Stage, rows: Rows) -> Stage:
+    """`stage` as `rows` take it: a shuffle of every record (`Shuffle.streamed`) within its streamed window
+    where they stream, whole where they are indexed."""
+    if isinstance(stage, Shuffle) and stage.streamed is not None and not isinstance(rows, pygrain.MapDataset):
+        return dataclasses.replace(stage, window=stage.streamed, streamed=None)
+    return stage
+
+
+def _for_read(pipeline: Pipeline, read: Read) -> Pipeline:
+    """`pipeline` as a `read` lowers it: a streamed read's shuffles of every record (`Shuffle.streamed`)
+    within their streamed windows, so its loading workers hand on where a window shuffle stands
+    (`_carried`)."""
+    if read != "streamed":
+        return pipeline
+    return dataclasses.replace(pipeline, stages=tuple(
+        dataclasses.replace(stage, window=stage.streamed, streamed=None)
+        if isinstance(stage, Shuffle) and stage.streamed is not None else stage for stage in pipeline.stages))
+
+
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
     """An order stage over an indexed dataset."""
     if isinstance(stage, Shuffle):
@@ -1681,6 +1700,7 @@ class _Build:
         """The rows before the batch. A global order comes back indexed,
         whole, for `batches` to cut into shares; a per-share order comes back
         as this share's stream of accepted rows."""
+        pipeline = _for_read(pipeline, self.read)
         source = pipeline.source
         placed = [index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapWithIndex)]
         last = max(placed, default=-1)
@@ -1805,6 +1825,7 @@ class _Build:
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
         """`rows` through `stage`, written at `at` in `pipeline`."""
+        stage = _for_rows(stage, rows)
         if isinstance(stage, _RECORD):
             return self.record_stage(rows, (stage,), pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
