@@ -94,6 +94,48 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_run_from_a_saved_diffusion_run_resumes_by_its_command_with_the_policy_it_sampled_by(tmp_path):
+    """A named diffusion run started from a saved diffusion run, sampling by that run's task's policy where
+    it states none (`Objective.resolved`, recorded as resolved), resumes when its command runs again
+    after the saved run has trained on, its policy and its source's step those it recorded (row 3864),
+    and trains on past its checkpoint."""
+    first = diffusion(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    command = dataclasses.replace(first, pretrained=str(source), text=None,
+                                  model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
+                                  objective=ObjectiveConfig("diffusion", {}))
+    trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2, "checkpoint_final": True})
+    assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_later_one_is(tmp_path):
+    """A decision run calibrated at its first step and trained on, calibrated again at its second, reads
+    each step with the calibration fitted on it (`Decide.save` keeps each, `CALIBRATIONS`): a reader
+    pinned to the first step, a run started from it among them, loads it after the second was fitted,
+    where only the latest was kept and refused it (row 3865)."""
+    from dew.decision.calibration import Calibration
+    from dew.decision.task import Decide, _fitted_file
+    from dew.registry import from_record
+
+    first = decision(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    read = SavedRun.pinned(str(source)).step
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    later = SavedRun.pinned(str(source)).step
+    assert later != read
+    for step in (read, later):
+        task = Decide.from_saved(SavedRun.pinned(str(source), step))
+        assert task.weights is not None and task.weights.step == step
+        fitted = json.loads(_fitted_file(str(source), task.weights).read_text())
+        assert task.calibration == from_record(Calibration, fitted["calibration"])
+
+
 def leaves_alike(tree, alike) -> None:
     for leaf, other in zip(jax.tree.leaves(jax.device_get(tree)), jax.tree.leaves(jax.device_get(alike)),
                            strict=True):
