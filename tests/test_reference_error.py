@@ -303,7 +303,7 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
 def test_over_jax_inputs_an_arm_runs_only_compiled_and_a_numpy_one_is_refused_there():
     """A draw holding no NumPy array calls no arm before the gate compiles it: a JAX arm over JAX inputs
     runs traced alone, where called as given once first a model arm ran eagerly, a minute of a check
-    (M43). A NumPy arm over them is refused where the gate's compile traces it, its NumPy call on a
+    (ledger 3774). A NumPy arm over them is refused where the gate's compile traces it, its NumPy call on a
     traced input refused by JAX; over NumPy inputs, where operators alone would trace it into float32
     JAX, it is refused before it runs compiled
     (`test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy`)."""

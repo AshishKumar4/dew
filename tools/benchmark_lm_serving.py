@@ -483,7 +483,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Dew's: each slot count's measured peak, in a process of its own, before this one opens a backend; none
     # on JAX's CPU devices alone, whose allocator keeps no high-water (tools/peak_memory.py), so each slot
-    # count's two peak runs would only measure None (M43: two of a CPU run's three processes).
+    # count's two peak runs would only measure None.
     peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
               for index in range(len(args.slots))] if args.backend == "dew" and not _cpu_alone() else None)
     engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
