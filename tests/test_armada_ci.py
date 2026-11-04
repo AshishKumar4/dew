@@ -805,7 +805,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
         ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
                 cache="off", coverage=tmp_path / "runs" / str(index))
     (tmp_path / "runs/logs").mkdir()
-    assert ci.coverage_report(tmp_path / "runs") == 0
+    assert ci.coverage_report.report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
              json.loads((tmp_path / "runs/coverage.json").read_text())["files"].items()}
     assert files["sign.py"]["summary"]["percent_covered"] == 100.0
@@ -816,7 +816,7 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     (tmp_path / "runs/2").mkdir()
     ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache="off", grace=5.0,
             coverage=tmp_path / "runs/2")
-    assert ci.coverage_report(tmp_path / "runs") == 1
+    assert ci.coverage_report.report(tmp_path / "runs") == 1
     [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
     assert (interrupted["kind"], interrupted["failed"]) == ("deadline", [])
 
