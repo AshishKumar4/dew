@@ -1524,6 +1524,8 @@ def site_environment(site: re.Match | None) -> dict[str, str]:
         # run's alone.
         later_file().unlink(missing_ok=True)
         stages_file().unlink(missing_ok=True)
+        # Check 1 appends to its log where the directory is (`_logged`).
+        stages_file().parent.mkdir(parents=True, exist_ok=True)
         return {POOL: str(armada_dir("ARMADA_INPUTS", INPUTS)), LATER: str(later_file()),
                 STAGES: str(stages_file())}
     return {DRAWS: f"{site['start']}:{site['stop']}", RECORDS: str(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS))}
