@@ -47,11 +47,11 @@ class Scan:
     chunk: int
     block: int
     family: mosaic.Family
+    positions: int
+    resident: int
     interpret: bool = False
     packed: bool = False
     entered: bool = False
-    positions: int = 8
-    resident: int = 3
 
     @property
     def chunks(self) -> int:
@@ -223,11 +223,12 @@ def backward_registers(positions: int) -> int:
 
 def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     """The programs of the backward, one warpgroup and no producer, a multiprocessor of `target` holds at once
-    at `registers` a thread: the most whose share of its registers (`resources.entry_registers`) holds them,
-    within its resident threads."""
+    at `registers` a thread: the shared planner's residency (`resources.RegisterModel.resident`) within its
+    resident threads."""
     threads = target.architecture.resident_threads // block_scan.THREADS
-    return max((programs for programs in range(1, min(resources.RESIDENT_PROGRAMS, threads) + 1)
-                if resources.entry_registers(1, programs) >= registers), default=0)
+    model = resources.RegisterModel(registers, cost.THREAD_REGISTERS, 1,
+                                    min(resources.RESIDENT_PROGRAMS, threads), cost.REGISTER_STEP, 0)
+    return model.resident(registers)
 
 
 def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
@@ -396,8 +397,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
-    scan = Scan(rows, padded, channels, states, chunk, block, family, interpret, packed=starts is not None,
-                positions=positions, resident=resident)
+    scan = Scan(rows, padded, channels, states, chunk, block, family, positions, resident, interpret,
+                packed=starts is not None)
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
