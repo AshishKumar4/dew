@@ -143,15 +143,17 @@ def judged(model):
 
 def _redrawn(inputs, seed: int):
     """`inputs` drawn afresh at `seed` with their shapes and kinds: integer ids below the largest given
-    (a token model's ids stay in its vocabulary), floats from a normal, the rest as given."""
+    (a token model's ids stay in its vocabulary), floats from a normal, the rest as given; JAX arrays,
+    whose arms the gate compiles before it runs them (a NumPy draw had it run each model arm once op by
+    op, a minute of a rung's check on armada)."""
     rng = np.random.default_rng([0x2A, seed])
 
     def leaf(value):
         value = np.asarray(value)
         if np.issubdtype(value.dtype, np.integer):
-            return rng.integers(0, int(value.max()) + 1, value.shape).astype(value.dtype)
+            return jnp.asarray(rng.integers(0, int(value.max()) + 1, value.shape).astype(value.dtype))
         if np.issubdtype(value.dtype, np.floating):
-            return rng.standard_normal(value.shape).astype(value.dtype)
+            return jnp.asarray(rng.standard_normal(value.shape).astype(value.dtype))
         return value
     return jax.tree.map(leaf, inputs)
 

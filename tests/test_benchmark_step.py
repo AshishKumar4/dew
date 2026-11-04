@@ -176,31 +176,33 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     return row
 
 
-def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(tmp_path):
+def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context_alone_and_cold(tmp_path):
     """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
     and compiled nothing (a compile there refuses the run), one high-water a device, the bytes XLA planned
-    beside it; that process runs inside the context a diagnostic names (`--within`), as the case does."""
+    beside it; that process runs inside the context a diagnostic names (`--within`), as the case does. Run
+    alone, the tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
+    own = tmp_path / "home-cache"
     (tmp_path / "marking.py").write_text(
         "import contextlib, os\n"
         "@contextlib.contextmanager\n"
         "def marked():\n"
         f"    with open({str(tmp_path / 'entered')!r}, 'a') as file: file.write(f'{{os.getpid()}}\\n')\n"
         "    yield\n")
-    row = peak_row(tmp_path, "cpu", "--within", "marking:marked")
+    row = peak_row(tmp_path, "cpu", "--within", "marking:marked", settings={"XDG_CACHE_HOME": str(own)})
     assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
     assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
+    assert not list(own.rglob("jit_*"))
 
 
-def test_a_cache_its_caller_names_keeps_what_the_step_compiled_and_a_run_alone_compiles_cold(tmp_path):
+def test_a_cache_its_caller_names_keeps_what_the_step_compiled(tmp_path):
     """perf_gate names each tree's compile cache, so its later rounds load what its first compiled: the step
-    compiled into it; run alone, the tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
+    compiled into it (run alone, the tool writes nothing to Dew's own cache:
+    `test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context_alone_and_cold`)."""
     named, own = tmp_path / "tree-cache", tmp_path / "home-cache"
     peak_row(tmp_path, "cpu", settings={
         "JAX_COMPILATION_CACHE_DIR": str(named), "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
         "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1", "XDG_CACHE_HOME": str(own)})
     assert [entry for entry in named.iterdir() if entry.name.startswith("jit_")]
-    peak_row(tmp_path, "cpu", settings={"XDG_CACHE_HOME": str(own)})
-    assert not list(own.rglob("jit_*"))
 
 
 def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
