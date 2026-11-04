@@ -339,7 +339,7 @@ def test_a_fresh_heads_row_writes_a_choices_option_as_its_text():
     """A fresh head's layout (`default_layout`) writes a choice's option as its description, the option's
     text, so a key that only names it (`option_0`) writes nothing the row reads, and an option of no
     description as its key; Laya's release reads its rows as it was trained, `key: description`. A fresh
-    layout's record reloads its writing, and a layout's record of the release's writing names none."""
+    layout's record reloads its writing, and an earlier record, which names none, the release's."""
     question = Choice("What is the capital of France?",
                       {"option_0": "Paris", "option_1": "London", "Rome": None})
     names = LABELS.names_for(3)
@@ -357,5 +357,7 @@ def test_a_fresh_heads_row_writes_a_choices_option_as_its_text():
     assert lines(("option_0: Paris", "option_1: London", "Rome")) in written(released)
     recorded = json.loads(json.dumps(to_record(fresh, StateFirstLayout)))
     assert from_record(StateFirstLayout, recorded, dtypes=False) == fresh
-    assert "option_text" not in to_record(released, StateFirstLayout)
+    earlier = {key: value for key, value in recorded.items() if key != "option_text"}
+    named = dataclasses.replace(fresh, option_text="named")
+    assert from_record(StateFirstLayout, earlier, dtypes=False) == named
 
