@@ -9,6 +9,7 @@ import time
 
 import pytest
 from remote_cache import r2
+from tool_support import load
 
 
 def test_an_object_round_trips_a_miss_is_none_and_a_listing_pages_to_its_end(cache_worker):
@@ -140,3 +141,18 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
     finally:
         server.shutdown()
 
+
+def test_the_records_one_thread_reads_in_turn_share_its_connections_to_the_worker(cache_worker, monkeypatch):
+    """A thread's record lookups (tools/armada/ci.py's `recorded`, as the plan's and a task's run) go on the
+    connection it keeps to the Worker (`KeptSend`), not one a lookup, each paying a TCP and a TLS handshake:
+    ten records read in turn open four connections to the Worker's stand-in, which ends each after three
+    requests without a word, as a server ends an idle one, and the lookup sent on one it ended goes again on
+    a new one, every record read whole."""
+    url, stored, seen = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    ci = load("ci", "tools/armada")
+    for index in range(10):
+        stored[f"/records/{index}"] = f'{{"index": {index}}}'.encode()
+    assert [ci.recorded(f"records/{index}", "token") for index in range(10)] == [
+        {"index": index} for index in range(10)]
+    assert len(seen) == 10 and len(seen.connections) == 4

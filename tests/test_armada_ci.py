@@ -1842,21 +1842,6 @@ def test_a_plan_reads_each_input_once_however_many_rows_ran_it(ci, tmp_path, cac
     assert json.loads(opened.read_text()).count("src/shapes.py") == 1
 
 
-
-def test_the_records_one_thread_reads_in_turn_share_its_connections_to_the_worker(ci, monkeypatch,
-                                                                                  cache_worker):
-    """A thread's record lookups (`recorded`, as the plan's and a task's run) go on the connection it keeps
-    to the Worker, not one a lookup, each paying a TCP and a TLS handshake: ten records read in turn open four
-    connections to the Worker's stand-in, which ends each after three requests without a word, as a server
-    ends an idle one, and the lookup sent on one it ended goes again on a new one, every record read whole."""
-    url, stored, seen = cache_worker
-    cached(monkeypatch, url)
-    for index in range(10):
-        stored[f"/records/{index}"] = json.dumps({"index": index}).encode()
-    assert [ci.recorded(f"records/{index}", "token") for index in range(10)] == [
-        {"index": index} for index in range(10)]
-    assert len(seen) == 10 and len(seen.connections) == 4
-
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """The plan's checkout, clean, keys rows as the task's checkout does, though the task's holds an editable
