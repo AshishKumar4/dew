@@ -5,6 +5,7 @@ the bodies of nested programs, scans, loops, conditionals and checkpoints are re
 
 import dataclasses
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -817,3 +818,80 @@ def test_a_parameter_is_keyed_by_what_it_is_not_by_its_printed_form():
     for value in [value for pair in (*equal, *unequal) for value in pair]:
         key = terms.parameter_key(value)
         assert ast.literal_eval(repr(key)) == key, value
+
+
+REGISTERED_AFTER = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from egglog import i64, rewrite, ruleset, var
+from jax.core import eval_jaxpr
+
+from dew import algebra
+from dew.algebra import rules
+from dew.algebra.terms import Term
+
+
+def sums(x, y):
+    return jnp.sum(jnp.exp(x), -1) + jnp.sum(jnp.tanh(y), -1)
+
+
+def branched(x, y):
+    return jax.lax.cond(jnp.sum(x) > 0, sums, lambda x, y: sums(y, x), x, y)
+
+
+rng = np.random.default_rng(0)
+x, y = (jnp.asarray(rng.standard_normal((5, 38)), jnp.float32) for _ in range(2))
+closed = jax.make_jaxpr(branched)(x, y)
+
+
+def computed():
+    window = jax.jit(algebra.rewritten(sums))(x, y)
+    rewritten = algebra.program_of(closed)
+    body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
+    return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
+
+
+before = computed()
+variable, params = var("x", Term), var("params", i64)
+exponential = ruleset(rewrite(variable.unary("exp", params)).to(variable), name="registered after")
+rules.register(rules.Rules("registered after", "reorders", exponential, receipt="a test's",
+                           instances={"the exponential as its argument": (jnp.exp, lambda x: x, None)}))
+print(json.dumps({"before": before, "after": computed()}))
+"""
+"""A process that rewrites a program's window and a branch body of one held program, registers a rule set
+(one that rewrites an exponential to its argument), and rewrites them again."""
+
+
+def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_after_it():
+    """A window's and a body's rewrite are kept by everything their derivation reads, the rule sets the
+    registry admits among them: a set registered after a program was rewritten (a user extending the
+    algebra in a running process) reaches the next rewrite of a window of its structure and of the same held
+    branch body, where a rewrite kept from before it would stand."""
+    done = subprocess.run([sys.executable, "-c", REGISTERED_AFTER], capture_output=True, text=True,
+                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    found = json.loads(done.stdout.strip().splitlines()[-1])
+    assert max(found["before"]) < 1e-4
+    assert min(found["after"]) > 0.1
+
+
+def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
+    """A region's values are priced at their own element size (`cost.work`): a program reading bfloat16
+    operands reads half the device bytes one reading float32 operands of the same shape does, and its product
+    stages half the bytes into its tile walk, so the pass weighs a narrow program's memory as it is."""
+    def priced(dtype):
+        def contracted(a, b):
+            return jnp.dot(a + b, b, preferred_element_type=jnp.float32)
+
+        a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
+        region = terms.region(jax.make_jaxpr(contracted)(a, b))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
+    assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
+    assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)

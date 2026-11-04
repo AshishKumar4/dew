@@ -70,9 +70,22 @@ def test_linearity_joins_two_reductions_into_one_pass():
 
 def test_each_rule_holds_its_right_side_to_its_left_side():
     """Every registered rule's right side is on par with its left side against the float64 truth (check 1),
-    over drawn and adversarial operands, as `algebra.rules.checked` instantiates each."""
+    over drawn and adversarial operands, as its set states its instances (`algebra.rules.instances`)."""
     for name, (left, right, draw) in algebra.rules.instances().items():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
+
+
+def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
+    """The qualification inventory is the registry's (`rules.instances`): every registered set's instances
+    name it, every set has some, and a set registered with none is refused, so no set enters the pass
+    unqualified and no instance stands for a rule the registry does not hold."""
+    from dew.algebra import rules
+
+    named = {name.split(": ", 1)[0] for name in rules.instances()}
+    assert named == set(rules.RULES)
+    with pytest.raises(ValueError):
+        rules.register(rules.Rules("unqualified", "exact", rules.RULES["identities"].ruleset, receipt="",
+                                   instances={}))
 
 
 def test_a_compensated_sums_residual_survives_a_rewritten_program():
@@ -306,26 +319,33 @@ REWRITE = """
 import json, sys
 import jax, jax.numpy as jnp
 from dew import algebra
-from dew.nn import precision
+from dew.nn.kernels.templates import report
 
-def unit_backward(x, dy):
-    _, pull = jax.vjp(precision.l2norm, x)
-    return pull(dy)[0]
+
+def program(x, y, a, b):
+    x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+    return jnp.sum(a * x, -1) + jnp.sum(a * y, -1), jnp.dot(x, y.T) * 0.5 + jnp.dot(b, y.T) * 0.5
 
 shape = jax.ShapeDtypeStruct((8, 64), jnp.float32)
-lowered = jax.jit(algebra.rewritten(unit_backward)).lower(shape, shape)
-print(json.dumps(lowered.as_text()))
+with report.refusals():
+    lowered = jax.jit(algebra.rewritten(program)).lower(shape, shape, shape, shape)
+    made = [{"nodes": rewrite.nodes, "iterations": rewrite.iterations, "spliced": rewrite.spliced,
+             "fired": dict(rewrite.fired)} for rewrite in report.rewrites()]
+print(json.dumps({"lowered": lowered.as_text(), "rewrites": made}))
 """
-"""A fresh process lowering a unit norm's rewritten backward."""
+"""A fresh process lowering a rewritten program whose windows the engine saturates, extracts and splices:
+two sums of a shared bounded factor, and two scaled contractions of one right operand."""
 
 
 def test_one_input_rewrites_to_one_program_in_any_process():
-    """Two fresh processes of different string hashing rewrite one program to the same lowered program, as a
-    pool of processes needs each to compile."""
-    lowered = []
+    """Two fresh processes of different string hashing rewrite one program to the same lowered program,
+    as a pool of processes needs each to compile, through the same saturation, extraction and splices: each
+    window's e-graph as large, its rules fired as often and its forms landing alike."""
+    found = []
     for seed in ("1", "2"):
         done = subprocess.run([sys.executable, "-c", REWRITE], capture_output=True, text=True, check=True,
                               env={**os.environ, "PYTHONHASHSEED": seed, "JAX_PLATFORMS": "cpu",
                                    "PYTHONPATH": str(SOURCE)})
-        lowered.append(json.loads(done.stdout.strip().splitlines()[-1]))
-    assert lowered[0] == lowered[1]
+        found.append(json.loads(done.stdout.strip().splitlines()[-1]))
+    assert found[0] == found[1]
+    assert any(rewrite["nodes"] and rewrite["spliced"] for rewrite in found[0]["rewrites"])

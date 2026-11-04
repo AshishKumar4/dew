@@ -68,19 +68,22 @@ def made(graph: EGraph, operands, held: dict | None = None) -> int:
     return math.prod(np.broadcast_shapes(*(known for known in shapes if known is not None)))
 
 
-def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: dict | None = None) -> Work:
-    """`node`'s work alone (the cost vocabulary, the module's account): an operand's (a leaf's) bytes, read
-    from device memory once however many values read it (extraction prices a shared node once), and nothing
-    else of device memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too) and
-    keeps its fused intermediates on chip; a product's tensor-core FLOPs (its result's elements by its
-    contraction's length, twice) and the bytes its operands are staged in (the tile walk's); a reduction's
+def work(graph: EGraph, node, region: Region, held: dict | None = None) -> Work:
+    """`node`'s work alone (the cost vocabulary, the module's account): an operand's (a leaf's) bytes, at its
+    dtype's element size, read from device memory once however many values read it (extraction prices a
+    shared node once), and nothing else of device memory, as XLA's fusion reads a program's inputs once (a
+    sibling reduction's too) and keeps its fused intermediates on chip; a product's tensor-core FLOPs (its
+    result's elements by its contraction's length, twice) and the bytes its operands are staged in (the tile
+    walk's, at their dtypes' sizes); a reduction's
     CUDA-core operations, one an element of its operand; a conversion's conversions and a special
     function's exponentials, one an element of their result; any other elementwise node's CUDA-core
     operations; a layout change none."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
         # The leaf's own shape from its region (a callback may read no table at a node it was not given).
-        extent = region.extents.get(key(Term.leaf(args[0])))
-        return Work() if extent is None else Work(device_bytes=math.prod(extent) * bytes_per_element)
+        leaf = key(Term.leaf(args[0]))
+        extent = region.extents.get(leaf)
+        return Work() if extent is None else Work(
+            device_bytes=math.prod(extent) * np.dtype(region.dtypes[leaf]).itemsize)
     if (args := get_callable_args(node, Term.reduce)) is not None:
         return Work(operations=made(graph, args[:1], held))
     if (args := get_callable_args(node, Term.dot)) is not None:
@@ -95,9 +98,11 @@ def work(graph: EGraph, node, region: Region, bytes_per_element: int = 4, held: 
         free = (math.prod(size for axis, size in enumerate(left) if axis not in (*contracted, *batch))
                 * math.prod(size for axis, size in enumerate(right)
                             if axis not in (*right_contracted, *right_batch)))
-        read = (math.prod(left) + math.prod(right)) * bytes_per_element
+        operands = region.products[index]
+        read = sum(math.prod(extent) * np.dtype(dtype).itemsize
+                   for extent, dtype in zip((left, right), operands, strict=True))
         flops = 2.0 * math.prod(left[axis] for axis in batch) * free * length
-        mode, passes = _mode(params.get("precision"), set(region.products.get(index, ())))
+        mode, passes = _mode(params.get("precision"), set(operands))
         return Work(shared_bytes=read, **{_MODES[mode]: flops * passes})
     if (args := get_callable_args(node, Term.convert)) is not None:
         return Work(conversions=made(graph, args[:1], held))
@@ -298,14 +303,14 @@ def walk(facts: generation.GpuTarget) -> Walk:
     return Walk(facts)
 
 
-def model(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel[Seconds]:
+def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     """Each node's work (`work`) under `schedule`; extraction adds them, once a shared node. A node is priced
     from its operands' shapes, the e-classes the extractor hands its callback, and its parameters
     (`region`'s)."""
     held: dict = {}
 
     def marginal(graph: EGraph, node) -> Seconds:
-        return Seconds(work(graph, node, region, bytes_per_element, held), schedule)
+        return Seconds(work(graph, node, region, held), schedule)
 
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
@@ -319,13 +324,13 @@ is rounded into what follows it, a difference that may cancel its operands' digi
 dev time measures every candidate's error (`dew.algebra.error.choose`)."""
 
 
-def stable(region: Region, schedule: Schedule, bytes_per_element: int = 4) -> DagCostModel[Seconds]:
+def stable(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     """The program's model (`model`) with each node of a rounding risk priced up (`RISK`), so its cheapest
     forms are the ones the stable rules wrote: the candidate dev time proposes for its accuracy."""
     held: dict = {}
 
     def marginal(graph: EGraph, node) -> Seconds:
-        done = work(graph, node, region, bytes_per_element, held)
+        done = work(graph, node, region, held)
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
                 # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
