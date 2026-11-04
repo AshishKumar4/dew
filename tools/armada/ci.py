@@ -568,9 +568,13 @@ def gpu_query(field: str) -> list[str]:
                           check=True).stdout.split("\n")[:-1]
 
 
+SEND = r2.KeptSend()
+"""How every request to the Worker is sent: on a connection its thread keeps (`r2.KeptSend`)."""
+
+
 def store(token: str) -> r2.Store:
     """The Worker that holds the records."""
-    return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10)
+    return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10, send=SEND)
 
 
 def record_key(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
