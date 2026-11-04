@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+from tool_support import load
 
 from dew.interop.pretrained import PretrainedDecoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -29,15 +30,22 @@ def checkpoint(directory: Path) -> Path:
     return directory
 
 
+CPUS = {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
+        "XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
+"""The benchmark's environment: two CPU devices, Dew's source."""
+
+
+def arguments(model: Path, out: Path, *options: str) -> list[str]:
+    """The benchmark's command line, the tool first, serving `model` and writing its record to `out`."""
+    return [str(ROOT / "tools" / "benchmark_lm_serving.py"), "--backend", "dew", "--model", str(model),
+            "--slots", str(SLOTS), "--requests", str(REQUESTS), "--prompt", str(PROMPT), "--output",
+            str(OUTPUT), "--vocab-limit", str(VOCABULARY), "--repeats", "1", "--out", str(out), *options]
+
+
 def served(model: Path, out: Path, *options: str) -> dict:
     """The benchmark's record, served on two CPU devices."""
-    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
-           "XLA_FLAGS": "--xla_force_host_platform_device_count=2"}
-    subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_lm_serving.py"), "--backend", "dew",
-                    "--model", str(model), "--slots", str(SLOTS), "--requests", str(REQUESTS),
-                    "--prompt", str(PROMPT), "--output", str(OUTPUT), "--vocab-limit", str(VOCABULARY),
-                    "--repeats", "1", "--out", str(out), *options],
-                   check=True, env=env, cwd=ROOT)
+    subprocess.run([sys.executable, *arguments(model, out, *options)], check=True, env={**os.environ, **CPUS},
+                   cwd=ROOT)
     return json.loads(out.read_text())
 
 
@@ -58,8 +66,24 @@ def test_the_benchmark_serves_weights_a_mesh_splits(tmp_path):
                for run in (whole, record) for point in run["sweep"] for repeat in point["repeats"])
     # Each slot count's measured peak, in a process of its own that loaded every program from the cache a
     # first run filled (tools/peak_memory.py); on the CPU, whose allocator keeps no high-water, unmeasured,
-    # and no peak process run.
+    # and no peak process run (`test_a_slot_counts_peak_run_loads_every_program_its_cache_was_given`).
     assert all(point["peak_device_bytes"] is None for run in (whole, record) for point in run["sweep"])
+
+
+@pytest.mark.whole_suite
+def test_a_slot_counts_peak_run_loads_every_program_its_cache_was_given(tmp_path, monkeypatch):
+    """A slot count's peak run, its server in a process of its own (`--peak-run`), which the benchmark
+    starts where its devices keep a high-water (`peak_memory.keeps_high_water`) and on the CPU does not:
+    measured there as it would be, it loads every program it runs from the cache its first run filled,
+    compiling none (`peak_memory.CompiledWhileMeasured`), and reports each device's peak, None on the CPU
+    (ledger 3847)."""
+    peak_memory = load("peak_memory")
+    model = checkpoint(tmp_path / "decoder")
+    for name, value in CPUS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.chdir(ROOT)
+    peaks = peak_memory.measured([*arguments(model, tmp_path / "peak.json"), "--peak-run", "0"])
+    assert peaks == [None, None]
 
 
 VLLM = {
