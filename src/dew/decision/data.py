@@ -13,6 +13,7 @@ import numpy as np
 
 from dew import _records
 from dew._records import JSON, json_value, record
+from dew.batch import Batch
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
 from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
@@ -281,14 +282,14 @@ class ParseExample(pygrain.MapTransform):
     its `GroupedExamples`, or a row that holds either already as it is. A Grain transform, so a chain
     that parses its rows by it is recorded and read back (`dew.data.records`)."""
 
-    def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
+    def __call__(self, row: Batch) -> Batch:
         return self.map(row)
 
-    def map(self, row: Mapping[str, object]) -> Mapping[str, object]:
-        held = row.get("example")
+    def map(self, element: Batch) -> Batch:
+        held = element.get("example")
         if isinstance(held, (Example, GroupedExamples)):
             return {"example": held}
-        return {"example": GroupedExamples.of(row) if "examples" in row else Example.of(row)}
+        return {"example": GroupedExamples.of(element) if "examples" in element else Example.of(element)}
 
 
 @dataclass(frozen=True)
