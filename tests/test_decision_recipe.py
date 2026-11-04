@@ -315,12 +315,13 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
 
 def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_changed_default(tmp_path):
     """A decision mixture read in Grain's schedule (`order="schedule"`), as one saved before its corpus
-    order was seeded read, saves its position; its chain built as it was resumes there and reads on as
-    the uninterrupted read does (a decision chain parses its examples in code, which no record holds, so
-    its command is its record), and the command left at today's default, which seeds the order, is
-    refused that position, its plan's order another (row 3870)."""
+    order was seeded read, saves its position; its chain read back from its record (`dew.data.records`,
+    the route a run takes from its run.json, row 3874) and its chain built as it was each resume there
+    and read on as the uninterrupted read does, and the command left at today's default, which seeds
+    the order, is refused that position, its plan's order another (row 3870)."""
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
+    from dew.data.records import decode, encode
 
     root = tmp_path / "mixture"
     root.mkdir()
@@ -344,12 +345,72 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     reader = loader(saved)
     states(next(reader) for _ in range(2))
     position = reader.get_state()
-    again = loader(mixture(str(root), order="schedule")[0])
-    again.set_state(position)
-    assert states(next(again) for _ in range(4)) == whole[8:]
+    for rebuilt in (decode(json.loads(json.dumps(encode(saved)))), mixture(str(root), order="schedule")[0]):
+        again = loader(rebuilt)
+        again.set_state(position)
+        assert states(next(again) for _ in range(4)) == whole[8:]
     changed = loader(mixture(str(root))[0])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as refused:
         changed.set_state(position)
+    from dew.data.plan import REBUILD, SCHEDULE, PlanOrderChanged
+
+    assert isinstance(refused.value, PlanOrderChanged)
+    # The refusal names what changed, the mix's selection seed it now draws by, and the routes it goes on.
+    assert refused.value.changed == {"selection_seed": (None, 0)}
+    assert refused.value.routes == (SCHEDULE, REBUILD)
+    # A mix saved under one seed and read under another is rebuilt as it was, not read unseeded.
+    seeded = loader(mixture(str(root), seed=4)[0])
+    next(seeded)
+    with pytest.raises(PlanOrderChanged) as reseeded:
+        loader(mixture(str(root), seed=5)[0]).set_state(seeded.get_state())
+    assert reseeded.value.changed["selection_seed"] == (4, 5) and reseeded.value.routes == (REBUILD,)
+
+
+def mixture_directory(root: Path, rows: int = 40) -> Path:
+    """A mixture directory under `root` of two corpora of `rows` decision rows each, at equal weights."""
+    directory = root / "mixture"
+    directory.mkdir()
+    files = {}
+    for name in ("billing", "legacy"):
+        (directory / f"{name}.jsonl").write_text("".join(
+            json.dumps(ticket(f"{name} {index}", answers="billing")) + "\n" for index in range(rows)))
+        files[name] = {"train": {"sha256": "unread"}}
+    (directory / "mixture.json").write_text(json.dumps({"weights": {"billing": 1.0, "legacy": 1.0},
+                                                        "slots": {"questions": 1, "options": 2},
+                                                        "files": files}))
+    return directory
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_command_names_it(tmp_path):
+    """A decision run over a mixture records its chain (row 3874): read back from its run.json
+    (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
+    mixture's order changed is refused that position by its plan, naming the record route first, as the
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and that record, put back,
+    resumes."""
+    from run_kinds import decision, trained
+
+    from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
+
+    root = mixture_directory(tmp_path)
+
+    def run_over(order: str) -> RunConfig:
+        train, _ = mixture(str(root), order=order)
+        return dataclasses.replace(decision(tmp_path, drawn=False), validation=None,
+                                   data=train.read("memory").batch(8).loading(Loading(workers=0)))
+
+    trained(run_over("schedule"), tmp_path, "mixed", trainer={"name": "mixed", "checkpoint_final": True})
+    directory = tmp_path / "runs" / "mixed"
+    loaded = RunConfig.load(str(directory))
+    trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "steps": 2, "checkpoint_final": True})
+    assert "2" in {path.name for path in directory.iterdir()}
+    with pytest.raises(PlanOrderChanged) as refused:
+        trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
+    assert refused.value.routes == (RECORD, SCHEDULE, REBUILD)
+    # The route it names holds: the record it resumes is put back, and resumes.
+    trained(RunConfig.load(str(directory)), tmp_path, "mixed",
+            trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
+    assert "3" in {path.name for path in directory.iterdir()}
 
 
 def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):
