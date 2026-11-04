@@ -313,6 +313,48 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
         mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
 
 
+def test_a_decision_mixture_reads_its_corpora_mixed_in_an_order_its_seed_draws(tmp_path):
+    """A mixture's training rows come in an order drawn from its seed (`mixture`): over a pass, each corpus
+    at its weight, 300 rows of `tickets` at 3 and 100 each of `billing` and `legacy` at 1, every row
+    once; windows of ten rows that each hold their own mix of the corpora, where the mix's interleave
+    repeated one cycle and gave every window six, two and two; and each corpus's rows out of its file's
+    order. One seed draws one order, another another, and `seed=None` reads the mix's own interleave."""
+    import collections
+
+    from dew.data.compile import iterate
+    from dew.decision import mixture
+
+    root = tmp_path / "mixture"
+    root.mkdir()
+    files = {}
+    for name, count in (("tickets", 300), ("billing", 100), ("legacy", 100)):
+        (root / f"{name}.jsonl").write_text("".join(json.dumps(ticket(f"{name} {index}", answers="billing"))
+                                                    + "\n" for index in range(count)))
+        files[name] = {"train": {"sha256": "unread"}}
+    (root / "mixture.json").write_text(json.dumps({"weights": {"tickets": 3.0, "billing": 1.0, "legacy": 1.0},
+                                                   "slots": {"questions": 1, "options": 2}, "files": files}))
+
+    def read(reading, **options) -> list[tuple[str, int]]:
+        train, _ = mixture(str(root), **options)
+        return [(name, int(index)) for name, index in
+                (row["example"].state.split() for row in iterate(train, **reading))]
+
+    for reading in ({}, {"read": "memory"}):
+        rows = read(reading)
+        assert sorted(rows) == sorted((name, index) for name, count in
+                                      (("tickets", 300), ("billing", 100), ("legacy", 100))
+                                      for index in range(count))
+        windows = {tuple(sorted(collections.Counter(name for name, _ in rows[start:start + 10]).items()))
+                   for start in range(0, len(rows), 10)}
+        assert len(windows) > 1, windows
+        for name in ("tickets", "billing", "legacy"):
+            read_in = [index for corpus, index in rows if corpus == name]
+            assert read_in != sorted(read_in), name
+        assert read(reading, seed=0) == rows and read(reading, seed=1) != rows
+    interleaved = read({}, seed=None)
+    assert [name for name, _ in interleaved[:10]] == ["billing", "legacy", *["tickets"] * 3] * 2
+
+
 def test_a_benchmark_reads_one_corpus_split_whatever_its_weight_under_the_descriptor_that_pins_it(tmp_path):
     """`corpus` reads one corpus's split as a decision run reads it, whatever its weight: the shards its
     manifest lists, in their order, through the index of their rows, each row the example it states, a
