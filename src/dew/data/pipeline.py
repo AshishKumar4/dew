@@ -840,6 +840,9 @@ class Mixture:
     pipelines: tuple[Pipeline, ...]
     weights: tuple[float, ...]
     tokens: Callable[[Batch], int] | None = None
+    seed: int | None = dataclasses.field(default=None, metadata={ADDED: True})
+    """The seed whose permutation of each window's corpus choices the mix reads in (`Proportions`):
+    None reads Grain's schedule, the same every window in the members' order."""
 
     def __post_init__(self) -> None:
         if not self.pipelines:
@@ -1412,11 +1415,16 @@ def _token_places(batch: Batch) -> tuple[int, int]:
 
 
 def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
-        by: Literal["records", "tokens"] = "records", field: str = "text") -> Pipeline:
+        by: Literal["records", "tokens"] = "records", field: str = "text",
+        seed: int | None = None) -> Pipeline:
     """`datasets` read together, each filling its share of a step, as Grain's
     `mix`: `weights` are the shares, equal by default, counted in records,
     or with `by="tokens"` in the valid target tokens of each member's `field`.
-    Each member logs under its name, its store's by default (`Dataset.named`)."""
+    Each member logs under its name, its store's by default (`Dataset.named`).
+    Counted in records, the mix reads its members in Grain's schedule, which every window of
+    the mix (its proportions' sum of positions) repeats in the members' order; a `seed`
+    permutes each window's choices by a permutation of its own, every window still holding
+    each member at its share (`dew.data.mixing.Proportions`)."""
     tokens = None
     if by == "tokens":
         from dew.data.steps.text import ValidTargets
@@ -1424,9 +1432,12 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
         tokens = ValidTargets(field)
     elif by != "records":
         raise ValueError(f"mix weighs records or tokens, not {by!r}")
+    if tokens is not None and seed is not None:
+        raise ValueError("a mix by tokens reads the member furthest below its share next, which no seed "
+                         "orders; seed a mix by records")
     shares = (1.0,) * len(datasets) if weights is None else tuple(float(weight) for weight in weights)
     chains = tuple(dataset._chain() for dataset in datasets)
-    return Pipeline(Mixture(chains, shares, tokens))
+    return Pipeline(Mixture(chains, shares, tokens, seed))
 
 
 def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:

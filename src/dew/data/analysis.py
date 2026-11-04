@@ -947,6 +947,8 @@ def _analyzed(
                     "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
+                    # The seed of the mix's corpus order where it has one, which another plan's is not.
+                    **({} if source.seed is None else {"selection_seed": source.seed}),
                 }
                 if isinstance(source, Mixture)
                 else {"source": source.describe()}

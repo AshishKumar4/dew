@@ -585,6 +585,77 @@ def test_a_member_shuffled_for_its_read_continues_its_order_into_the_next_phase(
         assert sorted(own) == list(range(start, start + 40)) and own != sorted(own)
 
 
+def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares():
+    """A mix seeded (`mix(seed=)`) reads its corpora in an order each window of the mix draws, its
+    proportions' sum of positions (300 for three equal weights), not Grain's schedule, which reads one of
+    each in the members' order every three positions: its opening and its windows differ by seed and
+    from that schedule, every window reads each corpus 100 times, and the counts a prefix of it holds
+    (`Proportions.counts`) are the ones it read at every prefix, indexed or streamed. A phase after
+    100 steps of it reads on each corpus where the mix left it, each record once."""
+    from dew.data.mixing import Proportions
+
+    def corpus(start: int) -> Pipeline:
+        return Pipeline(Memory({"id": np.arange(start, start + 600, dtype=np.int32)}))
+
+    def ids(seed, read) -> list[int]:
+        chain = mix([corpus(0), corpus(1000), corpus(2000)], seed=seed)
+        return [int(row["id"]) for row in iterate(chain, read=read)]
+
+    schedule = [0, 1, 2] * 600
+    for read in ("memory", "streamed"):
+        drawn = {seed: [value // 1000 for value in ids(seed, read)] for seed in (0, 1)}
+        assert ([value // 1000 for value in ids(None, read)] == schedule and drawn[0] != drawn[1]
+                and drawn[0][:6] != drawn[1][:6] and schedule not in drawn.values()), read
+        for seed, corpora in drawn.items():
+            proportions = Proportions.of((1.0, 1.0, 1.0), seed)
+            assert all(np.bincount(corpora[start:start + 300], minlength=3).tolist() == [100] * 3
+                       for start in range(0, len(corpora), 300))
+            assert all(proportions.counts(prefix) == tuple(np.bincount(corpora[:prefix], minlength=3))
+                       for prefix in range(0, len(corpora) + 1, 37))
+    def both() -> Pipeline:
+        return mix([corpus(0).repeat(), corpus(1000).repeat()], seed=3)
+
+    stream = trained(phases((both(), 100), (both(), None)))
+    read = [int(value) for batch in itertools.islice(stream.train(DataPartition()), 300)
+            for value in batch["id"]]
+    for start in (0, 1000):
+        own = [value for value in read if start <= value < start + 1000]
+        assert own[:600] and sorted(own[:600]) == list(range(start, start + 600)), start
+
+
+def test_a_seeded_mix_is_its_own_record_and_plan_and_ends_where_a_corpus_would_read_past_its_records():
+    """A seeded mix's record carries its seed (`dew.data.records`): read back, it reads its corpora in the
+    order it did. Its plan names the seed, so a plan of another seed refuses it (`Plan.check`) where one of
+    its own resumes, as a shuffle's streamed window names its own. Read by index or streamed, a seeded mix
+    of corpora too short for a whole window ends at the first position that would read past one, alike
+    either way, each record once."""
+    from dew.data.records import decode, encode
+
+    def corpus(start: int, size: int) -> Pipeline:
+        return Pipeline(Memory([{"id": index} for index in range(start, start + size)]))
+
+    chain = mix([corpus(0, 600), corpus(1000, 600)], seed=4)
+    again = decode(json.loads(json.dumps(encode(chain))))
+    assert ([int(row["id"]) for row in iterate(again, read="memory")]
+            == [int(row["id"]) for row in iterate(chain, read="memory")])
+    plan = compile(chain.batch(4), read="memory", loading=READ).plan
+    other = compile(mix([corpus(0, 600), corpus(1000, 600)], seed=5).batch(4), read="memory",
+                    loading=READ).plan
+    assert plan.check(plan.record()) == ()
+    with pytest.raises(ValueError):
+        plan.check(other.record())
+    # A shuffle's streamed window is its step's identity too (an added field), its stage named as before.
+    whole, windowed = (compile(corpus(0, 600).shuffle(0, **form).batch(4), read="memory", loading=READ).plan
+                       for form in ({}, {"streamed": 16}))
+    assert whole.check(whole.record()) == ()
+    with pytest.raises(ValueError):
+        whole.check(windowed.record())
+    short = mix([corpus(0, 3), corpus(1000, 5)], seed=0)
+    indexed, streamed = ([int(row["id"]) for row in iterate(short, read=read)]
+                         for read in ("memory", "streamed"))
+    assert indexed == streamed and len(set(indexed)) == len(indexed) and indexed, indexed
+
+
 def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp_path):
     """Packed phases step one program: a phase whose windows hold one document each and one whose
     windows hold four both declare four (`Coordinates.max_segments`), not their own most nor the
