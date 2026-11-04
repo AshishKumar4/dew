@@ -1647,8 +1647,10 @@ class RunConfig:
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
-        record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
-        return cls.read(earlier_run(json.loads(record)), trust=trust)
+        record = json.loads((path if str(directory).endswith(".json") else path / RUN_FILE).read_text())
+        # The packages trusted first, so the record's earlier shapes are read with its classes imported.
+        registry.import_trusted(record, trust)
+        return cls.read(earlier_run(record), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
