@@ -12,7 +12,7 @@ import pytest
 
 from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
-from dew.decision import Choice, Decide, decisions
+from dew.decision import Choice, Decide, decisions, mixture
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -313,12 +313,53 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
         mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
 
 
+def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_changed_default(tmp_path):
+    """A decision mixture read in Grain's schedule (`order="schedule"`), as one saved before its corpus
+    order was seeded read, saves its position; its chain built as it was resumes there and reads on as
+    the uninterrupted read does (a decision chain parses its examples in code, which no record holds, so
+    its command is its record), and the command left at today's default, which seeds the order, is
+    refused that position, its plan's order another (row 3870)."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    root = tmp_path / "mixture"
+    root.mkdir()
+    files = {}
+    for name in ("billing", "legacy"):
+        (root / f"{name}.jsonl").write_text("".join(json.dumps(ticket(f"{name} {index}", answers="billing"))
+                                                    + "\n" for index in range(40)))
+        files[name] = {"train": {"sha256": "unread"}}
+    (root / "mixture.json").write_text(json.dumps({"weights": {"billing": 1.0, "legacy": 1.0},
+                                                   "slots": {"questions": 1, "options": 2}, "files": files}))
+
+    def loader(chain):
+        return compile(chain.batch(4), read="memory", loading=Loading(workers=0)).train(DataPartition())
+
+    def states(batches) -> list[str]:
+        return [row.state for batch in batches for row in batch["example"]]
+
+    saved, _ = mixture(str(root), order="schedule")
+    reader = loader(saved)
+    whole = states(next(reader) for _ in range(6))
+    reader = loader(saved)
+    states(next(reader) for _ in range(2))
+    position = reader.get_state()
+    again = loader(mixture(str(root), order="schedule")[0])
+    again.set_state(position)
+    assert states(next(again) for _ in range(4)) == whole[8:]
+    changed = loader(mixture(str(root))[0])
+    with pytest.raises(ValueError):
+        changed.set_state(position)
+
+
 def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):
     """A mixture's corpora train each in an order drawn from its seed (`mixture`), the mix taking each's next
-    row: over a pass, 300 rows of `tickets` at weight 3 and 100 each of `billing` and `legacy` at 1, every
-    row once, every window of five rows three, one and one, and each corpus's rows out of its file's
-    order, read by its shards' index, in memory or as a stream. One seed draws one order, another
-    another, and `seed=None` reads each corpus in its file's order."""
+    row in the corpus order its seed draws for each window of the mix (`mix(seed=)`): over a pass, 600 rows
+    of `tickets` at weight 3 and 200 each of `billing` and `legacy` at 1, every row once, each of its two
+    windows of 500 rows 300, 100 and 100, no corpus in a fixed place, and each corpus's rows out of its
+    file's order, read by its shards' index, in memory or as a stream. One seed draws one order, another
+    another, and `seed=None` reads each corpus in its file's order in Grain's schedule, every five rows
+    billing, legacy and three tickets."""
     import collections
 
     from dew.data.compile import iterate
@@ -326,7 +367,7 @@ def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_
 
     root = tmp_path / "mixture"
     root.mkdir()
-    files, counts = {}, {"tickets": 300, "billing": 100, "legacy": 100}
+    files, counts = {}, {"tickets": 600, "billing": 200, "legacy": 200}
     for name, count in counts.items():
         shard = root / f"{name}.jsonl"
         shard.write_text("".join(json.dumps(ticket(f"{name} {index}", answers="billing")) + "\n"
@@ -352,15 +393,20 @@ def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_
         return {name: [index for corpus, index in rows if corpus == name] == list(range(count))
                 for name, count in counts.items()}
 
+    schedule = ["billing", "legacy", *["tickets"] * 3] * 200
     for reading in ({"read": "indexed"}, {"read": "memory"}, {"read": "streamed"}):
         rows = read(reading)
         assert sorted(rows) == sorted((name, index) for name, count in counts.items()
                                       for index in range(count))
-        assert {tuple(sorted(collections.Counter(name for name, _ in rows[start:start + 5]).items()))
-                for start in range(0, len(rows), 5)} == {(("billing", 1), ("legacy", 1), ("tickets", 3))}
+        shares = {(("billing", 100), ("legacy", 100), ("tickets", 300))}
+        assert {tuple(sorted(collections.Counter(name for name, _ in rows[start:start + 500]).items()))
+                for start in range(0, len(rows), 500)} == shares
+        assert [name for name, _ in rows] != schedule
         assert not any(in_file_order(rows).values()), reading
-        assert read(reading, seed=0) == rows and read(reading, seed=1) != rows
-    assert all(in_file_order(read({"read": "indexed"}, seed=None)).values())
+        other = read(reading, seed=1)
+        assert read(reading, seed=0) == rows and [name for name, _ in other] != [name for name, _ in rows]
+    interleaved = read({"read": "indexed"}, seed=None)
+    assert all(in_file_order(interleaved).values()) and [name for name, _ in interleaved] == schedule
 
 
 def test_a_benchmark_reads_one_corpus_split_whatever_its_weight_under_the_descriptor_that_pins_it(tmp_path):

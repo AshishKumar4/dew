@@ -66,7 +66,7 @@ import tyro
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations, is_protocol
 
-from dew._records import JSON, SAVED
+from dew._records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1003,8 +1003,7 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     own annotation. A field the record lacks takes its declared default; a
     field `member` does not declare, or a required one the record lacks,
     raises. A field marked `metadata={"record": False}` is a binding the
-    value picks up at runtime, not something a record carries, and one a run saved before it existed
-    meant a value by (`metadata={SAVED: value}`) reads as that value where the record lacks it."""
+    value picks up at runtime, not something a record carries."""
     declared = [f for f in dataclasses.fields(member) if _recorded(f)]
     names = sorted(f.name for f in declared)
     unknown = sorted(set(fields) - set(names))
@@ -1013,8 +1012,7 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     if unknown or missing:
         raise ValueError(f"{member.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its fields are {names}")
-    earlier = {f.name: f.metadata[SAVED] for f in declared if f.name not in fields and SAVED in f.metadata}
-    return {**earlier, **{name: _read(member, name, value, dtypes=dtypes) for name, value in fields.items()}}
+    return {name: _read(member, name, value, dtypes=dtypes) for name, value in fields.items()}
 
 
 def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,

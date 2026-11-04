@@ -3,6 +3,7 @@ release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`
 own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
+import json
 from pathlib import Path
 
 import jax
@@ -59,6 +60,38 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         released_run(exported, step="latest")
     with pytest.raises(ValueError):
         load_diffusion_source(str(source))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on(tmp_path):
+    """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
+    default (a diffusion run's, its latest) records that step; when the saved run has trained on, so that
+    its selection names a later one, the same command resuming takes the step it read before it pins
+    (`RunConfig.BUILT`, `source.step`, `resumed`), and its source compares alike with the record's; the
+    command naming the later step keeps it, and its resume is refused."""
+    from dew.config import earlier_run
+
+    first = diffusion(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    read = SavedRun.pinned(str(source)).step
+    command = dataclasses.replace(first, pretrained=str(source), text=None,
+                                  model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
+                                  objective=ObjectiveConfig("diffusion", {}))
+    trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    later = SavedRun.pinned(str(source)).step
+    assert later != read
+    again = dataclasses.replace(command, trainer=dataclasses.replace(
+        first.trainer, name="after", checkpoint_dir=str(tmp_path / "runs")))
+    saved = earlier_run(json.loads((tmp_path / "runs" / "after" / "run.json").read_text()))
+    recorded = DiffusionRunConfig.read(saved)
+    assert recorded.source.step == read
+    assert again.resumed().pinned().source == recorded.source
+    stated = dataclasses.replace(again, source=SourceOptions(step=later))
+    assert stated.resumed().pinned().source.step == later
+    with pytest.raises(ValueError):
+        dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
 
 
 def leaves_alike(tree, alike) -> None:

@@ -474,17 +474,22 @@ text, so this many hold tens of megabytes."""
 
 
 def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descriptor: str | None = None,
-            seed: int | None = 0) -> tuple[Pipeline, Pipeline | None]:
+            seed: int | None = 0, order: Literal["seeded", "schedule"] = "seeded"
+            ) -> tuple[Pipeline, Pipeline | None]:
     """The decision corpora of the mixture directory `root_url` (its `mixture.json`): every corpus of a
     positive weight, the manifest's weights over `weights`, mixed by them for training, and their held
     rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL.
 
     Each corpus trains on its rows in an order drawn from `seed` and its name (`Pipeline.shuffle`): all
     of them permuted where the run reads by index, within `STREAMED_WINDOW` rows where it streams. The
-    mix takes each corpus's next row in that order, so every window of the mix holds each corpus at its
-    share, and a corpus whose file groups its rows by task gives no window the next rows of its file.
-    `seed=None` reads each corpus in its file's order. A stage of each corpus's chain, the order
-    resumes and continues into a later phase as each corpus read it (`dew.data.compile`)."""
+    mix takes each corpus's next row in that order, choosing the corpus each position reads by a
+    permutation `seed` draws for each window of the mix (`mix(seed=)`), so every window holds each
+    corpus at its share in no fixed order, and a corpus whose file groups its rows by task gives no
+    window the next rows of its file. `order="schedule"` chooses the corpora in Grain's schedule, the
+    same every window in their manifest's order, as a mixture read before its corpus order was seeded
+    (row 3870); `seed=None` reads each corpus in its file's order, in that schedule. Stages of the
+    chain, the order resumes and continues into a later phase as the mix read it
+    (`dew.data.compile`)."""
     from dew.data.sources import Source
     from dew.data.sources.concatenate import Concatenate
 
@@ -512,7 +517,10 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
             "mixture_made": dict(stated)}
     training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
                 for child in training]
-    train = training[0] if len(training) == 1 else mix(training, kept)
+    if order not in ("seeded", "schedule"):
+        raise ValueError(f"a mixture's corpus order is 'seeded' or 'schedule', not {order!r}")
+    chosen = seed if order == "seeded" else None
+    train = training[0] if len(training) == 1 else mix(training, kept, seed=chosen)
     evaluated = None if not held else Pipeline(_DecisionSource(
         Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
         _slots(stated) or None, descriptor=pinned)).map(ParseExample())
