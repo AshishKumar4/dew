@@ -183,31 +183,137 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
 
 
-def test_shipped_prediction_weights_match_published_composition(source):
-    """MTP error 4.06e-6 dense / 1.32e-6 MoE with the real HF decoder layer.
+MTP_SEEDS = {"qwen38-dense-tiny": 128, "qwen38-moe-tiny": 64}
+"""Each family's prediction depth's declared check-1 seeds against the published composition, sized by
+`seeds_for` on armada."""
 
-    Source glue is pinned in qwen_mtp_reference.py to vLLM's forward. The
-    embedding/hidden norms cannot be swapped even when their shapes match.
-    """
-    loaded, inputs, _ = source
-    reference = np.load(loaded.source / "mtp_reference.npz")
-    hidden = loaded.model.apply(loaded.variables, inputs.tokens,
-                                 method=loaded.model.hidden_states, **inputs.kwargs())
-    predictions = loaded.model.apply(loaded.variables, hidden, inputs.tokens,
-                                      method=loaded.model.mtp_logits, **inputs.kwargs())[0]
-    valid = reference["valid"]
-    np.testing.assert_allclose(np.asarray(predictions)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
-    np.testing.assert_array_equal(
-        np.asarray(predictions)[valid].argmax(-1), reference["logits"][valid].argmax(-1)
-    )
+
+ENCODED = ("input_ids", "attention_mask", "mm_token_type_ids", "pixel_values", "image_grid_thw")
+"""The processor's fields a source's recorded encoding holds, of these, in a draw's order."""
+
+
+def encoded_fields(loaded) -> dict[str, np.ndarray]:
+    """The source's recorded batch encoding (tests/fixtures/hf/<source>/reference.npz): its rows,
+    padding, media placeholders and pixels, the template a draw keeps the geometry of."""
+    with np.load(loaded.source / "reference.npz") as recorded:
+        return {name: recorded[name] for name in ENCODED if name in recorded.files}
+
+
+def encoded_draw(loaded):
+    """Check 1's draw for a source's prediction depth: its recorded encoding with every real
+    ordinary token drawn again among the byte tokens (its specials, from 256, stay where the
+    encoding places media) and its pixels drawn at their scale, its padding, media slots and grid
+    as recorded; for a decoder that routes, redrawn until every routing its trunk and its
+    prediction depth take clears `selection_margins.MARGIN` (`selection_margins.clearing`)."""
+    import selection_margins
+
+    template = encoded_fields(loaded)
+    ordinary = (template["input_ids"] < 256) & (template["attention_mask"] > 0)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x2739, seed])
+        fields = dict(template)
+        fields["input_ids"] = np.where(ordinary, rng.integers(0, 256, ordinary.shape), template["input_ids"])
+        if "pixel_values" in fields:
+            pixels = template["pixel_values"]
+            fields["pixel_values"] = (rng.standard_normal(pixels.shape) * pixels.std()).astype(pixels.dtype)
+        return tuple(fields[name] for name in template)
+
+    if not selection_margins.selects(loaded.model_config):
+        return draw
+    captured = selection_margins.capture(loaded.model, depths)
+
+    def clears(fields):
+        # The routing of the computation judged: the drawn encoding as the source's processor arranges it.
+        inputs = loaded.processor.from_hf(dict(zip(template, fields, strict=True)))
+        selections = captured(loaded.variables, inputs)
+        return (selection_margins.margin(loaded.model_config, selections, "prediction depth", stable=False)
+                > selection_margins.MARGIN)
+    return selection_margins.clearing(draw, clears)
+
+
+def depths(module, inputs):
+    """A source's prediction depths' logits over its trunk's final states, of `inputs` (`ModelInputs`),
+    their fields read by both."""
+    hidden = module.hidden_states(inputs.tokens, **inputs.kwargs())
+    return module.mtp_logits(hidden, inputs.tokens, **inputs.kwargs())[0]
+
+
+def published_mtp_arms(loaded):
+    """Check 1's reference and truth for `loaded`'s prediction depth over a draw of its encoding
+    (`encoded_draw`): the published composition (tools/qwen_mtp_reference.py's `QwenMTP`, vLLM's predictor
+    over transformers' own decoder layer) over the actual transformers model's final hidden states and
+    embeddings, media included (`prediction_inputs`), its logits at the positions a prediction is
+    admitted to, loaded from the checkpoint in float32 and as its float64 twin (`transformers_arms`)."""
+    import torch
+    from interop_support import transformers_arms
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
+
+    from tools.qwen_mtp_reference import QwenMTP, prediction_inputs
+    from tools.torch_precision import float64
+
+    config = AutoConfig.from_pretrained(loaded.source)
+    config._attn_implementation = "eager"
+    factory = AutoModelForCausalLM if config.model_type.endswith("_text") else AutoModelForImageTextToText
+    stored = load_file(str(loaded.source / "model.safetensors"))
+    names = tuple(encoded_fields(loaded))
+
+    def built(dtype):
+        # The eager experts: transformers' grouped product takes no float64 operands.
+        model = factory.from_config(config, dtype=dtype, experts_implementation="eager")
+        model.mtp = QwenMTP(config.get_text_config())
+        model.load_state_dict(stored, strict=True)
+        return model.to(dtype).eval()
+
+    def predicted(network, *fields):
+        encoded = dict(zip(names, fields, strict=True))
+        _, hidden, embeddings, positions = prediction_inputs(network, encoded)
+        mask = encoded["attention_mask"].bool()
+        admitted = mask[:, :-1] & mask[:, 1:]
+        logits = network.lm_head(network.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted))
+        return logits[admitted]
+
+    def twin():
+        with float64():
+            return built(torch.float64)
+
+    return transformers_arms(built(torch.float32), predicted, twin=twin())
+
+
+def test_shipped_prediction_weights_match_published_composition(source):
+    """The prediction depth's logits over draws of the source's encoding (`encoded_draw`: its rows,
+    padding and media slots, drawn tokens and pixels) on par with the published composition's over the
+    actual transformers model (`published_mtp_arms`) at every admitted position, from its float64
+    twin's (check 1, ledger 2739); the embedding and hidden norms swapped fail it even where their
+    shapes match."""
+    from reference_error import GateFailure, as_given, assert_as_exact
+
+    loaded, _, _ = source
+    reference, truth = published_mtp_arms(loaded)
+    names = tuple(encoded_fields(loaded))
+    compiled = jax.jit(lambda variables, inputs: loaded.model.apply(variables, inputs, method=depths))
+
+    def predictions(variables):
+        @as_given
+        def predicted(*fields):
+            # The source's processor arranges the drawn encoding as the model's inputs, on the host.
+            encoded = dict(zip(names, fields, strict=True))
+            mask = np.asarray(encoded["attention_mask"]) > 0
+            inputs = loaded.processor.from_hf(encoded)
+            return np.asarray(compiled(variables, inputs))[mask[:, :-1] & mask[:, 1:]]
+        return predicted
+
+    draw = encoded_draw(loaded)
+    label, seeds = f"{loaded.source.name} prediction depth", MTP_SEEDS[loaded.source.name]
+    assert_as_exact(predictions(loaded.variables), reference, draw, label, seeds=seeds, truth_fn=truth)
     changed = jax.tree.map(lambda value: value, loaded.variables)
     text = changed["params"].get("language_model", changed["params"])
     depth = text["mtp_0"]
     depth["enorm"], depth["hnorm"] = depth["hnorm"], depth["enorm"]
-    wrong = loaded.model.apply(changed, hidden, inputs.tokens,
-                                method=loaded.model.mtp_logits, **inputs.kwargs())[0]
-    with pytest.raises(AssertionError):
-        np.testing.assert_allclose(np.asarray(wrong)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
+    with pytest.raises(GateFailure):
+        assert_as_exact(predictions(changed), reference, draw, f"{label} of a slip", seeds=seeds,
+                        truth_fn=truth)
 
 
 def test_prediction_cache_matches_reference_candidate_steps(source):

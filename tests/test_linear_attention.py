@@ -37,8 +37,8 @@ import numpy as np
 import pytest
 from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
-from model_support import decode_through
-from reference_error import as_given, assert_as_exact, widened
+from model_support import as_stepped, decode_through, float64_twin
+from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -455,46 +455,87 @@ def test_the_layer_matches_qwen3_5_gated_delta_net(reference, geometry):
     assert largest(out, reference["layer.output"]) < 5e-4
 
 
+DECODE_SEEDS = 8
+"""The reference layer's cached decode's declared check-1 seeds against its parallel forward at each
+step's width, sized by `seeds_for` on armada."""
+DECODED = 32
+"""A decode check's drawn positions: a prefill of 5 and 27 steps past it, which the conv tail and the
+recurrent memory cross, the parallel forwards from 25 positions on past a chunk (24 tokens at these
+keys' width, `held_chunk`). Each step's parallel forward is a program of its own width in the check's,
+whose compile sets the test's time: over the recording's 70 positions, 66 of them took 89 s a test, and
+in map tasks of 4 seeds 140 to 330 s a task under CI's load."""
+
+
+def decoded_draw(recorded: np.ndarray):
+    """A decode check's draw: inputs `DECODED` positions long, of `recorded`'s rows, width and scale."""
+    def draw(seed):
+        rng = np.random.default_rng([0x2739, seed])
+        shape = (*recorded.shape[:1], DECODED, *recorded.shape[2:])
+        return (jnp.asarray(rng.standard_normal(shape) * recorded.std(), jnp.float32),)
+    return draw
+
+
 def test_the_layer_decodes_as_it_prefills(reference, geometry):
-    """A prefill against the cache and single-token steps after it reproduce
-    the parallel forward: the conv tail and the recurrent memory both have
-    to cross the step boundary. Largest observed difference 3.4e-05 against
-    the parallel forward on the same 70 tokens."""
+    """A prefill against the cache and single-token steps after it, on the reference's own weights over
+    drawn inputs of the recording's width and scale (`DECODED` positions), on par with the parallel
+    forward at each step's width (`as_stepped`) from the float64 layer's forward (check 1, ledger
+    2739): the conv tail and the recurrent memory both have to cross the step boundary."""
     module = layer(geometry)
     variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])
-    parallel = module.apply(variables, hidden)
+    recorded = reference["layer.hidden"]
 
-    decoded, _, _ = decode_through(module, variables, hidden, prefill=5)
-    assert largest(decoded, parallel) < 5e-4
+    draw = decoded_draw(recorded)
+
+    wide = float64_twin(module)
+    assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=5)[0],
+                    lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden, 5),
+                    draw, "gated delta net decode", seeds=DECODE_SEEDS,
+                    truth_fn=lambda hidden: wide.apply(widened(variables), hidden))
 
 
-def test_a_bf16_layer_decodes_its_state_in_bf16_within_its_prefills_error(reference, geometry):
+BF16_DECODE_SEEDS = 8
+"""The bf16 layer's cached decode's declared check-1 seeds against its bf16 parallel forward at each
+step's width, sized by `seeds_for` on armada."""
+
+
+def test_a_bf16_layer_decodes_its_state_in_bf16_on_par_with_its_prefill(reference, geometry):
     """A bf16 layer at the default matmul precision holds its decode state in
-    bf16, as vLLM does, and runs the rule in fp32. Over 65 single-token steps
-    after a prefill its outputs stay within twice the bf16 parallel forward's
-    error (which keeps its chunk state in fp32), both measured from the fp32
-    forward, whose error is far below bf16's (tests/reference_error.py's
-    rule); the conv state, the projections' own bf16 values, is held as they
-    are. Asked for the highest precision, as this lane runs, it holds fp32."""
+    bf16, as vLLM does, and runs the rule in fp32: over drawn inputs, a prefill
+    and single-token steps after it on par with the bf16 parallel forward at
+    each step's width (`as_stepped`, its chunk state in fp32) from the float64
+    layer's forward (check 1, ledger 2739); the conv state, the projections'
+    own bf16 values, is held as they are. Asked for the highest precision, as
+    this lane runs, it holds fp32."""
     module = layer(geometry)
     variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])
-    truth = np.asarray(module.apply(variables, hidden), np.float64)
+    recorded = reference["layer.hidden"]
     narrow = module.clone(dtype=jnp.bfloat16)
-    exact = narrow.apply(variables, hidden[:, :1], MixerCall(decode=True), mutable=["cache"])[1]["cache"]
+    exact = narrow.apply(variables, jnp.asarray(recorded)[:, :1], MixerCall(decode=True),
+                         mutable=["cache"])[1]["cache"]
     assert {leaf.dtype for leaf in jax.tree.leaves(exact)} == {jnp.dtype(jnp.float32)}
-
     with jax.default_matmul_precision("default"):
-        parallel = np.asarray(narrow.apply(variables, hidden), np.float64)
-        stepped, cache, _ = decode_through(narrow, variables, hidden, prefill=5)
-        assert {leaf.dtype for leaf in jax.tree.leaves(cache)} == {jnp.dtype(jnp.bfloat16)}
-    decoded = np.asarray(stepped, np.float64)
+        _, cache, _ = decode_through(narrow, variables, jnp.asarray(recorded), prefill=5)
+    assert {leaf.dtype for leaf in jax.tree.leaves(cache)} == {jnp.dtype(jnp.bfloat16)}
 
-    def rms(x):
-        return float(np.sqrt(np.mean((x - truth) ** 2)))
+    draw = decoded_draw(recorded)
 
-    assert rms(decoded) <= 2 * rms(parallel), (rms(decoded), rms(parallel))
+    def at_default(run):
+        """`run` compiled as the gate compiles two Dew arms (`without_ynn`) at the default matmul
+        precision, as a bf16 layer's users run it, and run as given."""
+        compiled = without_ynn(run)
+
+        @as_given
+        def ran(hidden):
+            with jax.default_matmul_precision("default"):
+                return compiled(hidden)
+        return ran
+
+    wide = float64_twin(module)
+    assert_as_exact(at_default(lambda hidden: decode_through(narrow, variables, hidden, prefill=5)[0]),
+                    at_default(lambda hidden: as_stepped(lambda held: narrow.apply(variables, held), hidden,
+                                                         5)),
+                    draw, "bf16 gated delta net decode", seeds=BF16_DECODE_SEEDS,
+                    truth_fn=lambda hidden: wide.apply(widened(variables), hidden))
 
 
 def scan_masked_conv1d(x, kernel, valid, state=None):

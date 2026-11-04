@@ -52,10 +52,11 @@ def with_logit_cotangent(draw, vocab: int, salt: int):
 
 
 @functools.cache
-def decode_steps(model):
+def decode_steps(model, compiled=jax.jit):
     """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
-    compiled program: `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and
-    the cache after them."""
+    program `compiled` compiles (`jax.jit`, or the gate's `without_ynn` for a check between two Dew
+    arms): `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and the cache
+    after them."""
     def made(variables, rows):
         _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
         return made['cache']
@@ -63,7 +64,20 @@ def decode_steps(model):
     def step(variables, cache, ids):
         logits, mutated = model.apply({**variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
         return logits, mutated['cache']
-    return jax.jit(made, static_argnums=1), jax.jit(step)
+    return compiled(made, static_argnums=1), compiled(step)
+
+
+def decode_logits(model, params, prompt, rest, steps=None, *, prefilled: bool = False):
+    """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V], or with `prefilled`
+    every prefill position's logits too, [B, len(prompt) + len(rest), V]; by `steps`, the model's compiled
+    cache and step where its caller holds them (`decode_steps`)."""
+    made, step = steps or decode_steps(model)
+    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
+    steps = [logits if prefilled else logits[:, -1:]]
+    for position in range(rest.shape[1]):
+        logits, cache = step(params, cache, rest[:, position:position + 1])
+        steps.append(logits[:, -1:])
+    return jnp.concatenate(steps, axis=1)
 
 
 def two_documents(rng: np.random.Generator, rows: int, length: int):
@@ -122,6 +136,12 @@ def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, p
     """`forward`'s outputs over `sequence` `[B, S, ...]` at the shapes a cached decode computes them
     (`stepped_outputs`)."""
     return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
+
+
+def stepped_logits(forward: Callable[[jax.Array], jax.Array], ids: jax.Array, prompt: int) -> jax.Array:
+    """`forward`'s logits over `ids` at the widths a cached decode of a `prompt`-token prefill computes
+    them (`as_stepped`), from position `prompt - 1`: `decode_logits`'s positions."""
+    return as_stepped(forward, ids, prompt)[:, prompt - 1:]
 
 
 def float64_twin(model: nn.Module) -> nn.Module:
