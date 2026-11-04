@@ -465,7 +465,6 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
                     terms=terms)
 
 
-@pytest.mark.gpu(reason="the Mosaic backward's deterministic schedule, on an H100")
 def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():
     """attention_terms with a bias every row shares: the first query of a causal call keeps one key, so its
     query gradient is zero in float64, and its terms are not (a D from the rounded output rounds it to their
