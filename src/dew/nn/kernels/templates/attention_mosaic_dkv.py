@@ -491,8 +491,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
-        # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it owns
-        # (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
+        # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
+        # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
                     width + value_width + shares[1][1]
                     + part_count(query.dtype, walk.accurate)
