@@ -28,9 +28,9 @@ process has to itself (`dew.cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
-the whole family, which `gaps` names for maintainers. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`), each launch's under the jax it was measured with (Pallas lowers a kernel in
-jax, which a release moves without jaxlib), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public
+the whole family, which `gaps` names for maintainers. Picks persist per GPU model, jaxlib and jax beside XLA's
+own (`dew.cache.kernel_picks_path`; Pallas lowers a kernel in jax, which a release moves without jaxlib), in
+Dew's own JSON (`encoded`, `decoded`), which tokamax's public
 API leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
