@@ -739,19 +739,16 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
 
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
-    """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a test
-    part's 8 multiprocessors move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
+    """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a part's
+    8 multiprocessors or 64 move neither the step nor the hand-off's steps (row 3790; 3781's pricing,
     where a step at the device's peak over its multiprocessors read 16 times too short). At an H100's
     measured 0.78 us hand-off, a tail of 2 to 5 steps a tile takes no balancing, as the walk whole is
     cheaper, and one of 16 does."""
     h100 = generation.gpu_target("sm90")
-    few = dataclasses.replace(h100, multiprocessors=8)
-    # The catalogue's dense peak over the H100's 132 multiprocessors sits 0.04% under the generation's rate
-    # a clock, and lowers it there (`GpuTarget.tensor_rate`); fewer multiprocessors never raise it.
-    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == pytest.approx(
-        mosaic_gpu.step_seconds(COOPERATIVE, h100), rel=1e-3)
+    few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
+    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, more)
     handoff = mosaic_gpu.handoff_steps(COOPERATIVE, few)
-    assert handoff == pytest.approx(mosaic_gpu.handoff_steps(COOPERATIVE, h100), rel=1e-3) and handoff > 1
+    assert handoff == mosaic_gpu.handoff_steps(COOPERATIVE, more) and handoff > 1
     assert all(tail.balanced(11, steps, 8, handoff_steps=handoff) is None for steps in range(2, 6))
     assert tail.balanced(11, 16, 8, handoff_steps=handoff) is not None
 
