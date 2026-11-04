@@ -292,30 +292,58 @@ def lint():
     return load("lint_slop")
 
 
+KEPT = 3
+"""The requests the cache Worker's stand-in (`cache_worker`) serves on a connection before it closes it,
+saying nothing, as a server ends a connection kept idle."""
+
+
+class Seen(list):
+    """The cache Worker stand-in's requests, each its path, and the client port of each connection they came
+    on (`connections`)."""
+
+    def __init__(self):
+        super().__init__()
+        self.connections: set[int] = set()
+
+
 @pytest.fixture
 def cache_worker():
     """The dew-xla-cache Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on
     a miss, a 401 without the token, Cloudflare's 403 for urllib's own User-Agent, which never
     reaches the Worker, and the Worker's 413 for a body outside its contract's bounds
-    (tools/armada/r2.json). Each request's path is kept."""
-    stored, seen = {}, []
+    (tools/armada/r2.json), over HTTP/1.1, a connection carrying several requests as a server keeps it
+    alive, and closed after its `KEPT` requests without a word, as a server ends an idle one. Each
+    request's path is kept, and each connection's client port (`seen.connections`)."""
+    stored, seen = {}, Seen()
     contract = Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.json"
     bounds = json.loads(contract.read_text())
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args):
             pass
 
+        def _answer(self, status: int, body: bytes = b"", close: bool = False) -> None:
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            if close:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.served = getattr(self, "served", 0) + 1
+            if self.served >= KEPT:
+                self.close_connection = True
+
         def _authorized(self):
             seen.append(self.path)
+            seen.connections.add(self.client_address[1])
             if self.headers.get("User-Agent", "").startswith("Python-urllib"):
-                self.send_response(403)
-                self.end_headers()
+                self._answer(403)
                 return False
             if self.headers.get("Authorization") == "Bearer token":
                 return True
-            self.send_response(401)
-            self.end_headers()
+            self._answer(401)
             return False
 
         def do_GET(self):
@@ -326,29 +354,23 @@ def cache_worker():
                 query = urllib.parse.parse_qs(url.query)
                 prefix, start = "/" + query["list"][0], int(query.get("cursor", ["0"])[0])
                 keys = sorted(key[len(prefix):] for key in stored if key.startswith(prefix))
-                body = json.dumps({"keys": keys[start:start + 2],
-                                   "cursor": str(start + 2) if start + 2 < len(keys) else None}).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
+                cursor = str(start + 2) if start + 2 < len(keys) else None
+                self._answer(200, json.dumps({"keys": keys[start:start + 2], "cursor": cursor}).encode())
                 return
             value = stored.get(self.path)
-            self.send_response(404 if value is None else 200)
-            self.end_headers()
-            if value is not None:
-                self.wfile.write(value)
+            if value is None:
+                self._answer(404)
+            else:
+                self._answer(200, value)
 
         def do_PUT(self):
             if not self._authorized():
                 return
             if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
-                self.send_response(413)
-                self.send_header("Connection", "close")
-                self.end_headers()
+                self._answer(413, close=True)
                 return
             stored[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
-            self.send_response(204)
-            self.end_headers()
+            self._answer(204)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
