@@ -1392,7 +1392,7 @@ class GroupedCase:
     `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
     (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
     kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
-    family is its cell (`DECLARED`)."""
+    family is its cell (`DECLARED`), an FP8 call's kind its own (' fp8')."""
 
     placed: bool
     whole: bool
@@ -1539,7 +1539,10 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
         made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
     else:
         made = 'input_gradient' if options['trans_rhs'] else 'forward'
-    kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
+    # An FP8 call's cells are its own: `DECLARED`'s receipts timed 16-bit products, and XLA's dot of FP8
+    # operands sums narrower than the FP8 contract holds (row 1625), so the template takes them by default.
+    eight = ' fp8' if any(jnp.dtype(argument.dtype) in EIGHT for argument in arguments[:2]) else ''
+    kind = f"{'dense' if options['dense'] else 'grouped'} {made}{eight}"
     call = base.call(launches, *arguments, **options)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
@@ -1623,8 +1626,12 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
-        # (the FP8 contract's reference arm, testing.md, FP8 products), where XLA's FP8 GEMM sums narrower.
-        tokens, kernel = tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16)
+        # (the FP8 contract's reference arm, testing.md, FP8 products). The widened codes are held apart
+        # from the product (an optimization barrier), so XLA's GPU compiler does not rewrite it into its
+        # FP8 GEMM, whose running sum is narrower: on an H100 291 to 3011 times the dequantized product's
+        # distance from float64 (rows 1625, 3620).
+        widened = (tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16))
+        tokens, kernel = jax.lax.optimization_barrier(widened)
         precision = jax.lax.Precision.DEFAULT
     elif all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
         precision = jax.lax.Precision.DEFAULT

@@ -77,7 +77,7 @@ from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import surrogate
 from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.kernels.options import owned_program
-from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
+from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -563,24 +563,18 @@ def decoded_stored(variables: Variables) -> Variables:
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
-    """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
-    rows cast by the FP8 block cast, both sides' codes multiplied exactly and
-    summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
-    bf16 value) and both rows' scales applied after (`_scaled`). The widened codes are
-    held apart from the product (an optimization barrier), so XLA's GPU
-    compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
-    keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
-    GEMM lay 291 times the dequantized float32 product's distance from
-    float64 at the highest precision and 3011 times at the default, where
-    this product lies at 0.53 times it, in 1.7 times the FP8 GEMM's time
-    (receipts ig-fp8-probe3, 4 and 5). The FP8 GEMM returns with a kernel
-    whose sum keeps float32's accuracy (ledger 1625)."""
+    """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`' rows cast by the FP8 block cast
+    and multiplied by `rows` as the GEMM template multiplies FP8 (`templates.gemm.template.gemm`): on
+    Hopper's FP8 tensor cores, each 128-deep step's product promoted into the fp32 sum apart, within the
+    FP8 contract (testing.md, FP8 products: 2.8 to 12.8 times closer to float64 than cuBLASLt's FP8 GEMM, 1.36
+    times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
+    fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625). Both rows' scales apply
+    after (`_scaled`)."""
     from dew.interop.codecs import fp8_block_cast
+    from dew.nn.kernels.templates.gemm import template
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    held_codes, held_rows = jax.lax.optimization_barrier(
-        (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
-    product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
+    product = template.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
     return _scaled(product, scales, row_scales.T)
 
 
@@ -1006,11 +1000,9 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     stored tree, `/`-joined) is timed both ways, forward and input
     gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
-    products `frozen_fp8_dense` runs. Those multiply the codes as bf16 values
-    (`_fp8_rows`), slower than a bf16 Dense, so no site measures faster until
-    an FP8 kernel keeps fp32's sums (ledger 1625; docs/performance.md). The record names
-    the sites and the generation, so a run reproduces the choice; a GPU
-    without FP8 tensor cores is refused by name.
+    products `frozen_fp8_dense` runs, the GEMM template's on FP8 tensor cores
+    (`_fp8_rows`). The record names the sites and the generation, so a run
+    reproduces the choice; a GPU without FP8 tensor cores is refused by name.
 
     Process 0 measures and every process takes its record, as kernel picks
     are settled (`dew.nn.kernels.tuning`): the sites decide which kernels a
