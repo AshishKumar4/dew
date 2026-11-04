@@ -257,15 +257,14 @@ def test_the_selector_refuses_a_state_row_of_either_stream_no_bulk_copy_takes(st
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
 def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     """The selective scan's backward over Mamba's 16 states compiled for an H100 (`kernel_compile`), its
-    documents packed or not: its launch spills nothing at the registers its residency leaves a thread
-    (`selective.RESIDENT` programs a multiprocessor, `mosaic.compiler_params`' `resident`), and the most
-    programs the least spill-free cap ptxas finds (`register_need`) leaves room for is the residency it
-    launches at, so a backward whose need grows past its share, or falls below the next residency's, fails
-    here rather than spilling or leaving a program out on the GPU (row 3589)."""
+    documents packed or not: its launch spills nothing at the registers its derived residency leaves a thread
+    (`selective.backward_plan`, `mosaic.compiler_params`' `resident`), and the most programs the least
+    spill-free cap ptxas finds (`register_need`) leaves room for is the residency its register model gives
+    (`selective.backward_registers`), so a model whose decision parts from ptxas's, or a backward whose need
+    grows past its share, fails here rather than spilling or leaving a program out on the GPU (rows 3589,
+    3801)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    from dew.nn.kernels.templates import resources
 
     rows, length, channels, states = 1, 2048, 256, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
@@ -289,6 +288,8 @@ def test_the_backward_holds_its_registers_at_the_residency_it_launches(packed):
     (kernel,) = [kernel for kernel in record['kernels'] if 'selective_scan_backward' in kernel['kernel']]
     need = kernel['least']
     assert need is not None, kernel
-    held = max(programs for programs in range(1, resources.RESIDENT_PROGRAMS + 1)
-               if resources.entry_registers(1, programs) >= need)
-    assert held == selective.RESIDENT, (need, held, selective.RESIDENT)
+    target = generation.gpu_target('sm90')
+    positions, resident = selective.backward_plan(target)
+    held = selective.backward_programs(need, target)
+    assert held == resident == selective.backward_programs(selective.backward_registers(positions), target), (
+        need, held, resident, positions)
