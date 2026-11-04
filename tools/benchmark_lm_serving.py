@@ -427,13 +427,6 @@ async def sglang_points(args):
     return {"label": args.hardware}, points
 
 
-def _cpu_alone() -> bool:
-    """Whether JAX runs on its CPU devices alone (`jax_platforms`, read without opening a backend)."""
-    import jax
-
-    return jax.config.jax_platforms == "cpu"
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("dew", "vllm", "vllm-engine", "sglang-engine"), required=True)
@@ -482,10 +475,11 @@ def main():
         return
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Dew's: each slot count's measured peak, in a process of its own, before this one opens a backend; none
-    # on JAX's CPU devices alone, whose allocator keeps no high-water (tools/peak_memory.py), so each slot
-    # count's two peak runs would only measure None.
+    # where its devices keep no high-water (`peak_memory.keeps_high_water`), each slot count's two peak runs
+    # measuring only None.
     peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
-              for index in range(len(args.slots))] if args.backend == "dew" and not _cpu_alone() else None)
+              for index in range(len(args.slots))]
+             if args.backend == "dew" and peak_memory.keeps_high_water() else None)
     engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
     hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
     if args.backend == "dew":

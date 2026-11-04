@@ -282,9 +282,22 @@ attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm,
 compared with themselves its documents alone take 512."""
 
 
-@pytest.mark.parametrize("kind", sorted(mixers.paths))
+@pytest.mark.parametrize("kind", sorted(set(mixers.paths) - {"memory"}))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
+    """`assert_packs_as_alone` over every mixer in the registry but the in-context memory."""
+    assert_packs_as_alone(kind)
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_packed_row_of_in_context_memory_computes_what_its_documents_compute_alone():
+    """`assert_packs_as_alone` over the in-context memory, whose 256 seeds, each its packed row and every
+    document alone through a looped stack, took 102 s of 131 cold on armada's CI CPU: CI draws them in map
+    tasks of 64 (ledger 3773)."""
+    assert_packs_as_alone("memory")
+
+
+def assert_packs_as_alone(kind):
+    """A mixer `kind` of the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
     its documents give run one at a time, within the float64 gate, so no layer carries a conv history,
     a recurrent state or attention across a document boundary, nor between the documents and the
