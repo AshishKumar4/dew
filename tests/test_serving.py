@@ -821,11 +821,12 @@ one-entry-booked-twice's at 512."""
     ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
     ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission"])
-@pytest.mark.check1_shards(seeds=256, per_task=128)
+@pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
-    """`assert_reads_a_shared_prefix`'s sites of 256 seeds, which CI draws in map tasks of 128: the default
-    store's took 92 to 108 s in one task with its bundle on armada (ledger 3759)."""
+    """`assert_reads_a_shared_prefix`'s sites of 256 seeds, which CI draws in map tasks of 64: the default
+    store's took 92 to 108 s in one task with its bundle on armada, its first task of 128 cold 115 s
+    (ledger 3759)."""
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
 
 
