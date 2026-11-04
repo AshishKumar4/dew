@@ -297,7 +297,7 @@ KEPT = 3
 saying nothing, as a server ends a connection kept idle."""
 
 
-class Seen(list):
+class WorkerRequests(list):
     """The cache Worker stand-in's requests, each its path, and the client port of each connection they came
     on (`connections`)."""
 
@@ -314,7 +314,7 @@ def cache_worker():
     (tools/armada/r2.json), over HTTP/1.1, a connection carrying several requests as a server keeps it
     alive, and closed after its `KEPT` requests without a word, as a server ends an idle one. Each
     request's path is kept, and each connection's client port (`seen.connections`)."""
-    stored, seen = {}, Seen()
+    stored, seen = {}, WorkerRequests()
     contract = Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.json"
     bounds = json.loads(contract.read_text())
 

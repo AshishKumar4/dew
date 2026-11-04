@@ -172,9 +172,12 @@ class _Kept(_Answer):
 
     def close(self) -> None:
         response = self.response
-        # A success's body is the `Body`'s to read, and one it left unread (past its limit or its deadline)
-        # closes the connection; a miss's or a refusal's, which no `Body` reads, is read off in its bounds.
-        if (not response.isclosed() and not 200 <= response.status < 300 and response.length is not None
+        # An answer with nothing left to read (a PUT's 204, a HEAD's) ends at once. A success's body is the
+        # `Body`'s to read, and one it left unread (past its limit or its deadline) closes the connection; a
+        # miss's or a refusal's, which no `Body` reads, is read off in its bounds.
+        if not response.isclosed() and response.length == 0:
+            response.read()
+        elif (not response.isclosed() and not 200 <= response.status < 300 and response.length is not None
                 and response.length <= DRAINED):
             self.drained()
         if response.isclosed() and not response.will_close and self.place not in self.kept:
@@ -187,12 +190,11 @@ class _Kept(_Answer):
         most what is left of them; a body that does not come whole in time leaves the answer open, and its
         connection is closed."""
         ends = time.monotonic() + DRAIN_SECONDS
-        while not self.response.isclosed() and (left := ends - time.monotonic()) > 0:
-            try:
+        # A body cut short or refused leaves the answer open, which `close` reads as a connection to close.
+        with contextlib.suppress(OSError, http.client.HTTPException):
+            while not self.response.isclosed() and (left := ends - time.monotonic()) > 0:
                 if not self.read1(DRAINED, left):
-                    return
-            except (OSError, http.client.HTTPException):
-                return
+                    break
 
 
 class Body:

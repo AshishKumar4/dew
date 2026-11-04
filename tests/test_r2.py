@@ -115,19 +115,26 @@ def test_an_answer_that_ends_before_its_announced_length_is_unavailable_and_a_he
         server.shutdown()
 
 
-@SENDERS
-def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline(send):
-    """A Worker that sends its answer's body a few bytes at a time, each within the socket's timeout, gave
-    no object in time: its read is `Unavailable` at `timeout` plus its length at `MIN_RATE`, each receive
-    waiting at most what is left of that, never after the whole trickle's 12.8 s (2026-11-03: a test cache's
-    bundle read 28 minutes before its group's first test)."""
+def served(handler: type[http.server.BaseHTTPRequestHandler]) -> http.server.ThreadingHTTPServer:
+    """A server of `handler`'s answers on a port of its own, each connection in a daemon thread."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def trickling(status: int) -> type[http.server.BaseHTTPRequestHandler]:
+    """A Worker that answers `status` with a body of 4 KiB it sends 64 bytes every 0.2 s, each within a
+    socket's timeout, 12.8 s in all, over HTTP/1.1."""
 
     class Trickle(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args):
             pass
 
         def do_GET(self):
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Length", str(64 * 64))
             self.end_headers()
             # Written until the client gives up on it, which closes the connection.
@@ -137,9 +144,17 @@ def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_dead
                     self.wfile.flush()
                     time.sleep(0.2)
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return Trickle
+
+
+@SENDERS
+def test_an_answer_arriving_slower_than_its_floor_is_unavailable_within_its_deadline(send):
+    """A Worker that sends its answer's body a few bytes at a time, each within the socket's timeout, gave
+    no object in time: its read is `Unavailable` at `timeout` plus its length at `MIN_RATE`, each receive
+    waiting at most what is left of that, never after the whole trickle's 12.8 s (2026-11-03: a test cache's
+    bundle read 28 minutes before its group's first test)."""
+
+    server = served(trickling(200))
     try:
         store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=1,
                          send=send)
@@ -167,12 +182,14 @@ def test_the_records_one_thread_reads_in_turn_share_its_connections_to_the_worke
     assert len(seen) == 10 and len(seen.connections) == 4
 
 
-def served(handler: type[http.server.BaseHTTPRequestHandler]) -> http.server.ThreadingHTTPServer:
-    """A server of `handler`'s answers on a port of its own, each connection in a daemon thread."""
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
+def test_answers_with_no_body_to_read_leave_their_kept_connection_for_the_next_request(cache_worker):
+    """A PUT's 204, which the Store never reads, ends its answer at once, so the connection `KeptSend` keeps
+    carries the next request: two writes and a read go on one connection to the Worker's stand-in."""
+    url, _, seen = cache_worker
+    store = r2.Store(url, "token", "dew-test", timeout=10, send=r2.KeptSend())
+    store.put("records/a", b"a")
+    store.put("records/b", b"b")
+    assert store.get("records/a") == b"a" and len(seen.connections) == 1
 
 
 def test_a_kept_connection_the_worker_closes_after_an_answer_reads_that_answer_whole():
@@ -207,23 +224,7 @@ def test_a_miss_whose_body_trickles_is_none_within_the_kept_connections_drain():
     kept connection reads such a body off for its next request at most `DRAIN_SECONDS`, then closes it,
     never after the whole trickle's 12.8 s."""
 
-    class Trickle(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            self.send_response(404)
-            self.send_header("Content-Length", str(64 * 64))
-            self.end_headers()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                for _ in range(64):
-                    self.wfile.write(b"x" * 64)
-                    self.wfile.flush()
-                    time.sleep(0.2)
-
-    server = served(Trickle)
+    server = served(trickling(404))
     try:
         store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10,
                          send=r2.KeptSend())
