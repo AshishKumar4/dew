@@ -25,6 +25,14 @@ def widened(tree):
     return jax.tree.map(wide, tree)
 
 
+def float64_held(tree):
+    """`tree` widened (`widened`) as arrays made under x64, so a program keeps them float64: the variables
+    a float64 truth compiled once for every draw reads, where a layer that indexes a weight by its ids
+    (DeepSeek V4's hash routing, Gemma 4's per-expert scales) indexes an array in a program (row 3654)."""
+    with jax.enable_x64(new_val=True):
+        return jax.tree.map(jnp.asarray, widened(tree))
+
+
 def summed_as_run():
     """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
     the process's default backend (`jax.default_backend()`), fp32 products summed in fp32

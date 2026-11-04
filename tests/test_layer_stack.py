@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
+from arm_arithmetic import float64_held
 from flax import linen as nn
 from model_support import largest_difference, stepped_decode
 from reference_error import (
@@ -505,7 +506,7 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
     # The loop's float64 twin over its variables widened once, a program the gate compiles for every draw: a
     # truth that fetched its steps to the host ran eagerly, decoding each draw's ten steps op by op.
     with jax.enable_x64(new_val=True):
-        twin, wide = hybrid(6, dtype=jnp.float64), jax.tree.map(jnp.asarray, widened(variables))
+        twin, wide = hybrid(6, dtype=jnp.float64), float64_held(variables)
 
     def truth(ids):
         return decoded(twin, wide, ids)[0]
@@ -593,7 +594,7 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     draw = interop_support.token_draw(0x642, config["vocab_size"], (2, 10))
 
     with jax.enable_x64(new_val=True):
-        twin, wide = plain.model.clone(dtype=jnp.float64), jax.tree.map(jnp.asarray, widened(plain.variables))
+        twin, wide = plain.model.clone(dtype=jnp.float64), float64_held(plain.variables)
 
     def truth(ids):
         return decoded(twin, wide, ids)[0]
