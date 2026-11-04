@@ -171,6 +171,56 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
 
 
+def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> tuple[Path, int, object]:
+    """`kind`'s saved run of `recorded` unpacked, its last step, and the run that made it built again, as
+    `dew train` builds it from its Python or its flags (`SAVED_KINDS`), not read back from its record,
+    `stated` set on it, to resume that step and train one more: a source the repo holds named by its
+    path in the repo, as the corpus records it, read from the checkout's root."""
+    run = extracted(tmp_path, recorded, kind)
+    recorded_run = RunConfig.load(str(run))
+    with Checkpoints(str(run)) as checkpoints:
+        last = checkpoints.latest
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    clocked = recorded_run.trainer.examples is not None
+    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
+                                  **({} if clocked else {"steps": last + 1}), resume="require",
+                                  compilation_cache_dir=None, multi_host=False)
+    here = SAVED_KINDS[kind](tmp_path, drawn=False)
+    sourced = {"pretrained": recorded_run.pretrained} if hasattr(recorded_run, "pretrained") else {}
+    return run, last, dataclasses.replace(here, trainer=trainer, **sourced, **stated)
+
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_path, monkeypatch, recorded,
+                                                                         kind):
+    """A kind's run saved at an earlier main resumes from its last checkpoint when the run that made it is
+    built again from its command (`rebuilt`): every field it leaves for its build to resolve takes the
+    saved run's value (`RunConfig.BUILT`: a decision run's option text, its rows' writing, row 3848, and
+    its source's storage), so the resume compares alike and fits the one step past its checkpoint."""
+    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
+    built.prepare().train(kind)
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+
+
+def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refused(tmp_path, monkeypatch):
+    """A field a run leaves to its build takes the saved run's value only where the run leaves it None: a
+    lettered decision run saved before its option text was a field wrote its options named, and its
+    command run again setting `described` keeps it, so its resume is refused, where the same run writing
+    them named resumes."""
+    from dew.config import earlier_run
+
+    recorded = next(recorded for recorded, kind in SAVED if kind == "decision-lettered")
+    run, _, built = rebuilt(tmp_path, monkeypatch, recorded, "decision-lettered", option_text="described")
+    assert built.resumed().option_text == "described"
+    saved = earlier_run(json.loads((run / "run.json").read_text()))
+    prepared = built.resumed().pinned().build_run().run
+    with pytest.raises(ValueError):
+        prepared.check_resume(saved)
+    dataclasses.replace(prepared, option_text="named").check_resume(saved)
+
+
 def test_a_packed_projections_products_count_at_each_of_its_members():
     """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
     q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member
