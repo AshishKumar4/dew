@@ -178,6 +178,23 @@ def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
             reader(DataPartition(0, 2))
 
 
+def test_a_validation_pass_keeps_its_rows_mask_through_a_host_projection():
+    """Three records read in batches of two fill their last batch with a copy its real-row mask
+    (`VALID_ROWS`) marks: a host step after the batch that returns only the fields it projects keeps the
+    reader's mask, as it keeps its examples count, so the copy is counted once, where the projection
+    dropped the mask and a loss counted the third record twice (row 3937)."""
+    def projected(batch):
+        return {"id": batch["id"]}
+
+    held = validation(Pipeline(Memory(Indexed(1, 3))).batch(2).map(projected), batch=2,
+                      loading=READ)(DataPartition())
+    try:
+        masks = [np.asarray(batch[VALID_ROWS]).tolist() for batch in held]
+    finally:
+        held.close()
+    assert masks == [[True, True], [True, False]]
+
+
 def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():
     """A mixed pass keeps the weights and each split's own order, and stops
     before any corpus comes round, so a score is a score of the same records
@@ -1220,6 +1237,16 @@ def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
     fitted = regression_trainer(tmp_path / "fitted").fit(chain, steps=5)
     written = regression_trainer(tmp_path / "written").fit(compile(read, seed=0), steps=5)
     assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
+
+
+def test_phases_of_another_batch_are_refused_before_their_step_ends_are_counted():
+    """Phases read until training steps, so each is of the run's one batch (`phases`): one batched by 4
+    between two batched by 8 is refused, where its end was counted at 4 records a step and the stream
+    moved on a step early under a loader declaring 8 (row 3940)."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    with pytest.raises(ValueError):
+        compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
+                loading=READ)
 
 
 class TokenCounted(Regression):

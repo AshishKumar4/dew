@@ -30,6 +30,7 @@ from diffusion_support import images_of
 from flax import linen as nn
 from jepa_cases import MASK
 from map_judge import judging, pooled_units, record_units
+from optim_support import stage_local_adam
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -600,7 +601,7 @@ def assert_fits_as_drawn(case, tmp_path, mesh: MeshSpec, devices, state, steps: 
         return
     # The state fit returns, every layer whole, and the one the step holds (`place`), a pipelined run's
     # leaf stacked by stage, each stage's layers on its own devices.
-    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0]
+    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=stage_local_adam(1e-3))[0].place()[0]
     for held in (fitted, adam):
         sharded = fsdp_leaves(held.variables)
         assert sharded, "no parameter was sharded over the fsdp axis"

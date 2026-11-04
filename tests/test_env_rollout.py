@@ -517,6 +517,43 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
                    for one, other in zip(bits(whole), bits(afresh), strict=True))
 
 
+class Counted(ControlRollout):
+    """`ControlRollout`, keeping each collection it makes and each batch it serves."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "made", [])
+        object.__setattr__(self, "served", [])
+
+    def __call__(self, state, batch, key):
+        before = self._collected
+        out = super().__call__(state, batch, key)
+        if self._collected is not before:
+            self.made.append(self._collected)
+        self.served.append(out)
+        return out
+
+
+def test_a_control_run_accumulating_two_minibatches_an_update_serves_each_collection_once_a_pass():
+    """A PPO run whose update pools two microbatches (`accumulation=2`) serves its rollout's collection in
+    one pass of its two minibatches: two calls an update, each the next minibatch, a collection each update,
+    every sequence of each collection served once. The cursor is the rollout's own, apart from the updates
+    the optimizer commits, where reading it off them collected afresh on every call of an update and
+    served the first minibatch of each (row 3932)."""
+    from dew.objectives.rl.config import idle
+    from dew.training import Trainer
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
+    rollout = Counted(objective, Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16), unroll_length=8,
+                      epochs=1, minibatches=2)
+    Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout, accumulation=2).fit(
+        idle(), steps=4, log_every=4)
+    assert len(rollout.made) == 2 and len(rollout.served) == 4
+    for made, pair in zip(rollout.made, (rollout.served[:2], rollout.served[2:]), strict=True):
+        rewards = np.sort(np.concatenate([np.asarray(batch["reward"]) for batch in pair]), axis=0)
+        np.testing.assert_array_equal(rewards, np.sort(np.asarray(made["reward"]), axis=0))
+
+
 def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path):
     """A PPO run on walks with a cooldown at its fourth update ends, every leaf bit for bit, where the run
     with no cooldown does: the branch's updates run on the rollout's walks and collection and leave them as

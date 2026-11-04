@@ -20,6 +20,7 @@ import pytest
 from affine_run import Replaying
 from flax import linen as nn
 from model_support import TINY_DECODER
+from optim_support import stage_local_adam
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened
 from token_support import token_rows
 
@@ -28,7 +29,14 @@ from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig, ParamGroup, parameter_name, scale_by_m3, weight_decay_mask
+from dew.optim import (
+    STACKED_OPTIMIZERS,
+    OptimConfig,
+    ParamGroup,
+    parameter_name,
+    scale_by_m3,
+    weight_decay_mask,
+)
 from dew.registry import models
 from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
 from dew.training.diloco import DiLoCo
@@ -88,9 +96,9 @@ def test_each_device_holds_one_stage_of_the_pipelined_run(stages):
     its memory analysis reports, the batch's rows aside, is within a few bytes a leaf of that. Before,
     every device held the whole run, and the step restacked it."""
     model = decoder(num_layers=8)
-    one = trainer(model, optax.adam(1e-3), MeshSpec(), 1).initial_state()
+    one = trainer(model, stage_local_adam(1e-3), MeshSpec(), 1).initial_state()
     inside, outside = run_bytes({"variables": one.variables, "opt_state": one.opt_state, "ema": one.ema})
-    run = trainer(model, optax.adam(1e-3), MeshSpec(stage=stages), 8)
+    run = trainer(model, stage_local_adam(1e-3), MeshSpec(stage=stages), 8)
     state, _, _ = run.place()
     batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
     run.compile(state, batch)
@@ -111,13 +119,31 @@ its gradient. At Adam's 1e-8 a gradient within rounding of zero steps by lr one 
 an error of 2 lr that no layout makes or removes, and check 1's ratio would count such gradients in
 a draw rather than the layout's rounding."""
 
+ADAM = OptimConfig(optimizer="adam", learning_rate=1e-3)
+"""Dew's named Adam, which reads a stage-local run's stacked leaf as its stored layers, as optax's Adam given
+built does not say it does (`STACKED_OPTIMIZERS`, row 3934)."""
+
+ADAM_FAST = OptimConfig(optimizer="adam", learning_rate=1e-2)
+"""`ADAM` at a rate whose two steps move the decoder's state measurably."""
+
+
+NAMED_FIELDS: dict[str, tuple[dict, dict]] = {
+    "adamw": ({"weight_decay": 0.1}, {}),
+    "lamb": ({"weight_decay": 0.1}, {}),
+    "muon": ({"weight_decay": 0.1}, {}),
+    "muonclip": ({"optimizer_opts": {**SMOOTH, "qk_clip_threshold": 0.05}}, {"qk_norm": False}),
+    # LaProp's adaptive clip engaged on every layer, its update clipped to a thousandth of each layer's norm.
+    "laprop": ({"optimizer_opts": {**SMOOTH, "agc": 1e-3}}, {}),
+}
+"""What a named optimizer of `STACKED_OPTIMIZERS` needs set for its per-layer rule to act, its config's
+fields and the decoder's: weight decay's mask, QK-Clip's maxima on a decoder whose queries and keys no norm
+divides, LaProp's clip engaged."""
+
 OPTIMIZERS = {
-    "adamw": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
-                          optimizer_opts=SMOOTH), {}),
-    "muon": (OptimConfig(optimizer="muon", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH), {}),
-    "muonclip": (OptimConfig(optimizer="muonclip", learning_rate=1e-2,
-                             optimizer_opts={**SMOOTH, "qk_clip_threshold": 0.05}), {"qk_norm": False}),
-    "lamb": (OptimConfig(optimizer="lamb", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH), {}),
+    **{name: (OptimConfig(optimizer=name, learning_rate=1e-2,
+                          **{"optimizer_opts": SMOOTH, **NAMED_FIELDS.get(name, ({}, {}))[0]}),
+              NAMED_FIELDS.get(name, ({}, {}))[1])
+       for name in sorted(STACKED_OPTIMIZERS)},
     "groups": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH,
                            param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
                                                     weight_decay=0.0),
@@ -130,21 +156,25 @@ OPTIMIZERS = {
         **SMOOTH, "per_head": {"layers_*/self_attn/q_proj/kernel": 8}}), {}),
     "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
                             optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
-    # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors.
+    # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
+    # stepped at its rate by a schedule, whose state names the transform that steps a number at a time.
     "m3": (optax.multi_transform(
         {"m3": optax.chain(scale_by_m3(beta1=0.9, beta2=0.95, beta3=0.99, alpha=5.0, eps=1e-8, frequency=2),
-                           optax.scale_by_learning_rate(1e-2)),
-         "adam": optax.adam(1e-2)},
+                           optax.scale_by_schedule(lambda count: -1e-2)),
+         "adam": stage_local_adam(1e-2)},
         lambda params: jax.tree.map(lambda matrix: "m3" if matrix else "adam", weight_decay_mask(params))),
         {}),
+    # optax's own LAMB, given as it is: its trust ratio a stateless transform reducing over a whole leaf.
+    "optax_lamb": (optax.lamb(1e-2, eps=1e-4, weight_decay=0.1), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
     "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
                          optimizer_opts=SMOOTH),
              {"emb_features": 8, "num_heads": 2, "num_kv_heads": 1, "mlp_features": 256}),
 }
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
-the weight-decay mask's rank, Muon's matrix axes, QK-Clip's per-layer maxima (on a decoder whose queries
-and keys no norm divides), LAMB's trust ratio, a param group's patterns and int8 moments' threshold."""
+every named optimizer Dew stacks (`STACKED_OPTIMIZERS`), its weight-decay mask's rank, Muon's matrix axes,
+QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group's patterns, int8 moments'
+threshold and Muon's variants; and transformations given as they are, M3's and optax's LAMB."""
 
 LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
 """What the LoRA cell trains its factors with."""
@@ -260,8 +290,10 @@ def test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_op
     leave its variables, optimizer state and EMA on par with the same pipeline's with every layer whole
     on every stage (check 1): each rule that reads a leaf as one layer reads a stacked leaf as its layers.
     Read whole, a layer's norm scales stacked would decay as a matrix, Muon would find three sides,
-    QK-Clip would find no maxima, LAMB would take one ratio over both stages, a group's pattern would
-    miss, and int8 would quantize a moment one layer keeps in float32."""
+    QK-Clip would find no maxima, LAMB would take one ratio over both stages, LaProp would clip both
+    stages by one norm (row 3933), a group's pattern would miss, and int8 would quantize a moment one
+    layer keeps in float32; a transformation given as it is whose state cannot say it reads a leaf a
+    number at a time (optax's LAMB, a stateless trust ratio) keeps every layer whole (row 3934)."""
     optimizer, fields = OPTIMIZERS[name]
     assert_trains_as_replicated(decoder(**fields), optimizer, f"stage-local {name}")
 
@@ -305,7 +337,7 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     3457): its model reads it off the mesh as its stored layers, computing from it what it computes from
     the same state with every layer whole (`Trainer.stored`), which is what the run's last checkpoint
     holds; the objective's pipeline generates from it; and it trains on when handed back to `fit`."""
-    model, optimizer = decoder(), optax.adam(1e-2)
+    model, optimizer = decoder(), stage_local_adam(1e-2)
     run = trainer(model, optimizer, STAGED, 8, checkpoints=Checkpoints(str(tmp_path)))
     observe = Observe(STEPS, lambda state: (state.variables, state.opt_state, state.ema))
     trained = run.fit(stream(), steps=STEPS, log_every=1, observe=observe, checkpoint_every=STEPS)
@@ -380,11 +412,11 @@ def test_a_headed_or_actor_critic_objectives_decoders_keep_their_runs_stage_loca
         decoders = [decoder(), decoder()]
 
     def run(stage_local: bool) -> Trainer:
-        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
+        return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
                        layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
 
     # Each decoder's run alone, an LM's without an average, as a lower bound of what it spares.
-    alone = sum(saving(functools.partial(trainer, model, optax.adam(1e-3), STAGED, 8, ema=None))
+    alone = sum(saving(functools.partial(trainer, model, ADAM, STAGED, 8, ema=None))
                 for model in decoders)
     assert alone > 0 and saving(run) >= alone
 
@@ -423,17 +455,23 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
 
 @pytest.mark.mesh(devices=8)
 def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trains():
-    """Over two stages, Adam given as optax builds it keeps each run stage-local, and Adafactor, whose
-    factored moments and block clip read a leaf whole, keeps every layer whole on every stage, given built
-    or named by its import path in an `OptimConfig`: no per-layer view of a transform whose reductions
-    only its own code knows is exact short of each layer a leaf of its own, which one program can hold on
-    every stage alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
+    """Over two stages, a transformation given built whose every state names a transform that acts a
+    number at a time (Adam's moments, a schedule's rate) keeps each run stage-local; optax's Adam, whose
+    constant rate is a stateless transform (`optax.EmptyState`, which names none: optax's LAMB trust ratio
+    holds one too, row 3934), and Adafactor, whose factored moments and block clip read a leaf whole, keep
+    every layer whole on every stage, given built or named by its import path in an `OptimConfig`, and the
+    run's plan names what kept them whole. No per-layer view of a transform whose reductions only its own
+    code knows is exact short of each layer a leaf of its own, which one program can hold on every stage
+    alone, so the run trains as `Layout(stage_local=False)` trains it, and steps."""
     model = decoder()
-    assert saving(functools.partial(trainer, model, optax.adam(1e-3), STAGED, 8, ema=None)) > 0
-    for given in (optax.adafactor(1e-3), OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
+    assert saving(functools.partial(trainer, model, stage_local_adam(1e-3), STAGED, 8, ema=None)) > 0
+    for given in (optax.adam(1e-3), optax.adafactor(1e-3),
+                  OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3)):
         # An OptimConfig's transformation is built over the run's length, which fit gives.
         assert saving(functools.partial(trainer, model, given, STAGED, 8, ema=None)) == 0
-        assert int(trainer(model, given, STAGED, 8, ema=None).fit(stream(), steps=1, log_every=1).step) == 1
+        run = trainer(model, given, STAGED, 8, ema=None)
+        assert int(run.fit(stream(), steps=1, log_every=1).step) == 1
+        assert run.plan["layers_whole_for"]
 
 
 @pytest.mark.mesh(devices=8)
@@ -520,10 +558,10 @@ def test_a_distillation_runs_student_keeps_its_run_stage_local():
     def run(stage_local: bool) -> Trainer:
         objective = DistillationObjective(LMObjective(student, SEQ, ema_decay=None),
                                           LMObjective(teacher, SEQ, ema_decay=None))
-        return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=STAGED,
+        return Trainer(objective, ADAM, key=jax.random.key(0), mesh=STAGED,
                        layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local), tracker=None)
 
-    alone = saving(functools.partial(trainer, student, optax.adam(1e-3), STAGED, 8, ema=None))
+    alone = saving(functools.partial(trainer, student, ADAM, STAGED, 8, ema=None))
     assert saving(run) == alone > 0
 
 
@@ -565,7 +603,7 @@ def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
     with no copy of every layer on every stage (ledger 3477): its policy reads the store off the mesh as
     its stored layers, choosing the tokens the same state with every layer whole chooses."""
     model = decoder()
-    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    run = trainer(model, ADAM_FAST, STAGED, 8)
     read = []
 
     def rollout(state, batch, key):
@@ -590,7 +628,7 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     3487): a run over four stages given it by `fit(state=...)`, and a run with no stage axis given its
     variables by its objective (SFT into DPO), each start from every layer of it, where placement refused
     a store stacked over another count."""
-    model, optimizer = decoder(), optax.adam(1e-2)
+    model, optimizer = decoder(), stage_local_adam(1e-2)
     trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
     stored = on_host(trainer(model, optimizer, STAGED, 8).stored(trained).variables)
     four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
@@ -615,7 +653,7 @@ def test_a_server_reloads_a_stage_local_state_as_its_stored_layers():
     from dew.sampling import Sampling
 
     model = decoder(max_seq_len=64)
-    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    run = trainer(model, ADAM_FAST, STAGED, 8)
     trained = run.fit(stream(), steps=1, log_every=1)
     whole = jax.device_get(run.stored(trained).variables)
     assert all(isinstance(leaf, np.ndarray)
@@ -640,7 +678,7 @@ def test_a_generation_from_a_stage_local_state_packs_its_projections():
     from dew.inference.projections import pending
 
     model = decoder()
-    run = trainer(model, optax.adam(1e-2), STAGED, 8)
+    run = trainer(model, ADAM_FAST, STAGED, 8)
     trained = run.fit(stream(), steps=1, log_every=1)
     groups = [pending(model, variables) for variables in (trained.variables, run.stored(trained).variables)]
     assert groups[1] and groups[0] == groups[1]

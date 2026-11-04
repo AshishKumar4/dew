@@ -175,6 +175,35 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
                     truth_fn=exact)
 
 
+@pytest.mark.parametrize("rows,features", [(64, 8), (8, 64)], ids=["primal", "dual"])
+def test_a_gauss_newton_step_solves_only_its_real_rows(rows, features):
+    """A batch whose last quarter of rows its mask marks unreal (`VALID_ROWS`, a share's exhausted rows
+    on the examples clock, or an evaluation's fill) states the system of its real rows alone, as its
+    loss counts them: its damped step is NumPy's solve of the real rows' normal equations (or their Gram
+    form) at w = 0 (check 1), where the unreal rows' residuals entered the system and the step solved
+    another objective (row 3929)."""
+    from dew.batch import VALID_ROWS
+
+    objective = LeastSquares(features)
+    params = objective.init(jax.random.key(0))["params"]
+    step = Step(jnp.asarray(0), jax.random.key(0), None, equations=True)
+    optimizer = gauss_newton(damping=1e-3)
+    draw = least_squares_draw(rows, features, 0x6B)
+    real = np.arange(rows) < rows * 3 // 4
+
+    def dews(x, y):
+        statistics = objective.loss({"params": params}, {"x": x, "y": y, VALID_ROWS: jnp.asarray(real)}, step)
+        update, _ = optimizer.update(jax.tree.map(jnp.zeros_like, params), optimizer.init(params), params,
+                                     statistics=statistics)
+        return -update["Dense_0"]["kernel"][:, 0]
+
+    numpy = as_given(lambda x, y: solved(x[real], y[real], 1e-3))
+    exact = as_given(lambda x, y: solved(x[real].astype(np.float64), y[real].astype(np.float64), 1e-3))
+    label = f"masked gauss-newton {rows}x{features}"
+    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
+                    truth_fn=exact)
+
+
 def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None, bias: bool = False):
     """One update of a least-squares objective of damping 1e-3 (by `optimizer` where given), from zero
     weights, of a draw's `rows` rows read in `accumulation` microbatches of an accumulation window: its
