@@ -59,11 +59,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from architecture_cases import CASES as ARCHITECTURES
-from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads
+from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads, tokens
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
 from model_support import float64_twin, moved
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, summed_as_run, widened
 from tiny_models import build_model, tiny_inputs
 
 from dew.batch import coordinates
@@ -478,20 +478,24 @@ def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
 
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
-    """The resized model reads the same variables to the model's logits, and
-    a causal one decodes into a cache of `CAPACITY` slots and draws the same
-    tokens. Its attention reduces over the shorter cache, so the cached
-    logits are the model's bits or as exact as them (`as_exact`)."""
-    source, read = loaded(name), reads(name, "float32")
+    """The resized model reads the same variables to the model's logits, both in one program, bit for bit,
+    and a causal one decodes into a cache of `CAPACITY` slots and draws the same tokens. Its attention
+    reduces over the shorter cache, so the cached logits are the model's bits or as exact as them
+    (`as_exact`). Each call is compiled, where op by op the logits took a minute of the test, and the
+    greedy decodes run as the check runs its arms (`summed_as_run`), whose programs they share (ledger
+    2957)."""
+    source, rows = loaded(name), tokens(name)
     model, variables = source.model, source.variables
     sized = model.with_cache_capacity(CAPACITY)
-    same(sized.apply(variables, read.tokens, method="logits"), read.logits)
+    same(*jax.jit(lambda variables, rows: [network.apply(variables, rows, method="logits")
+                                           for network in (sized, model)])(variables, rows))
     if not model.causal:
         return
     call = tuple(_decoding(name).items())
     own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
-    cache, drawn, _ = _greedy(own, variables, read.tokens)
-    sized_cache, sized_drawn, _ = _greedy(at_capacity, variables, read.tokens)
+    with summed_as_run():
+        cache, drawn, _ = _greedy(own, variables, rows)
+        sized_cache, sized_drawn, _ = _greedy(at_capacity, variables, rows)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
