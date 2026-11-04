@@ -71,7 +71,7 @@ class Dataset()  [dew.data.pipeline]
   .repeat(self, epochs: int | None = None) -> Pipeline
   .select_columns(self, *names: str) -> Pipeline
   .show(self, count: int = 8) -> None
-  .shuffle(self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None) -> Pipeline
+  .shuffle(self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None, streamed: int | None = None) -> Pipeline
   .snapshot(self, url: str, *, format: Literal['array_record', 'parquet'] | Writer = 'array_record', rows_per_shard: int = 100000, deduplicate: NearDuplicates | None = None) -> Mapping[str, object]
   .stats(self, records: int = 1000) -> dict[str, float]
   .take(self, count: int) -> Pipeline
