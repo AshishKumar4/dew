@@ -203,12 +203,34 @@ class DecideSettings:
     which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
 
 
-def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
-    """The calibration `Decide.save` wrote into the run in `directory` (`TASK_FILE`) and the weights it
-    was fitted on; None where it wrote none."""
+CALIBRATIONS = "calibrations"
+"""The directory of a run beside its steps that holds each calibration `Decide.save` wrote, one file a set
+of weights it was fitted on (`_fitted_file`), so a reader pinned to a step reads the one fitted on it after
+a later one was fitted (row 3865)."""
+
+
+def _fitted_file(directory: str, weights: Weights) -> epath.Path:
+    """Where the run in `directory` keeps the calibration fitted on `weights` (`CALIBRATIONS`)."""
+    return epath.Path(directory) / CALIBRATIONS / f"{weights.step}{'-averaged' if weights.ema else ''}.json"
+
+
+def step_calibrations(directory: str, step: int) -> tuple[epath.Path, ...]:
+    """The calibrations the run in `directory` keeps fitted on `step`'s weights, live and averaged, each
+    file that exists: what a read of that step loads beside its latest (`Decide.from_saved`), which an
+    export of the step is a function of (`dew.interop.saved_sources`)."""
+    return tuple(path for path in (_fitted_file(directory, Weights(step, ema)) for ema in (False, True))
+                 if path.exists())
+
+
+def _calibrated(directory: str, weights: Weights | None = None
+                ) -> tuple[Mapping[str, object], Weights] | None:
+    """The calibration `Decide.save` wrote into the run in `directory` and the weights it was fitted on:
+    the one fitted on `weights` where it kept one (`CALIBRATIONS`), else its latest (`TASK_FILE`); None
+    where it wrote none."""
     from dew.registry import from_record
 
-    saved = epath.Path(directory) / TASK_FILE
+    kept = None if weights is None else _fitted_file(directory, weights)
+    saved = kept if kept is not None and kept.exists() else epath.Path(directory) / TASK_FILE
     if not saved.exists():
         return None
     settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
@@ -355,7 +377,7 @@ class Decide(SavedRunTask, InItsForm):
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
         task = replace(task, variables=_served(task.model, task.variables))
-        saved = _calibrated(directory)
+        saved = _calibrated(directory, Weights(step, averaged))
         if saved is None:
             return task
         settings, fitted = saved
@@ -468,10 +490,15 @@ class Decide(SavedRunTask, InItsForm):
             self._claimed(directory)
             # A directory of its own, made before its calibration file is written into it.
             epath.Path(directory).mkdir(parents=True, exist_ok=True)
-        write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
+        written = json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
-            "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+            "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n"
+        # The weights' own file first, kept when a later step is fitted, then the run's latest.
+        kept = _fitted_file(directory, self.weights)
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(kept, written)
+        write_atomically(epath.Path(directory) / TASK_FILE, written)
         if self.weights.averaged:
             # The calibration file first: a save stopped before its checkpoint lands leaves a directory
             # that no reader takes for a run, and that a save again completes.
