@@ -303,31 +303,7 @@ def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a
     from map_judge import DRAWS, POOL, RECORDS
 
     assert (ci.DRAWS, ci.RECORDS, ci.POOL, ci.REDRAW) == (DRAWS, RECORDS, POOL, REDRAW)
-    out = site_checkout(tmp_path, f"""import sys
-from pathlib import Path
-
-sys.path.insert(0, {str(ROOT / "tests")!r})
-import jax.numpy as jnp
-import numpy as np
-import pytest
-from reference_error import assert_as_exact
-
-
-def draw(seed):
-    rng = np.random.default_rng([2641, seed])
-    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
-            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
-
-
-def test_light():
-    with Path("runs-light").open("a") as runs:
-        runs.write("x")
-
-
-@pytest.mark.check1_shards(seeds=16, per_task=40)
-def test_site():
-    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product sharded across map tasks", seeds=16)
-""")
+    out = site_checkout(tmp_path, GATED)
     entries = planned(ci)
     judge = entries[ci.site_task("3.12", "tests/test_site.py", "test_site")]
     inputs = tmp_path / ".verdict/inputs"
@@ -410,6 +386,92 @@ def test_halved():
         whole = judged(test, maps)
         assert (whole["exitCode"], whole.get("more")) == (1, None)
         assert whole["first_failure"].partition(":")[0].rpartition(".")[2] == "GateFailure"
+
+
+GATED = f"""import sys
+
+sys.path.insert(0, {str(ROOT / "tests")!r})
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import assert_as_exact
+
+
+def draw(seed):
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def halved(x, w):
+    return (x.astype(jnp.bfloat16) @ w.astype(jnp.bfloat16)).astype(jnp.float32)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_on_par():
+    assert_as_exact(jnp.matmul, jnp.matmul, draw, "a product on par", seeds=16)
+
+
+@pytest.mark.check1_shards(seeds=16, per_task=40)
+def test_halved():
+    assert_as_exact(halved, jnp.matmul, draw, "a halved product", seeds=16)
+"""
+"""Two check-1 sites of 16 seeds, each a map task of 40: a product on par, which its first stage decides,
+and a halved one, which its first stage finds something in, so its judge asks for its second stage and then
+fails it."""
+
+
+def test_a_site_whose_last_judgement_needed_its_later_draws_draws_them_in_the_first_wave(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Check 1 as armada runs a site with the test cache on, each task recording its row on its class: a
+    judge that needed its later map tasks (it asked for them, then judged them all) says so in its row, and
+    the next plan of its file, its inputs changed, draws them in the first wave beside its first stage's, the
+    judge then asking for nothing; a site its first stage decided keeps them later. The halved site's judge is
+    red, its record keyed by nothing, and the plan reads it all the same."""
+    out = site_checkout(tmp_path, GATED)
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    monkeypatch.setenv("DEW_XLA_CACHE_READ_TOKEN", "token")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": "GenuineIntel", "family": 6, "model": 143}
+    (tmp_path / ".armada.json").write_text(json.dumps(config))
+
+    def judged(test: str, drawn: list[dict], entries: dict[str, dict], run: str) -> dict:
+        inputs = tmp_path / f".verdict/inputs-{run}-{test}-{len(drawn)}"
+        for index, entry in enumerate(drawn):
+            assert entry_task(ci, monkeypatch, entry, out, artifacts=inputs / "job" / str(index)) == 0
+        judge = entries[ci.site_task("3.12", "tests/test_site.py", test)]
+        assert entry_task(ci, monkeypatch, judge, out, artifacts=tmp_path / f".verdict/judge-{run}-{test}",
+                          inputs=inputs) == 0
+        [row] = json.loads(out.read_text())["rows"]
+        return row
+
+    def maps(entries: dict[str, dict], test: str) -> list[dict]:
+        return [entries[name] for name in entries[ci.site_task("3.12", "tests/test_site.py", test)]["after"]]
+
+    def waves(entries: dict[str, dict], test: str) -> list[bool]:
+        return [entry.get("later", False) for entry in maps(entries, test)]
+
+    entries = planned(ci)
+    assert waves(entries, "test_on_par") == waves(entries, "test_halved") == [False, True, True]
+    first = judged("test_on_par", maps(entries, "test_on_par")[:1], entries, "first")
+    assert (first["exitCode"], first.get("check1_later")) == (0, False)
+    halved = maps(entries, "test_halved")
+    asked = judged("test_halved", halved[:1], entries, "first")
+    assert (asked["exitCode"], asked.get("more"), asked.get("check1_later")) == (1, True, True)
+    whole = judged("test_halved", halved, entries, "first")
+    assert (whole["exitCode"], whole.get("more"), whole.get("check1_later")) == (1, None, True)
+    # The file changed, so both sites run again: the halved site's later draws are in the first wave.
+    source = tmp_path / "tests/test_site.py"
+    source.write_text(source.read_text() + "\n# changed\n")
+    again = planned(ci)
+    assert (waves(again, "test_on_par"), waves(again, "test_halved")) == ([False, True, True],
+                                                                          [False, False, False])
+    # Its judge over them all asks for nothing, and judges as the one that asked did.
+    eager = judged("test_halved", maps(again, "test_halved"), again, "again")
+    assert (eager["exitCode"], eager.get("more"), eager.get("check1_later")) == (1, None, True)
+    assert eager["first_failure"].partition(":")[0] == whole["first_failure"].partition(":")[0]
 
 
 def run_cached(ci, tmp_path: Path, monkeypatch, cache_worker, site: str, later: bool) -> None:
