@@ -481,10 +481,12 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
 
     Each corpus trains on its rows in an order drawn from `seed` and its name (`Pipeline.shuffle`): all
     of them permuted where the run reads by index, within `STREAMED_WINDOW` rows where it streams. The
-    mix takes each corpus's next row in that order, so every window of the mix holds each corpus at its
-    share, and a corpus whose file groups its rows by task gives no window the next rows of its file.
-    `seed=None` reads each corpus in its file's order. A stage of each corpus's chain, the order
-    resumes and continues into a later phase as each corpus read it (`dew.data.compile`)."""
+    mix takes each corpus's next row in that order, choosing the corpus each position reads by a
+    permutation `seed` draws for each window of the mix (`mix(seed=)`), so every window holds each
+    corpus at its share in no fixed order, and a corpus whose file groups its rows by task gives no
+    window the next rows of its file. `seed=None` reads each corpus in its file's order, interleaved
+    in Grain's schedule. Stages of the chain, the order resumes and continues into a later phase as
+    the mix read it (`dew.data.compile`)."""
     from dew.data.sources import Source
     from dew.data.sources.concatenate import Concatenate
 
@@ -512,7 +514,7 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
             "mixture_made": dict(stated)}
     training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
                 for child in training]
-    train = training[0] if len(training) == 1 else mix(training, kept)
+    train = training[0] if len(training) == 1 else mix(training, kept, seed=seed)
     evaluated = None if not held else Pipeline(_DecisionSource(
         Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
         _slots(stated) or None, descriptor=pinned)).map(ParseExample())
