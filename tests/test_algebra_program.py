@@ -856,7 +856,7 @@ def computed():
 
 before = computed()
 variable, params = var("x", Term), var("params", i64)
-exponential = rules.Family("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
+exponential = rules.RuleFamily("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
     variable),), (jnp.exp, lambda x: x, None))
 rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
 print(json.dumps({"before": before, "after": computed()}))
@@ -921,6 +921,13 @@ def _scaled_twice(s, q_pos, k_pos, a, b):
     return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
 
+def _scaled_operands(seed: int, shape: tuple[int, ...]) -> tuple:
+    """A tile of `shape` and two scalar scales, drawn by `seed`."""
+    rng = np.random.default_rng(seed)
+    return (jnp.asarray(rng.standard_normal(shape), jnp.float32),
+            *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
+
+
 def _multiplies(closed) -> int:
     return sum(equation.primitive is jax.lax.mul_p for equation in equations(closed))
 
@@ -942,9 +949,7 @@ def test_a_score_hook_and_its_slopes_pass_the_algebra_pass_before_a_kernel_place
         return scored(_scaled_twice, s, q_pos, k_pos, (a, b), slopes=True)
 
     def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.standard_normal((16, 32)), jnp.float32),
-                *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
+        return _scaled_operands(seed, (16, 32))
 
     assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 1
     with algebra.passes(on=False):
@@ -968,11 +973,6 @@ def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_
         capped = jnp.tanh(x)
         return capped * jnp.tanh(a) + capped * jnp.tanh(b)
 
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.standard_normal((64, 128)), jnp.float32),
-                *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
-
     with report.refusals():
-        fused._split(producer, draw(0))
+        fused._split(producer, _scaled_operands(1, (64, 128)))
         assert any(made.spliced for made in report.rewrites())

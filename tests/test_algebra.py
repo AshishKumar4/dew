@@ -88,7 +88,7 @@ def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
 
 
 def test_each_rewrite_of_a_registered_set_is_declared_with_its_instance():
-    """A registered set is declared as its rewrites (`rules.Family`), each its rules (every direction and
+    """A registered set is declared as its rewrites (`rules.RuleFamily`), each its rules (every direction and
     layout of it) and its instance written as JAX, so no rule of the registry runs without a case of its own
     qualifying it: the inventory (`rules.instances`), which the accuracy test holds each right side to its
     left side over, is every family's."""

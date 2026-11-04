@@ -165,7 +165,7 @@ Instance = tuple[Callable, Callable, Callable]
 
 
 @dataclasses.dataclass(frozen=True)
-class Family:
+class RuleFamily:
     """One rewrite of a set: its rules (egglog's, each direction and layout of it) and its `instance`, the
     rewrite written as JAX, which its accuracy test holds the right side to the left side by."""
 
@@ -185,7 +185,7 @@ class Rules:
     rounding: Literal["exact", "reorders", "bounded"]
     ruleset: Ruleset
     receipt: str
-    families: tuple[Family, ...] = ()
+    families: tuple[RuleFamily, ...] = ()
     """Its rewrites, every rule of its ruleset one of theirs where it is `declared`: a registered set's
     (`register`); a derivation's own set (`derive.DECOUPLED`, `carry.CARRIED`), whose rules read its readings
     and never run among the registry's, is qualified by its derivation's tests."""
@@ -201,7 +201,7 @@ class Rules:
 
     @classmethod
     def declared(cls, name: str, rounding: Literal["exact", "reorders", "bounded"],
-                 families: tuple[Family, ...], receipt: str, *, dev: bool = False,
+                 families: tuple[RuleFamily, ...], receipt: str, *, dev: bool = False,
                  aid: bool = False) -> Rules:
         """A set whose ruleset is its `families`' rules, every one of them declared with its instance."""
         made = ruleset(*(each for family in families for each in family.rules), name=name)
@@ -209,7 +209,7 @@ class Rules:
 
     @property
     def instances(self) -> Mapping[str, Instance]:
-        """Each of its rewrites written as JAX, by its name (`Family.instance`)."""
+        """Each of its rewrites written as JAX, by its name (`RuleFamily.instance`)."""
         return {family.name: family.instance for family in self.families}
 
 
@@ -265,7 +265,7 @@ _POSITIVE = _drawn((64, 1024), (), scale=lambda rng, shape: (
 _ROW_SCALED = _drawn((64, 1024), (64,), (64, 1024))
 
 
-def _stable() -> tuple[Family, ...]:
+def _stable() -> tuple[RuleFamily, ...]:
     """Stable forms (docs/design/algebra.md §1.5): `exp(x - (m + log t))` as `exp(x - m) / t`, so the
     logarithm of a sum is never rounded into a value as large as the logits (a derived attention backward's
     mapped dK and dQ came to 1.6-1.7 times the reference's error without it); `log(1 + x)` as `log1p(x)`
@@ -276,26 +276,26 @@ def _stable() -> tuple[Family, ...]:
     # The stock primitives' indices are read in a rule's conditions, where egglog allows a lookup.
     divided, plus_one, minus_one = vars_("divided plus_one minus_one", i64)
     return (
-        Family("a sum's logarithm out of the exponent", (
+        RuleFamily("a sum's logarithm out of the exponent", (
             rewrite(x.binary("sub", m.binary("add", t.unary("log", logged), added), subbed)
                     .unary("exp", exped)).to(
                 x.binary("sub", m, subbed).unary("exp", exped).binary("div", t, divided),
                 eq(shape(m)).to(shape(x)), eq(shape(t)).to(shape(x)), plain(subbed), plain(added),
                 eq(divided).to(stock("div"))),),
             (lambda x, m, t: jnp.exp(x - (m + jnp.log(t))), lambda x, m, t: jnp.exp(x - m) / t, _FOLDED)),
-        Family("the logarithm of one more", (
+        RuleFamily("the logarithm of one more", (
             rewrite(one.binary("add", x, added).unary("log", logged)).to(
                 x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p"))),
             rewrite(x.binary("add", one, added).unary("log", logged)).to(
                 x.unary("log1p", plus_one), unit(one), plain(added), eq(plus_one).to(stock("log1p")))),
             (lambda x: jnp.log(1 + x), jnp.log1p, _SMALL)),
-        Family("one less than the exponential", (
+        RuleFamily("one less than the exponential", (
             rewrite(x.unary("exp", exped).binary("sub", one, subbed)).to(
                 x.unary("expm1", minus_one), unit(one), plain(subbed), eq(minus_one).to(stock("expm1"))),),
             (lambda x: jnp.exp(x) - 1, jnp.expm1, _SMALL)))
 
 
-def _linear() -> tuple[Family, ...]:
+def _linear() -> tuple[RuleFamily, ...]:
     """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a positive scalar's
     scale taken out of a maximum or a minimum it keeps the order of (`positive_scale`: `max(c x) = c max(x)`,
     each element's one rounding of `c x` kept as the reduced one's, so it reorders no rounding and makes no
@@ -323,7 +323,7 @@ def _linear() -> tuple[Family, ...]:
         new = scaled.binary("mul", a, multiplied)
         bounds, contracted = product_magnitude(([], power), magnitude(other, "other"),
                                                var("replaced_length", i64))
-        families.append(Family(f"a power of two's scale into a contraction's {side} operand", (rule(
+        families.append(RuleFamily(f"a power of two's scale into a contraction's {side} operand", (rule(
             eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar), exact_scale(a),
             plain(params), plain(multiplied), *facts, *dominated(power, "new"),
             eq(var("replaced_length", i64)).to(contracted_length(x.dot(y, params))), *bounds,
@@ -341,20 +341,20 @@ def _linear() -> tuple[Family, ...]:
                 *dominated(power + shared_bound + shared_length, "factored"))
 
     families += [
-        Family("distributivity", (rule(
+        RuleFamily("distributivity", (rule(
             eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
             *dominated(power, "new")).then(
             union(t).with_(a.binary("mul", new, multiplied)), *made(new, power)),),
             (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), _ROWS)),
-        Family("a shared left operand out of two products", (rule(
+        RuleFamily("a shared left operand out of two products", (rule(
             eq(t).to(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
             *dominated(power, "new"), *factored(a.dot(x, multiplied))).then(
             union(t).with_(a.dot(new, multiplied)), *made(new, power)),),
             (lambda x, y, a: jnp.dot(a, x.T) + jnp.dot(a, y.T), lambda x, y, a: jnp.dot(a, (x + y).T),
              _ROWS)),
-        Family("a shared right operand out of two products", (rule(
+        RuleFamily("a shared right operand out of two products", (rule(
             eq(t).to(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
             *dominated(power, "new"), *factored(x.dot(a, multiplied))).then(
@@ -364,7 +364,7 @@ def _linear() -> tuple[Family, ...]:
     facts, power = magnitude(x, "x")
     length = var("length", i64)
     sum_of = x.reduce("sum", axes, summed)
-    families.append(Family("a row scalar out of a sum", (rule(
+    families.append(RuleFamily("a row scalar out of a sum", (rule(
         eq(t).to(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).reduce("sum", axes, summed)),
         along(laid, axis), plain(multiplied), eq(axes).to(Vec[i64](axis)), eq(shape(x)).to(extent),
         eq(shape(a.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied))).to(extent),
@@ -374,7 +374,7 @@ def _linear() -> tuple[Family, ...]:
     return (*families, *_extrema(), *_scale_lifts())
 
 
-def _extrema() -> tuple[Family, ...]:
+def _extrema() -> tuple[RuleFamily, ...]:
     """A positive scalar's scale out of a maximum and a minimum (`_linear`'s)."""
     x, a, t = vars_("x a t", Term)
     axes = var("axes", Vec[i64])
@@ -396,13 +396,13 @@ def _extrema() -> tuple[Family, ...]:
                      eq(shape(x)).to(shape(a.shaped("broadcast_in_dim", laid)))).then(
                     union(t).with_(x.reduce(reduced, axes, summed).binary("mul", a, multiplied))),
             ]
-        families.append(Family(f"a positive scale out of a {named}", tuple(out_of), (
+        families.append(RuleFamily(f"a positive scale out of a {named}", tuple(out_of), (
             lambda x, c, extremum=extremum: extremum(x * c, -1),
             lambda x, c, extremum=extremum: extremum(x, -1) * c, _POSITIVE)))
     return tuple(families)
 
 
-def _scale_lifts() -> tuple[Family, ...]:
+def _scale_lifts() -> tuple[RuleFamily, ...]:
     """A matrix product of an operand scaled along its kept axis as the product scaled (`_linear`'s)."""
     x, y, t = vars_("x y t", Term)
     params, laid, multiplied = vars_("params laid multiplied", i64)
@@ -435,15 +435,15 @@ def _scale_lifts() -> tuple[Family, ...]:
             set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
             *made(product, power)))
     return (
-        Family("a row scale out of a product", tuple(lifted_by["row"]),
+        RuleFamily("a row scale out of a product", tuple(lifted_by["row"]),
                (lambda x, s, y: jnp.dot(x * s[:, None], y.T), lambda x, s, y: jnp.dot(x, y.T) * s[:, None],
                 _ROW_SCALED)),
-        Family("a column scale out of a product", tuple(lifted_by["column"]),
+        RuleFamily("a column scale out of a product", tuple(lifted_by["column"]),
                (lambda x, s, y: jnp.dot(x, (y * s[:, None]).T), lambda x, s, y: jnp.dot(x, y.T) * s[None, :],
                 _ROW_SCALED)))
 
 
-def _joined() -> tuple[Family, ...]:
+def _joined() -> tuple[RuleFamily, ...]:
     """Two sums along one axis of operands of one shape as one sum of their terms (linearity), in their
     operands' dtype (`plain`), where the new sum of terms and the new reduction of it, its length's power
     (`sum_length`) above them, are each under the program's reach (`dominated`): `sum(x) + sum(y)` may be
@@ -457,7 +457,7 @@ def _joined() -> tuple[Family, ...]:
     new = x.binary("add", y, added)
     reduced = new.reduce("sum", axes, params)
     summed_x = x.reduce("sum", axes, params)
-    return (Family("two sums along an axis", (rule(
+    return (RuleFamily("two sums along an axis", (rule(
         eq(t).to(summed_x.binary("add", y.reduce("sum", axes, params), added)), eq(shape(x)).to(shape(y)),
         plain(added), eq(length).to(sum_length(summed_x)), *facts, *dominated(power + length, "new")).then(
         union(t).with_(reduced), *made(new, power), *made(reduced, power + length)),),
@@ -470,7 +470,7 @@ each bound as the primitive it names (its params'), the multiply priced nothing 
 (`cost.work`)."""
 
 
-def _contracted() -> tuple[Family, ...]:
+def _contracted() -> tuple[RuleFamily, ...]:
     """A multiply an add or a subtract reads first, contracted into it as a fused multiply-add: the compiler
     fuses the two into one instruction rounding the product once (NVPTX's `fma`), so the pair costs one
     operation an element where the multiply has no other reader. A multiply another node reads too (a scaled
@@ -482,25 +482,25 @@ def _contracted() -> tuple[Family, ...]:
     multiplied, added = vars_("multiplied added", i64)
     fused = x.binary(CONTRACTED["mul"], y, multiplied)
     return (
-        Family("a multiply an add reads", (
+        RuleFamily("a multiply an add reads", (
             rewrite(x.binary("mul", y, multiplied).binary("add", z, added)).to(
                 fused.binary(CONTRACTED["add"], z, added)),
             rewrite(z.binary("add", x.binary("mul", y, multiplied), added)).to(
                 fused.binary(CONTRACTED["add"], z, added))),
             (lambda x, y, a: a * x + y, lambda x, y, a: a * x + y, _ROWS)),
-        Family("a multiply a subtract reads", (
+        RuleFamily("a multiply a subtract reads", (
             rewrite(x.binary("mul", y, multiplied).binary("sub", z, added)).to(
                 fused.binary(CONTRACTED["sub"], z, added)),),
             (lambda x, y, a: a * x - y, lambda x, y, a: a * x - y, _ROWS)))
 
 
-def _identities() -> tuple[Family, ...]:
+def _identities() -> tuple[RuleFamily, ...]:
     """Commutativity of addition and multiplication: each rounds as the form it replaces."""
     x, y = vars_("x y", Term)
     params = var("params", i64)
-    return (Family("addition's commutativity", (birewrite(x.binary("add", y, params)).to(
+    return (RuleFamily("addition's commutativity", (birewrite(x.binary("add", y, params)).to(
         y.binary("add", x, params)),), (lambda x, y, a: x + y, lambda x, y, a: y + x, _ROWS)),
-            Family("multiplication's commutativity", (birewrite(x.binary("mul", y, params)).to(
+            RuleFamily("multiplication's commutativity", (birewrite(x.binary("mul", y, params)).to(
                 y.binary("mul", x, params)),), (lambda x, y, a: x * y, lambda x, y, a: y * x, _ROWS)))
 
 
