@@ -33,7 +33,7 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, fast_rounding, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, mosaic_rule
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
@@ -183,7 +183,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
     hooks', its numbers the run's fast forms' where they are its forms (`rounded`, as its route resolves
-    it, `recurrence_chunk.fast_rounding`: a rated scan's mamba_ssm's, an fp32 call's two parts)."""
+    it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's and an fp32
+    call's two parts, `recurrence_chunk.chunk_rounding`)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
@@ -193,7 +194,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=fast_rounding())
+                                rounded=fast_rounding() if hooks.rated else chunk_rounding(
+                                    hooks.delta, jnp.result_type(query, key, given.value)))
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
