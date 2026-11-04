@@ -168,7 +168,8 @@ def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updat
     settings = {"trainer.batch_ramp": {"start": 4, "increment": 4, "samples": 4}, "trainer.accumulation": 2}
     run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 2, **settings})
     first = saved(run)[-1]
-    trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, **settings})
+    # Resumed from its record, as `dew train <run>/run.json` resumes it.
+    assert main(["train", str(run / "run.json"), "--set", "trainer.steps=4"]) == 0
     started = recorded(run, "FitStarted")[-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (first, True)
     assert saved(run)[-1] > first
