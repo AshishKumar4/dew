@@ -432,7 +432,7 @@ class Held:
 
 def _addressed(staging: tuple, landing: dict) -> list:
     """The shared tiles a launch's consumer thread reads and writes through its registers, each `(shape,
-    dtype)` a role's own (`mosaic.addresses`): its staging tiles and its stores' landings."""
+    dtype)` a role's own (`resources.addresses`): its staging tiles and its stores' landings."""
     staged = [(tile.shape, tile.dtype) for tile in jax.tree.leaves(staging, is_leaf=lambda leaf: hasattr(
         leaf, "shape"))]
     return staged + list(landing.values())
@@ -1159,7 +1159,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, system: bool)
                          held=_intra_held(call, keys), staging=staging, landing=landing,
                          name="recurrence_intra_system" if system else "recurrence_intra",
                          # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
-                         swizzles={name: mosaic.widest_swizzle(dtype, keys)
+                         swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(q, k, g, beta, taken)
 
 
@@ -1322,7 +1322,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: Call):
                          # A key block's walk a program a tile; a decay a head's one step a tile, persistent.
                          persistent=not call.per_key,
                          # A key block's streams staged at its row: a tile slices only whole swizzle rows.
-                         swizzles={f"{name}{p}": mosaic.widest_swizzle(operand.stored, keyed)
+                         swizzles={f"{name}{p}": resources.widest_swizzle(operand.stored, keyed)
                                    for name, (_, operand) in given.items()
                                    if name in ("keys", "gates", "lows") for p in range(operand.parts)})(
         k, v, k if a is None else a, hi, lo, beta, taken)
@@ -1712,9 +1712,9 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
     and the memory's (`Q Kᵀ`, `Q H`): the keys' swizzle is the memory's, which a 32-wide bf16 block's rows
     fill at 64 bytes, and at the keys' 128 Mosaic GPU found no layout for the launch."""
     family = call.family
-    swizzle = mosaic.widest_swizzle(call.given.stored, call.width)
+    swizzle = resources.widest_swizzle(call.given.stored, call.width)
     if not family.operands_in_registers:
-        swizzle = min(swizzle, mosaic.widest_swizzle(call.memories.stored, bv))
+        swizzle = min(swizzle, resources.widest_swizzle(call.memories.stored, bv))
     while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
             > family.registers(1)):

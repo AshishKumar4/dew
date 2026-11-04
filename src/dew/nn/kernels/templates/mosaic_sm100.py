@@ -175,7 +175,7 @@ TCGEN05 = Tcgen05()
 def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
-    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, contraction))
+    return mosaic.swizzle_transforms(dtype, resources.widest_swizzle(dtype, contraction))
 
 
 def operand(shape: tuple[int, int], dtype, contraction: int):

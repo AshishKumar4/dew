@@ -165,7 +165,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
         the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
         is narrower."""
-        swizzle = mosaic.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
+        swizzle = resources.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
         return max(self.fragment_depth(depth), min(depth, mosaic.swizzle_columns(self.dtype, swizzle)))
 
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
