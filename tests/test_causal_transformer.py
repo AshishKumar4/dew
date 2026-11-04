@@ -312,9 +312,10 @@ def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
         nn.unbox(tiny(**{field: rate}).init(rng, tokens(rng, length=4)))
 
 
-def decode_logits(model, params, prompt, rest):
-    """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V]."""
-    made, step = decode_steps(model)
+def decode_logits(model, params, prompt, rest, steps=None):
+    """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V], by `steps`, the
+    model's compiled cache and step where its caller holds them (`decode_steps`)."""
+    made, step = steps or decode_steps(model)
     logits, cache = step(params, made(params, prompt.shape[0]), prompt)
     steps = [logits[:, -1]]
     for position in range(rest.shape[1]):
@@ -615,27 +616,28 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     the attention's KV cache), on par with the same twelve tokens scored at
     once over drawn weights and tokens (check 1), every argmax equal. A delta
     net that stops writing its memory back (`recurrent.value = final`
-    dropped) moves the logits by 3.8e+00."""
+    dropped) moves the logits by 3.8e+00. Each call is one compiled program,
+    the decode's prefill and step the ones its check reads (`decode_steps`),
+    where run op by op they took a minute of the test (ledger 3774)."""
     model = hybrid()
     ids = tokens(rng)
     params = nn.unbox(model.init(rng, ids))
-    full = model.apply(params, ids)
-
-    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
-                        mutable=['cache'])[1]['cache']
+    full = jax.jit(model.apply)(params, ids)
+    made, step = decode_steps(model)
+    cache = made(params, ids.shape[0])
 
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
 
-    incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:])
+    incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:], (made, step))
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
     decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
-    _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
-    kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
+    _, mutated = step(params, cache, ids[:, :4])
+    kept, _ = step(params, mutated, ids[:, 4:5])
     zeroed = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jnp.zeros_like(leaf) if jax.tree_util.DictKey("conv_state") in path else leaf,
-        mutated["cache"])
-    reset, _ = model.apply({**params, "cache": zeroed}, ids[:, 4:5], decode=True, mutable=["cache"])
+        mutated)
+    reset, _ = step(params, zeroed, ids[:, 4:5])
     assert not jnp.array_equal(kept, reset)
 
 

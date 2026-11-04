@@ -460,7 +460,7 @@ def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
 
 
 NEEDS: dict[str, int | dict | None] = {}
-"""Each Mosaic GPU kernel's register need this process measured (`register_need`), by its module, as
+"""Each modelled Mosaic GPU kernel's register decisions this process measured (`_needs`), by its module, as
 `COMPILED` keeps its compile: a later compile of the same module prints no PTX."""
 
 
@@ -479,7 +479,8 @@ def _least(module: str | None, generation: str) -> int | None:
 def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
     """`kernel`'s record with its register need: from the PTX its compile printed (`needs`, by its name and
     launch, `report.launch_name`), which this process keeps by its module (`NEEDS`), or, where Mosaic compiled
-    the same module before in this process and printed none, that compile's."""
+    the same module before in this process and printed none, that compile's; None for a kernel no model
+    states (`_needs`)."""
     name = report.launch_name(kernel["kernel"], kernel["launch"])
     if name in needs:
         if kernel["module"] is not None:
@@ -638,22 +639,18 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 
 
 def _needs(directory: str, generation: str,
-           models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
-    """Each kernel's register need (`register_need`) from the PTX Mosaic printed into `directory`
-    (`write_modules`), by its name and launch (`report.launch_name`), at its model where `models` holds one
-    so."""
-    found = {}
-    for path in Path(directory).glob("*.ptx"):
-        name = path.stem
-        model = (models or {}).get(name)
-        found[name] = (register_decisions(path.read_text(), generation, model) if model is not None
-                       else register_need(path.read_text(), generation))
-    return found
+           models: dict[str, resources.RegisterModel]) -> dict[str, int | dict | None]:
+    """Each modelled kernel's register decisions at its model (`register_decisions`) from the PTX Mosaic
+    printed into `directory` (`write_modules`), by its name and launch (`report.launch_name`). A need's one
+    reader is its model's evidence (`_register_evidence`), so a kernel no model states takes no scan of
+    ptxas at every cap (25 a kernel: 55 s of a B200 forward's compile test on armada, ledger 3786)."""
+    return {path.stem: register_decisions(path.read_text(), generation, models[path.stem])
+            for path in Path(directory).glob("*.ptx") if path.stem in models}
 
 
 def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]:
-    """`compile_mosaic_kernels`' records, compiled in this process, each kernel's register need beside its
-    reports (`register_need`, from the PTX Mosaic prints)."""
+    """`compile_mosaic_kernels`' records, compiled in this process, each modelled kernel's register
+    decisions beside its reports (`_needs`, from the PTX Mosaic prints)."""
     found: list[dict] = []
     for case in cases:
         # The program's own record (its error, or XLA's refusal of its block), its Mosaic kernels' reports the
