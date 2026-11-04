@@ -321,10 +321,11 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
 def smoothed(targets: jax.Array, where: jax.Array | None = None, share: float = 0.0) -> jax.Array:
     """`targets` over the last axis with `share` of their mass spread evenly over the classes `where`
     holds, `(1 - share) t_k + share / K` for a row of K classes (`optax.smooth_labels`), and nothing on
-    the others; integer targets smoothed in float32."""
+    the others; integer targets in the floating type a Python number promotes them to (float64 under
+    x64)."""
     targets = jnp.asarray(targets)
     if not jnp.issubdtype(targets.dtype, jnp.floating):
-        targets = targets.astype(jnp.float32)
+        targets = targets.astype(jnp.result_type(targets, 1.0))
     held = jnp.ones(targets.shape, bool) if where is None else where
     return jnp.where(held, optax.smooth_labels(targets, share, where=held), 0.0)
 
