@@ -1626,12 +1626,10 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     """
     if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
-        # (the FP8 contract's reference arm, testing.md, FP8 products). The widened codes are held apart
-        # from the product (an optimization barrier), so XLA's GPU compiler does not rewrite it into its
-        # FP8 GEMM, whose running sum is narrower: on an H100 291 to 3011 times the dequantized product's
-        # distance from float64 (rows 1625, 3620).
-        widened = (tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16))
-        tokens, kernel = jax.lax.optimization_barrier(widened)
+        # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
+        # ragged dot of widened FP8 codes into its narrower-summing FP8 GEMM (sm90's lowering of this
+        # product holds no F8 GEMM, FS-1625-HLO, row 1625).
+        tokens, kernel = tokens.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16)
         precision = jax.lax.Precision.DEFAULT
     elif all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
         precision = jax.lax.Precision.DEFAULT
