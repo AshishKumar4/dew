@@ -35,9 +35,10 @@ scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat", "remat2", "checkpoint",
-                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
+                   "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr", "marked_call"})
 """The calls whose bodies are evaluated op by op, as the computation's own:
-a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal. A
+a jit, a remat (`jax.checkpoint` binds 'remat2'), a custom rule's primal, a
+marked span (`dew.nn.derivatives.marked`, lowered as its body). A
 shard_map's per-device program is too, on each device's blocks (`_mapped`).
 A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
 their own size."""

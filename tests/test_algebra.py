@@ -75,15 +75,18 @@ def test_each_rule_holds_its_right_side_to_its_left_side():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
 
 
-def test_a_compensated_sum_keeps_its_residual():
-    """An error-free transform's residual survives the rewrite (`dew.nn.precision.compensated_add`): the
-    rewritten program still computes the low word reassociation would cancel."""
+def test_a_compensated_sums_residual_survives_a_rewritten_program():
+    """What a user of an error-free transform relies on (`dew.nn.precision.compensated_add`): its low word,
+    which reassociation would cancel, is what the program computes once rewritten and rewritten again. The
+    protection itself is proven against a control the pass does rewrite
+    (test_algebra_program.py's protected span)."""
     def compensated(a, b):
         return precision.compensated_add((a, jnp.zeros_like(a)), (b, jnp.zeros_like(b)))[1]
 
     a, b = jnp.asarray([1e8], jnp.float32), jnp.asarray([1.0], jnp.float32)
     low = float(jax.jit(compensated)(a, b)[0])
-    assert float(jax.jit(algebra.rewritten(compensated))(a, b)[0]) == low != 0.0
+    for rewrite in (algebra.rewritten(compensated), algebra.rewritten(algebra.rewritten(compensated))):
+        assert float(jax.jit(rewrite)(a, b)[0]) == low != 0.0
 
 
 def test_a_complex_programs_literals_are_read_by_the_rules():
@@ -286,17 +289,6 @@ def test_custom_derivatives_survive_the_rewrite():
         np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(fn))(x)), np.asarray(fn(x)))
     np.testing.assert_array_equal(np.asarray(jax.grad(lambda v: jnp.sum(algebra.rewritten(clipped)(v)))(x)),
                                   np.ones(16, np.float32))
-
-
-def test_a_protected_region_stays_protected_once_rewritten():
-    """An error-free transform's residual survives a rewrite of a program already rewritten, as the rewrite
-    emits its protected equations under their marker again."""
-    def compensated(a, b):
-        return precision.compensated_add((a, jnp.zeros_like(a)), (b, jnp.zeros_like(b)))[1]
-
-    a, b = jnp.asarray([1e8], jnp.float32), jnp.asarray([1.0], jnp.float32)
-    twice = algebra.rewritten(algebra.rewritten(compensated))
-    assert float(jax.jit(twice)(a, b)[0]) == float(jax.jit(compensated)(a, b)[0]) != 0.0
 
 
 def test_outputs_sharing_a_value_keep_it_shared():

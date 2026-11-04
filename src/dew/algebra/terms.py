@@ -10,8 +10,11 @@ from an equation states its shape (`rules.shape`), which rules read before they 
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
+import hashlib
 import math
+import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import overload
 
@@ -38,8 +41,6 @@ from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
-
-from dew.nn.precision import PROTECTED
 
 BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter", "and",
                     "or", "xor"})
@@ -252,10 +253,90 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[str, str]:
-    """An equation's primitive and parameters as a region holds them: two whose parameters print alike share
-    one entry of its table (`Region.params`), the first's."""
-    return primitive.name, repr(sorted(values.items(), key=lambda named: named[0]))
+def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
+    """An equation's primitive and parameters as a region holds them: two equations of one primitive whose
+    parameters are one (`parameter_key`) share one entry of its table (`Region.params`), the first's."""
+    return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
+
+
+def parameter_key(value) -> Hashable:
+    """An equation's parameter as what it is, the one structural key the algebra pass (`parameters_key`,
+    `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
+    every process, tagged with its kind. A number by its value whatever its Python or NumPy type (a float by
+    its bits, so a NaN is one key and -0.0 another than 0.0); a sequence's parts, a named tuple's with its
+    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity);
+    a dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
+    its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
+    its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
+    function by its module and name, a partial one with its bound arguments. Any other object is its type's
+    name and the object itself, compared by its own equality, never by its printed form, which a key kept in
+    another process cannot read (`opaque`). `value` is any parameter JAX's primitives take, which share no
+    type."""
+    if value is None or isinstance(value, (bool, str)):
+        return type(value).__name__, value
+    if isinstance(value, (int, np.integer)):
+        return "int", int(value)
+    if isinstance(value, (float, np.floating)):
+        return "float", float(value).hex()
+    if isinstance(value, complex):
+        return "complex", value.real.hex(), value.imag.hex()
+    if isinstance(value, np.dtype):
+        return "dtype", value.name
+    if isinstance(value, enum.Enum):
+        return "enum", _named(type(value)), value.name
+    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
+        array = np.asarray(jax.random.key_data(value) if jnp.issubdtype(value.dtype, jax.dtypes.prng_key)
+                           else value)
+        return ("array", str(value.dtype), array.shape, str(array.dtype),
+                hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+    if isinstance(value, jax.sharding.Mesh):
+        # An empty mesh (a jit's context outside any) holds no devices.
+        devices = () if value.empty else value.device_ids
+        return ("mesh", parameter_key(devices), parameter_key(value.axis_names),
+                parameter_key(value.axis_types))
+    if isinstance(value, jax.sharding.AbstractMesh):
+        return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
+                parameter_key(value.axis_types), parameter_key(value.abstract_device))
+    if isinstance(value, jax.sharding.NamedSharding):
+        # Its mesh, partitions, memory and logical device order, as JAX pickles it, which its equality reads.
+        _, arguments = value.__reduce__()
+        return "named sharding", parameter_key(arguments)
+    if isinstance(value, functools.partial):
+        return "partial", parameter_key(value.func), parameter_key(value.args), parameter_key(value.keywords)
+    if isinstance(value, jax.sharding.PartitionSpec):
+        return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
+                parameter_key(value.reduced), parameter_key(value.unreduced_kind))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = dataclasses.fields(value)
+        return "record", _named(type(value)), tuple((field.name, parameter_key(getattr(value, field.name)))
+                                                    for field in fields)
+    if isinstance(value, (tuple, list)):
+        # A named tuple's type names its fields, which its parts take in order.
+        return "sequence", _named(type(value)), tuple(parameter_key(part) for part in value)
+    if isinstance(value, (set, frozenset)):
+        return "set", tuple(sorted((parameter_key(part) for part in value), key=repr))
+    if isinstance(value, Mapping):
+        return "mapping", tuple(sorted(((parameter_key(name), parameter_key(part))
+                                        for name, part in value.items()), key=repr))
+    if isinstance(value, types.FunctionType):
+        return "function", value.__module__, value.__qualname__
+    return "object", _named(type(value)), value
+
+
+def opaque(key) -> Hashable:
+    """`key` (`parameter_key`'s) with each object no structural key reads as its type's name alone: what a
+    key kept beyond this process reads (`dew.nn.kernels.tuning.program`'s digest), the same in every
+    process, where the object itself would print its process's address."""
+    if isinstance(key, tuple) and len(key) == 3 and key[0] == "object":
+        return key[:2]
+    if isinstance(key, tuple):
+        return tuple(opaque(part) for part in key)
+    return key
+
+
+def _named(kind: type) -> str:
+    """A type's import path, which names it in every process."""
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 def declarations(language: object) -> Declarations:
@@ -264,12 +345,6 @@ def declarations(language: object) -> Declarations:
     if not isinstance(language, HasDeclarations):
         raise TypeError(f"{language!r} declares no egglog language")
     return language.__egg_decls__
-
-
-def protected(equation: jcore.JaxprEqn) -> bool:
-    """Whether an equation lies in a region a precision module marks protected (`PROTECTED`, an error-free
-    transform's), which survives autodiff in the name stack its traced equations carry."""
-    return PROTECTED in str(equation.source_info.name_stack)
 
 
 Magnitude = int
@@ -303,8 +378,8 @@ def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
 def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
            forms: type[Term] | type[Skeleton] = Term) -> Region:
     """`closed`'s equations as terms: each of the language a constructor over its inputs' terms, each other
-    one (and each protected one, `protected`) a leaf for each output, after its inputs' terms, each of `forms`
-    (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
+    one (a protected span's marked call among them) a leaf for each output, after its inputs' terms, each of
+    `forms` (egglog's `Term`, or a window's structure alone, `Skeleton`). Each term's
     magnitude (`Magnitude`) from its constants', its operands' declared `ranges` (by input index, the
     constants apart: a bound on its magnitude, or an interval `(low, high)`, whose `high` at most 0 bounds its
     exponential by 2, one power past the reals' 1 for a native exponential; an input with none is
@@ -319,7 +394,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     """`region`'s terms, each of `forms`."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
-    indexed: dict[tuple[str, str, tuple | None], int] = {}
+    indexed: dict[tuple[jcore.Primitive, Hashable, tuple | None], int] = {}
     literals: list = []
     shapes: list[tuple[Node, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
@@ -370,7 +445,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
     opaque: list[Opaque] = []
     for equation in jaxpr.eqns:
-        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+        if (equation.primitive is jax.lax.broadcast_in_dim_p
                 and not isinstance(equation.invars[0], jcore.Literal) and equation.invars[0] in laid):
             source, inner = laid[equation.invars[0]]
             outer = tuple(equation.params["broadcast_dimensions"])
@@ -384,10 +459,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             laid[out] = (source, composed["broadcast_dimensions"])
             depths[out] = depths.get(source, 0) + 1
             continue
-        if (equation.primitive is jax.lax.broadcast_in_dim_p and not protected(equation)
+        if (equation.primitive is jax.lax.broadcast_in_dim_p
                 and not isinstance(equation.invars[0], jcore.Literal)):
             laid[equation.outvars[0]] = (equation.invars[0], tuple(equation.params["broadcast_dimensions"]))
-        term = None if protected(equation) else _term(equation, read, param)
+        term = _term(equation, read, param)
         if term is not None:
             out = equation.outvars[0]
             env[out] = term
@@ -639,9 +714,10 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
 
 
 def spoken(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is of the language (`_term` makes a term of it), outside every protected region."""
+    """Whether `equation` is of the language (`_term` makes a term of it): a protected span is one marked
+    call (`dew.nn.derivatives.Protected`), no equation of it."""
     name, arity = equation.primitive.name, len(equation.invars)
-    if len(equation.outvars) != 1 or protected(equation):
+    if len(equation.outvars) != 1:
         return False
     binary = name in BINARY or name in COMPARISONS or name == "dot_general"
     unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"
