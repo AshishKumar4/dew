@@ -44,6 +44,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
+from dew.nn import programs
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 from dew.nn.kernels.templates.gemm import template
 
@@ -156,8 +157,7 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
                   'prologue_jvp': jvp}
 
 
-CALLS = frozenset({'pjit', 'jit', 'closed_call', 'core_call', 'remat', 'remat2', 'checkpoint',
-                   'custom_jvp_call', 'custom_vjp_call', 'custom_vjp_call_jaxpr'})
+CALLS = programs.CALLS | {'remat', 'custom_vjp_call_jaxpr'}
 """The equations whose bodies the split reads through (a jitted, checkpointed or custom-derivative call, as
 Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_jvp`)."""
 

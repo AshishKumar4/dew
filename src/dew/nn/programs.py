@@ -10,13 +10,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call"})
+                   "custom_vjp_call", "marked_call"})
 """The primitives that run a program on their operands, one for one, and return its results. A `jit`
 lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
 `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a checkpoint
-(`_remat_lowering`, jax/_src/ad_checkpoint.py) and a custom derivative's primal
-(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py) lower to their program in the caller, so
-XLA sees no call. A result that is the program's own parameter is its operand's buffer, and one that is a
+(`_remat_lowering`, jax/_src/ad_checkpoint.py), a custom derivative's primal
+(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py) and a marked span
+(`dew.nn.derivatives.marked_call_p`, its body inlined) lower to their program in the caller, so XLA sees no
+call. A result that is the program's own parameter is its operand's buffer, and one that is a
 cheap value of another is recomputed where it is read, as it would be without the call."""
 
 

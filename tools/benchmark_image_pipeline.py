@@ -12,6 +12,7 @@ The separate training timing runs a small pixel-EDM objective through the
 Trainer's compiled, prefetched update, with compilation and warmup excluded.
 """
 
+import functools
 import hashlib
 import importlib.metadata
 import io
@@ -216,6 +217,7 @@ def training_timing(config, backend):
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
+    from dew.training.ahead import step_batch
 
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
                       dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST, attention_impl="reference")
@@ -230,7 +232,9 @@ def training_timing(config, backend):
     # before each update; `Trainer.fit` runs them inside it.
     augmented = device_steps(data.device)
     durations = []
-    with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
+    # Each batch as `fit` hands it to its step (`step_batch`), so the step timed is a run's.
+    with DevicePrefetchIterator(source, trainer.device_mesh,
+                                prepare=functools.partial(step_batch, trainer)) as batches:
         step = trainer.compile(state, augmented(next(batches)))
         for _ in range(config.warmup):
             state, loss, _, _, _, _ = step(state, augmented(next(batches)))

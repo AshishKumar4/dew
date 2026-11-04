@@ -533,9 +533,14 @@ def _gradient(trainer, state) -> dict[str, NDArray]:
 def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = False,
                   devices: int | None = None):
     """The trainer's step and its inputs, reusable across exact parameter orders."""
+    from dew.data.dataset import DataPartition
+    from dew.training.ahead import step_batch
+
     trainer = _trainer(case, fields, one_device=one_device, devices=devices)
     state, _, _ = trainer.place()
-    data = placed(batch, trainer.device_mesh)
+    # The batch as `fit` hands it to its step (`step_batch`), so the step compared is a run's: every row,
+    # read whole on each process (`placed`), its rows marked as one reader's.
+    data = placed(step_batch(trainer, batch, DataPartition()), trainer.device_mesh)
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
@@ -713,15 +718,25 @@ class Arm:
         # One program copies the placed state on its devices, where placing it again from the host
         # each draw recomputed its shardings and moved every leaf (most of a small model's draw).
         self.fresh = jax.jit(lambda state: jax.tree.map(jnp.copy, state))
-        self.step = self.trainer.compile(self.initial, placed(drawn_batch(case, 0), self.trainer.device_mesh))
+        self.step = self.trainer.compile(self.initial, self.placed(0))
         self.compiled = {"flops_per_device": self.trainer.step_flops and self.trainer.step_flops.hardware,
                          "mesh": {axis: int(size) for axis, size in self.trainer.device_mesh.shape.items()},
                          "replicated": replicated_share(case, self.trainer.objective, fields.get("stage", 1))}
 
+    def placed(self, seed: int):
+        """Draw `seed`'s batch placed on the arm's mesh as `fit` hands it to its step (`step_batch`), so the
+        step compared is a run's: every row, read whole on each process (`placed`), its rows marked as
+        one reader's, as the one-device reference's are."""
+        from dew.data.dataset import DataPartition
+        from dew.training.ahead import step_batch
+
+        batch = step_batch(self.trainer, drawn_batch(self.case, seed), DataPartition())
+        return placed(batch, self.trainer.device_mesh)
+
     def __call__(self, seed: int) -> Drawn:
         from dew.objectives.base import taken_record
 
-        data = placed(drawn_batch(self.case, seed), self.trainer.device_mesh)
+        data = self.placed(seed)
         state, loss, metrics, *_ = self.step(self.fresh(self.initial), data)
         record, _ = taken_record(metrics)
         assert record is not None, "a recording trainer's step returns its record"
