@@ -119,7 +119,7 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     pinned to the first step, a run started from it among them, loads it after the second was fitted,
     where only the latest was kept and refused it (row 3865)."""
     from dew.decision.calibration import Calibration
-    from dew.decision.task import Decide, _fitted_file
+    from dew.decision.task import Decide
     from dew.registry import from_record
 
     first = decision(tmp_path, drawn=False)
@@ -129,17 +129,17 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read
-    for step in (read, later):
-        task = Decide.from_saved(SavedRun.pinned(str(source), step))
+    tasks = {step: Decide.from_saved(SavedRun.pinned(str(source), step)) for step in (read, later)}
+    from dew.decision.task import step_calibrations
+
+    for step, task in tasks.items():
         assert task.weights is not None and task.weights.step == step
-        fitted = json.loads(_fitted_file(str(source), task.weights).read_text())
-        assert task.calibration == from_record(Calibration, fitted["calibration"])
+        (kept,) = step_calibrations(str(source), step)
+        assert task.calibration == from_record(Calibration, json.loads(kept.read_text())["calibration"])
     # The release of the first step is written again where its own calibration changes, the run's latest
     # as it was (`released_run`'s fingerprint holds the step's calibrations).
     release = released_run(source, step=read)
-    task = Decide.from_saved(SavedRun.pinned(str(source), read))
-    assert task.weights is not None
-    kept = _fitted_file(str(source), task.weights)
+    (kept,) = step_calibrations(str(source), read)
     changed = json.loads(kept.read_text())
     changed["name"] = "recalibrated"
     kept.write_text(json.dumps(changed))
