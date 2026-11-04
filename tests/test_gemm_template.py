@@ -1675,26 +1675,24 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
 
 
 @pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])
-def test_the_forward_pairs_a_groups_row_tiles_where_its_rows_span_two(trans_rhs):
-    """On an H100 the forward and the input gradient derive a pair of multiprocessors a cluster
-    (`mosaic.Family.cluster`) where a group averages a row tile's rows, each multiprocessor's tile and
-    stages as alone, and one multiprocessor where it averages fewer; an A100's mma.sync bundle takes no
-    cluster at any rows. Each derived tile is legal, a decode step's few rows a group too."""
+def test_the_forward_derives_a_legal_tile_at_every_rows_a_group_and_takes_a_pinned_cluster(trans_rhs):
+    """The forward and the input gradient derive a legal tile on an H100 and an A100 where a group averages
+    a row tile's rows, fewer, and a decode step's few, which tile the derivation picks being its own choice
+    (rows 3767, 3796); and a pair of multiprocessors a cluster (`mosaic.Family.cluster`), pinned on the
+    H100's tile, is legal there."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     groups, depth, width = 8, 2048, 1536
     launch = grouped_matmul.MosaicGmm()
-    derived = {}
     for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm90", 8 * 32), ("sm80", 8 * 512)):
         with generation.assumed(name):
             target = generation.gpu_target()
             ba = launch.bind(bf16((rows, width if trans_rhs else depth)), bf16((groups, depth, width)),
                              jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16",
                              trans_rhs=trans_rhs, interpret=False)
-            derived[name, rows] = launch.derived(ba, target)
-            assert launch.legal(ba, derived[name, rows], target)
-    paired, alone = derived["sm90", 8 * 512], derived["sm90", 8 * 100]
-    assert (paired.cluster, alone.cluster, derived["sm80", 8 * 512].cluster) == (2, 1, 1)
-    assert (paired.block_m, paired.block_n, paired.stages) == (alone.block_m, alone.block_n, alone.stages)
+            derived = launch.derived(ba, target)
+            assert launch.legal(ba, derived, target)
+            if (name, rows) == ("sm90", 8 * 512):
+                assert launch.legal(ba, dataclasses.replace(derived, cluster=2), target)
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
