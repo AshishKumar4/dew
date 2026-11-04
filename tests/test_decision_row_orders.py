@@ -355,5 +355,7 @@ def test_a_fresh_heads_row_writes_a_choices_option_as_its_text():
 
     assert lines(("Paris", "London", "Rome")) in written(fresh) and "option_0" not in written(fresh)
     assert lines(("option_0: Paris", "option_1: London", "Rome")) in written(released)
-    assert from_record(to_record(fresh)) == fresh and "option_text" not in json.dumps(to_record(released))
+    recorded = json.loads(json.dumps(to_record(fresh, StateFirstLayout)))
+    assert from_record(StateFirstLayout, recorded, dtypes=False) == fresh
+    assert "option_text" not in to_record(released, StateFirstLayout)
 

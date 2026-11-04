@@ -468,22 +468,11 @@ def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "tex
     return dataclasses.replace(chain, source=wrapped).map(Configured(_ParseConfigured(table), needs=()))
 
 
-STREAMED_WINDOW = 2**14
-"""The records a mixture read as a stream draws its order from (`mixture`): decision examples are rows of
-text, so this many hold tens of megabytes."""
-
-
-def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descriptor: str | None = None,
-            seed: int | None = 0) -> tuple[Pipeline, Pipeline | None]:
+def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
+            descriptor: str | None = None) -> tuple[Pipeline, Pipeline | None]:
     """The decision corpora of the mixture directory `root_url` (its `mixture.json`): every corpus of a
     positive weight, the manifest's weights over `weights`, mixed by them for training, and their held
-    rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL.
-
-    The training rows come in an order drawn from `seed` (`Pipeline.shuffle`): a mix reads its corpora
-    each in its own file's order, interleaved by their weights in a cycle that repeats, so a corpus
-    whose file groups its rows by task gave every batch the same sources at the same places, each
-    from the same task. Every row of the mix is permuted where every corpus reads by index, and drawn
-    from `STREAMED_WINDOW` rows where one streams. `seed=None` keeps the mix's own order."""
+    rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL."""
     from dew.data.sources import Source
     from dew.data.sources.concatenate import Concatenate
 
@@ -510,9 +499,6 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descri
     training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
                 for child in training]
     train = training[0] if len(training) == 1 else mix(training, kept)
-    if seed is not None:
-        indexed = all(child.source.supports("indexed") for child in training)
-        train = train.shuffle(seed, window=None if indexed else STREAMED_WINDOW)
     evaluated = None if not held else Pipeline(_DecisionSource(
         Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
         _slots(stated) or None, descriptor=pinned)).map(ParseExample())

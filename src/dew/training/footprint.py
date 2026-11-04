@@ -35,7 +35,6 @@ from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
-from dew.nn.kernels.templates import report
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -169,14 +168,13 @@ def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.
     runs on a cotangent of ones, returning the gradient's leaves and then the pullback's own, its
     residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes. Its math is
     the algebra pass's, as the step that compiles it rewrites its trace (`algebra.program_of`,
-    `OuterProgram`, docs/design/algebra.md §6.7), its rewrites recorded as no compile's
-    (`report.uncompiled`)."""
+    `OuterProgram`, docs/design/algebra.md §6.7): each region it rewrites is recorded as any trace's,
+    the derivation the compile then reuses (`program._derived`)."""
     def both(params, *arguments):
         outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs)), pullback
-    with report.uncompiled():
-        closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
-        closed = algebra.program_of(closed)
+    closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
+    closed = algebra.program_of(closed)
     count = len(jax.tree.leaves(gradients))
     return closed.jaxpr, count, jax.tree.leaves(pullback)
 

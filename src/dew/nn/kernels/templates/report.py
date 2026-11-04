@@ -295,16 +295,6 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def uncompiled() -> Iterator[None]:
-    """Within the block, programs traced to be read, not compiled (a planner's derivation of a step's
-    memory, `dew.training.footprint`), see this context's refusals as its compiles do and record nothing:
-    a compile's report holds what the programs that compile traced, as a relowering's rewrites join it only
-    where its replacement compiles (`_proposing`)."""
-    with _proposing([]):
-        yield
-
-
-@contextlib.contextmanager
 def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
     registry or its file; the scope's registry, whose rewrites the replacement's trace recorded. A successful

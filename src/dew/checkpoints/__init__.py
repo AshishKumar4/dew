@@ -1114,13 +1114,13 @@ class Checkpoints:
         """Return whether an evaluation would enter the best-K set of any of its trackers."""
         return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
-    def _cache_step(self, step: int, manager: ocp.CheckpointManager) -> None:
+    def _cache_step(self, step: int, store: ocp.CheckpointManager) -> None:
         """Record `step`'s committed metrics and custom metadata, which its staged save, if any, became: its
-        metrics item as `manager` reads it (`metrics`) and its own metadata file
+        metrics item as `store` reads it (`metrics`) and its own metadata file
         (`ocp.metadata.get_step_metadata`), as `_custom` reads it, not the manager's metadata, which opens
         every array's TensorStore besides (row 3763)."""
         custom = ocp.metadata.get_step_metadata(self.path(step)).custom_metadata
-        self._committed[step] = (dict(manager.metrics(step) or {}), copy.deepcopy(custom or {}))
+        self._committed[step] = (dict(store.metrics(step) or {}), copy.deepcopy(custom or {}))
         self._staged.pop(step, None)
 
     def _custom(self, step: int) -> dict:
