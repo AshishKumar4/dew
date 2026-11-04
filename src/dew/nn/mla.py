@@ -108,9 +108,24 @@ INDEXER_COLLECTION = 'indexer'
 when a caller opens it, as the LM objective does to train the indexer."""
 
 SELECTIONS = 'selections'
-"""The collection V3.2's lightning indexer sows its scores and its heads' agreements before their relu
-under when a caller opens it (`SparseIndexer.scores`), as a selection's margin does to read how near a
-tie each key sits; never at initialization, so no variable tree holds it."""
+"""The collection a lightning indexer sows what it selects by under when a caller opens it, as a
+selection's margin does to read how near a tie each key sits: V3.2's its scores and its heads'
+agreements before their relu (`SparseIndexer.scores`), DeepSeek V4's each selection whole
+(`sow_selection`); never at initialization, so no variable tree holds it."""
+
+
+def sow_selection(module: nn.Module, scores, agreements, visible, budget: int, **pooled: int) -> None:
+    """Sow a top-`budget` selection under SELECTIONS as `selection`, for a caller that opens the
+    collection: the `scores` `[B, S, T]` it ranks, its heads' `agreements` `[B, S, H, T]` before their
+    relu (`index_agreements`), the keys each query may take, `visible` (broadcast to the scores), and
+    the budget; with `pooled`, the candidate pool's `blocks` and `block_size` the scores rank their
+    blocks by too (`candidate_pool`). Never at initialization."""
+    if module.is_initializing():
+        return
+    record = {"scores": scores, "agreements": agreements,
+              "visible": jnp.broadcast_to(visible, scores.shape), "budget": jnp.asarray(budget)}
+    module.sow(SELECTIONS, "selection",
+               {**record, **{name: jnp.asarray(value) for name, value in pooled.items()}})
 
 INDEXER_EPS = 1e-8
 """MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its

@@ -187,25 +187,35 @@ def smooth_image() -> np.ndarray:
     return (0.8 * image + 0.05 * np.random.default_rng(0).standard_normal(image.shape)).astype(np.float32)
 
 
+def published_vae():
+    """The published VAE (`PUBLISHED_VAE`), downloaded, on the CPU."""
+    from diffusers import AutoencoderKLFlux2
+
+    return AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
+
+
+def published_walk(model, dtype) -> dict[str, np.ndarray]:
+    """`model`'s (the published VAE's) pipeline latent of `smooth_image()` and its decode's top-left `CROP`
+    pixels at `dtype`, on the device `model` is on."""
+    from diffusers import Flux2Pipeline
+
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        mean = model.bn.running_mean.view(1, -1, 1, 1)
+        std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps)
+        folded = Flux2Pipeline._patchify_latents(
+            model.encode(torch.from_numpy(smooth_image()).to(device, dtype)).latent_dist.mode())
+        pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
+        return {"vae.latent": ((folded - mean) / std).cpu().numpy(),
+                "vae.pixels": pixels.cpu().numpy()[:, :, :CROP, :CROP]}
+
+
 def published(destination: str) -> None:
     """The published VAE's pipeline latent of `smooth_image()` and its
-    decode's top-left `CROP` pixels, in float32 and in float64 (`.fp64`),
-    for `tests/fixtures/flux2_published.npz`."""
-    from diffusers import AutoencoderKLFlux2, Flux2Pipeline
-
-    model = AutoencoderKLFlux2.from_pretrained(PUBLISHED_VAE[0], subfolder="vae", revision=PUBLISHED_VAE[1]).eval()
-
-    def walk(model, dtype) -> dict[str, np.ndarray]:
-        with torch.no_grad():
-            mean = model.bn.running_mean.view(1, -1, 1, 1)
-            std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps)
-            folded = Flux2Pipeline._patchify_latents(
-                model.encode(torch.from_numpy(smooth_image()).to(dtype)).latent_dist.mode())
-            pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
-            return {"vae.latent": ((folded - mean) / std).numpy(), "vae.pixels": pixels.numpy()[:, :, :CROP, :CROP]}
-
+    decode's top-left `CROP` pixels (`published_walk`), on the CPU in float32
+    and in float64 (`.fp64`), for `tests/fixtures/flux2_published.npz`."""
     arrays = {key.replace("fp64.vae.", "vae.") + (".fp64" if key.startswith("fp64.") else ""): value
-              for key, value in twice(walk, model).items()}
+              for key, value in twice(published_walk, published_vae()).items()}
     np.savez_compressed(destination, **arrays)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
