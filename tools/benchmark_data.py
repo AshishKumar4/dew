@@ -547,6 +547,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
     from dew.telemetry.instrumentation import NO_FLOPS
     from dew.telemetry.profile import Profiler
     from dew.training import Trainer
+    from dew.training.ahead import step_batch
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
@@ -555,7 +556,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
     counted = Counted(factory(), objective)
     index = 0
     signals, completed_seconds, segment_started = [], 0.0, None
-    with DevicePrefetchIterator(counted, trainer.device_mesh) as reader:
+    # Each batch as `fit` hands it to its step (`step_batch`), so the step timed is a run's.
+    with DevicePrefetchIterator(counted, trainer.device_mesh,
+                                prepare=functools.partial(step_batch, trainer)) as reader:
         while len(measured) < timed.train_steps:
             start = time.perf_counter()
             batch = next(reader)

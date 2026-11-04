@@ -228,6 +228,7 @@ def main() -> None:
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.ahead import step_batch
 
     shape = SHAPES[args.shape]
     platform = jax.devices()[0].platform
@@ -255,7 +256,8 @@ def main() -> None:
     compiled, losses, seconds, reached, compile_seconds = None, [], [], None, 0.0
     outer = Outer(state.variables["params"]) if args.diloco else None
     for step in range(1, args.steps + 1):
-        batch = shard_batch(trainer.device_mesh, next(batches))
+        # The batch as `fit` hands it to its step (`step_batch`), so the step timed is a run's.
+        batch = shard_batch(trainer.device_mesh, step_batch(trainer, next(batches)))
         start = time.monotonic()
         if compiled is None:
             compiled = trainer.compile(state, batch)
