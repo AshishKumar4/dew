@@ -146,7 +146,9 @@ def callable_name(step: Callable[..., Batch]) -> str:
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
     module its code comes from (`modules`): its own, then those of the
-    factory that configured it."""
+    factory that configured it. `code` places among `modules` those of a
+    function outside Dew that declares no identity, which state nothing of
+    what it computes but its code (`Plan.check`); no record holds it."""
 
     name: str
     config: str
@@ -154,6 +156,7 @@ class StepIdentity:
     modules: tuple[str, ...] = ()
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    code: tuple[int, ...] = ()
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
@@ -187,17 +190,23 @@ class StepIdentity:
         if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
                 dependencies or _holds_arrays(step) or set_added(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
-        named = cls(name, config, exact, modules, declared, dependencies)
+        code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
+        named = cls(name, config, exact, modules, declared, dependencies, code)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
 
-    @property
-    def stated(self) -> bool:
-        """Whether the identity states what the step computes: declared, or configured (a frozen step's
-        fields, a configured step's factory and values). A function's is its name alone, and what it
-        computes is its code, which only its modules' bytes name (`Plan.check`)."""
-        return self.declared is not None or self.config != self.name
+    def record(self) -> dict[str, JSON]:
+        """The identity as a manifest records it: every field but `code`, which its modules' places say."""
+        return {field.name: json_value(getattr(self, field.name), field.name)
+                for field in dataclasses.fields(self) if field.name != "code"}
+
+    def composed(self, factory: StepIdentity, config: str) -> StepIdentity:
+        """This step's identity as the `Configured` stage `factory` resolved it, under `config`: the
+        factory's modules after its own, and their places of code (`code`) with them."""
+        return dataclasses.replace(
+            self, config=config, modules=(*self.modules, *factory.modules),
+            code=(*self.code, *(len(self.modules) + place for place in factory.code)))
 
     def keyable(self, *, function: bool, external: bool) -> bool:
         """Whether a cache can key what the step computes: a stable identity,
@@ -208,8 +217,7 @@ class StepIdentity:
     def semantic(self) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
         modules' bytes, which only a manifest's environment records."""
-        recorded = dataclasses.asdict(self)
-        return {name: json_value(value, name) for name, value in recorded.items() if name != "modules"}
+        return {name: value for name, value in self.record().items() if name != "modules"}
 
 
 @runtime_checkable
@@ -401,8 +409,8 @@ class Manifest:
             for field in dataclasses.fields(self)
             if field.name not in ("steps", "ran")
         }
-        recorded["steps"] = [json_value(dataclasses.asdict(step), "step") for step in self.steps]
-        recorded["ran"] = [json_value(dataclasses.asdict(step), "step") for step in self.ran]
+        recorded["steps"] = [step.record() for step in self.steps]
+        recorded["ran"] = [step.record() for step in self.ran]
         return recorded
 
     def semantic(self) -> dict[str, JSON]:
@@ -955,13 +963,15 @@ class Plan:
         # and topology reads on under another Dew, a global order's or a share's, the change reported.
         changes = _changed(saved_environment, environment)
         if resume != "non-exact" and edited is None:
-            # A step outside Dew that declares no identity is what its code computes: its module's bytes
-            # changed, it may make other rows from the same records (row 3938).
+            # A function outside Dew that declares no identity, a step's or the factory's that configured
+            # it, is what its code computes: its module's bytes changed, it may make other rows from the
+            # same records (row 3938).
             saved_modules = listed(saved_environment.get("modules", []), "saved data modules",
                                    read=json_value, what="each step's module digests")
             rewritten = [step.name for step, before in zip(
                 (*self.manifest.ran, *self.manifest.steps), saved_modules, strict=False)
-                if not step.stated and step.modules and before != list(step.modules)]
+                if isinstance(before, list) and len(before) == len(step.modules)
+                and any(before[place] != step.modules[place] for place in step.code)]
             if rewritten:
                 raise ValueError(
                     f"the code of data step {', '.join(rewritten)} changed since the position was saved, "
