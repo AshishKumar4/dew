@@ -203,17 +203,19 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
                       'the decay bound')
 
 
-@pytest.mark.parametrize('name', SITES)
-@pytest.mark.parametrize('regime', INTERPRETED)
-def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
-    """Each form's 16-bit forward through the template, interpreted off a GPU, finite wherever the float64
-    recurrence's is on the regime's first draw; a form it refuses is checked refused and skipped."""
-    hooks = SITES[name]
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-    drawn = (bf16(stressed(hooks, regime, 0)[0], hooks),)
-    if not runs(mosaic, hooks, drawn[0], drawn, 'forward'):
-        pytest.skip(f'the template refuses {name}: a refusal, not numerical coverage')
-    assert_finite(jax.jit(mosaic), jax.jit(functools.partial(token_by_token, hooks)), drawn, regime)
+@pytest.mark.parametrize(('name', 'regime', 'forms'),
+                         [(name, regime, forms) for name, regime, product, forms in CASES
+                          if product == 'forward' and regime in INTERPRETED])
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
+    """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
+    tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
+    with its reference arm. Held finite alone, a write gate without the delta rule rounded as the SSD is
+    (`recurrence_chunk.chunk_rounding`) put its final memory 2.1e4 times the portable math's distance from
+    float64 unseen off a GPU (row 3962). Whole, the cells took 27 to 151 s (Kimi delta attention's aligned
+    keys 128, the rated scan's decays near zero under the accurate forms 151, stab-case at d51a2d2cf): a site
+    each, sharded over the most seeds a cell declares."""
+    the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
 @pytest.mark.parametrize('regime', REGIMES)
