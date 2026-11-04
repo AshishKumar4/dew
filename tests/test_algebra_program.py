@@ -874,3 +874,23 @@ def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_af
     found = json.loads(done.stdout.strip().splitlines()[-1])
     assert max(found["before"]) < 1e-4
     assert min(found["after"]) > 0.1
+
+
+def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
+    """A region's values are priced at their own element size (`cost.work`): a program reading bfloat16
+    operands reads half the device bytes one reading float32 operands of the same shape does, and its product
+    stages half the bytes into its tile walk, so the pass weighs a narrow program's memory as it is."""
+    def priced(dtype):
+        def contracted(a, b):
+            return jnp.dot(a + b, b, preferred_element_type=jnp.float32)
+
+        a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
+        region = terms.region(jax.make_jaxpr(contracted)(a, b))
+        graph, bundle, _ = program.graphed(region)
+        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+        return price.work
+
+    narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
+    assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
+    assert (narrow.device_bytes, narrow.shared_bytes) == (2 * 64 * 64 * 2, 2 * 64 * 64 * 2)
