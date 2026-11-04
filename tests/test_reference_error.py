@@ -300,6 +300,33 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def test_over_jax_inputs_an_arm_runs_only_compiled_and_a_numpy_one_is_refused_there():
+    """A draw holding no NumPy array calls no arm before the gate compiles it: a JAX arm over JAX inputs
+    runs traced alone, where called as given once first a model arm ran eagerly, a minute of a check
+    (M43). A NumPy arm over them is refused where the gate's compile traces it, its NumPy call on a
+    traced input refused by JAX; over NumPy inputs, where operators alone would trace it into float32
+    JAX, it is refused before it runs compiled
+    (`test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy`)."""
+    from reference_error import assert_as_exact
+
+    called = []
+
+    def dew(x):
+        called.append(isinstance(x, jax.core.Tracer))
+        return x * 2
+
+    def numpy(x):
+        return np.asarray(x) * 2
+
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng(seed).standard_normal(8), jnp.float32),)
+
+    assert_as_exact(dew, dew, draw, "a JAX arm over JAX inputs", seeds=8)
+    assert called and all(called)
+    with pytest.raises(jax.errors.TracerArrayConversionError):
+        assert_as_exact(dew, numpy, draw, "a NumPy arm over JAX inputs", seeds=8)
+
+
 def noised_draw(seed):
     """A draw of standard normal values beside three noises of 1e-7 of them, which arms add at chosen scales
     (the further references' and the library arm's sites)."""
