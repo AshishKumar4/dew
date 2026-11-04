@@ -99,6 +99,13 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # aborted the process (tests/test_discrete.py's toy run on CI, three
     # times). Two threads per device hold both launches.
     environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
+    # One OpenMP thread, torch's intra-op pool and the host BLAS's: the suite's torch and NumPy arms are
+    # references of small ops, which a pool of the machine's cores runs no faster, and whose spinning
+    # barriers stall whenever one of its threads is descheduled, by XLA's pool beside it, another xdist
+    # worker or a busy host. test_torchax_fallback.py's [bias] case took 39 s on a quiet 4-core container,
+    # past 1,500 s beside four busy loops, and 80 s beside them on one thread (ledger 3829). A count a
+    # process is given (the GPU lane's share of a node's CPUs, tools/armada/ci.py) stands.
+    environ.setdefault("OMP_NUM_THREADS", "1")
     # Parity tests assert fp32 against references computed in fp32. Ampere and
     # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
     # 1e-2 between two correct implementations.
@@ -121,8 +128,9 @@ def configured(environ: Mapping[str, str]) -> dict[str, str]:
 
 def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:
     """`environ` as a user's process on one CPU device sees it: without every setting `configure_lane` gives
-    the suite (its simulated devices and their threads, its matmul precision, its wide CPU arithmetic), JAX
-    on the CPU, for a page, an example or a tool a test runs as a reader would (ledgers 2510, 2736)."""
+    the suite (its simulated devices and their threads, its one OpenMP thread, its matmul precision, its wide
+    CPU arithmetic), JAX on the CPU, for a page, an example or a tool a test runs as a reader would (ledgers
+    2510, 2736)."""
     suite = configured({})
     return {**{name: value for name, value in environ.items() if name not in suite}, "JAX_PLATFORMS": "cpu"}
 
