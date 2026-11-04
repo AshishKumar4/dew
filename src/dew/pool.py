@@ -135,9 +135,8 @@ process may use."""
 
 
 def selected_gpus(selected: str) -> tuple[int, ...] | None:
-    """The GPUs JAX's own selection names (`jax_cuda_visible_devices`, from JAX_CUDA_VISIBLE_DEVICES or set in
-    the process: a comma list of the driver's ordinals, as JAX reads it), or None where it selects
-    `ALL_GPUS`."""
+    """The GPUs JAX's own selection names (`jax_cuda_visible_devices`, set in the process: a comma list of
+    the driver's ordinals, as JAX reads it), or None where it selects `ALL_GPUS`."""
     return None if selected == ALL_GPUS else tuple(int(ordinal) for ordinal in selected.split(","))
 
 

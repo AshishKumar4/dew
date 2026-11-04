@@ -256,10 +256,10 @@ def needs_of(gpus: int | None = None) -> Needs | None:
 def _child(configured: Mapping) -> Needs:
     """The measurement a child process of this interpreter makes (`main`), its environment the parent's."""
     began = time.perf_counter()
-    # The child opens the GPUs this process does, its selection set in this process or in the environment.
-    environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                   "JAX_CUDA_VISIBLE_DEVICES": jax.config.read("jax_cuda_visible_devices")}
-    done = subprocess.run([sys.executable, "-m", "dew.communicators"], capture_output=True,
+    environment = {**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
+    # The child opens the GPUs this process's JAX selects (`local_gpus`), which JAX reads from no environment.
+    selected = jax.config.read("jax_cuda_visible_devices")
+    done = subprocess.run([sys.executable, "-m", "dew.communicators", selected], capture_output=True,
                           text=True, env=environment, check=False)
     if done.returncode != 0:
         raise RuntimeError(f"measuring NCCL's communicators on this host's GPUs failed (exit "
@@ -566,6 +566,8 @@ def main() -> None:
     import jax.numpy as jnp
     import numpy as np
 
+    # The GPUs its parent's JAX selects (`_child`), selected before the backend opens.
+    jax.config.update("jax_cuda_visible_devices", sys.argv[1] if len(sys.argv) > 1 else pool.ALL_GPUS)
     before = {index: gpu_free_bytes(index) or 0 for index in local_gpus() or ()}
     devices = jax.local_devices()
 

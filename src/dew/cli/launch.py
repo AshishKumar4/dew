@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, TextIO
 
@@ -41,7 +41,6 @@ from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
 from dew.pool import (
-    ALL_GPUS,
     COORDINATOR,
     LOCAL_DEVICES,
     PREEMPTED_EXIT,
@@ -51,10 +50,8 @@ from dew.pool import (
     detected_cluster,
     listed_gpus,
     local_gpu_count,
-    local_gpus,
     refuse_idle_gpus,
     runs_on_gpu,
-    selected_gpus,
     slurm_tasks_here,
     visible_gpus,
 )
@@ -220,7 +217,7 @@ class Launch:
                              f"from it, so drop {', '.join(refused)}")
         tasks = slurm_tasks_here()
         if cluster.name == "slurm" and tasks is not None and runs_on_gpu(os.environ):
-            refuse_idle_gpus(tasks, opened_gpu_count(os.environ), "this slurm step")
+            refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
         emit(f"{cluster.name}: process {cluster.process} of {cluster.count}, placed by the "
              f"cluster; running {shlex.join(self.command)}")
         if cluster.count > 1 and cluster.process == 0 and cluster.name in ("gcetpu", "gketpu"):
@@ -246,7 +243,7 @@ class Launch:
             per_node = os.environ.get("SLURM_GPUS_PER_NODE")
             # --gpus-per-node reads `[type:]count`, several types separated by commas.
             gpus = (sum(int(part.rsplit(":", 1)[-1]) for part in per_node.split(","))
-                    if per_node else opened_gpu_count({**os.environ, **self.extra_env()}))
+                    if per_node else local_gpu_count())
         tasks = self.processes_per_host
         if tasks is None and "SLURM_NTASKS_PER_NODE" in os.environ:
             refuse_idle_gpus(int(os.environ["SLURM_NTASKS_PER_NODE"]), gpus, allocation)
@@ -306,7 +303,7 @@ class Launch:
         env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
         on_gpu = runs_on_gpu(env)
         # None where the GPUs could not be counted, which is not zero of them.
-        gpus = gpu_count(first_host, env) if on_gpu else 0
+        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
         if processes is None:
             processes = max(1, (gpus or 0) // (devices or 1))
         # More processes than GPUs, as in a rehearsal of programs that do
@@ -440,26 +437,16 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
         "kill -KILL -$rank 2>/dev/null", "exit $code"])
 
 
-def gpu_count(host: str, env: Mapping[str, str]) -> int | None:
-    """GPUs a pool process on `host` of environment `env` opens: those JAX's own selection names
-    (JAX_CUDA_VISIBLE_DEVICES, `selected_gpus`), else those CUDA_VISIBLE_DEVICES lists when the pool sets it
-    itself, else what `host` shows, asked over ssh when it is another machine; None when they could not be
+def gpu_count(host: str, visible: str | None) -> int | None:
+    """GPUs a pool process on `host` may use: those `visible` lists when
+    the pool sets CUDA_VISIBLE_DEVICES itself, else what `host` shows,
+    asked over ssh when it is another machine; None when they could not be
     counted there."""
-    named = selected_gpus(env.get("JAX_CUDA_VISIBLE_DEVICES", ALL_GPUS))
-    if named is not None:
-        return len(named)
-    if (visible := env.get("CUDA_VISIBLE_DEVICES")) is not None:
+    if visible is not None:
         return visible_gpus(visible)
     if host in LOCAL_HOSTS:
         return local_gpu_count()
     return listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
-
-
-def opened_gpu_count(env: Mapping[str, str]) -> int | None:
-    """GPUs a process of environment `env` on this machine opens (`dew.pool.local_gpus` under its
-    JAX_CUDA_VISIBLE_DEVICES); None where they could not be counted."""
-    gpus = local_gpus(env.get("JAX_CUDA_VISIBLE_DEVICES", ALL_GPUS))
-    return None if gpus is None else len(gpus)
 
 
 def names_loopback(host: str) -> bool:
