@@ -202,13 +202,19 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width):
     the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong=False)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=32)
-@pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
-def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone_at_a_strong_decay(decay_width):
-    """`the_chunked_rule_runs_packed_documents_as_each_runs_alone` at a strong decay, its 128 declared seeds
-    (`PACKED_RULE_SEEDS`) in armada map tasks of 32 (`check1_shards`): whole, a case took up to 153 s, about
-    1.1 s a seed (test_durations at 8e7d4ce444, row 3772)."""
-    the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong=True)
+# At a strong decay, each decay width a check-1 site of its own, its 128 declared seeds (`PACKED_RULE_SEEDS`)
+# in armada map tasks of 16 (`check1_shards`): whole, a case took up to 153 s (test_durations at 8e7d4ce444,
+# row 3772), a task of 32 seeds of both 209 s (site-tasks at c17a54df2), about 3.3 s a case's seed.
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone_at_a_strong_decay_a_head():
+    """`the_chunked_rule_runs_packed_documents_as_each_runs_alone` at a strong decay a head."""
+    the_chunked_rule_runs_packed_documents_as_each_runs_alone(1, strong=True)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone_at_a_strong_decay_a_key_dimension():
+    """`the_chunked_rule_runs_packed_documents_as_each_runs_alone` at a strong decay a key dimension."""
+    the_chunked_rule_runs_packed_documents_as_each_runs_alone(8, strong=True)
 
 
 def the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
