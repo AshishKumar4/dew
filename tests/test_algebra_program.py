@@ -740,6 +740,23 @@ def test_an_algebra_span_joins_the_windows_around_it():
                     lambda seed: rows(seed, *SHAPES_MARKED), "an opened span", seeds=8)
 
 
+def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
+    """An Algebra span whose body has effects (a callback's) is not opened into the region around it, whose
+    renaming would leave its effects naming the body's own variables: it is rewritten within its call, as a
+    surrogate's body is, which stays one call of its kind, and it computes what it computes (check 1)."""
+    from dew.nn.derivatives import Algebra, marked
+
+    def noted(x, y, a):
+        jax.debug.callback(lambda value: None, jnp.sum(x))
+        return two_sums(x, y, a)
+
+    spanned = marked(Algebra(), noted)
+    rewritten = jax.make_jaxpr(algebra.rewritten(spanned))(*rows(15, *SHAPES_MARKED))
+    assert (reductions(rewritten) - 1, _marked_kinds(rewritten)) == (1, [Algebra()])
+    assert_as_exact(jax.jit(algebra.rewritten(spanned)), jax.jit(two_sums),
+                    lambda seed: rows(seed, *SHAPES_MARKED), "an effectful span", seeds=8)
+
+
 def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
     """An Algebra span opened for the pass, around which no form is cheaper, leaves the program jit traced as
     it is, its marked call kept (`program_of`: the same object, lowered as traced)."""
@@ -754,8 +771,9 @@ def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
 
 def _parameter_pairs():
     """Equation parameters the algebra pass and the kernel tuner key (`terms.parameter_key`), as pairs of
-    values each (equal, unequal) and the value as JAX holds it: two that print alike but differ (a mesh over
-    the same devices in another order; two long arrays apart in an element their printed forms elide), and
+    values each (equal, unequal) and the value as JAX holds it: two that print alike or key alike but differ
+    (a mesh over the same devices in another order, a sharding of one mesh over its devices in another order;
+    two long arrays apart in an element their printed forms elide), and
     two that are one parameter however they were built (an integer and NumPy's, a dtype and its scalar
     type, two shardings, dimension numbers and precisions built apart)."""
     from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec as P
@@ -768,7 +786,9 @@ def _parameter_pairs():
     abstract = AbstractMesh((4,), ("data",), axis_types=(AxisType.Explicit,))
     numbers = jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
                                              start_index_map=(0,))
-    unequal = [(ordered, reordered), (long, changed)]
+    placed = NamedSharding(ordered, P("data"))
+    permuted = NamedSharding(ordered, P("data"), _logical_device_ids=(3, 2, 1, 0))
+    unequal = [(ordered, reordered), (long, changed), (placed, permuted)]
     equal = [((1, 2), (np.int64(1), np.int64(2))), (np.dtype(jnp.bfloat16), jnp.dtype("bfloat16")),
              (NamedSharding(abstract, P("data", None)), NamedSharding(abstract, P("data", None))),
              (numbers, jax.lax.GatherDimensionNumbers(offset_dims=(1,), collapsed_slice_dims=(0,),
