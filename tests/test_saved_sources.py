@@ -67,8 +67,9 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
     """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
     default (a diffusion run's, its latest) records that step; when the saved run has trained on, so that
     its selection names a later one, the same command resuming takes the step it read before it pins
-    (`RunConfig.BUILT`, `source.step`, `resumed`), and its source compares alike with the record's; the
-    command naming the later step keeps it, and its resume is refused."""
+    (`RunConfig.BUILT`, `source.step`, `resumed`), and its source compares alike with the record's, so
+    it trains on past its checkpoint, sampling by the policy it recorded (row 3864); the command naming
+    the later step keeps it, and its resume is refused."""
     from dew.config import earlier_run
 
     first = diffusion(tmp_path, drawn=False)
@@ -92,22 +93,6 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
     assert stated.resumed().pinned().source.step == later
     with pytest.raises(ValueError):
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
-
-
-@pytest.mark.mesh(devices=8)
-def test_a_run_from_a_saved_diffusion_run_resumes_by_its_command_with_the_policy_it_sampled_by(tmp_path):
-    """A named diffusion run started from a saved diffusion run, sampling by that run's task's policy where
-    it states none (`Objective.resolved`, recorded as resolved), resumes when its command runs again
-    after the saved run has trained on, its policy and its source's step those it recorded (row 3864),
-    and trains on past its checkpoint."""
-    first = diffusion(tmp_path, drawn=False)
-    trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
-    source = tmp_path / "runs" / "first"
-    command = dataclasses.replace(first, pretrained=str(source), text=None,
-                                  model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
-                                  objective=ObjectiveConfig("diffusion", {}))
-    trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
-    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
     trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
 
@@ -115,9 +100,12 @@ def test_a_run_from_a_saved_diffusion_run_resumes_by_its_command_with_the_policy
 @pytest.mark.mesh(devices=8)
 def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_later_one_is(tmp_path):
     """A decision run calibrated at its first step and trained on, calibrated again at its second, reads
-    each step with the calibration fitted on it (`Decide.save` keeps each, `CALIBRATIONS`): a reader
-    pinned to the first step, a run started from it among them, loads it after the second was fitted,
-    where only the latest was kept and refused it (row 3865)."""
+    each step with the calibration fitted on it (`Decide.save` keeps each, `CALIBRATIONS`, and a latest an
+    earlier Dew kept alone by its own weights before replacing it): a reader pinned to the first step, a
+    run started from it among them, loads it after the second was fitted, where only the latest was kept
+    and refused it (rows 3865, 3877)."""
+    import shutil
+
     from dew.decision.calibration import Calibration
     from dew.decision.task import Decide
     from dew.registry import from_record
@@ -126,6 +114,9 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     read = SavedRun.pinned(str(source)).step
+    # The run as a Dew that kept no calibration by step left it: its latest alone, which the next fit
+    # keeps by its own weights before it replaces it (row 3877).
+    shutil.rmtree(source / "calibrations")
     trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read
