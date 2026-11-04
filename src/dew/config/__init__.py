@@ -990,18 +990,20 @@ def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -
     return kept(before) == kept(now)
 
 
-def _at(value: object, path: str) -> object:
-    """The field of `value` at the dotted `path` (`RunConfig.BUILT`)."""
-    for name in path.split("."):
-        value = getattr(value, name)
-    return value
+def _at(run: "RunConfig", path: str) -> str | int | None:
+    """The field of `run` at the dotted `path` (`RunConfig.BUILT`), a name, a step or None."""
+    *owners, name = path.split(".")
+    holder: DataclassInstance = run
+    for owner in owners:
+        holder = getattr(holder, owner)
+    return getattr(holder, name)
 
 
-def _with[T](value: T, path: str, field: object) -> T:
-    """`value` with its field at the dotted `path` replaced by `field`."""
+def _with[T: "DataclassInstance"](holder: T, path: str, field: str | int | None) -> T:
+    """`holder` with its field at the dotted `path` replaced by `field`."""
     name, _, rest = path.partition(".")
-    inner = field if not rest else _with(getattr(value, name), rest, field)
-    return dataclasses.replace(value, **{name: inner})  # pyright: ignore[reportArgumentType]
+    inner = field if not rest else _with(getattr(holder, name), rest, field)
+    return dataclasses.replace(holder, **{name: inner})
 
 
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1031,8 +1033,9 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     named = registry.class_record(record)
     if named is None or named[0] not in registry.runs or "option_text" in named[1]:
         return record
-    declared = {field.name for field in dataclasses.fields(registry.runs[named[0]])}
-    if "option_text" not in declared:
+    run_class = registry.runs[named[0]]
+    if not (isinstance(run_class, type) and dataclasses.is_dataclass(run_class)) or "option_text" not in {
+            field.name for field in dataclasses.fields(run_class)}:
         return record
     return {**record, "fields": {**named[1], "option_text": "named"}}
 
