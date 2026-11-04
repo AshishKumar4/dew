@@ -128,13 +128,13 @@ def test_the_training_forward_keeps_a_state_a_backward_block():
     kept = jax.eval_shape(lambda *operands: jax.vjp(template, *operands)[1], *operands)
     beyond = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)) - sum(
         operand.size * operand.dtype.itemsize for operand in operands)
-    chunks = length // recurrence_chunk.SELECTIVE_CHUNK
+    chunks = length // selective.CHUNK
     assert beyond < chunks * rows * states * channels * 4, beyond
 
 
 LAYER = {"emb_features": 64, "intermediate_size": 128, "state_size": 16, "time_step_rank": 8,
          "chunk_size": 32}
-"""A Mamba layer one channel block wide (`recurrence_chunk.SELECTIVE_BLOCK`), Mamba's 16 states."""
+"""A Mamba layer one channel block wide (`selective.block_scan.THREADS`), Mamba's 16 states."""
 
 
 HELD = {"into the template": (False, True), "out of the template": (True, False),
@@ -214,7 +214,7 @@ def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast"
     for a scan traced for `target` over fp32 `x` and `B` and a `c_dtype` `C` of `states` states, two rows of
     a chunk's tokens and a channel block, under the run's `forms`, the template named where `named`: each
     route's `(kernel, refusal code)`; or the refusal it raises."""
-    x = jnp.zeros((2, recurrence_chunk.SELECTIVE_CHUNK, recurrence_chunk.SELECTIVE_BLOCK), jnp.float32)
+    x = jnp.zeros((2, selective.CHUNK, selective.block_scan.THREADS), jnp.float32)
     a, b = jnp.zeros((x.shape[-1], states)), jnp.zeros((*x.shape[:2], states))
     named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
     with (generation.assumed(target), named_template, generation.routes() as found,

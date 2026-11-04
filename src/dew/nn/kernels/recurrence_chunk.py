@@ -1066,7 +1066,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
     (`template.ranged`); a `rounded` call takes the run's fast forms' numbers (`fast_rounding`,
     `mainloop.forward`)."""
-    from .templates import bundles
+    from .templates import bundles, report as template_report
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
@@ -1090,6 +1090,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 target=template.Mosaic.launched(), starts=starts,
                 max_segments=max_segments, delta=delta, floor=floor, rounded=rounded, ranged=run["ranged"],
                 skip=skip))
+
+    # The launch tracing the forward (`report.launch_digest`), whose name the fast backward's kernels carry
+    # too (`report.relaunched`): JAX traces the backward after that launch's scope ended.
+    launch = template_report.launch_digest()
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
@@ -1126,10 +1130,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
                 "launches past the device's at these tiles): the delta rule's selector gives a training call "
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
-        *grads, dh0, dskip = mainloop_backward.gradients(
-            query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
-            max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta, rounded=rounded,
-            skip=skip, **run)
+        with template_report.relaunched(launch):
+            *grads, dh0, dskip = mainloop_backward.gradients(
+                query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
+                max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
+                rounded=rounded, skip=skip, **run)
         return (*grads, None if state is None else dh0, None, None,
                 None if dskip is None else dskip.astype(skip.dtype))
 
@@ -1512,12 +1517,13 @@ class SelectiveCase:
     family: str | None = None
 
 
-SELECTIVE_CHUNK = 32
-"""The tokens a chunk of the template's selective scan takes (`templates.recurrence.selective`)."""
+def _selective():
+    """The template's selective scan (`templates.recurrence.selective`), its constants read where a
+    requirement asks: its least chunk (`CHUNK`) and a program's channels, one a thread of its warpgroup."""
+    from .templates.recurrence import selective
 
-SELECTIVE_BLOCK = 128
-"""The channels a program of the template's selective scan takes, one a thread of its consumer warpgroup
-(`templates.recurrence.selective`)."""
+    return selective
+
 
 COPY_BYTES = 16
 """The bytes a bulk copy's rows come in a whole number of (TMA's, cp.async's widest)."""
@@ -1534,9 +1540,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
                 "interprets, as the CPU suite runs it where a call names it", row=INHERENT, kind='measured'),
     Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16, jnp.float32),
                 lambda case: f"{case.dtype} operands; the template takes 16-bit and fp32 ones", row=INHERENT),
-    Requirement('channels', lambda case: case.channels % SELECTIVE_BLOCK == 0,
+    Requirement('channels', lambda case: case.channels % _selective().block_scan.THREADS == 0,
                 lambda case: f"{case.channels} channels, no whole number of the template's blocks of "
-                             f"{SELECTIVE_BLOCK}", row='ledger 1300'),
+                             f"{_selective().block_scan.THREADS}", row='ledger 1300'),
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
@@ -1544,8 +1550,8 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
                 lambda case: f"{case.states} states of {case.state_dtype}, a B or C row of no whole number "
                              f"of a bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
                 row='ledger 1300'),
-    Requirement('tokens', lambda case: case.length >= SELECTIVE_CHUNK,
-                lambda case: f"{case.length} tokens, fewer than a chunk of {SELECTIVE_CHUNK}: a decode "
+    Requirement('tokens', lambda case: case.length >= _selective().CHUNK,
+                lambda case: f"{case.length} tokens, fewer than a chunk of {_selective().CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
     Requirement('strided copies', lambda case: case.family != 'mma.sync',
                 "mma.sync's streams copy a channel block untiled by cp.async, which jax 0.12.0.1.post41 "

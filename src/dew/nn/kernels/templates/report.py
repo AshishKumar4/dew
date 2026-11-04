@@ -180,6 +180,25 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
         _TRACING.reset(token)
 
 
+@contextlib.contextmanager
+def relaunched(digest: str | None) -> Iterator[None]:
+    """Within the block, the kernels traced carry the launch `digest` names in their names, as `launching`'s
+    do: a launch's derivative traced after its forward's scope ended (a custom VJP's backward, which JAX
+    traces on its pullback) is named for the launch that traced the forward, so a compile's report of its
+    kernels refuses that launch (`spilled`). A digest this process traced no launch under, or None, names
+    nothing."""
+    launch = None if digest is None else _LAUNCHES.get(digest)
+    if launch is None:
+        yield
+        return
+    token = _TRACING.set(_Pending(lambda: launch.identity, launch.op, launch.config, lambda: launch.padded,
+                                  digest))
+    try:
+        yield
+    finally:
+        _TRACING.reset(token)
+
+
 def named(name: str | None) -> str | None:
     """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
     where none is."""
