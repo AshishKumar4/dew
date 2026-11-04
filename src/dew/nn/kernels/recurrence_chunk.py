@@ -1598,16 +1598,11 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
     scan, interpreted off a GPU (where a call names it), per shard of rows on a mesh (`manual_map`: B and C
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
     the portable math."""
-    from .templates import bundles
     from .templates.recurrence import selective
 
     def template(x, dt, A, B, C, D, state, *starts):
-        interpret = generation.backend() != 'gpu'
-        family = (bundles.INTERPRETED if interpret
-                  else bundles.of(generation.device_generation(), jnp.result_type(x)))
-        assert family is not None, "a bundle claims the device's family (`selective_kernel`)"
-        return selective.selective_scan(x, dt, A, B, C, D, state, *(starts or (None,)), family=family,
-                                        chunk=SELECTIVE_CHUNK, block=SELECTIVE_BLOCK, interpret=interpret)
+        return selective.SELECTIVE(x, dt, A, B, C, D, state, *(starts or (None,)),
+                                   interpret=generation.backend() != 'gpu')
 
     def run(kernel, x, dt, A, B, C, D, state):
         if kernel != 'mosaic_gpu':
