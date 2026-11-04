@@ -410,12 +410,15 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     loaded = RunConfig.load(str(directory))
     trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in directory.iterdir()}
-    record = (directory / "run.json").read_bytes()
+    saved = directory / "run.json"
+    record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
         trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
     assert refused.value.routes == (RECORD, SCHEDULE, REBUILD)
-    # Refused before it writes its record, it leaves the one it resumes as it was, which resumes.
-    assert (directory / "run.json").read_bytes() == record
+    # Refused before it writes its record, it never replaces the one it resumes (a write replaces the
+    # file, `write_atomically`), which is as it was, byte for byte, and resumes.
+    assert saved.read_bytes() == record
+    assert (saved.stat().st_ino, saved.stat().st_mtime_ns) == (written.st_ino, written.st_mtime_ns)
     trained(RunConfig.load(str(directory)), tmp_path, "mixed",
             trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
     assert "3" in {path.name for path in directory.iterdir()}
