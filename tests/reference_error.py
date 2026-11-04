@@ -306,14 +306,19 @@ def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
     within it (`over_windows`), without YNNPACK's fusions, paired by `pairing` (`_Paired`); a `reference`
     unrewritten (`arm_arithmetic.unrewritten`)."""
-    run = unrewritten(fn) if reference else fn
+    run = unrewritten if reference else _as_is
     if _given(fn) or getattr(fn, "without_ynn", False):
-        return run
+        return run(fn)
     if getattr(fn, "dew_programs", False):
-        return run if compile is jax.jit else _Paired(pairing, _with_ynn_off(run), run)
+        return run(fn) if compile is jax.jit else _Paired(pairing, run(_with_ynn_off(fn)), run(fn))
     if isinstance(fn, _Windowed):
         return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
-    return compile(run) if compile is jax.jit else _Paired(pairing, compile(run), jax.jit(run))
+    return run(compile(fn)) if compile is jax.jit else _Paired(pairing, run(compile(fn)), run(jax.jit(fn)))
+
+
+def _as_is(fn):
+    """`fn` itself: a candidate arm, run as its users run it."""
+    return fn
 
 
 @dataclasses.dataclass(eq=False)
@@ -430,7 +435,7 @@ def _truth_program(fn):
         return unrewritten(fn)
     if isinstance(fn, _Windowed):
         return _Windowed(_truth_program(fn.fn))
-    return Truth(unrewritten(fn))
+    return Truth(fn)
 
 
 def _with_ynn_off(fn):

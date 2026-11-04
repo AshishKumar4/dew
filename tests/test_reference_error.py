@@ -267,7 +267,7 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
 
     host = as_given(lambda x: np.asarray(x) + np.asarray(x))
     mine, theirs = _arms(dew, host)
-    assert theirs.__wrapped__ is host and not getattr(mine, "without_ynn", False)
+    assert theirs.wrapped is host and not getattr(mine, "without_ynn", False)
     np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
@@ -890,14 +890,14 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         np.testing.assert_allclose(first["y"], truth(x, w)["y"], rtol=1e-14)
         numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
         numpy(x, w)
-        assert numpy.run is numpy.fn
+        assert numpy.run.wrapped is numpy.fn
         # A truth that widens its inputs on the host and returns JAX values fails at its first call.
         hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
         with pytest.raises(jax.errors.TracerArrayConversionError):
             hosted(x, w)
     # A truth run as given, or compiled already, is itself, its programs unrewritten.
     given = as_given(truth)
-    assert _truth_program(given).__wrapped__ is given and _truth_program(_product).__wrapped__ is _product
+    assert _truth_program(given).wrapped is given and _truth_program(_product).wrapped is _product
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
     assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, Truth)

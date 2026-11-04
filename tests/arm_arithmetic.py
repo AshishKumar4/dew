@@ -3,7 +3,6 @@
 (`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -45,21 +44,37 @@ def summed_as_run():
 
 
 def unrewritten(fn):
-    """`fn` run with the algebra pass off (`dew.algebra.passes(on=False)`), the one scope of every reference
-    arm (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`) the gate runs: the
-    programs they trace or run are Dew's as written, never a rewrite the candidate's check judges
-    (docs/design/algebra.md §3). The switch is in JAX's trace context, which jit's and Dew's programs key
-    their executables on, so a reference's never stands in for the candidate's. A recorded arm, which
-    replays values and runs no program, is as it is."""
-    if fn is None or getattr(fn, "recorded", False):
-        return fn
-    from dew.algebra import passes
+    """`fn` run with the algebra pass off (`Unrewritten`), the one scope of every reference arm
+    (`reference_error._compiled`) and float64 truth (`reference_error._truth_program`, `Truth`) the gate
+    runs: the programs they trace or run are Dew's as written, never a rewrite the candidate's check judges
+    (docs/design/algebra.md §3). A recorded arm, which replays values and runs no program, is as it is."""
+    return fn if fn is None or getattr(fn, "recorded", False) else Unrewritten(fn)
 
-    @functools.wraps(fn)
-    def run(*inputs, **options):
+
+class Unrewritten:
+    """`wrapped`, called or lowered (`lower`, a compiled arm's) with the algebra pass off
+    (`dew.algebra.passes(on=False)`), its other attributes `wrapped`'s (an arm's marks: `as_given`,
+    `pilots`). The switch is in JAX's trace context, which jit's and Dew's programs key their traces and
+    executables on: a reference's program never stands in for the candidate's, and a function's own, wrapped
+    once a site, is the same program at every site of it."""
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __call__(self, *inputs, **options):
+        from dew.algebra import passes
+
         with passes(on=False):
-            return fn(*inputs, **options)
-    return run
+            return self.wrapped(*inputs, **options)
+
+    def lower(self, *inputs, **options):
+        from dew.algebra import passes
+
+        with passes(on=False):
+            return self.wrapped.lower(*inputs, **options)
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
 
 
 class Truth:
@@ -75,16 +90,17 @@ class Truth:
     def __call__(self, *inputs):
         if self.run is not None:
             return self.run(*inputs)
-        compiled = jax.jit(self.fn)
+        # Its own function jitted, which every site of it shares, run unrewritten (`unrewritten`).
+        compiled = unrewritten(jax.jit(self.fn))
         try:
             # Compiled from the first call on, never run eagerly: a seed's truth is the same whichever seed
             # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
             values = compiled(*inputs)
         except Exception as untraced:
-            first = self.fn(*inputs)
+            first = unrewritten(self.fn)(*inputs)
             if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
                 raise untraced
-            self.run = self.fn
+            self.run = unrewritten(self.fn)
             return first
         self.run = compiled
         return values
