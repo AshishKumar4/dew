@@ -320,10 +320,14 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
 
 def smoothed(targets: jax.Array, where: jax.Array | None = None, share: float = 0.0) -> jax.Array:
     """`targets` over the last axis with `share` of their mass spread evenly over the classes `where`
-    holds, `(1 - share) t_k + share / K` for a row of K classes, and nothing on the others."""
+    holds, `(1 - share) t_k + share / K` for a row of K classes (`optax.smooth_labels`), and nothing on
+    the others; integer targets in the floating type a Python number promotes them to (float64 under
+    x64)."""
+    targets = jnp.asarray(targets)
+    if not jnp.issubdtype(targets.dtype, jnp.floating):
+        targets = targets.astype(jnp.result_type(targets, 1.0))
     held = jnp.ones(targets.shape, bool) if where is None else where
-    count = jnp.sum(held, axis=-1, keepdims=True)
-    return jnp.where(held, (1.0 - share) * targets + share / count, 0.0)
+    return jnp.where(held, optax.smooth_labels(targets, share, where=held), 0.0)
 
 
 def brier(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -395,8 +399,8 @@ def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,
         # A shared class of no probability adds no term, nor does a non-member's, whose mean is no
         # group's: their logarithms read one, not zero, so no derivative meets 0 * inf.
         held = (answer > 0) & member[:, None]
-        ratio = jnp.log(jnp.where(held, answer, 1.0)) - jnp.log(jnp.where(held, mean, 1.0))
-        each = jnp.sum(jnp.where(held, answer * ratio, 0.0), axis=-1)
+        each = optax.kl_divergence(jnp.log(jnp.where(held, mean, 1.0)), jnp.where(held, answer, 1.0),
+                                   where=held)
         return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
                 jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
 

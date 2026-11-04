@@ -470,7 +470,7 @@ class Confident:
             scores = jnp.where(scores < cutoff, -jnp.inf, scores)
         if self.temperature not in (0.0, 1.0):
             scores = scores / self.temperature
-        scores = jax.nn.log_softmax(scores, axis=-1)
+        scores = categorical.log_probs(scores)
         tokens = jnp.argmax(scores, axis=-1).astype(jnp.int32) if self.temperature == 0.0 else drawn(scores)
         probability = jnp.exp(jnp.take_along_axis(scores, tokens[..., None], -1)[..., 0])
         confidence = jnp.where(masked, probability, -jnp.inf)
