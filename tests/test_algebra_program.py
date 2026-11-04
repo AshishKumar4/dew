@@ -992,11 +992,11 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
             return _scaled_twice(s, q_pos, k_pos, a, b)
         return transient
 
-    hook = made()
-    held = weakref.ref(hook)
-    operands = _scaled_operands(2, (16, 32))
-    jax.make_jaxpr(lambda s, a, b: hooked(hook, s, jnp.arange(16)[:, None], jnp.arange(32)[None, :],
-                                          (a, b)))(*operands)
-    del hook
+    def traced(hook) -> weakref.ref:
+        jax.make_jaxpr(lambda s, a, b: hooked(hook, s, jnp.arange(16)[:, None], jnp.arange(32)[None, :],
+                                              (a, b)))(*_scaled_operands(2, (16, 32)))
+        return weakref.ref(hook)
+
+    held = traced(made())
     gc.collect()
     assert held() is None
