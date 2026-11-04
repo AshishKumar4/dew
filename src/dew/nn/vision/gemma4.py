@@ -27,7 +27,7 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scan_orders import patchify
 from dew.registry import Record
 
@@ -221,7 +221,8 @@ class Gemma4VisionTransformer(nn.Module):
         output_length = hidden_states.shape[1] // kernel ** 2
         width = safe[..., 0].max(axis=-1, keepdims=True) + 1
         indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)
-        values = jnp.where(valid[..., None], hidden_states, 0).astype(jnp.float32) / kernel ** 2
+        values = (jnp.where(valid[..., None], hidden_states, 0).astype(at_least_fp32(hidden_states.dtype))
+                  / kernel ** 2)
         # Segment sums avoid the reference pooler's [patches, soft_tokens]
         # one-hot matrix while preserving its position-indexed block average.
         pooled = jax.vmap(lambda value, index: jax.ops.segment_sum(value, index, output_length))(

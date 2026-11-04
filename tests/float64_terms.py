@@ -45,6 +45,15 @@ A body that runs elsewhere, a Pallas kernel, is one operation, its outputs
 their own size."""
 
 
+def float32_values(jaxpr) -> int:
+    """How many values of float32 `jaxpr`, and every jaxpr it holds, makes: none in a float64 program
+    that computes in float64 throughout (`dew.nn.precision.at_least_fp32`)."""
+    made = sum(any(getattr(getattr(var, "aval", None), "dtype", None) == jnp.float32
+                   for var in eqn.outvars) for eqn in jaxpr.eqns)
+    return made + sum(float32_values(inner) for eqn in jaxpr.eqns
+                      for inner in jax.extend.core.jaxprs_in_params(eqn.params))
+
+
 def float64_forward(module, variables, *args, **kwargs):
     """`module`'s own forward of `args` in float64, and each output's terms
     (`float64_terms`): the module computing in float64 over its variables

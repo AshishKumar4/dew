@@ -137,8 +137,19 @@ def float64_twin(model: torch.nn.Module,
 
     A complex table keeps its imaginary half: built inside `float64` it is complex128 already, and
     `Module.to(torch.float64)` would cast it to a real dtype, dropping the sines of a rotation (Llama 4's
-    vision `freqs_ci`), where `double` promotes floating tensors alone."""
+    vision `freqs_ci`), where `double` promotes floating tensors alone.
+
+    A wrapper's sub-configs (its text, vision and audio towers') are set to float64 with it: transformers
+    builds each tower from its own config at that config's dtype, the default dtype its constructor's
+    tables take (Gemma 3n's and Gemma 4's `embed_scale`, Gemma 3n's per-layer scales), so a tower left
+    at float32 would hold them rounded to float32 (ledger 3332)."""
     import copy
+
+    def widened_config(config):
+        config.dtype = torch.float64
+        for name in getattr(config, "sub_configs", {}):
+            if getattr(config, name, None) is not None:
+                widened_config(getattr(config, name))
 
     with float64():
         if build is not None:
@@ -148,7 +159,7 @@ def float64_twin(model: torch.nn.Module,
             if hasattr(type(model), "from_config") and not hasattr(config, "to_dict"):
                 twin = type(model).from_config(config)
             else:
-                config.dtype = torch.float64
+                widened_config(config)
                 twin = type(model)(config)
         twin.double()
     twin.load_state_dict(model.state_dict(), strict=True)

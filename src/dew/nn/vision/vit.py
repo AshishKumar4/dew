@@ -41,7 +41,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers.short_conv import GatedGridConv
 from dew.nn.mlp import GatedMLP
 from dew.nn.norms import LayerNorm, RMSNorm
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import declared
 from dew.nn.text_encoders import clip_layer
@@ -196,11 +196,11 @@ class ViTLayout:
                              "from another origin or holding special tokens does not state")
 
 
-def _interp_taps(index, size, side: int, align_corners: bool):
-    """Bilinear taps into a `side`-long table for positions along one axis, and their weights:
-    transformers' `_interpolation_axis_taps_weights` (vision_utils.py) with aligned corners, or with
-    half-pixel centres and out-of-range taps weighing zero."""
-    index = index.astype(jnp.float32)
+def _interp_taps(index, size, side: int, align_corners: bool, dtype):
+    """Bilinear taps into a `side`-long table for positions along one axis, and their weights in
+    `at_least_fp32(dtype)`: transformers' `_interpolation_axis_taps_weights` (vision_utils.py) with
+    aligned corners, or with half-pixel centres and out-of-range taps weighing zero."""
+    index = index.astype(at_least_fp32(dtype))
     if align_corners:
         source = index * (side - 1) / jnp.maximum(size - 1, 1)
     else:
@@ -218,12 +218,12 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
     """The learned square table resampled to each patch's grid place: bilinear over its rows and
     columns separately, the outer product of the taps (vision_utils.py,
     get_vision_interpolation_indices_and_weights)."""
-    side = round(len(table) ** 0.5)
-    row_taps, row_weights = _interp_taps(rows, heights, side, align_corners)
-    column_taps, column_weights = _interp_taps(columns, widths, side, align_corners)
+    side, dtype = round(len(table) ** 0.5), table.dtype if dtype is None else dtype
+    row_taps, row_weights = _interp_taps(rows, heights, side, align_corners, dtype)
+    column_taps, column_weights = _interp_taps(columns, widths, side, align_corners, dtype)
     indices = (row_taps[..., :, None] * side + column_taps[..., None, :]).reshape(*rows.shape, 4)
     weights = (row_weights[..., :, None] * column_weights[..., None, :]).reshape(*rows.shape, 4)
-    gathered = table_rows(table, indices, table.dtype if dtype is None else dtype)
+    gathered = table_rows(table, indices, dtype)
     return (gathered * weights[..., None]).sum(axis=-2)
 
 
