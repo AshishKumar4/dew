@@ -144,6 +144,41 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["unsized_kernels"] == 0
 
 
+def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
+    """The step the tool times (`benchmark_models.compiled_step`) is the program a run's first step compiles:
+    lowered for a GPU (`lower_for`), the tool's compile and a fit over the same batches lower one program
+    (`dew.training.ahead.program_of`), the tool handing its compile each batch as fit hands its step, its
+    rows marked, its work counted and its host fields apart (`dew.training.ahead.step_batch`, row 3700)."""
+    from dew.data.dataset import Loader
+    from dew.training._lowering import Lowered
+    from dew.training.ahead import program_of
+
+    tool = load("benchmark_step")
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_models as models
+    config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer'], warmup=1, steps=1,
+                                  dtype='float32')
+    (case,) = tool.build_cases(config)
+
+    def lowered(run) -> str:
+        trainer = models.build_trainer(case)
+        trainer.lower_for = "sm90"
+        with pytest.raises(Lowered) as raised:
+            run(trainer)
+        return program_of(raised.value.lowered)
+
+    def timed(trainer):
+        with models.compiled_step(case, trainer):
+            pass
+
+    def fitted(trainer):
+        data = Loader(lambda partition: models.batches(case, trainer.device_mesh), None,
+                      batch=case.batch_size, records=None)
+        trainer.fit(data, steps=1)
+
+    assert lowered(timed) == lowered(fitted)
+
+
 def test_a_steps_count_some_launches_work_is_missing_from_reads_as_a_lower_bound():
     """A row whose step runs launches no count sizes (`StepFlops.unsized`) shows its FLOPs and
     utilization as the lower bounds they are, as the trainer names them train/hfu_lower_bound; a

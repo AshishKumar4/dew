@@ -293,7 +293,10 @@ def requested(task) -> object:
         # source's vocabulary (diffusion-gemma-sft's 32).
         return task([[4, 5, 6, 7]], max_new_tokens=2, key=0)
     if isinstance(task, Decide):
-        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+        # Options described, as a user's are, so a row's writing of them (`QuestionLayout.option_text`) shows.
+        question = {"team": Choice("which team", {"billing": "invoices and charges",
+                                                  "technical": "the site and the app",
+                                                  "sales": "plans and prices"})}
         # A context beside the state where the backbone's cross-attention reads one (`context_length`),
         # unless its layout reads the question there (`spans_in_context`), which reads no other.
         reads = task.context_length is not None and not task.layout.spans_in_context

@@ -27,6 +27,7 @@ import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
+from dew import algebra
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -165,11 +166,15 @@ ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.Jaxpr, int, list]:
     """One trace of `loss(params, *arguments)`'s forward and backward: the program `jax.vjp`'s pullback
     runs on a cotangent of ones, returning the gradient's leaves and then the pullback's own, its
-    residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes."""
+    residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes. Its math is
+    the algebra pass's, as the step that compiles it rewrites its trace (`algebra.program_of`,
+    `OuterProgram`, docs/design/algebra.md §6.7): each region it rewrites is recorded as any trace's,
+    the derivation the compile then reuses (`program._derived`)."""
     def both(params, *arguments):
         outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs)), pullback
     closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
+    closed = algebra.program_of(closed)
     count = len(jax.tree.leaves(gradients))
     return closed.jaxpr, count, jax.tree.leaves(pullback)
 

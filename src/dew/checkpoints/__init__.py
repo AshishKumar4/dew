@@ -1114,9 +1114,13 @@ class Checkpoints:
         """Return whether an evaluation would enter the best-K set of any of its trackers."""
         return bool(self._candidates((ranking,) if isinstance(ranking, Ranking) else ranking))
 
-    def _cache_step(self, step: int, metadata) -> None:
-        """Record `step`'s committed metadata, which its staged save, if any, became."""
-        self._committed[step] = (dict(metadata.metrics or {}), copy.deepcopy(metadata.custom_metadata or {}))
+    def _cache_step(self, step: int, store: ocp.CheckpointManager) -> None:
+        """Record `step`'s committed metrics and custom metadata, which its staged save, if any, became: its
+        metrics item as `store` reads it (`metrics`) and its own metadata file
+        (`ocp.metadata.get_step_metadata`), as `_custom` reads it, not the manager's metadata, which opens
+        every array's TensorStore besides (row 3763)."""
+        custom = ocp.metadata.get_step_metadata(self.path(step)).custom_metadata
+        self._committed[step] = (dict(store.metrics(step) or {}), copy.deepcopy(custom or {}))
         self._staged.pop(step, None)
 
     def _custom(self, step: int) -> dict:
@@ -1151,7 +1155,7 @@ class Checkpoints:
             if step not in self._committed:
                 if not self._complete(step):
                     continue
-                self._cache_step(step, persistent.metadata(step))
+                self._cache_step(step, persistent)
             # A view of the committed record; `_kept` copies the nested rules callers may change.
             retained.append(_kept(step, *self._committed[step]))
         return retained
@@ -1258,9 +1262,8 @@ class Checkpoints:
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue
-                metadata = self._step_metadata(step)
-                self._cache_step(step, metadata)
-                custom = metadata.custom_metadata or {}
+                self._cache_step(step, self._manager)
+                custom = self._committed[step][1]
                 if custom.get('profiles') is not None:
                     self._profile_snapshots.add(step)
                 for name, rule in (custom.get('rankings') or {}).items():

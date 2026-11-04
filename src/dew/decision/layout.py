@@ -625,8 +625,8 @@ _UNREAD = _Unread()
 class QuestionLayout(Layout):
     """A layout of one row per question, scored at one marker token per option.
 
-    Each option is rendered as text (`key: description` for a choice,
-    `level i: description` for a score, `false: ...` and `true: ...` for a noul).
+    Each option is rendered as text (`option_text`: `key: description` for a choice, or its
+    description alone, `level i: description` for a score, `false: ...` and `true: ...` for a noul).
     The question, its instructions and options, is kept whole, and the state
     fills the rest of `max_len`; a list state (a conversation) keeps its end, and
     any other state keeps its start. A question that alone passes `max_len` is a
@@ -687,6 +687,13 @@ class QuestionLayout(Layout):
     reads: "Reads | None" = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
     """Which of the row's streams each reads (`Reads`), where its question's segments stand in a stream
     of the row's own (`Instructions.stream`); None for a row read in order."""
+
+    option_text: Literal["named", "described"] = dataclasses.field(default="named", repr=False,
+                                                                    metadata={_records.ADDED: True})
+    """How a choice's option is written (`options`): `named`, its key and its description
+    (`key: description`), as Laya's release reads its rows; or `described`, its description alone, the
+    option's text, which a fresh head reads (`default_layout`), so a key that only identifies the
+    option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1158,11 +1165,12 @@ class QuestionLayout(Layout):
             budget = self.head_max_len - fixed - sum(len(option) + each for option in options)
         return head[:max(8, budget)], options
 
-    @staticmethod
-    def options(question: Question) -> tuple[str, ...]:
-        """Return each option's text, in the question's order."""
+    def options(self, question: Question) -> tuple[str, ...]:
+        """Return each option's text, in the question's order (`option_text`)."""
         if isinstance(question, Choice):
-            return tuple(key if description is None or description == "" else f"{key}: {render(description)}"
+            return tuple(key if description is None or description == ""
+                         else render(description) if self.option_text == "described"
+                         else f"{key}: {render(description)}"
                          for key, description in zip(question.options, question.descriptions, strict=True))
         if isinstance(question, Score):
             return tuple(f"level {level}: {render(description)}"
@@ -1915,10 +1923,11 @@ def default_layout(causal: bool, one_question: bool) -> Layout:
     request in one row (`JointLayout`) for a head that reads several a row
     (`Head.one_question` false), else the one the backbone's order asks for,
     the state first for a causal backbone (`StateFirstLayout`) and Laya's
-    markers for a bidirectional one (`MarkerLayout`)."""
+    markers for a bidirectional one (`MarkerLayout`), each choice option written as its description,
+    the option's text (`QuestionLayout.option_text`)."""
     if not one_question:
         return JointLayout()
-    return StateFirstLayout() if causal else MarkerLayout()
+    return StateFirstLayout(option_text="described") if causal else MarkerLayout(option_text="described")
 
 
 def _compact(value: JSON) -> str:
