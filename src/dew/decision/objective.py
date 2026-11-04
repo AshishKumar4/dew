@@ -459,7 +459,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             )
             logits = logits / jnp.asarray(table)[inputs.kinds, jnp.sum(inputs.options, axis=-1)][..., None]
         empty = ~jnp.any(inputs.options, axis=-1, keepdims=True)
-        probabilities = jax.nn.softmax(jnp.where(empty, 0.0, logits), axis=-1)
+        probabilities = categorical.probabilities(jnp.where(empty, 0.0, logits))
         return Decisions(
             probabilities=probabilities,
             options=inputs.options,
