@@ -214,6 +214,14 @@ def _fitted_file(directory: str, weights: Weights) -> epath.Path:
     return epath.Path(directory) / CALIBRATIONS / f"{weights.step}{'-averaged' if weights.ema else ''}.json"
 
 
+def step_calibrations(directory: str, step: int) -> tuple[epath.Path, ...]:
+    """The calibrations the run in `directory` keeps fitted on `step`'s weights, live and averaged, each
+    file that exists: what a read of that step loads beside its latest (`Decide.from_saved`), which an
+    export of the step is a function of (`dew.interop.saved_sources`)."""
+    return tuple(path for path in (_fitted_file(directory, Weights(step, ema)) for ema in (False, True))
+                 if path.exists())
+
+
 def _calibrated(directory: str, weights: Weights | None = None
                 ) -> tuple[Mapping[str, object], Weights] | None:
     """The calibration `Decide.save` wrote into the run in `directory` and the weights it was fitted on:

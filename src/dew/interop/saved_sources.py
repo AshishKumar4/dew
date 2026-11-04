@@ -84,12 +84,16 @@ def _fingerprint(run: SavedRun, ema: bool | None) -> str:
     """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
     the EMA choice, the code that writes it (`package_digest`, ledger 2775), the contents of the run's
     own records beside its checkpoints (its run record and a task's assets, a decision task's
-    calibration among them), and the step's metadata files, by size and write time, which a new save of
-    the step rewrites."""
+    calibration among them, its latest and those fitted on the step, `step_calibrations`), and the
+    step's metadata files, by size and write time, which a new save of the step rewrites."""
+    from dew.decision.task import step_calibrations
+
     root = epath.Path(run.directory)
     digest = hashlib.sha256(json.dumps([str(root), run.step, ema, package_digest()]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
+    for path in step_calibrations(str(root), run.step):
+        digest.update(f"{path.parent.name}/{path.name}\0".encode() + path.read_bytes())
     for path in sorted((root / str(run.step)).iterdir(), key=str):
         if path.is_file():
             stat = path.stat()
