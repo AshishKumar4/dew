@@ -826,7 +826,7 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import i64, rewrite, ruleset, var
+from egglog import i64, rewrite, var
 from jax.core import eval_jaxpr
 
 from dew import algebra
@@ -856,9 +856,9 @@ def computed():
 
 before = computed()
 variable, params = var("x", Term), var("params", i64)
-exponential = ruleset(rewrite(variable.unary("exp", params)).to(variable), name="registered after")
-rules.register(rules.Rules("registered after", "reorders", exponential, receipt="a test's",
-                           instances={"the exponential as its argument": (jnp.exp, lambda x: x, None)}))
+exponential = rules.Family("the exponential as its argument",
+                           (rewrite(variable.unary("exp", params)).to(variable),), (jnp.exp, lambda x: x, None))
+rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
 print(json.dumps({"before": before, "after": computed()}))
 """
 """A process that rewrites a program's window and a branch body of one held program, registers a rule set

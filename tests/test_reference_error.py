@@ -2439,7 +2439,7 @@ import json
 
 import jax.numpy as jnp
 import numpy as np
-from egglog import i64, rewrite, ruleset, var
+from egglog import i64, rewrite, var
 from reference_error import GateFailure, assert_as_exact, dew_programs
 
 from dew.algebra import rules
@@ -2447,10 +2447,9 @@ from dew.algebra.terms import Term
 from dew.nn.kernels import options
 
 x, params = var("x", Term), var("params", i64)
-rules.register(rules.Rules("faulty exponential", "reorders",
-                           ruleset(rewrite(x.unary("exp", params)).to(x), name="faulty exponential"),
-                           receipt="tests/test_reference_error.py",
-                           instances={"the exponential as its argument": (jnp.exp, lambda x: x, None)}))
+faulty = rules.Family("the exponential as its argument", (rewrite(x.unary("exp", params)).to(x),),
+                      (jnp.exp, lambda x: x, None))
+rules.register(rules.Rules.declared("faulty exponential", "reorders", (faulty,), "a test's"))
 
 
 def sums(x, y):

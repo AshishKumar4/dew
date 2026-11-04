@@ -84,8 +84,7 @@ def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
     named = {name.split(": ", 1)[0] for name in rules.instances()}
     assert named == set(rules.RULES)
     with pytest.raises(ValueError):
-        rules.register(rules.Rules("unqualified", "exact", rules.RULES["identities"].ruleset, receipt="",
-                                   instances={}))
+        rules.register(rules.Rules.declared("unqualified", "exact", (), ""))
 
 
 def test_each_rewrite_of_a_registered_set_is_declared_with_its_instance():
