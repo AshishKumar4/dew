@@ -912,3 +912,64 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
             algebra.program_of(closed)
             reused.append([made.reused for made in report.rewrites()])
     assert reused[0] and not any(reused[0]) and not any(reused[1])
+
+
+def _scaled_twice(s, q_pos, k_pos, a, b):
+    """A score hook the pass rewrites: two scales of the logits summed, one product of their sum."""
+    return s * a + s * b
+
+
+def _multiplies(closed) -> int:
+    return sum(equation.primitive is jax.lax.mul_p for equation in equations(closed))
+
+
+def test_a_score_hook_and_its_slopes_pass_the_algebra_pass_before_a_kernel_places_them():
+    """A score hook and its derivative are rewritten by the algebra pass before a kernel's tile places them
+    (docs/design/algebra.md §2): the tile's hook (`attention_algebra.hooked`) and its slopes
+    (`attention_gradient.scored`) trace the hook's cheaper form, one multiply of the two scales' sum, which
+    they compute as the hook does (check 1); with the pass off, the hook as written."""
+    from dew.nn.kernels.templates.attention_algebra import hooked
+    from dew.nn.kernels.templates.attention_gradient import scored
+
+    q_pos, k_pos = jnp.arange(16)[:, None], jnp.arange(32)[None, :]
+
+    def tile(s, a, b):
+        return hooked(_scaled_twice, s, q_pos, k_pos, (a, b))
+
+    def sloped(s, a, b):
+        return scored(_scaled_twice, s, q_pos, k_pos, (a, b), slopes=True)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((16, 32)), jnp.float32),
+                *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
+
+    assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 1
+    with algebra.passes(on=False):
+        assert _multiplies(jax.make_jaxpr(tile)(*draw(0))) == 2
+    rewritten, written = jax.make_jaxpr(sloped)(*draw(0)), None
+    with algebra.passes(on=False):
+        written = jax.make_jaxpr(sloped)(*draw(0))
+    assert _multiplies(rewritten) < _multiplies(written)
+    assert_as_exact(jax.jit(tile), jax.jit(lambda s, a, b: _scaled_twice(s, q_pos, k_pos, a, b)), draw,
+                    "a rewritten score hook", seeds=8)
+
+
+def test_a_fused_gemms_producer_passes_the_algebra_pass_before_the_fuser_places_it():
+    """A fused GEMM's producer is rewritten by the algebra pass before the fuser stages it (algebra.md §2):
+    a producer of two scales of one operand summed is staged as its cheaper form, its window's rewrite
+    spliced (the fused products' values against their references: tests/test_gemm_template.py)."""
+    from dew.nn.kernels.templates.gemm import fused
+
+    def producer(values):
+        x, a, b = values
+        return x * a + x * b
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((64, 128)), jnp.float32),
+                *(jnp.asarray(rng.uniform(0.5, 2.0), jnp.float32) for _ in range(2)))
+
+    with report.refusals():
+        fused._split(producer, draw(0))
+        assert any(made.spliced for made in report.rewrites())
