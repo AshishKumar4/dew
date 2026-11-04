@@ -70,9 +70,22 @@ def test_linearity_joins_two_reductions_into_one_pass():
 
 def test_each_rule_holds_its_right_side_to_its_left_side():
     """Every registered rule's right side is on par with its left side against the float64 truth (check 1),
-    over drawn and adversarial operands, as `algebra.rules.checked` instantiates each."""
+    over drawn and adversarial operands, as its set states its instances (`algebra.rules.instances`)."""
     for name, (left, right, draw) in algebra.rules.instances().items():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
+
+
+def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
+    """The qualification inventory is the registry's (`rules.instances`): every registered set's instances
+    name it, every set has some, and a set registered with none is refused, so no set enters the pass
+    unqualified and no instance stands for a rule the registry does not hold."""
+    from dew.algebra import rules
+
+    named = {name.split(": ", 1)[0] for name in rules.instances()}
+    assert named == set(rules.RULES)
+    with pytest.raises(ValueError, match="instances"):
+        rules.register(rules.Rules("unqualified", "exact", rules.RULES["identities"].ruleset, receipt="",
+                                   instances={}))
 
 
 def test_a_compensated_sums_residual_survives_a_rewritten_program():
