@@ -28,9 +28,10 @@ process has to itself (`dew.cache.measures_picks`), every variant of a launch
 without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept;
 a win over the derived config is a gap in the derivation, fixed there for
-the whole family. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public API
-leaves to its callers. Wall-clock timing is
+the whole family, which `gaps` names for maintainers. Picks persist per GPU model and jaxlib beside XLA's own
+(`dew.cache.kernel_picks_path`), each launch's under the jax it was measured with (Pallas lowers a kernel in
+jax, which a release moves without jaxlib), in Dew's own JSON (`encoded`, `decoded`), which tokamax's public
+API leaves to its callers. Wall-clock timing is
 `dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
 Tile choice changes a kernel's reduction order, and its error is not
@@ -73,6 +74,7 @@ from jax.extend.backend import get_default_device
 
 from dew import _coordination, _records, cache
 from dew._records import JSON
+from dew.algebra.terms import opaque, parameter_key
 from dew.files import write_atomically
 from dew.nn.kernels.options import owned_program
 
@@ -362,9 +364,46 @@ def loads_launches(text: str) -> list[tokamax.BoundArguments]:
 
 def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
-    them (`_read`): each launch with the configs that ran."""
+    them (`_read`): each launch with the jax it was measured under, its derived config (`gaps`) and
+    the configs that ran."""
     return json.dumps({"device_kind": device_kind, "data": [
-        {**_launch_json(ba), "timings": _timings_json(timings)} for ba, timings in picks]})
+        {**_launch_json(ba), "jax": jax.__version__, "derived": encoded(ba.heuristics_config),
+         "timings": _timings_json(timings)} for ba, timings in picks]})
+
+
+@dataclasses.dataclass(frozen=True)
+class Gap:
+    """A stored launch whose fastest config is not its derived one: a gap in the derivation, which a
+    maintainer fixes for the whole family (bible §6). `derived_ms` is None where the derived config did
+    not run."""
+
+    kernel: str
+    key: str
+    derived: Hashable
+    picked: Hashable
+    derived_ms: float | None
+    picked_ms: float
+
+    @property
+    def gain(self) -> float | None:
+        """The derived config's time over the pick's."""
+        return None if self.derived_ms is None else self.derived_ms / self.picked_ms
+
+
+def gaps(device_kind: str) -> list[Gap]:
+    """The launches stored for GPUs of `device_kind` under this jax whose derived config lost
+    (`Gap`), each named once."""
+    found = []
+    ours, _ = _partitioned(cache.kernel_picks_path(device_kind))
+    for entry, (ba, timings) in ours:
+        derived, fastest = _key(decoded(entry["derived"])), timings.fastest_config
+        if fastest == derived:
+            continue
+        time = timings.get(derived)
+        found.append(Gap(type(ba.op).__name__, str(dict(ba.autotuning_cache_key)), derived, fastest,
+                         time.median_evaluation_time_ms if isinstance(time, tokamax.BenchmarkData) else None,
+                         timings[fastest].median_evaluation_time_ms))
+    return found
 
 
 class _Picks(dict):
@@ -724,6 +763,11 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     def update(*parts) -> None:
         digest.update(repr(parts).encode())
 
+    def read(parameter) -> Hashable:
+        # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
+        # same in every process (`terms.opaque`).
+        return opaque(parameter_key(parameter))
+
     def constants(values) -> None:
         for constant in values:
             if isinstance(constant, jax.core.Tracer):
@@ -741,7 +785,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
         def atom(value) -> Hashable:
             if isinstance(value, jax_core.Literal):
-                return "literal", str(value.aval), _parameter(value.val)
+                return "literal", str(value.aval), read(value.val)
             return bound(value)
 
         update("inputs", *((bound(var), str(var.aval)) for var in (*jaxpr.constvars, *jaxpr.invars)))
@@ -750,9 +794,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
                    tuple((bound(var), str(var.aval)) for var in equation.outvars),
                    # The configuration an equation evaluates and lowers under (a key's bits' construction).
-                   _parameter((context.compute_type, context.threefry_partitionable, context.xla_metadata,
-                               str(context.cur_abstract_mesh), str(context.cur_layout_mode),
-                               context.remove_size_one_mesh_axis)))
+                   read((context.compute_type, context.threefry_partitionable, context.xla_metadata,
+                         str(context.cur_abstract_mesh), str(context.cur_layout_mode),
+                         context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
@@ -761,7 +805,7 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
                         constants(inner.consts)
                         walk(inner)
                     else:
-                        update(name, _parameter(inner))
+                        update(name, read(inner))
         update("outputs", *(atom(value) for value in jaxpr.outvars))
 
     constants(closed.consts)
@@ -775,31 +819,6 @@ def _host(value) -> np.ndarray:
     if isinstance(value, jax.Array) and jnp.issubdtype(value.dtype, jax.dtypes.prng_key):
         return np.asarray(jax.random.key_data(value))
     return np.asarray(value)
-
-
-def _parameter(value) -> Hashable:
-    """An equation's parameter as `program`'s digest reads it, the same in every process: a number or a
-    string as it is, a sequence's and a set's parts in order (a set's sorted by their own, which a process's
-    hash seed does not order), a mapping's items sorted, an array by its shape, dtype and bytes' digest, a
-    function by its module and name, any other object by its type and its representation less a memory
-    address (which no two processes share); each tagged with its kind."""
-    if value is None or isinstance(value, (bool, int, float, complex, str)):
-        return type(value).__name__, value
-    if isinstance(value, (tuple, list)):
-        return type(value).__name__, tuple(_parameter(part) for part in value)
-    if isinstance(value, (set, frozenset)):
-        return "set", tuple(sorted((_parameter(part) for part in value), key=repr))
-    if isinstance(value, dict):
-        return "mapping", tuple(sorted(((_parameter(key), _parameter(part)) for key, part in value.items()),
-                                       key=repr))
-    if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax.core.Tracer):
-        array = _host(value)
-        return ("array", str(value.dtype), array.shape, str(array.dtype),
-                hashlib.sha256(array.tobytes()).hexdigest()[:16])
-    if isinstance(value, types.FunctionType):
-        return "function", value.__module__, value.__qualname__
-    text = repr(value)
-    return type(value).__qualname__, None if " at 0x" in text else text
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
@@ -997,30 +1016,41 @@ def _read(path: str) -> tuple[Keyed, list]:
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
     config fields, or another signature of a kernel, with an operand more or
-    one fewer), which a write keeps as they are. An entry is read only where
-    its argument names are exactly its kernel's parameters. Each launch is
-    read alone, so one launch
-    this checkout cannot read leaves the others readable. A missing file, or
-    one that is not JSON, holds nothing."""
-    if not os.path.exists(path):
-        return {}, []
-    try:
-        with open(path) as file:
-            stored = json.load(file)
-        entries = list(stored["data"])
-    except (ValueError, KeyError, TypeError) as error:
-        _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
-        return {}, []
-    read: Keyed = {}
-    foreign = []
-    for entry in entries:
-        try:
-            launch = _launch(entry), _timings(entry.get("timings") if isinstance(entry, dict) else None)
-        except Unreadable:
+    one fewer, or a launch measured under another jax), which a write keeps
+    as they are. An entry is read only where its argument names are exactly
+    its kernel's parameters. Each launch is read alone, so one launch this
+    checkout cannot read leaves the others readable. A missing file, or one
+    that is not JSON, holds nothing."""
+    ours, foreign = _partitioned(path)
+    return _keyed([launch for _, launch in ours]), foreign
+
+
+def _partitioned(path: str) -> tuple[list[tuple[dict, tuple[tokamax.BoundArguments, Timings]]], list]:
+    """The entries of the store at `path` this checkout reads, each with its launch and timings, and the
+    entries it does not (`_read`): another checkout's, or one measured under another jax or written
+    before the store kept its jax."""
+    ours, foreign = [], []
+    for entry in _stored(path):
+        if not isinstance(entry, dict) or entry.get("jax") != jax.__version__:
             foreign.append(entry)
             continue
-        read.update(_keyed([launch]))
-    return read, foreign
+        try:
+            ours.append((entry, (_launch(entry), _timings(entry.get("timings")))))
+        except Unreadable:
+            foreign.append(entry)
+    return ours, foreign
+
+
+def _stored(path: str) -> list:
+    """The entries of the store at `path`, as JSON; none where it is missing or no store."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as file:
+            return list(json.load(file)["data"])
+    except (ValueError, KeyError, TypeError) as error:
+        _log.warning("the kernel picks at %s are not a store, so they are measured anew: %s", path, error)
+        return []
 
 
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:

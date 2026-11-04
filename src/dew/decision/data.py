@@ -468,11 +468,23 @@ def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "tex
     return dataclasses.replace(chain, source=wrapped).map(Configured(_ParseConfigured(table), needs=()))
 
 
-def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
-            descriptor: str | None = None) -> tuple[Pipeline, Pipeline | None]:
+STREAMED_WINDOW = 2**14
+"""The rows a corpus read as a stream draws its order from (`mixture`): decision examples are rows of
+text, so this many hold tens of megabytes."""
+
+
+def mixture(root_url: str, *, weights: Mapping[str, float] | None = None, descriptor: str | None = None,
+            seed: int | None = 0) -> tuple[Pipeline, Pipeline | None]:
     """The decision corpora of the mixture directory `root_url` (its `mixture.json`): every corpus of a
     positive weight, the manifest's weights over `weights`, mixed by them for training, and their held
-    rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL."""
+    rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL.
+
+    Each corpus trains on its rows in an order drawn from `seed` and its name (`Pipeline.shuffle`): all
+    of them permuted where the run reads by index, within `STREAMED_WINDOW` rows where it streams. The
+    mix takes each corpus's next row in that order, so every window of the mix holds each corpus at its
+    share, and a corpus whose file groups its rows by task gives no window the next rows of its file.
+    `seed=None` reads each corpus in its file's order. A stage of each corpus's chain, the order
+    resumes and continues into a later phase as each corpus read it (`dew.data.compile`)."""
     from dew.data.sources import Source
     from dew.data.sources.concatenate import Concatenate
 
@@ -487,6 +499,8 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
             continue
         for split, destination in (("train", training), ("held", held)):
             read = _corpus(root_url, stated, pinned, name, split)
+            if read is not None and split == "train" and seed is not None:
+                read = read.shuffle(_drawn(seed, name), streamed=STREAMED_WINDOW)
             if read is not None:
                 destination.append(read)
         kept.append(weight)
@@ -503,6 +517,12 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
         Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
         _slots(stated) or None, descriptor=pinned)).map(ParseExample())
     return train, evaluated
+
+
+def _drawn(seed: int, name: str) -> int:
+    """Corpus `name`'s own seed of a mixture drawn from `seed` (`mixture`): two corpora of one length read
+    in orders of their own, and a corpus keeps its order whichever others the mixture weighs."""
+    return int.from_bytes(hashlib.sha256(f"{seed}:{name}".encode()).digest()[:4], "big")
 
 
 def corpus(root_url: str, name: str, split: Literal["train", "held"] = "held",

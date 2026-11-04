@@ -50,6 +50,52 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
                                norm_swiglu.SwigluBackward))
 
 
+def _norm_launch_and_two_configs():
+    """A norm launch of `test_tuning`'s step, its derived config and another of its space."""
+    from test_tuning import operands, step
+
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    ba = next(ba.op.keyed(ba) for ba in found if len(ba.autotuning_configs) > 1)
+    other = next(config for config in ba.autotuning_configs if config != ba.heuristics_config)
+    return ba, ba.heuristics_config, other
+
+
+def _timed(ms):
+    return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,),
+                                 metadata={})
+
+
+def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
+    """Picks persist per device, shape and JAX version (bible §6): Pallas lowers a kernel in jax itself,
+    which a release moves without jaxlib, so a launch measured under another jax is read by none, kept
+    in the store for its own checkout, and measured anew here."""
+    monkeypatch.setattr(tuning.cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    ba, derived, other = _norm_launch_and_two_configs()
+    with monkeypatch.context() as patched:
+        patched.setattr(jax, "__version__", "0.0.0.other")
+        tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
+    read, foreign = tuning._read(str(tmp_path / "gpu.json"))
+    assert (read, len(foreign)) == ({}, 1)
+    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
+    read, foreign = tuning._read(str(tmp_path / "gpu.json"))
+    assert len(read) == 1 and len(foreign) == 1
+
+
+def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):
+    """The tuner's picks feed a maintainer report (bible §6): each stored launch whose fastest config is
+    not its derived one names the launch, its derived config and the pick, and their times; a launch
+    whose derived config won names none."""
+    monkeypatch.setattr(tuning.cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
+    ba, derived, other = _norm_launch_and_two_configs()
+    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(3.0), other: _timed(2.0)}))])
+    [gap] = tuning.gaps("gpu")
+    assert (gap.derived, gap.picked, gap.derived_ms, gap.picked_ms) == (derived, other, 3.0, 2.0)
+    assert gap.gain == 1.5 and gap.key == str(dict(ba.autotuning_cache_key))
+    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(1.0), other: _timed(2.0)}))])
+    assert tuning.gaps("gpu") == []
+
+
 def test_a_timing_mapping_takes_its_fastest_run_and_drops_its_failures():
     def timed(ms):
         return tokamax.BenchmarkData(compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(ms,),
@@ -515,10 +561,40 @@ def test_a_programs_key_holds_what_its_equations_evaluate_under():
 
 
 UNORDERED = """
-from dew.nn.kernels import tuning
-print(repr(tuning._parameter(frozenset({"data", "model", "expert", "pipeline"}))))
+from dew.algebra.terms import parameter_key
+print(repr(parameter_key(frozenset({"data", "model", "expert", "pipeline"}))))
 """
-"""A parameter JAX holds as a set of axis names (`shard_map`'s manual axes), as `program` reads it."""
+"""A parameter JAX holds as a set of axis names (`shard_map`'s manual axes), as `program` reads it
+(`dew.algebra.terms.parameter_key`)."""
+
+
+CALLED_BACK = """
+import functools
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dew.nn.kernels import tuning
+
+def scaled(x, factor):
+    return np.asarray(x) * factor
+
+def hook(x):
+    shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    return jax.pure_callback(functools.partial(scaled, factor=2.0), shape, x)
+
+print(tuning.program(hook, jax.ShapeDtypeStruct((4,), jnp.float32)))
+"""
+"""A launch's hook calling back into a module's function with an argument bound (`functools.partial`), as
+`program` keys it."""
+
+
+def test_a_programs_key_reads_a_callback_alike_in_every_process():
+    """A hook calling back into a function with an argument bound is keyed alike in every process, whose
+    functions sit at other addresses: every process keys the launch alike and a pick persists across runs."""
+    read = {subprocess.run([sys.executable, "-c", CALLED_BACK], capture_output=True, text=True, check=True,
+                           env={**os.environ, "JAX_PLATFORMS": "cpu"}).stdout
+            for _ in range(2)}
+    assert len(read) == 1
 
 
 def test_a_programs_key_reads_a_set_alike_in_every_process():

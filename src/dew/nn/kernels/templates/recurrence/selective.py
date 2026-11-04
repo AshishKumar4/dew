@@ -20,8 +20,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import mosaic, resources, scan as block_scan
+from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
+from dew.nn.kernels.templates import cost, mosaic, resources, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -35,7 +35,8 @@ class Scan:
     `channels` channels and `states` states each, `block` channels a program, on `family`'s Mosaic GPU
     mainloop (interpreted where `interpret`); `packed` where tokens reset their state (a document's first),
     `entered` where the entering state of each chunk opening a backward block (`block_positions`) is kept
-    for the backward, which starts its blocks from them."""
+    for the backward, which starts its blocks from them; the backward's tokens a thread and programs a
+    multiprocessor (`backward_plan`)."""
 
     rows: int
     length: int
@@ -47,6 +48,8 @@ class Scan:
     interpret: bool = False
     packed: bool = False
     entered: bool = False
+    positions: int = 8
+    resident: int = 3
 
     @property
     def chunks(self) -> int:
@@ -55,7 +58,7 @@ class Scan:
     @property
     def opening(self) -> int:
         """The chunks a backward block takes, its first's entering state the forward keeps (`entered`)."""
-        return block_positions(self.length) // self.chunk
+        return block_positions(self.length, self.positions) // self.chunk
 
     @property
     def blocks(self) -> int:
@@ -193,30 +196,65 @@ sequential adds put B's gradient 1.95 times the portable scan's distance from fl
 starting at every chunk (the interpreted regime test); the adds a buffer takes fewer, as contended."""
 
 
-POSITIONS_PER_THREAD = 8
-"""The tokens a backward thread takes: the most whose registers leave a multiprocessor three programs, as
-mamba_ssm's kMinBlocks at 128 threads holds (`__launch_bounds__(128, 3)`, selective_scan_bwd_kernel.cuh): at
-8 the backward needed 152 registers spill-free (`BACKWARD_REGISTERS`), at 16 224, past every residency but
-one (need-*-sm90 at 1213539d0 and 02c73b9f0, minctasm-1213539d0); its warpgroup's 1024 tokens a block."""
+BACKWARD_VECTORS = 12
+"""The token vectors a backward thread holds live at its state loop's peak, each its tokens' fp32 values: the
+channel's sums over the states (dx, ddt), the block's operands (x, dt, dy), and the state's (B, C, its decay,
+its write, the states before each token, C dy and the cotangent after each token), counted from `backward`."""
 
-BACKWARD_REGISTERS = 152
-"""The registers a backward thread holds at `POSITIONS_PER_THREAD` tokens, ptxas's least spill-free cap (165
-taken at minctasm 3): its residency's need (`RESIDENT`)."""
+BACKWARD_FIXED = 56
+"""The registers a backward thread holds apart from its token vectors: its refs' 64-bit addresses (20), the
+block scan's running pair, lane and warp terms (8), the state loop's scalars (its rate, entering state,
+carried cotangent, rate gradient so far and indices, 12) and a thread's control
+(`resources.CONTROL_REGISTERS`). With `BACKWARD_VECTORS` it states ptxas's least spill-free cap on an H100 at
+4, 8 and 16 tokens a thread, 96, 152 and 232, as 104, 152 and 248 (sel-need at f3040b154)."""
 
-RESIDENT = max(programs for programs in range(1, resources.RESIDENT_PROGRAMS + 1)
-               if resources.entry_registers(1, programs) >= BACKWARD_REGISTERS)
-"""The backward's programs a multiprocessor holds at once: the most whose share of its registers holds
-`BACKWARD_REGISTERS` a thread (three, 168 each), which its compile caps a thread's registers at
-(`mosaic.compiler_params`' `resident`, `min_blocks_per_sm`), where ptxas otherwise fills them, two programs a
-multiprocessor at any tokens a thread (row 2940)."""
+SCAN_STEPS = 16
+"""The dependent steps of one block scan past its tokens' own (`templates.scan.linear_scan`): six shuffles
+across the warp, three warpgroup barriers, a shared store and load of the warps' aggregates and four joins of
+them, and the apply to the thread's tokens. The backward runs two a state, forward and reverse."""
 
 
-def block_positions(length: int) -> int:
-    """The tokens a backward block of a scan `length` tokens long takes: its threads'
-    (`POSITIONS_PER_THREAD`) where the length is long enough, else the fewest whole tokens a thread covering
-    it."""
+def backward_registers(positions: int) -> int:
+    """The registers a backward thread holds at `positions` tokens (`BACKWARD_VECTORS`, `BACKWARD_FIXED`)."""
+    return BACKWARD_VECTORS * positions + BACKWARD_FIXED
+
+
+def backward_programs(registers: int, target: generation.GpuTarget) -> int:
+    """The programs of the backward, one warpgroup and no producer, a multiprocessor of `target` holds at once
+    at `registers` a thread: the most whose share of its registers (`resources.entry_registers`) holds them,
+    within its resident threads."""
+    threads = target.architecture.resident_threads // block_scan.THREADS
+    return max((programs for programs in range(1, min(resources.RESIDENT_PROGRAMS, threads) + 1)
+                if resources.entry_registers(1, programs) >= registers), default=0)
+
+
+def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
+    """The backward's tokens a thread and the programs a multiprocessor holds of it at their registers
+    (`backward_registers`, `backward_programs`), which its compile caps a thread's registers at
+    (`mosaic.compiler_params`' `resident`): of the token counts whose registers a thread holds, the one whose
+    dependent steps a token, its own two and its block's scans' `2 * SCAN_STEPS` shared by the thread's
+    tokens, take the least time across the programs a multiprocessor holds at once, ties to more programs
+    (a family whose threads issue their own steps hides their latency by resident warps first,
+    `resources.hidden`). On an H100 the derived 8 tokens at three programs took Mamba-1's bf16 training step
+    at 8x2048x5120 in 6.43 ms, 16 at two 6.48, 4 at four 7.48, and fewer programs than the registers hold
+    longer at each (8 at two 8.10, 4 at three 8.53): ptxas filled the registers a cap left it, and the step
+    slowed (sel-sweep-sxm at f3040b154)."""
+    plans = []
+    positions = 1
+    while backward_registers(positions) <= cost.THREAD_REGISTERS:
+        programs = backward_programs(backward_registers(positions), target)
+        if programs:
+            plans.append(((2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs, positions))
+        positions *= 2
+    _, programs, positions = min(plans)
+    return positions, -programs
+
+
+def block_positions(length: int, positions: int) -> int:
+    """The tokens a backward block of a scan `length` tokens long takes: its threads' `positions` each where
+    the length is long enough, else the fewest whole tokens a thread covering it."""
     threads = block_scan.THREADS
-    return min(threads * POSITIONS_PER_THREAD, -(-length // threads) * threads)
+    return min(threads * positions, -(-length // threads) * threads)
 
 
 @tuning.lowered_once(("scan",))
@@ -237,7 +275,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped)."""
     rows, channels, length = x.shape
-    states, positions = b.shape[1], block_positions(length)
+    states, positions = b.shape[1], block_positions(length, scan.positions)
     blocks = length // positions
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
@@ -312,7 +350,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 sized((rows, states, channels), jnp.float32))
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, channels), grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
-                             name="selective_scan_backward", resident=RESIDENT,
+                             name="selective_scan_backward", resident=scan.resident,
                              scratch=(block_scan.scratch(), block_scan.exchange_scratch(positions),
                                       plgpu.SMEM((2, states), jnp.float32)))
     def accumulated(refs):
@@ -339,9 +377,12 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     Returns `(y [B, S, D], final state [B, D, N])` in `x`'s dtype. The sequence is padded to whole chunks
     with a zero step, which neither decays nor writes. `chunk` divides the backward's block
     (`block_positions`), which starts from a chunk's entering state the forward keeps."""
-    if block_scan.THREADS * POSITIONS_PER_THREAD % chunk:
+    # Interpreted, the interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`).
+    positions, resident = backward_plan(generation.gpu_target(
+        generation.INTERPRETED_GENERATION if interpret else None))
+    if block_scan.THREADS * positions % chunk:
         raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
-                         f"{block_scan.THREADS * POSITIONS_PER_THREAD}: its blocks start at no kept state")
+                         f"{block_scan.THREADS * positions}: its blocks start at no kept state")
     rows, length, channels = x.shape
     states = A.shape[-1]
     padded = -(-length // chunk) * chunk
@@ -351,7 +392,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
                 else jnp.swapaxes(jnp.asarray(state, jnp.float32), 1, 2))
-    scan = Scan(rows, padded, channels, states, chunk, block, family, interpret, packed=starts is not None)
+    scan = Scan(rows, padded, channels, states, chunk, block, family, interpret, packed=starts is not None,
+                positions=positions, resident=resident)
     y, final = _scan(pad(x), pad(dt), jnp.asarray(A, jnp.float32), pad(B), pad(C),
                      jnp.asarray(D, jnp.float32), entering, resets, scan)
     return y[:, :length], jnp.swapaxes(final, 1, 2).astype(x.dtype)
@@ -380,7 +422,7 @@ def _scan_forward(x, dt, A, B, C, D, entering, resets, scan: Scan):
 def _scan_backward(scan: Scan, residuals, grads):
     x, dt, A, B, C, D, entered, resets = residuals
     dy, dfinal = grads
-    positions = block_positions(scan.length)
+    positions = block_positions(scan.length, scan.positions)
     padded = -(-scan.length // positions) * positions
 
     def leading(t):

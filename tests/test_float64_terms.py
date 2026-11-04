@@ -82,6 +82,27 @@ def test_a_recomputed_body_sums_its_own_terms():
     assert np.all(recomputed > 1e-3)
 
 
+@pytest.mark.parametrize("kind", ["Protected", "Surrogate"])
+def test_a_marked_span_is_its_bodys_value_and_sums_its_bodys_terms(kind):
+    """A marked span (`dew.nn.derivatives.marked`: an error-free transform's, a surrogate's forward body,
+    which every transform keeps one call) is the computation's own, as a recomputed body is: a key bias's
+    gradient computed inside one is the body's value and sums the same cancelling terms as outside it, so
+    its rounding bound is the body's."""
+    from dew.nn import derivatives
+
+    rng = np.random.default_rng(0)
+    query, keys, values = (rng.normal(size=shape) for shape in ((2, 4), (2, 6, 4), (2, 6, 3)))
+    gradient = jax.grad(lambda bias: loss_of(keys + bias, query, values))
+
+    with jax.enable_x64(new_val=True):
+        value, plain = float64_terms(gradient, jnp.zeros(4))
+        spanned_value, spanned = float64_terms(derivatives.marked(getattr(derivatives, kind)(), gradient),
+                                               jnp.zeros(4))
+    np.testing.assert_array_equal(spanned_value, value)
+    np.testing.assert_allclose(spanned, plain, rtol=1e-12)
+    assert np.all(spanned > 1e-3)
+
+
 def test_a_named_sum_carries_its_terms_through_a_residual_add():
     """A block names its projection's output for a remat policy
     (`checkpoint_name`) before the residual add. The name moves the sum, so
