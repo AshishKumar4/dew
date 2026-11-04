@@ -1,6 +1,6 @@
 """The arithmetic a check's arms and truths run in (tests/reference_error.py): the scope each arm runs in
-(`summed_as_run`), the programs a reference and a truth run (`unrewritten`) and the float64 truth's inputs
-(`widened`)."""
+(`summed_as_run`), the programs a reference and a truth run (`unrewritten`), the float64 truth's inputs
+(`widened`) and its compiled program (`Truth`)."""
 
 import contextlib
 import functools
@@ -60,3 +60,31 @@ def unrewritten(fn):
         with passes(on=False):
             return fn(*inputs, **options)
     return run
+
+
+class Truth:
+    """A check's float64 truth as the gate runs it (`reference_error._truth_program`): compiled from its
+    first call, or, where it cannot be traced and returns host values run as it is given (a NumPy truth), as
+    given. A truth that returns JAX values and cannot be traced does host work on its inputs (a widening or a
+    conversion on the host): it fails at its first seed with its trace's error, naming itself; it passes
+    `as_given`."""
+
+    def __init__(self, fn):
+        self.fn, self.run = fn, None
+
+    def __call__(self, *inputs):
+        if self.run is not None:
+            return self.run(*inputs)
+        compiled = jax.jit(self.fn)
+        try:
+            # Compiled from the first call on, never run eagerly: a seed's truth is the same whichever seed
+            # a process draws first (a map task's, DRAWS), and a large truth pays no eager run.
+            values = compiled(*inputs)
+        except Exception as untraced:
+            first = self.fn(*inputs)
+            if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
+                raise untraced
+            self.run = self.fn
+            return first
+        self.run = compiled
+        return values

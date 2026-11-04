@@ -872,7 +872,8 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     own. A NumPy truth (it cannot be traced, and returns host values) runs as given, and so do a truth
     `as_given`, one compiled already and a window loop's by its own; a check over a compiled truth judges
     as over the eager one."""
-    from reference_error import _Truth, _truth_program, _Windowed, as_given, over_windows
+    from arm_arithmetic import Truth
+    from reference_error import _truth_program, _Windowed, as_given, over_windows
 
     calls = []
 
@@ -899,7 +900,7 @@ def test_a_float64_truth_runs_as_one_compiled_program():
     assert _truth_program(given).__wrapped__ is given and _truth_program(_product).__wrapped__ is _product
     assert _truth_program(None) is None
     windowed = _truth_program(over_windows(truth))
-    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, _Truth)
+    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, Truth)
     assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
 
 
