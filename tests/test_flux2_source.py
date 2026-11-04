@@ -196,20 +196,35 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, on a smooth 128x192 image, against the source run in
-    float32 and float64 (`flux2_published.npz`): the pipeline's folded,
-    normalized latent and a corner of its decode, each as near float64 as the
-    source's float32."""
+    float32 on the device Dew runs on, its matmuls and convolutions in fp32
+    (no TF32), and the float64 truth recorded on the CPU
+    (`flux2_published.npz`): the pipeline's folded, normalized latent and a
+    corner of its decode, each as near float64 as the source's float32 there.
+    On an A100 cuDNN's fp32 convolutions put the source's latent 2.3 times as
+    far from float64 as the CPU's arithmetic does, Dew's alike (ledger 1703),
+    so a GPU run is judged against the source on its GPU."""
+    import torch
+
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = tool_support.load("diffusers_flux2_reference")
-    reference = np.load(ROOT / "tests/fixtures/flux2_published.npz")
+    recorded = np.load(ROOT / "tests/fixtures/flux2_published.npz")
     repo, revision = tool.PUBLISHED_VAE
     autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
     latent = autoencoder.encode(params, nhwc(tool.smooth_image()))
-    pixels = autoencoder.decode(params, nhwc(reference["vae.latent.fp64"]))[:, :tool.CROP, :tool.CROP]
+    pixels = autoencoder.decode(params, nhwc(recorded["vae.latent.fp64"]))[:, :tool.CROP, :tool.CROP]
     assert latent.shape == (1, 8, 12, 128)
+    device = {"gpu": "cuda", "cpu": "cpu"}[jax.devices()[0].platform]
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.fail("the source runs on the GPU Dew runs on, and this torch has no CUDA")
+    held = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    try:
+        reference = tool.published_walk(tool.published_vae().to(device), torch.float32)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = held
     for key, value in (("latent", latent), ("pixels", pixels)):
         assert_as_exact_as_the_reference(value, nhwc(reference[f"vae.{key}"]),
-                                         nhwc(reference[f"vae.{key}.fp64"]), f"published {key}")
+                                         nhwc(recorded[f"vae.{key}.fp64"]), f"published {key}")
 
 
 @pytest.fixture(scope="module")

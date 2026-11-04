@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -30,19 +29,6 @@ def restore_transformers_names() -> None:
                         ("WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")):
         if not hasattr(transformers.utils, name):
             setattr(transformers.utils, name, value)
-
-
-def frequency_exponent(half: int, shift: float, max_period: float) -> torch.Tensor:
-    """`get_timestep_embedding`'s float32 exponent, its own arithmetic."""
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32)
-    return exponent / (half - shift)
-
-
-def torch_exp_disagreements(half: int) -> int:
-    """How many of a `half`-entry table's frequencies torch's float32 `exp`
-    rounds differently from the float64 one; the attribution a record carries."""
-    exponent = frequency_exponent(half, 0, 10000)
-    return int((torch.exp(exponent) != torch.exp(exponent.double()).float()).sum())
 
 
 def step_noise(shape: tuple[int, ...], count: int,
