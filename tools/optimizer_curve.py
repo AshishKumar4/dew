@@ -19,6 +19,7 @@ Usage:
         --learning-rate 3e-3 --out /tmp/muon-3e-3.json
 """
 
+import functools
 import json
 import time
 from dataclasses import asdict, dataclass
@@ -40,6 +41,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
+from dew.training.ahead import step_batch
 
 Solver = Literal["adam", "adamw", "lamb", "muon", "muon-unsplit"]
 """The OPTIMIZER_MAP names, plus the unsplit Muon arm."""
@@ -117,8 +119,9 @@ def run(config: Comparison) -> Curve:
     state, _, _ = trainer.place()
     parameters = sum(x.size for x in jax.tree.leaves(state.variables))
 
-    with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)),
-                                trainer.device_mesh) as source:
+    # Each batch as `fit` hands it to its step (`step_batch`), so the step trained is a run's.
+    with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)), trainer.device_mesh,
+                                prepare=functools.partial(step_batch, trainer)) as source:
         train_step = trainer.compile(state, next(source))
 
         losses: list[float] = []

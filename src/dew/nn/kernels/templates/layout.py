@@ -9,6 +9,8 @@ from typing import Any
 import jax
 import jax.extend.core as jax_core
 
+from dew.nn.programs import CALLS
+
 
 class Untransposable(NotImplementedError):
     """A function whose program `transposed` cannot take axis for axis: an operation it has no rule for, or a
@@ -163,7 +165,7 @@ def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
         name = eqn.primitive.name
         if nested:
             # A call, or the custom derivative's own primal (its pullback's trace evaluates it).
-            if name not in (*CALLS, "custom_jvp_call", "custom_vjp_call") or not all(
+            if name not in CALLS or not all(
                     _axis_free(inner, shape) for inner in nested):
                 return False
         elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and _rank(eqn.invars[0]) == 0):
@@ -197,9 +199,6 @@ ENTRYWISE = frozenset({
 })
 """The operations of one entry at a time, whose operands are each a scalar or a value of their output's
 shape: bound on held tiles unchanged. An operation neither these nor `RULES` take is refused."""
-
-CALLS = frozenset({"jit", "pjit", "closed_call"})
-"""The operations that call a nested program as it is (`_axis_free` looks into them)."""
 
 
 def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
