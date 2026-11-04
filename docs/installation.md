@@ -182,7 +182,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `test` | The test suite's dependencies and pinned reference libraries |
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
 | `kernel-compile` | JAX's CUDA plugin, CUDA's compiler and libtpu, to compile every kernel config on a host with no accelerator |
-| `mutation` | cosmic-ray, for mutation testing (`tools/mutation.py`) |
 | `notebooks` | nbclient, nbformat and an IPython kernel, to execute notebooks |
 | `tutorials` | The tutorial notebooks' environment outside Colab: `streaming`, `interop`, `notebooks` and matplotlib |
 | `live` | The live site container's bridge: its WebSocket release, the kernel gateway, an IPython kernel and ipywidgets |
