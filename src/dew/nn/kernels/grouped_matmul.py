@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic, mosaic_sm90, report, resources, tail as tail_of
+from .templates import base, bundles, cost, mosaic, report, resources, tail as tail_of
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
 
@@ -713,7 +713,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
         K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
         refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
-        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is mosaic_sm90.WGMMA
+        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is not None and family.takes_fp8
                 and ba.arguments['trans_rhs']
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))

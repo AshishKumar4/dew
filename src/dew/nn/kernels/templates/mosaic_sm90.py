@@ -21,6 +21,7 @@ class WgmmaIssuer(mosaic.Issuer):
 
     name = "wgmma"
     takes_tf32 = True
+    takes_fp8 = True
     rows = 64
     role_rows = 64
     widest_product = 256

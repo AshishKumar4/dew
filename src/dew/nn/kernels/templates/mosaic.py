@@ -1099,6 +1099,11 @@ class Issuer[Accumulator](abc.ABC):
     fp32 shared-memory operands so; mma.sync's m16n8k8.tf32, the fork's from 0.12.0.1.post42); where not, a
     template splits fp32 operands into bf16 parts instead."""
 
+    takes_fp8: bool = False
+    """Whether its products take FP8 operands (`product.EIGHT`: E4M3, E5M2), both read K-major as Hopper's
+    warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
+    consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
+
     transposes_tf32: bool = False
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so

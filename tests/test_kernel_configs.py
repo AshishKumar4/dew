@@ -390,6 +390,9 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
 """The forms every family's GEMM launches emit: each product and output dtype they take."""
 
+FP8_FORMS = ("forward fp8",)
+"""The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
+
 HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
@@ -554,14 +557,16 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 
 
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
-    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`): none without a bundle, the
-    hooked and exactly summed ones where its register model counts what they hold (`Family.counts_hooks`);
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`): none without a
+    bundle, the hooked and exactly summed ones where its register model counts what they hold
+    (`Family.counts_hooks`), the FP8 ones where its products take FP8 (`Family.takes_fp8`);
     at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
     it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
     and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ())}
+    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ()),
+             *(FP8_FORMS if family.takes_fp8 else ())}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
