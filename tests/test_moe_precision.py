@@ -631,27 +631,27 @@ on armada."""
 
 
 @pytest.mark.mesh
-@pytest.mark.usefixtures('x64')
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 def test_both_dispatches_carry_the_same_tangents(activation):
     """A JVP through the whole routed layer, parameters, tokens and router weights all perturbed: the
     exchange dispatch's output and tangent on par with the global dispatch's from the float64 layer's
-    over the declared draws (check 1). The dispatches are two programs, the exchange splitting each
-    expert's rows over the devices, whose floats XLA keeps no common bits between (ledger 3178)."""
+    over the declared draws (check 1), that truth on a CPU device, which has the float64 ragged dot a
+    TPU has none of. The dispatches are two programs, the exchange splitting each expert's rows over
+    the devices, whose floats XLA keeps no common bits between (ledger 3178)."""
     mesh = MeshSpec(expert=4, fsdp=2).build()
     model, _, specs, tokens, *_ = placed_experts(mesh, activation, skewed=False, scale_inputs=False,
                                                  limit=None)
 
-    def dispatched(dispatch, dtype=jnp.bfloat16):
-        """The layer's JVP under `dispatch` at `dtype` on the mesh, compiled as the gate compiles two Dew
-        arms (`without_ynn`) and run as given."""
-        network = model.clone(dispatch=dispatch, dtype=dtype)
-
+    def jvp(network):
         def run(parameters, x, weights, choices, dp, dx, dw):
             return jax.jvp(lambda parameters, x, weights: jnp.asarray(
                 network.apply(parameters, x, weights, choices)), (parameters, x, weights), (dp, dx, dw))
+        return run
 
-        compiled = without_ynn(run, out_shardings=(tokens, tokens))
+    def dispatched(dispatch):
+        """The bf16 layer's JVP under `dispatch` on the mesh, compiled as the gate compiles two Dew arms
+        (`without_ynn`) and run as given."""
+        compiled = without_ynn(jvp(model.clone(dispatch=dispatch)), out_shardings=(tokens, tokens))
 
         @as_given
         def placed(*inputs):
@@ -670,9 +670,15 @@ def test_both_dispatches_carry_the_same_tangents(activation):
             return jnp.asarray(rng.normal(scale=.05, size=value.shape), value.dtype)
         return drawn, x, weights, choices, *jax.tree.map(tangent, (drawn, x, weights))
 
+    host = jax.devices("cpu")[0]
+    wide = jax.jit(jvp(model.clone(dispatch='global', dtype=jnp.float64)))
+
+    def truth(*inputs):
+        with jax.default_device(host):
+            return wide(*jax.device_put(inputs, host))
+
     assert_as_exact(dispatched('exchange'), dispatched('global'), draw,
-                    f"exchange dispatch's JVP, {activation}", seeds=DISPATCH_TANGENT_SEEDS,
-                    truth_fn=dispatched('global', jnp.float64))
+                    f"exchange dispatch's JVP, {activation}", seeds=DISPATCH_TANGENT_SEEDS, truth_fn=truth)
 
 
 def exchange_residue_case():
