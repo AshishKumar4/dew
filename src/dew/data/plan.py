@@ -39,6 +39,11 @@ _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a n
 """How a run whose saved data position this Dew cannot read goes on: every such refusal names both routes
 (row 3534)."""
 
+_REBUILT = ("resume it with the chain it saved, read back from its record "
+            "(`dew train <run directory>/run.json`, `RunConfig.load`), or build its chain as it was")
+"""How a run whose chain changed since it saved its position goes on: its record holds the chain it read
+(a default a later Dew changed, a decision mixture's corpus order among them, row 3870)."""
+
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     return json.dumps(
@@ -857,7 +862,8 @@ class Plan:
         saved_order = unplaced(json_value(saved.get("order"), "saved order"))
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
-            raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
+            raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> "
+                             f"{current['order']!r}; {_REBUILT}")
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
@@ -929,7 +935,7 @@ class Plan:
         current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
         before_order = {name: value for name, value in order.items() if name not in mixture}
         if unplaced(before_order) != unplaced(current):
-            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}")
+            raise ValueError(f"saved data plan order changed: {order!r} -> {self.order!r}; {_REBUILT}")
         return (*(f"member {key} joined" for key in sorted(set(self.members) - set(before))),
                 *(f"member {key} left" for key in sorted(set(before) - set(self.members))),
                 *(("weights changed",) if order.get("weights") != self.order.get("weights") else ()))
