@@ -990,6 +990,22 @@ def _learns_alike(before: ObjectiveConfig | None, now: ObjectiveConfig | None) -
     return kept(before) == kept(now)
 
 
+def _at(run: "RunConfig", path: str) -> str | int | None:
+    """The field of `run` at the dotted `path` (`RunConfig.BUILT`), a name, a step or None."""
+    *owners, name = path.split(".")
+    holder: DataclassInstance = run
+    for owner in owners:
+        holder = getattr(holder, owner)
+    return getattr(holder, name)
+
+
+def _with[T: "DataclassInstance"](holder: T, path: str, field: str | int | None) -> T:
+    """`holder` with its field at the dotted `path` replaced by `field`."""
+    name, _, rest = path.partition(".")
+    inner = field if not rest else _with(getattr(holder, name), rest, field)
+    return dataclasses.replace(holder, **{name: inner})
+
+
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
     Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
@@ -1000,12 +1016,28 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
-    chain's store under the fields its class renamed since, by today's names
-    (`dew.data.records.earlier_chains`).
+    decision run's option text as its rows wrote it (`earlier_option_text`); a chain's store under the
+    fields its class renamed since, by today's names (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return records.earlier_chains(earlier_profile(earlier_newton_schulz(earlier_trainer(record))), _CHAINS)
+    return records.earlier_chains(earlier_option_text(earlier_profile(earlier_newton_schulz(
+        earlier_trainer(record)))), _CHAINS)
+
+
+def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record of a class that states how its rows write a choice's option (`option_text`,
+    `dew.decision.DecisionRunConfig`) where it states none: its rows wrote each option's key beside its
+    description, as every layout did before the field (`QuestionLayout.option_text`), so it reads
+    `named`. Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    if named is None or named[0] not in registry.runs or "option_text" in named[1]:
+        return record
+    run_class = registry.runs[named[0]]
+    if not (isinstance(run_class, type) and dataclasses.is_dataclass(run_class)) or "option_text" not in {
+            field.name for field in dataclasses.fields(run_class)}:
+        return record
+    return {**record, "fields": {**named[1], "option_text": "named"}}
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1280,6 +1312,15 @@ class RunConfig:
     and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
+
+    BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step")
+    """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
+    whose resolution a later Dew, or a later state of what it reads, may change: the storage of the
+    source it reads (`SourceOptions.param_dtype`), the step of a saved Dew run it starts from, which
+    that run's later checkpoints move (`with_pinned_run`), and in a kind of run that adds them its own
+    (a decision run's option text). A run that leaves one None and resumes a saved run under its name
+    takes the saved run's value (`resumed`), so running the same command again resumes what it trained;
+    one it sets is its own, and a resume refuses it where it differs (`check_resume`)."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: Annotated[Dataset | None, tyro.conf.Suppress] = None
@@ -1606,8 +1647,10 @@ class RunConfig:
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
-        record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
-        return cls.read(earlier_run(json.loads(record)), trust=trust)
+        record = json.loads((path if str(directory).endswith(".json") else path / RUN_FILE).read_text())
+        # The packages trusted first, so the record's earlier shapes are read with its classes imported.
+        registry.import_trusted(record, trust)
+        return cls.read(earlier_run(record), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1631,9 +1674,32 @@ class RunConfig:
         return run_class.from_dict(named[1])
 
     def prepare(self) -> Prepared:
-        """Build what this run trains, as `build_run` builds it from the run with its Hub sources pinned
-        (`pinned`), so the record names what it started from and is what it loads."""
-        return self.pinned().build_run()
+        """Build what this run trains, as `build_run` builds it from the run with the fields it leaves to
+        its build at the run it resumes (`resumed`) and its Hub sources pinned (`pinned`), so the record
+        names what it started from and is what it loads."""
+        return self.resumed().pinned().build_run()
+
+    def resumed(self) -> Self:
+        """This run with each field it leaves None for its build to resolve (`BUILT`) at the value the
+        saved run it resumes under its name recorded, read as every earlier shape of a saved run is
+        (`earlier_run`); itself where it resumes none (`TrainerConfig.resumes`) or leaves none to its
+        build."""
+        trainer = self.trainer
+        unset = [path for path in self.BUILT if _at(self, path) is None]
+        if not unset or trainer.name is None or trainer.resume == "never" or not trainer.resumes():
+            return self
+        saved = epath.Path(trainer.checkpoint_dir) / trainer.name / RUN_FILE
+        if not saved.exists():
+            return self
+        named = registry.class_record(earlier_run(json.loads(saved.read_text())))
+        if named is None or registry.runs[named[0]] is not type(self):
+            return self
+        recorded = type(self).from_dict({name: value for name, value in named[1].items()
+                                         if name not in _CHAINS})
+        run = self
+        for path in unset:
+            run = _with(run, path, _at(recorded, path))
+        return run
 
     def build_run(self) -> Prepared:
         """Build what this run trains, the run as it stands, its sources already pinned (`prepare`
