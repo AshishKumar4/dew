@@ -92,10 +92,15 @@ def label_scores(token_scores: Callable, prompts: Sequence[Sequence[int]], label
     `token_scores(rows)` gives (`LMObjective.token_scores(variables, rows).losses`, `[B, S]`, the row's
     target `t + 1` at `t`), summed over the label's tokens alone. Padding after a row reads nothing a
     label's token reads. The rows are laid out on the host, so the scores trace and compile as the
-    objective's own program does."""
+    objective's own program does. A prompt holds at least one token, from which its labels' first is
+    scored (row 3941: an empty one's was left unscored)."""
     pairs = [(prompt, label) for prompt in prompts for label in labels]
     if not pairs or any(not label for label in labels):
         raise ValueError("label scores read at least one prompt and one label of at least one token")
+    if any(not prompt for prompt in prompts):
+        # A label's first token is scored from the token before it, which an empty prompt has none of.
+        raise ValueError("a label's first token is scored from the prompt's last, so every prompt holds at "
+                         "least one token: give an empty prompt the tokenizer's beginning-of-sequence token")
     width = max(len(prompt) + len(label) for prompt, label in pairs)
     rows = np.full((len(pairs), width), pad_id, np.int32)
     scored = np.zeros((len(pairs), width - 1), bool)

@@ -24,7 +24,8 @@ import jax.extend.core as jcore
 from jax.core import ShapedArray
 
 from dew.distributed.placement import placed_bytes
-from dew.training.compiled_program import bodies, computed, inlined
+from dew.nn.programs import bodies
+from dew.training.compiled_program import computed, inlined
 
 PURE_CALLS = frozenset({"jit", "pjit", "closed_call", "core_call"})
 """The operations that call a program on their operands and do nothing else, which `flattened` runs in

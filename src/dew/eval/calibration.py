@@ -79,16 +79,22 @@ def tied_prefixes(confidence: np.ndarray, correct: np.ndarray) -> tuple[np.ndarr
     return confidence[last], last + 1, np.cumsum(correct)[last]
 
 
+REJECT_ALL = float(np.nextafter(1.0, 2.0))
+"""The threshold of forecasts no threshold meets the target for: the next float above every probability, so
+an abstention below it (`Calibration.abstains`) abstains on all of them, a top of exactly 1 among them (row
+3939: a threshold of 1 served a confidence of 1)."""
+
+
 def abstention_threshold(tops: np.ndarray, correct: np.ndarray, *, target_error: float,
                          conservative: bool = True) -> float:
     """The smallest top probability at which the forecasts at or above it err at most `target_error`,
     a group of tied forecasts counted as a whole (`tied_prefixes`); with `conservative`, the error is
-    estimated as (errors + 1) / (accepted + 1). 1.0 where no threshold meets the target."""
+    estimated as (errors + 1) / (accepted + 1). `REJECT_ALL` where no threshold meets the target."""
     levels, accepted, right = tied_prefixes(np.asarray(tops), np.asarray(correct, bool))
     errors = accepted - right
     rate = (errors + 1) / (accepted + 1) if conservative else errors / accepted
     met = rate <= target_error
-    return float(levels[met].min()) if met.any() else 1.0
+    return float(levels[met].min()) if met.any() else REJECT_ALL
 
 
 def reliability_bins(tops: np.ndarray, correct: np.ndarray, bins: int) -> np.ndarray:

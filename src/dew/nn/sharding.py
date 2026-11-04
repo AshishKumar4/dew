@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import optax
 from flax import linen as nn
 from flax.typing import Initializer
 
@@ -227,6 +228,16 @@ def layers_of(path: tuple) -> tuple[tuple[tuple, ...], int]:
     layers, or the leaf itself, stacked over none."""
     held = stacked_layers(path)
     return ((path,), 0) if held is None else held
+
+
+def layer_norms(leaf: jax.Array, stacked: int, floor: float = 0.0) -> jax.Array:
+    """Each stored layer's norm of `leaf`, a leaf whose first `stacked` dimensions stack its layers
+    (`layers_of`), over the layer's own values and kept against its layers' axes, at least `floor`: the whole
+    leaf's where it stacks none, as an optimizer rule reads one layer. The values flattened to one axis, as
+    `optax.safe_norm` takes one axis or two."""
+    flat = leaf.reshape((*leaf.shape[:stacked], -1))
+    held = optax.safe_norm(flat, floor, axis=-1, keepdims=True)
+    return held.reshape((*leaf.shape[:stacked], *(1,) * (leaf.ndim - stacked)))
 
 
 @dataclasses.dataclass

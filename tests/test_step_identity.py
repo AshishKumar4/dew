@@ -1,17 +1,29 @@
 """A data step's identity (`dew.data.plan.StepIdentity`) across Dew revisions: a field added to a
-configuration after runs were saved with it (`dew._records.ADDED`)."""
+configuration after runs were saved with it (`dew._records.ADDED`), and a function's code, which an exact
+resume holds where it declares no identity."""
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
+from uuid import uuid4
 
 import numpy as np
 import pytest
+from reader_support import resumed_changes, saved_after_one
 
 from dew._records import ADDED, earlier_fields, without_removed
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition, Loading
+from dew.data.pipeline import Configured, Pipeline
 from dew.data.plan import StepIdentity
+from dew.data.sources import Memory
 from dew.decision.layout import Instructions, OptionLines
+
+READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
+ROWS = Memory(tuple({"id": np.int32(index)} for index in range(8)))
+"""Eight records a resumed function step reads."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,3 +116,58 @@ def test_a_field_removed_after_runs_were_saved_leaves_their_identity_and_records
     record = {"class": "dew.decision.layout:OptionLines", "fields": {"line": "x", "stream": "context"}}
     assert earlier_fields({"segments": [record]}) == {
         "segments": [{"class": "dew.decision.layout:OptionLines", "fields": {"line": "x"}}]}
+
+
+SHIFT = """def shifted(row):
+    return {{**row, "id": row["id"] + {by}}}
+
+
+def shifting(metadata):
+    return shifted
+"""
+
+
+@pytest.mark.parametrize("read", ["indexed", "memory"])
+@pytest.mark.parametrize("configured", [False, True], ids=["function", "configured"])
+def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, monkeypatch, read, configured):
+    """A function outside Dew that declares no identity, a step or the factory that configured one, is
+    what its code computes, which its module's bytes name: rewritten to make other rows, it refuses an
+    exact resume, where the plan names the step and where a memory read's rows name the steps that made
+    them, and reads on under resume='non-exact'; unchanged, it resumes exactly (row 3938)."""
+    module = tmp_path / f"shift_{uuid4().hex}.py"
+    module.write_text(SHIFT.format(by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    shift = importlib.import_module(module.stem)
+
+    def reader(resume="exact"):
+        step = Configured(shift.shifting, needs=()) if configured else shift.shifted
+        pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
+        return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
+
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
+    module.write_text(SHIFT.format(by=10))
+    importlib.reload(shift)
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+    assert resumed_changes(reader("non-exact"), state) == ("modules",)
+
+
+def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(
+        tmp_path, monkeypatch):
+    """A function step that declares what it computes (`identity=`) is that identity, as a configured step's
+    fields are: a change to its module's code is its environment's, which an exact resume reads on over and
+    reports (row 3938)."""
+    module = tmp_path / f"shift_{uuid4().hex}.py"
+    module.write_text(SHIFT.format(by=1))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    shift = importlib.import_module(module.stem)
+
+    def reader():
+        pipeline = Pipeline(ROWS).map(shift.shifted, identity="shift@1").shuffle(0).repeat().batch(2)
+        return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
+
+    state = saved_after_one(reader)
+    module.write_text(SHIFT.format(by=10))
+    importlib.reload(shift)
+    assert resumed_changes(reader(), state) == ("modules",)

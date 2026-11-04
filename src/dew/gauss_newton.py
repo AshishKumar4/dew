@@ -65,11 +65,15 @@ class RowEquations:
     update: int = struct.field(pytree_node=False)
 
     def solved(self, damping: float) -> jax.Array:
-        """The dual's damped step, J^T (J J^T + damping I)^-1 r, flat."""
+        """The dual's damped step, J^T (J J^T + damping I)^-1 r, flat. A row of no Jacobian (a row its
+        batch marks unreal, `dew.objectives.Residuals`) is its own equation of the Gram's, of one, which
+        the step reads none of (J^T's column of it is zero), so its zero row and column leave the real
+        rows' system solvable undamped and its solve theirs alone (row 3929)."""
         gram = float32_einsum("rp,sp->rs", self.jacobian, self.jacobian)
         eye = jnp.eye(gram.shape[0], dtype=gram.dtype)
-        return float32_einsum("rp,r->p", self.jacobian, cho_solve(cho_factor(gram + damping * eye),
-                                                                  self.residual))
+        unread = jnp.all(self.jacobian == 0, axis=1).astype(gram.dtype)
+        return float32_einsum("rp,r->p", self.jacobian, cho_solve(
+            cho_factor(gram + damping * eye + jnp.diag(unread)), self.residual))
 
 
 class GaussNewtonState(NamedTuple):

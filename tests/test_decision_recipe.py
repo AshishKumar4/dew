@@ -4,6 +4,7 @@ import csv
 import dataclasses
 import hashlib
 import json
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -323,15 +324,7 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     from dew.data.dataset import DataPartition
     from dew.data.records import decode, encode
 
-    root = tmp_path / "mixture"
-    root.mkdir()
-    files = {}
-    for name in ("billing", "legacy"):
-        (root / f"{name}.jsonl").write_text("".join(json.dumps(ticket(f"{name} {index}", answers="billing"))
-                                                    + "\n" for index in range(40)))
-        files[name] = {"train": {"sha256": "unread"}}
-    (root / "mixture.json").write_text(json.dumps({"weights": {"billing": 1.0, "legacy": 1.0},
-                                                   "slots": {"questions": 1, "options": 2}, "files": files}))
+    root = mixture_directory(tmp_path)
 
     def loader(chain):
         return compile(chain.batch(4), read="memory", loading=Loading(workers=0)).train(DataPartition())
@@ -348,9 +341,13 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     # A mixture read before its corpus order was seeded wrote no selection seed in its plan's order; one
     # read in the schedule writes none either, so this position is one such a run saved (row 3875).
     assert "selection_seed" not in json.dumps(json.loads(position))
-    # Its record names where each corpus's manifest is read, not a copy of it a corpus (row 3884).
+    # Its record names where each corpus's manifest is read, not a copy of it a corpus (row 3884): a
+    # manifest grown a thousandfold leaves the record's length as it was (row 3973).
     written = json.dumps(encode(saved))
-    assert "mixture_made" not in written and written.count('"mixture_root"') == 2
+    manifest = json.loads((root / "mixture.json").read_text())
+    (root / "mixture.json").write_text(json.dumps({**manifest, "notes": "n" * 1000 * len(written)}))
+    assert len(json.dumps(encode(mixture(str(root), order="schedule")[0]))) == len(written)
+    (root / "mixture.json").write_text(json.dumps(manifest))
     for rebuilt in (decode(json.loads(written)), mixture(str(root), order="schedule")[0]):
         again = loader(rebuilt)
         again.set_state(position)
@@ -370,6 +367,47 @@ def test_a_mixture_saved_in_grains_schedule_resumes_as_it_was_built_not_by_its_c
     with pytest.raises(PlanOrderChanged) as reseeded:
         loader(mixture(str(root), seed=5)[0]).set_state(seeded.get_state())
     assert reseeded.value.changed["selection_seed"] == (4, 5) and reseeded.value.routes == (REBUILD,)
+    # Its corpora mounted elsewhere and its weights changed, the refusal names what the plan's check
+    # compares, the weight, not the corpora's mount (row 3914).
+    moved = tmp_path / "moved"
+    shutil.copytree(root, moved)
+    with pytest.raises(PlanOrderChanged) as reweighted:
+        loader(mixture(str(moved), weights={"billing": 2.0}, seed=4)[0]).set_state(seeded.get_state())
+    assert reweighted.value.changed == {"weights[0]": (1.0, 2.0)} and reweighted.value.routes == (REBUILD,)
+
+
+def test_a_changed_order_names_each_path_and_offers_the_schedule_where_seeds_alone_were_added():
+    """A refused order names each path that changed, a phase's mix by its place (`phases[1]`), and offers
+    reading the schedule it saved where every change is a mix's seed it saved none of; a seed added beside
+    another change is rebuilt (row 3914)."""
+    from dew.data.plan import REBUILD, SCHEDULE, PlanOrderChanged
+
+    def mixed(**seed):
+        return {"corpora": [{"source": "a", "stages": []}], "members": ["place:0"], "weights": [1.0], **seed,
+                "stages": []}
+
+    phased = PlanOrderChanged.between({"phases": [mixed(), mixed()], "until_steps": [4]},
+                                      {"phases": [mixed(), mixed(selection_seed=0)], "until_steps": [4]})
+    assert phased.changed == {"phases[1].selection_seed": (None, 0)} and phased.routes == (SCHEDULE, REBUILD)
+    restaged = PlanOrderChanged.between(mixed(), {**mixed(selection_seed=0), "stages": ["Shuffle(seed=1)"]})
+    assert restaged.changed == {"selection_seed": (None, 0), "stages": ([], ["Shuffle(seed=1)"])}
+    assert restaged.routes == (REBUILD,)
+
+
+def test_a_mixtures_summary_reads_the_manifest_its_corpora_were_read_by(tmp_path):
+    """A decision mixture's corpora name the manifest that made them and the digest of the bytes they were
+    read by: a run's summary reads it again (`made_by`), and refuses it rewritten since, which would name
+    another than the corpora's (row 3969); a chain whose corpora name no manifest states none (row 3968)."""
+    from dew.decision.data import made_by
+
+    root = mixture_directory(tmp_path)
+    facts = mixture(str(root))[0].facts()
+    stated = json.loads((root / "mixture.json").read_text())
+    assert made_by(facts) == stated
+    (root / "mixture.json").write_text(json.dumps({**stated, "weights": {"billing": 3.0, "legacy": 1.0}}))
+    with pytest.raises(ValueError):
+        made_by(facts)
+    assert made_by({"mixture_weights": {"billing": 1.0}, "mixture_made": stated}) is None
 
 
 def mixture_directory(root: Path, rows: int = 40) -> Path:
@@ -387,25 +425,31 @@ def mixture_directory(root: Path, rows: int = 40) -> Path:
     return directory
 
 
+def mixed_run(tmp_path: Path, root: Path, order: str) -> RunConfig:
+    """A decision run over the mixture directory `root`, its corpora read in `order`, its validation
+    none."""
+    from run_kinds import decision
+
+    train, _ = mixture(str(root), order=order)
+    return dataclasses.replace(decision(tmp_path, drawn=False), validation=None,
+                               data=train.read("memory").batch(8).loading(Loading(workers=0)))
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_command_names_it(tmp_path):
     """A decision run over a mixture records its chain (row 3874): read back from its run.json
     (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
     mixture's order changed is refused that position by its plan, naming the record route first, as the
-    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), before it writes its own
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and the saved schedule's route
+    as a decision run reads its mixture, not the data layer's mix (row 3976), before it writes its own
     record: the one it resumes is left byte for byte as it was, and resumes."""
-    from run_kinds import decision, trained
+    from run_kinds import trained
 
     from dew.data.plan import REBUILD, RECORD, SCHEDULE, PlanOrderChanged
 
     root = mixture_directory(tmp_path)
-
-    def run_over(order: str) -> RunConfig:
-        train, _ = mixture(str(root), order=order)
-        return dataclasses.replace(decision(tmp_path, drawn=False), validation=None,
-                                   data=train.read("memory").batch(8).loading(Loading(workers=0)))
-
-    trained(run_over("schedule"), tmp_path, "mixed", trainer={"name": "mixed", "checkpoint_final": True})
+    trained(mixed_run(tmp_path, root, "schedule"), tmp_path, "mixed",
+            trainer={"name": "mixed", "checkpoint_final": True})
     directory = tmp_path / "runs" / "mixed"
     loaded = RunConfig.load(str(directory))
     trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "steps": 2, "checkpoint_final": True})
@@ -413,8 +457,10 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     saved = directory / "run.json"
     record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(run_over("seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
-    assert refused.value.routes == (RECORD, SCHEDULE, REBUILD)
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
+    routes = refused.value.routes
+    assert len(routes) == 3 and (routes[0], routes[-1]) == (RECORD, REBUILD) and SCHEDULE not in routes
+    assert routes[1] == DecisionRunConfig.UNSEEDED
     # Refused before it writes its record, it never replaces the one it resumes (a write replaces the
     # file, `write_atomically`), which is as it was, byte for byte, and resumes.
     assert saved.read_bytes() == record
@@ -422,6 +468,27 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     trained(RunConfig.load(str(directory)), tmp_path, "mixed",
             trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
     assert "3" in {path.name for path in directory.iterdir()}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebuild_its_chains(tmp_path):
+    """A decision run whose record would not rebuild its chains, its validation built in Python, is
+    refused its changed mixture order without the record route, which would refuse it again
+    (`_read_chain`), where it records its data alone (row 3913)."""
+    from run_kinds import trained
+
+    from dew.data.plan import RECORD, PlanOrderChanged
+
+    root = mixture_directory(tmp_path)
+    trained(mixed_run(tmp_path, root, "schedule"), tmp_path, "mixed",
+            trainer={"name": "mixed", "checkpoint_final": True})
+    saved = tmp_path / "runs" / "mixed" / "run.json"
+    unrebuilt = json.loads(saved.read_text())
+    unrebuilt["fields"]["validation"] = {"unrecorded": "built in Python"}
+    saved.write_text(json.dumps(unrebuilt))
+    with pytest.raises(PlanOrderChanged) as refused:
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 2})
+    assert RECORD not in refused.value.routes
 
 
 def test_a_decision_mixture_reads_each_corpus_in_an_order_its_seed_draws_at_its_share(tmp_path):
