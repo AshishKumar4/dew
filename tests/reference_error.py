@@ -301,18 +301,18 @@ def _refuse_numpy_arms(draw, *arms) -> None:
                             f"values unconverted")
 
 
-def _compiled(fn, compile, pairing=None, *, unrewritten: bool = False):
+def _compiled(fn, compile, pairing=None, *, reference: bool = False):
     """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program already
     (another jit around it would nest its compiler options), or compiled by `compile`, a window loop's arm
     within it (`over_windows`), without YNNPACK's fusions, paired with its check's other arms by `pairing`
-    (`_Paired`); a reference arm `unrewritten` (`arm_arithmetic.unrewritten`)."""
-    run = unrewritten(fn) if unrewritten else fn
+    (`_Paired`); a `reference` arm unrewritten (`arm_arithmetic.unrewritten`)."""
+    run = unrewritten(fn) if reference else fn
     if _given(fn) or getattr(fn, "without_ynn", False):
         return run
     if getattr(fn, "dew_programs", False):
         return run if compile is jax.jit else _Paired(pairing, _with_ynn_off(run), run)
     if isinstance(fn, _Windowed):
-        return _Windowed(_compiled(fn.fn, compile, pairing, unrewritten=unrewritten))
+        return _Windowed(_compiled(fn.fn, compile, pairing, reference=reference))
     return compile(run) if compile is jax.jit else _Paired(pairing, compile(run), jax.jit(run))
 
 
@@ -483,7 +483,7 @@ def _arms(dew_fn, reference_fn):
     cannot compile without the fusions turns both arms over to them, decided once a site (`_ynn_decided`)."""
     compile, pairing = (jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn), _Pairing()
     _refuse_owned_policies(compile, dew_fn, reference_fn)
-    return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, unrewritten=True)
+    return _compiled(dew_fn, compile, pairing), _compiled(reference_fn, compile, pairing, reference=True)
 
 
 def _arms_with(dew_fn, reference_fn, further: list, label: str):
