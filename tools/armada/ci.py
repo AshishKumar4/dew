@@ -159,10 +159,10 @@ PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLAS
                         if re.fullmatch(re.escape(_PREFIX) + r"\d+\.\d+", classifier)),
                        key=lambda version: tuple(int(part) for part in version.split("."))))
 """The tested versions pyproject.toml's classifiers declare, oldest first: the floor runs every
-test on every run, the newest every test on the daily run (DEW_TEST_CACHE off) and on a pushed
-run the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints them for
-tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's smoke
-(.armada.json) to them."""
+test on every run, the newest every test on the daily run (DEW_WHOLE_SUITE) and on a pushed
+run, whatever its cache's policy, the files whose behaviour changed with it (`NEWEST_FILES`).
+`pythons` prints them for tools/armada/install.sh, and `pythons --check` holds .python-version
+and the environment's smoke (.armada.json) to them."""
 NEWEST_FILES = (
     # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (ec3c5fb54).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
@@ -186,10 +186,12 @@ NEWEST_FILES = (
     # (ledger 3794); and a mixture's compile, its tracemalloc peak recorded.
     "tests/test_saved_sources.py", "tests/test_mixture_scale.py",
 )
-"""The files the newest Python runs whole on a pushed run: those its changes broke before, and
-the ones around the same machinery. It imports every other test file there (`COLLECT`), and runs
-every file on the daily run. The list is kept by hand, from those breaks, because no record can
-derive it: the test cache records the checkout's files a run executed and read (executed.py),
+"""The files the newest Python runs whole on a pushed run, its cache's policy on or off: those its
+changes broke before, and the ones around the same machinery. It imports every other test file there
+(`COLLECT`), and runs every file on the daily run (DEW_WHOLE_SUITE): a policy-off train ran every file
+on both Pythons, doubling its suite (train 542's 3.14 rows were 43 container-hours of 87), which the
+daily, the land queue's gate, runs anyway. The list is kept by hand, from those breaks, because no
+record can derive it: the test cache records the checkout's files a run executed and read (executed.py),
 while each break lived in the standard library's or a dependency's behaviour under the new
 Python (PEP 649's lazy annotations read through tyro, forkserver as the default start method,
 threads ended at interpreter exit, a process's allocations under tracemalloc), which no record
@@ -1202,7 +1204,8 @@ def plan(target: float, timings: dict) -> list[dict]:
     the work, not the longest task, as warm estimates did. A site marked one of `SHARDS` runs as armada's
     map and judge, apart from its file's tasks (`site_entries`)."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
-    # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
+    # The daily run alone (DEW_WHOLE_SUITE) runs whole_suite cells (`selected`) and every file on the newest
+    # Python.
     cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
@@ -1216,8 +1219,9 @@ def plan(target: float, timings: dict) -> list[dict]:
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
-        # Every file on every Python daily; on a pushed run the newest takes `NEWEST_FILES` whole.
-        whole = python == PYTHONS[0] or cache == "off"
+        # Every file on every Python daily; on a pushed run, its cache's policy on or off, the newest takes
+        # `NEWEST_FILES` whole.
+        whole = python == PYTHONS[0] or cells == "1"
         files = every if whole else [name for name in every if name in NEWEST_FILES]
         timings = borrowed(timings, python)
         timed = weights(files, timings, python)
@@ -1870,7 +1874,7 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
              site: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
-    the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
+    the daily run (`whole`: DEW_WHOLE_SUITE, CI's schedule), whatever
     the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
     2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
     release checks run in their own tasks alone (`release`), every one whatever else marks it, under a
