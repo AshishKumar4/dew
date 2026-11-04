@@ -422,7 +422,9 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
     def loss(tree):
         return task.scalar_loss({**variables, "params": tree}, batch, step)
 
-    (value, aux), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+    # One compiled program, as a run's step is: run op by op, the step compiled each of its 2,900
+    # operations apart, most of the fixture's two minutes (row 3817).
+    (value, aux), gradients = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
     roundings = chain_roundings(jax.make_jaxpr(jax.grad(lambda tree: loss(tree)[0]))(params))
     return SimpleNamespace(task=task, variables=variables, params=params, batch=batch, step=step, value=value,
                            aux=aux, gradients=gradients, roundings=roundings)

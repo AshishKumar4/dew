@@ -85,21 +85,29 @@ def stacked(records: list) -> dict:
 
 
 def wide(tree):
-    """`tree` with every floating leaf in float64; a host field, a record's captions, as it is."""
-    return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+    """`tree` with every floating leaf in float64, on the host, which compiles no conversion a leaf's shape;
+    a host field, a record's captions, as it is."""
+    return jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
                         if jnp.issubdtype(np.asarray(leaf).dtype, jnp.floating) else leaf, tree)
 
 
 def moved(tree, seed: int):
     """`tree` in float64 with every floating leaf moved by a draw of its own,
     so a student is not its teacher nor a policy its reference, and no loss is
-    a constant the repeats could not move."""
+    a constant the repeats could not move: one program over the whole tree,
+    where a draw a leaf compiled each leaf's shape apart, most of a large
+    model's case (row 3891)."""
     leaves, structure = jax.tree.flatten(wide(tree))
-    keys = jax.random.split(jax.random.key(seed), len(leaves))
-    return jax.tree.unflatten(structure, [
-        leaf + 0.05 * jax.random.normal(key, jnp.shape(leaf), jnp.float64)
-        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf
-        for leaf, key in zip(leaves, keys, strict=True)])
+    at = [index for index, leaf in enumerate(leaves) if jnp.issubdtype(np.asarray(leaf).dtype, jnp.floating)]
+
+    @jax.jit
+    def drawn(held, key):
+        keys = jax.random.split(key, len(leaves))
+        return [leaf + 0.05 * jax.random.normal(keys[index], jnp.shape(leaf), jnp.float64)
+                for index, leaf in zip(at, held, strict=True)]
+
+    moving = dict(zip(at, drawn([leaves[index] for index in at], jax.random.key(seed)), strict=True))
+    return jax.tree.unflatten(structure, [moving.get(index, leaf) for index, leaf in enumerate(leaves)])
 
 
 @pytest.mark.parametrize("held", [7, 1])
