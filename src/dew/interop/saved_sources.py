@@ -27,6 +27,7 @@ from etils import epath
 from jax.sharding import Mesh
 
 from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
+from dew._records import JSON, json_value
 from dew.cache import dew_cache_dir, package_digest
 from dew.checkpoints import RUN_FILE
 from dew.files import staged
@@ -43,7 +44,6 @@ if TYPE_CHECKING:
     from dew.lora import LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.autoencoders import AutoEncoder
-    from dew.objectives.base import Objective
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
 
@@ -81,12 +81,16 @@ def is_saved_run(name_or_dir: str | Path) -> bool:
     return path.is_dir() and (path / RUN_FILE).is_file()
 
 
-def step_records(objective: type[Objective], directory: str, step: int) -> tuple[epath.Path, ...]:
-    """The files the task of `objective`'s runs keeps by the `step` of the run in `directory`
-    (`SavedRunTask.step_records`); none for a task that keeps none, or an objective that names none."""
-    from dew.inference.tasks import SavedRunTask
+def step_records(artifact: JSON, directory: str, step: int) -> tuple[epath.Path, ...]:
+    """The files the task of the objective `artifact`, a step's inference declaration
+    (`Checkpoints.artifact`), names keeps by the `step` of the run in `directory`
+    (`SavedRunTask.step_records`); none for a step that declares no objective, an objective that names no
+    task, or a task that keeps none."""
+    from dew.inference.tasks import SavedRunTask, declared_objective
 
-    task = objective.saved_task
+    if not isinstance(artifact, dict) or "objective" not in artifact:
+        return ()
+    task = declared_objective(artifact).saved_task
     if task is None or not issubclass(task, SavedRunTask):
         return ()
     return task.step_records(directory, step)
@@ -102,7 +106,7 @@ def _fingerprint(run: SavedRun, ema: bool | None) -> str:
     digest = hashlib.sha256(json.dumps([str(root), run.step, ema, package_digest()]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
-    for path in step_records(run.objective, run.directory, run.step):
+    for path in step_records(json_value(run.record, "artifact"), run.directory, run.step):
         digest.update(f"{path.relative_to(root)}\0".encode() + path.read_bytes())
     for path in sorted((root / str(run.step)).iterdir(), key=str):
         if path.is_file():

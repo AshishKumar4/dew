@@ -11,10 +11,8 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew._records import text
 from dew.checkpoints import frozen_entries, is_uri, step_artifact
 from dew.interop.saved_sources import step_records
-from dew.registry import objectives
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
@@ -53,9 +51,7 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     path = epath.Path(directory)
     run = path.parent
     # The run's root files, and those its task keeps by the step, by their places in the run.
-    declared = step_artifact(directory)
-    kept = () if not isinstance(declared, dict) or "objective" not in declared else step_records(
-        objectives[text(declared["objective"], "objective")], str(run), int(path.name))
+    kept = step_records(step_artifact(directory), str(run), int(path.name))
     files = [*sorted((entry for entry in run.iterdir() if entry.is_file()), key=lambda entry: entry.name),
              *kept]
     entries = frozen_entries(directory)
