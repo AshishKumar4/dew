@@ -1635,9 +1635,9 @@ class CausalTransformer(LinearProducts):
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads these unscaled embeddings, media
-        # replacements in place, which token ids cannot rebuild: computed where
-        # a caller opens the collection alone, so a forward that does not traces
-        # no second input projection (ledger 3525); init leaves it out.
+        # replacements in place, which token ids cannot rebuild. They are
+        # computed only where a caller opens the collection, as a forward that
+        # does not would trace a second input projection; init leaves it out.
         if not self.is_initializing() and self.is_mutable_collection("embeddings"):
             prepared = self._prepared(self.stream_embeddings(tokens), input_embeddings)
             self.sow("embeddings", "prepared", prepared,

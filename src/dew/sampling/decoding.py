@@ -295,7 +295,7 @@ class TopP(_Numerical):
     def apply(excluded_mass: float, state: StepState, logits: jax.Array) -> jax.Array:
         order = jnp.argsort(logits, axis=-1, stable=True)
         ascending = jnp.take_along_axis(logits, order, axis=-1)
-        tail = jnp.cumsum(categorical.probabilities(ascending), axis=-1) <= excluded_mass
+        tail = jnp.cumsum(jax.nn.softmax(ascending), axis=-1) <= excluded_mass
         tail = tail.at[:, -1].set(False)
         rows = jnp.arange(logits.shape[0])[:, None]
         removed = jnp.zeros_like(tail).at[rows, order].set(tail)
@@ -316,7 +316,7 @@ class MinP(_Numerical):
 
     @staticmethod
     def apply(p: float, state: StepState, logits: jax.Array) -> jax.Array:
-        probabilities = categorical.probabilities(logits)
+        probabilities = jax.nn.softmax(logits)
         cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * p
         return jnp.where(probabilities < cutoff, FILTER, logits)
 
@@ -335,13 +335,12 @@ class Typical(_Numerical):
 
     @staticmethod
     def apply(mass: float, state: StepState, logits: jax.Array) -> jax.Array:
-        normalized = categorical.log_probs(logits)
+        normalized = jax.nn.log_softmax(logits)
         entropy = categorical.entropy(logits)[..., None]
         shifted = jnp.abs(-normalized - entropy)
         order = jnp.argsort(shifted, axis=-1, stable=True)
         sorted_shift = jnp.take_along_axis(shifted, order, axis=-1)
-        ordered = jnp.take_along_axis(logits, order, axis=-1)
-        cumulative = jnp.cumsum(categorical.probabilities(ordered), axis=-1)
+        cumulative = jnp.cumsum(jax.nn.softmax(jnp.take_along_axis(logits, order, axis=-1)), axis=-1)
         last = jnp.clip(jnp.sum(cumulative < mass, axis=-1), 0, logits.shape[-1] - 1)
         removed = sorted_shift > jnp.take_along_axis(sorted_shift, last[:, None], axis=-1)
         removed = removed.at[:, 0].set(False)
@@ -365,7 +364,7 @@ class EpsilonCutoff(_Numerical):
     @staticmethod
     def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
         best = jnp.max(logits, axis=-1, keepdims=True)
-        removed = (categorical.probabilities(logits) < epsilon) & (logits < best)
+        removed = (jax.nn.softmax(logits) < epsilon) & (logits < best)
         return jnp.where(removed, FILTER, logits)
 
 
@@ -384,7 +383,7 @@ class EtaCutoff(_Numerical):
 
     @staticmethod
     def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
-        probabilities = jnp.exp(categorical.log_probs(logits))
+        probabilities = jnp.exp(jax.nn.log_softmax(logits))
         entropy = categorical.entropy(logits)
         cutoff = jnp.asarray(epsilon, jnp.float32)
         eta = jnp.minimum(cutoff, jnp.sqrt(cutoff) * jnp.exp(-entropy))[:, None]
@@ -438,7 +437,7 @@ class Renormalize:
     """Replaces scores by their log softmax, as `LogitNormalization`."""
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return categorical.log_probs(logits)
+        return jax.nn.log_softmax(logits)
 
 
 @struct.dataclass
