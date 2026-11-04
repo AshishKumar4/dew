@@ -137,7 +137,6 @@ seams: "scan-cells": {
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "SCAN_CELLS"
 	declared: {
-		"(wgmma, forward)":     "Nemotron-H's SSD forward on an H100"
 		"(wgmma, training)":    "Nemotron-H's SSD training on an H100"
 		"(mma.sync, training)": "the SSD's training on an A100"
 	}
