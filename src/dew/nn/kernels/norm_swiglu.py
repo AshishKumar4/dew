@@ -593,8 +593,11 @@ def _rms_backward(x_ref, scale_ref, gate_ref, mean_square_ref, dy_ref, stream_re
         if inverse_rounded:
             dx = _rounded_inverse_cotangent(m, x, multiplier, slope, dy_ref.dtype, width, interpret)
         else:
-            # The two x contributions are kept separate, as XLA's square VJP is.
-            correction = jnp.sum(m * x, axis=1) * slope * (1.0 / width)
+            # The two x contributions are kept separate, as XLA's square VJP is. The reduction reads x
+            # normalized and the mean square's own slope (`slope / inverse`), the same product, so near
+            # float32's largest (inputs near 2**63) its sum (2**130 as m * x) does not overflow while the
+            # slope (2**-189) underflows, whose product was NaN where the formula is finite (ledger 2692).
+            correction = jnp.sum(m * (x * inverse[:, None]), axis=1) * (-0.5 / mean_square) * (1.0 / width)
             dx = m * multiplier[:, None] + (2.0 * x) * correction[:, None]
         if ds is not None:
             # The stream's own cotangent joins in fp32, one rounding for the sum.
