@@ -4,6 +4,6 @@
  "path": "recordings/3e7c608f12a2ec8fe2f5e964474c8527578b3d8e5da1dba654e42866961056c6.npz",
  "reference": "transformers 5.17.0 (openai/gpt-oss-20b at 6cee5e81ee83917806bbde320786a8fb61efebee)",
  "repo": "dewml/fixtures",
- "revision": null,
+ "revision": "0c463b0c79c62e7462a9ca0ab8b39b7951ae7af8",
  "sha256": "3e7c608f12a2ec8fe2f5e964474c8527578b3d8e5da1dba654e42866961056c6"
 }
