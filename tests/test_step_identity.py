@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import numpy as np
 import pytest
+from reader_support import resumed_changes, saved_after_one
 
 from dew._records import ADDED, earlier_fields, without_removed
 from dew.data.compile import compile
@@ -143,32 +144,13 @@ def test_an_exact_resume_refuses_a_function_step_whose_code_changed(tmp_path, mo
         pipeline = Pipeline(ROWS).map(step).shuffle(0).repeat().batch(2)
         return compile(pipeline, read=read, loading=READ, resume=resume).train(DataPartition())
 
-    first = reader()
-    try:
-        next(first)
-        state = first.get_state()
-    finally:
-        first.close()
-    same = reader()
-    try:
-        same.set_state(state)
-        assert same.manifest_changes == ()
-    finally:
-        same.close()
+    state = saved_after_one(reader)
+    assert resumed_changes(reader(), state) == ()
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
-    rewritten = reader()
-    try:
-        with pytest.raises(ValueError):
-            rewritten.set_state(state)
-    finally:
-        rewritten.close()
-    resumed = reader("non-exact")
-    try:
-        resumed.set_state(state)
-        assert resumed.manifest_changes == ("modules",)
-    finally:
-        resumed.close()
+    with pytest.raises(ValueError):
+        resumed_changes(reader(), state)
+    assert resumed_changes(reader("non-exact"), state) == ("modules",)
 
 
 def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_change_to_its_code(
@@ -185,17 +167,7 @@ def test_a_function_step_that_declares_its_identity_resumes_exactly_over_a_chang
         pipeline = Pipeline(ROWS).map(shift.shifted, identity="shift@1").shuffle(0).repeat().batch(2)
         return compile(pipeline, read="indexed", loading=READ).train(DataPartition())
 
-    first = reader()
-    try:
-        next(first)
-        state = first.get_state()
-    finally:
-        first.close()
+    state = saved_after_one(reader)
     module.write_text(SHIFT.format(by=10))
     importlib.reload(shift)
-    resumed = reader()
-    try:
-        resumed.set_state(state)
-        assert resumed.manifest_changes == ("modules",)
-    finally:
-        resumed.close()
+    assert resumed_changes(reader(), state) == ("modules",)
