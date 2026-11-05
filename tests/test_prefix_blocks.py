@@ -272,11 +272,11 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     bundle.save(tmp_path / "export")
     exported = Pretrained.load(tmp_path / "export", dtype="float32").pipeline()
     assert (exported.prefix, exported.precision) == (PREFIX, trained_in)
-    again = exported(prompt, NEW, key=0)
-    # The prompts' rows: the run's task, its weights placed over the run's devices, returns 8 rows for these
-    # 2 prompts (row 4332), the export's, on the host, the 2.
-    np.testing.assert_array_equal(again.tokens, theirs.tokens[:BATCH])
-    np.testing.assert_array_equal(again.raw_log_probs, theirs.raw_log_probs[:BATCH])
+    # Each generation's real rows on the host (`Generation.host`): the run's task holds its weights over the
+    # run's devices, its batch padded to the data axis there.
+    again, run = exported(prompt, NEW, key=0).host(), theirs.host()
+    np.testing.assert_array_equal(again.tokens, run.tokens)
+    np.testing.assert_array_equal(again.raw_log_probs, run.raw_log_probs)
 
 
 def test_with_no_prefix_the_loss_is_the_causal_one_bitwise():
