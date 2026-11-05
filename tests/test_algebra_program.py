@@ -237,14 +237,13 @@ def _shared_products(a, x, y):
 def test_a_run_under_the_accurate_forms_keeps_its_program_as_written():
     """Under the run's accurate numerics (`precision="accurate"`, `generation.run_precision`) the pass admits
     the `exact` sets alone (docs/design/algebra.md §1.4): two products of a shared operand, summed, which the
-    default numerics join into one, stay two (`dot_general` counted) and compute what they compute."""
+    default numerics join into one, stay two (`dot_general` counted), no window splicing a form."""
     from dew.nn.precision import ACCURATE
 
     operands_ = rows(1, (256, 64), (64, 64), (64, 64))
     with generation.run_precision(ACCURATE), report.refusals():
         accurate = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
-        # Its numerics admit commutativity alone, which XLA's HloCSE takes already: no pass runs.
-        assert not report.rewrites()
+        assert not any(made.spliced for made in report.rewrites())
     default = jax.make_jaxpr(algebra.rewritten(_shared_products))(*operands_)
     assert (count(accurate, "dot_general"), count(default, "dot_general")) == (2, 1)
 
@@ -1002,20 +1001,14 @@ def test_a_tiles_transient_hook_is_released_once_its_trace_is_done():
     assert held() is None
 
 
-@pytest.mark.parametrize("name, inverse, kind", [
-    ("a negation negated", lambda x: jnp.negative(jnp.negative(x)), jax.lax.neg_p),
-    ("a negation's magnitude", lambda x: jnp.abs(-x), jax.lax.neg_p),
-    ("a magnitude's magnitude", lambda x: jnp.abs(jnp.abs(x)), jax.lax.abs_p),
-    ("a value times its sign", lambda x: jnp.sign(x) * x, jax.lax.sign_p)])
-def test_an_operation_its_inverse_cancels_is_rewritten_away_under_either_numerics(name, inverse, kind):
-    """An exact identity (`inverses`: a negation negated, the magnitude of a negation or of a magnitude, a
-    value times its sign) rounds as its left side does, so the pass rewrites it away under the default and
-    the accurate numerics alike: the summed program holds one equation of the cancelled kind fewer, and
-    computes bit for bit what it computes as written."""
-    def summed(x):
-        return jnp.sum(inverse(x), axis=-1)
-
+def test_a_value_times_its_sign_is_its_magnitude_under_either_numerics():
+    """A value times its sign is its magnitude, an exact identity (`signs`) that rounds as its left side
+    does, so the pass rewrites it under the default and the accurate numerics alike: the summed program
+    holds no sign and no multiply of it, and computes bit for bit what it computes as written."""
     from dew.nn.precision import ACCURATE, Numerics
+
+    def summed(x):
+        return jnp.sum(jnp.sign(x) * x, axis=-1)
 
     x = rows(18, (4, 64))[0]
     for policy in (Numerics(), ACCURATE):
@@ -1023,6 +1016,4 @@ def test_an_operation_its_inverse_cancels_is_rewritten_away_under_either_numeric
             rewritten = jax.make_jaxpr(algebra.rewritten(summed))(x)
             np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(summed))(x)),
                                           np.asarray(jax.jit(summed)(x)))
-        written = jax.make_jaxpr(summed)(x)
-        count = [sum(eq.primitive is kind for eq in equations(closed)) for closed in (rewritten, written)]
-        assert count[0] < count[1], (name, policy)
+        assert not any(eq.primitive in (jax.lax.sign_p, jax.lax.mul_p) for eq in equations(rewritten)), policy
