@@ -2020,6 +2020,10 @@ class RunConfig:
         # review): a loader compiled already reads by its own plan's version, which it records.
         named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
         plan = dataset.plan if isinstance(dataset, Loader) else None
+        if plan is not None and self.data_plan_version not in (None, plan.version):
+            raise ValueError(f"the run reads by data plan version {self.data_plan_version}, and the loader "
+                             f"it is given was compiled at {plan.version}; compile the loader at the run's "
+                             "version (`compile(..., plan_version=...)`), or leave the run's to the loader")
         planned = (named.resumed(("data_plan_version",)) if plan is None
                    else dataclasses.replace(named, data_plan_version=plan.version))
         dataset, held = planned.compiled(objective.data(), dataset, validation)
