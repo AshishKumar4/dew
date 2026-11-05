@@ -655,3 +655,92 @@ def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
     with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
             lowering_platforms=("cuda",))
+
+
+def _relayed_products(q, k, v, *, interpret):
+    """FlashAttention 4's relay on tcgen05's bundle: `S = q k` into tensor memory by the product warp, read
+    out by a role of the table (`Tcgen05Issuer.read`), doubled, narrowed and written back as `P`
+    (`write`), and `O = P v` with `P` the left operand from tensor memory (the TS product); `O` read out
+    and stored by the same role. Its roles wait on signals the products' commit and the role's publication
+    arrive at (`signals`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    rows = q.shape[0]
+    columns = v.shape[1]
+
+    def body(q_gmem, k_gmem, v_gmem, o_gmem):
+        def scoped(q_smem, k_smem, v_smem, o_smem, loaded, s_tmem, p_tmem, o_tmem, scored, weighed, summed):
+            s = mosaic_sm100.Accumulator(s_tmem, (rows, k.shape[1]))
+            p = mosaic_sm100.Accumulator(p_tmem, (rows, k.shape[1]), dtype=jnp.bfloat16)
+            o = mosaic_sm100.Accumulator(o_tmem, (rows, columns))
+            scored, weighed, summed = (family.signals().opened(each) for each in (scored, weighed, summed))
+            first = mosaic.Turn.of(0, 1)
+
+            def relay(index):
+                del index
+                plgpu.barrier_wait(scored.barriers.at[0], parity=0)
+                family.write(p, family.read(s) * 2)
+                weighed.published(first)
+                plgpu.barrier_wait(summed.barriers.at[0], parity=0)
+                o_smem[...] = family.read(o)
+                plgpu.wait_load_tmem()
+                plgpu.commit_smem()
+                plgpu.copy_smem_to_gmem(o_smem, o_gmem)
+                plgpu.wait_smem_to_gmem(0)
+
+            def load():
+                for gmem, smem, at in ((q_gmem, q_smem, 0), (k_gmem, k_smem, 1), (v_gmem, v_smem, 2)):
+                    plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
+
+            def products():
+                for at in range(3):
+                    plgpu.barrier_wait(loaded.at[at], parity=0)
+                family.products(s, q_smem, k_smem, interpret)
+                scored.committed(first)
+                plgpu.barrier_wait(weighed.barriers.at[0], parity=0)
+                family.products(o, p, v_smem, interpret)
+                summed.committed(first)
+
+            family.roles_of(((1, relay),), load=load, products=products)
+
+        smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
+                for each in (q, k, v)]
+        signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
+                   family.signals().scratch()]
+        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32), plgpu.Barrier(num_barriers=3),
+                      family.tensor_memory((rows, k.shape[1])),
+                      family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
+                      family.tensor_memory((rows, columns)), *signals, collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="relayed")(q, k, v)
+
+
+def _relayed_operands():
+    """Small integers, so `2 (q k) v` is exact in fp32 and its weights exact in bf16."""
+    keys = jax.random.split(jax.random.key(3), 3)
+    q = jax.random.randint(keys[0], (128, 64), -2, 3).astype(jnp.bfloat16)
+    k = jax.random.randint(keys[1], (64, 128), -2, 3).astype(jnp.bfloat16)
+    v = jax.random.randint(keys[2], (128, 64), -2, 3).astype(jnp.bfloat16)
+    return q, k, v
+
+
+@INTERPRETS
+def test_a_role_relays_scores_through_tensor_memory_into_a_product_that_reads_them_there():
+    """Interpreted: scores issued into tensor memory, read out by a role, doubled and written back narrowed,
+    and the next product reading them from tensor memory as its left operand (tcgen05's TS form, P·V):
+    exactly `2 (q k) v`."""
+    q, k, v = _relayed_operands()
+    got = np.asarray(_relayed_products(q, k, v, interpret=INTERPRETED))
+    weights = 2 * (np.asarray(q, np.float32) @ np.asarray(k, np.float32))
+    np.testing.assert_array_equal(got, weights @ np.asarray(v, np.float32))
+
+
+def test_the_relay_through_tensor_memory_lowers_for_a_b200():
+    """The relay lowers for a B200 on any host, as the GPU gate runs it."""
+    q, k, v = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _relayed_operands())
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
+            lowering_platforms=("cuda",))
