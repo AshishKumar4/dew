@@ -18,7 +18,6 @@ and context frames at signal level 1 - `tau_ctx` when generating.
 from __future__ import annotations
 
 import functools
-import math
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -245,17 +244,9 @@ class Dynamics(nn.Module):
         return out.reshape(noisy.shape)
 
 
-def sampled_steps(key: jax.Array, shape: tuple[int, ...], k_max: int) -> tuple[jax.Array, jax.Array]:
-    """Eq. 4: each frame's step size d, the reciprocal of a power of two up to `k_max` drawn uniformly,
-    and its signal level tau drawn uniformly from {0, d, ..., 1 - d} (`_gridded`)."""
-    size_key, level_key = jax.random.split(key)
-    return _gridded(jax.random.randint(size_key, shape, 0, int(math.log2(k_max)) + 1),
-                   jax.random.uniform(level_key, shape))
-
-
 def _gridded(exponent: jax.Array, uniform: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Eq. 4 from its draws: the signal level tau and the step size d = 2^-`exponent`, tau `uniform` in
-    [0, 1) floored to d's grid."""
+    """Eq. 4 from its draws: each frame's signal level tau and step size d = 2^-`exponent`, the reciprocal
+    of a power of two up to K_max, tau `uniform` in [0, 1) floored to d's grid {0, d, ..., 1 - d}."""
     d = 1.0 / 2.0 ** exponent.astype(jnp.float32)
     return jnp.floor(uniform / d) * d, d
 
@@ -340,6 +331,10 @@ class WorldModelObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return None
 
+    def model_variables(self, variables: Variables) -> Variables:
+        """The dynamics model's own collections out of `variables`: every one but the tokenizer's."""
+        return {name: tree for name, tree in variables.items() if name != TOKENIZER}
+
     def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
         """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
         return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
@@ -356,7 +351,7 @@ class WorldModelObjective(Objective[Ratio]):
         tau, d = step.boundary("signal level", tau), step.boundary("step size", d)
         noise = step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows)
 
-        dynamics = self.model.bind(_dynamics(variables))
+        dynamics = self.model.bind(self.model_variables(variables))
 
         def f(noisy: jax.Array, tau: jax.Array, d: jax.Array) -> jax.Array:
             return dynamics(noisy, tau, d, actions)
@@ -386,16 +381,11 @@ class WorldModelObjective(Objective[Ratio]):
                                        jnp.full((context.shape[0], 1), level)], 1)
                 d = jnp.full(tau.shape, d_model)
                 given = None if actions is None else actions[:, :sequence.shape[1]]
-                predicted = self.model.bind(_dynamics(variables))(sequence, tau, d, given)[:, -1]
+                predicted = self.model.bind(self.model_variables(variables))(sequence, tau, d, given)[:, -1]
                 current = current + (predicted - current) / (1 - level) / steps
             produced = jnp.concatenate([produced, current[:, None]], 1)
         return produced[:, context.shape[1]:]
 
 
-def _dynamics(variables: Variables) -> Variables:
-    """A world model's tree without its tokenizer: the dynamics model's own collections."""
-    return {name: tree for name, tree in variables.items() if name != TOKENIZER}
-
-
 __all__ = ["TOKENIZER", "CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
-           "diffusion_forcing_loss", "ramp", "sampled_steps", "shortcut_forcing_loss", "unit_frames"]
+           "diffusion_forcing_loss", "ramp", "shortcut_forcing_loss", "unit_frames"]
