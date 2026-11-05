@@ -242,9 +242,12 @@ def autotune_dir(path: str) -> str:
 def kernel_picks_path(device_kind: str) -> str:
     """The file of Dew's kernel configs measured on GPUs of `device_kind`
     (`dew.nn.kernels.tuning`), beside XLA's picks in the cache this process
-    compiles to."""
+    compiles to, one file a jax: Pallas lowers a kernel in jax, which a
+    release moves without jaxlib, so a store shared by every jax kept each
+    fork's copy of a GPU's picks that every other jax's read parsed (row 3837)."""
     name = device_kind.lower().replace(' ', '_').replace('/', '_')
-    return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"{name}.json")
+    return os.path.join(autotune_dir(default_compilation_cache_dir()), 'kernels', f"jax-{jax.__version__}",
+                        f"{name}.json")
 
 
 KERNEL_TUNES = jax.make_user_context(0)

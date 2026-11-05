@@ -160,9 +160,10 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
 
 def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32) -> Work:
     """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at the default precision,
-    in their mode (`_mode`): a chunk form's products (`dew.algebra.linear_scan`), Dew's fp32 products."""
+    in their mode (`_mode`), each a kernel of XLA's fusion, its root (`work`'s products): a chunk form's
+    products (`dew.algebra.linear_scan`), Dew's fp32 products."""
     mode, passes = _mode(None, {jnp.dtype(dtype)})
-    return Work(**{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
+    return Work(kernels=float(count), **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -251,7 +252,7 @@ class Fused:
     facts: generation.GpuTarget
 
     def pieces(self, done: Work) -> tuple[float, ...]:
-        fixed = _fixed(self.facts)
+        fixed = self.facts.fixed_seconds
         return (sum(kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[0])
                 + (0.0 if fixed is None else done.kernels * fixed),)
 
@@ -266,16 +267,9 @@ class Fused:
         return 0.0
 
     def unpriced(self, done: Work) -> tuple[float, ...]:
-        latency = kernel_cost.step_latency(self.facts, device=True)
+        latency, fixed = kernel_cost.step_latency(self.facts, device=True), self.facts.fixed_seconds
         return (*kernel_cost.units(done, kernel_cost.rates(self.facts, device=True))[1],
-                kernel_cost.spanned(done, latency)[1], done.kernels if _fixed(self.facts) is None else 0.0)
-
-
-def _fixed(facts: generation.GpuTarget) -> float | None:
-    """A kernel's fixed seconds on `facts`' part, measured (`Measured.fixed`); None for a part no one
-    measured, whose kernels no time prices."""
-    part = facts.part
-    return None if part is None else part.fixed
+                kernel_cost.spanned(done, latency)[1], done.kernels if fixed is None else 0.0)
 
 
 def fused(facts: generation.GpuTarget) -> Fused:

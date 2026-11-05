@@ -358,6 +358,13 @@ class GpuTarget:
         return self.memory_bandwidth if part is None else part.bytes_per_second
 
     @property
+    def fixed_seconds(self) -> float | None:
+        """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
+        on the part (`Measured.fixed`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.fixed
+
+    @property
     def launch_seconds(self) -> float | None:
         """The seconds a kernel launch adds to a program of kernels one after another, measured on the part
         (`Measured.launch`); None where no one measured it."""
@@ -412,7 +419,7 @@ class GpuTarget:
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
 # A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
-# Server 2617/1792. The rates, latencies and L2 a family shares are `architecture`'s.
+# Server 2617/1597. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -1053,6 +1060,19 @@ def gpu_placed() -> bool:
     GPU host, so it makes none."""
     import jax
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+
+
+def cuda_lowered() -> bool:
+    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
+    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
+    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
+    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
+    import jax
+    if gpu_placed():
+        return True
+    found = assumption()
+    return (found is not None and jax.default_backend() == 'gpu'
+            and _generation(jax.local_devices()[0]) == found.generation)
 
 
 def backend() -> str:

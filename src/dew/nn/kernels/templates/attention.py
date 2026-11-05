@@ -1182,7 +1182,8 @@ class Split(NamedTuple):
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
     keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's
-    `2^-shift` `[B, H, Q]` (`attention_algebra.room`)."""
+    `2^-shift` `[B, H, Q]` (`attention_algebra.room`), or normalized over the natural denominator where the
+    shift is `attention_algebra.NORMALIZED` (a guarded walk's live row, `normalized_rows`)."""
 
     others: jax.Array
     own: jax.Array

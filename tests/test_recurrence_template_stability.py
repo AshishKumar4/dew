@@ -45,9 +45,15 @@ HOOKS = SITES['scalar delta']
 
 def forms_of(hooks) -> tuple[str | None, ...]:
     """The run's forms a form's checks run under: the rated scan's fast and accurate both, whose numbers
-    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts), any other form's the run's
-    own (None), which its numbers do not read."""
-    return ('fast', 'accurate') if hooks.rated else (None,)
+    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts); the accurate ones for a form
+    whose queries and keys its l2 norm widens, an fp32 call, whose fast numbers take its operands in two
+    bf16 parts past TF32's bits (`mainloop.FAST_PARTS`), held to recorded fla-core's TF32 by
+    test_recurrence_mosaic and not to an fp32 arm (the gated net's final memory 42 to 52 times its fp32
+    port's distance from float64, interpreted and on an H100, row 3962); any other form's the run's own
+    (None), which its numbers do not read."""
+    if hooks.rated:
+        return ('fast', 'accurate')
+    return ('accurate',) if hooks.l2norm else (None,)
 
 
 CASES = [(name, regime, product, forms) for name in SITES for forms in forms_of(SITES[name])
@@ -203,17 +209,19 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
                       'the decay bound')
 
 
-@pytest.mark.parametrize('name', SITES)
-@pytest.mark.parametrize('regime', INTERPRETED)
-def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
-    """Each form's 16-bit forward through the template, interpreted off a GPU, finite wherever the float64
-    recurrence's is on the regime's first draw; a form it refuses is checked refused and skipped."""
-    hooks = SITES[name]
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-    drawn = (bf16(stressed(hooks, regime, 0)[0], hooks),)
-    if not runs(mosaic, hooks, drawn[0], drawn, 'forward'):
-        pytest.skip(f'the template refuses {name}: a refusal, not numerical coverage')
-    assert_finite(jax.jit(mosaic), jax.jit(functools.partial(token_by_token, hooks)), drawn, regime)
+@pytest.mark.parametrize(('name', 'regime', 'forms'),
+                         [(name, regime, forms) for name, regime, product, forms in CASES
+                          if product == 'forward' and regime in INTERPRETED])
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
+    """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
+    tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
+    with its reference arm. Held finite alone, a write gate without the delta rule rounded as the SSD is
+    (`recurrence_chunk.chunk_rounding`) put its final memory 2.1e4 times the portable math's distance from
+    float64 unseen off a GPU (row 3962). Whole, the cells took 27 to 151 s (Kimi delta attention's aligned
+    keys 128, the rated scan's decays near zero under the accurate forms 151, stab-case at d51a2d2cf): a site
+    each, sharded over the most seeds a cell declares."""
+    the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
 @pytest.mark.parametrize('regime', REGIMES)

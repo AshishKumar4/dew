@@ -1,5 +1,5 @@
 """The accurate form's outcomes on the default route (row 2556): a call that names the accurate form
-(`generation.chosen(attention_form='accurate')`), whichever kernel the route takes, is on par with the
+(`generation.run_precision(Numerics(forms='accurate'))`), whichever kernel the route takes, is on par with the
 reference path's IEEE float32 products, and on a GPU the fast form is not, over the inputs that tell them
 apart. Apart from the route's selection and refusals (`test_attention_route`), which another lane edits."""
 

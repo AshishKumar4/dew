@@ -284,6 +284,9 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
         opt_state = jax.tree.map(np.asarray, initial.opt_state)
         held = train.staged(initial)
         run = train.compile(held, first)
+        # A QK-Clip given built reads the maxima its forward reports, so a pipelined run keeps every layer
+        # whole on every stage and says so (`whole_reading`, row 4035); a named Muon-Clip keeps them local.
+        assert ("layers_whole_for" in train.plan) == staged
         partial, *_ = run(held, first)
         pooled = jax.tree.map(np.asarray, train.stored(partial).accumulation.qk_stats)
         final, *_ = run(partial, second)

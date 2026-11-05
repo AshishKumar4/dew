@@ -100,8 +100,8 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
 def test_a_program_no_rule_changes_is_staged_once():
     """An outer program (`options.program`) whose math no rule changes (an opaque equation beside an unbounded
     sum), lowered with the pass on: each of its equations staged once, by jit's own trace, which lowers as it
-    is (`program.program_of`), where the pass's replay of its traced program staged each again (a Dory-4B
-    training step's 1.8 seconds of compile, nothing rewritten)."""
+    is (`program.rewritten_program`), where the pass's replay of its traced program staged each again (a
+    Dory-4B training step's 1.8 seconds of compile, nothing rewritten)."""
     from jax.extend import core as jex_core
     from jax.interpreters import mlir
 
@@ -481,6 +481,30 @@ def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generati
     assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
 
 
+def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
+    """XLA's schedule (`cost.fused`) prices each kernel of a form, a product's or a reduction's (a root of
+    XLA's fusion), at its part's measured fixed latency (`GpuTarget.fixed_seconds`, its launch and first
+    byte) beside its work: a traced product and a chunk form's products (`cost.product_work`, one a product)
+    alike, row 4081's receipts finding a small fusion's time that latency. On a part no one measured, the
+    kernels are work no rate prices (`Schedule.unpriced`)."""
+    hopper = generation.gpu_target("NVIDIA H100 80GB HBM3")
+    schedule = cost.fused(hopper)
+
+    def priced(fn, *shapes):
+        region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.bfloat16) for shape in shapes)))
+        graph, bundle, _ = program.graphed(region)
+        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                             cost_model=cost.model(region, schedule))[1].work
+
+    traced = priced(lambda a, b: jnp.sum(jnp.dot(a, b), axis=-1), (64, 64), (64, 64))
+    assert traced.kernels == 2
+    one, two = cost.product_work(64, 64, 64), cost.product_work(64, 64, 64, count=2)
+    throughput = sum(kernel_cost.units(one, kernel_cost.rates(hopper, device=True))[0])
+    assert schedule(one) == pytest.approx(throughput + hopper.fixed_seconds)
+    assert schedule(two) == pytest.approx(2 * (throughput + hopper.fixed_seconds))
+    assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
+
+
 def test_device_memory_is_priced_at_the_parts_measured_stream():
     """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
     tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
@@ -759,14 +783,14 @@ def test_an_algebra_span_with_effects_is_rewritten_within_its_call():
 
 def test_an_algebra_span_no_rule_changes_keeps_the_program_as_traced():
     """An Algebra span opened for the pass, around which no form is cheaper, leaves the program jit traced as
-    it is, its marked call kept (`program_of`: the same object, lowered as traced)."""
+    it is, its marked call kept (`rewritten_program`: the same object, lowered as traced)."""
     from dew.nn.derivatives import Algebra, marked
 
     def stepped(x):
         return marked(Algebra(), lambda x: jnp.cumsum(jnp.sin(x), axis=-1))(x) * 2.0
 
     traced = jax.make_jaxpr(stepped)(rows(14, (8, 48))[0])
-    assert algebra.program_of(traced) is traced
+    assert algebra.rewritten_program(traced) is traced
 
 
 def _parameter_pairs():
@@ -848,7 +872,7 @@ closed = jax.make_jaxpr(branched)(x, y)
 
 def computed():
     window = jax.jit(algebra.rewritten(sums))(x, y)
-    rewritten = algebra.program_of(closed)
+    rewritten = algebra.rewritten_program(closed)
     body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
     return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
 
@@ -908,7 +932,7 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
     reused = []
     for precision in ("default", "highest"):
         with report.refusals(), jax.default_matmul_precision(precision):
-            algebra.program_of(closed)
+            algebra.rewritten_program(closed)
             reused.append([made.reused for made in report.rewrites()])
     assert reused[0] and not any(reused[0]) and not any(reused[1])
 

@@ -311,11 +311,11 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
 
 
 def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
-    """The algebra pass rewrites the program a step compiles (`algebra.program_of`, docs/design/algebra.md
-    §6.7): two products of one operand summed become one product of it with the summed others, so the
-    forward holds one 256 x 1024 product, not two, and the backward reads one. The derived peak and
-    residuals are that program's (row 3445): below the unrewritten program's, which the pass turned off
-    (`algebra.passes`) derives."""
+    """The algebra pass rewrites the program a step compiles (`algebra.rewritten_program`,
+    docs/design/algebra.md §6.7): two products of one operand summed become one product of it with the
+    summed others, so the forward holds one 256 x 1024 product, not two, and the backward reads one. The
+    derived peak and residuals are that program's (row 3445): below the unrewritten program's, which the
+    pass turned off (`algebra.passes`) derives."""
     from dew import algebra
     from dew.training.footprint import derived_terms
 
