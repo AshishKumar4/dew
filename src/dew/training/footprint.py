@@ -252,22 +252,33 @@ def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace,
 
 
 def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`program` with each equation computed from literals alone, and each reading only such equations'
-    results, run first, in their order: a constant's subgraph, which XLA schedules ahead of the work that
-    computes from the program's inputs and holds to its last reader. The gradient of a parameter the
-    loss reads none of is a broadcast zero JAX writes at the backward's end, which XLA made during the
-    forward: Qwen3.5-4B's step at 4 x 2048 tokens under 'minimal_with_scan_and_conv', compiled for an
-    H100, held its multi-token head's 25 zero gradients, 0.48 GiB, from step 2,480 of its schedule to
-    the update at 15,091, its peak at 4,863 among them (row 4089, its buffer dump)."""
-    constant: set[jcore.Var] = set()
-    early = []
+    """`program` with each output computed from literals alone run first, with the equations that compute
+    it, in their order: a constant the program returns and no equation of its work reads, which XLA
+    schedules ahead of that work and holds to its reader past the program. The gradient of a parameter
+    the loss reads none of is such a constant, a broadcast zero JAX writes at the backward's end, which
+    XLA made during the forward: Qwen3.5-4B's step at 4 x 2048 tokens under 'minimal_with_scan_and_conv',
+    compiled for an H100, held its multi-token head's 25 zero gradients, 0.48 GiB, from step 2,480 of its
+    schedule to the update at 15,091, its peak at 4,863 among them (row 4089, its buffer dump). A
+    constant the work reads (a loop's zero carry) is made where the work needs it, as XLA makes it."""
+    constant: dict[jcore.Var, int] = {}
     for index, equation in enumerate(program.eqns):
         reads = [value for value in equation.invars if computed(value)]
         if not equation.effects and all(value in constant for value in reads):
-            constant.update(out for out in equation.outvars if computed(out))
-            early.append(index)
-    first = set(early)
-    ordered = early + [index for index in range(len(program.eqns)) if index not in first]
+            constant.update((out, index) for out in equation.outvars if computed(out))
+    # A constant equation is hoisted where every reader of its results is a hoisted one or the outputs.
+    readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
+    for index, equation in enumerate(program.eqns):
+        for value in equation.invars:
+            if computed(value):
+                readers[value].add(index)
+    returned = {value for value in program.outvars if computed(value)}
+    early: set[int] = set()
+    for index in sorted(set(constant.values()), reverse=True):
+        made = [out for out in program.eqns[index].outvars if computed(out)]
+        if any(out in returned or readers[out] for out in made) and all(
+                reader in early for out in made for reader in readers[out]):
+            early.add(index)
+    ordered = sorted(range(len(program.eqns)), key=lambda index: index not in early)
     return program.replace(eqns=[program.eqns[index] for index in ordered])
 
 
