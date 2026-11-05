@@ -2376,3 +2376,46 @@ def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_proc
                           text=True, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.split() == ["meta", "torch.float64", "meta", "torch.int64"]
+
+
+TOOLKIT_FAMILIES = ("import jax\n"
+                    "class Issuer: ...\n"
+                    "class Transport: ...\n"
+                    "class Family(Issuer, Transport): ...\n"
+                    "class RingFamily[A](Family): ...\n"
+                    "class Pieces: ...\n"
+                    "TILE_ROWS = 8\n")
+"""A toolkit's `mosaic.py` for SLOP028's checkouts: a family's classes, a value class and a constant."""
+
+TOOLKIT_BUNDLES = ("from sparx.nn.kernels.templates import mosaic\n"
+                   "class Wgmma(mosaic.RingFamily[jax.Array]): ...\n"
+                   "WGMMA = Wgmma()\n"
+                   "LIMIT = int(4)\n")
+"""A toolkit's `mosaic_sm90.py` for SLOP028's checkouts: a bundle's class, the bundle, another constant."""
+
+
+def test_a_template_asking_which_family_it_runs_on_is_reported(tmp_path):
+    """SLOP028: a template asks no family's class (`isinstance`, `issubclass`, through a tuple too), name (a
+    family's `name`, a tile's `family`) or identity (a bundle the toolkit holds); a toolkit value's class, a
+    toolkit constant and a fact are not reported, nor the same questions in the toolkit's own modules."""
+    template = ("from sparx.nn.kernels.templates import mosaic, mosaic_sm90\n"
+                "from sparx.nn.kernels.templates.mosaic import RingFamily as Rings\n"
+                "def plan(family, tiles, indices, rows):\n"
+                "    ringed = isinstance(family, mosaic.RingFamily)\n"
+                "    either = isinstance(family, (int, Rings))\n"
+                "    sub = issubclass(type(family), mosaic_sm90.Wgmma)\n"
+                "    named = family.name == 'wgmma'\n"
+                "    tiled = tiles.family in ('wgmma', 'mma.sync')\n"
+                "    same = family is mosaic_sm90.WGMMA\n"
+                "    pieces = isinstance(indices, mosaic.Pieces)\n"
+                "    whole = rows % mosaic.TILE_ROWS == 0 and rows < mosaic_sm90.LIMIT\n"
+                "    return family.copies_in_pieces\n")
+    toolkit = {"src/sparx/nn/kernels/templates/mosaic.py": TOOLKIT_FAMILIES,
+               "src/sparx/nn/kernels/templates/mosaic_sm90.py": TOOLKIT_BUNDLES}
+    path = "src/sparx/nn/kernels/templates/attention.py"
+    assert _linted(tmp_path / "template", {**toolkit, path: template}) == [
+        (path, line, "SLOP028") for line in (4, 5, 6, 7, 8, 9)]
+    composed = template.replace("def plan", "def of")
+    bundles = "src/sparx/nn/kernels/templates/bundles.py"
+    assert _linted(tmp_path / "toolkit", {**toolkit, bundles: composed}) == []
+    assert _linted(tmp_path / "elsewhere", {**toolkit, "src/sparx/nn/attention.py": template}) == []

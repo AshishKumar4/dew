@@ -72,6 +72,12 @@ Scope is per rule, because the rules are not all about the same thing:
   launch point's (`nn/kernels/launches.py`), which holds each launch to the
   per-shard boundary (`sharding.per_shard`), so no route launches a kernel over
   operands an automatic mesh axis splits (rows 1897, 1923, 4077).
+- SLOP028 is about the templates of `src/<package>/nn/kernels/templates`: none
+  asks which family it runs on, by the class of a family, an issuer or a
+  transport of the toolkit (`isinstance`, `issubclass`), by a family's name
+  (`family.name`, a tile's `family`) or by a bundle of the toolkit (`is`, `==`
+  `mosaic_sm90.WGMMA`); each asks the fact it turns on, which the families state
+  (rows 4320, 4321). The toolkit's own modules (`TOOLKIT`) compose the bundles.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -1997,6 +2003,82 @@ def pallas_launches(module: Module) -> Iterator[Finding]:
                           f"`dew.nn.kernels.launches.{launch}`, which holds the launch per shard")
 
 
+TEMPLATES = "nn/kernels/templates/"
+"""The templates' package of `src/<package>` (SLOP028)."""
+
+TOOLKIT = ("mosaic", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "bundles")
+"""The template toolkit's modules in `TEMPLATES` (SLOP028): its families, their issuers and transports, and
+the bundles a device composes of them, which alone name them."""
+
+FAMILY_ROOTS = frozenset({"mosaic.Family", "mosaic.Issuer", "mosaic.Transport"})
+"""The toolkit classes a family's class reaches through its bases (SLOP028)."""
+
+
+@functools.cache
+def _families(root: Path, package: str) -> tuple[frozenset[str], frozenset[str]]:
+    """SLOP028: the toolkit's classes (`module.Class`, `TOOLKIT`'s modules) whose bases reach a family, an
+    issuer or a transport (`FAMILY_ROOTS`), and the bundles it holds (`module.NAME`, a module's name bound to
+    such a class's instance), read from the toolkit's source under `root`."""
+    bases: dict[str, list[str]] = {}
+    built: dict[str, str] = {}
+
+    def spelled(module: str, node: ast.expr) -> str:
+        name = _named(node.value if isinstance(node, ast.Subscript) else node)
+        return name if "." in name else f"{module}.{name}"
+
+    for name in TOOLKIT:
+        path = root / "src" / package / TEMPLATES / f"{name}.py"
+        if not path.exists():
+            continue
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.ClassDef):
+                bases[f"{name}.{node.name}"] = [spelled(name, base) for base in node.bases]
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        built[f"{name}.{target.id}"] = spelled(name, node.value.func)
+    classes = set(FAMILY_ROOTS)
+    while grown := {name for name, reached in bases.items()
+                    if name not in classes and classes & set(reached)}:
+        classes |= grown
+    return frozenset(classes), frozenset(name for name, made in built.items() if made in classes)
+
+
+def family_checks(module: Module) -> Iterator[Finding]:
+    """SLOP028: a template's question of which family it runs on: an `isinstance` or `issubclass` of a
+    toolkit family's class (`_family_classes`), a comparison of a family's name (`family.name`, a tile's
+    `family`) or of a bundle the toolkit holds (`mosaic_sm90.WGMMA`), read through the imports of its scope,
+    anywhere in `TEMPLATES` but the toolkit's own modules (`TOOLKIT`)."""
+    prefix = f"src/{module.package}/{TEMPLATES}"
+    within = module.relative.removeprefix(prefix).removesuffix(".py")
+    if not module.relative.startswith(prefix) or within in TOOLKIT:
+        return
+    root = module.path.parents[len(Path(module.relative).parts) - 1]
+    classes, bundles = _families(root, module.package)
+    toolkit = f"{module.package}.{TEMPLATES.replace('/', '.')}"
+
+    def of_toolkit(node: ast.expr, table) -> str:
+        resolved = scopes.resolved(node, table) if isinstance(node, (ast.Name, ast.Attribute)) else ""
+        return resolved.removeprefix(toolkit) if resolved.startswith(toolkit) else ""
+
+    for node, table in scopes.scoped(module.tree.body, {}, _parent(module)):
+        asked = isinstance(node, ast.Call) and _named(node.func) in ("isinstance", "issubclass")
+        if asked and len(node.args) == 2:
+            kinds = node.args[1].elts if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
+            if any(of_toolkit(kind, table) in classes for kind in kinds):
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP028",
+                              "asks a family's class; ask the fact it turns on, which the families state")
+        elif isinstance(node, ast.Compare) and all(
+                isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn, ast.Is, ast.IsNot)) for op in node.ops):
+            operands = [node.left, *node.comparators]
+            named = any(_named(operand).endswith(("family.name", ".family")) for operand in operands)
+            bundle = any(of_toolkit(operand, table) in bundles for operand in operands)
+            if named or bundle:
+                yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP028",
+                              "asks which family it runs on by name; ask the fact it turns on, which the "
+                              "families state")
+
+
 GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
                   "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
@@ -2282,7 +2364,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
-                  pallas_launches)
+                  pallas_launches, family_checks)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
