@@ -1666,6 +1666,12 @@ class Transport[Allocated, Opened](abc.ABC):
         accumulator's axes a vector follows, where a family stages its loads through registers in the
         accumulator's layouts (`mosaic_sm80.Mma`); a vector whose axes go unstated follows its columns."""
 
+    def shares_rows(self, rows: int, consumers: int) -> bool:
+        """Whether a step's block of `rows` rows splits into the copies `consumers` consumers each make of it:
+        always where a producer loads it whole (TMA's rings)."""
+        del rows, consumers
+        return True
+
     def load_barriers(self, count: int):
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
         allocations hold beside its streams (`scoped`, `resources.Scope`)."""
