@@ -1842,17 +1842,23 @@ def test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for(dtype, k
 
 
 def _forward_kernels(op, ba, config) -> dict:
-    """The forward's register model by each launch's kernel name (`attention_forward`, its training,
-    peaks, natural and guarded launches, `attention_mosaic_forward._launch`), all the op's
-    (`MosaicForward.registers`, a bound on the peak walk's), a natural launch's at its own tiles."""
+    """The forward's register model by each name a launch of it takes (`attention_mosaic_forward._launch`:
+    `attention_{forward, training, peaks}`, then `_natural`, `_kept`, `_guarded`, `_columns{width}` and
+    `_split` where it is so), each the op's (`MosaicForward.registers`): a peak walk's its own, a natural
+    launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the values' columns at that
+    block's width."""
     family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
-    # A fold's natural rewalk at its own tiles (`Tiles.relaunch`), its model theirs.
-    models = {"": resources.register_model(family, config.consumers, op.registers(ba, config)),
-              "_natural": resources.register_model(family, config.relaunch.consumers,
-                                                   op.registers(ba, config.relaunch))}
-    return {f"attention_{kind}{natural}{guarded}": models[natural]
-            for kind in ("forward", "training", "peaks") for natural in models
-            for guarded in ("", "_guarded")}
+    found = {}
+    for natural, tiles in (("", config), ("_natural", config.relaunch)):
+        for kind in ("forward", "training", "peaks"):
+            for columns in (None, 64, 128, 256):
+                registers = op.registers(ba, tiles, peaks=kind == "peaks", columns=columns)
+                model = resources.register_model(family, tiles.consumers, registers)
+                named = "" if columns is None else f"_columns{columns}"
+                found.update({f"attention_{kind}{natural}{kept}{guarded}{named}{split}": model
+                              for kept in ("", "_kept") for guarded in ("", "_guarded")
+                              for split in ("", "_split")})
+    return found
 
 
 @COMPILES_ON_CPU
@@ -1878,8 +1884,17 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
         return attention_decode.attend(query, key, value, spans)
 
     with generation.assumed(generation_name):
-        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, (query, key, key)), {})],
-                                       generation_name)
+        # The plan's op over the packed rows, its launches' models (`_forward_kernels`).
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        rows, row_spans, _ = attention_decode.packed(zeros[0], spans, key.shape[2])
+        op, args = attention_mosaic._forward_call(rows, *zeros[1:], row_spans, None, scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True)
+        ba = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
+        config = attention_decode.plan(rows, *zeros[1:], row_spans, None, scale=None,
+                                       target=generation.gpu_target()).config
+        found = compile_mosaic_kernels(
+            [KernelCase("decode", lambda: (decode, (query, key, key)), _forward_kernels(op, ba, config))],
+            generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
