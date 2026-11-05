@@ -24,11 +24,11 @@ Invariants:
   reads it as the stored layers it stacks (`dew.nn.sharding.stacked_layers`): Dew's
   weight-decay mask, Muon's matrix axes, a param group's patterns, int8 moments' size threshold,
   LAMB's trust ratio, LaProp's adaptive clip and QK-Clip's per-layer maxima each give what they give
-  unstacked. An optax transformation given as it is runs over the stacked leaf, so unless every state it
-  holds names a transform Dew knows to act a number at a time, the run keeps every layer whole on every
-  stage, the replicated layout's memory, which trains it exactly (`StageLocal.of`): a stateless
-  transform (`optax.EmptyState`) says nothing of what it reads, and optax's LAMB trust ratio, its
-  adaptive clip and a constant rate's scale all hold one (row 3934).
+  unstacked. An optax transformation given as it is runs over the stacked leaf, so the run keeps its runs
+  stage-local where the update's program reads each stored layer from that layer alone, along the stacked
+  layers both ways (`whole_reading`, the causality walk of `dew.interop.sequence_causality`), and keeps
+  every layer whole on every stage otherwise, the replicated layout's memory, which trains it exactly: a
+  trust ratio or a clip over a leaf's norm reads every layer (rows 3934, 3995).
 
 Rejected: the stage axis as one more axis the state splits over, as fsdp splits it, which keeps each
 leaf one layer but moves the run's parameters to their stage and its gradients back every step, the

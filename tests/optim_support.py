@@ -1,34 +1,15 @@
 """What the optimizer tests share: the learning rate they build at, the small decoder whose parameter
-tree they step, the axes its modules draw it in, its tree drawn afresh for a seed, and SGD and Adam given
-built as a pipelined run keeps them stage-local."""
+tree they step, the axes its modules draw it in, and its tree drawn afresh for a seed."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew.batch import unboxed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.sharding import boxed, boxed_axes
 
 LR = 1e-3
-
-
-def stage_local_sgd(rate: float, momentum: float | None = None) -> optax.GradientTransformation:
-    """optax's SGD at `rate` given built, its rate a schedule's and its momentum (where set) a trace,
-    every state naming a transform that acts a number at a time, which a pipelined run keeps stage-local
-    (`dew.optim.STACKED_STATES`), where `optax.sgd`'s constant rate holds a state that names no transform
-    (`optax.EmptyState`, row 3996). Its updates are `optax.sgd(rate, momentum)`'s."""
-    traced = () if momentum is None else (optax.trace(decay=momentum),)
-    return optax.chain(*traced, optax.scale_by_schedule(lambda count: -rate))
-
-
-def stage_local_adam(rate: float) -> optax.GradientTransformation:
-    """optax's Adam at `rate` given built, its rate a schedule's: every state it holds names a transform
-    that acts a number at a time, which a pipelined run reads as its stored layers and keeps stage-local
-    (`dew.optim.STACKED_STATES`), where `optax.adam`'s constant rate holds a state that names no transform
-    and keeps every layer whole (`optax.EmptyState`, row 3934). Its updates are `optax.adam(rate)`'s."""
-    return optax.chain(optax.scale_by_adam(), optax.scale_by_schedule(lambda count: -rate))
 
 
 def decoder_draw():

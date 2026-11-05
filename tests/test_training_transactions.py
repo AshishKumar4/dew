@@ -273,9 +273,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
 
     def clip(threshold):
-        # A rate of naught the schedule's, whose state names its transform, so a staged run keeps the
-        # layers stage-local (`dew.optim.STACKED_STATES`), as `optax.sgd(0.0)`'s would not.
-        return optax.chain(optax.scale_by_schedule(lambda count: -0.0), scale_by_qk_clip(threshold))
+        return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
 
     def trained(threshold, first, second):
         train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
