@@ -200,6 +200,26 @@ def test_a_loops_stacked_results_are_held_beside_each_turns_own():
     assert peak_bytes(program, "gpu", Workspace(0, 0)) == (10 + 2) * 8 * 8 * 4
 
 
+def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are_held():
+    """The gradient of a parameter the loss reads none of is a broadcast zero JAX writes at the backward's
+    end, which XLA makes ahead of the work, held to its reader: where the step holds every gradient to its
+    end (`consumed` false, a global clip's), it is held through the backward's peak, one buffer of the
+    parameter's size more than where the parameter is read (row 4089: Qwen3.5-4B's multi-token head's 25
+    zero gradients, 0.48 GiB, at its step's peak)."""
+    # Activations of 8 MiB a layer make the backward's peak, past which the gradients alone are held.
+    rows = jax.ShapeDtypeStruct((4096, 512), jnp.float32)
+    params = {"used": jax.ShapeDtypeStruct((512, 512), jnp.float32),
+              "unread": jax.ShapeDtypeStruct((128, 128), jnp.float32)}
+
+    def loss(params, rows):
+        return jnp.sum(jnp.tanh(jnp.tanh(rows @ params["used"]) @ params["used"])), ()
+
+    held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
+    read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
+                         workspace=Workspace(0, 0)).bytes
+    assert held == read + 128 * 128 * 4, (held, read)
+
+
 def test_a_transposed_input_returned_flat_is_a_copy():
     """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
     which a flattening of it returned holds, where a transpose of a value the program computes is laid
