@@ -85,9 +85,10 @@ class CorpusCounts:
     (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
     tokens: int = 0
-    """The valid target tokens of the rows it delivered, where its reader weighs its rows in them (a
-    mixture measured in tokens, `mix(..., by="tokens")`, or a layout's windows), under its member where a
-    mixture's rows are: each member's share of a run's committed tokens (row 4119)."""
+    """The valid target tokens of the rows its reader weighed as it accepted them, under its member where a
+    mixture's rows are (row 4119): what a mixture measured in tokens (`mix(..., by="tokens")`) drew of each
+    member, the shares it balances, or a layout's windows that hold a target. A step after the weighing
+    that refuses a weighed row counts it under `data/rejected`, its tokens staying weighed."""
 
     def delivered(self, element: Batch | bytes, examples: int | None = None,
                   tokens: int | None = None) -> None:
@@ -152,7 +153,7 @@ class CorpusCounts:
         delivered, its rejections and the augmentation it declined by reason as integers, the share
         of those rows cut short and the chunks per chunked record."""
         examples = {f"data/rows/{label}": self.accepted} if self.rows else {}
-        tokens = {f"data/tokens/{label}": self.tokens} if self.tokens else {}
+        tokens = {f"data/weighed_tokens/{label}": self.tokens} if self.tokens else {}
         return {
             **examples,
             **tokens,
@@ -1113,7 +1114,8 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         combined.attempted = max(combined.attempted, counts.attempted)
         combined.chunks = max(combined.chunks, counts.chunks)
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
-        # Counters inside one iterator weigh the same rows: the outermost delivered them.
+        # Counters inside one iterator weigh the same rows, a later one those an earlier left: the first
+        # weighing is the corpus's.
         combined.tokens = max(combined.tokens, counts.tokens)
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)

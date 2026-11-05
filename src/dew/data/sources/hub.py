@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
@@ -320,8 +320,12 @@ class Hub(Dataset):
         # dataset repo holds are what `save_to_disk` and `push_to_hub` write, Arrow's stream format, which no
         # reader can cut into shards or count without reading it whole; such a split streams its Parquet
         # conversion, or is prepared.
+        # An archive's module is what it holds, which only reading it says: such a split streams no files of
+        # its own, as datasets' inference would open each archive to learn it.
         from datasets.load import infer_module_for_data_files_list
 
+        if any(PurePosixPath(path).suffix.lower() == ".zip" for path in paths):
+            return [], "parquet"
         module, _ = infer_module_for_data_files_list(paths)
         kinds: Mapping[str, tuple[Format, ...]] = {"parquet": ("parquet",), "json": ("jsonl", "json")}
         matches = [path for path in paths if inferred_format(path) in kinds.get(module or "", ())]
