@@ -412,41 +412,36 @@ more would share the host's cores among more compiles without finishing more."""
 
 @dataclasses.dataclass(frozen=True)
 class Attempt:
-    """A program's first compile (`attempted`): its executable and its kernels that spill, or the error XLA
-    raised of it, which its settlement raises in its caller's turn (`settled`) where it is no refusal of a
-    Triton kernel asking shared bytes past a block (`shared_asked`)."""
+    """A program's first compile (`attempted`): its executable, or the error XLA raised of it, which its
+    settlement raises in its caller's turn (`settled`) where it is no refusal of a Triton kernel asking
+    shared bytes past a block (`shared_asked`)."""
 
     executable: jax.stages.Compiled | None
-    spilling: list["Binary"]
     error: Exception | None = None
     """A `jax.errors.JaxRuntimeError`, which JAX names as a value, no type."""
 
 
-def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-              read: bool) -> Attempt:
-    """`lowered` compiled once under `options`, its kernels' binaries read where it runs a template's
-    (`read`, `reads_binaries`): the part of a compile that reads and writes nothing of this process's but
-    the executable it makes and the persistent compilation cache, so a thread of its own runs it
-    (`compiled_at_once`); what it found, or XLA's error, is kept by `settled`."""
+def attempted(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None) -> Attempt:
+    """`lowered` compiled once under `options`: XLA's compile alone, which reads and writes nothing of this
+    process's but the executable it makes and the persistent compilation cache, so a thread of its own
+    runs it (`compiled_at_once`); its kernels' binaries are read where it is kept (`settled`), in its
+    caller's thread, as reading them walks the executable's MLIR (`binaries`), which two threads at once
+    failed in (a Qwen3.5-4B step and its sampled step for a compile-only H100: `MLIRError: Failure while
+    executing pass pipeline`)."""
     try:
-        executable = lowered.compile(options)
+        return Attempt(lowered.compile(options))
     except jax.errors.JaxRuntimeError as error:
-        return Attempt(None, [], error)
-    return Attempt(executable, [found for found in binaries(executable) if found.frame] if read else [])
+        return Attempt(None, error)
 
 
 def attempts(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]]
              ) -> list[Attempt]:
     """Each of `programs` compiled once (`attempted`), at most `COMPILE_THREADS` at once, in order; a
-    program alone compiles in this thread. Whether a program's binaries are read is read here, from its
-    lowering, so no thread walks another's module (`reads_binaries`)."""
-    reads = [reads_binaries(lowered) for lowered, _ in programs]
+    program alone compiles in this thread."""
     if len(programs) < 2:
-        return [attempted(lowered, options, read) for (lowered, options), read in zip(programs, reads,
-                                                                                      strict=True)]
+        return [attempted(lowered, options) for lowered, options in programs]
     with ThreadPoolExecutor(min(len(programs), COMPILE_THREADS), thread_name_prefix="dew-compile") as pool:
-        pending = [pool.submit(attempted, lowered, options, read)
-                   for (lowered, options), read in zip(programs, reads, strict=True)]
+        pending = [pool.submit(attempted, lowered, options) for lowered, options in programs]
         return [each.result() for each in pending]
 
 
@@ -464,9 +459,7 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
          relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None) -> jax.stages.Compiled:
     """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
-    if first is None:
-        first = attempted(lowered, options, reads_binaries(lowered))
-    return settled(lowered, options, relower, first)
+    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first)
 
 
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
@@ -486,9 +479,9 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         if asked is None:
             raise first.error
         return _unblocked(lowered, options, relower, asked, first.error)
-    executable, spilling = first.executable, first.spilling
+    executable = first.executable
     assert executable is not None
-    found = _misses_of(spilling)
+    found = _misses_of(_spilling(lowered, executable))
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
         _recorded(found, stepped=False)
@@ -580,9 +573,15 @@ def _recorded(found: list, *, stepped: bool) -> None:
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
     executable = lowered.compile(options)
+    return executable, _spilling(lowered, executable)
+
+
+def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> list["Binary"]:
+    """The kernels of `executable`, `lowered` compiled, that spill, where it runs a template's
+    (`reads_binaries`)."""
     if not reads_binaries(lowered):
-        return executable, []
-    return executable, [found for found in binaries(executable) if found.frame]
+        return []
+    return [found for found in binaries(executable) if found.frame]
 
 
 @dataclasses.dataclass(frozen=True)
