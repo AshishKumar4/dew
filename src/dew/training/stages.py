@@ -642,11 +642,11 @@ class _Numbering:
             if index in stacked or not entrywise(equation) or tuple(shapes[index]) != whole:
                 continue
             # An entrywise equation's operand of no stack of a stack's shape: each row's the same where it
-            # is a scalar's broadcast, any other's rows its own, which no row's expression names.
-            if operand not in self.uniform:
-                return None
-            operands[index] = (operand,) * count
-            stacked.append(index)
+            # is a scalar's broadcast; any other's is read whole beside each row, a key no layer's
+            # expression holds (its shape among the key's).
+            if operand in self.uniform:
+                operands[index] = (operand,) * count
+                stacked.append(index)
         row_shapes = [shape[held:] if index in stacked else shape for index, shape in enumerate(shapes)]
         every = _full_sum(equation, held)
         if every is not None:
