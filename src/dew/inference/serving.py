@@ -779,27 +779,7 @@ class Server:
         for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
-        ceiling = cache_ceiling(task.model)
-        if ceiling is None:
-            raise ValueError("a server needs a model that declares max_seq_len for its cache")
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("capacity must be a positive number of cache slots per row")
-        model = task.model
-        if kv_cache is not None:
-            if not isinstance(model, Layered):
-                raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
-            model = model.with_kv_cache(kv_cache)
-        layout = model.kv_cache if isinstance(model, Layered) else KVCache()
-        # One program serves one capacity, so the cache holds whole tiles of it
-        # rather than a power-of-two bucket: every decode step's attention reads
-        # each slot, and a capacity of 384 bucketed to 512 read a third more.
-        # A model shorter than the tiles keeps whole pages within its max_seq_len, which no row passes.
-        unit = math.lcm(64, layout.page_size or 64)
-        page = layout.page_size or 1
-        rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
-        if rounded < capacity:
-            raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
-                             + ("" if page == 1 else f" in whole pages of {page}"))
+        model, layout, rounded = _served_layout(task.model, kv_cache, capacity)
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every, host_pages)
@@ -1440,6 +1420,32 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
         raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
                          "own prefill; serve without chunk and prefix_cache")
     return strategy
+
+
+def _served_layout(model: nn.Module, kv_cache: KVCache | None,
+                   capacity: int) -> tuple[nn.Module, KVCache, int]:
+    """The served model over `kv_cache` where given, its cache layout, and its rows' `capacity` rounded to
+    whole 64-slot tiles and whole pages: one program serves one capacity, so the cache holds whole tiles of
+    it rather than a power-of-two bucket (every decode step's attention reads each slot, and a capacity of
+    384 bucketed to 512 read a third more), and a model shorter than the tiles keeps whole pages within its
+    max_seq_len, which no row passes."""
+    ceiling = cache_ceiling(model)
+    if ceiling is None:
+        raise ValueError("a server needs a model that declares max_seq_len for its cache")
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("capacity must be a positive number of cache slots per row")
+    if kv_cache is not None:
+        if not isinstance(model, Layered):
+            raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
+        model = model.with_kv_cache(kv_cache)
+    layout = model.kv_cache if isinstance(model, Layered) else KVCache()
+    unit = math.lcm(64, layout.page_size or 64)
+    page = layout.page_size or 1
+    rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+    if rounded < capacity:
+        raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
+                         + ("" if page == 1 else f" in whole pages of {page}"))
+    return model, layout, rounded
 
 
 def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,

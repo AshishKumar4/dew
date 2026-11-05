@@ -868,7 +868,7 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
             failed = failure
         else:
             primary.add_note(f"Closing the run failed: {failure!r}")
-            if failure is error:
+            if error is not None and failure is error:
                 # This process's own: the closes it came from, as `attempted` noted each with its step.
                 for note in error.__notes__:
                     primary.add_note(note)
