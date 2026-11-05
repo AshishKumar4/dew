@@ -101,6 +101,7 @@ def check_schedule(ref, case):
 
         return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float32)
 
+    @as_given
     def truth(initial, jitter):
         import torch
 
@@ -148,6 +149,7 @@ def check_unet(directory, case):
 
     reference = torch_arm(source)
 
+    @as_given
     def truth(*inputs):
         with float64():
             return torch_arm(wide)(*inputs)

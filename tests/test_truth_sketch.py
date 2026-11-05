@@ -30,7 +30,7 @@ def test_a_truths_sketch_is_its_signed_sums(size, dtype):
     block of SKETCH_BLOCK summed (a block past the end padded with zeros) and the blocks' sums summed
     exactly, which is then every product summed exactly. At a block's and a host chunk's edges, with
     signed zeros among a floating truth's entries, so a recorded sketch stays a recomputed truth's."""
-    from reference_error import SKETCH, _sign_bits, truth_sketch
+    from truth_sketch import SKETCH, _sign_bits, truth_sketch
 
     rng = np.random.default_rng(size)
     truth = DRAWN[dtype](rng, size)
@@ -49,7 +49,7 @@ def test_a_devices_block_sums_are_the_hosts_where_each_block_sums_exactly():
     zeros among them), across a device chunk's edge and a last block padded with zeros: the same
     products in the same blocks, so on any truth the two part by each block's own rounding alone, within
     gamma(SKETCH_BLOCK) of its magnitudes."""
-    from reference_error import DEVICE_CHUNK, _device_partials, _host_partials, _sign_bits
+    from truth_sketch import DEVICE_CHUNK, _device_partials, _host_partials, _sign_bits
 
     size = DEVICE_CHUNK + (1 << 16) + 70
     truth = np.random.default_rng(size).integers(-(1 << 20), 1 << 20, size) / 1024.0

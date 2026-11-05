@@ -212,7 +212,8 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
         return {metric: np.float64({**terms, "loss": loss}[name]) for metric, name in named.items()}
 
     assert_as_exact(dew, reference, drawn_parameters(params), f"{kind} distillation terms",
-                    seeds=DISTILLATION_SEEDS["terms"], truth_fn=lambda params: reference(params, "float64"))
+                    seeds=DISTILLATION_SEEDS["terms"],
+                    truth_fn=as_given(lambda params: reference(params, "float64")))
 
 
 @pytest.mark.parametrize("kind", ["cosine", "l2"])

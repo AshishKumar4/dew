@@ -362,6 +362,7 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
     def jordan(wide, tall):
         return [jax.vmap(muon_orthogonalized)(jnp.asarray(stack, jnp.bfloat16)) for stack in (wide, tall)]
 
+    @as_given
     def truth(wide, tall):
         return [np.stack([newton_schulz_reference(np.asarray(matrix, np.float64)) for matrix in stack])
                 for stack in (wide, tall)]

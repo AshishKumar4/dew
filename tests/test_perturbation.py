@@ -410,6 +410,7 @@ def test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does(
         widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
         return pooled_estimate(objective, widened, {"x": x, "y": y}, 1)
 
+    @as_given
     def truth(x, y):
         # Traced under x64, so its jitters are the float32 runs' and everything after them float64.
         with jax.enable_x64(new_val=True):

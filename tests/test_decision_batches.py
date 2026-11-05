@@ -109,6 +109,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
             found.append(np.asarray(forward(task.variables, inputs))[np.asarray(inputs.options)])
         return np.concatenate(found)
 
+    @as_given
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
@@ -278,6 +279,7 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
 
     wide = {}
 
+    @as_given
     def truth(seed):
         with jax.enable_x64(new_val=True):
             if "task" not in wide:
