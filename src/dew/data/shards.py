@@ -13,7 +13,7 @@ import grain.python as grain
 from dew._records import boolean, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import Shard, ShardManifest, ShardReader
+from .sources.base import Shard, ShardManifest, ShardRows
 
 _log = logging.getLogger(__name__)
 
@@ -148,7 +148,7 @@ class _ShardPass[Place](grain.IterDataset):
     is held in examples over shards that state no rows. A loading worker reads its slice of the places
     (`set_slice`) and its part of the quota, every worker's count-th."""
 
-    def __init__(self, root: grain.MapDataset, reader: Callable[..., grain.IterDataset], cycle: int,
+    def __init__(self, root: grain.MapDataset, reader: Callable[[Place], ShardRows], cycle: int,
                  loading: Loading, name: str, quota: int | None = None):
         super().__init__(root)
         self.root, self.reader = root, reader
@@ -170,9 +170,6 @@ class _ShardPass[Place](grain.IterDataset):
             cycle_length=self.cycle,
             num_make_iter_threads=max(self.loading.threads, 1),
             make_iter_buffer_size=self.loading.read_buffer,
-            # Each shard open reads a row ahead on a thread of its own, none where the reading holds none
-            # ahead (a member's share of a mix's read-ahead), as the shards it opens next.
-            iter_buffer_size=min(self.loading.read_buffer, 1),
         )
         limited = rows if self.quota is None else experimental.LimitIterDataset(rows, self.quota)
         return _Passing(limited.__iter__())
@@ -225,34 +222,68 @@ class _EmptyRun:
             _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 
 
+def iterated(rows: ShardRows, loading: Loading) -> grain.IterDataset:
+    """A shard's `rows` streamed: read by index, they are read under the reading's `loading`, its threads
+    and its read-ahead, a mix's share of them for a member of one (none of a thousand members' share of
+    one thread, which reads on the thread that draws from it), where Grain's own default opened sixteen
+    threads and five hundred rows ahead for every shard (row 4079: a thousand-member mix held 9,249
+    threads after 190 packed steps, each opened member's own); streamed, as they are."""
+    if isinstance(rows, grain.MapDataset):
+        return rows.to_iter_dataset(grain.ReadOptions(loading.threads, loading.read_buffer))
+    return rows
+
+
 @dataclasses.dataclass(frozen=True)
 class _Taken:
     """A shard reader of `(shard, rows)` places (`bounded_places`): the shard's first `rows` rows."""
 
-    reader: ShardReader
+    reader: Callable[[Shard], ShardRows]
 
-    def __call__(self, place: tuple[Shard, int],
-                 options: grain.ReadOptions | None = None) -> grain.IterDataset:
+    def __call__(self, place: tuple[Shard, int]) -> ShardRows:
         shard, rows = place
-        read = self.reader(shard, options)
-        return read if rows == shard.rows else experimental.LimitIterDataset(read, rows)
+        read = self.reader(shard)
+        if rows == shard.rows:
+            return read
+        if isinstance(read, grain.MapDataset):
+            return read[:rows]
+        return experimental.LimitIterDataset(read, rows)
 
 
 @dataclasses.dataclass(frozen=True)
 class _Reader[Place]:
-    """A place's reader (a shard's), its rows read under the reading's loading, its threads and its
-    read-ahead, and watched for a run of empty shards (`_EmptyRun`). A mix member reads under its share of
-    the run's (none of a thousand members' share of one thread, which read on the thread that draws
-    from them), where Grain's own read each shard on sixteen threads of its own and five hundred rows
-    ahead (row 4079: a thousand-member packed mix held 9,249 threads after 190 steps)."""
+    """A place's reader (a shard's), its rows watched for a run of empty shards (`_EmptyRun`): indexed, as
+    the reading's own iterator of them opens them (`_Indexed`), streamed, as they are."""
 
-    reader: Callable[..., grain.IterDataset]
+    reader: Callable[[Place], ShardRows]
     empty: _EmptyRun
     loading: Loading
 
-    def __call__(self, place: Place) -> grain.IterDataset:
-        options = grain.ReadOptions(self.loading.threads, self.loading.read_buffer)
-        return _Watched(self.reader(place, options), self.empty)
+    def __call__(self, place: Place) -> grain.MapDataset | grain.IterDataset:
+        rows = self.reader(place)
+        if isinstance(rows, grain.MapDataset):
+            return _Indexed(rows, self.empty, self.loading)
+        return _Watched(rows, self.empty)
+
+
+class _Indexed(grain.MapDataset):
+    """A shard's indexed rows, which an interleave opens by their own iterator (`MapDataset.__iter__`,
+    where a streamed shard is read through a thread of the interleave's that reads it ahead): the
+    reading's, its rows streamed under its loading (`iterated`) and watched for a run of empty shards, so
+    a mix member's share of no thread reads on the thread that draws from it (row 4079: each member's
+    shard of a thousand-member mix read on a thread of its own)."""
+
+    def __init__(self, rows: grain.MapDataset, empty: _EmptyRun, loading: Loading):
+        super().__init__(rows)
+        self.rows, self.empty, self.loading = rows, empty, loading
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _WatchedIterator(iterated(self.rows, self.loading).__iter__(), self.empty)
 
 
 class _Watched(grain.IterDataset):

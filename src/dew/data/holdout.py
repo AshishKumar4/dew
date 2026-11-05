@@ -175,9 +175,9 @@ class HashPart(View[Source]):
                              None if subdivide is None else functools.partial(_unsized_parts, subdivide),
                              index_ordered=manifest.index_ordered)
 
-    def _reader(self, manifest: ShardManifest, shard: Shard, options=None):
+    def _reader(self, manifest: ShardManifest, shard: Shard):
         # The other part's rows are no rejection, as a memory read holds none of them.
-        return manifest.reader(shard, options).filter(self.keeps)
+        return manifest.reader(shard).filter(self.keeps)
 
 
 def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
@@ -389,5 +389,5 @@ class _Placed:
 
         return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
 
-    def __call__(self, shard: Shard, options=None):
-        return self.rows()[shard.start : shard.stop].to_iter_dataset(options)
+    def __call__(self, shard: Shard):
+        return self.rows()[shard.start : shard.stop].to_iter_dataset()

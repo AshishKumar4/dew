@@ -11,7 +11,7 @@ import numpy as np
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest, unnamed
+from .base import Read, Shard, ShardManifest, ShardRows, unnamed
 
 
 @dataclass(frozen=True, eq=False)
@@ -55,9 +55,7 @@ class Grain(Dataset):
                                  index_ordered=True)
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
-    def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        if isinstance(self.dataset, grain.MapDataset):
-            return self.dataset.to_iter_dataset(options)
+    def _read_shard(self, shard: Shard) -> ShardRows:
         return self.dataset
 
     def metadata(self) -> Mapping[str, object]:
