@@ -42,6 +42,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import logging
 import math
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -508,8 +509,10 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     stack reads each row as its layer's does where it holds the rows on its leading axes and its
     parameters are the layer's over them (`_row_form`): an entrywise one, a product, a reduction, a
     transpose, a reshape or a broadcast of each row. A sum over every axis of a stack is the sum of its
-    rows', and a scalar's sums are one sum whatever their order (`_Numbering.summed`), as a clip by the
-    global norm forms it. Row r of a stack of n rows is read against row r of every stacked input of n
+    rows', and a scalar's sums of non-negative floating terms are one sum whatever their order
+    (`_Numbering.summed`), as a clip by the global norm forms it: the two programs' sums then round
+    within one bound of the exact sum, though not to one value, so a comparison after them may decide
+    otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row r of a stack of n rows is read against row r of every stacked input of n
     rows; a stack of another count is no row's."""
     from dew.training.staging import flattened
 
@@ -556,7 +559,7 @@ class _Numbering:
 
     def __init__(self):
         self.numbers: dict[Hashable, int] = {}
-        self.sums: dict[int, tuple[tuple[int, int], ...]] = {}
+        self.sums: dict[int, tuple[int, int, int]] = {}
         self.nonnegative: set[int] = set()
         """The numbers of values no entry of which is negative: squares, magnitudes, their sums and roots,
         whose sums reassociated round within the same bound in any order (no cancellation), so their
@@ -570,15 +573,19 @@ class _Numbering:
 
     def summed(self, terms: Sequence[int]) -> int:
         """The number of the sum of `terms`, each non-negative (`nonnegative`), each sum among them read as
-        its own terms, in any order: its terms and how many times each, so a sum of a thousand leaves is
-        kept as its terms, not as every prefix's."""
-        counts: dict[int, int] = {}
+        its own terms, in any order: the multiset of its terms, named by two 64-bit sums of each term's
+        own random word (`_word`) and its count of terms, a few integers a sum however many terms it
+        holds, so no sum keeps its prefixes (a collision of both words over distinct multisets is a
+        2**-128 chance)."""
+        first = second = count = 0
         for term in terms:
-            for part, times in self.sums.get(term, ((term, 1),)):
-                counts[part] = counts.get(part, 0) + times
-        parts = tuple(sorted(counts.items()))
-        total = self.number(("sum", parts))
-        self.sums[total] = parts
+            held = self.sums.get(term)
+            if held is None:
+                low, high = _word(term)
+                held = (low, high, 1)
+            first, second, count = (first + held[0]) % 2**64, (second + held[1]) % 2**64, count + held[2]
+        total = self.number(("sum", first, second, count))
+        self.sums[total] = (first, second, count)
         self.nonnegative.add(total)
         return total
 
@@ -587,7 +594,7 @@ class _Numbering:
         if isinstance(value, jcore.Literal):
             number = self.number(("literal", str(value.aval), parameter_key(value.val)))
             held = np.asarray(value.val)
-            if held.dtype.kind in "biuf" and bool(np.all(held >= 0)):
+            if held.dtype.kind == "f" and bool(np.all(held >= 0)):
                 # A literal with no negative entry, a sum's starting zero among them (`summed`).
                 self.nonnegative.add(number)
             return number
@@ -617,7 +624,7 @@ class _Numbering:
                       for operand, shape in zip(operands, shapes, strict=True))
         if spread or (free and name in ENTRYWISE and uniform):
             self.uniform.update(made)
-        if _keeps_sign(name, params, operands, self.nonnegative):
+        if _keeps_sign(equation, name, params, operands, self.nonnegative):
             self.nonnegative.update(made)
         return made
 
@@ -789,10 +796,22 @@ UNROLLED = 256
 numbered once a step; a longer one keeps every layer whole."""
 
 
-def _keeps_sign(name: str, params: Mapping, operands: Sequence, nonnegative: set[int]) -> bool:
-    """Whether an equation `name` under `params` over `operands` makes no negative entry: a square (`x * x`,
-    `square`, an even integer power), a magnitude, an exponential, or a sum, product, maximum, quotient,
-    root or conversion of values that make none."""
+def _word(term: int) -> tuple[int, int]:
+    """Two 64-bit words drawn for expression number `term`, fixed by it, which a sum's name adds
+    (`_Numbering.summed`)."""
+    digest = hashlib.blake2b(term.to_bytes(8, "little"), digest_size=16).digest()
+    return int.from_bytes(digest[:8], "little"), int.from_bytes(digest[8:], "little")
+
+
+def _keeps_sign(equation, name: str, params: Mapping, operands: Sequence, nonnegative: set[int]) -> bool:
+    """Whether an equation `name` under `params` over `operands` makes no negative entry, its operands and
+    results all real floating point (an integer's magnitude or square can overflow negative, a
+    complex square is no ordering at all): a square (`x * x`, `square`, an even integer power), a
+    magnitude, an exponential, or a sum, product, maximum, quotient, root or floating conversion of
+    values that make none."""
+    values = [*equation.invars, *equation.outvars]
+    if not all(jnp.issubdtype(value.aval.dtype, jnp.floating) for value in values):
+        return False
     if name in ("abs", "exp", "square") or (name == "mul" and len(operands) == 2
                                              and operands[0] == operands[1]):
         return True
