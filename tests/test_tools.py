@@ -1976,6 +1976,30 @@ def test_an_outer_program_built_outside_the_compile_point_is_reported(tmp_path):
     assert _linted(tmp_path / "suite", {"tests/test_rollout.py": rollout, "tools/rollout.py": rollout}) == []
 
 
+def test_a_custom_derivative_applied_outside_the_derivatives_module_is_reported(tmp_path):
+    """SLOP026: in any package of `src/<package>`, `jax.custom_vjp` and `jax.custom_jvp` as a decorator,
+    within functools.partial, imported by their own names or by their module's path are reported; a
+    derivative declared through the derivatives module's functions is not, nor either in that module, the
+    tests or the tools."""
+    site = ("import functools\n"
+            "import jax\n"
+            "from jax import custom_jvp\n"
+            "from jax.custom_derivatives import custom_vjp\n"
+            "from sparx.nn import derivatives\n"
+            "@jax.custom_vjp\n"
+            "def clipped(x): return x\n"
+            "partial = functools.partial(jax.custom_jvp, nondiff_argnums=(1,))\n"
+            "@custom_jvp\n"
+            "def smoothed(x): return x\n"
+            "rounded = custom_vjp(clipped)\n"
+            "declared = derivatives.declared_derivative(derivatives.Protected(), clipped, clipped, clipped)\n")
+    for package in ("nn", "precision", "sampling"):
+        assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, "SLOP026", (6, 8, 9, 11))
+    owner = "import jax\n@jax.custom_vjp\ndef rule(x): return x\n"
+    assert _linted(tmp_path / "owner", {"src/sparx/nn/derivatives.py": owner}) == []
+    assert _linted(tmp_path / "suite", {"tests/test_site.py": site, "tools/site.py": site}) == []
+
+
 def test_the_compile_points_own_jit_is_the_only_bare_one(tmp_path):
     """SLOP025: the compile point's own class (`COMPILE_POINT`, `OuterProgram`) and the nested program
     (`nested`) compile by a bare jit and no finding is made of them; the same jit in another class of the
