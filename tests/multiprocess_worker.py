@@ -2370,12 +2370,14 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
 
 def mode_decision_publish(args) -> dict:
     """The slot release at `--release`, placed over the pool's devices with its readout partitioned
-    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
-    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
-    the report. Every process takes part; process 0 writes both."""
+    across the processes (`Layout(min_shard=1)`), published as both publishers read it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, a tensor at a time read
+    home by the pool together (`reading_home`), into the `.npz` beside the report. Every process takes
+    part; process 0 writes both, the others read along."""
     import jax
     import jax.numpy as jnp
 
+    from dew._coordination import reading_home
     from dew.inference import rollouts
     from dew.interop import Pretrained
     from dew.training import Layout, MeshSpec
@@ -2385,9 +2387,11 @@ def mode_decision_publish(args) -> dict:
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)
-    published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
-    if published is not None:
-        np.savez(args.out.with_suffix(".npz"), **published.export())
+    with reading_home("push export", writes=jax.process_index() == 0):
+        exported = rollouts._published(placed, placed.variables, jnp.dtype("float32")).export()
+        tensors = {name: exported[name] for name in sorted(exported)}
+    if jax.process_index() == 0:
+        np.savez(args.out.with_suffix(".npz"), **tensors)
     leaves = jax.tree.leaves(placed.head_variables)
     return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
 
