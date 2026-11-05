@@ -2136,13 +2136,19 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
         reader.close()
 
 
+def _unless_third(row) -> bool:
+    """Whether a row is not every third long one, which a step after a mixture refuses."""
+    return int(row["id"]) // 1000 != 2 or int(row["id"]) % 3 != 2
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-def test_a_token_mixture_logs_the_tokens_each_member_delivered_through_a_resume(read):
-    """A mixture measured in tokens logs each member's valid target tokens (`data/tokens/<member>`): the
-    targets of the rows of it the run read, one a short row and nine a long one, across a saved position
-    and its resume (row 4119)."""
+def test_a_token_mixture_logs_the_tokens_it_drew_of_each_member_through_a_resume(read):
+    """A mixture measured in tokens logs the valid target tokens it drew of each member
+    (`data/weighed_tokens/<member>`), the shares it balances: one a short row and nine a long one, of
+    the rows the run read and of those a step after the mix refused, across a saved position and its
+    resume (row 4119)."""
     chain = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()],
-                by="tokens").batch(1)
+                by="tokens").filter(_unless_third, reason="third").batch(1)
     data = compile(chain, read=read, loading=READ)
     stopped = data.train(DataPartition())
     try:
@@ -2157,5 +2163,8 @@ def test_a_token_mixture_logs_the_tokens_each_member_delivered_through_a_resume(
         statistics = data.statistics()
     finally:
         resumed.close()
-    for name, tag, targets in (("short", 1, 1), ("long", 2, 9)):
-        assert statistics[f"data/tokens/{name}"] == targets * sum(value // 1000 == tag for value in read_ids)
+    refused = sum(count for name, count in statistics.items() if name.endswith("/third"))
+    assert refused > 0
+    for name, tag, targets, after in (("short", 1, 1, 0), ("long", 2, 9, refused)):
+        drawn = sum(value // 1000 == tag for value in read_ids) + after
+        assert statistics[f"data/weighed_tokens/{name}"] == targets * drawn
