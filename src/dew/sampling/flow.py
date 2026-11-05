@@ -22,6 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.nn.derivatives import Protected, declared_tangent
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, divided
 
@@ -229,8 +230,7 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     return _scaled(quotient, power)
 
 
-@jax.custom_jvp
-def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+def _half_mahalanobis_value(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
     """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
     (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
     wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
@@ -238,7 +238,6 @@ def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) ->
     return _divergence(value, mean, variance)
 
 
-@_half_mahalanobis.defjvp
 def _half_mahalanobis_jvp(primals, tangents):
     """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
     / variance`, formed from the residual and the term as they are held, shifted to range
@@ -265,13 +264,17 @@ def _half_mahalanobis_jvp(primals, tangents):
             moved + _scaled(stretched, stretch_power - _half(stretch_power)))
 
 
+_half_mahalanobis = declared_tangent(Protected(), _half_mahalanobis_value, _half_mahalanobis_jvp)
+"""The density's quadratic term (`_half_mahalanobis_value`), differentiated by its range-safe rule
+(`_half_mahalanobis_jvp`): numerics the algebra pass keeps as written."""
+
+
 def _half(power: jax.Array) -> jax.Array:
     """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
     return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
-@jax.custom_jvp
-def _gaussian_kl(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
+def _gaussian_kl_value(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
     """`_divergence`, the KL of two transitions of one variance, differentiated as one linear map: its
     forward mode `_kl_tangent`'s, its reverse mode `_kl_pullback`'s, each forming every difference,
     product and quotient from operands scaled to range, so each is finite wherever its derivative is,
@@ -280,9 +283,13 @@ def _gaussian_kl(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> 
     return _divergence(mean, reference, variance)
 
 
-@_gaussian_kl.defjvp
 def _gaussian_kl_jvp(primals, tangents):
     return _gaussian_kl(*primals), linear_map(_kl_tangent, _kl_pullback, primals, tangents)
+
+
+_gaussian_kl = declared_tangent(Protected(), _gaussian_kl_value, _gaussian_kl_jvp)
+"""The KL of two transitions (`_gaussian_kl_value`), differentiated as one range-safe linear map
+(`_gaussian_kl_jvp`): numerics the algebra pass keeps as written."""
 
 
 def _kl_tangent(primals: tuple[jax.Array, jax.Array, jax.Array],

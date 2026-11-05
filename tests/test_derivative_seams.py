@@ -145,7 +145,7 @@ CONTRACTED = {
     "src/dew/sampling/flow.py::_half_mahalanobis":
         ("test_a_transitions_quadratic_term_holds_every_order", NUMERICS),
     "src/dew/sampling/guidance.py::_guided":
-        ("test_a_guided_prediction_holds_every_order", NUMERICS),
+        ("test_a_guided_prediction_holds_every_order", SURROGATE),
     "src/dew/nn/derivatives.py::surrogate.rule":
         ("test_a_surrogate_holds_every_order", SURROGATE),
     "src/dew/nn/derivatives.py::declared_derivative.rule":
@@ -155,8 +155,8 @@ CONTRACTED = {
 }
 """Each contracted seam, `path::qualified name`, the test of tests/test_contracts_*.py that holds it, and its
 kind: a kernel's derivative (`KERNEL`: a launch's own backward, or the tangent of the code it stands for),
-a derivative of the value written for its rounding or range (`NUMERICS`: time_shift's regular form, a
-guided prediction's affine derivative among them), or a declared derivative that is not the value's
+a derivative of the value written for its rounding or range (`NUMERICS`: time_shift's regular form among
+them), or a declared derivative that is not the value's
 (`SURROGATE`, `dew.nn.derivatives.surrogate`)."""
 
 
@@ -239,8 +239,8 @@ def test_each_seams_kind_is_its_declaration():
     """A seam is a surrogate exactly where it is declared one (`surrogate`, or a builder's `Surrogate()`
     kind, `_maker`), every other a kernel's or a
     numerics derivative: a derivative that is not its value's cannot hide in a custom rule of its own,
-    and the safely written true derivatives (time_shift, a guided prediction, a held hook's, a gemm
-    prologue's) are not surrogates. The declaration's own custom rule is the surrogate kind's."""
+    and the safely written true derivatives (time_shift, a held hook's, a gemm prologue's) are not
+    surrogates. The declaration's own custom rule is the surrogate kind's."""
     kinds = {seam: kind for seam, (_, kind) in CONTRACTED.items()}
     assert set(kinds.values()) <= {KERNEL, NUMERICS, SURROGATE}
     marked = {seam for seam, kind in kinds.items() if kind == SURROGATE}
