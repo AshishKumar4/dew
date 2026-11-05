@@ -33,7 +33,7 @@ from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.nn.kernels.options import owned_program
 from dew.optim import learning_rate
-from dew.state import REPLICA_FIELDS, Replicas, TrainState
+from dew.state import REPLICA_FIELDS, Replicas, ReplicaState, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
 
@@ -146,7 +146,7 @@ class DiLoCo:
         return _dropped(met, state.window_size)
 
 
-def regrouped(inner: Replicas, change: Callable[[Replicas], Replicas]) -> Replicas:
+def regrouped(inner: ReplicaState, change: Callable[[ReplicaState], ReplicaState]) -> ReplicaState:
     """`inner` with each group's state as `change` makes it of that group's alone, restacked: a host-side
     change of a supplied state (`dew.training._fit.afresh`), once a run."""
     groups = jax.tree.leaves(inner.variables)[0].shape[0]
