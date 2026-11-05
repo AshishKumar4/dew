@@ -2006,7 +2006,7 @@ def pallas_launches(module: Module) -> Iterator[Finding]:
 TEMPLATES = "nn/kernels/templates/"
 """The templates' package of `src/<package>` (SLOP028)."""
 
-TOOLKIT = ("mosaic", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "bundles")
+TOOLKIT = ("mosaic", "mosaic_sm80", "mosaic_sm90", "mosaic_sm100", "mosaic_tpu", "bundles")
 """The template toolkit's modules in `TEMPLATES` (SLOP028): its families, their issuers and transports, and
 the bundles a device composes of them, which alone name them."""
 
