@@ -210,6 +210,29 @@ def _exp_interval(values, bits):
     return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
+def _near_zero_interval(function):
+    """An outward float64 enclosure of an mpmath interval `function` of `1 + x` (log1p's) or of `exp(x) - 1`
+    (expm1's) at each finite value, its precision raised by the value's own exponent below one, so `1 + x`
+    is exact at every scale down to fp32's least subnormal and the enclosure's width stays below the value's
+    own last bit."""
+    def enclose(values, bits):
+        low, high = np.empty(values.shape), np.empty(values.shape)
+        for index, value in enumerate(values.flat):
+            raised = bits + max(0, -math.frexp(float(value))[1]) if value else bits
+            with interval_precision(raised) as iv:
+                a, b = interval_ends(function(iv, iv.mpf(float(value))), raised)
+            low.flat[index], high.flat[index] = _outward(a, -math.inf), _outward(b, math.inf)
+        return low, high
+    return enclose
+
+
+def _expm1_interval(values, bits):
+    """expm1's outward enclosure at each finite value, taken at EXP_RANGE's nearer end beyond it, as exp's
+    (`_exp_interval`): past its upper end the same two neighbours bound every expm1, and past its lower end
+    every expm1 lies within a format's last step of -1."""
+    return _near_zero_interval(lambda iv, x: iv.exp(x) - 1)(np.clip(values, *EXP_RANGE), bits)
+
+
 def _erfinv_enclosed(values, bits):
     """An outward enclosure of erfinv at each value in (-1, 1): mpmath's erfinv at `bits`, widened by
     2^-(bits - 24) of itself, verified at its two ends by erfc at `bits` + 64 bits, 2^40 times finer
@@ -238,6 +261,21 @@ def _log_special(value):
     expected = np.select([value < 0, value == 0, value == np.inf, value == 1], [np.nan, -np.inf, np.inf, 0.0],
                          np.nan)
     return expected, named
+
+
+def _log1p_special(value):
+    """log1p's limit at -1 and infinity, its NaN below -1, and its exact values at ±0 (log1p(±0) = ±0),
+    named."""
+    named = np.isnan(value) | (value <= -1) | (value == np.inf) | (value == 0)
+    expected = np.select([value < -1, value == -1, value == np.inf, value == 0],
+                         [np.nan, -np.inf, np.inf, value], np.nan)
+    return expected, named
+
+
+def _expm1_special(value):
+    """expm1's limits at the infinities and its exact values at ±0 (expm1(±0) = ±0), named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [np.inf, -1.0, value], np.nan), named
 
 
 def _exp_special(value):
@@ -721,6 +759,8 @@ LEVELS = {
     "sqrt": _arithmetic(_root),
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_exp_interval, _exp_special),
+    "log1p": _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
+    "expm1": _transcendental(_expm1_interval, _expm1_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
     "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
     "logistic": _transcendental(_logistic_interval, _logistic_special),
@@ -743,7 +783,8 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
-    range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
+    range and a quarter near zero; log1p and expm1 at every binade near zero, subnormals included, and
+    across their domains; inverse error functions across (-1, 1) and a quarter near its poles;
     reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
     across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
     log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
@@ -774,6 +815,16 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     elif name in ("exp", "logistic"):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 0.0
+        drawn = [value]
+    elif name in ("log1p", "expm1"):
+        # Every binade near zero, subnormals included, where the functions are their argument to within a
+        # last bit; and their domains' reach: log1p's down to just above -1 and up to fp32's largest, expm1's
+        # across fp32's range.
+        value = scaled(-149, 0)
+        value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
+                                      else rng.uniform(-104, 89, quarter))
+        value[2 * quarter:3 * quarter] = np.abs(scaled(0, 127))[:quarter]
         value[0] = 0.0
         drawn = [value]
     elif name == "rsqrt":
@@ -829,6 +880,8 @@ CONTRACTS = {
     "convert_element_type": _converted,
     "log": _rounding("log", None),
     "exp": _rounding("exp", None),
+    "log1p": _rounding("log1p", None),
+    "expm1": _rounding("expm1", None),
     "erf_inv": _rounding("erf_inv", None),
     "rsqrt": _rounding("rsqrt", None),
     "logistic": _rounding("logistic", None),
