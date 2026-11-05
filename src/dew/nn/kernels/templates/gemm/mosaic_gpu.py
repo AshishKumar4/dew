@@ -56,7 +56,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
-from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_padded
+from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, sides_extended, sides_padded
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -497,8 +497,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     extent = (m if family_of(tiles, lhs.dtype).bounded_loads and not interpret
               else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile))
     lhs = rows_extended(lhs, row_axis, extent)
-    prologue_operands = sides_padded(prologue_operands, prologue_axes, extent=extent)
-    epilogue_operands = sides_padded(epilogue_operands, epilogue_axes, extent=extent)
+    prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
+    epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     # A dense product's last wave balanced over the programs (`tail.balanced`), as the kernel gradient's: one
     # matrix, one accumulator, a tile a program.
     # An exact sum's order is its contract, which a tile summed across programs reassociates.

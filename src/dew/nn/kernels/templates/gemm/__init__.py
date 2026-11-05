@@ -20,14 +20,18 @@ def rows_padded(array: jax.Array, axis: int, multiple: int) -> jax.Array:
     return rows_extended(array, axis, -(-array.shape[axis] // multiple) * multiple)
 
 
-def sides_padded(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]], multiple: int | None = None,
-                 *, extent: int | None = None, along: str = 'rows') -> tuple[jax.Array, ...]:
+def sides_padded(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]], multiple: int, *,
+                 along: str = 'rows') -> tuple[jax.Array, ...]:
     """Each side operand (a prologue's or an epilogue's, `axes_of` naming each one's dimensions by the
-    launch axis it follows) padded along the dimension that follows `along` as the operand it follows is:
-    to a multiple of `multiple`, or to `extent`; one that follows no `along` as it is."""
-    def padded(side: jax.Array, axes: tuple[str, ...]) -> jax.Array:
-        if along not in axes:
-            return side
-        axis = axes.index(along)
-        return rows_extended(side, axis, extent) if multiple is None else rows_padded(side, axis, multiple)
-    return tuple(padded(side, axes) for side, axes in zip(sides, axes_of, strict=True))
+    launch axis it follows) padded along the dimension that follows `along` to a multiple of `multiple`, as
+    the operand it follows is; one that follows no `along` as it is."""
+    return tuple(rows_padded(side, axes.index(along), multiple) if along in axes else side
+                 for side, axes in zip(sides, axes_of, strict=True))
+
+
+def sides_extended(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]],
+                   extent: int) -> tuple[jax.Array, ...]:
+    """Each side operand (`sides_padded`'s) extended with zeros along the dimension that follows the rows to
+    `extent`, as the rows are; one that follows no rows as it is."""
+    return tuple(rows_extended(side, axes.index('rows'), extent) if 'rows' in axes else side
+                 for side, axes in zip(sides, axes_of, strict=True))
