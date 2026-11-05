@@ -33,7 +33,7 @@ import numpy as np
 import optax
 import tyro
 
-from dew._moments import QuantizedMoments, bf16_moments, int8_moments, scale_by_adam
+from dew._moments import bf16_moments, int8_moments, scale_by_adam
 from dew._records import share
 from dew.gauss_newton import gauss_newton, solved_directions
 from dew.held_updates import holds_state, refuse_untold, update_applied
@@ -754,7 +754,8 @@ class M3State(NamedTuple):
 class M3GivenState(M3State):
     """`scale_by_m3`'s state where its caller gave its matrices' dimension numbers, which may name a stored
     layer's axes or a stacked leaf's as written: a stage-local run keeps every layer whole on every stage
-    for it (outside `STACKED_STATES`), where M3's own default reads each stored layer."""
+    where those numbers read across a stacked leaf's layers, as its update's dataflow says
+    (`dew.training.stages.whole_reading`), where M3's own default reads each stored layer."""
 
 
 def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
@@ -2321,26 +2322,8 @@ class OptimConfig:
         return {group.name: group.rates(self.rate) for group in self.param_groups}
 
 
-STACKED_STATES: frozenset[type] = frozenset({
-    optax.MaskedNode, optax.ScaleByAdamState, optax.ScaleByAmsgradState,
-    optax.ScaleByAdaDeltaState, optax.ScaleByAdanState, optax.ScaleByBeliefState, optax.ScaleByLionState,
-    optax.ScaleByRmsState, optax.ScaleByRpropState, optax.ScaleByRssState, optax.ScaleByRStdDevState,
-    optax.ScaleByScheduleState, optax.TraceState, optax.EmaState, optax.AddNoiseState, optax.ZeroNansState,
-    optax.MaskedState, optax.MultiTransformState, optax.MultiStepsState, optax.ApplyIfFiniteState,
-    optax.ConditionallyMaskState, optax.ConditionallyTransformState, optax.InjectHyperparamsState,
-    optax.InjectStatefulHyperparamsState, optax.LookaheadState,
-    QKClipState, BoundsState, M3State, RateState, PowerProfilesState, QuantizedMoments})
-"""The optimizer states whose transforms step a stage-local run's stacked leaf as they step its layers
-one by one (`dew.training.stages.whole_reading`): optax's that act a number at a time, or read every
-leaf together, and Dew's own, whose rules read a stacked leaf as its layers (`layers_of`). The masks
-and labels a transform holds as functions are its caller's, which Dew cannot read. A stateless
-transform's `optax.EmptyState` is none of these: it names no transform, and optax's LAMB trust ratio and
-adaptive clip, which read a leaf whole, hold one (row 3934)."""
-
-
 __all__ = [
     "NEWTON_SCHULZ",
-    "STACKED_STATES",
     "BoundsState",
     "Cosine",
     "DeltaState",

@@ -119,27 +119,29 @@ def greedy_walk(model, params, prompts, steps: int) -> np.ndarray:
     return np.asarray(walk(prompts))
 
 
-@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
-def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
-    """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
-    a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
-    walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
-    (`strategies.block_step`), crossing in the replay of what the block emits; a prompt that starts so
-    walks a token a block and still fills its budget."""
-    model, params = longrope_speculator(kind)
-    for held, steps in LONGROPE_CASES:
-        prompts = jnp.asarray(held)
-        speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
-                              sampling=Sampling(temperature=0), strategy=Speculative(block=3))
-        np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
-                                      greedy_walk(model, params, prompts, steps))
-        np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
-
-
 LONGROPE_CASES = [(np.asarray([[1, 2, 3], [7, 8, 9]], np.int32), 6),
                   (np.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], np.int32), 2)]
 """Two rows' prompts that cross LongRoPE's change past their third token, and two that start at it, each
 with its budget."""
+
+
+@pytest.mark.parametrize("case", range(len(LONGROPE_CASES)))
+@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
+def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, case):
+    """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
+    a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
+    walk (`greedy_walk`). A row whose candidates would cross keeps none and walks its block's one token
+    (`strategies.block_step`), crossing in the replay of what the block emits; a prompt that starts so
+    walks a token a block and still fills its budget. Each case a test of its own, its programs its own
+    (ledger 3892: DSpark's two took 168 s in one test)."""
+    model, params = longrope_speculator(kind)
+    held, steps = LONGROPE_CASES[case]
+    prompts = jnp.asarray(held)
+    speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
+                          sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
+                                  greedy_walk(model, params, prompts, steps))
+    np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
 
 def longrope_speculator(kind: str):

@@ -22,8 +22,9 @@ SHARED_BYTES_PER_CLOCK = 128
 kernels run on (CUDA C++ Programming Guide, "Shared Memory", compute capabilities 5.x to 12.x)."""
 
 EXPONENTIALS_PER_CLOCK = 16
-"""Base-2 exponentials a multiprocessor's special-function units return per clock (CUDA C++ Programming
-Guide, "Arithmetic Instructions" throughput table, compute capabilities 5.x to 12.x)."""
+"""Base-2 exponentials a multiprocessor's special-function units return per clock (the CUDA C++ Best Practices
+Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, compute capabilities 7.5 to 12.1, where CUDA 13 moved the
+Programming Guide's throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
 
 REGISTER_STEP = 8
 """Registers a thread in one allocation unit (256 registers a warp)."""
