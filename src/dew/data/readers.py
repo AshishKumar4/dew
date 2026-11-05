@@ -12,7 +12,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import position
-from dew._records import record
+from dew._records import json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -126,10 +126,32 @@ class _CanonicalPass:
 
 
 @dataclasses.dataclass
-class _PublishedCounts:
-    """Reader-owned snapshots retained without retaining its Grain iterator."""
+class _Published:
+    """A position a reader published, and its counts (`state_counts`) once they are asked."""
 
-    counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    state: Mapping[str, object] | None
+    read: Mapping[str, CorpusCounts] | None = None
+
+
+@dataclasses.dataclass
+class _PublishedCounts:
+    """Reader-owned snapshots retained without retaining its Grain iterator: the position last published,
+    whose counts are read from it as they are asked, a run logging them every few steps, not read from
+    each batch's position (row 4079). A publication replaces the whole `_Published`, so counts read off
+    one, on another thread than the reader's, are that one's and kept on it alone."""
+
+    published: _Published = dataclasses.field(default_factory=lambda: _Published(None))
+
+    @property
+    def counts(self) -> Mapping[str, CorpusCounts]:
+        published = self.published
+        if published.read is None:
+            state = published.state
+            published.read = MappingProxyType({} if state is None else state_counts(state))
+        return published.read
+
+    def publish(self, state: Mapping[str, object] | None) -> None:
+        self.published = _Published(state)
 
 
 class _PerShare(Forwarding):
@@ -201,7 +223,7 @@ class _PerShare(Forwarding):
 
     def _publish(self, state: Mapping[str, object]) -> None:
         self._state = state
-        self._statistics.counts = MappingProxyType(state_counts(state))
+        self._statistics.publish(state)
 
     def get_state(self) -> bytes:
         state = self._state
@@ -209,7 +231,10 @@ class _PerShare(Forwarding):
             state = self._reader().get_state()
             self._publish(state)
         saved = {"dew_data_plan": self._plan.record(), "counters": COUNTERS, "iterator": state}
-        return json.dumps({position.REPLICATED: saved} if self._replicated else saved).encode()
+        # A mix's captured positions are shared mappings (`SharedMapping`), written as the records they
+        # read as.
+        return json.dumps(json_value({position.REPLICATED: saved} if self._replicated else saved,
+                                     "data position")).encode()
 
     def set_state(self, state: bytes) -> None:
         held = position.replicated(state)
@@ -226,7 +251,7 @@ class _PerShare(Forwarding):
         saved = record(iterator, "saved Grain iterator")
         self.close()
         self._saved = saved
-        self._statistics.counts = MappingProxyType({})
+        self._statistics.publish(None)
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
