@@ -26,6 +26,23 @@ VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
 under default layouts)."""
 
+
+def bitcast(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation`'s result is a bitcast of its one operand under a row-major layout: a shape
+    primitive's (`VIEWS`), a stack of one value (a new leading axis of one), or an unstack along an axis of
+    one (that axis dropped), which XLA lowers to a reshape (`lax.stack`, `lax.unstack`): a scanned head's
+    loop reads its weight gradient's carry by unstacking it and writes it back by stacking, each a view of
+    the carry's buffer, which the derivation counted twice over (Qwen3.5-4B's fused tiled head, 2 x 2.37
+    GiB, row 4089)."""
+    name = equation.primitive.name
+    if name in VIEWS:
+        return True
+    if name == "stack":
+        return len(equation.invars) == 1
+    if name == "unstack":
+        return len(equation.outvars) == 1
+    return False
+
 UNEVALUATED = frozenset({"pure_callback", "io_callback", "debug_callback", "ffi_call", "pallas_call",
                          "axis_index"})
 """Primitives XLA's evaluator computes no offset through: those JAX lowers to a custom call, and the
@@ -220,7 +237,7 @@ class Slicing:
                     sliced.update(equation.outvars)
                 elif equation.outvars[0] in program.outvars and computed(equation.invars[1]):
                     updated.update(_bitcast_sources(equation.invars[1], producers, readers))
-            elif name in VIEWS and reads and reads[0] in sliced:
+            elif bitcast(equation) and reads and reads[0] in sliced:
                 sliced.update(equation.outvars)
             elif (reads and all(read in counted for read in reads) and name not in ("scan", "while", "cond")
                   and evaluable(equation)):
@@ -325,7 +342,7 @@ def _bitcast_sources(value: jcore.Var, producers: Mapping, readers: Mapping) -> 
     if len(readers.get(value, ())) != 1:
         return set()
     found = {value}
-    while (equation := producers.get(value)) is not None and equation.primitive.name in VIEWS \
+    while (equation := producers.get(value)) is not None and bitcast(equation) \
             and computed(equation.invars[0]) and len(readers.get(equation.invars[0], ())) == 1:
         value = equation.invars[0]
         found.add(value)

@@ -38,7 +38,14 @@ from dew.nn.kernels.generation import _compute_capability, gpu_target
 from dew.nn.programs import bodies, computed
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.compiled_program import VIEWS, Slicing, compiled, deviceless, dimensions, lowering_platform
+from dew.training.compiled_program import (
+    Slicing,
+    bitcast,
+    compiled,
+    deviceless,
+    dimensions,
+    lowering_platform,
+)
 from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
@@ -427,7 +434,7 @@ def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.Jaxpr
 class Frontier:
     """Which values of `program` XLA's fusion for `platform` keeps a buffer of: each but one a primitive
     it recomputes in its consumers computes (`recomputed`), which reads those it is computed from in
-    its place, and one a layout primitive (`VIEWS`) makes of another's buffer, which XLA's layout
+    its place, and one a layout primitive (`bitcast`) makes of another's buffer, which XLA's layout
     assignment lays that buffer out for; the program's outputs, where it returns them (`returned`),
     always but as such a view; neither its inputs nor its literals."""
 
@@ -454,7 +461,7 @@ class Frontier:
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
-        (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
+        (`bitcast`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
         if value in self.forwards:
@@ -462,7 +469,7 @@ class Frontier:
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
-        if equation.primitive.name in VIEWS:
+        if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
         return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
@@ -574,6 +581,9 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
     name = equation.primitive.name
+    if bitcast(equation):
+        # A bitcast holds no buffer of its own, on any platform.
+        return True
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:
