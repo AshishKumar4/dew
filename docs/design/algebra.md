@@ -599,9 +599,11 @@ def limits(region, saturation: Saturation) -> tuple[int, int]: ...   # (nodes, i
 - The limits are derived from the region's size where they are set (`limits`): nodes at `growth` times its
   equations, iterations at `depth` times its longest chain. egglog has no node limit of its own, so the count is
   checked between iterations.
-- `growth` and `depth` are measured per mode. At compile time they are the largest the compile-time sets reach
-  at their fixpoint on the eval's programs; at dev time, on the declarations. They are recorded with the rule
-  sets' receipts and re-measured when a set changes.
+- `growth` and `depth` are measured per mode. At compile time they sit above the largest the compile-time sets
+  reach at their fixpoint on Dew's step programs: none of 756 windows (a UNet's fsdp2 x tensor2 matrix cell,
+  benchmark_step's cpu-smoke steps) reached either of 64 and 4, the largest using under a quarter of each,
+  and none priced lower at four times both (`SATURATION`'s receipt). At dev time they are measured on the
+  declarations when the generator resumes. They are re-measured when a set changes.
 - A region that reaches a limit keeps the cheapest form found so far, and the report says so.
 - Sets run in registry order, one iteration each, until no set changes the graph or a limit is reached.
 - The e-graph runs with one thread and is built in equation order, so the same input gives the same output in any
