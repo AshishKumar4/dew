@@ -15,7 +15,7 @@ from typing import ClassVar, TypeGuard
 import tokamax
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import cost, report
+from dew.nn.kernels.templates import report, resources
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -60,10 +60,10 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def register_budget(self, config: Config) -> int:
         """The registers a thread of the launch's program may hold at `config`: a thread's own
-        (`cost.THREAD_REGISTERS`) unless the launch's roles share the file otherwise (a warp-specialized
-        program's consumers, `resources.consumer_registers`)."""
+        (`Multiprocessor.thread_registers`) unless the launch's roles share the file otherwise (a
+        warp-specialized program's consumers, `resources.consumer_registers`)."""
         del config
-        return cost.THREAD_REGISTERS
+        return resources.facts().thread_registers
 
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
@@ -112,8 +112,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         return isinstance(config, self.config_cls)
 
     def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
-        """Whether `config`'s threads hold their registers (`registers` within `register_budget`)."""
-        return (self.registers(ba, config) or 0) <= self.register_budget(config)
+        """Whether `config`'s threads hold their registers (`registers` within `register_budget`); a launch
+        stating none (a TPU's, the XLA program's) holds any."""
+        registers = self.registers(ba, config)
+        return registers is None or registers <= self.register_budget(config)
 
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
@@ -134,9 +136,9 @@ class Template[Config: Hashable](tuning.KernelOp):
         outside what the launch's kernel takes (its legality's other rules, or a fixed space)."""
         if not self._typed(config):
             return f"it is no {self.config_cls.__name__}"
-        registers, budget = self.registers(ba, config) or 0, self.register_budget(config)
         if not self._held(ba, config):
-            return f"its threads hold {registers} registers live, past the {budget} a thread has"
+            return (f"its threads hold {self.registers(ba, config)} registers live, past the "
+                    f"{self.register_budget(config)} a thread has")
         target = generation.gpu_target()
         staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
         if staged > shared:

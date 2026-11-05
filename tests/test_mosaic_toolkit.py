@@ -436,6 +436,19 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
     assert (single.programs, single.stages) == (3, 1)
 
 
+def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
+    """A one-warpgroup mma.sync launch of a few registers a thread on an L4 (sm89), whose multiprocessor runs
+    1536 threads in at most 24 blocks (CUDA C++ Programming Guide §5.1, Table 33): its registers would hold
+    sixteen programs, its threads hold twelve, and the residency it is planned at is twelve, where an A100's
+    2048 threads hold sixteen."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    for generation_name, programs in (("sm89", 12), ("sm80", 16)):
+        with generation.assumed(generation_name):
+            family = bundles.of(generation_name, jnp.bfloat16)
+            assert resources.register_programs(family, 1, 32) == programs
+
+
 def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
     """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
     the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
@@ -445,8 +458,8 @@ def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
 
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
-    assert resources.raised_registers(1, 1) == 248
-    assert family.registers(1) == 248
+        assert resources.raised_registers(1, 1) == 248
+        assert family.registers(1) == 248
 
 
 def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
@@ -460,7 +473,7 @@ def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
         model = resources.register_model(family, 1, None)
-    assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
+        assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
 
 
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():

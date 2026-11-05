@@ -13,7 +13,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import ADDED, integer, record
-from dew.batch import Batch
+from dew.batch import Batch, coordinates
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
@@ -743,15 +743,15 @@ def _unit_rows(element: Batch, units: np.ndarray, owned: np.ndarray
     """A window's rows, numbered from 1 in the order they stand and 0 for padding, from the packer's
     documents (`units`, `owned` each question's) and each token's and question's row in its unit
     (`row`, `question_row`; a unit of one row where the window holds none); each question's row; and
-    each token's position in its row."""
+    each token's position in its row, as `dew.batch.coordinates` counts a document's tokens."""
     if "row" not in element:
         return units, owned, np.asarray(element["tokens_positions"])
     numbered = _numbered(element, units)
     segments = numbered(units, element["row"])
     owners = numbered(owned, element["question_row"])
-    starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])])
-    positions = np.where(segments > 0, np.arange(len(segments)) - starts[np.maximum(segments - 1, 0)], 0)
-    return segments, owners, positions.astype(np.int32)
+    positions = coordinates(segments=segments[None], xp=np).positions
+    assert positions is not None, "a window's coordinates count its documents' tokens"
+    return segments, owners, np.asarray(positions[0])
 
 
 def _numbered(element: Batch, units: np.ndarray) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:

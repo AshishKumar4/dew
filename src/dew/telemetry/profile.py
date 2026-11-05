@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -42,6 +43,12 @@ class _Converter(Protocol):
 _active: Profiler | None = None
 _lifecycle = threading.Lock()
 _logger = logging.getLogger(__name__)
+
+
+def profile_installed() -> bool:
+    """Whether XProf, the `dewml[profile]` extra a capture reports through, is installed, asked of the
+    import system without importing it (`require_profile_support` resolves its converters)."""
+    return importlib.util.find_spec("xprof") is not None
 
 
 def require_profile_support() -> _Converter:

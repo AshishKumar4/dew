@@ -162,6 +162,12 @@ class Op[C]:
     """Another op's named choice that names this one's kernel, unless this call or op names its own.
     Entries are ordered, as the op's requirements and candidates are."""
 
+    def __post_init__(self):
+        from . import generation
+
+        # The op's choice is one of the vocabulary `chosen` reads: none is served it does not name.
+        generation.known_choices((self.choice,))
+
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:
             if kernel.name == name:

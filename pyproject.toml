@@ -18,14 +18,14 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post51; a release sorts below it, so an
+    # first build with every fix is post52; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The CUDA and PJRT plugins the
     # cuda12 and cuda13 extras name are Dew's builds of its native code,
-    # post45's, which post46's to post51's Python fixes left as it was. A bump runs the GPU
+    # post45's, which post46's to post52's Python fixes left as it was. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post51,<0.12.1",
+    "jax>=0.12.0.1.post52,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -125,9 +125,10 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # dew.quantization: quantized training and serving. Qwix declares
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
 # Dew's build of it (pypi.dewml.dev): 0.1.8, get_current_rule reaching a nested
-# provider where the outer one's rules match nothing, and a public
-# qwix.is_quantized(model).
-quantization = ["qwix==0.1.8.post2"]
+# provider where the outer one's rules match nothing, a public
+# qwix.is_quantized(model), and conv_general_qt's backward over grouped
+# convolutions.
+quantization = ["qwix==0.1.8.post3"]
 test = [
     "pytest",
     # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.
@@ -277,13 +278,16 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' a
                   "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
 ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
-      "flake8"]
+      "flake8",
+      # The compile gate's SASS rules disassemble the cubins it reads, wherever the suite runs: a CUDA 13 wheel,
+      # laid out in nvidia/cu13, which post52's JAX takes as its CUDA root only where it holds ptxas too
+      # (tests/test_cuda_root.py).
+      "nvidia-cuda-nvdisasm==13.4.92; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
 tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]

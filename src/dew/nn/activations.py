@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype
 
+from .derivatives import Protected, declared_tangent
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, capped_logits, rounded_to
 
@@ -156,15 +157,15 @@ def ungated_activation(name: str, x: jax.Array) -> jax.Array:
     return UNGATED[name](x)
 
 
-@jax.custom_jvp
-def exact_gelu(x: jax.Array) -> jax.Array:
+def _exact_gelu(x: jax.Array) -> jax.Array:
     """`dew.nn.activations.gelu_exact`, rounded once to `x`'s dtype in both
     differentiation directions: a bf16 gate's activation rounds once, wherever
-    the compiler places it."""
+    the compiler places it. A protected span (`exact_gelu`,
+    `dew.nn.derivatives.declared_tangent`): its barriers hold the roundings the
+    algebra pass must not move."""
     return gelu_exact(jax.lax.optimization_barrier(x))
 
 
-@exact_gelu.defjvp
 def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
                     ) -> tuple[jax.Array, jax.Array]:
     x, = primals
@@ -174,6 +175,9 @@ def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
     _, derivative = jax.jvp(gelu_exact, (work,), (jnp.ones_like(work),))
     tangent = derivative * jax.lax.optimization_barrier(dx).astype(work.dtype)
     return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
+
+
+exact_gelu = declared_tangent(Protected(), _exact_gelu, _exact_gelu_jvp)
 
 
 @dataclasses.dataclass(frozen=True)

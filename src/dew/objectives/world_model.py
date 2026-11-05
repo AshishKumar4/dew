@@ -17,8 +17,8 @@ and context frames at signal level 1 - `tau_ctx` when generating.
 
 from __future__ import annotations
 
-import math
-from collections.abc import Callable, Mapping
+import functools
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -26,30 +26,43 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables, unboxed
 from dew.inputs import unit_range
-from dew.nn.attention import reference_attention
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.mlp import GatedMLP
+from dew.nn.scan_orders import patchify, unpatchify
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
+RMS_EPSILON = 1e-6
+"""The world model's RMS norms' epsilon, every one of them (Flax's `nn.RMSNorm` default, which its blocks
+were drawn with)."""
 
-class _Block(nn.Module):
-    """A pre-RMSNorm transformer block: QK-normed attention under `mask` (`reference_attention`), then a
-    SwiGLU MLP."""
 
-    width: int
-    heads: int
+def _block(width: int, heads: int, tokens: int, name: str) -> DecoderBlock:
+    """A pre-RMSNorm `DecoderBlock` of `width` features over `tokens` tokens: unrotated attention of `heads`
+    biased heads (`nope`), each head's queries and keys RMS-normed, under the call's pairwise mask
+    (`AttentionMetadata.pairwise_mask`) in the reference implementation, its logits formed in at least
+    float32 (`MixerContext.wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the
+    width (`GatedMLP`)."""
+    attention = functools.partial(CausalSelfAttention, nope=True, ctx=MixerContext(
+        emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads, max_seq_len=tokens,
+        causal=False, qk_norm=True, norm_eps=RMS_EPSILON, attention_bias=True, attention_impl="reference",
+        wide_logits=True))
+    mlp = functools.partial(GatedMLP, hidden_features=4 * width, out_features=width, use_bias=True)
+    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=RMS_EPSILON, name=name)
 
-    @nn.compact
-    def __call__(self, x: jax.Array, mask: jax.Array) -> jax.Array:
-        head = self.width // self.heads
-        h = nn.RMSNorm()(x)
-        q, k, v = (nn.DenseGeneral((self.heads, head))(h) for _ in range(3))
-        q, k = nn.RMSNorm()(q), nn.RMSNorm()(k)
-        # In at least float32, as TSSM's blocks attend (`reference_attention`); any leading axes of the
-        # tokens are batch axes, which `mask` `[tokens, tokens]` is shared across.
-        attended = reference_attention(q, k, v, mask=mask, wide_logits=True)
-        x = x + nn.DenseGeneral(self.width, axis=(-2, -1))(attended)
-        h = nn.RMSNorm()(x)
-        gate, up = nn.Dense(4 * self.width)(h), nn.Dense(4 * self.width)(h)
-        return x + nn.Dense(self.width)(nn.silu(gate) * up)
+
+def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array) -> jax.Array:
+    """`tokens` `[..., S, D]` through `blocks`, each token reading the tokens `mask` `[S, S]` lets it, any
+    leading axes of the tokens batch axes it is shared across, flattened into one for the blocks and
+    restored."""
+    *lead, count, width = tokens.shape
+    flat = tokens.reshape(-1, count, width)
+    metadata = AttentionMetadata(pairwise_mask=jnp.broadcast_to(mask, (flat.shape[0], count, count)))
+    for block in blocks:
+        flat = block(flat, attention_metadata=metadata)
+    return flat.reshape(*lead, count, width)
 
 
 class CausalTokenizer(nn.Module):
@@ -72,19 +85,17 @@ class CausalTokenizer(nn.Module):
         return (height // self.patch) * (width // self.patch)
 
     def _patchify(self, frames: jax.Array) -> jax.Array:
+        """Frames `[..., H, W, C]` as `nn.scan_orders.patchify`'s row-major patches, its batch the frames'
+        leading axes."""
         *lead, height, width, channels = frames.shape
-        p = self.patch
-        x = frames.reshape(*lead, height // p, p, width // p, p, channels)
-        x = jnp.moveaxis(x, -4, -3)
-        return x.reshape(*lead, (height // p) * (width // p), p * p * channels)
+        patches = patchify(frames.reshape(-1, height, width, channels), self.patch)
+        return patches.reshape(*lead, *patches.shape[1:])
 
     def _unpatchify(self, patches: jax.Array) -> jax.Array:
-        *lead, _, _ = patches.shape
-        height, width, channels = self.frame
-        p = self.patch
-        x = patches.reshape(*lead, height // p, width // p, p, p, channels)
-        x = jnp.moveaxis(x, -3, -4)
-        return x.reshape(*lead, height, width, channels)
+        """`_patchify`'s inverse (`nn.scan_orders.unpatchify`)."""
+        *lead, count, size = patches.shape
+        frames = unpatchify(patches.reshape(-1, count, size), self.patch, *self.frame)
+        return frames.reshape(*lead, *self.frame)
 
     def setup(self) -> None:
         self.embed = nn.Dense(self.width)
@@ -93,26 +104,30 @@ class CausalTokenizer(nn.Module):
                                         (self.latents, self.width))
         self.patch_positions = self.param("patch_positions", nn.initializers.normal(0.02),
                                           (self.patches, self.width))
-        self.encoder = [_Block(self.width, self.heads) for _ in range(self.depth)]
+        tokens = self.patches + self.latents
+        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}")
+                        for index in range(self.depth)]
         self.squeeze = nn.Dense(self.bottleneck)
         self.unsqueeze = nn.Dense(self.width)
         self.readout_tokens = self.param("readout_tokens", nn.initializers.normal(0.02),
                                          (self.patches, self.width))
-        self.decoder = [_Block(self.width, self.heads) for _ in range(self.depth)]
+        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}")
+                        for index in range(self.depth)]
         self.pixels = nn.Dense(self.patch * self.patch * self.frame[2])
 
     def __call__(self, frames: jax.Array) -> jax.Array:
         return self.decode(self.encode(frames))
 
-    def encode(self, frames: jax.Array, mask_rate: jax.Array | None = None,
-               key: jax.Array | None = None) -> jax.Array:
-        """Each frame's latents; with `mask_rate` `[...]`, each patch replaced by the mask token with
-        that frame's probability, drawn from `key`."""
+    def encode(self, frames: jax.Array, mask_rate: jax.Array | None = None, key: jax.Array | None = None,
+               *, masked: jax.Array | None = None) -> jax.Array:
+        """Each frame's latents; each patch `masked` `[..., patches]` replaced by the mask token, or with
+        `mask_rate` `[...]` each with that frame's probability, drawn from `key`."""
         x = self.embed(self._patchify(frames)) + self.patch_positions
         if mask_rate is not None:
             if key is None:
                 raise ValueError("masking a tokenizer's patches draws from a key")
             masked = jax.random.uniform(key, x.shape[:-1]) < mask_rate[..., None]
+        if masked is not None:
             x = jnp.where(masked[..., None], self.mask_token, x)
         lead = x.shape[:-2]
         latent = jnp.broadcast_to(self.latent_tokens, (*lead, *self.latent_tokens.shape))
@@ -120,9 +135,7 @@ class CausalTokenizer(nn.Module):
         count = self.patches
         index = jnp.arange(tokens.shape[-2])
         # Latents read everything; patches read only patches.
-        mask = (index[:, None] >= count) | (index[None, :] < count)
-        for block in self.encoder:
-            tokens = block(tokens, mask)
+        tokens = _attended(self.encoder, tokens, (index[:, None] >= count) | (index[None, :] < count))
         return jnp.tanh(self.squeeze(tokens[..., count:, :]))
 
     def decode(self, latents: jax.Array) -> jax.Array:
@@ -132,9 +145,7 @@ class CausalTokenizer(nn.Module):
         index = jnp.arange(tokens.shape[-2])
         count = self.latents
         # Latents read only latents; readout tokens read themselves and the latents.
-        mask = (index[None, :] < count) | (index[:, None] >= count)
-        for block in self.decoder:
-            tokens = block(tokens, mask)
+        tokens = _attended(self.decoder, tokens, (index[None, :] < count) | (index[:, None] >= count))
         return self._unpatchify(self.pixels(tokens[..., count:, :]))
 
 
@@ -165,12 +176,19 @@ class TokenizerObjective(Objective[Ratio]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
-        rate_key, mask_key = jax.random.split(step.key)
-        rate = jax.random.uniform(rate_key, video.shape[:2], maxval=self.max_mask) if step.training else None
+        rows, frames = video.shape[:2]
+        masked = None
+        if step.training:
+            # Each clip's own draws (`Step.sample`): a frame's mask rate, and each patch's uniform.
+            rate = step.sample("mask rate", functools.partial(jax.random.uniform, maxval=self.max_mask),
+                               (frames,), rows=rows)
+            uniform = step.sample("patch draw", jax.random.uniform, (frames, self.model.patches), rows=rows)
+            masked = step.boundary("patch mask", uniform < rate[..., None])
 
         tokenizer = self.model.bind(variables)
-        error = jnp.mean(jnp.square(tokenizer.decode(tokenizer.encode(video, rate, mask_key)) - video))
-        return Ratio(error, jnp.ones(())), Aux({"mse": error})
+        stats = self.row_mean(jnp.square(tokenizer.decode(tokenizer.encode(video, masked=masked)) - video),
+                              batch)
+        return stats, Aux({"mse": stats.mean()[0]})
 
 
 class Dynamics(nn.Module):
@@ -220,22 +238,19 @@ class Dynamics(nn.Module):
         tokens = tokens + times[:frames, None]
         tokens = tokens.reshape(batch, frames * per_frame, self.width)
         time = jnp.repeat(jnp.arange(frames), per_frame)
-        mask = time[:, None] >= time[None, :]
-        for _ in range(self.depth):
-            tokens = _Block(self.width, self.heads)(tokens, mask)
+        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}")
+                  for index in range(self.depth)]
+        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :])
         spatial_out = tokens.reshape(batch, frames, per_frame, -1)[:, :, 2:]
-        out = nn.Dense(grouped.shape[-1])(nn.RMSNorm()(spatial_out))
+        out = nn.Dense(grouped.shape[-1])(nn.RMSNorm(epsilon=RMS_EPSILON)(spatial_out))
         return out.reshape(noisy.shape)
 
 
-def sampled_steps(key: jax.Array, shape: tuple[int, ...], k_max: int) -> tuple[jax.Array, jax.Array]:
-    """Eq. 4: each frame's step size d, the reciprocal of a power of two up to `k_max` drawn uniformly,
-    and its signal level tau drawn uniformly from {0, d, ..., 1 - d}."""
-    size_key, level_key = jax.random.split(key)
-    levels = int(math.log2(k_max)) + 1
-    d = 1.0 / 2.0 ** jax.random.randint(size_key, shape, 0, levels).astype(jnp.float32)
-    tau = jnp.floor(jax.random.uniform(level_key, shape) / d) * d
-    return tau, d
+def _gridded(exponent: jax.Array, uniform: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Eq. 4 from its draws: each frame's signal level tau and step size d = 2^-`exponent`, the reciprocal
+    of a power of two up to K_max, tau `uniform` in [0, 1) floored to d's grid {0, d, ..., 1 - d}."""
+    d = 1.0 / 2.0 ** exponent.astype(jnp.float32)
+    return jnp.floor(uniform / d) * d, d
 
 
 def ramp(tau: jax.Array) -> jax.Array:
@@ -278,42 +293,67 @@ def diffusion_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau
     return ramp(tau) * jnp.sum(jnp.square(predicted - clean), tuple(range(tau.ndim, clean.ndim)))
 
 
+TOKENIZER = "tokenizer"
+"""The collection of a world model's tree holding its frozen tokenizer's weights (`WorldModelObjective`)."""
+
+
 class WorldModelObjective(Objective[Ratio]):
     """Trains `Dynamics` over a frozen tokenizer's latents of a batch's `video` (and `actions`, where
-    the model reads them) by shortcut forcing, or with `shortcut` False by diffusion forcing."""
+    the model reads them) by shortcut forcing, or with `shortcut` False by diffusion forcing. The
+    tokenizer's weights are state, under `TOKENIZER` beside the dynamics' (`held_variables`), as a
+    diffusion objective's frozen towers are: they reach the compiled step as arguments, placed and
+    checkpointed with the rest, and the optimizer never sees them."""
 
     shown: Mapping[str, Shown] = {"loss": Shown()}
+
+    # The held tree is the starting tree or the tokenizer a draw goes beside.
+    _held_parts = True
 
     def __init__(self, model: Dynamics, tokenizer: CausalTokenizer, tokenizer_variables: Variables, *,
                  shortcut: bool = True):
         self.model = model
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
-        self.tokenizer, self.tokenizer_variables = tokenizer, unboxed(tokenizer_variables)
+        self.tokenizer, self._tokenizer = tokenizer, unboxed(tokenizer_variables)
         self.shortcut = shortcut
 
+    def held_variables(self) -> Variables:
+        """The starting tree, or none, with the tokenizer's weights it starts from under `TOKENIZER`."""
+        return {TOKENIZER: self._tokenizer, **(self.variables or {})}
+
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        held = self.held_variables() if held is None else held
         frames = jnp.zeros((1, 2, self.model.latents, self.model.bottleneck))
         # A labeled model's action projection drawn with the rest, so labeled and unlabeled batches
         # read one tree.
         actions = jnp.zeros((1, 2, self.model.action_size)) if self.model.action_size else None
-        return self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)), actions)
+        drawn = self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)), actions)
+        return {**drawn, TOKENIZER: held[TOKENIZER]}
 
     @property
     def validation_loss_refusal(self) -> str | None:
         return None
 
-    def latents(self, video: jax.Array) -> jax.Array:
-        return jax.lax.stop_gradient(self.tokenizer.bind(self.tokenizer_variables).encode(video))
+    def model_variables(self, variables: Variables) -> Variables:
+        """The dynamics model's own collections out of `variables`: every one but the tokenizer's."""
+        return {name: tree for name, tree in variables.items() if name != TOKENIZER}
+
+    def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
+        """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
+        return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        clean = self.latents(unit_frames(batch["video"]))
+        clean = self.latents(variables, unit_frames(batch["video"]))
         actions = batch.get("actions")
-        steps_key, noise_key = jax.random.split(step.key)
+        rows, frames = clean.shape[:2]
         d_min = 1.0 / self.model.k_max
-        tau, d = sampled_steps(steps_key, clean.shape[:2], self.model.k_max)
-        noise = jax.random.normal(noise_key, clean.shape)
+        # Each clip's own draws (`Step.sample`): Eq. 4's step size and signal level a frame, and its noise.
+        exponents = functools.partial(jax.random.randint, minval=0, maxval=self.model.levels)
+        exponent = step.sample("step exponent", exponents, (frames,), rows=rows)
+        tau, d = _gridded(exponent, step.sample("level draw", jax.random.uniform, (frames,), rows=rows))
+        tau, d = step.boundary("signal level", tau), step.boundary("step size", d)
+        noise = step.sample("noise", jax.random.normal, clean.shape[1:], rows=rows)
 
-        dynamics = self.model.bind(variables)
+        dynamics = self.model.bind(self.model_variables(variables))
 
         def f(noisy: jax.Array, tau: jax.Array, d: jax.Array) -> jax.Array:
             return dynamics(noisy, tau, d, actions)
@@ -322,8 +362,8 @@ class WorldModelObjective(Objective[Ratio]):
             per_frame = shortcut_forcing_loss(f, clean, noise, tau, d, d_min)
         else:
             per_frame = diffusion_forcing_loss(f, clean, noise, jnp.floor(tau / d_min) * d_min, d_min)
-        stats = Ratio(per_frame.sum(), jnp.asarray(per_frame.size, per_frame.dtype))
-        return stats, Aux({"frame_loss": per_frame.mean()})
+        stats = self.row_mean(per_frame, batch)
+        return stats, Aux({"frame_loss": stats.mean()[0]})
 
     def generate(self, variables: Variables, context: jax.Array, frames: int, key: jax.Array, *,
                  steps: int = 4, tau_ctx: float = 0.1, actions: jax.Array | None = None) -> jax.Array:
@@ -343,11 +383,11 @@ class WorldModelObjective(Objective[Ratio]):
                                        jnp.full((context.shape[0], 1), level)], 1)
                 d = jnp.full(tau.shape, d_model)
                 given = None if actions is None else actions[:, :sequence.shape[1]]
-                predicted = self.model.bind(variables)(sequence, tau, d, given)[:, -1]
+                predicted = self.model.bind(self.model_variables(variables))(sequence, tau, d, given)[:, -1]
                 current = current + (predicted - current) / (1 - level) / steps
             produced = jnp.concatenate([produced, current[:, None]], 1)
         return produced[:, context.shape[1]:]
 
 
-__all__ = ["CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
-           "diffusion_forcing_loss", "ramp", "sampled_steps", "shortcut_forcing_loss", "unit_frames"]
+__all__ = ["TOKENIZER", "CausalTokenizer", "Dynamics", "TokenizerObjective", "WorldModelObjective",
+           "diffusion_forcing_loss", "ramp", "shortcut_forcing_loss", "unit_frames"]

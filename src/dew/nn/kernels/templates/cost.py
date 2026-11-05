@@ -4,43 +4,28 @@ walk does tensor-core FLOPs, stages bytes through shared memory (its operand til
 back by its matrix instructions), evaluates special-function exponentials and does fp32 operations on the
 CUDA cores (the algebra between its products); its units overlap, so its time is the longest unit's at its
 rate (`walked`, ties broken by the units in series, `dew.algebra.cost.Walk`). The tensor cores' rate is the
-generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates the CUDA
-architecture's own (`SHARED_BYTES_PER_CLOCK`, `EXPONENTIALS_PER_CLOCK`), the CUDA cores' the generation's
-fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the derivation prices a
-form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`). The register and
-shared-memory constants the resource model reads live here beside it (`resources`)."""
+generation's (`GpuTarget.tensor_rate`), the shared-memory and special-function rates its architecture's
+(`generation.Multiprocessor.shared_bytes_per_clock`, `exponentials_per_clock`), the CUDA cores' the
+generation's fp32 rate. Nothing ranks a launch's configs by it (bible §6: configs are derived); the
+derivation prices a form a template's algebra takes by it (`dew.algebra.derive`, `dew.algebra.carry`)."""
 
 
 import dataclasses
 import functools
 import math
 
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+
 from dew.nn.kernels import generation
 
-SHARED_BYTES_PER_CLOCK = 128
-"""Shared memory a multiprocessor serves per clock: 32 banks of 4 bytes, on every CUDA generation Dew's
-kernels run on (CUDA C++ Programming Guide, "Shared Memory", compute capabilities 5.x to 12.x)."""
 
-EXPONENTIALS_PER_CLOCK = 16
-"""Base-2 exponentials a multiprocessor's special-function units return per clock (the CUDA C++ Best Practices
-Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, compute capabilities 7.5 to 12.1, where CUDA 13 moved the
-Programming Guide's throughput table; 15.97 measured on an H200, the kernel challenge's MUFU.EX2)."""
-
-REGISTER_STEP = 8
-"""Registers a thread in one allocation unit (256 registers a warp)."""
-
-
-THREAD_REGISTERS = 255
-"""32-bit registers one thread may hold, compute capabilities 5.0 to 12.x (CUDA C++ Programming Guide,
-"Technical Specifications per Compute Capability"); what a kernel needs past them it spills to memory."""
-
-REGISTERS = 64 * 1024
-"""32-bit registers per multiprocessor, compute capabilities 5.0 to 12.x (the same table)."""
-
-RESERVED_SHARED = 1024
-"""Shared memory the driver reserves for each resident block, compute capabilities 8.0 to 12.x (CUDA C++
-Programming Guide, "Shared Memory" of compute capability 8.x): a multiprocessor holds the opted-in block
-size plus one reservation."""
+def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstimate:
+    """A launch's cost as it states it to XLA and to Dew's FLOP count (the custom call's cost estimate,
+    `dew.telemetry.instrumentation.sizes`): its `flops`, its `transcendentals`, and the bytes of each of
+    `arrays`, its operands and outputs, once."""
+    return pl.CostEstimate(flops=int(flops), transcendentals=int(transcendentals), bytes_accessed=int(sum(
+        math.prod(array.shape) * jnp.dtype(array.dtype).itemsize for array in arrays)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,19 +77,19 @@ def rates(target: generation.GpuTarget, *, device: bool) -> tuple[float | None, 
         each = clock
     else:
         each = clock * target.multiprocessors if clock and target.multiprocessors else None
-    # The special-function and shared-memory rates are a CUDA multiprocessor's (a TPU has neither).
-    cuda = generation.capability(target.generation) is not None
 
     def rate(per_clock: float | None) -> float | None:
         return None if per_clock is None or each is None else per_clock * each
 
+    # A TPU has no CUDA multiprocessor, nor its special-function units' or shared memory's rates.
+    held = target.architecture.multiprocessor
     tensor = rate(target.tensor_rate("16bit"))
     if tensor is None and device:
         tensor = target.bf16_peak
     eight = rate(target.tensor_rate("8bit")) or tensor
     return (tensor, rate(target.tensor_rate("tf32")), eight, rate(target.tensor_rate("fp32")),
-            rate(EXPONENTIALS_PER_CLOCK if cuda else None),
-            math.inf if device else rate(SHARED_BYTES_PER_CLOCK if cuda else None),
+            rate(None if held is None else held.exponentials_per_clock),
+            math.inf if device else rate(None if held is None else held.shared_bytes_per_clock),
             target.memory_rate if device else math.inf)
 
 
@@ -134,9 +119,9 @@ def spanned(work: Work, latency: float | None) -> tuple[float, float]:
 
 def step_latency(target: generation.GpuTarget, *, device: bool) -> float | None:
     """A dependent step's latency on a schedule's path: XLA's loop iteration (`GpuTarget.step_seconds`) for
-    the whole device's; a template's in-kernel step from its instructions' latencies, which no fact states
-    yet, so none."""
-    return target.step_seconds if device else None
+    the whole device's; a template's in-kernel step, a tile's dependent reduction within a program
+    (`GpuTarget.kernel_step_seconds`), for a tile walk's. None where the GPU's was not measured."""
+    return target.step_seconds if device else target.kernel_step_seconds
 
 
 def walked(work: Work, target: generation.GpuTarget) -> float:

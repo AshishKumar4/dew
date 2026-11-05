@@ -33,6 +33,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
+from dew.telemetry.instrumentation import compiled_memory
 from dew.training.compiled_program import deviceless
 
 if TYPE_CHECKING:
@@ -288,11 +289,10 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     free block that large, not that many free bytes in total (`placeable`). Where
     the allocator `strands_temporaries`, they need room twice.
     """
-    stats = executable.memory_analysis()
+    stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, capacity, stats.argument_size_in_bytes - built,
-                    stats.output_size_in_bytes - stats.alias_size_in_bytes + held, stats.temp_size_in_bytes)
+    return admitted(devices, capacity, stats.argument - built, stats.output - stats.alias + held, stats.temp)
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -437,10 +437,8 @@ def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int,
     each of `devices`' allocator stats and free GPU bytes, in bytes. A step
     the check passed and the devices then refused is read from it, with the
     pool Dew sized for the host's communicators (`dew.communicators.held`)."""
-    stats = executable.memory_analysis()
-    analysis: JSON = None if stats is None else {
-        name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
-        for name in ("argument", "output", "alias", "temp", "generated_code")}
+    stats = compiled_memory(executable)
+    analysis: JSON = None if stats is None else stats._asdict()
     devices_stats: list[JSON] = []
     for device in devices:
         memory = device_memory(device)

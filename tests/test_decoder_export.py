@@ -92,10 +92,11 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 from flax import linen as nn
 from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
-from model_support import cached_round_trips, flat_tree, streamed_export
+from model_support import cached_round_trips, flat_tree, prediction_logits, streamed_export
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -335,11 +336,10 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
     as the reference's composition reads the export."""
     trip = trips('glm5_next')
     model = trip.source.model
-    states, _ = jax.jit(functools.partial(model.apply, method=model.states_and_logits))(trip.trained,
-                                                                                       trip.ids)
-    assert np.shape(states) == (*trip.ids.shape, model.emb_features)
-    actual = np.asarray(jax.jit(functools.partial(model.apply, method=model.mtp_logits))(
-        trip.trained, states, trip.ids)[0])
+    states, _ = jax.eval_shape(functools.partial(model.apply, method=model.states_and_logits), trip.trained,
+                               trip.ids)
+    assert states.shape == (*trip.ids.shape, model.emb_features)
+    actual = np.asarray(jax.jit(functools.partial(prediction_logits, model))(trip.trained, trip.ids))
     expected = tool.glm5_prediction_logits(trip.case, trip.export, trip.ids)
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
     difference = float(np.max(np.abs(actual - expected)))
@@ -408,11 +408,8 @@ def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
 
     trip = trips('deepseek_v4')
     model = trip.source.model
-    # Compiled: op by op the two reads took most of the test's Dew side (ledger 3842).
-    _, streams = jax.jit(functools.partial(model.apply, method=model.hidden_and_mtp_inputs))(
-        trip.trained, trip.ids)
-    actual = jax.jit(functools.partial(model.apply, method=model.mtp_logits))(trip.trained, streams,
-                                                                             trip.ids)[0]
+    # Compiled: op by op the reads took most of the test's Dew side (ledger 3842).
+    actual = jax.jit(functools.partial(prediction_logits, model))(trip.trained, trip.ids)
     reference, _ = tool.reference_model(trip.case, trip.export)
     reference.eval()
     reference.set_attn_implementation('eager')
@@ -556,7 +553,7 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
     1579). The deadline is the test's own, past the tiny checkpoint's seconds."""
     out = tmp_path / "out"
     out.write_text("a file where the export's directory goes\n")
-    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    environment = outside_suite(os.environ)
     run = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "benchmark_streaming_export.py"),
                           str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
                          env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},
@@ -1234,11 +1231,9 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
     assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
     if model.num_nextn_predict_layers:
         # Each forward compiled once, as a user runs it, not op by op.
-        def depths(model, variables):
-            states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
-            return model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
-        prediction = jax.jit(functools.partial(depths, model))(variables)
-        reloaded_prediction = jax.jit(functools.partial(depths, restored.model))(restored.variables)
+        prediction = jax.jit(functools.partial(prediction_logits, model))(variables, jnp.asarray(ids))
+        reloaded_prediction = jax.jit(functools.partial(prediction_logits, restored.model))(
+            restored.variables, jnp.asarray(ids))
         np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
         np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
                                    prediction, atol=LOGITS, rtol=0)

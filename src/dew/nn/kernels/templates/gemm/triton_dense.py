@@ -21,7 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates.axes import named, placed
+from dew.nn.kernels.templates.axes import GROUPS, by_rows, held, named, placed
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes: tuple, interpret: bool,
@@ -53,9 +53,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
     blocks = {'rows': (block_m, 0), 'depth': (padded_depth, None), 'columns': (block_n, 1)}
 
     def spec(side_axes):
-        return pl.BlockSpec(named(side_axes, {axis: block for axis, (block, _) in blocks.items()}),
-                            lambda i, j: named(side_axes, {axis: 0 if grid is None else (i, j)[grid]
-                                                           for axis, (_, grid) in blocks.items()}))
+        return _side_spec(side_axes, blocks)
 
     matrix_spec = (pl.BlockSpec((block_n, padded_depth), lambda i, j: (j, 0)) if transpose_rhs
                    else pl.BlockSpec((padded_depth, block_n), lambda i, j: (0, j)))
@@ -64,7 +62,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
                 *(spec(axes) for axes in prologue_axes), *(spec(axes) for axes in epilogue_axes)]
     kernel = functools.partial(
         _gmm_kernel, depth=depth, block_k=block_k, transpose_rhs=transpose_rhs, prologue=prologue,
-        prologue_axes=prologue_axes, epilogue=epilogue,
+        prologue_axes=prologue_axes, epilogue=epilogue, epilogue_axes=epilogue_axes,
         sides=(len(prologue_operands), len(epilogue_operands)), exact_sums=exact_sums,
         matrices=len(matrices))
     outs = launches.pallas_call(
@@ -81,7 +79,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
 
 
 def _gmm_kernel(live_ref, lhs_ref, *refs, depth: int, block_k: int, transpose_rhs: bool, prologue,
-                prologue_axes: tuple, epilogue, sides: tuple, exact_sums: bool, matrices: int):
+                prologue_axes: tuple, epilogue, epilogue_axes: tuple, sides: tuple, exact_sums: bool,
+                matrices: int):
     matrix_refs, refs = refs[:matrices], refs[matrices:]
     prologue_refs, epilogue_refs, out_refs = refs[:sides[0]], refs[sides[0]:sum(sides)], refs[sum(sides):]
     live = live_ref[0] > 0
@@ -90,7 +89,7 @@ def _gmm_kernel(live_ref, lhs_ref, *refs, depth: int, block_k: int, transpose_rh
         span = pl.ds(k * block_k, block_k)
         x = lhs_ref[:, span]
         if prologue is not None:
-            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'depth', span)).astype(x.dtype)
+            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'depth', span, x.shape[0])).astype(x.dtype)
             if depth % block_k:
                 x = _kept(x, k * block_k, depth, axis=1)
         # A paired product's two matrices multiply the one loaded (and transformed) tile of `lhs`.
@@ -102,7 +101,9 @@ def _gmm_kernel(live_ref, lhs_ref, *refs, depth: int, block_k: int, transpose_rh
 
     zeros = jnp.zeros(out_refs[0].shape, jnp.float32)
     accs = lax.fori_loop(0, lhs_ref.shape[1] // block_k, step, (zeros,) * matrices)
-    outs = accs if epilogue is None else epilogue(*accs, *(ref[...] for ref in epilogue_refs))
+    outs = accs if epilogue is None else epilogue(*accs, *(by_rows(ref[...], axes, zeros.shape[0])
+                                                          for ref, axes in zip(epilogue_refs, epilogue_axes,
+                                                                               strict=True)))
     for ref, out in zip(out_refs, outs if isinstance(outs, tuple) else (outs,), strict=True):
         ref[...] = out.astype(ref.dtype)
 
@@ -123,9 +124,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
     blocks = {'rows': (padded, None), 'depth': (block_k, 0)}
 
     def spec(side_axes):
-        return pl.BlockSpec(named(side_axes, {axis: block for axis, (block, _) in blocks.items()}),
-                            lambda i, j: named(side_axes, {axis: i if grid == 0 else 0
-                                                           for axis, (_, grid) in blocks.items()}))
+        return _side_spec(side_axes, blocks)
 
     kernel = functools.partial(_tgmm_kernel, rows=rows, block_m=block_m, prologue=prologue,
                                prologue_axes=prologue_axes, exact_sums=exact_sums)
@@ -152,7 +151,7 @@ def _tgmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, rows: int, block_m: int, pro
         span = pl.ds(r * block_m, block_m)
         x = lhs_ref[span, :]
         if prologue is not None:
-            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'rows', span)).astype(x.dtype)
+            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'rows', span, x.shape[0])).astype(x.dtype)
             if rows % block_m:
                 x = _kept(x, r * block_m, rows, axis=0)
         product = jnp.dot(x.T, rhs_ref[span, :], precision=lax.Precision.DEFAULT,
@@ -161,6 +160,18 @@ def _tgmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, rows: int, block_m: int, pro
 
     acc = lax.fori_loop(0, lhs_ref.shape[0] // block_m, step, jnp.zeros(out_ref.shape, jnp.float32))
     out_ref[...] = acc.astype(out_ref.dtype)
+
+
+def _side_spec(side_axes: tuple, blocks: dict) -> pl.BlockSpec:
+    """A side operand's block: along each launch axis its extent and the grid axis that walks it (`blocks`,
+    None for a block of the whole extent), along `groups` the dense product's one group's, squeezed."""
+    extents = {GROUPS: None, **{axis: block for axis, (block, _) in blocks.items()}}
+
+    def index(*grid):
+        return named(side_axes, {GROUPS: 0, **{axis: 0 if walked is None else grid[walked]
+                                               for axis, (_, walked) in blocks.items()}})
+
+    return pl.BlockSpec(named(side_axes, extents), index)
 
 
 _LIVE_SPEC = pl.BlockSpec((1,), lambda i, j: (0,))
@@ -203,7 +214,8 @@ def _padded_on(sides: tuple, axes_of: tuple, axis_name: str, block: int) -> tupl
                  for side, axes in zip(sides, axes_of, strict=True))
 
 
-def _cut(refs, axes_of: tuple, stepped: str, span) -> list:
-    """Each side tile of a step: its block cut to `span` along the `stepped` launch axis, whole along the
-    others."""
-    return [ref[placed(side_axes, {stepped: span})] for ref, side_axes in zip(refs, axes_of, strict=True)]
+def _cut(refs, axes_of: tuple, stepped: str, span, rows: int) -> list:
+    """Each side tile of a step of `rows` rows: its block cut to `span` along the `stepped` launch axis,
+    whole along the others, a side operand by group's at each row (`axes.by_rows`)."""
+    return [by_rows(ref[placed(held(side_axes), {stepped: span})], side_axes, rows)
+            for ref, side_axes in zip(refs, axes_of, strict=True)]

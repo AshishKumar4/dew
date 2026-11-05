@@ -61,7 +61,6 @@ from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.compiled_program import gradients_read
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
-from dew.training.memory import head_fused_of, head_tile_of
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.staging import fetched, in_device, staged
@@ -285,9 +284,8 @@ def pooled_by_mean(stats_shape) -> bool:
     return isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
 
 
-def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                                          optimizer: optax.GradientTransformation, state: TrainState,
-                                          window: int, *, shared: bool, progressed: bool) -> bool:
+def consumed_where_made(optimizer: optax.GradientTransformation, state: TrainState, window: int, *,
+                        shared: bool, progressed: bool) -> bool:
     """Whether the step reads each gradient where it is made into the buffers its state donates, so it
     holds none beside another (`footprint.gradient_peak`'s `consumed`): with the state it commits
     (`COMMIT_FIELDS`) in device memory, a window of several microbatches that pools them by mean (`shared`,
@@ -298,13 +296,9 @@ def consumed_where_made[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     finite, a committed state fetched from the host is fetched behind one barrier over every gradient
     (`Transaction.past`), and an update that reads them together (clipping by the global norm) holds them
     all until it has read the last. A head that takes its gradient in the backward a tile at a time
-    (`head_tile`, unfused) has XLA hold the layers' gradients to the step's end: Qwen3.5-4B's step at 2 x
-    2048 tokens under 'minimal', compiled for an H100 at 59.4 GiB, ran every layer's weight gradient and
-    update after the whole backward, 20.1 GB of temporaries against the 10.3 derived, where the whole
-    logits' step ran them beside the backward; on an H100 itself the 13 layers its backward reached last
-    waited (row 3653)."""
-    if head_tile_of(objective) is not None and not head_fused_of(objective):
-        return False
+    (`head_tile`, unfused) has XLA run every layer's weight gradient after the whole backward (row 3653),
+    which the footprint derives by running them there (`footprint.sunk`), each gradient then read where it
+    is made as any head's."""
     if state.scale is not None or not in_device([getattr(state, field) for field in COMMIT_FIELDS]):
         return False
     if window > 1:
