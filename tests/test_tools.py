@@ -1929,7 +1929,7 @@ def test_a_custom_derivative_applied_outside_the_derivatives_module_is_reported(
             "@custom_jvp\n"
             "def smoothed(x): return x\n"
             "rounded = custom_vjp(clipped)\n"
-            "declared = derivatives.declared_derivative(derivatives.Protected(), clipped, clipped, clipped)\n")
+            "declared = derivatives.declared_derivative(derivatives.Algebra(), clipped, clipped, clipped)\n")
     for package in ("nn", "precision", "sampling"):
         assert_reported(tmp_path / package, f"src/sparx/{package}/site.py", site, "SLOP026", (6, 8, 9, 11))
     owner = "import jax\n@jax.custom_vjp\ndef rule(x): return x\n"
