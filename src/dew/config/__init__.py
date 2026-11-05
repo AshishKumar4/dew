@@ -852,7 +852,7 @@ def _closed(tracker, checkpoints: Checkpoints | None, primary: BaseException | N
     own failure is the one a caller wants; without one, the first failure is
     raised with the others noted on it.
     """
-    def labelled(label: str, close: Callable[[], object]) -> tuple[str, Callable[[], None]]:
+    def labelled(label: str, close: Callable[[], bool | None]) -> tuple[str, Callable[[], None]]:
         """`close` under `label`, which a failure of it carries, whichever close fails first."""
         def closing() -> None:
             try:
