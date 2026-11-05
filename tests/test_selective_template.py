@@ -118,19 +118,20 @@ def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_int
 @pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_the_template_holds_its_hardest_regimes_interpreted(regime):
     """The template's output and every input's gradient on par from float64 with the portable scan's in each
-    regime its backward's fixes were measured in (`REGIMES`), over check 1's fewest draws, one row of a ragged
-    chunk over two channel blocks: a backward adding B's and C's gradients through one buffer put B's 1.95
-    times the portable scan's distance with a document at every chunk (`selective.PARTIALS`), which no CPU
-    test held once the regime cases went to the GPU flow alone (row 3133)."""
+    regime its backward's fixes were measured in (`REGIMES`), over check 1's fewest draws of fp32 operands,
+    whose rounding a bf16 draw's hides, one row of a ragged chunk over two channel blocks: a backward adding
+    B's and C's gradients through one buffer put B's 1.95 times the portable scan's distance with a document
+    at every chunk (`selective.PARTIALS`), which no CPU test held once the regime cases went to the GPU flow
+    alone (row 3133)."""
     shape = SHAPES["interpreted"]
-    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), jnp.bfloat16)
+    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
 
     def draws(seed):
-        inputs, _, dy = regime_draw(regime, jnp.bfloat16, seed, *shape)
+        inputs, _, dy = regime_draw(regime, jnp.float32, seed, *shape)
         return (*inputs, dy)
 
-    starts = regime_draw(regime, jnp.bfloat16, 0, *shape)[1]
+    starts = regime_draw(regime, jnp.float32, 0, *shape)[1]
     assert_as_exact(jax.jit(with_gradients(scanned(template, starts))),
                     jax.jit(with_gradients(scanned(portable, starts))), draws,
                     f"the selective template under {regime}", seeds=FEWEST_SEEDS,
