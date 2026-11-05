@@ -831,9 +831,9 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     elif name in ("log1p", "expm1"):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
         # enclosures' precision raised there, `_near_zero_interval`); a quarter densest across (-0.5, 1),
-        # where XLA's log1p rounds farthest, and out to 8; and their domains' reach: log1p's down to just above -1 and up to fp32's largest,
-        # expm1's across fp32's range. A subnormal operand is read as the lane reads it (`flushes`), whose
-        # expm1 keeps one its multiply flushes.
+        # where XLA's log1p rounds farthest, and out to 8; and their domains' reach: log1p's down to just
+        # above -1 and up to fp32's largest, expm1's across fp32's range. A subnormal operand is read as the
+        # lane reads it (`flushes`), whose expm1 keeps one its multiply flushes.
         value = scaled(-126, 0)
         value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
                                       else rng.uniform(-104, 89, quarter))
