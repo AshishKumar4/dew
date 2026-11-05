@@ -1385,6 +1385,22 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
 
 
 
+@pytest.mark.distributed
+def test_a_pooled_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_process_draws(tmp_path):
+    """A server over two processes that decodes on a mesh of each process's first device and prefills on a
+    mesh of each process's second: the weights, each admission and its prefilled rows move between the two
+    meshes over the pool's hosts, and every request draws what one process serving them all draws, decoding
+    on one device and prefilling on another (ledger 875)."""
+    from pathlib import Path
+
+    from process_support import run_pool, run_worker
+
+    worker = Path(__file__).with_name("serving_worker.py")
+    reports = run_pool("pooled_prefill_apart", tmp_path / "pool", 2, script=worker, devices=2, timeout=300)
+    single = run_worker("pooled_prefill_apart", tmp_path / "single.json", script=worker, devices=2)
+    assert {**reports[0]["drawn"], **reports[1]["drawn"]} == single["drawn"]
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("decoding", [2, 1, 0], ids=["two", "one", "unmeshed"])
 def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(decoding):

@@ -673,9 +673,6 @@ class Server:
         self.prefill_mesh = mesh
         if mesh is None:
             return
-        if self.pooled or mesh.devices.size != len(mesh.local_devices):
-            raise ValueError("a server moves its prefilled rows between its meshes within one process; serve "
-                             "a pool's server without prefill_mesh")
         rows = self.rows
         if not isinstance(rows, DenseRows) or rows.chunk is not None or rows.placement.plan is not None:
             raise ValueError("a server that prefills on a mesh of its own prefills each prompt whole over a "
@@ -1113,13 +1110,15 @@ class Server:
         mesh = self.prefill_mesh
         # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
         split = admission.slots.shape[0] % _row_groups(mesh) == 0
-        rows = jax.device_put(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()))
+        rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
+                      phase="an admission to the prefill mesh")
         with jax.set_mesh(mesh), whole():
             prefilled = self._prefill(self.model, self._prefill_variables, self.pad_id, self.rows.placement,
                                       rows, self.progress)
         # Onto the decoding rows: the server's mesh's, or the default device's, where an unmeshed state is.
-        return dataclasses.replace(admission, prefilled=jax.device_put(
-            prefilled, default_placement() if self._admitted is None else self._admitted))
+        return dataclasses.replace(admission, prefilled=_moved(
+            prefilled, default_placement() if self._admitted is None else self._admitted,
+            phase="prefilled rows to the decoding mesh"))
 
     def _owed(self) -> dict[str, list[list[int]]]:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
@@ -1470,11 +1469,27 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
 def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
     """`variables` placed on `mesh` as they lie on their own, each leaf's partition spec kept: a copy of a
     server's weights on its prefill mesh. A leaf on one device is replicated."""
-    def placed(leaf: jax.Array) -> jax.Array:
-        spec = leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()
-        return jax.device_put(leaf, NamedSharding(mesh, spec))
+    return _moved(variables, jax.tree.map(lambda leaf: NamedSharding(
+        mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()), variables),
+        phase="weights to the prefill mesh")
 
-    return jax.tree.map(placed, variables)
+
+def _moved[T](tree: T, shardings: object, *, phase: str) -> T:
+    """`tree` placed by `shardings` (one, or a tree of them): where JAX moves it between the device sets
+    (`jax.device_put`, every array within this process's devices), as it does; between meshes over several
+    processes, each leaf gathered to every process's host (`collective_host`, every process calling it) and
+    each process's shards made of it, as JAX's transfers cannot move a sharded array to another processes'
+    device set."""
+    leaves, structure = jax.tree.flatten(tree)
+    targets = (jax.tree.leaves(shardings, is_leaf=lambda x: isinstance(x, jax.sharding.Sharding))
+               if not isinstance(shardings, jax.sharding.Sharding) else [shardings] * len(leaves))
+    if all(leaf.is_fully_addressable and target.is_fully_addressable
+           for leaf, target in zip(leaves, targets, strict=True)):
+        return jax.device_put(tree, shardings)
+    home = collective_host(leaves, phase=phase)
+    return jax.tree.unflatten(structure, [
+        jax.make_array_from_callback(held.shape, target, lambda index, held=held: held[index])
+        for held, target in zip(home, targets, strict=True)])
 
 
 def _served_layout(model: nn.Module, kv_cache: KVCache | None,
