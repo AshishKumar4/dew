@@ -71,7 +71,6 @@ import functools
 import hashlib
 import logging
 import math
-import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
@@ -96,7 +95,7 @@ from dew.batch import (
     token_positions,
     token_validity,
 )
-from dew.inference.engine import Timed, normalized, reloaded, settled
+from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
@@ -555,8 +554,6 @@ class Server:
                  progress: Progress = END) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
-        if type(admission) is not int or not 1 <= admission <= slots:
-            raise ValueError("admission must be between one and the slot count")
         _refuse_unserved_modes(
             model, paged=isinstance(rows, PagedRows), chunked=rows.chunk is not None,
             prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages),
@@ -569,6 +566,8 @@ class Server:
         if slots % self.groups or admission % self.groups:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
+        if type(admission) is not int or not 1 <= admission <= slots:
+            raise ValueError("admission must be between one and the slot count")
         self.model = model
         self.cross: tuple[CrossBlocks, int, np.dtype] | None = None
         """The model's cross-attention layers and its context's width and dtype, where a request may
@@ -599,18 +598,13 @@ class Server:
         self.progress = progress
         # The PRNG implementation its rows' keys are of: the default one as its rows were made.
         self.decode_steps, self.steps, self.prng = decode_steps, 0, rows.placement.prng
-        self._queue: deque[_Row] = deque()
-        """The requests waiting for a slot, oldest first. `submit` appends on
-        the right while a step seats from the left, so a submitting thread
-        never waits for a step (a deque's append and popleft are atomic)."""
-        self._ingress = threading.Lock()
-        """Orders a submission's append with a failure's sweep."""
+        self._waiting: Waiting[_Row] = Waiting("the server stopped after a device check failed")
+        """The requests waiting for a slot."""
         self.arrived: Callable[[], None] = _nothing
         """Called after each submission: an `Engine` serving this kind wakes to it
         (`dew.inference.engine.Kind`)."""
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
-        self._failed: BaseException | None = None
         self.rows = rows
         self.grammar = grammar
         self.prefix_hits = 0
@@ -775,12 +769,13 @@ class Server:
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.
+        # A model shorter than the tiles keeps whole pages within its max_seq_len, which no row passes.
         unit = math.lcm(64, layout.page_size or 64)
-        rounded = -(-capacity // unit) * unit
-        if rounded > ceiling:
-            raise ValueError(
-                f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
-            )
+        page = layout.page_size or 1
+        rounded = min(-(-capacity // unit) * unit, ceiling // page * page)
+        if rounded < capacity:
+            raise ValueError(f"a capacity of {capacity} passes the model's max_seq_len of {ceiling}"
+                             + ("" if page == 1 else f" in whole pages of {page}"))
         groups = _row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every)
@@ -824,12 +819,12 @@ class Server:
 
     @property
     def queued(self) -> int:
-        return len(self._queue)
+        return len(self._waiting.queue)
 
     @property
     def busy(self) -> bool:
         """Whether a request waits or runs, or a call's draws wait to be read."""
-        return bool(self._queue or self._rows or self._pending is not None)
+        return bool(self._waiting.queue or self._rows or self._pending is not None)
 
     def reload(self, variables: Variables, progress: Progress | None = None) -> None:
         """Serve `variables` from the next step on, in place of the current weights, at the run's
@@ -889,11 +884,10 @@ class Server:
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int) -> Ticket:
         row = self._prepared(prompt, max_new_tokens, seed, fold)
-        with self._ingress:
-            if self._failed is not None:
-                raise RuntimeError("the server stopped after a device check failed") from self._failed
-            if row.budget:
-                self._queue.append(row)
+        if row.budget:
+            self._waiting.append(row)
+        else:
+            self._waiting.check()
         self.arrived()
         if not row.budget:
             self._finish(row, terminated=False)
@@ -1026,9 +1020,8 @@ class Server:
         The call admits the queued requests that fit and runs `decode_steps`
         iterations. Its own draws are read by the next `step`, or by `run`.
         """
-        if self._failed is not None:
-            raise RuntimeError("the server stopped after a device check failed") from self._failed
-        if not (self._queue or self._rows):
+        self._waiting.check()
+        if not (self._waiting.queue or self._rows):
             # Nothing to run: the host reads the last call's draws.
             self._settle()
             return
@@ -1053,7 +1046,7 @@ class Server:
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
-        while self._queue or self._rows:
+        while self._waiting.queue or self._rows:
             self.step()
         self._settle()
 
@@ -1091,7 +1084,7 @@ class Server:
         size, share = self.slots // self.groups, self.admission // self.groups
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
                 for group in range(self.groups)]
-        seated = self.rows.seat(self._queue, free, share)
+        seated = self.rows.seat(self._waiting.queue, free, share)
         # After seating: a request another thread submitted while the queue
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
@@ -1233,11 +1226,8 @@ class Server:
     def fail(self, failure: BaseException) -> None:
         """Stop after `failure`: every waiting and running request settles with it, and a later
         submission or step is refused."""
-        with self._ingress:
-            self._failed = failure
-            waiting = [*self._rows.values(), *self._queue]
-            self._rows.clear()
-            self._queue.clear()
+        waiting = self._waiting.failed(failure, *self._rows.values())
+        self._rows.clear()
         for row in waiting:
             settled(row.ticket, failure)
 

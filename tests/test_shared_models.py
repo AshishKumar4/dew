@@ -120,13 +120,13 @@ def as_service(held):
 
 def live_kernel(service, tmp_path):
     """The live page's two sides over a tiny run: the guest's client (its contract read from Dew), the tiny
-    run's pipeline, and the shared process's native models serving it, behind the progress reporter, as
-    "model" at "pinned", with the guidance record and solvers it takes from Dew."""
+    run's pipeline, and the shared process's native models serving it through an engine, as "model" at
+    "pinned", with the guidance record and solvers it takes from Dew."""
     import numpy as np
     from test_inference import make_run
 
     from dew import sampling
-    from dew.inference import TextToImage
+    from dew.inference import Engine, ScoringServer, TextToImage
 
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")
@@ -134,7 +134,10 @@ def live_kernel(service, tmp_path):
     make_run(tmp_path)
     pipe = TextToImage.from_run(str(tmp_path))
     native = service.NativeModels.__new__(service.NativeModels)
-    native.np, native.progress, native.pipe = np, progress, progress.Reporting(pipe)
+    native.np, native.progress, native.pipe = np, progress, pipe
+    native.images = ScoringServer.from_task(*pipe.scoring(images=1))
+    native.engine = Engine(native.images)
+    native.engine.start()
     native.cfg = sampling.CFG
     native.solvers = {name: getattr(sampling, name)
                       for name in ("DPMSolverMultistep", "EulerAncestral", "Heun")}
@@ -196,3 +199,45 @@ def test_a_live_cell_takes_dews_arguments_and_is_refused_only_what_the_service_d
     with pytest.raises(ValueError):
         service.validate(request)
 
+
+
+def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
+        service, tmp_path, monkeypatch):
+    """A guest's request the engine still holds when its connection's wait runs out keeps the guest's one
+    admission: a second request is refused while the first runs, and admitted once the engine settles
+    it, so a slow pass never lets one guest queue a second job past the service's bounds."""
+    import json
+    import os
+    import socket
+    from concurrent.futures import Future
+
+    held = []
+
+    class Models:
+        def describe(self, request):
+            return {}
+
+        def submitted(self, request, emit):
+            future = Future()
+            held.append(future)
+            return future, lambda result: {"text": result}
+
+    monkeypatch.setattr(service, "REQUEST_SECONDS", 0.2)
+    request = {"op": "text", "model": "m", "prompt": "hi", "tokens": 1, "key": 0}
+
+    def asked():
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(str(tmp_path / "model.sock"))
+            client.sendall(json.dumps(request).encode() + b"\n")
+            return json.loads(client.makefile().readline())
+
+    shared = service.ModelService(tmp_path / "model.sock", Models(), uids=(os.getuid(),))
+    try:
+        assert asked()["error"]["name"] == "TimeoutError"
+        # Refused while the first still runs: the engine is handed nothing more.
+        assert "error" in asked() and len(held) == 1
+        held[0].set_result("done")
+        assert asked()["error"]["name"] == "TimeoutError" and len(held) == 2
+    finally:
+        held[-1].set_result("done")
+        shared.server_close()

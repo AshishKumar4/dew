@@ -46,6 +46,20 @@ class Tokens(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
+class ServedRollout:
+    """A prompt rollout drawn ahead of the trainer from Dew's own server (`RolloutScheduler.served`):
+    `slots` rows the server decodes at once, `ahead` batches submitted before the trainer reads them, a
+    rollout at most `max_lag` updates behind the trainer, and the weights pushed every `sync_every`
+    updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
+    weights (`--objective.behavior-importance`)."""
+
+    slots: int = 8
+    ahead: int = 1
+    max_lag: int = 1
+    sync_every: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
 class PromptRollout:
     """GRPO's synchronous rollout over a run's prompts (`RolloutScheduler.sampled`): `groups`
     completions of each prompt the policy draws under `sampling`, each at most `max_new_tokens`, each
@@ -64,7 +78,10 @@ class PromptRollout:
     `reward` names it by its import path: a function of a completion's text and its prompt's record
     (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
     (`dew.rl.sandbox:MathReward`). A reward outside Dew is imported before the run loads, as any
-    class a run names is (`dew.registry.imported`)."""
+    class a run names is (`dew.registry.imported`).
+
+    `served`, where given, draws the completions ahead of the trainer from Dew's own server
+    (`ServedRollout`, `--rollout.served.slots 8`) in place of each step's own generation."""
 
     reward: str
     groups: int = 4
@@ -76,6 +93,7 @@ class PromptRollout:
     admit: int | None = None
     overlong_cache: int | None = None
     generation_batches: int = 1
+    served: Annotated[ServedRollout, tyro.conf.subcommand("served")] | None = None
 
     def __post_init__(self) -> None:
         from dew.objectives.rl.methods import method
@@ -121,8 +139,9 @@ class PromptRollout:
             return RolloutSettings(estimator=self.estimator or "group")
         return method(self.method).rollout(self.max_new_tokens, self.overlong_cache)
 
-    def build(self, objective, decode):
-        """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
+    def build(self, objective, decode, tasks: int):
+        """The scheduler drawing over `objective`'s policy, decoding completions with `decode`, a batch
+        of `tasks` prompts a process."""
         from numbers import Real
 
         from dew.data.prompts import PromptRecord
@@ -138,18 +157,27 @@ class PromptRollout:
             if not isinstance(score, Real):
                 raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
             return float(score)
-        return RolloutScheduler.sampled(objective, reward,
-                                        decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
-                                        truncation=self.truncation, sampling=self.sampling, admit=self.admit,
-                                        generation_batches=self.generation_batches,
-                                        **self.scheduler_settings())
+        served = self.served
+        if served is None:
+            return RolloutScheduler.sampled(objective, reward, decode=decode, groups=self.groups,
+                                            max_new_tokens=self.max_new_tokens, truncation=self.truncation,
+                                            sampling=self.sampling, admit=self.admit,
+                                            generation_batches=self.generation_batches,
+                                            **self.scheduler_settings())
+        return RolloutScheduler.served(objective, reward, tasks=tasks, slots=served.slots, ahead=served.ahead,
+                                       max_lag=served.max_lag, sync_every=served.sync_every, decode=decode,
+                                       groups=self.groups, max_new_tokens=self.max_new_tokens,
+                                       truncation=self.truncation, sampling=self.sampling, admit=self.admit,
+                                       generation_batches=self.generation_batches,
+                                       **self.scheduler_settings())
 
 
 @dataclasses.dataclass(frozen=True)
 class LMRunConfig(DecoderRunConfig):
     """A decoder's run (`DecoderRunConfig`) plus the settings specific to language models."""
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**DecoderRunConfig._FLAG_SELECTED, "rollout": "rollout"}
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**DecoderRunConfig._FLAG_SELECTED, "rollout": "rollout",
+                                                   "rollout.served": "served"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
                                             "sampling")
 
@@ -271,8 +299,12 @@ class LMRunConfig(DecoderRunConfig):
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = run.validation_metrics(validates=scored)
         decode = tokenizer_for(written).decode
-        rollout = None if self.rollout is None else self.rollout.build(objective, decode)
-        return Prepared(run, objective, loaded, metrics=validation, validation=held, rollout=rollout)
+        if self.rollout is None:
+            return Prepared(run, objective, loaded, metrics=validation, validation=held)
+        rollout = self.rollout.build(objective, decode, loaded.batch // jax.process_count())
+        # The stream as the rollout reads it: one drawn ahead registers each batch as the trainer reads it.
+        return Prepared(run, objective, rollout.tasks(loaded), metrics=validation, validation=held,
+                        rollout=rollout)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """Perplexity, where the run evaluates a validation split it holds."""

@@ -366,6 +366,59 @@ def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path
         refused.run()
 
 
+def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
+    """A GRPO run whose rollout names a served draw (`--rollout.served.slots 8`, `ServedRollout`) trains
+    on completions Dew's own server draws ahead of the trainer (`RolloutScheduler.served`), its first
+    weights a copy of the run's first snapshot's, which the trainer's update donates and the server
+    serves until its next push two updates on: by its third step a batch submitted a step ahead trails
+    the trainer's weights (`rollout/lag/mean` above 0, which each step's own generation never does), each
+    weighted by the objective's behavior importance, and the server ends with the run. The run records the
+    served settings and loads with them, and a record written before they existed loads as drawing each
+    step's own (ledger 2695)."""
+    import json
+    import threading
+
+    import rl_support
+
+    from dew.config import ObjectiveConfig
+    from dew.config.lm import LMRunConfig, PromptRollout, ServedRollout
+    from dew.data import Memory, presets
+    from dew.registry import ModelConfig
+    from dew.training import LocalTracker
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    rows = [{"prompt": "hi there", "data_source": "rule", "ground_truth": "a"}] * 8
+    rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
+    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                               "dtype": "float32"})
+    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
+                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
+                          model=model, max_new_tokens=0)
+    config = LMRunConfig.cli(["--trainer.steps", "3", "--trainer.name", "served", "--trainer.checkpoint-dir",
+                              str(tmp_path), "--trainer.compilation-cache-dir", "None",
+                              "--trainer.multi-host", "False", "--trainer.log-every", "1",
+                              "--rollout.served.slots", "8", "--rollout.served.sync-every", "2",
+                              "--rollout.served.max-lag", "2", "--objective.behavior-importance", "2.0"],
+                             default=default)
+    assert config.rollout is not None
+    assert config.rollout.served == ServedRollout(slots=8, max_lag=2, sync_every=2)
+    state = config.run()
+    assert int(state.step) == 3
+    # The server and its reward pool end with the run: no engine or scorer thread outlives it.
+    assert not [thread for thread in threading.enumerate()
+                if thread.name.startswith(("dew-rollout-server", "dew-reward"))]
+    with LocalTracker(tmp_path / "served" / "tracking") as journal:
+        lags = [scalars["rollout/lag/mean"] for _, scalars in journal.scalars()
+                if "rollout/lag/mean" in scalars]
+    assert max(lags) > 0
+    assert LMRunConfig.load(str(tmp_path / "served")).rollout == config.rollout
+    record = json.loads((tmp_path / "served" / "run.json").read_text())
+    del record["fields"]["rollout"]["served"]
+    (tmp_path / "served" / "run.json").write_text(json.dumps(record))
+    loaded = LMRunConfig.load(str(tmp_path / "served")).rollout
+    assert loaded is not None and loaded.served is None
+
+
 def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     """An LM run that names GRPO records its rollout as a field (`LMRunConfig.rollout`, `--rollout.reward`):
     over a prompts chain whose prompts fill its width it trains on the completions its policy draws,
