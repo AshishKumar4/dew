@@ -150,6 +150,10 @@ LOWERED = {"gpu": "cuda"}
 """The platform JAX lowers for where a derivation names only its kind (`lowering_platform`)."""
 
 LOOPS = frozenset({"scan", "while"})
+
+PRODUCTS = frozenset({"dot_general", "conv_general_dilated", "ragged_dot_general"})
+"""The products a weight's gradient is made by, past which a value is a cotangent the backward reads on
+(`sunk`)."""
 """The primitives that run their body turn after turn, their results held across the turns."""
 
 GEMM_REWRITE_SIZE = 100
@@ -237,13 +241,14 @@ def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, wor
 
 
 def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`program`, a gradient's, with the equations whose results reach its outputs alone run after every
-    other, in their order: each weight's gradient product, and what sums, casts or lays it out, once the
-    rest of the backward has run, the operands it reads held to then. XLA schedules a step's gradient so
-    where its head takes the backward a tile at a time (`head_tile`, unfused; `candidate_footprint`):
-    Qwen3.5-4B's step at 2 x 4096 tokens under 'full', compiled for an H100, held 29 layers' four
-    [8192, 9216] product operands at its peak, 16.3 of its 34.6 GiB, and no layer's gradient (row 3341,
-    its calibration's buffer dumps)."""
+    """`program`, a gradient's, with each weight's gradient run after every other equation, in their order:
+    the equations whose results reach its outputs through no product (`PRODUCTS`), each weight's gradient
+    product and what sums, casts or lays it out, the backward's cotangents, which the products of the
+    layers before read, left where they are, and the operands those products read held to the end. XLA
+    schedules a step's gradient so where its head takes the backward a tile at a time (`head_tile`,
+    unfused) on some GPUs (`GpuTarget.late_weight_gradients`): Qwen3.5-4B's step at 2 x 4096 tokens under
+    'full', compiled for an H100, held 29 layers' four [8192, 9216] product operands at its peak, 16.3 of
+    its 34.6 GiB, and no layer's gradient (row 3341, its calibration's buffer dumps)."""
     outputs = {value for value in program.outvars if computed(value)}
     readers: dict[jcore.Var, list[int]] = collections.defaultdict(list)
     for index, equation in enumerate(program.eqns):
@@ -252,9 +257,10 @@ def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
     late: set[int] = set()
     for index in range(len(program.eqns) - 1, -1, -1):
         made = [out for out in program.eqns[index].outvars if computed(out)]
-        # Every result read by late equations alone, and one at least read or returned.
+        # Every result read by late equations alone, none a product, and one at least read or returned.
         if any(readers[out] or out in outputs for out in made) and all(
-                all(reader in late for reader in readers[out]) for out in made):
+                reader in late and program.eqns[reader].primitive.name not in PRODUCTS
+                for out in made for reader in readers[out]):
             late.add(index)
     ordered = sorted(range(len(program.eqns)), key=lambda index: index in late)
     return program.replace(eqns=[program.eqns[index] for index in ordered])
