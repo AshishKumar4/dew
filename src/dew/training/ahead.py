@@ -75,6 +75,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, step_flops
+from dew.training.memory import compiled_memory
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -751,16 +752,15 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
-    memory = compiled.memory_analysis()
+    memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered),
         Executable.of(compiled),
         flops=step_flops(compiled),
-        argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
-        alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
-        code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
+        argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
+        temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices)),
         refusals=report.refused_launches(), sampled=sampled)

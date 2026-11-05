@@ -12,8 +12,9 @@ import json
 import logging
 import math
 import re
+import weakref
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -288,11 +289,10 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     free block that large, not that many free bytes in total (`placeable`). Where
     the allocator `strands_temporaries`, they need room twice.
     """
-    stats = executable.memory_analysis()
+    stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, capacity, stats.argument_size_in_bytes - built,
-                    stats.output_size_in_bytes - stats.alias_size_in_bytes + held, stats.temp_size_in_bytes)
+    return admitted(devices, capacity, stats.argument - built, stats.output - stats.alias + held, stats.temp)
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -431,16 +431,43 @@ def outside_pool(device) -> int | None:
     return gpu_free_bytes(device.local_hardware_id)
 
 
+class CompiledMemory(NamedTuple):
+    """A compiled step's memory as XLA analyses it (`Compiled.memory_analysis`), each in bytes: its
+    arguments', its outputs', the outputs aliasing a donated argument, its temporaries' and its code's."""
+
+    argument: int
+    output: int
+    alias: int
+    temp: int
+    generated_code: int
+
+
+_ANALYSED: weakref.WeakKeyDictionary[jax.stages.Compiled, CompiledMemory | None] = (
+    weakref.WeakKeyDictionary())
+
+
+def compiled_memory(executable: jax.stages.Compiled) -> CompiledMemory | None:
+    """`executable`'s memory as XLA analyses it, None where its backend states none, read once an
+    executable: the planner's probe and forecast, the step's headroom (`step_headroom`), the run's record
+    (`memory_record`) and a step compiled ahead each read one compiled step, and each read walked its
+    program again (0.2 to 0.5 s of a CPU U-Net step's, row 3763)."""
+    if executable not in _ANALYSED:
+        stats = executable.memory_analysis()
+        _ANALYSED[executable] = None if stats is None else CompiledMemory(
+            int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
+            int(stats.alias_size_in_bytes), int(stats.temp_size_in_bytes),
+            int(stats.generated_code_size_in_bytes))
+    return _ANALYSED[executable]
+
+
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
     """What the fit check read for a compiled step, as `step_headroom` reads
     it, and its answer `fits`: XLA's memory analysis of the step, `held`, and
     each of `devices`' allocator stats and free GPU bytes, in bytes. A step
     the check passed and the devices then refused is read from it, with the
     pool Dew sized for the host's communicators (`dew.communicators.held`)."""
-    stats = executable.memory_analysis()
-    analysis: JSON = None if stats is None else {
-        name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
-        for name in ("argument", "output", "alias", "temp", "generated_code")}
+    stats = compiled_memory(executable)
+    analysis: JSON = None if stats is None else stats._asdict()
     devices_stats: list[JSON] = []
     for device in devices:
         memory = device_memory(device)

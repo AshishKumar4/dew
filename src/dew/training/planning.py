@@ -45,6 +45,7 @@ from dew.training.footprint import Footprint
 from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
+    compiled_memory,
     derived_headroom,
     deviceless_options,
     head_fused_of,
@@ -269,10 +270,10 @@ class Probe:
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
              headroom: int | None, executable: jax.stages.Compiled | None) -> Probe:
         """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled."""
-        stats = None if executable is None else executable.memory_analysis()
+        stats = None if executable is None else compiled_memory(executable)
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
-                   None if stats is None else int(stats.temp_size_in_bytes),
-                   None if stats is None else int(stats.argument_size_in_bytes), candidate.footprint)
+                   None if stats is None else stats.temp, None if stats is None else stats.argument,
+                   candidate.footprint)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
@@ -468,9 +469,9 @@ class Forecast:
              factor: int) -> None:
         """Keep what the compile of `split` at rung `key` measured on every process; every process
         calls this at every compile."""
-        stats = None if executable is None else executable.memory_analysis()
+        stats = None if executable is None else compiled_memory(executable)
         local = (None if stats is None or headroom is None
-                 else (int(stats.temp_size_in_bytes), headroom, factor))
+                 else (stats.temp, headroom, factor))
         self.measured.setdefault(key, []).append((split, self.gather(local)))
 
     def likely(self, key: str, split: int) -> bool:
