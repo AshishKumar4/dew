@@ -264,22 +264,23 @@ SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
          "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
-"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
-documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
-armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
-seed, where its defaults (128 heads of 64 over 128) took 256 at 30 minutes a run. Kimi delta attention's
-heads are 32 wide (`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048
-seeds, one seed carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it
-carries at most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code,
-and the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rule`), which
-tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi layer or
-Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these documents sit in
-one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py and
-tests/test_mamba_ssd.py at their own geometries. Lightning attention runs 8 heads of 16 in 64-token chunks
-(`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32 channels, the reference compared with itself did
-not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64. Kimi delta
-attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm, on armada, ledger 2828):
-compared with themselves its documents alone take 512."""
+"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
+fewest for which documents run alone compared with themselves resolve PARITY in every logit and parameter
+gradient, or for a kind so stated, paired with the packed row (ledger 2889). Mamba2's 8 heads of 32 over a
+state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a seed, where its defaults (128 heads of
+64 over 128) took 256 at 30 minutes a run. Kimi delta attention's heads are 32 wide (`KIND_FIELDS`): at 16
+the reference compared with itself did not resolve within 2048 seeds, one seed carrying up to 68% of a
+leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at most 5%. 16 is no path of
+its own: the portable math this site runs has no width-specific code, and the port pads every key width
+below 64 to 64 (`recurrence_chunk._blocked_rule`), which tests/test_fla_gdn.py's any-width site holds at
+32. The packed row no longer runs a 16-wide Kimi layer or Mamba2's defaults (128 heads of 64 over a state
+of 128 in 256-token chunks, where these documents sit in one chunk); the scan's packed resets within a
+chunk stay held by tests/test_mamba2.py and tests/test_mamba_ssd.py at their own geometries. Lightning
+attention runs 8 heads of 16 in 64-token chunks (`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32
+channels, the reference compared with itself did not resolve within 512 seeds (2048 at 8); at 8 or 16
+heads of 16, or 4 of 64, it resolves at 64. Kimi delta attention's 64 are sized paired (`seeds_for` with
+the packed row as its Dew arm, on armada, ledger 2828): compared with themselves its documents alone take
+512."""
 
 
 SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
