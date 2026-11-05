@@ -158,6 +158,11 @@ _FROZE = False
 """Whether the first open block of `held_objects` froze the objects alive, the process having frozen none
 of its own."""
 
+_RUNTIME_FROZEN = gc.get_freeze_count()
+"""The objects Python's runtime holds frozen as this module is imported: CPython 3.12's immortal ones,
+which each collection returns to the permanent generation (375 in a fresh 3.12 interpreter, before and
+after an unfreeze and a collection). A freeze past them is the process's own."""
+
 
 @contextlib.contextmanager
 def held_objects() -> Iterator[None]:
@@ -169,14 +174,14 @@ def held_objects() -> Iterator[None]:
     FS2440-GC-PLAIN; held over the search, 7 paused it 7 s and it took 279, FS2440-GC-LIBRARY2; held over
     each trace alone, it took 334, FS2440-GC-LIBRARY). Nested and concurrent blocks share one freeze; the
     last to leave restores the thresholds and returns the frozen objects to the collector (`gc.unfreeze`).
-    A process that froze objects of its own before (`gc.get_freeze_count`) keeps its freeze as it made
-    it: the block freezes nothing more, which no unfreeze could part from the process's, and unfreezes
-    nothing."""
+    A process that froze objects of its own before, more than its runtime holds frozen as this module is
+    imported (`_RUNTIME_FROZEN`), keeps its freeze as it made it: the block freezes nothing more, which no
+    unfreeze could part from the process's, and unfreezes nothing."""
     global _HELD, _FROZE
     with _HELD_GUARD:
         if not _HELD:
             _THRESHOLDS[:] = gc.get_threshold()
-            _FROZE = not gc.get_freeze_count()
+            _FROZE = gc.get_freeze_count() <= _RUNTIME_FROZEN
             if _FROZE:
                 gc.freeze()
             gc.set_threshold(TRACING_COLLECTIONS, *_THRESHOLDS[1:])
