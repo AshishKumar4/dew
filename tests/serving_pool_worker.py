@@ -100,9 +100,10 @@ def mode_served_rollout(args) -> dict:
 
 def mode_served_step_failure(args) -> dict:
     """A served GRPO run over the pool (`served_run`) whose server's second step fails on process 1
-    alone: every process hears it at that step's agreement and stops its server, none waiting on a round
-    the other never reads (`NativeRolloutServer.waited`). Each process's report: the error it raised and
-    whether its server then refuses a draw as stopped."""
+    alone, after the step's own agreements (as its settling of a request may, `Server._settle`): every
+    process hears it at that step's agreement and stops its server, none waiting on a round the other
+    never reads (`NativeRolloutServer.waited`). Each process's report: the error it raised and whether its
+    server then refuses a draw as stopped."""
     import jax
 
     from dew.inference.rollouts import NativeRolloutServer
@@ -113,9 +114,9 @@ def mode_served_step_failure(args) -> dict:
 
     def failing(server, *step_args, **step_kwargs):
         calls.append(None)
+        stepped(server, *step_args, **step_kwargs)
         if jax.process_index() == 1 and len(calls) == 2:
             raise RuntimeError("an injected step failure")
-        return stepped(server, *step_args, **step_kwargs)
 
     Server.step = failing
     rollout, trainer, tasks = served_run([])
