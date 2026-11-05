@@ -221,12 +221,11 @@ def _midpoints_near(estimate, fmt: oc.Format) -> np.ndarray:
 @pytest.mark.parametrize("name", ["exp", "exp2"])
 def test_an_enclosure_that_straddles_a_midpoint_is_decided_by_the_argument_alone(fmt, name):
     """The oracles' last resort (`_enclosure_rounded`): an element whose enclosure rounds two ways is
-    decided by interval arithmetic of its argument alone, whatever the enclosure held. A drawn fp32 or
-    bf16 argument's value lies far further from a midpoint than EXP_BOUND's 2^-80 (its grid's spacing is
-    2^-24 or 2^-8 of it), so the near-midpoint draws of `test_exp_rounds_as_interval_arithmetic_does`
-    reach the enclosure's decided side alone: this hands the path an enclosure centred on the midpoint
-    nearest each argument's value, and its rounding is the argument's own, as interval arithmetic
-    rounds it (ledger 4397)."""
+    decided by interval arithmetic of its argument alone, whatever the enclosure held. A synthetic
+    regression of that path: it hands the helper an enclosure centred on the midpoint nearest each
+    argument's value, which rounds two ways, and the result is the argument's own rounding, as interval
+    arithmetic rounds it. Whether any fp32 or bf16 argument reaches the path through `exp_rounded` or
+    `exp2_rounded` at EXP_BOUND is not established here (ledger 4397)."""
     rng = np.random.default_rng(9)
     sample = oc.exact_cast(rng.uniform(-80.0, 80.0, 64), fmt)
     sample = sample[(sample != np.rint(sample)) & (sample != 0)]
