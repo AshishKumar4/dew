@@ -177,8 +177,8 @@ def test_a_declared_derivatives_nondifferentiable_array_is_bound_not_traced():
     bare.defvjp(forward, backward)
     table, x = jnp.asarray([2.0]), jnp.linspace(0.1, 1.0, 8)
 
-    def gradient(function):
-        return jax.grad(lambda x: jnp.sum(function(table, x)))(x)
+    def gradient(function, run):
+        return run(jax.grad(lambda x: jnp.sum(function(table, x))))(x)
 
     for run in (lambda f: f, jax.jit):
-        np.testing.assert_array_equal(np.asarray(run(gradient)(declared)), np.asarray(run(gradient)(bare)))
+        np.testing.assert_array_equal(np.asarray(gradient(declared, run)), np.asarray(gradient(bare, run)))
