@@ -323,7 +323,7 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
     observation = jnp.asarray(rng.normal(size=(3, 6, 1)), jnp.float32)
     previous = jnp.asarray(rng.uniform(-1, 1, (3, 6, 1)), jnp.float32)
     first = jnp.zeros((3, 6), bool).at[:, 0].set(True)
-    _, stoch, _ = jax.jit(objective.observed)(variables, observation, previous, first, jax.random.key(13))
+    _, stoch, _, _ = jax.jit(objective.observed)(variables, observation, previous, first, jax.random.key(13))
 
     @jax.jit
     def stepped(variables):
