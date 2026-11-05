@@ -111,6 +111,30 @@ def test_a_memory_compile_reads_each_source_once():
     assert reads.count("memory") == 1
 
 
+def _unthird(row) -> bool:
+    """Whether a row is not every third, which a filter keeps."""
+    return int(row["id"]) % 3 != 2
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_compiled_reader_reads_its_store_in_memory_no_more_to_name_it(read):
+    """A store in memory names itself by a hash of every record it holds, which its compile takes once:
+    each reader the compile opens names its corpus as the compile did, reading the store no more than
+    for its rows, however often a run opens one (row 803)."""
+    reads = []
+    kept = Pipeline(Logged(source(8).values, reads=reads)).filter(_unthird)
+    ordered = kept.shuffle(0, window=4) if read == "streamed" else kept.shuffle(0)
+    data = compile(ordered.repeat().batch(2), read=read, loading=READ)
+    before = len(reads)
+    for _ in range(3):
+        reader = data.train(DataPartition())
+        try:
+            listed(reader, 2)
+        finally:
+            reader.close()
+    assert len(reads) - before <= 3
+
+
 class Decoded(list):
     """The rows one read of a source made, which a test can watch be let go."""
 
