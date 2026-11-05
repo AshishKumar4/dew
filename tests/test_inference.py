@@ -904,9 +904,15 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     def truth(keys):
         images = []
         for rows, key in zip(prompts, keys, strict=True):
-            prepared = jax.tree.map(np.asarray, pipe.prepare(list(rows), key=int(key), steps=3))
+            prepared = pipe.prepare(list(rows), key=int(key), steps=3)
+
+            def real(leaf, count=prepared.rows):
+                """A prepared leaf's real rows, on the host: the mesh pads them to its devices."""
+                return np.asarray(leaf) if leaf.shape[0] == 1 else np.asarray(leaf)[:count]
+
+            held = widened(jax.tree.map(real, prepared))
             with jax.enable_x64(new_val=True):
-                images.append(wide(widened(prepared), **settings, key=int(key)).host().images)
+                images.append(wide(held, **settings, key=int(key)).host().images)
         return tuple(images)
 
     label = "served images"
