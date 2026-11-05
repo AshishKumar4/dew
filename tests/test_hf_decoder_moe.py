@@ -592,17 +592,19 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
         for name in theirs:
             np.testing.assert_array_equal(np.asarray(ours[name]), np.asarray(theirs[name]), err_msg=name)
 
-    messages = [{"role": "user", "content": [{"type": "image", "image": images[1]},
-                                             {"type": "text", "text": "w5"}]}]
-    chatted = loaded.processor.chat(messages)
-    written = loaded.processor.reference.apply_chat_template(messages, tokenize=False,
-                                                             add_generation_prompt=True)
-    direct = loaded.processor(written, images=[images[1]])
-    np.testing.assert_array_equal(np.asarray(chatted.tokens), np.asarray(direct.tokens))
-    np.testing.assert_array_equal(np.asarray(chatted.conditioning["pixel_values"]),
-                                  np.asarray(direct.conditioning["pixel_values"]))
-    assert np.count_nonzero(np.asarray(chatted.tokens) == image_id) == \
-        release.media_processor.media_tokens_calculator({"type": "image", "image": pictures[1]})
+    # Dew's spelling of an image part and the release's two (its template's and its call's `image_url`).
+    for part in ({"type": "image", "image": images[1]}, {"type": "image_url", "image_url": pictures[1]},
+                 {"type": "image", "image_url": images[1]}):
+        messages = [{"role": "user", "content": [part, {"type": "text", "text": "w5"}]}]
+        chatted = loaded.processor.chat(messages)
+        written = loaded.processor.reference.apply_chat_template(messages, tokenize=False,
+                                                                 add_generation_prompt=True)
+        direct = loaded.processor(written, images=[images[1]])
+        np.testing.assert_array_equal(np.asarray(chatted.tokens), np.asarray(direct.tokens))
+        np.testing.assert_array_equal(np.asarray(chatted.conditioning["pixel_values"]),
+                                      np.asarray(direct.conditioning["pixel_values"]))
+        assert np.count_nonzero(np.asarray(chatted.tokens) == image_id) == \
+            release.media_processor.media_tokens_calculator({"type": "image", "image": pictures[1]})
 
     def logits(images):
         inputs = loaded.processor(rows, images=images)

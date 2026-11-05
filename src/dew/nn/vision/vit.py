@@ -138,8 +138,8 @@ class ViTLayout:
     the attention's maps, and `qk_norm` norms each head's queries and keys (an RMS norm at the layers'
     epsilon) before the rotary; under `scale_after_cast` every RMS norm weighs its normalized input after
     its cast back, as Llama's does. An RMS norm's epsilon None (`norm_eps`, `outer_norm_eps`) is the
-    machine epsilon of the dtype it accumulates in (`compute_epsilon`), as torch's RMSNorm(eps=None)
-    takes it (Kimi K3's MoonViT).
+    machine epsilon of the dtype its input accumulates in (`RMSNorm.epsilon`), as torch's
+    RMSNorm(eps=None) takes it (Kimi K3's MoonViT).
     """
 
     depth: int
@@ -256,14 +256,11 @@ def resampled_positions(table, rows, columns, heights, widths, *, align_corners:
     return (gathered * weights[..., None]).sum(axis=-2)
 
 
-def compute_epsilon(epsilon: float | None, dtype: Dtype | None) -> float:
-    """A norm's `epsilon`, or for None the machine epsilon of the dtype it accumulates in, `dtype` (the
-    tower's, float32 without one) at least float32: torch's rms_norm (2.8, layer_norm.cpp
-    `rms_norm_symint`) reads a half or bfloat16 input in float32 and takes float32's epsilon, a float64
-    input float64's (`ViTLayout`)."""
-    if epsilon is not None:
-        return epsilon
-    return float(jnp.finfo(jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)).eps)
+def _stated(epsilon: float | None) -> float:
+    """A layer norm's epsilon, which a layout states (`ViTLayout.__post_init__`)."""
+    if epsilon is None:
+        raise ValueError("a layer norm states its epsilon; its input dtype's (None) is an RMS norm's")
+    return epsilon
 
 
 def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
@@ -278,7 +275,7 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                                   dtype=dtype, precision=precision)
     return clip_layer(layout.hidden_size, layout.num_heads, layout.intermediate_size, 1,
                       kv_heads=layout.num_kv_heads, head_dim=layout.head_dim, activation=layout.activation,
-                      eps=compute_epsilon(layout.norm_eps, dtype), norm_type=layout.norm_type,
+                      eps=layout.norm_eps, norm_type=layout.norm_type,
                       norm_bias=layout.norm_bias,
                       mlp_bias=layout.mlp_bias, mlp_packed=layout.mlp_packed,
                       rotary_axes=None if layout.rotary is None else (layout.head_dim // 2,) * 2,
@@ -320,9 +317,9 @@ class VisionTransformer(nn.Module):
                 lay.positions.side ** 2 + int(lay.special_tokens.cls is not None), lay.hidden_size,
                 lay.positions, dtype=self.dtype if lay.positions.compute_dtype else None,
                 name="position_table")
-        outer = compute_epsilon(lay.outer_norm_eps, self.dtype)
+        outer = lay.outer_norm_eps
         if lay.post_norm == "layer":
-            self.post_norm = LayerNorm(epsilon=outer, use_scale=lay.post_norm_affine,
+            self.post_norm = LayerNorm(epsilon=_stated(outer), use_scale=lay.post_norm_affine,
                                        use_bias=lay.post_norm_affine, dtype=self.dtype, name="post_norm")
         elif lay.post_norm == "rms":
             self.post_norm = RMSNorm(epsilon=outer, with_scale=lay.post_norm_affine,
@@ -379,10 +376,10 @@ class VisionTransformer(nn.Module):
                                 frame=frame, times=grid[:, 0:1])
         tokens = lay.special_tokens
         if lay.pre_norm == "layer":
-            hidden = LayerNorm(epsilon=compute_epsilon(lay.outer_norm_eps, self.dtype), dtype=self.dtype,
+            hidden = LayerNorm(epsilon=_stated(lay.outer_norm_eps), dtype=self.dtype,
                                name="pre_norm")(hidden)
         elif lay.pre_norm == "rms":
-            hidden = RMSNorm(epsilon=compute_epsilon(lay.outer_norm_eps, self.dtype),
+            hidden = RMSNorm(epsilon=lay.outer_norm_eps,
                              scale_after_cast=lay.scale_after_cast,
                              dtype=self.dtype, name="pre_norm")(hidden)
 

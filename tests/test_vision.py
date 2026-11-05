@@ -475,3 +475,27 @@ def test_a_moonvit_pools_frames_finitely_beside_a_padded_item():
     assert not out[0, 16:].any() and not out[1].any()
     gradient = jax.grad(lambda held: module.apply(held, pixels, grid)[0, :16].sum())(variables)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(gradient))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("antialias", [False, True], ids=["plain", "antialiased"])
+def test_a_bicubic_resize_weighs_each_pixel_as_torch_does_in_its_inputs_dtype(dtype, antialias):
+    """A bicubic resize (`torch_bicubic_resize`, a vision tower's position table, REPA's and RAE's
+    preprocessing) weighs each source pixel as torch's `F.interpolate(mode="bicubic")` does, in the
+    dtype its input computes in, float64's for a float64 input: each unit image of seven rows resized to
+    five and to eleven is torch's same resize, bit for bit, its one nonzero pixel reading out that
+    pixel's weight in each output row, where float32 weights left a float64 resize rounded at 1e-8."""
+    import torch
+
+    from dew.nn.blocks import torch_bicubic_resize
+
+    for size_out in (5, 11):
+        units = np.eye(7).reshape(7, 7, 1, 1)
+        with jax.enable_x64(new_val=True):
+            ours = np.asarray(torch_bicubic_resize(jnp.asarray(units, dtype), size_out, 1,
+                                                   antialias=antialias))
+        theirs = torch.nn.functional.interpolate(
+            torch.tensor(units.transpose(0, 3, 1, 2), dtype=getattr(torch, dtype)), size=(size_out, 1),
+            mode="bicubic", align_corners=False, antialias=antialias).numpy().transpose(0, 2, 3, 1)
+        assert ours.dtype == theirs.dtype
+        np.testing.assert_array_equal(ours, theirs, err_msg=f"7 to {size_out}")

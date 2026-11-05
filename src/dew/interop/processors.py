@@ -429,11 +429,20 @@ class Processor:
                      for content in (message.get("content"),)
                      if isinstance(content, Sequence) and not isinstance(content, str) for part in content
                      if isinstance(part, Mapping)]
-            kinds = sorted({part.type for part in parts if part.needs_processor} - {"image"})
+            # An image part as the release's template and call read it: an `image` or `image_url` part, its
+            # image under either name (`_extract_medias_from_messages` reads `image_url` for both kinds).
+            kinds = sorted({part.type for part in parts if part.needs_processor} - {"image", "image_url"})
             if kinds:
                 raise ValueError(f"{type(self._media_reference).__name__} reads images alone from a chat, "
                                  f"not {kinds}: hand the model its processed fields (`from_hf`)")
-            images = [part.fields["image"] for part in parts if part.type == "image"]
+            images = []
+            for part in parts:
+                if part.type in ("image", "image_url"):
+                    held = [part.fields[name] for name in ("image", "image_url") if name in part.fields]
+                    if len(held) != 1:
+                        raise ValueError(f"an {part.type} part holds its image under one of image and "
+                                         f"image_url, not {sorted(part.fields)}")
+                    images.append(held[0])
             return self._from_arrays(self._medias_fields(images, text=text))
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(

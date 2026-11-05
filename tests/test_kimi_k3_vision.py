@@ -96,20 +96,27 @@ def test_a_kimi_k3_bundle_loads_whole_and_its_language_model_alone_on_request():
 
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32", "float64"])
-def test_an_rms_norms_default_epsilon_is_the_one_torch_takes_in_each_dtype(dtype):
-    """An RMS norm stating no epsilon (K3's `RMSNorm(eps=None)`) takes the one torch's rms_norm takes for an
-    input of `dtype` (`compute_epsilon`): over inputs small enough that the epsilon dominates, torch's
-    norm at Dew's resolved epsilon is its norm at None, bit for bit, where its input dtype's own epsilon
-    differs for a half or bfloat16 input."""
+def test_an_rms_norms_default_epsilon_is_the_one_torch_takes_for_its_input(dtype):
+    """An RMS norm stating no epsilon (K3's `RMSNorm(eps=None)`, `RMSNorm.epsilon` None) takes the one
+    torch's rms_norm takes for an input of `dtype`, the module stating no dtype of its own: over inputs
+    small enough that the epsilon dominates, torch's norm at None is its norm at float32's machine
+    epsilon for a half, bfloat16 or float32 input and float64's for a float64 one, bit for bit, where its
+    input's own differs for a half or bfloat16 one; and Dew's norm at None is its norm at that epsilon."""
     import torch
 
-    from dew.nn.vision.vit import compute_epsilon
+    from dew.nn.norms import RMSNorm
 
+    values = np.full((2, 16), 2.0 ** -12)
+    values[1] = np.linspace(-1, 1, 16) * 2.0 ** -10
     narrow = getattr(torch, dtype)
-    x = torch.full((2, 16), 2.0 ** -12, dtype=narrow)
-    x[1] = torch.linspace(-1, 1, 16, dtype=narrow) * 2.0 ** -10
-    taken = torch.nn.functional.rms_norm(x, (16,), eps=None)
-    resolved = torch.nn.functional.rms_norm(x, (16,), eps=compute_epsilon(None, jnp.dtype(dtype)))
-    assert torch.equal(taken, resolved)
+    x = torch.tensor(values, dtype=narrow)
+    taken = torch.finfo(torch.float64 if dtype == "float64" else torch.float32).eps
+    default = torch.nn.functional.rms_norm(x, (16,), eps=None)
+    assert torch.equal(default, torch.nn.functional.rms_norm(x, (16,), eps=taken))
     own = torch.nn.functional.rms_norm(x, (16,), eps=torch.finfo(narrow).eps)
-    assert torch.equal(taken, own) == (dtype in ("float32", "float64"))
+    assert torch.equal(default, own) == (dtype in ("float32", "float64"))
+    with jax.enable_x64(new_val=True):
+        ours = jnp.asarray(values, dtype)
+        variables = RMSNorm(epsilon=None).init(jax.random.key(0), ours)
+        np.testing.assert_array_equal(np.asarray(RMSNorm(epsilon=None).apply(variables, ours), np.float64),
+                                      np.asarray(RMSNorm(epsilon=taken).apply(variables, ours), np.float64))

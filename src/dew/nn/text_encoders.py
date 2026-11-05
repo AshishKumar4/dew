@@ -88,7 +88,7 @@ def tower_activation(hidden_act: str) -> str:
 
 
 def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
-               activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float = 1e-5,
+               activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float | None = 1e-5,
                rotary_axes: tuple[int, ...] | None = None,
                rotary_pairs: Literal["half", "adjacent"] = "half", rotary_interleaved: bool = False,
                rope_theta: float = 10000.0, packed: bool = False, kv_heads: int | None = None,
@@ -118,14 +118,19 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     queries and keys at the layer's epsilon (`qk_norm`), logits formed in at least fp32
     (`wide_logits`, `MixerContext.wide_logits`: the world model's), RMS norms that weigh their
     normalized input after its cast back (`scale_after_cast`, Llama's); a `mixer` takes the attention's place
-    (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`).
+    (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`). An `eps` of None is each RMS
+    norm's input dtype's (`RMSNorm.epsilon`, Kimi K3's MoonViT).
     """
     head_dim = width // heads if head_dim is None else head_dim
+    if eps is None and qk_norm:
+        raise ValueError("a query and key norm states its epsilon; its input dtype's (None) is a block "
+                         "norm's (`RMSNorm.epsilon`)")
     attention = functools.partial(
         CausalSelfAttention, ctx=MixerContext(
             emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
             head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm, wide_logits=wide_logits,
-            attention_bias=attention_bias, norm_eps=eps, scale_after_cast=scale_after_cast,
+            attention_bias=attention_bias, **({} if eps is None else {"norm_eps": eps}),
+            scale_after_cast=scale_after_cast,
             rope_theta=rope_theta,
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).
             sliding_window=None if window is None else window + 1, bidirectional_window=window is not None,
