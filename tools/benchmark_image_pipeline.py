@@ -44,6 +44,7 @@ from dew.distributed.batches import split_fields
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
+from receipt_paths import named, recorded
 
 
 @dataclass
@@ -253,6 +254,14 @@ def training_timing(config, backend):
             "updates": int(state.updates)}
 
 
+def recorded_config(config: Config) -> dict:
+    """`config` as the receipt records it (`receipt_paths.recorded`): the flowers' TFDS directory, given as a
+    string, as its dataset and version outside the checkout (`named`), a bucket's URI as given; where the
+    receipt is written left out."""
+    return {name: value for name, value in {**recorded(config), "flowers": named(config.flowers, 2)}.items()
+            if name != "out"}
+
+
 def main(config):
     cv2.setNumThreads(1)
     if config.peak_run is not None:
@@ -280,7 +289,7 @@ def main(config):
     report = {"hardware": {"cpu": cpu, "device": jax.devices()[0].device_kind},
               "versions": versions,
               "images": len(encoded), "corpus_sha256": hashlib.sha256(b"".join(encoded)).hexdigest(),
-              "config": {name: value for name, value in vars(config).items() if name != "out"},
+              "config": recorded_config(config),
               "augmentation_parity": augmentation_accuracy(),
               "decoders": decoder_timings(encoded, config.image_size, config.repeats)}
     if not config.decoder_only:

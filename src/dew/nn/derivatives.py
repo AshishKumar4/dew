@@ -28,6 +28,8 @@ import inspect
 from collections.abc import Callable, Sequence
 
 import jax
+from jax.core import eval_context
+from jax.extend import core as jax_core
 from jax.extend.core import create_call_primitive
 
 __all__ = [
@@ -36,6 +38,7 @@ __all__ = [
     "Kind",
     "Protected",
     "Surrogate",
+    "TangentKind",
     "bound_span",
     "declared_derivative",
     "declared_tangent",
@@ -73,25 +76,28 @@ def surrogate[Value](forward: Callable[..., Value], derivative: Callable[..., Va
 
 
 def declared_derivative[Value](kind: Kind, primal: Callable[..., Value], forward: Callable,
-                               backward: Callable, *,
-                               nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+                               backward: Callable, *, nondiff_argnums: Sequence[int] = (),
+                               symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared reverse-mode rule (`forward` saving its residuals, `backward` taking them and
-    the cotangent, as `jax.custom_vjp.defvjp` takes them), one marked call of `kind` (`bound_span`): a
-    kernel's glue (`KernelGlue`), a rule its numerics need as written (`Protected`), a derivative of Dew's
-    choosing (`Surrogate`) or one written to restructure algebra (`Algebra`). Forward mode refuses it as a
-    bare `jax.custom_vjp` does."""
+    the cotangent, as `jax.custom_vjp.defvjp` takes them, with `symbolic_zeros` as it takes it), one marked
+    call of `kind` (`bound_span`): a kernel's glue (`KernelGlue`), a rule its numerics need as written
+    (`Protected`), a derivative of Dew's choosing (`Surrogate`) or one written to restructure algebra
+    (`Algebra`). Forward mode refuses it as a bare `jax.custom_vjp` does."""
     rule = jax.custom_vjp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defvjp(forward, backward)
+    rule.defvjp(forward, backward, symbolic_zeros=symbolic_zeros)
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
-def declared_tangent[Value](kind: Kind, primal: Callable[..., Value], tangent: Callable, *,
-                            nondiff_argnums: Sequence[int] = ()) -> Callable[..., Value]:
+def declared_tangent[Value](kind: TangentKind, primal: Callable[..., Value], tangent: Callable, *,
+                            nondiff_argnums: Sequence[int] = (),
+                            symbolic_zeros: bool = False) -> Callable[..., Value]:
     """`primal` with a declared tangent rule (`tangent(primals, tangents)` returning the primal's value and
-    its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes), one marked call of
-    `kind` (`bound_span`), as `declared_derivative` takes it."""
+    its tangent, as `jax.custom_jvp.defjvp` takes it, which reverse mode transposes; with `symbolic_zeros`,
+    an operand no tangent reaches is a `SymbolicZero` there, as `defjvp` gives it), one marked call of
+    `kind` (`bound_span`), as `declared_derivative` takes it; a surrogate's tangent is `surrogate`'s, whose
+    rule reads the surrogate's own value, so a second order meets the rule again (`TangentKind`)."""
     rule = jax.custom_jvp(primal, nondiff_argnums=tuple(nondiff_argnums))
-    rule.defjvp(tangent)
+    rule.defjvp(tangent, symbolic_zeros=symbolic_zeros)
     return bound_span(kind, rule, static=nondiff_argnums)
 
 
@@ -153,6 +159,10 @@ class Algebra:
 type Kind = Protected | Surrogate | KernelGlue | Algebra
 """What a marked span is to the algebra pass, read as an object, never a name."""
 
+type TangentKind = Protected | KernelGlue | Algebra
+"""The kinds a tangent rule is declared as (`declared_tangent`): a surrogate's forward mode is `surrogate`'s
+alone, the one route whose rule reads the surrogate's own value."""
+
 marked_call_p = create_call_primitive("marked_call")
 """A marked span: a call of its body's jaxpr (`call_jaxpr`) under its `kind`, whose JVP, linearization,
 transpose, batching, partial evaluation and checkpointing are JAX's call primitive's, each a marked call of
@@ -160,10 +170,23 @@ the same kind; lowered by inlining its body, so it costs nothing compiled, insid
 (Dew's JAX build lowers a call primitive there as its body)."""
 
 
+def _evaluating() -> bool:
+    """Whether a call here runs eagerly: the current trace is JAX's own evaluation (`jax.core.eval_context`'s)
+    and not a trace that records a program (a jit's, a `make_jaxpr`'s, a transform's), whatever the
+    call's arguments are."""
+    here = jax_core.find_top_trace(())
+    with eval_context():
+        return here is jax_core.find_top_trace(())
+
+
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
     """`function` as one marked call of `kind` (`marked_call_p`) over its arguments, a tree of arrays: it
-    computes what `function` does, and every transform of it keeps a marked call of `kind`."""
+    computes what `function` does, and every transform of it keeps a marked call of `kind`. An eager call
+    (`_evaluating`), which no program records, is `function`'s own: traced, every such call traced a program
+    a step's steady state paid each step (a decision task's eager scores, train 586)."""
     def call(*arguments):
+        if _evaluating():
+            return function(*arguments)
         flat, structure = jax.tree.flatten(arguments)
         closed, shaped = jax.make_jaxpr(lambda *leaves: function(*jax.tree.unflatten(structure, leaves)),
                                         return_shape=True)(*flat)

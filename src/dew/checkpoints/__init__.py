@@ -70,7 +70,7 @@ import math
 import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -221,6 +221,22 @@ def location(directory: str) -> epath.Path:
     """
     path = epath.Path(directory)
     return path if is_uri(directory) else path.resolve()
+
+
+class Envelope(TypedDict):
+    """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
+    take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
+    it was read by, the stop control, the rung, the artifact, the boxed axes and the rollout's tree
+    (`dew.training.Trainer`'s one envelope, row 4126)."""
+
+    state: TrainState
+    saved: bytes | None
+    share: DataPartition | None
+    control: dict | None
+    rung: JSON
+    artifact: JSON
+    boxed: Mapping[tuple[str, ...], LogicalAxes] | None
+    rollout: Mapping[str, object] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1209,12 +1225,15 @@ class Checkpoints:
         write_atomically(path, json.dumps(dict(pending), sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
-        """Return the selected step's inference declaration.
+        """Return the selected step's inference declaration, from its custom metadata alone (`_custom`), as
+        `control` reads a committed step's: the manager's metadata opens every array's TensorStore besides
+        (1.7 s of a U-Net run's reload, which reads it before anything, row 3763); a local step's as its
+        process holds it.
 
         It is None when the step's objective declares no inference record."""
         step = self.pinned(step)
-        local = step == self._local_latest()
-        custom = self._step_metadata(step, local=local).custom_metadata or {}
+        custom = (self._step_metadata(step, local=True).custom_metadata or {} if step == self._local_latest()
+                  else self._custom(step))
         return json_value(custom.get('artifact'), 'artifact')
 
     def control(self, step: int) -> dict:

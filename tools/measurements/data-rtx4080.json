@@ -29,7 +29,7 @@
     "images": 512,
     "corpus_sha256": "e316cecae63e97ddc542ee047777dd092a53faf64737db12b053df7d20188106",
     "config": {
-      "flowers": "~/.cache/dew/datasets/oxford_flowers102/2.1.1",
+      "flowers": "oxford_flowers102/2.1.1",
       "images": 512,
       "repeats": 3,
       "image_size": 128,

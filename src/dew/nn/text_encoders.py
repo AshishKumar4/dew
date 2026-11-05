@@ -95,7 +95,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
                branch_scale: float | None = None, attention_bias: bool = True, qk_norm: bool = False,
-               scale_after_cast: bool = False, mixer: Callable[..., nn.Module] | None = None,
+               wide_logits: bool = False, scale_after_cast: bool = False,
+               mixer: Callable[..., nn.Module] | None = None,
                dtype: Dtype | None = None, precision: PrecisionLike = None,
                name: str | None = None) -> DecoderBlock:
     """One encoder layer of a text or vision tower as the decoder block runs it: CLIP's, SigLIP's,
@@ -112,15 +113,16 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     `head_dim` beside `width // heads`, RMS norms or no norm bias, an unbiased or gated
     feed-forward whose gate and up maps are one (`mlp_packed`), queries, keys and values in
     one map (`packed`), unbiased attention maps (`attention_bias`), an RMS norm on each head's
-    queries and keys at the layer's epsilon (`qk_norm`), RMS norms that weigh their normalized input
-    after its cast back (`scale_after_cast`, Llama's); a `mixer` takes the attention's place
+    queries and keys at the layer's epsilon (`qk_norm`), logits formed in at least fp32
+    (`wide_logits`, `MixerContext.wide_logits`: the world model's), RMS norms that weigh their
+    normalized input after its cast back (`scale_after_cast`, Llama's); a `mixer` takes the attention's place
     (LFM3-VL's grid convolution, `dew.nn.mixers.short_conv.GatedGridConv`).
     """
     head_dim = width // heads if head_dim is None else head_dim
     attention = functools.partial(
         CausalSelfAttention, ctx=MixerContext(
             emb_features=width, num_heads=heads, num_kv_heads=heads if kv_heads is None else kv_heads,
-            head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm,
+            head_dim=head_dim, max_seq_len=positions, causal=causal, qk_norm=qk_norm, wide_logits=wide_logits,
             attention_bias=attention_bias, norm_eps=eps, scale_after_cast=scale_after_cast,
             rope_theta=rope_theta,
             # A window keeps the keys within `window` places: |q - k| < window + 1 (`window_sides`).

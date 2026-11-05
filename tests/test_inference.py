@@ -807,6 +807,27 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
                                   np.asarray(loaded.text_processor("the cat sat").tokens))
 
 
+def test_a_checkpoints_inference_declaration_is_read_opening_no_array(tmp_path, monkeypatch):
+    """A saved run's inference declaration (`Checkpoints.artifact`, which `SavedRun.at` reads before it
+    loads anything) is its step's custom metadata, read from the step's own metadata file: no array of the
+    step is opened, where the manager's metadata opened every array's TensorStore (1.7 s of a U-Net run's
+    reload, row 3763)."""
+    import tensorstore
+
+    objective, _ = make_lm_run(tmp_path)
+    opened = []
+    real = tensorstore.open
+
+    def counted(*arguments, **options):
+        opened.append(arguments)
+        return real(*arguments, **options)
+
+    monkeypatch.setattr(tensorstore, "open", counted)
+    record = Checkpoints(str(tmp_path), keep=2).artifact()
+    assert isinstance(record, dict) and record["objective"] == objective.inference_record()["objective"]
+    assert not opened
+
+
 def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
     """An LM run records its decoder's task settings (`TextSettings`) and nothing else beside
     its objective, its model and the numerics it trained under (rows 2255 and 2500), and they read back as

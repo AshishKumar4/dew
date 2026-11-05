@@ -41,7 +41,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, mosaic_sm100, tail
-from dew.nn.kernels.templates.axes import named
+from dew.nn.kernels.templates.axes import at_group, by_rows, held, named
 from dew.nn.kernels.templates.gemm.mosaic_gpu import GroupInfo, tile_groups
 from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
 
@@ -135,7 +135,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     scratch = (
         stages.scratch(), accumulators.scratch(target),
         tuple(plgpu.SMEM((block_m, tiles.epilogue_n), dtype) for dtype in dtypes),
-        tuple(plgpu.SMEM(named(side_axes, side_extent), side.dtype)
+        tuple(plgpu.SMEM(named(held(side_axes), side_extent), side.dtype)
               for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True)),
         plgpu.Barrier(num_barriers=max(len(epilogue_operands), 1)),
     )
@@ -231,7 +231,8 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
             acc = chunk_of(chunk)
             values = (acc,) if epilogue is None else _epilogue(
                 epilogue, acc, sides, scratch.side_smems, scratch.side_full, epilogue_axes,
-                {'rows': rows_of.block_start + own, 'columns': column}, shape.side_extent)
+                {'rows': rows_of.block_start + own, 'columns': column}, shape.side_extent,
+                jnp.minimum(rows_of.group_id, shape.groups - 1))
             for o_smem, o_gmem, value in zip(scratch.o_smems, outs, values, strict=True):
                 mosaic.staged_rows(o_smem, value, o_gmem, rows_of.block_start + own, first, stored, column,
                                    min(block_m, shape.rows))
@@ -246,14 +247,17 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
     pl.when(~tile.computes)(lambda: store(lambda chunk: TCGEN05.zeros((tiles.block_m, chunk_n))))
 
 
-def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:
+def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict, group) -> tuple:
     """`epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile at the chunk's rows and
-    columns brought to shared memory by TMA first (`mosaic.loaded`)."""
+    columns brought to shared memory by TMA first (`mosaic.loaded`), a side operand by group's at the tile's
+    `group` (the unrouted rows' the last's) and handed the epilogue at each of the chunk's rows."""
     blocks = {axis: pl.ds(origins[axis], extent[axis]) for axis in origins}
     sides = zip(gmems, smems, axes_of, strict=True)
-    mosaic.loaded(tuple((gmem.at[named(side_axes, blocks)], smem, barriers.at[index])
+    mosaic.loaded(tuple((gmem.at[named(side_axes, blocks | at_group(side_axes, gmem.shape, group))], smem,
+                         barriers.at[index])
                         for index, (gmem, smem, side_axes) in enumerate(sides)))
-    outs = epilogue(acc, *(smem[...] for smem in smems))
+    outs = epilogue(acc, *(by_rows(smem[...], side_axes, extent['rows'])
+                           for smem, side_axes in zip(smems, axes_of, strict=True)))
     return outs if isinstance(outs, tuple) else (outs,)
 
 

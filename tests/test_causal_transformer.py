@@ -22,10 +22,10 @@ import pytest
 from flax import linen as nn
 from model_support import (
     TINY_DECODER,
+    as_stepped,
     decode_logits,
     decode_steps,
     model_draw,
-    stepped_logits,
     with_logit_cotangent,
 )
 from reference_error import (
@@ -330,7 +330,8 @@ def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ,
     forward = jax.jit(model.apply)
 
     def stepped(params, ids):
-        return stepped_logits(lambda tokens: forward(params, tokens), ids, prompt)
+        # The widths a cached decode of the prefill computes, from its last prompt position on.
+        return as_stepped(lambda tokens: forward(params, tokens), ids, prompt)[:, prompt - 1:]
 
     def full(model, divided=1.0):
         return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)
@@ -380,12 +381,15 @@ def a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministi
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
 
 
-def test_a_cached_prompt_reads_its_cache_under_a_chosen_template():
+@pytest.mark.parametrize("scanned", [False, True], ids=["loop", "scan"])
+def test_a_cached_prompt_reads_its_cache_under_a_chosen_template(scanned):
     """A prompt prefilled into the cache under `chosen(attention='template')` builds no mask, so the mask's
     kernel is never decided and the template takes the call (row 2662: decided eagerly, the template's
-    refusal of a mask raised): its logits on par with the xla kernel's uncached forward from the float64
-    forward over drawn weights and prompts (check 1)."""
-    model = tiny()
+    refusal of a mask raised), in a scanned stack too, whose residual dtype's abstract layer opens only
+    the call's collections (row 4101: opened beyond them, its attention sowed QK-Clip maxima over a mask
+    and the cache's making was refused): its logits on par with the xla kernel's uncached forward from
+    the float64 forward over drawn weights and prompts (check 1)."""
+    model = tiny(scan_layers=scanned)
     made, step = decode_steps(model)
 
     def prefilled(params, prompt):

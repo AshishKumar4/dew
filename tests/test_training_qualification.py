@@ -36,8 +36,8 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
-from map_judge import pooled_units, record_units
-from process_support import ProcessGroup
+from map_judge import sharded
+from process_support import ProcessGroup, owned, terminate
 from remote_cache import HOST
 from token_support import encoded_token_fixture
 from transformers import (
@@ -55,20 +55,19 @@ TOKENIZER = FIXTURES / "tokenizers" / "tiny-tools"
 
 
 def spawn(directory: Path, mode: str) -> subprocess.Popen:
-    """One run of the worker in its own session, so a kill takes its children
-    too. It inherits the session's platform and the lane's flags
-    (tests/lane_environment.py), which on CUDA make the reductions repeatable."""
-    environment = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
-    return subprocess.Popen([sys.executable, str(Path(worker.__file__)), str(directory), mode],
-                            cwd=ROOT, env=environment, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    """One run of the worker as a group its owner holds (`process_support.owned`), so a kill takes its
+    children too, and a test killed while the run blocks takes the run with it. It inherits the session's
+    platform and the lane's flags (tests/lane_environment.py), which on CUDA make the reductions
+    repeatable."""
+    return owned([sys.executable, str(Path(worker.__file__)), str(directory), mode],
+                 {**os.environ, "PYTHONPATH": str(ROOT / "src")})
 
 
 def finish(process: subprocess.Popen, mode: str) -> None:
     try:
         log = process.communicate(timeout=900)[0]
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
+        terminate(process)
         pytest.fail(f"the {mode} run did not finish within 900s\n{process.communicate()[0]}")
     assert process.returncode == 0, f"the {mode} run exited {process.returncode}\n{log}"
 
@@ -78,7 +77,7 @@ def kill_when_ready(process: subprocess.Popen, marker: Path) -> None:
     deadline = time.monotonic() + 900
     while not marker.exists():
         if process.poll() is not None or time.monotonic() >= deadline:
-            os.killpg(process.pid, signal.SIGKILL)
+            terminate(process)
             pytest.fail(f"the interrupted run never blocked\n{process.communicate()[0]}")
         time.sleep(0.05)
     assert int(marker.read_text()) == process.pid
@@ -182,15 +181,14 @@ def ran(directory: Path) -> dict[str, bytes]:
 @pytest.mark.parametrize("kind", ["dense", "moe"])
 @pytest.mark.shards(units=1, per_task=1)
 def test_a_loaded_source_resumes_mid_accumulation_and_exports_as_transformers_reads_it(kind, tmp_path):
-    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit
-    (`map_judge.record_units`), which its judge holds to transformers (`pooled_units`); run whole, the
-    runs then the judge."""
+    """The module's claims for a source of `kind`: its runs (`ran`), one map task's unit, which its
+    judge holds to transformers (`map_judge.sharded`); run whole, the runs then the judge."""
     directory = prepared(tmp_path / "qualification", kind)
     label = f"the {kind} source's qualification runs"
-    if record_units(label, lambda start, stop: [ran(directory) for _ in range(start, stop)]):
+    pooled = sharded(label, lambda start, stop: [ran(directory) for _ in range(start, stop)], 1)
+    if pooled is None:
         return
-    pooled = pooled_units(label, 1)
-    units = [ran(directory)] if pooled is None else [unit for _, _, payload in pooled for unit in payload]
+    units = [unit for payload in pooled for unit in payload]
     for files in units:
         for name, content in files.items():
             (directory / name).parent.mkdir(parents=True, exist_ok=True)

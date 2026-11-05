@@ -34,12 +34,19 @@ from dew.data.dataset import rows_of
 from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
-from dew.nn.kernels.generation import _compute_capability
+from dew.nn.kernels.generation import _compute_capability, gpu_target
 from dew.nn.programs import bodies, computed
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.compiled_program import VIEWS, Slicing, compiled, deviceless, dimensions, lowering_platform
-from dew.training.memory import judged
+from dew.training.compiled_program import (
+    Slicing,
+    bitcast,
+    compiled,
+    deviceless,
+    dimensions,
+    lowering_platform,
+)
+from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
 
@@ -150,6 +157,10 @@ LOWERED = {"gpu": "cuda"}
 """The platform JAX lowers for where a derivation names only its kind (`lowering_platform`)."""
 
 LOOPS = frozenset({"scan", "while"})
+
+PRODUCTS = frozenset({"dot_general", "conv_general_dilated", "ragged_dot_general"})
+"""The products a weight's gradient is made by, past which a value is a cotangent the backward reads on
+(`sunk`)."""
 """The primitives that run their body turn after turn, their results held across the turns."""
 
 GEMM_REWRITE_SIZE = 100
@@ -176,12 +187,16 @@ def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.
 
 
 def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
-                  lowering: str | None = None, consumed: bool = False) -> tuple[int, Peak]:
+                  lowering: str | None = None, consumed: bool = False,
+                  deferred: bool = False) -> tuple[int, Peak]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
-    backward (`traced_gradient`), as each derives it from its own."""
-    traced = traced_gradient(loss, params, arguments)
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced, platform, lowering), _peak(*traced, platform, workspace, lowering, consumed)
+    backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
+    alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
+    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
+    return (_kept(lowered, count, shapes, platform),
+            _peak(lowered, count, platform, workspace, consumed, deferred))
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -195,12 +210,13 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
     every other value, count whole. Matching an axis's size to the batch size cannot identify its
     sharding: a weight or a scan's layer axis can have that size too."""
-    lowering = lowering or LOWERED.get(platform, platform)
-    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    return _kept(compiled(program, lowering or LOWERED.get(platform, platform)), count, shapes, platform)
 
 
 def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
-                  workspace: Workspace, lowering: str | None = None, consumed: bool = False) -> Peak:
+                  workspace: Workspace, lowering: str | None = None, consumed: bool = False,
+                  deferred: bool = False) -> Peak:
     """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
     device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
     `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
@@ -213,23 +229,52 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     `HloInputOutputAliasConfig`), and XLA's memory-minimizing schedule runs a consumer that frees its
     operand as soon as it is ready (`ListScheduler::BytesFreedIfScheduled`,
     xla/hlo/transforms/simplifiers/hlo_memory_scheduler.cc; `ScheduleGpuModule`,
-    xla/service/gpu/gpu_hlo_schedule.cc)."""
-    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
-                 lowering or LOWERED.get(platform, platform), consumed)
+    xla/service/gpu/gpu_hlo_schedule.cc). With `deferred`, the gradient's own equations run after the rest
+    of the backward (`sunk`)."""
+    program, count, _ = traced_gradient(loss, params, arguments)
+    return _peak(compiled(program, lowering or LOWERED.get(platform, platform)), count, platform, workspace,
+                 consumed, deferred)
 
 
-def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
-    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
-    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program as it is `lowered` (`compiled`), its outputs past
+    the first `count` the residuals."""
+    return _residuals(lowered.replace(outvars=lowered.outvars[count:]), shapes, platform)
 
 
-def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
-          lowering: str, consumed: bool = False) -> Peak:
-    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
-    del shapes
-    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
-    return Peak(peak_bytes(lowered, platform, workspace, consumed=consumed),
-                not bounded_below(lowered, platform))
+def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, consumed: bool = False,
+          deferred: bool = False) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
+    outputs the gradient."""
+    gradient = lowered.replace(outvars=lowered.outvars[:count])
+    return Peak(peak_bytes(sunk(gradient) if deferred else gradient, platform, workspace, consumed=consumed),
+                not bounded_below(gradient, platform))
+
+
+def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program`, a gradient's, with each weight's gradient run after every other equation, in their order:
+    the equations whose results reach its outputs through no product (`PRODUCTS`), each weight's gradient
+    product and what sums, casts or lays it out, the backward's cotangents, which the products of the
+    layers before read, left where they are, and the operands those products read held to the end. XLA
+    schedules a step's gradient so where its head takes the backward a tile at a time (`head_tile`,
+    unfused) on some GPUs (`GpuTarget.late_weight_gradients`): Qwen3.5-4B's step at 2 x 4096 tokens under
+    'full', compiled for an H100, held 29 layers' four [8192, 9216] product operands at its peak, 16.3 of
+    its 34.6 GiB, and no layer's gradient (row 3341, its calibration's buffer dumps)."""
+    outputs = {value for value in program.outvars if computed(value)}
+    readers: dict[jcore.Var, list[int]] = collections.defaultdict(list)
+    for index, equation in enumerate(program.eqns):
+        for value in {read for read in equation.invars if computed(read)}:
+            readers[value].append(index)
+    late: set[int] = set()
+    for index in range(len(program.eqns) - 1, -1, -1):
+        made = [out for out in program.eqns[index].outvars if computed(out)]
+        # Every result read by late equations alone, none a product, and one at least read or returned.
+        if any(readers[out] or out in outputs for out in made) and all(
+                reader in late and program.eqns[reader].primitive.name not in PRODUCTS
+                for out in made for reader in readers[out]):
+            late.add(index)
+    ordered = sorted(range(len(program.eqns)), key=lambda index: index in late)
+    return program.replace(eqns=[program.eqns[index] for index in ordered])
 
 
 def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
@@ -393,7 +438,7 @@ def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.Jaxpr
 class Frontier:
     """Which values of `program` XLA's fusion for `platform` keeps a buffer of: each but one a primitive
     it recomputes in its consumers computes (`recomputed`), which reads those it is computed from in
-    its place, and one a layout primitive (`VIEWS`) makes of another's buffer, which XLA's layout
+    its place, and one a layout primitive (`bitcast`) makes of another's buffer, which XLA's layout
     assignment lays that buffer out for; the program's outputs, where it returns them (`returned`),
     always but as such a view; neither its inputs nor its literals."""
 
@@ -420,7 +465,7 @@ class Frontier:
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
-        (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
+        (`bitcast`), or a transpose's of a value the program computes into a buffer and reads nowhere
         else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
         if value in self.forwards:
@@ -428,7 +473,7 @@ class Frontier:
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
-        if equation.primitive.name in VIEWS:
+        if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
         return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
@@ -540,6 +585,9 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
     name = equation.primitive.name
+    if bitcast(equation):
+        # A bitcast holds no buffer of its own, on any platform.
+        return True
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:
@@ -578,6 +626,13 @@ def gemm_workspace(device) -> Workspace:
         return Workspace(0, 0)
     rewritten = (32 if int(capability.split('.')[0]) >= 9 else 4) << 20
     return Workspace(DEFAULT_WORKSPACE if deviceless(device) else rewritten, rewritten)
+
+
+def late_weight_gradients(device) -> bool:
+    """Whether XLA runs a step's weight gradients on `device` after the whole backward where its head takes
+    its gradient a tile at a time, unfused (`GpuTarget.late_weight_gradients`, `sunk`)."""
+    capability = _compute_capability(device) if device.platform == 'gpu' else None
+    return bool(capability) and gpu_target(f"sm{capability.replace('.', '')}").late_weight_gradients
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
@@ -646,9 +701,13 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
             reads = consumed()
+            # A head that takes its gradient in the backward a tile at a time, unfused, has XLA run the
+            # weight gradients after the backward on some GPUs (`late_weight_gradients`).
+            late = (head_tile_of(objective) is not None and not head_fused_of(objective)
+                    and late_weight_gradients(target))
             residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
                                             platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering, consumed=reads)
+                                            lowering=lowering, consumed=reads, deferred=late)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}

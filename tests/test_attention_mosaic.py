@@ -212,7 +212,7 @@ registers, the route's next mainloop taking it (`_takes_backward`): a query's te
 every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed sums beside the hook's three slopes and its
 mask); a softcap with sinks and ALiBi, whose dQ at 64 x 64, width 128, in two column halves, spilled 204 bytes
 at ptxas's 255 where its model held 254 (et-ceil), refused once a consumer's raise is at most
-`resources.RAISE_CEILING`'s 248."""
+`resources.raise_ceiling`'s 248."""
 
 
 def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
@@ -221,10 +221,8 @@ def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks 
     target in effect, checked against `declined`, the call one it declines for its registers
     (`MosaicBackward.declined`'s resources, the route's next implementation's: `ACCURATE_DECLINED`)."""
     query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
-    residuals = _residuals(query.shape)
-    op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
-                                               natural=attention_mosaic.NATURAL, accurate=accurate)
-    reason = op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    reason = attention_mosaic.backward_declined(query, key, key, spans, hooks, query,
+                                                residuals=_residuals(query.shape), accurate=accurate)
     assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
     return reason is None
 
@@ -448,6 +446,30 @@ def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
     walk's rows, no anchor, `rowsum(dO ⊙ O)` of the rounded output, as FlashAttention's is), in two launches
     and in one: within check 1 of the reference from float64, its D's rounding judged a term at a time."""
     _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, kept=template.Kept.OUTPUT)
+
+
+def test_a_slope_reaches_a_custom_vjp_only_through_the_operands_it_feeds():
+    """A score hook's slope along an input counts as reaching a `jax.custom_vjp` only where that input
+    feeds one, through a jit's program operand by operand (`_reaches_custom_vjp`): a score added to a
+    custom VJP of a parameter has the constant slope one, traced, and the parameter's slope is counted."""
+    from dew.nn.kernels.templates.attention_mosaic_program import _reaches_custom_vjp
+
+    @jax.custom_vjp
+    def held(x):
+        return x
+
+    held.defvjp(lambda x: (x, None), lambda _, cotangent: (cotangent,))
+    traced = jax.make_jaxpr(lambda s, p: jax.jit(lambda s, p: s + held(p))(s, p))(1.0, 2.0).jaxpr
+    assert not _reaches_custom_vjp(traced, {traced.invars[0]})
+    assert _reaches_custom_vjp(traced, {traced.invars[1]})
+    # A jit's outputs reached one by one: its second output, independent of `s`, feeds the custom VJP.
+    paired = jax.make_jaxpr(lambda s, p: (lambda pair: pair[0] + held(pair[1]))(
+        jax.jit(lambda s, p: (s, p))(s, p)))(1.0, 2.0).jaxpr
+    assert not _reaches_custom_vjp(paired, {paired.invars[0]})
+    assert _reaches_custom_vjp(paired, {paired.invars[1]})
+    # No tangent passes a stop_gradient.
+    stopped = jax.make_jaxpr(lambda s: held(jax.lax.stop_gradient(s)))(1.0).jaxpr
+    assert not _reaches_custom_vjp(stopped, {stopped.invars[0]})
 
 
 @INTERPRETS

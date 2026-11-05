@@ -74,6 +74,43 @@ def test_entries_both_sides_add_at_the_head_of_unreleased_are_both_kept(tmp_path
         "## Unreleased\n\n", "## Unreleased\n\n- Main's new entry.\n- A head's new entry.\n")
 
 
+def test_an_entry_both_sides_carry_merges_once(tmp_path):
+    """Train 451's merge: main took a train's entries, and a head carries the same entries as a commit of its
+    own beside its new one; the two sides' insertions meet at the head of `## Unreleased`, and the entries
+    both hold merge once, the head's new entry beside them (row 3431)."""
+    carried = "- A train's entry.\n- Its second entry.\n"
+    ours = BASE.replace("## Unreleased\n\n", f"## Unreleased\n\n{carried}")
+    theirs = BASE.replace("## Unreleased\n\n", f"## Unreleased\n\n- A head's new entry.\n{carried}")
+    merge, root = merged(tmp_path, ours, theirs)
+    assert merge.returncode == 0, merge.stdout + merge.stderr
+    assert (root / "CHANGELOG.md").read_text() == BASE.replace(
+        "## Unreleased\n\n", f"## Unreleased\n\n{carried}- A head's new entry.\n")
+
+
+def test_an_entry_sharing_its_last_line_with_the_other_sides_stays_whole(tmp_path):
+    """Two new entries, one a side's, that end on the same continuation line are two entries: each merges
+    whole, its shared last line kept in both, where a line's dedupe cut the second one short (row 3431's
+    review)."""
+    ours = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Our entry,\n  as the docs say.\n")
+    theirs = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Their entry,\n  as the docs say.\n")
+    merge, root = merged(tmp_path, ours, theirs)
+    assert merge.returncode == 0, merge.stdout + merge.stderr
+    assert (root / "CHANGELOG.md").read_text() == BASE.replace(
+        "## Unreleased\n\n",
+        "## Unreleased\n\n- Our entry,\n  as the docs say.\n- Their entry,\n  as the docs say.\n")
+
+
+def test_entries_both_sides_carry_in_another_order_merge_once(tmp_path):
+    """Entries both sides carry merge once wherever each side holds them, a side's new entry between or
+    after them kept where its side has it."""
+    ours = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- First.\n- Second.\n")
+    theirs = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Second.\n- New.\n- First.\n")
+    merge, root = merged(tmp_path, ours, theirs)
+    assert merge.returncode == 0, merge.stdout + merge.stderr
+    assert (root / "CHANGELOG.md").read_text() == BASE.replace(
+        "## Unreleased\n\n", "## Unreleased\n\n- First.\n- Second.\n- New.\n")
+
+
 def test_a_deletion_apart_from_the_other_sides_new_entry_merges_with_it(tmp_path):
     ours = BASE.replace("## Unreleased\n\n", "## Unreleased\n\n- Main's new entry.\n")
     theirs = BASE.replace(f"{OLD}\n", "")

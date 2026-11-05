@@ -17,16 +17,19 @@ The rows are a covering set, not the whole product: every pair of settings
 (read mode, cache, filter, packing, the count that saves and the other count
 the save is resumed on or refused) meets in some row, and the boundary rows
 hold the indexed read beside each single step that turns its global order
-into a per-share one. A pool that nobody stopped, and the pool that saves a
-row's checkpoint, are each run once per cell and count and read by every
-test that needs them: each row resumes on its own count and on the other as
-two tests, each within its budget (row 2788).
+into a per-share one. One pool per cell and count trains six steps and saves
+at the third on its way, nobody stopping it: it is the run a resume on its
+count must land on, and its third step's checkpoint is what a row saved by
+that count resumes from. Each runs once and is read by every test that needs
+it; each row resumes on its own count and on the other as two tests, each
+within its budget (rows 2788, 3568).
 
 Run the matrix alone with `pytest tests/test_data_matrix.py`; `-k` picks rows.
 """
 
 import functools
 import shutil
+from pathlib import Path
 
 import pytest
 from matrix_support import published_matrix
@@ -82,48 +85,42 @@ def prepared(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def uninterrupted(tmp_path_factory, prepared):
-    """A pool of `processes` that trains `cell` for six steps and nobody stops: its reports and
-    where it wrote them, run once a cell and count."""
+def trained(tmp_path_factory, prepared):
+    """A pool of `processes` that trains `cell` for six steps, saving at the third and the sixth, and
+    nobody stops: its reports, where it wrote them and the run directory it saved to, run once a cell
+    and count."""
     @functools.cache
     def run(cell: str, processes: int):
-        directory = tmp_path_factory.mktemp("whole")
+        directory = tmp_path_factory.mktemp("trained")
         reports = run_pool("matrix", directory / "out", processes, run_dir=directory / "run", cell=cell,
-                           name="matrix", steps=2 * STEPS, **prepared(cell))
-        return reports, directory / "out"
+                           name="matrix", steps=2 * STEPS, save_every=STEPS, **prepared(cell))
+        return reports, directory / "out", directory / "run"
 
     return run
 
 
-@pytest.fixture(scope="module")
-def saved(tmp_path_factory, prepared):
-    """A pool of `processes` that trains `cell` for three steps and saves: its reports and the run
-    directory it saved to, run once a cell and count, which each resume copies."""
-    @functools.cache
-    def run(cell: str, processes: int):
-        directory = tmp_path_factory.mktemp("saved")
-        reports = run_pool("matrix", directory / "first", processes, run_dir=directory / "run", cell=cell,
-                           name="matrix", steps=STEPS, save_every=STEPS, **prepared(cell))
-        return reports, directory / "run"
-
-    return run
+def saved_at_third_step(run: Path, directory: Path) -> None:
+    """`run`'s directory copied to `directory` as it stood once its third step saved: without the
+    sixth step's checkpoint, which it wrote after."""
+    shutil.copytree(run, directory,
+                    ignore=lambda at, names: [str(2 * STEPS)] if Path(at).name == "matrix" else [])
 
 
 @pytest.mark.parametrize("resumed_by", ["same", "other"])
 @pytest.mark.parametrize("cell, saved_by, other", ROWS,
                          ids=[f"{cell}-saved-by-{saved}-then-{other}" for cell, saved, other in ROWS])
-def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, uninterrupted, saved, prepared,
+def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, trained, prepared,
                                                                     cell, saved_by, other, resumed_by):
-    first, checkpoint = saved(cell, saved_by)
+    first, _, run = trained(cell, saved_by)
     elastic = first[0]["lowering"] == "global"
     # A published generation is the preparation that makes a filtered or packed read global.
     assert elastic or ",published," not in cell
     processes = saved_by if resumed_by == "same" else other
     directory = tmp_path / f"resumed{processes}" / "run"
-    shutil.copytree(checkpoint, directory)
+    saved_at_third_step(run, directory)
     if not elastic and processes != saved_by:
         # The checkpoint resumes the shares that saved it and refuses another count's.
-        checkpoints = Checkpoints(str(checkpoint / "matrix"))
+        checkpoints = Checkpoints(str(directory / "matrix"))
         checkpoints.restore(share=DataPartition(0, saved_by))
         with pytest.raises(ValueError):
             checkpoints.restore(share=DataPartition(0, processes))
@@ -133,7 +130,7 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, un
         return
     resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                        cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
-    whole, written = uninterrupted(cell, processes)
+    whole, written, _ = trained(cell, processes)
     # On the count that saved it a resume reduces in the order the run it continues did, so it lands
     # on that run's parameters bit for bit; on another count it reduces otherwise.
     same = assert_identical_parameters if processes == saved_by else assert_same_parameters

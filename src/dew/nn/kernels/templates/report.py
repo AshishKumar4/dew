@@ -11,11 +11,16 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import importlib.util
 import logging
 import re
+import shutil
 import struct
+import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Hashable, Iterator
+from pathlib import Path
 from typing import overload
 
 import jax
@@ -243,6 +248,18 @@ def launch_digest() -> str | None:
 def traced(digest: str) -> Launch | None:
     """The launch this process traced under `digest` (a report's `launch`), or None."""
     return _LAUNCHES.get(digest)
+
+
+def derivation_inputs(op, arguments: tokamax.BoundArguments, target) -> Hashable:
+    """What a launch's derivation of its config for `arguments` on `target` reads of the launch and its
+    compiles: the launch's identity (`_identity`: the op, its arguments' shapes and dtypes, its hooks), the
+    whole target, whose facts price its schedules, and each config this context's compiles refused it
+    (`refused`), so a refusal recorded after a derivation derives it again."""
+    identity = _identity(op, arguments)
+    with _GUARD:
+        refusals = frozenset((config, kernels) for (launch, config), kernels in _registry().refused.items()
+                             if launch == identity)
+    return identity, target, refusals
 
 
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable) -> bool:
@@ -493,17 +510,19 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 class Binary:
     """A Mosaic GPU or Pallas-Triton kernel's binary as its executable carries it (`binaries`): its name less
     the launch it carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its
-    stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and
-    the dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
-    `shared_memory_bytes`), None where its proto states none."""
+    stack frame's bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), the
+    dynamic shared memory its launch asks for (a Mosaic kernel proto's `smem_bytes`, a custom kernel's
+    `shared_memory_bytes`), None where its proto states none, and, read `decoded`, what its machine code
+    breaks of the SASS rules (`sass_findings`), None where no disassembler read it."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
     shared: int | None = None
+    sass: tuple[str, ...] | None = ()
 
 
-def binaries(executable: jax.stages.Compiled) -> list[Binary]:
+def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[Binary]:
     """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
     form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
     compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
@@ -513,7 +532,8 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
     kernel's code in it. Nothing is read from or written to the process's environment or disk: a compile
     that set Mosaic's dump settings around itself handed its directory to every other thread's compile and
     removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
-    (row 2816)."""
+    (row 2816). `decoded`, each binary's SASS findings too (`sass_findings`, the compile gate's), each
+    cubin disassembled from a file of its own."""
     from jax._src.thunky import thunky
 
     found: list[Binary] = []
@@ -525,24 +545,24 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
             if operation.name == "thunky.call_thunk_proto":
                 attributes = operation.attributes
                 proto = ir.StringAttr(attributes["thunk_proto"]).value_bytes
-                found.extend(thunk_kernels(proto))
+                found.extend(thunk_kernels(proto, decoded=decoded))
                 name = ir.StringAttr(attributes["kernel_name"]).value
                 # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template
                 # launch's names its launch (`named`).
                 kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
                 if kernel is not None:
                     elf, shared = kernel
-                    found.append(dataclasses.replace(_binary(name, elf), shared=shared))
+                    found.append(dataclasses.replace(_binary(name, elf, decoded), shared=shared))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
     return found
 
 
-def thunk_kernels(proto: bytes) -> list[Binary]:
+def thunk_kernels(proto: bytes, *, decoded: bool = False) -> list[Binary]:
     """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
     a call whose binary is missing would read as a kernel that does not spill, so it raises."""
-    kernels, calls = _kernels(proto)
+    kernels, calls = _kernels(proto, decoded)
     if len(kernels) != calls:
         raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
     return kernels
@@ -578,7 +598,7 @@ def _fields(message: bytes) -> dict[int, list]:
     return fields
 
 
-def _kernels(message: bytes) -> tuple[list[Binary], int]:
+def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
     `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
@@ -588,22 +608,23 @@ def _kernels(message: bytes) -> tuple[list[Binary], int]:
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == ELF and isinstance(name[0], bytes)):
         stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
-        return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0], decoded), shared=stated)], 0
     found, calls = [], 0
     for values in fields.values():
         for value in values:
             if value == MOSAIC_TARGET:
                 calls += 1
             elif isinstance(value, bytes):
-                kernels, named = _kernels(value)
+                kernels, named = _kernels(value, decoded)
                 found += kernels
                 calls += named
     return found, calls
 
 
-def _binary(function: str, elf: bytes) -> Binary:
+def _binary(function: str, elf: bytes, decoded: bool = False) -> Binary:
     """The `Binary` of the kernel `function` from its cubin `elf`: its `.nv.info` attributes' registers and
-    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function)."""
+    frame (`REGISTER_COUNT`, `FRAME_SIZE`; a Mosaic module compiles one kernel function), and `decoded` its
+    SASS findings (`sass_findings`)."""
     (sections_at,) = struct.unpack_from("<Q", elf, 0x28)
     entry, count, names = struct.unpack_from("<HHH", elf, 0x3A)
     headers = [struct.unpack_from("<IIQQQQIIQQ", elf, sections_at + index * entry) for index in range(count)]
@@ -627,4 +648,57 @@ def _binary(function: str, elf: bytes) -> Binary:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0),
+                  sass=sass_findings(elf) if decoded else ())
+
+
+def disassembler() -> Path | None:
+    """NVIDIA's nvdisasm, which the SASS rules read a kernel's machine code through (`sass_findings`): the
+    nvdisasm wheel's (`nvidia/cu13/bin`), which the `ci` extra installs in every lock the suite runs on, or
+    the PATH's; None where neither is installed, a user's install among them."""
+    spec = importlib.util.find_spec("nvidia")
+    for root in (spec.submodule_search_locations or ()) if spec else ():
+        if (found := Path(root) / "cu13" / "bin" / "nvdisasm").is_file():
+            return found
+    found = shutil.which("nvdisasm")
+    return None if found is None else Path(found)
+
+
+def sass_findings(elf: bytes) -> tuple[str, ...] | None:
+    """What the machine code of the cubin `elf` breaks of the SASS rules (`sass_findings_of`, nvdisasm's
+    listing of it); None where no disassembler is installed (`disassembler`), the rules unread."""
+    tool = disassembler()
+    if tool is None:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".cubin") as cubin:
+        cubin.write(elf)
+        cubin.flush()
+        listing = subprocess.run([str(tool), "-c", cubin.name], capture_output=True, text=True, check=True)
+    return sass_findings_of(listing.stdout)
+
+
+_INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")
+_LABEL = re.compile(r"^\s*(\.L_\w+):")
+_WATERFALL = re.compile(r"\bBRA\.U\.ANY\s+`?\(?(\.L_\w+)\)?`?")
+
+
+def sass_findings_of(listing: str) -> tuple[str, ...]:
+    """What nvdisasm's `listing` of a kernel breaks of the kernel challenge's SASS rules (row 4071, its
+    harness/ptxas checks; notes/ptxas-re.md §2): an elect waterfall (a backward BRA.U.ANY) holding an R2UR, a
+    copy issued lane by lane because ptxas could not prove its operand uniform."""
+    instructions, labels, pending = [], {}, []
+    for line in listing.splitlines():
+        if label := _LABEL.match(line):
+            pending.append(label.group(1))
+        elif found := _INSTRUCTION.search(line):
+            labels.update(dict.fromkeys(pending, len(instructions)))
+            pending = []
+            instructions.append(" ".join(found.group(2).split()))
+    serialized = 0
+    for at, text in enumerate(instructions):
+        head = labels.get(branch.group(1)) if (branch := _WATERFALL.search(text)) else None
+        if head is not None and head <= at:
+            serialized += any("R2UR" in held for held in instructions[head:at + 1])
+    if not serialized:
+        return ()
+    return (f"{serialized} elect waterfall holding an R2UR, a copy issued lane by lane",)

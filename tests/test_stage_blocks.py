@@ -70,9 +70,10 @@ CASES = {
 """Each model by its registry name and fields, and the inputs it reads."""
 
 CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "fsdp2_stage2"),
-         ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2"), ("unet", "fsdp2_stage2")]
-"""The cells each a task runs whole; the UNet beside the sequence axis, CI's map tasks draw
-(`test_a_unets_stages_beside_the_sequence_axis_compute_what_one_device_computes`)."""
+         ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2")]
+"""The cells each a task runs whole; the UNet's, CI's map tasks draw
+(`test_a_unets_stages_beside_fsdp_compute_what_one_device_computes`,
+`test_a_unets_stages_beside_the_sequence_axis_compute_what_one_device_computes`)."""
 
 SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 128, "patch_conv": 8}
 """Each model's check-1 seeds, the most any of its layouts took (`LAYOUT_SEEDS` where a layout took
@@ -192,6 +193,15 @@ def stacks_as_one_device(case: str, layout: str) -> None:
 def test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes(case, layout):
     """`stacks_as_one_device` over each cell a task runs whole (`CELLS`)."""
     stacks_as_one_device(case, layout)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.check1_shards(seeds=64, per_task=16)
+def test_a_unets_stages_beside_fsdp_compute_what_one_device_computes():
+    """`stacks_as_one_device` over the UNet's stages beside fsdp, its 64 seeds and their redraws drawn by
+    CI's map tasks (`check1_shards`), 16 a task: whole, it took 62 s on armada (33 s its fixed part, 0.45 s
+    a seed) and 58 to 145 s in CI (trains 580 and 573, ledger 3998)."""
+    stacks_as_one_device("unet", "fsdp2_stage2")
 
 
 @pytest.mark.mesh(devices=8)

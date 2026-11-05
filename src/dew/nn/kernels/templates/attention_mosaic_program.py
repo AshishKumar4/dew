@@ -42,7 +42,8 @@ from dew.nn.kernels.templates.attention import (
     shared_place,
     whole,
 )
-from dew.nn.programs import CALLS
+from dew.nn.kernels.templates.cost import estimate
+from dew.nn.programs import CALLS, equations
 
 QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
 """The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
@@ -493,14 +494,49 @@ def _varying_slopes(score_mod, params: tuple, graded: tuple[Kind, ...]) -> int:
         return jax.jvp(along, (inputs[place],), (jnp.ones_like(inputs[place]),))[1]
 
     count = int(_varies(score_mod, logits, positions, positions, *values))
+    traced = jax.make_jaxpr(score_mod)(logits, positions, positions, *values).jaxpr
     formed = [index for index in floating_params(values) if params[index][0] in graded]
     for place in (0, *(1 + index for index in formed)):
-        try:
-            count += _varies(functools.partial(slope, place), logits, positions, positions, *values)
-        except TypeError:
-            # A `jax.custom_vjp` hook takes no forward derivative: its slope counted.
-            count += 1
+        # A `jax.custom_vjp` the input reaches takes no forward derivative: that slope is counted untraced.
+        reached = _reaches_custom_vjp(traced, {traced.invars[0 if place == 0 else place + 2]})
+        count += reached or _varies(functools.partial(slope, place), logits, positions, positions, *values)
     return count
+
+
+def _reaches_custom_vjp(jaxpr: jax_core.Jaxpr, starts: set) -> bool:
+    """Whether any of `starts`, `jaxpr`'s inputs, reaches a `jax.custom_vjp` call along its tangent
+    (`_tangent_reach`)."""
+    return _tangent_reach(jaxpr, starts)[0]
+
+
+def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
+    """Whether `starts`, `jaxpr`'s inputs, reach a `jax.custom_vjp` call along their tangent, and the
+    outputs they reach: no further than a `stop_gradient`, which passes no tangent; through a call whose one
+    sub-program takes the call's operands and gives its outputs in order (a jit's, a custom JVP's), by the
+    operands reached into that program and the outputs it reaches back out; through any other holding a
+    sub-program, a branch or a loop body not followed operand by operand, wherever that program calls one
+    (`_primitives`), else to every output."""
+    reached = set(starts)
+    for equation in jaxpr.eqns:
+        hit = [index for index, var in enumerate(equation.invars)
+               if not isinstance(var, jax_core.Literal) and var in reached]
+        if not hit or equation.primitive.name == "stop_gradient":
+            continue
+        if equation.primitive is jax_core.primitives.custom_vjp_call_p:
+            return True, set()
+        inner = list(jax_core.jaxprs_in_params(equation.params))
+        if (len(inner) == 1 and len(inner[0].invars) == len(equation.invars)
+                and len(inner[0].outvars) == len(equation.outvars)):
+            found, outputs = _tangent_reach(inner[0], {inner[0].invars[index] for index in hit})
+            if found:
+                return True, set()
+            reached.update(out for out, inner_out in zip(equation.outvars, inner[0].outvars, strict=True)
+                           if inner_out in outputs)
+            continue
+        if any(jax_core.primitives.custom_vjp_call_p.name in _primitives(program) for program in inner):
+            return True, set()
+        reached.update(equation.outvars)
+    return False, {var for var in jaxpr.outvars if not isinstance(var, jax_core.Literal) and var in reached}
 
 
 def _varies(function: Callable, *arguments: jax.ShapeDtypeStruct) -> bool:
@@ -544,8 +580,8 @@ def _transposable(score_mod, params: tuple) -> bool:
 
 def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
     """Whether every operation of `jaxpr` that reads its `inputs` (by place) acts one entry at a time
-    (`layout.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it reads of them
-    and each it gives a scalar or the `tile`."""
+    (`dew.nn.programs.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it
+    reads of them and each it gives a scalar or the `tile`."""
     tainted = {jaxpr.invars[index] for index in inputs}
     for eqn in jaxpr.eqns:
         read = [index for index, var in enumerate(eqn.invars)
@@ -571,12 +607,8 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
-    """The names of the operations of `jaxpr` and of every jaxpr inside it."""
-    names = {eqn.primitive.name for eqn in jaxpr.eqns}
-    for eqn in jaxpr.eqns:
-        for inner in jax_core.jaxprs_in_params(eqn.params):
-            names |= _primitives(inner)
-    return names
+    """The names of the operations of `jaxpr` and of every jaxpr inside it (`dew.nn.programs.equations`)."""
+    return {eqn.primitive.name for eqn in equations(jaxpr)}
 
 
 def _columns(array: jax.Array, unit: int) -> jax.Array:
@@ -741,9 +773,7 @@ def stated(spec: algebra.Forward, batch: int, heads: int, widths: int, *arrays,
     pairs = issued(spec, tile_walk)
     if pairs is None:
         return None
-    return pl.CostEstimate(flops=2 * batch * heads * pairs * widths, transcendentals=batch * heads * pairs,
-                           bytes_accessed=sum(math.prod(array.shape) * jnp.dtype(array.dtype).itemsize
-                                              for array in arrays))
+    return estimate(2 * batch * heads * pairs * widths, *arrays, transcendentals=batch * heads * pairs)
 
 
 def modelled(spec: algebra.Forward, batch: int, heads: int, queries: int, widths: int) -> int | None:

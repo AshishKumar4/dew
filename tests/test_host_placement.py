@@ -31,7 +31,9 @@ import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Spread, val_batches
 from flax import linen as nn
+from model_support import float64_twin
 from process_support import run_pool
+from reference_error import assert_as_exact
 
 from dew.data.dataset import Loader
 from dew.inference.banks import CheckpointBanks, HeldBanks
@@ -147,18 +149,9 @@ SHAPES = {
     "capped_banks": {"num_layers": 6, "bank_layers": 2},
 }
 
-# The scanned stack against the plain loop. Both are fp32 evaluations of the
-# same logits, so they can differ by the sum of their errors against the
-# exact values. Measured against a float64 evaluation of the same weights on
-# CPU, the narrow shape's scanned logits are off by up to 7.3e-06 and its
-# plain ones by up to 4.7e-06, depending on the ISA XLA compiles for
-# (--xla_cpu_max_isa SSE4_2, AVX, AVX2); an AVX-512 CI runner measured a
-# difference of 1.03e-05 between them. Twice the larger error, 1.5e-05,
-# rounded up, is the bound.
-# A fetched run reassociates nothing the scan does not; what it must not do
-# is differ from the same banks on the device, which every case asserts
-# bitwise.
-SCAN_BOUND = 2e-5
+HOST_SCAN_SEEDS = 32
+"""The drawn prompts a fetched stack's logits are judged over against the plain loop's from float64
+(check 1, `assert_as_exact`)."""
 
 
 def pair(**overrides):
@@ -184,8 +177,10 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
 
     Bitwise against the resident banks: the fetch is a copy, and a copy that
     changed a value would show here whatever the layer kind, the grouping or
-    the head. Against the plain loop only to the scan's own bound, which is
-    where the loop's reassociation lives and is unchanged by the fetching.
+    the head. Against the plain loop on par from float64 over drawn prompts
+    (check 1): the scan reassociates where the loop does not, and the fetching
+    adds nothing to it (row 3950: an absolute bound measured on one machine
+    stood in for the check).
     """
     plain, scanned, variables, tokens = pair(**SHAPES[shape])
     before = np.asarray(plain.apply(variables, tokens))
@@ -198,8 +193,21 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     assert all(not leaf.is_deleted() for leaf in jax.tree.leaves(variables))
     after = np.asarray(plain.apply(variables, tokens))
     np.testing.assert_array_equal(after, before)
-    difference = float(jnp.max(jnp.abs(fetched - after)))
-    assert difference < SCAN_BOUND, f"max |logit difference| {difference:.3e}"
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
+        truth = jax.jit(float64_twin(plain).apply)
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(1, VOCAB, size=tokens.shape).astype(np.int32),)
+
+    def wide_logits(drawn):
+        with jax.enable_x64(new_val=True):
+            return truth(wide, jnp.asarray(drawn))
+
+    # The fetched stack called as a caller calls it, its host-resident banks fetched per call.
+    assert_as_exact(lambda drawn: scanned.apply(on_host, jnp.asarray(drawn)),
+                    jax.jit(lambda drawn: plain.apply(variables, drawn)), draw,
+                    f"{shape}: a fetched stack's logits", seeds=HOST_SCAN_SEEDS, truth_fn=wide_logits)
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))

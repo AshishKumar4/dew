@@ -662,7 +662,10 @@ class CausalTransformer(LinearProducts):
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision, "dex": dex, "dex_start": dex_start,
             "value_experts": self.value_experts if routed else None,
-            "mixture": self.mixture if routed else None}
+            "mixture": self.mixture if routed else None,
+            # A decoder forms its logits as its kernels do; a block needing them wide asks so itself
+            # (`MixerContext.wide_logits`, the world model's).
+            "wide_logits": False}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1524,7 +1527,7 @@ class CausalTransformer(LinearProducts):
         does; `layer_state` reads one layer back. Neither is a Flax method, so
         the filter the capture calls on every module runs no module call.
         """
-        return method == "__call__" and (module.name or "").startswith("layers_")
+        return method == "__call__" and group_layers(module.name or "") is not None
 
     layer_collections: ClassVar[tuple[str, ...]] = (_INTERMEDIATES, _FINAL)
     """The collections a reader of layer states opens (`LayerStates`)."""
@@ -1915,18 +1918,24 @@ class CausalTransformer(LinearProducts):
         A scan carries one dtype through, and each pipeline stage takes the
         dtype the stage before returns. Under a bf16 policy the dense
         feed-forward returns fp32, so the loops use fp32 from the start. The
-        first layer runs abstractly in its own scope (no cache, nothing sown,
-        a placeholder 'params' key, which flax draws any other stream from),
-        and a banked store answers from its first bank's first row without
-        fetching it.
+        first layer runs abstractly in its own scope (a placeholder 'params'
+        key, which flax draws any other stream from), with the collections the
+        call opened open and no other, so it takes the call's own path: opened
+        beyond them, an attention sowing its QK-Clip maxima decided a kernel
+        for a mask the call never builds (a cache made under a chosen template
+        refused, row 4101). A banked store answers from its first bank's first
+        row without fetching it.
         """
         layer = self.layers[0]
         streams = x.streams if isinstance(x, Carried) else x
+        assert self.scope is not None, "a bound decoder's stack"
+        opened = self.scope.mutable
         output = jax.eval_shape(lambda held: layer.apply(
-            held, x, mutable=True, rngs={'params': jax.random.key(0)},
+            held, x, mutable=opened, rngs={'params': jax.random.key(0)},
             train=train, decode=decode, kv_store={} if self._provides else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
-            attention_metadata=attention_metadata)[0], self.first_layer_shapes())
+            attention_metadata=attention_metadata), self.first_layer_shapes())
+        output = output if opened is False else output[0]
         output = output.streams if isinstance(output, Carried) else output
         return jnp.result_type(streams.dtype, output.dtype)
 

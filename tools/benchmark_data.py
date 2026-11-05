@@ -50,6 +50,9 @@ from absl import flags
 from dew.data import Loading
 from dew.data.dataset import Forwarding
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from receipt_paths import named, recorded
+
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
@@ -785,19 +788,6 @@ def comparison(rows: list[dict]) -> list[dict]:
                if "cold_first_batch_from_open_seconds" in verdict else {})}
         verdicts.append(verdict)
     return verdicts
-
-
-def named(path: Path) -> str:
-    """`path` as a receipt records it: relative to the checkout inside it, by its name outside it, so no
-    receipt names the directories of the host that ran it (bible §2)."""
-    root, whole = Path(__file__).resolve().parents[1], path.resolve()
-    return str(whole.relative_to(root)) if whole.is_relative_to(root) else path.name
-
-
-def recorded(config: object) -> dict:
-    """`config`'s fields as a receipt records them, each path `named`."""
-    return {name: named(value) if isinstance(value, Path) else value
-            for name, value in asdict(config).items()}
 
 
 def recorded_inputs(inputs: dict) -> dict:

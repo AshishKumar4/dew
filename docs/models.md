@@ -13,7 +13,5 @@ These families were asked for and are not in the tables above. Each one is track
 | Family | What is missing |
 |---|---|
 | MiniMax M3 | The shared expert, MTP and vision-language half, and a reader. |
-| LLaDA MoE (GSAI LLaDA-MoE-v2-30B-A3B, inclusionAI LLaDA-MoE-7B-A1B) and LLaDA 2.x | The expert layers and routers in the LLaDA reader, which reads the dense 8B model. |
-| Apple DiffuCoder | A pinned load compared with the released model. The Dream reader targets Dream-v0. |
 | Kimi K2.5 and K3 vision | The vision towers and projectors. Both load as text decoders. |
-| MiniMax M2.5, M2.7 and H3 | Their configurations, to check whether the M2 reader covers them. |
+| MiniMax H3 | Its configuration, to check whether the M2 reader covers it. |

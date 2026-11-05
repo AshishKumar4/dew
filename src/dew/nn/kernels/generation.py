@@ -78,14 +78,15 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
-                      'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                      'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
-"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
+                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'narrow_copies',
+                     'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
+"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
+selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
+(`chosen_kernel`, likewise)."""
 
 
-def _named(choices: Iterable[str]) -> None:
+def known_choices(choices: Iterable[str]) -> None:
     """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
     if unknown := set(choices) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
@@ -101,7 +102,7 @@ def chosen(**kernels: str) -> Iterator[None]:
     outside the block traces again within it."""
     from dew import cache
 
-    _named(kernels)
+    known_choices(kernels)
     with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
 
@@ -140,6 +141,58 @@ lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 
 @dataclasses.dataclass(frozen=True)
+class RegisterRaises:
+    """The register counts a warpgroup's `setmaxnreg` moves a thread's allocation to: from `lowest` to
+    `highest` in steps of `step` (PTX ISA, "setmaxnreg": a count in 24 to 256, a multiple of 8, on sm_90a,
+    sm_100f and sm_120f)."""
+
+    lowest: int
+    highest: int
+    step: int
+
+
+SETMAXNREG = RegisterRaises(24, 256, 8)
+"""`setmaxnreg`'s range on every architecture that takes it (PTX ISA, "setmaxnreg")."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Multiprocessor:
+    """A CUDA multiprocessor's resources, which the templates' register and resource models read
+    (`templates.resources`, `templates.cost`): the most threads and blocks resident at once
+    (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
+    (`thread_registers`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
+    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
+    (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
+    to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; the exponentials the CUDA C++ Best
+    Practices Guide 13's §12.1.1 Table 5, `lg2.approx.f32`'s row, where CUDA 13 moved the throughput table,
+    15.97 measured on an H200, the kernel challenge's MUFU.EX2; 128 bytes a clock measured 126 to 128 on an
+    A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through Microbenchmarking",
+    Table 3) and setmaxnreg's range,
+    which a target of no architecture (the CPU interpreting a launch) reads too, under which every family's
+    launch interprets."""
+
+    resident_threads: int = 1536
+    resident_blocks: int = 16
+    registers: int = 64 * 1024
+    thread_registers: int = 255
+    register_step: int = 8
+    reserved_shared: int = 1024
+    shared_bytes_per_clock: int = 128
+    exponentials_per_clock: int = 16
+    register_raises: RegisterRaises | None = SETMAXNREG
+
+    def raises(self) -> RegisterRaises:
+        """The range setmaxnreg moves a thread's registers in (`register_raises`); a multiprocessor before
+        Hopper's takes none, which no family raising its consumers runs on."""
+        if self.register_raises is None:
+            raise ValueError("this multiprocessor takes no setmaxnreg: a family raising its consumers' "
+                             "registers runs on Hopper's and Blackwell's")
+        return self.register_raises
+
+
+@dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
     generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
@@ -151,11 +204,12 @@ class Architecture:
     into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
     `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
     control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks)."""
+    its devices' facts serve the rest of Dew (MFU's peaks). Its CUDA multiprocessor's resources
+    (`multiprocessor`), None on a TPU."""
 
     family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
-    resident_threads: int = 1536
+    multiprocessor: Multiprocessor | None = Multiprocessor()
     wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
@@ -177,28 +231,37 @@ class Architecture:
 # 16384). Hopper's mma.sync takes none (an m16n8k32 e4m3 assembles to F2FP unpacks and HMMA.16816 on
 # sm_90a; the kernel challenge's judge-facts.md:127), nor does Ampere's: there an FP8 product runs as a
 # 16-bit one.
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, resident_threads=2048)
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256})
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256})
+# Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
+# 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
+# 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
+_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
+_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256},
+                                Multiprocessor(register_raises=None))
+_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+                    Multiprocessor(resident_blocks=24, register_raises=None))
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, resident_threads=1024)
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128},
+                       Multiprocessor(resident_threads=1024, register_raises=None))
 _HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       resident_threads=2048, wgmma=True, tma=True, dependent_launch=True)
+                       Multiprocessor(resident_threads=2048, resident_blocks=32), wgmma=True, tma=True,
+                       dependent_launch=True)
 # Blackwell's tcgen05 family.
 _BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
-                          resident_threads=2048,
-                          tmem_columns=512, tma=True, dependent_launch=True)
+                          Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
+                          tma=True, dependent_launch=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
 _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
-                                   tma=True, dependent_launch=True)
+                                   Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
 # v6e: two 256x256 MXUs, 918 TF over its clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20)}
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
+                             vmem_bytes=128 * 2 ** 20),
+         'v6e': Architecture('tpu', {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -294,10 +357,21 @@ class GpuTarget:
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
     where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
     (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
+    late_weight_gradients: bool = False
+    """Whether XLA's schedule of a training step for this GPU runs its weight gradients after the whole
+    backward where the step's head takes its gradient a tile at a time, unfused, holding the products'
+    operands to then, as the derivation runs them (`dew.training.footprint.sunk`): an H100's every one, a
+    B200's and a B300's some, which running every one there bounds from above (row 3341's calibration,
+    compile-only, `TARGETS`' comments)."""
     step_seconds: float | None = None
     """One dependent step's latency on XLA's path: an iteration of a loop XLA lowers, its launches and its
     predicate, each reading the last (the work-span model's step, `templates.cost.Work.span`), measured per
     GPU (FS-STEP-SECONDS1's receipts); None where none was, so a form's span there is priced by no time."""
+    kernel_step_seconds: float | None = None
+    """One dependent step's latency within a kernel: a tile's 128-lane reduction broadcast into the next
+    step's operand, in one program, each reading the last (a template walk's span, `templates.cost.walked`),
+    measured per GPU as the slope over 1,024 to 16,384 steps (FS-STEP-SECONDS1's kernel path); None where
+    none was."""
 
     @property
     def architecture(self) -> Architecture:
@@ -333,6 +407,14 @@ class GpuTarget:
         return self.architecture.vmem_bytes
 
     @property
+    def multiprocessor(self) -> Multiprocessor:
+        """The resources of this target's CUDA multiprocessor (`Architecture.multiprocessor`); a TPU has
+        none, which no CUDA launch's derivation reads."""
+        if self.architecture.multiprocessor is None:
+            raise ValueError(f"a {self.generation} target has no CUDA multiprocessor")
+        return self.architecture.multiprocessor
+
+    @property
     def device_kind_prefixes(self) -> tuple[str, ...]:
         return tuple(self.dense_peaks)
 
@@ -356,6 +438,13 @@ class GpuTarget:
         else its clocks' bandwidth (`memory_bandwidth`)."""
         part = self.part
         return self.memory_bandwidth if part is None else part.bytes_per_second
+
+    @property
+    def fixed_seconds(self) -> float | None:
+        """The seconds a kernel's stream spends before its bytes arrive, its launch and first byte, measured
+        on the part (`Measured.fixed`); None where no one measured it."""
+        part = self.part
+        return None if part is None else part.fixed
 
     @property
     def launch_seconds(self) -> float | None:
@@ -412,7 +501,7 @@ class GpuTarget:
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
 # A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
-# Server 2617/1792. The rates, latencies and L2 a family shares are `architecture`'s.
+# Server 2617/1597. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -448,6 +537,9 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
               memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
+              # and 225.25).
+              kernel_step_seconds=225.3e-9,
               # tools/device_facts.py on an A100-SXM4-40GB: its stream FS-DEVICEFACTS2-a100's (1.555 TB/s by
               # its clocks), its launch FS-DEVICEFACTS4-a100's.
               measured={'NVIDIA A100-SXM4-40GB': Measured(6.04e-6, 1.486e12, launch=2.11e-6)}),
@@ -471,6 +563,17 @@ TARGETS = {target.generation: target for target in (
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
               clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
+              # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
+              # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
+              # gradients run after the backward; Qwen3.5-0.8B's at 8 x 3072, 32.1. For an A100 they hold
+              # 10.8 and 8.5, each layer's weight gradient run in its backward, and the 0.8B's 8.6 for an
+              # RTX PRO 6000 (row 3341's calibration, compile-only; an L4's attention kernel compiles
+              # for none).
+              late_weight_gradients=True,
+              # In-kernel: a dependent lane reduction's 142.7 ns on an H100 80GB HBM3 (FS-STEP-SECONDS1-h100,
+              # its two rounds 142.72 and 142.61).
+              kernel_step_seconds=142.7e-9,
               # tools/device_facts.py on an H100 SXM and a GH200: their streams FS-DEVICEFACTS2-h100's and
               # -gh200's, their launches and hand-offs FS-DEVICEFACTS4's; the H200's stream the same line
               # through the kernel challenge's best read at each size, 16.8 MB to 805 MB, cold L2 under graph
@@ -485,21 +588,32 @@ TARGETS = {target.generation: target for target in (
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
+              # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
+              # gradients run after the backward, which the derivation bounds from above by running all
+              # there (43.4 derived; 8.5 with each in its layer's backward), row 3341's calibration,
+              # compile-only.
+              late_weight_gradients=True),
     # Blackwell Ultra, datasheet alone and unmeasured, a compile-only sm103 device's facts: 160 SMs and
     # 8 TB/s (NVIDIA, "Inside NVIDIA Blackwell Ultra"), HGX B300's 2.25/4.5 PF dense bf16/fp8 a GPU (the
     # HGX table's sparse figures halved over 8 GPUs). No source states its clock: B200's, which steers
     # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12,
+              # The B200's step above compiled for a B300 holds 13.9 GiB, 5.6 with the head fused: some
+              # weight gradients late, bounded from above as on a B200 (row 3341's calibration).
+              late_weight_gradients=True),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               # The Server Edition's 1.597 TB/s (NVIDIA's RTX PRO 6000 Blackwell Server Edition page and
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
-              step_seconds=3.68e-6),
+              # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
+              # and 137.66).
+              step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
@@ -739,7 +853,7 @@ def chosen_kernel(choice: str, default: str) -> str:
     without a selector (the attention template's form, a step's narrow copies)."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
@@ -810,7 +924,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import cache
 
-    _named((choice,))
+    known_choices((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)

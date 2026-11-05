@@ -26,7 +26,7 @@ import tyro
 from flax import linen as nn
 
 from dew._records import record
-from dew.batch import Variables
+from dew.batch import Variables, unboxed
 from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
@@ -160,7 +160,10 @@ class WorldModelRunConfig(RunConfig):
         tokenizer = saved.model.build(**saved.numerics_fields(), **saved.derived({"frame": frame}))
         with Checkpoints(held.run) as checkpoints:
             variables = checkpoints.variables(step=held.step, ema=False)
-        fresh = jax.eval_shape(lambda key: tokenizer.init(key, jnp.zeros((1, *frame))), jax.random.key(0))
+        # Drawn plain, as a checkpoint holds it: a draw's boxes (`nn.with_logical_partitioning`) are its
+        # table's.
+        fresh = unboxed(jax.eval_shape(lambda key: tokenizer.init(key, jnp.zeros((1, *frame))),
+                                       jax.random.key(0)))
         try:
             fitting = jax.tree.map(lambda drawn, read: np.shape(drawn) == np.shape(read), fresh, variables)
         except ValueError:

@@ -35,7 +35,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, FROZEN, Batch, owned_dicts, select, unboxed
-from dew.checkpoints import Checkpoints, Ranking, Resume
+from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import Handed
 from dew.data.dataset import (
@@ -45,7 +45,6 @@ from dew.data.dataset import (
     PhasedStream,
     RampedStream,
     Stage,
-    rows_of,
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
@@ -94,7 +93,7 @@ from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, s
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import exported as telemetry_exported, region
+from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training import staging
 from dew.training._fit import (
@@ -109,13 +108,14 @@ from dew.training._fit import (
     afresh,
     check_inputs,
     clocked,
-    closes_window,
     consumption_counted,
+    counted_step,
     declarations,
     first_batch,
     fit_policies,
     handed_splits,
     pooled_first,
+    read_batch,
     restored,
     stage_reached,
     unrecorded_parts,
@@ -184,13 +184,14 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     Trials,
+    held_objects,
     read_whole,
     settled,
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window
-from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
+from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -998,7 +999,7 @@ class Trainer(Generic[Loss, Effects]):
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
-        with self._traced_on(mesh, links) as schedule:
+        with self._traced_on(mesh, links) as schedule, held_objects():
             planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
@@ -1191,8 +1192,7 @@ class Trainer(Generic[Loss, Effects]):
         (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
         (`group_of`), not the outer optimizer's."""
         with group_of(prepared, micro) as (view, _):
-            return consumed_where_made(self.objective, self.optimizer, view, window,
-                                       shared=pooled_by_mean(shapes[0]),
+            return consumed_where_made(self.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
                                        progressed=self._examples is not None)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, split: int,
@@ -1494,13 +1494,12 @@ class Trainer(Generic[Loss, Effects]):
                 # The first read restores the stream's position and opens its reader on the prefetch
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
-                batch = waited_read(run, interval, agree=run.agrees(first=not seen))
-                if batch is None:
+                read = read_batch(run, interval, state, self.rollout, self.device_mesh, self._marked,
+                                  self._examples, agree=run.agrees(first=not seen))
+                if read is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                batch, ahead = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked,
-                                          interval, run, examples=self._examples, closes=True)
-                device, _ = split_fields(batch)
+                (batch, device, ahead), read = read, None  # the batch's buffers held by `batch` alone
                 if batch_signature(device) not in compiled and self.rollout is None:
                     # Each batch of a shape the run has not stepped is checked against what the objective
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
@@ -1541,8 +1540,8 @@ class Trainer(Generic[Loss, Effects]):
                 position = run.train.source_state if ahead is None else ahead
                 run.current, seen = run.current + 1, seen + 1
                 self._display.step(run.current)
-                interval.count(batch, measured_flops, loss, finite, committed, aux,
-                               run.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
+                counted_step(interval, run, self.objective.row_tokens, batch, device, measured_flops, loss,
+                             finite, committed, aux)
                 # The step's batch is no cooldown branch's to hold beside its own (`_cooled`).
                 batch = device = None
                 if run.first_step is None:
@@ -1585,8 +1584,7 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
-        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
+        exported = waited_export(profile, profiler)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -1950,20 +1948,19 @@ class Trainer(Generic[Loss, Effects]):
                     if schedule_ended(ends, lambda: branched.clock.read) or (cut := run.notice.reached()):
                         break
                     self._scheduled(plan, branched)
-                    batch = waited_read(branched, counted, agree=branched.agrees(first=not done),
-                                        phase="cooldown read")
-                    if batch is None:
+                    read = read_batch(branched, counted, cooled, self.rollout, self.device_mesh, self._marked,
+                                      self._examples, agree=branched.agrees(first=not done),
+                                      phase="cooldown read", branch=True)
+                    if read is None:
                         break
-                    batch, _ = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked,
-                                          counted, branched)
-                    device = closes_window(split_fields(batch)[0], self._examples)
+                    (batch, device, _), read = read, None
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                     cooled, loss, aux, finite, _, committed = step(
                         rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
-                    counted.count(batch, None, loss, finite, committed, aux,
-                                  branched.clock.stepped(self.objective.row_tokens(device), rows_of(device)))
+                    counted_step(counted, branched, self.objective.row_tokens, batch, device, None, loss,
+                                 finite, committed, aux)
                     done, branched.current = done + 1, branched.current + 1
             finally:
                 self._stage_starts = starts
@@ -2298,26 +2295,26 @@ class Trainer(Generic[Loss, Effects]):
             metadata.setdefault('train/loss', float(jax.device_get(interval.book.loss) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
-        write = functools.partial(
-            checkpoints.save, step, self._staging.saved(state), position, metadata, ranking=ranking,
-            share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
-            weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
-            boxed=self._boxed_axes(), rollout=None if weights_only else _rollout_saved(self.rollout))
+        envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
+        write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
+                                  weights_only=weights_only, **envelope)
         with run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
         self._display.status("")
         return time.perf_counter() - paused
 
-    def _saved_local_checkpoint(
-        self,
-        checkpoints: Checkpoints,
-        step: int,
-        state: TrainState,
-        position: bytes | None,
-        interval: Interval,
-        run: FitRun,
-    ) -> float:
+    def _checkpoint_envelope(self, state: TrainState, position: bytes | None, interval: Interval, run: FitRun,
+                             *, weights_only: bool = False) -> Envelope:
+        """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
+        envelope a persistent and a local save submit (row 4126)."""
+        control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
+        return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
+                "rung": self._checkpoint_rung(), "artifact": self._artifact(), "boxed": self._boxed_axes(),
+                "rollout": None if weights_only else _rollout_saved(self.rollout)}
+
+    def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
+                                position: bytes | None, interval: Interval, run: FitRun) -> float:
         """Write one checkpoint to the local directory with `run`'s stop control, its stream placing
         nothing meanwhile (`FitRun.held`), and report it.
 
@@ -2325,11 +2322,8 @@ class Trainer(Generic[Loss, Effects]):
         node reads back, not the run's record."""
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
-        write = functools.partial(
-            checkpoints.save_local, step, self._staging.saved(state), position,
-            share=DataPartition.of(self.device_mesh), control={**run.stop_control, **interval.token_control},
-            rung=self._checkpoint_rung(), artifact=self._artifact(), boxed=self._boxed_axes(),
-            rollout=_rollout_saved(self.rollout))
+        write = functools.partial(checkpoints.save_local, step,
+                                  **self._checkpoint_envelope(state, position, interval, run))
         with run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2388,7 +2382,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
-        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
+        error = reported_window(self._report, self._display.note, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:

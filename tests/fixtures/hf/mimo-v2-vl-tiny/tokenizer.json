@@ -1,0 +1,180 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "w0",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "w1",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "w2",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 58,
+      "content": "<|vision_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 59,
+      "content": "<|vision_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 60,
+      "content": "<|image|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 61,
+      "content": "<|video|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 62,
+      "content": "<|audio|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "WhitespaceSplit"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "w0": 0,
+      "w1": 1,
+      "w2": 2,
+      "w3": 3,
+      "w4": 4,
+      "w5": 5,
+      "w6": 6,
+      "w7": 7,
+      "w8": 8,
+      "w9": 9,
+      "w10": 10,
+      "w11": 11,
+      "w12": 12,
+      "w13": 13,
+      "w14": 14,
+      "w15": 15,
+      "w16": 16,
+      "w17": 17,
+      "w18": 18,
+      "w19": 19,
+      "w20": 20,
+      "w21": 21,
+      "w22": 22,
+      "w23": 23,
+      "w24": 24,
+      "w25": 25,
+      "w26": 26,
+      "w27": 27,
+      "w28": 28,
+      "w29": 29,
+      "w30": 30,
+      "w31": 31,
+      "w32": 32,
+      "w33": 33,
+      "w34": 34,
+      "w35": 35,
+      "w36": 36,
+      "w37": 37,
+      "w38": 38,
+      "w39": 39,
+      "w40": 40,
+      "w41": 41,
+      "w42": 42,
+      "w43": 43,
+      "w44": 44,
+      "w45": 45,
+      "w46": 46,
+      "w47": 47,
+      "w48": 48,
+      "w49": 49,
+      "w50": 50,
+      "w51": 51,
+      "w52": 52,
+      "w53": 53,
+      "w54": 54,
+      "w55": 55,
+      "w56": 56,
+      "w57": 57,
+      "<|vision_start|>": 58,
+      "<|vision_end|>": 59,
+      "<|image|>": 60,
+      "<|video|>": 61,
+      "<|audio|>": 62,
+      "w63": 63
+    },
+    "unk_token": "w0"
+  }
+}

@@ -236,48 +236,65 @@ def test_a_mamba_layer_from_a_held_state_out_of_the_template_is_as_exact_interpr
     the_layer_is_as_exact_under_the_template(packed=False, held="out of the template")
 
 
-def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast", named: bool = False):
-    """The kernels and refusals the selective scan's dispatch (`recurrence_chunk.selective_scan`) reports
-    for a scan traced for `target` over fp32 `x` and `B` and a `c_dtype` `C` of `states` states, two rows of
-    a chunk's tokens and a channel block, under the run's `forms`, the template named where `named`: each
-    route's `(kernel, refusal code)`; or the refusal it raises."""
-    x = jnp.zeros((2, selective.CHUNK, selective.block_scan.THREADS), jnp.float32)
-    a, b = jnp.zeros((x.shape[-1], states)), jnp.zeros((*x.shape[:2], states))
-    named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
-    with (generation.assumed(target), named_template, generation.routes() as found,
-          generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
-        jax.eval_shape(functools.partial(recurrence_chunk.selective_scan, portable=portable),
-                       x, x, a, b, b.astype(c_dtype), x[0, 0], None, None)
-    return {(route.kernel, route.refusal and route.refusal.code) for route in found}
+def dispatched(forms: str, *, named: bool, c_dtype, target: str | None = None):
+    """The selective scan's dispatch (`recurrence_chunk.selective_scan`) under the run's `forms`, the template
+    named where `named` (interpreted off a GPU), `C` in `c_dtype` and every other operand as drawn, traced
+    for `target` where given (lowered for it, never run here): the output alone."""
+    def run(x, dt, a, b, c, skip):
+        named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
+        assumed = contextlib.nullcontext() if target is None else generation.assumed(target)
+        with (assumed, named_template,
+              generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
+            return recurrence_chunk.selective_scan(x, dt, a, b, c.astype(c_dtype), skip, None, None,
+                                                   portable=portable)[0]
+
+    return run
 
 
-def test_the_selector_takes_the_template_where_it_is_qualified():
-    """An H100's scan of whole blocks of Mamba's 16 states takes the template under the fast forms, held to
-    recorded mamba_ssm there (row 2968), and the portable math under the accurate forms with those its
-    refusal, as a call naming the template overrides; an A100's refuses it for its strided copies whatever
-    the call names."""
-    from dew.nn.kernels.selection import KernelRefused
+ROUTE_CASES = [("fast", jnp.float32), ("accurate", jnp.float32), ("fast", jnp.bfloat16)]
+"""The scans whose dispatch takes the template where a call names it, interpreted here as off any GPU: under
+the fast forms and the accurate ones, and a bf16 `C` beside fp32 `x` and `B`, whose rows a bulk copy takes
+whole at Mamba's 16 states. Which kernel an H100's or an A100's selector takes unnamed is the GPU flow's to
+run (tests/test_gpu_recurrence.py), each held there to recorded mamba_ssm."""
 
-    assert routed("sm90", 16) == {("mosaic_gpu", None)}
-    assert routed("sm90", 16, forms="accurate") == {("xla", "forms")}
-    assert routed("sm90", 16, forms="accurate", named=True) == {("mosaic_gpu", None)}
-    with pytest.raises(KernelRefused) as refused:
-        routed("sm80", 16, named=True)
-    assert [refusal.code for refusal in refused.value.refusals] == ["strided copies"]
+
+@pytest.mark.parametrize(("forms", "c_dtype"), ROUTE_CASES,
+                         ids=[f"{forms}-C {jnp.dtype(c).name}" for forms, c in ROUTE_CASES])
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_scan(forms, c_dtype):
+    """The selective scan through its dispatch with the template named, its placement and operand dtypes as
+    a call hands them over: its output and every input's gradient on par from float64 with the portable
+    scan's over drawn fp32 operands, `C` drawn in `c_dtype` (check 1), one row of a ragged chunk over two
+    channel blocks (KT5: no route held, the scan's behaviour)."""
+    shape = SHAPES["interpreted"]
+
+    def draws(seed):
+        (x, dt, a, b, c, skip), _, dy = draw(jnp.float32, seed, *shape, packed=False)
+        return x, dt, a, b, c.astype(c_dtype), skip, dy
+
+    def reference(x, dt, a, b, c, skip):
+        return portable(x, dt, a, b, c.astype(jnp.float32), skip, None, None)[0]
+
+    assert_as_exact(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
+                    jax.jit(with_gradients(reference)), draws,
+                    f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
+                    f"{jnp.dtype(c_dtype).name}",
+                    seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(reference)))
 
 
 @pytest.mark.parametrize("states", [4, 12])
-def test_the_selector_refuses_a_state_row_of_either_stream_no_bulk_copy_takes(states):
+def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     """fp32 `x` and `B` with a bf16 `C` at `states` states, whose B rows a bulk copy's 16 bytes divide and
-    whose C rows (8 or 24 bytes) they do not: the template's streams copy each unpadded in its own dtype, so
-    a call naming the template is refused for C's rows (row 2975), and the same scan with an fp32 `C`, every
-    row whole, is taken."""
+    whose C rows (8 or 24 bytes) they do not: the template's streams copy each unpadded in its own dtype, so a
+    call naming the template is refused for C's rows, typed (row 2975), at the trust boundary of its operands'
+    layout."""
     from dew.nn.kernels.selection import KernelRefused
 
+    shape = (1, selective.CHUNK, selective.block_scan.THREADS, states)
+    inputs, _, _ = draw(jnp.float32, 0, *shape, packed=False)
     with pytest.raises(KernelRefused) as refused:
-        routed("sm90", states, jnp.bfloat16, named=True)
+        jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.bfloat16, target="sm90"), *inputs)
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
-    assert routed("sm90", states, named=True) == {("mosaic_gpu", None)}
 
 
 @lowers('sm90')
@@ -382,14 +399,18 @@ def test_a_spill_steps_the_kernel_that_spilled():
                                       selective.backward_programs(selective.backward_registers(fewer), facts))
 
 
-@pytest.mark.parametrize(('length', 'chunk'), [(129, 32), (2048, 128)], ids=['129 tokens', '2048 tokens'])
-def test_a_chunk_walks_no_more_padding_than_the_shortest(length, chunk):
-    """The forward's derived chunk on an H100's facts: the longest whose ring a block holds, dividing the
-    call's tokens padded to the shortest chunk's, so 129 tokens walk 160 at 32 a chunk, not 256 at 128
-    (row 3853)."""
+@pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
+def test_a_chunk_walks_no_more_padding_than_the_shortest(length):
+    """The forward's derived chunk on an H100's facts walks the call's tokens padded to the shortest chunk's
+    (`selective.CHUNK`) and no further, at tiles the template holds legal: 129 tokens walked 256 at a chunk of
+    128 before row 3853, where 32 a chunk walks 160. Which chunk the derivation takes is its own."""
     target = generation.gpu_target('sm90')
+    bound = _bound(length)
     with generation.assumed(target):
-        assert selective.SELECTIVE.derived(_bound(length), target).chunk == chunk
+        tiles = selective.SELECTIVE.derived(bound, target)
+        assert selective.SELECTIVE.legal(bound, tiles, target)
+    shortest = -(-length // selective.CHUNK) * selective.CHUNK
+    assert -(-length // tiles.chunk) * tiles.chunk == shortest
 
 
 @lowers('sm90')
