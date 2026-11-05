@@ -1354,7 +1354,10 @@ class Server:
         conditioning = {} if cross is None else {CONTEXT: placed[11], CONTEXT_LENGTHS: placed[12]}
         fields = {VALIDITY_FIELD: placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
                                                           strict=True))}
-        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:11])
+        slots, budgets, keys, tables, cursors, final, history, history_valid, adapters = placed[2:11]
+        return Admission(ModelInputs(placed[0], fields, conditioning), slots=slots, budgets=budgets,
+                         keys=keys, tables=tables, cursors=cursors, final=final, history=history,
+                         history_valid=history_valid, adapters=adapters)
 
     def _placed(self, local: list) -> list[jax.Array]:
         """This process's rows of an admission's arrays placed as the admission is (`_admitted`): every row
@@ -1476,25 +1479,26 @@ def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
 def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
     """`variables` placed on `mesh` as they lie on their own, each leaf's partition spec kept: a copy of a
     server's weights on its prefill mesh. A leaf on one device is replicated."""
-    return _moved(variables, jax.tree.map(lambda leaf: NamedSharding(
-        mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()), variables),
+    return _moved(variables, lambda leaf: NamedSharding(
+        mesh, leaf.sharding.spec if isinstance(leaf.sharding, NamedSharding) else P()),
         phase="weights to the prefill mesh")
 
 
-def _moved[T](tree: T, shardings: object, *, phase: str) -> T:
-    """`tree` placed by `shardings` (one, or a tree of them): where JAX moves it between the device sets
-    (`jax.device_put`, every array within this process's devices), as it does; between meshes over several
-    processes, each leaf gathered to every process's host (`collective_host`, every process calling it) and
-    each process's shards made of it, as JAX's transfers cannot move a sharded array to another processes'
-    device set."""
+def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[jax.Array], jax.sharding.Sharding], *,
+              phase: str) -> T:
+    """`tree` placed by `sharding`, one for every leaf or each leaf's: where JAX moves it between the
+    device sets (`jax.device_put`, every array within this process's devices), as it does; between meshes
+    over several processes, each leaf gathered to every process's host (`collective_host`, every process
+    calling it) and each process's shards made of it, as JAX's transfers cannot move a sharded array to
+    another processes' device set."""
     leaves, structure = jax.tree.flatten(tree)
-    targets = (jax.tree.leaves(shardings, is_leaf=lambda x: isinstance(x, jax.sharding.Sharding))
-               if not isinstance(shardings, jax.sharding.Sharding) else [shardings] * len(leaves))
+    targets = [sharding if isinstance(sharding, jax.sharding.Sharding) else sharding(leaf) for leaf in leaves]
     if all(leaf.is_fully_addressable and target.is_fully_addressable
            for leaf, target in zip(leaves, targets, strict=True)):
-        return jax.device_put(tree, shardings)
+        return jax.tree.unflatten(structure, jax.device_put(leaves, targets))
     # Gathered under the mesh the leaves lie on, whatever mesh the caller traces under.
     source = next(leaf.sharding.mesh for leaf in leaves if isinstance(leaf.sharding, NamedSharding))
+    assert isinstance(source, Mesh), "an array's placed sharding names a concrete mesh"
     with jax.set_mesh(source):
         home = collective_host(leaves, phase=phase)
     return jax.tree.unflatten(structure, [
