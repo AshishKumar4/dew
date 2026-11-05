@@ -7,6 +7,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A checkpoint step is Orbax items: `model` (the counters, variables and EMA), `profiles` (the post-hoc EMA
+  averages) and `resume` (the rest). Each kept step keeps what its retention keeps it for:
+  `Keep(weights_only=True)` keeps its periodic, interval and predicate steps past the latest as their model
+  alone, a step a weights-only ranking keeps loses the rest once it falls out of the latest, and a post-hoc
+  EMA snapshot kept for nothing else keeps its averages alone. `kept()` reports such steps as `"weights"` or
+  `"profiles"`. A step an earlier Dew wrote reads as before. A step saved between two updates no longer holds
+  the accumulation window, whose gradient sum no resume reads (about a third of a 9B run's checkpoint).
+- A DiLoCo run's post-hoc EMA profiles, which its groups' optimizers keep, are recorded, retained and
+  restored; `posthoc_ema` returns the groups' mean of each group's own reconstruction. Its groups' collections
+  other than `params` go to the content-addressed store, and their EMA is stored as its difference from their
+  weights, as the outer model's are.
+- `Decide.save` writes the average's model alone.
 - Dew's support modules are private: `dew.accuracy`, `dew.builds`, `dew.cache`, `dew.cleanup`, `dew.devices`,
   `dew.files`, `dew.logging`, `dew.pool`, `dew.position` and `dew.cli` are now `dew._accuracy` and so on, with
   no alias left, and the API reference no longer lists `dew.cache`. `CPUOnlyJax`, which a run raises where JAX

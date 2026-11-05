@@ -412,8 +412,9 @@ def test_a_diloco_step_stores_its_groups_collections_once_and_their_ema_against_
     unbroken = run().fit(dataset(), steps=5, log_every=1)
     stopped = run(tmp_path / "run").fit(dataset(), steps=3, checkpoint_every=1, log_every=1)
 
-    manager = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers=ocp.PyTreeCheckpointHandler())
-    assert set(manager.metadata(3).item_metadata.tree["inner"]["variables"]) == {"params"}
+    manager = ocp.CheckpointManager(str(tmp_path / "run"), item_handlers={
+        name: ocp.PyTreeCheckpointHandler() for name in ("model", "resume")})
+    assert set(manager.metadata(3).item_metadata["resume"].tree["inner"]["variables"]) == {"params"}
     # The run keeps its latest two steps; the outer count, which only a meeting moves, is shared too.
     kept = (2, 3)
     recorded = set.intersection(*(set(frozen_entries(str(tmp_path / "run" / str(step)))) for step in kept))
@@ -422,7 +423,7 @@ def test_a_diloco_step_stores_its_groups_collections_once_and_their_ema_against_
             checkpointer.restore(epath.Path(tmp_path / "run") / entry))}
     assert {(2, 1000), (1000,)} <= shapes
 
-    tree = manager.restore(3, args=ocp.args.PyTreeRestore())
+    tree = dict(manager.restore(3, args=ocp.args.Composite(resume=ocp.args.PyTreeRestore()))["resume"])
     deltas = manager.metadata(3).custom_metadata["deltas"]["inner/ema"]
     weights = dict(jax.tree_util.tree_flatten_with_path(tree["inner"]["variables"])[0])
     averages = dict(jax.tree_util.tree_flatten_with_path(stopped.inner.ema)[0])

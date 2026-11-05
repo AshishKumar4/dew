@@ -534,9 +534,10 @@ class Decide(SavedRunTask, InItsForm):
 
     def _persisted(self, directory: str) -> None:
         """The average's weights written to `directory`, its calibration file already there, as a run of
-        its own (`save`): its state at its weights' step, the optimizer's empty, under its record, where
-        the directory holds no checkpoint yet; one it holds is this average's (`_claimed`). Its counters
-        and key are placed over the task's mesh (`_mesh`), as a pool's save writes them."""
+        its own (`save`): its model alone at its weights' step (`Checkpoints.save`'s `weights_only`), which
+        resumes nothing, under its record, where the directory holds no checkpoint yet; one it holds is
+        this average's (`_claimed`). Its counters are placed over the task's mesh (`_mesh`), as a pool's
+        save writes them; the state's other fields, which the model's item leaves out, are scaffolding."""
         import optax
 
         from dew.decision.objective import DecisionObjective
@@ -555,7 +556,7 @@ class Decide(SavedRunTask, InItsForm):
             # The record names the numerics the average answers under (`traced`).
             with self.traced():
                 record = DecisionObjective(self).inference_record()
-            checkpoints.save(self.weights.step, state, artifact=record)
+            checkpoints.save(self.weights.step, state, artifact=record, weights_only=True)
             checkpoints.wait()
 
     @overload

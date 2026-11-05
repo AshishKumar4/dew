@@ -125,8 +125,10 @@ def test_a_checkpoint_writes_the_averages_once_and_restores_them(tmp_path):
     Checkpoints(str(tmp_path / "run")).wait()
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    written = checkpoints._open().item_metadata(8)
-    assert dict(written)["opt_state"]["averages"] is not None
+    # The averages are the step's profiles item, and its optimizer state holds none beside them.
+    written = dict(checkpoints._open().item_metadata(8))
+    assert jax.tree.leaves(dict(written["profiles"])["averages"])
+    assert not jax.tree.leaves(dict(written["resume"])["opt_state"]["averages"])
     stored = tuple(checkpoints.stored(8)["opt_state"]["averages"])
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), stored) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), state.opt_state.averages)
@@ -209,7 +211,7 @@ def test_an_interrupted_snapshot_restores_the_previous_step_and_is_never_reconst
     monkeypatch.setattr(handler, 'finalize', fail_before_commit)
     interrupted._manager = ocp.CheckpointManager(
         directory, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True),
-        item_handlers=handler)
+        item_handlers=dict.fromkeys(("model", "profiles", "resume", "default"), handler))
     interrupted.save(4, state.replace(step=jnp.int32(4)), None, ranking=Ranking('train/loss', 0.1))
     with pytest.raises(OSError):
         interrupted.wait()

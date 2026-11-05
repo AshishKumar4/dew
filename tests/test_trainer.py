@@ -791,8 +791,8 @@ def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
 
 
 def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
-    """A step is one Orbax PyTree item: Orbax's own manager reads the state's
-    fields by name, the PRNG key as a key, and an EMA leaf the metadata
+    """A step is Orbax PyTree items, its model and the rest of its state: Orbax's own manager reads the
+    state's fields by name, the PRNG key as a key, and an EMA leaf the metadata
     lists as byte planes decodes to the run's average bit for bit, as the
     checkpoint guide says."""
     import orbax.checkpoint as ocp
@@ -806,8 +806,12 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
     trainer.checkpoints.save(int(state.step), state)
     trainer.checkpoints.wait()
 
-    manager = ocp.CheckpointManager(str(tmp_path), item_handlers=ocp.PyTreeCheckpointHandler())
-    tree = manager.restore(manager.latest_step(), args=ocp.args.PyTreeRestore())
+    items = ("model", "resume")
+    manager = ocp.CheckpointManager(str(tmp_path), item_handlers={
+        name: ocp.PyTreeCheckpointHandler() for name in items})
+    read = manager.restore(manager.latest_step(), args=ocp.args.Composite(**{
+        name: ocp.args.PyTreeRestore() for name in items}))
+    tree = {name: value for item in items for name, value in dict(read[item]).items()}
     deltas = manager.metadata(manager.latest_step()).custom_metadata["deltas"]["ema"]
     assert int(tree["step"]) == int(state.step) == 2
     assert jnp.issubdtype(tree["key"].dtype, jax.dtypes.prng_key)
@@ -1177,8 +1181,10 @@ def _rewrite_position(trainer, step, rows, shares):
     table = {"rows": np.stack(written),
              "lengths": np.array([len(row) for row in written], np.int64),
              "shares": np.array(shares, np.int64)}
+    # Written as one item, as an earlier Dew wrote a step (`dew.checkpoints.ONE_ITEM`).
     manager = trainer.checkpoints._open()
-    manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
+    manager.save(step, args=ocp.args.Composite(default=ocp.args.PyTreeSave({**restored, "position": table})),
+                 force=True)
     manager.wait_until_finished()
 
 
