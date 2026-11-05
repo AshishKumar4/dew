@@ -769,12 +769,12 @@ def _full_sum(equation, held: int) -> Mapping | None:
 
 
 def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mapping | None:
-    """`equation`'s parameters as one of its rows reads them, its stacked operands' (`stacked`) rows on
-    their `held` leading axes and its results' too: an entrywise one over operands of its result's
-    shape or scalars; a broadcast, a reshape, a transpose or a pad that keeps the rows' axes leading; a reduction,
-    a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; and a product of
-    rows batched on their leading axes, or of a stack's rows and one operand of no stack. None where a
-    row reads another, or the rows leave their leading axes."""
+    """`equation`'s parameters as one of its rows reads them, its stacked operands' (`stacked`) rows on their
+    `held` leading axes and its results' too: an entrywise one over operands of its result's shape or
+    scalars; a broadcast, a reshape, a transpose or a pad that keeps the rows' axes leading; a reduction,
+    a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; a product of rows
+    batched on their leading axes, or of a stack's rows and one operand of no stack. None where a row
+    reads another, or the rows leave their leading axes."""
     name, params = equation.primitive.name, dict(equation.params)
     out = equation.outvars[0].aval.shape
     rows = shapes[next(iter(stacked))][:held]
