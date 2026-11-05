@@ -182,23 +182,34 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
 
 
 def test_a_worst_row_one_element_rules_takes_one_values_factor():
-    """A wide leaf's worst row whose largest element carries past RULED_SHARE of the reference's worst row's
-    squared error is judged at a row of one value's factor (row 3684), at three and sixteen values a row: a
-    worst row twenty times the reference's passes there, and fails where the reference's worst row is spread
-    over its values, or its shares unknown (a recording's summary)."""
+    """A wide leaf whose worst rows, Dew's and the reference's, each have one element carrying past
+    RULED_SHARE of the row's squared error is judged at a row of one value's factor (row 3684), at three and
+    sixteen values a row: a worst row twenty times the reference's passes there, and fails where either
+    arm's worst row is spread over its values (Dew's own row fault among them), or a share is unknown (a
+    recording's summary)."""
     from check1_statistics import RULED_SHARE
     from reference_error import NARROW_FACTORS, NO_ZERO_ROWS, _Draws, _judgement
 
     worst = 20.0
     assert NARROW_FACTORS[1] > worst > NARROW_FACTORS[2]
     for width in (3, 16):
-        for shares, fails in ((np.full((8, 1), (1 + RULED_SHARE) / 2), False),
-                              (np.full((8, 1), RULED_SHARE / 2), True), (None, True)):
+        ruled, spread = (1 + RULED_SHARE) / 2, RULED_SHARE / 2
+        cases = (((ruled, ruled), False), ((spread, ruled), True), ((ruled, spread), True),
+                 ((ruled, np.nan), True))
+        for (mine, theirs), fails in cases:
+            shares = np.tile([[[mine, theirs]]], (8, 1, 1))
             draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
                            np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
                            np.ones((8, 1), bool), (width,), shares=shares)
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, shares)
+        # A site of stacked examples judges their paired worst rows at its width's factor whatever the shares:
+        # Dew's rows ten times the reference's on every example fail, however one value rules each.
+        tenfold = [[np.full(32, np.log(10.0))] for _ in range(8)]
+        draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)), np.zeros((8, 1, 2)), [[NO_ZERO_ROWS]] * 8,
+                       np.ones((8, 1), bool), (width,), example_rows=tenfold,
+                       shares=np.tile([[[ruled, ruled]]], (8, 1, 1)))
+        assert _judgement(draws, "leaf")[0], width
 
 
 def test_a_narrow_rows_factor_holds_through_check_one():

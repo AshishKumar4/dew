@@ -105,6 +105,7 @@ from check1_statistics import (
     log_sum,
     pooled_zero_rows,
     root_mean,
+    row_factor,
     shown,
 )
 from check1_wire import DRAWS, REDRAW, STAGES, staged_units
@@ -924,10 +925,11 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
 
 def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
     """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
-    float64 zero the first order's, its worst rows the worse of the two, the reference's worst row's share
-    (`RecordedLeaf.share`) that of the order its worst row is, its values finite at both."""
+    float64 zero the first order's, its worst rows the worse of the two, each worst row's share
+    (`RecordedLeaf.share`) that of the order it is, its values finite at both."""
     return [(one[0], one[1], float(np.fmax(one[2], other[2])), float(np.fmax(one[3], other[3])), one[4],
-             one[5] and other[5], other[6] if other[3] > one[3] else one[6])
+             one[5] and other[5], tuple(other[6][arm] if other[2 + arm] > one[2 + arm] else one[6][arm]
+                                        for arm in (0, 1)))
             for one, other in zip(first, later, strict=True)]
 
 
@@ -1094,11 +1096,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
 
 
 def _shares(found: list[list], count: int) -> np.ndarray | None:
-    """The reference's worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf), None where any
-    is unknown (a recording's summary keeps no row's elements)."""
-    if any(share is None for seed in found for share in seed):
-        return None
-    return np.asarray(found, np.float64).reshape(count, -1)
+    """The worst rows' shares over a run's seeds (`_Draws.shares`, seed by leaf by arm), NaN where one is
+    unknown (a recording's summary keeps no row's elements), None where every one is."""
+    held = np.asarray([[[np.nan if share is None else share for share in pair] for pair in seed]
+                       for seed in found], np.float64).reshape(count, -1, 2)
+    return None if np.isnan(held).all() else held
 
 
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
@@ -1230,7 +1232,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (path, kept, their.dtype)
-            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, 0.0))
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True, (0.0, 0.0)))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = was or shared or np.array_equal(np.asarray(true), np.asarray(their_true))
@@ -1259,7 +1261,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
-                mine.finite and theirs.finite, theirs.share)
+                mine.finite and theirs.finite, (mine.share, theirs.share))
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -1279,8 +1281,11 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
         zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
+    # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
+    shares = (mine.share if worst == mine.log_worst else None,
+              theirs.share if their_worst == theirs.log_worst else None)
     return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
-            mine.finite and theirs.finite, theirs.share)
+            mine.finite and theirs.finite, shares)
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
@@ -1332,7 +1337,9 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
-        factor = draws.factor(index)
+        # The paired examples' test keeps its width's factor (its null is exchangeability, whatever a row's
+        # error is); the maximum's takes a row one value rules at one value's (`_Draws.factor`).
+        factor = row_factor(draws.widths[index])
         paired = draws.of_example_rows(index) if contained else None
         if paired is not None and (found_rows := _paired_rows(paired, factor)) < tails[0]:
             # A site that stacks examples: each example's worst row against the reference's on it.
@@ -1342,6 +1349,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 f"{int(np.sum(paired > math.log(factor)))} of {len(paired)} examples, the reference's past "
                 f"it on {int(np.sum(paired < -math.log(factor)))} (p {found_rows:.1e}; `_paired_rows`)"))
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        factor = draws.factor(index)
         if paired is None and not my_row <= math.log(factor) + their_row:
             over.append(Finding(leaf, "row", my_row - their_row,
                                 f"{leaf}: the worst row over {count} seeds is {shown(my_row)} from float64 "

@@ -30,16 +30,20 @@ class _Draws:
     """At such a site, each seed's per-example log ratio of Dew's worst row over the reference's worst row
     on the same example, each over its size (`_example_worst_rows`), else None."""
     shares: np.ndarray | None = None
-    """The share of the reference's worst row's squared error its largest element carries (seed by leaf),
-    zero where no row is sized; None where the reference keeps no rows' elements (a recording's summary)."""
+    """The share of each seed's worst row's squared error its largest element carries, Dew's and the
+    reference's (seed by leaf by arm, as `worst`), zero where no row is sized and NaN where it is unknown (a
+    recording's summary keeps no row's elements, a row of float64 zero a live reference measured); None
+    where every one is unknown."""
 
     def factor(self, index: int) -> float:
-        """The worst-row rule's factor for leaf `index`: its rows' width's (`row_factor`), but a row of one
-        value's where one element carries past RULED_SHARE of the reference's worst row over these draws."""
+        """The worst-row rule's factor for leaf `index` (its maximum's, `_judgement`): its rows' width's
+        (`row_factor`), but a row of one value's at rows of more than two values where one element carries
+        past RULED_SHARE of both Dew's worst row and the reference's over these draws, the two rows one
+        value rules alike. A share unknown keeps the width's."""
         width = self.widths[index]
         if width > 2 and self.shares is not None:
-            at = int(np.argmax(self.worst[:, index, 1]))
-            if self.shares[at, index] > RULED_SHARE:
+            mine, theirs = (int(np.argmax(self.worst[:, index, arm])) for arm in (0, 1))
+            if self.shares[mine, index, 0] > RULED_SHARE and self.shares[theirs, index, 1] > RULED_SHARE:
                 return row_factor(1)
         return row_factor(width)
 
@@ -103,7 +107,11 @@ class _Draws:
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
         # one reference.
-        shares = (None if self.shares is None or library.shares is None
-                  else np.where(pick, library.shares, self.shares))
+        # A picked cell's worst row is the library arm's, and so is its share (unknown where it keeps none).
+        shares = None
+        if self.shares is not None:
+            theirs = np.full(pick.shape, np.nan) if library.shares is None else library.shares[..., 1]
+            shares = self.shares.copy()
+            shares[..., 1] = np.where(pick, theirs, self.shares[..., 1])
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths, shares=shares)

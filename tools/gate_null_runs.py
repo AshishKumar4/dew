@@ -531,17 +531,17 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int,
         truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
         # Drawn only where shared, so the other controls keep their streams.
         scale = 2.0 ** rng.integers(0, 25, (span, rows)) if shared else None
-        arms, shares = [], None
+        arms, shares = [], []
         for _ in range(2):
             errors = rng.standard_normal((span, rows, width))
             if amplified:
                 errors[..., 0] *= scale if shared else 2.0 ** rng.integers(0, 25, (span, rows))
             sized = np.sqrt(np.mean(np.square(errors), axis=2)) / truth
             arms.append(sized.max(axis=1))
-            # The reference's (the second arm's) worst row's largest element's share, as check 1 reads it.
-            at = np.argmax(sized, axis=1)
-            shares = _largest_share(errors[np.arange(span), at])[:, None]
+            # Each seed's worst row's largest element's share, as check 1 reads each arm's.
+            shares.append(_largest_share(errors[np.arange(span), np.argmax(sized, axis=1)]))
         worst = np.stack(arms, axis=-1)[:, None, :]
+        shares = np.stack(shares, axis=-1)[:, None, :]
 
         def drawn(start, stop, worst=worst, shares=shares):
             count = stop - start
