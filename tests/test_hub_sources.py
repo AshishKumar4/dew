@@ -562,6 +562,47 @@ def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, 
     assert streamed(split()) == online
 
 
+@pytest.mark.parametrize("held", ["lines", "array"])
+def test_a_hub_split_of_compressed_json_files_streams_them_natively(tmp_path, monkeypatch, held):
+    """A repository of gzipped JSON files at its root, laid out as codeparrot-clean's (`file-*.json.gz`),
+    streams its own files, the records `datasets` reads of them, not its Parquet conversion (row 2402)."""
+    import gzip
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Hub
+
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    rows = [{"id": index, "content": f"def f{index}():\n    return {index}"} for index in range(9)]
+    names = ["README.md", *(f"file-00000000000{number}.json.gz" for number in (1, 2, 3))]
+    for number, name in enumerate(names[1:]):
+        part = rows[3 * number:3 * number + 3]
+        body = json.dumps(part) if held == "array" else "".join(json.dumps(row) + "\n" for row in part)
+        (tmp_path / name).write_bytes(gzip.compress(body.encode()))
+    (tmp_path / "README.md").write_text("# code\n")
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **options: SimpleNamespace(
+        sha=commit))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, *, repo_type, revision: (
+        names if revision == commit else ["default/train/0000.parquet"]))
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **options: GitRefs(branches=[], converts=[conversion], tags=[]))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
+        "name": path, "type": "file", "size": (tmp_path / Path(path).name).stat().st_size,
+        "blob_id": f"blob:{Path(path).name}"})
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        (tmp_path / Path(path).name).read_bytes()))
+    source = Hub("owner/code")
+    assert source.streamed == commit
+    assert source.files.url == tuple(f"hf://datasets/owner/code@{commit}/{name}" for name in names[1:])
+    read = sorted((int(row["id"]), row["content"]) for row in iterate(Pipeline(source), read="streamed"))
+    assert read == [(row["id"], row["content"]) for row in rows]
+
+
 def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
     """A Hub split's JSON lines shard and the offset index its commit holds beside it keep, with the
     Hub offline, the identity they had online, the index's facts among the shard's: an index the
